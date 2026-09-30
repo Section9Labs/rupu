@@ -33,7 +33,7 @@ use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
 use rupu_cp::host::bucket::{Bucket, ControlEnvelope, ObjectStoreBucket};
-use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind};
+use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, CAP_USAGE_LEDGER};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -136,6 +136,9 @@ struct FileOffsets {
     events: u64,
     step_results: u64,
     unit_checkpoints: u64,
+    /// `usage.jsonl` — the run's usage ledger. Only ever advanced on a
+    /// tunnel connection whose CP advertised [`CAP_USAGE_LEDGER`].
+    usage: u64,
 }
 
 /// Per-run state for the bucket pull agent.  Extends [`FileOffsets`] with
@@ -147,6 +150,7 @@ struct BucketRunState {
     events_seq: u64,
     step_results_seq: u64,
     unit_checkpoints_seq: u64,
+    usage_seq: u64,
     /// Highest control seq we've already applied (`None` = none applied yet).
     last_ctrl_seq: Option<u64>,
 }
@@ -431,12 +435,16 @@ async fn connect_and_run(
         .ok_or_else(|| anyhow::anyhow!("server closed before Welcome"))?
         .context("recv Welcome")?;
     let welcome_frame = parse_frame(&welcome_msg)?;
-    if !matches!(welcome_frame, Frame::Welcome {}) {
+    if !matches!(welcome_frame, Frame::Welcome { .. }) {
         anyhow::bail!(
             "expected Welcome from server, got: {}",
             serde_json::to_string(&welcome_frame).unwrap_or_else(|_| "?".into())
         );
     }
+    // Only forward the usage ledger to a CP that said it mirrors it: an older
+    // CP can't parse the `usage` artifact kind and would log-and-drop every
+    // line. (Bucket hosts need no gate — an older poller just skips the key.)
+    let usage_ok = welcome_advertises(&welcome_frame, CAP_USAGE_LEDGER);
     eprintln!("connected ✓ (authenticated as {node_id})");
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 
@@ -485,6 +493,11 @@ async fn connect_and_run(
             ) {
                 send_artifact(&mut sink, rid, ArtifactFile::UnitCheckpoints, line).await;
             }
+            // usage.jsonl — drained before the terminal run.json check below
+            // so a finishing run's last ledger rows go out before RunFinished.
+            for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
+                send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
+            }
             // run.json — check for terminal status.
             if let Some((status, body)) = read_terminal_status(&run_dir.join("run.json")) {
                 send_artifact(&mut sink, rid, ArtifactFile::RunJson, body).await;
@@ -518,6 +531,7 @@ async fn connect_and_run(
                                     events: 0,
                                     step_results: 0,
                                     unit_checkpoints: 0,
+                                    usage: 0,
                                 },
                             },
                         );
@@ -593,7 +607,7 @@ async fn connect_and_run(
                 }
             }
             Frame::Hello { .. }
-            | Frame::Welcome {}
+            | Frame::Welcome { .. }
             | Frame::Pong {}
             | Frame::Artifact { .. }
             | Frame::RunFinished { .. } => {
@@ -769,6 +783,23 @@ pub fn drain_new_lines(path: &Path, offset: &mut u64) -> Vec<String> {
         .collect()
 }
 
+/// Drain the run's usage ledger (`<run_dir>/usage.jsonl`) when `enabled`.
+///
+/// `enabled` is the tunnel capability gate (the CP advertised
+/// [`CAP_USAGE_LEDGER`]); when it is `false` the ledger is left untouched and
+/// `offsets.usage` does not move, so nothing is sent or consumed.
+fn drain_usage_ledger(run_dir: &Path, offsets: &mut FileOffsets, enabled: bool) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    drain_new_lines(&run_dir.join("usage.jsonl"), &mut offsets.usage)
+}
+
+/// True when `frame` is a `Welcome` that lists `capability`.
+fn welcome_advertises(frame: &Frame, capability: &str) -> bool {
+    matches!(frame, Frame::Welcome { capabilities } if capabilities.iter().any(|c| c == capability))
+}
+
 // ---------------------------------------------------------------------------
 // Frame / message helpers
 // ---------------------------------------------------------------------------
@@ -913,10 +944,12 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                                 events: 0,
                                 step_results: 0,
                                 unit_checkpoints: 0,
+                                usage: 0,
                             },
                             events_seq: 0,
                             step_results_seq: 0,
                             unit_checkpoints_seq: 0,
+                            usage_seq: 0,
                             last_ctrl_seq: None,
                         },
                     );
@@ -976,6 +1009,19 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                     warn!(run_id = %rid, key = %key, error = %e, "node pull: put unit_checkpoints result failed");
                 } else {
                     state.unit_checkpoints_seq += 1;
+                }
+            }
+
+            // Drain usage.jsonl (the run's usage ledger). No capability gate:
+            // an older CP's poller skips the unknown `usage.*` key.
+            let lines = drain_usage_ledger(&run_dir, &mut state.offsets, true);
+            if !lines.is_empty() {
+                let body = lines.join("\n") + "\n";
+                let key = result_key("usage", state.usage_seq);
+                if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
+                    warn!(run_id = %rid, key = %key, error = %e, "node pull: put usage result failed");
+                } else {
+                    state.usage_seq += 1;
                 }
             }
 
@@ -1213,6 +1259,93 @@ mod tests {
         let lines = drain_new_lines(&path, &mut offset);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("partial"));
+    }
+
+    // ------------------------------------------------------------------
+    // usage ledger forwarding: capability gate + drain
+    // ------------------------------------------------------------------
+
+    fn offsets() -> FileOffsets {
+        FileOffsets {
+            events: 0,
+            step_results: 0,
+            unit_checkpoints: 0,
+            usage: 0,
+        }
+    }
+
+    #[test]
+    fn welcome_advertises_reads_the_capability_list() {
+        let none = Frame::Welcome {
+            capabilities: vec![],
+        };
+        let other = Frame::Welcome {
+            capabilities: vec!["something_else".to_string()],
+        };
+        let usage = Frame::Welcome {
+            capabilities: vec!["something_else".to_string(), CAP_USAGE_LEDGER.to_string()],
+        };
+        // An old CP's bare `{"type":"welcome"}` parses to an empty list.
+        let old: Frame = serde_json::from_str(r#"{"type":"welcome"}"#).unwrap();
+        assert!(!welcome_advertises(&none, CAP_USAGE_LEDGER));
+        assert!(!welcome_advertises(&old, CAP_USAGE_LEDGER));
+        assert!(!welcome_advertises(&other, CAP_USAGE_LEDGER));
+        assert!(welcome_advertises(&usage, CAP_USAGE_LEDGER));
+        // Not a Welcome at all.
+        assert!(!welcome_advertises(&Frame::Pong {}, CAP_USAGE_LEDGER));
+    }
+
+    /// The usage ledger is drained incrementally into the frames' lines when
+    /// the CP advertised the capability, and is left completely untouched
+    /// (no lines, offset unmoved) when it did not.
+    #[test]
+    fn drain_usage_ledger_honours_the_capability_gate() {
+        let dir = tempdir().unwrap();
+        let ledger = dir.path().join("usage.jsonl");
+        std::fs::write(
+            &ledger,
+            "{\"id\":\"01J0000000000000000000USG1\"}\n{\"id\":\"01J0000000000000000000USG2\"}\n",
+        )
+        .unwrap();
+
+        // Gate closed (old CP): nothing sent, nothing consumed.
+        let mut off = offsets();
+        assert!(drain_usage_ledger(dir.path(), &mut off, false).is_empty());
+        assert_eq!(off.usage, 0, "a gated ledger must not be consumed");
+
+        // Gate open: both rows, then nothing until the ledger grows.
+        let lines = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("USG1") && lines[1].contains("USG2"));
+        assert!(drain_usage_ledger(dir.path(), &mut off, true).is_empty());
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        writeln!(f, r#"{{"id":"01J0000000000000000000USG3"}}"#).unwrap();
+        drop(f);
+        let more = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(more.len(), 1);
+        assert!(more[0].contains("USG3"));
+        // The other artifacts' offsets are independent.
+        assert_eq!(off.events, 0);
+    }
+
+    /// A run with no usage ledger yet (or never) drains to nothing.
+    #[test]
+    fn drain_usage_ledger_missing_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let mut off = offsets();
+        assert!(drain_usage_ledger(dir.path(), &mut off, true).is_empty());
+        assert_eq!(off.usage, 0);
+    }
+
+    #[test]
+    fn result_key_usage_matches_the_poller_classifier() {
+        // The CP's bucket poller classifies by the `usage` prefix + `.jsonl`.
+        assert_eq!(result_key("usage", 0), "usage.0000.jsonl");
+        assert_eq!(result_key("usage", 7), "usage.0007.jsonl");
     }
 
     // ------------------------------------------------------------------

@@ -150,6 +150,9 @@ impl NodeMirror {
     /// - [`ArtifactFile::Events`] → append to `events.jsonl`.
     /// - [`ArtifactFile::StepResults`] → append to `step_results.jsonl`.
     /// - [`ArtifactFile::UnitCheckpoints`] → append to `unit_checkpoints.jsonl`.
+    /// - [`ArtifactFile::Usage`] → append to `usage.jsonl` (the run's usage
+    ///   ledger; the CP fold dedups rows by their ULID `id`, so a replayed
+    ///   line is harmless).
     /// - [`ArtifactFile::RunJson`] → parse `line` as [`RunRecord`], reapply
     ///   `id` and `worker_id`, then overwrite `run.json` via
     ///   [`RunStore::update`].
@@ -194,6 +197,11 @@ impl NodeMirror {
                     .root
                     .join(run_id)
                     .join("unit_checkpoints.jsonl");
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                writeln!(f, "{line}")?;
+            }
+            ArtifactFile::Usage => {
+                let path = self.run_store.usage_ledger_path(run_id);
                 let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                 writeln!(f, "{line}")?;
             }

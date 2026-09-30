@@ -1349,10 +1349,10 @@ impl SshHostConnector {
         // every token (as build_remote_command does) would prevent $HOME from
         // expanding, producing a literal path that never exists on the remote.
         // run_id contains only [A-Za-z0-9_] (ULID prefix), so unquoted
-        // concatenation is safe. That invariant covers ALL FOUR tailed paths
+        // concatenation is safe. That invariant covers ALL FIVE tailed paths
         // and both cat commands below: run_id is their only variable component.
         //
-        // The fourth path is the run's agent transcript, which lives OUTSIDE
+        // The last path is the run's agent transcript, which lives OUTSIDE
         // the run directory (`transcripts/<run_id>.jsonl`, not
         // `runs/<run_id>/…`) — a placed agent run's only real content. It
         // doesn't exist for workflow runs (and doesn't exist yet at spawn
@@ -1364,6 +1364,7 @@ impl SshHostConnector {
              $HOME/.rupu/runs/{run_id}/events.jsonl \
              $HOME/.rupu/runs/{run_id}/step_results.jsonl \
              $HOME/.rupu/runs/{run_id}/unit_checkpoints.jsonl \
+             $HOME/.rupu/runs/{run_id}/usage.jsonl \
              $HOME/.rupu/transcripts/{run_id}.jsonl"
         );
         let cat_cmd = format!("cat $HOME/.rupu/runs/{run_id}/run.json");
@@ -1372,7 +1373,8 @@ impl SshHostConnector {
         // tailed files. The directory component makes mis-attribution
         // impossible: none of the `runs/<run_id>/*.jsonl` artifacts can end
         // with `transcripts/<run_id>.jsonl`, and the transcript can't end
-        // with `events.jsonl` / `step_results.jsonl` / `unit_checkpoints.jsonl`.
+        // with `events.jsonl` / `step_results.jsonl` / `unit_checkpoints.jsonl` /
+        // `usage.jsonl`.
         let transcript_suffix = format!("transcripts/{run_id}.jsonl");
 
         // Register the dispatcher-facing handle BEFORE spawning, so a caller
@@ -1440,6 +1442,14 @@ impl SshHostConnector {
                                                 Some(ArtifactFile::StepResults)
                                             } else if path.ends_with("unit_checkpoints.jsonl") {
                                                 Some(ArtifactFile::UnitCheckpoints)
+                                            } else if path.ends_with("usage.jsonl") {
+                                                // The pump never truncates the mirrored
+                                                // ledger. `tail -n +1` replays it from
+                                                // byte zero after a reconnect, re-appending
+                                                // lines already mirrored; that is
+                                                // harmless because the CP's usage fold
+                                                // dedups rows by their ULID `id`.
+                                                Some(ArtifactFile::Usage)
                                             } else if path.ends_with(&transcript_suffix) {
                                                 if !transcript_replayed {
                                                     transcript_replayed = true;
@@ -5161,9 +5171,12 @@ mod tests {
         let event_json = r#"{"type":"step_started","step":"s1"}"#;
         // Expanded absolute path (as the remote `tail` would emit after $HOME
         // expansion) — still ends with `events.jsonl`, so routing matches.
+        let usage_json = r#"{"id":"01J0000000000000000000USG1","step_id":"s1","input_tokens":10}"#;
         let tail_lines = vec![
             "==> /home/ci/.rupu/runs/run_01TESTPUMP01/events.jsonl <==".to_string(),
             event_json.to_string(),
+            "==> /home/ci/.rupu/runs/run_01TESTPUMP01/usage.jsonl <==".to_string(),
+            usage_json.to_string(),
         ];
         let run_json = r#"{"run_id":"run_01TESTPUMP01","status":"completed"}"#;
 
@@ -5208,6 +5221,29 @@ mod tests {
         assert!(
             contents.contains(event_json),
             "expected event line in events.jsonl, got: {contents:?}"
+        );
+
+        // The usage ledger is tailed too, and its line lands in the mirror's
+        // `usage.jsonl` — not misfiled into events.jsonl.
+        assert!(
+            !contents.contains(usage_json),
+            "usage line must not be misfiled into events.jsonl: {contents:?}"
+        );
+        let usage =
+            std::fs::read_to_string(run_store.usage_ledger_path(run_id)).unwrap_or_default();
+        assert_eq!(
+            usage.lines().collect::<Vec<_>>(),
+            vec![usage_json],
+            "expected the usage line in the mirrored usage.jsonl"
+        );
+        let commands = fake.commands.lock().unwrap().clone();
+        let tail = commands
+            .iter()
+            .find(|c| c.starts_with("tail "))
+            .expect("tail command recorded");
+        assert!(
+            tail.contains("$HOME/.rupu/runs/run_01TESTPUMP01/usage.jsonl"),
+            "tail must include the usage ledger path, got: {tail}"
         );
     }
 

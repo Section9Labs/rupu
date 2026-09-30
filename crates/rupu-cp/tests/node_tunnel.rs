@@ -287,6 +287,63 @@ fn mirror_create_append_finish_round_trip() {
     );
 }
 
+/// A node's usage ledger lines land verbatim in the run's `usage.jsonl`
+/// (`RunStore::usage_ledger_path`) — the file the CP's live usage fold reads.
+#[test]
+fn mirror_usage_lines_land_in_the_run_usage_ledger() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRUSAGE01";
+    let node_id = "node-42";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    let row1 = r#"{"id":"01J0000000000000000000USG1","step_id":"s1","input_tokens":10}"#;
+    let row2 = r#"{"id":"01J0000000000000000000USG2","step_id":"s2","input_tokens":20}"#;
+    mirror
+        .append(run_id, node_id, ArtifactFile::Usage, row1)
+        .expect("append usage 1");
+    mirror
+        .append(run_id, node_id, ArtifactFile::Usage, row2)
+        .expect("append usage 2");
+
+    let path = store.usage_ledger_path(run_id);
+    assert!(path.ends_with(format!("{run_id}/usage.jsonl")));
+    let content = std::fs::read_to_string(&path).expect("read usage.jsonl");
+    assert_eq!(content.lines().collect::<Vec<_>>(), vec![row1, row2]);
+
+    // Ownership is still enforced for the new artifact kind.
+    let err = mirror
+        .append(run_id, "intruder", ArtifactFile::Usage, row1)
+        .expect_err("a different node must not append to this run's ledger");
+    assert!(
+        matches!(err, rupu_cp::node::mirror::MirrorError::WrongNode(_)),
+        "expected WrongNode, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().count(),
+        2,
+        "rejected append must not touch the ledger"
+    );
+}
+
 /// After `create_run` + `append(RunJson, <node record with bogus paths>)`,
 /// the loaded record must carry the CP-side `transcript_dir` and
 /// `workspace_path` (not the node's paths), while run-state fields
@@ -847,7 +904,7 @@ async fn ws_node_connect_exempt_from_bearer() {
         .expect("connection closed before Welcome");
 
     assert!(
-        matches!(response, Frame::Welcome {}),
+        matches!(response, Frame::Welcome { .. }),
         "expected Welcome, got {response:?}"
     );
 
@@ -905,8 +962,17 @@ async fn ws_valid_hello_receives_welcome_and_is_online() {
         .expect("connection closed before Welcome");
 
     assert!(
-        matches!(response, Frame::Welcome {}),
+        matches!(response, Frame::Welcome { .. }),
         "expected Welcome, got {response:?}"
+    );
+    // The CP mirrors `ArtifactFile::Usage`, so it must say so — a node only
+    // forwards its usage ledger to a CP that advertised this.
+    assert!(
+        matches!(
+            &response,
+            Frame::Welcome { capabilities } if capabilities.iter().any(|c| c == rupu_cp::node::protocol::CAP_USAGE_LEDGER)
+        ),
+        "Welcome must advertise usage_ledger, got {response:?}"
     );
 
     // Node must be online in the registry.
@@ -1647,7 +1713,7 @@ async fn tunnel_e2e_dispatch_mirror_observe_cancel() {
         .expect("timed out waiting for Welcome")
         .expect("WS closed before Welcome");
     assert!(
-        matches!(welcome, Frame::Welcome {}),
+        matches!(welcome, Frame::Welcome { .. }),
         "expected Welcome, got {welcome:?}"
     );
 
@@ -1989,7 +2055,7 @@ async fn e2e_approve_over_tunnel() {
         .expect("timed out waiting for Welcome")
         .expect("WS closed before Welcome");
     assert!(
-        matches!(welcome, Frame::Welcome {}),
+        matches!(welcome, Frame::Welcome { .. }),
         "expected Welcome, got {welcome:?}"
     );
 
@@ -2250,7 +2316,7 @@ async fn e2e_reject_over_tunnel() {
         .expect("timed out waiting for Welcome")
         .expect("WS closed before Welcome");
     assert!(
-        matches!(welcome, Frame::Welcome {}),
+        matches!(welcome, Frame::Welcome { .. }),
         "expected Welcome, got {welcome:?}"
     );
 
