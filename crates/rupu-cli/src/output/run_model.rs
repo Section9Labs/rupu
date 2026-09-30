@@ -78,6 +78,11 @@ pub struct StepView {
     pub state: StepState,
     pub agent: Option<String>,
     pub codename: Option<String>,
+    /// Provider / model of a singleton agent step, from its `AgentStarted`.
+    /// Always `None` for fan-out / parallel / panel steps: those run many
+    /// agent instances under one step id (units carry their own).
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub host: Option<String>,
     pub duration_ms: Option<u64>,
     /// Fan-out units keyed by their own `index` (stable per unit within a
@@ -153,6 +158,8 @@ impl RunView {
             state: StepState::Pending,
             agent: None,
             codename: None,
+            provider: None,
+            model: None,
             host: None,
             duration_ms: None,
             units: BTreeMap::new(),
@@ -324,6 +331,32 @@ impl RunView {
                     }
                 }
             }
+            // A singleton agent step (linear / run / loop / …) runs exactly one
+            // agent, so its provider/model describe the step. Fan-out,
+            // parallel and panel steps run many agent instances under one
+            // step id — no single provider/model describes them — so they
+            // stay unset rather than showing whichever instance started last.
+            Event::AgentStarted {
+                step_id,
+                unit_index: None,
+                provider,
+                model,
+                ..
+            } => {
+                let s = self.step_mut(step_id);
+                let many = matches!(
+                    s.kind,
+                    StepKind::ForEach | StepKind::Parallel | StepKind::Panel
+                );
+                if !many {
+                    if provider.is_some() {
+                        s.provider = provider.clone();
+                    }
+                    if model.is_some() {
+                        s.model = model.clone();
+                    }
+                }
+            }
             // Sub-agent dispatches live in their own map, keyed by
             // `sub_run_id`, and never touch any step's `units` — this is the
             // fix for the dispatch-overwrites-unit-slot bug. The event carries
@@ -380,7 +413,6 @@ impl RunView {
                 s.panel_round = Some(*round);
                 s.panel_max = Some(*max_iterations);
             }
-            _ => {}
         }
     }
 }
@@ -638,6 +670,40 @@ mod tests {
         });
         assert_eq!(v.steps[0].units[&0].provider.as_deref(), Some("openai"));
         assert_eq!(v.steps[0].units[&0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn agent_started_attaches_provider_model_to_singleton_step_only() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let agent_started = |step: &str, model: &str| Event::AgentStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            unit_index: None,
+            codename: None,
+            agent: "a".into(),
+            provider: Some("anthropic".into()),
+            model: Some(model.into()),
+            agent_run_id: "ar".into(),
+            transcript_path: "t".into(),
+        };
+        let mut v = RunView::default();
+        v.apply(&started("solo", StepKind::Linear));
+        v.apply(&started("crowd", StepKind::Panel));
+        v.apply(&agent_started("solo", "claude-opus-5-5"));
+        v.apply(&agent_started("crowd", "claude-haiku-4-5"));
+        v.apply(&agent_started("crowd", "claude-opus-5-5"));
+
+        let solo = &v.steps[0];
+        assert_eq!(solo.provider.as_deref(), Some("anthropic"));
+        assert_eq!(solo.model.as_deref(), Some("claude-opus-5-5"));
+        // A panel runs several agents under one step id: no single
+        // provider/model describes it, so none is recorded.
+        let crowd = &v.steps[1];
+        assert_eq!(
+            (crowd.provider.as_deref(), crowd.model.as_deref()),
+            (None, None)
+        );
     }
 
     #[test]
