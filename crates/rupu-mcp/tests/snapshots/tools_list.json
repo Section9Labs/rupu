@@ -803,7 +803,7 @@
           "type": "array"
         },
         "report": {
-          "description": "A complete security finding report, recorded once by the agent. Every presentation (UI, Markdown, HTML, PDF) is generated from it. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
+          "description": "A complete security finding report, recorded once by the agent. The report is the source of truth for the finding. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
           "properties": {
             "artifacts": {
               "description": "Proof-of-concept files (scripts, outputs, harnesses) as workspace-relative paths; rupu stores them with the finding. Supply only 'path'.",
