@@ -144,7 +144,7 @@ async fn run_workflow_with_live_view(
     pricing: rupu_config::PricingConfig,
 ) -> Result<OrchestratorRunResult, RunWfErr> {
     let runner_task = tokio::spawn(run_workflow(opts));
-    let view_task = tokio::spawn(async move {
+    let mut view_task = tokio::spawn(async move {
         let _ =
             crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id, pricing).await;
     });
@@ -153,8 +153,11 @@ async fn run_workflow_with_live_view(
         Err(e) => {
             // A panicked runner task is a hard failure; surface it as an
             // io error (the closest typed variant) so the caller's
-            // existing error mapping applies.
+            // existing error mapping applies. Await the aborted view so its
+            // `AltScreenGuard` has restored the normal screen before the caller
+            // prints the completion summary (same as the timeout branch below).
             view_task.abort();
+            let _ = view_task.await;
             return Err(RunWfErr::Io(std::io::Error::other(format!(
                 "workflow task panicked: {e}"
             ))));
@@ -167,7 +170,6 @@ async fn run_workflow_with_live_view(
     // guaranteed restored before the caller prints the completion summary.
     // Merely dropping the join handle would detach the task and leave the
     // alt-screen up while the summary was written into it.
-    let mut view_task = view_task;
     if tokio::time::timeout(std::time::Duration::from_millis(300), &mut view_task)
         .await
         .is_err()
@@ -4746,6 +4748,17 @@ fn persist_portable_run_metadata(
     Ok(Some((manifest_path, result)))
 }
 
+/// Whether `execute_workflow_invocation` prints the shared completion summary.
+///
+/// Only a direct, interactive run: `attach_ui` excludes cron / webhook /
+/// `run_by_*` (no-UI) runs, and a shared printer means an autoflow cycle is
+/// interleaving many runs' lines through one printer, where a multi-line block
+/// per run would tear the stream. Pure so the "who prints" decision is
+/// unit-testable without running a workflow.
+fn summary_enabled(attach_ui: bool, has_shared_printer: bool) -> bool {
+    attach_ui && !has_shared_printer
+}
+
 async fn execute_workflow_invocation(
     name: &str,
     workflow: Workflow,
@@ -4999,7 +5012,7 @@ async fn execute_workflow_invocation(
     // interleaving many runs' lines through one printer, where a multi-line
     // block per run would tear the stream. Those surfaces keep the printer's
     // own terse completion line.
-    let print_summary = ctx.attach_ui && ctx.shared_printer.is_none();
+    let print_summary = summary_enabled(ctx.attach_ui, ctx.shared_printer.is_some());
 
     let workflow_result = if use_live_view {
         match run_workflow_with_live_view(
@@ -6798,5 +6811,31 @@ steps:
             out.contains(longest),
             "longest workflow name must render intact on one line: {out}"
         );
+    }
+
+    #[test]
+    fn summary_enabled_truth_table() {
+        // (attach_ui, has_shared_printer) -> prints the completion summary
+        assert!(
+            super::summary_enabled(true, false),
+            "interactive run prints"
+        );
+        assert!(
+            !super::summary_enabled(true, true),
+            "shared-printer (autoflow) run must not print a per-run block"
+        );
+        assert!(
+            !super::summary_enabled(false, false),
+            "no-UI run (cron/webhook/run_by_*) prints nothing"
+        );
+        assert!(!super::summary_enabled(false, true));
+    }
+
+    #[test]
+    fn attach_opts_default_keeps_terse_done_line() {
+        // `rupu watch` (and any caller using `..AttachOpts::default()`) must
+        // keep the terse `✓ … complete` line; only `execute_workflow_invocation`
+        // opts in to suppressing it when the shared summary follows.
+        assert!(!crate::output::workflow_printer::AttachOpts::default().suppress_done_line);
     }
 }
