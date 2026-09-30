@@ -65,6 +65,9 @@ pub fn render(blocks: &[Block]) -> String {
                 if steps.is_empty() {
                     continue;
                 }
+                // Typst reads `1 a A i I *` in a numbering pattern as counting
+                // symbols, so a relabel containing those letters (e.g.
+                // "Finding 1:") would break the numbering, not just the label.
                 out.push_str("#enum(numbering: \"Step 1:\",\n");
                 for s in steps {
                     out.push_str(&format!("  [{}],\n", md_to_typst(s).trim_end()));

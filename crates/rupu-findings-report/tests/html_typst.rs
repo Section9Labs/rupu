@@ -89,7 +89,7 @@ fn html_is_self_contained_with_a_locked_down_csp() {
     assert!(lower.contains("<meta charset=\"utf-8\">"), "{h}");
     assert!(
         h.contains(
-            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">"
         ),
         "{h}"
     );
@@ -117,6 +117,50 @@ fn html_is_self_contained_with_a_locked_down_csp() {
         "{head}"
     );
     assert!(h.contains("<style>") && h.contains("</style>"), "{h}");
+}
+
+#[test]
+fn html_csp_and_referrer_metas_come_before_title_style_and_body() {
+    let h = html::render("t", &[Block::Title("x".into())]);
+    let csp = h.find("http-equiv=\"Content-Security-Policy\"").unwrap();
+    let referrer = h
+        .find("<meta name=\"referrer\" content=\"no-referrer\">")
+        .unwrap();
+    for later in ["<title>", "<style>", "<body>"] {
+        let at = h.find(later).unwrap();
+        assert!(csp < at, "CSP meta must precede {later}: {h}");
+        assert!(referrer < at, "referrer meta must precede {later}: {h}");
+    }
+    assert!(
+        h.contains("base-uri 'none'") && h.contains("form-action 'none'"),
+        "{h}"
+    );
+    // Exactly one of each; nothing else in the head loads or redirects.
+    assert_eq!(h.matches("Content-Security-Policy").count(), 1, "{h}");
+    assert!(
+        !h.to_ascii_lowercase().contains("http-equiv=\"refresh\""),
+        "{h}"
+    );
+}
+
+#[test]
+fn html_export_of_a_report_with_an_image_in_its_prose_has_no_img() {
+    let mut report = full_report();
+    report.root_cause =
+        "Shown: ![alt text](https://x.example/y.png?d=1) and ![z](data:image/png;base64,AAAA)"
+            .into();
+    let f = numbered(vec![input(
+        "notebin",
+        None,
+        full_record("fnd_img", Severity::High, report),
+    )])
+    .remove(0);
+    let blocks = finding_blocks(&f, &number_map(std::slice::from_ref(&f)));
+    let h = html::render("t", &blocks);
+    assert!(h.contains("alt text"), "{h}");
+    assert!(!h.to_ascii_lowercase().contains("<img"), "{h}");
+    assert!(!h.contains("x.example"), "{h}");
+    assert!(!h.contains("data:image"), "{h}");
 }
 
 #[test]
@@ -177,6 +221,10 @@ fn html_recleans_the_code_language_itself() {
                 lang: Some("c++".into()),
                 text: "z".into(),
             },
+            Block::Code {
+                lang: Some("c#".into()),
+                text: "w".into(),
+            },
         ],
     );
     assert!(!h.contains("onmouseover=\""), "{h}");
@@ -188,6 +236,10 @@ fn html_recleans_the_code_language_itself() {
     assert!(h.contains("<pre><code>y</code></pre>"), "{h}");
     assert!(
         h.contains("<pre><code class=\"language-c++\">z</code></pre>"),
+        "{h}"
+    );
+    assert!(
+        h.contains("<pre><code class=\"language-c#\">w</code></pre>"),
         "{h}"
     );
 }
@@ -342,6 +394,14 @@ fn typst_code_uses_raw_with_a_cleaned_lang() {
             lang: None,
             text: "v".into(),
         },
+        Block::Code {
+            lang: Some("$ \"\\".into()),
+            text: "w".into(),
+        },
+        Block::Code {
+            lang: Some("c#".into()),
+            text: "x".into(),
+        },
     ]);
     assert!(
         t.contains("#raw(block: true, lang: \"diff\", \"--- a\\n+++ b\\n\")"),
@@ -351,8 +411,12 @@ fn typst_code_uses_raw_with_a_cleaned_lang() {
         t.contains("#raw(block: true, lang: \"xevil\", \"t\")"),
         "{t}"
     );
-    assert!(t.contains("#raw(block: true, \"u\")"), "{t}");
+    // `#` is a legal tag character (`c#`), so it survives; the rest is dropped.
+    assert!(t.contains("#raw(block: true, lang: \"#\", \"u\")"), "{t}");
     assert!(t.contains("#raw(block: true, \"v\")"), "{t}");
+    // Nothing left after cleaning: no `lang:` at all.
+    assert!(t.contains("#raw(block: true, \"w\")"), "{t}");
+    assert!(t.contains("#raw(block: true, lang: \"c#\", \"x\")"), "{t}");
 }
 
 #[test]

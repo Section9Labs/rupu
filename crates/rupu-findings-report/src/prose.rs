@@ -39,36 +39,75 @@ fn typst_link_dest(url: &str) -> Option<String> {
         .then_some(u)
 }
 
-/// Markdown → HTML with raw HTML shown as text and script-ish links removed.
+/// Heading levels agent prose may use, shifted two down (h1→h3, h2→h4,
+/// h3 and deeper→h5) so a heading in agent text can never look like the
+/// document title or a section heading. `md_to_typst` applies the same shift.
+fn shifted(level: HeadingLevel) -> HeadingLevel {
+    match level {
+        HeadingLevel::H1 => HeadingLevel::H3,
+        HeadingLevel::H2 => HeadingLevel::H4,
+        _ => HeadingLevel::H5,
+    }
+}
+
+/// Markdown → HTML with raw HTML shown as text, script-ish links removed,
+/// images replaced by their alt text (so the output never loads a resource),
+/// and headings shifted below the document's own.
 pub fn md_to_html(md: &str) -> String {
-    let events = parser(md).map(|e| match e {
-        Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
-        Event::Start(Tag::Link {
-            link_type,
-            dest_url,
-            title,
-            id,
-        }) if unsafe_url(&dest_url) => Event::Start(Tag::Link {
-            link_type,
-            dest_url: "#".into(),
-            title,
-            id,
-        }),
-        Event::Start(Tag::Image {
-            link_type,
-            dest_url,
-            title,
-            id,
-        }) if unsafe_url(&dest_url) => Event::Start(Tag::Image {
-            link_type,
-            dest_url: "#".into(),
-            title,
-            id,
-        }),
-        other => other,
-    });
+    let mut events: Vec<Event> = Vec::new();
+    let mut alt: Option<(usize, String)> = None; // (nesting depth, alt text) inside an image
+    for e in parser(md) {
+        if let Some((depth, text)) = alt.as_mut() {
+            match e {
+                Event::Start(_) => *depth += 1,
+                Event::End(_) if *depth > 0 => *depth -= 1,
+                Event::End(_) => {
+                    let (_, text) = alt.take().expect("inside image");
+                    events.push(Event::Text(text.into()));
+                }
+                // Raw HTML in alt text stays visible as text, like elsewhere.
+                Event::Text(t) | Event::Code(t) | Event::Html(t) | Event::InlineHtml(t) => {
+                    text.push_str(&t)
+                }
+                Event::SoftBreak | Event::HardBreak => text.push(' '),
+                _ => {}
+            }
+            continue;
+        }
+        events.push(match e {
+            Event::Start(Tag::Image { .. }) => {
+                alt = Some((0, String::new()));
+                continue;
+            }
+            Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
+            Event::Start(Tag::Heading {
+                level,
+                id,
+                classes,
+                attrs,
+            }) => Event::Start(Tag::Heading {
+                level: shifted(level),
+                id,
+                classes,
+                attrs,
+            }),
+            Event::End(TagEnd::Heading(level)) => Event::End(TagEnd::Heading(shifted(level))),
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) if unsafe_url(&dest_url) => Event::Start(Tag::Link {
+                link_type,
+                dest_url: "#".into(),
+                title,
+                id,
+            }),
+            other => other,
+        });
+    }
     let mut out = String::new();
-    pulldown_cmark::html::push_html(&mut out, events);
+    pulldown_cmark::html::push_html(&mut out, events.into_iter());
     out
 }
 
@@ -280,6 +319,69 @@ mod tests {
         );
         let t = md_to_typst(&just_ok);
         assert!(t.contains("#link("), "{t}");
+    }
+
+    #[test]
+    fn html_renders_images_as_alt_text_and_drops_the_url() {
+        for md in [
+            "![alt text](https://x/y.png)",
+            "![alt text](https://x/y.png \"title\")",
+            "![alt text][r]\n\n[r]: https://x/y.png",
+            "![alt text](data:image/png;base64,AAAA)",
+            "![alt text](javascript:alert(1))",
+            "![alt text](a/b.png)",
+        ] {
+            let h = md_to_html(md);
+            assert!(h.contains("alt text"), "{md} -> {h}");
+            assert!(!h.contains("<img"), "{md} -> {h}");
+            assert!(!h.contains("src="), "{md} -> {h}");
+            for url in [
+                "https://x/y.png",
+                "data:",
+                "javascript:",
+                "a/b.png",
+                "title",
+            ] {
+                assert!(!h.contains(url), "{md} -> {h}");
+            }
+        }
+    }
+
+    #[test]
+    fn html_image_alt_is_escaped_flattened_and_may_sit_inside_a_link() {
+        let h = md_to_html("![a *b* `<c>` <d>](https://x/y.png)");
+        assert!(
+            !h.contains("<img") && !h.contains("<em>") && !h.contains("<d>"),
+            "{h}"
+        );
+        assert!(h.contains("a b &lt;c&gt; &lt;d&gt;"), "{h}");
+        let h = md_to_html("[![logo](https://x/y.png)](https://example.com/home)");
+        assert!(
+            h.contains(r#"<a href="https://example.com/home">logo</a>"#),
+            "{h}"
+        );
+        // Text after an image is untouched.
+        let h = md_to_html("![one](https://x/1.png) then *two*");
+        assert!(h.contains("one then <em>two</em>"), "{h}");
+        // An image nested inside an image's alt text cannot leak either.
+        let h = md_to_html("![a ![b](https://x/inner.png) c](https://x/outer.png)");
+        assert!(!h.contains("<img") && !h.contains("x/"), "{h}");
+    }
+
+    #[test]
+    fn html_shifts_prose_headings_below_the_document_headings() {
+        let h = md_to_html(
+            "# one\n\n## two\n\n### three\n\n#### four\n\n###### six\n\nSetext\n======\n",
+        );
+        assert!(h.contains("<h3>one</h3>"), "{h}");
+        assert!(h.contains("<h4>two</h4>"), "{h}");
+        assert!(h.contains("<h5>three</h5>"), "{h}");
+        assert!(h.contains("<h5>four</h5>"), "{h}");
+        assert!(h.contains("<h5>six</h5>"), "{h}");
+        assert!(h.contains("<h3>Setext</h3>"), "{h}");
+        for shallow in ["<h1", "<h2", "</h1", "</h2"] {
+            assert!(!h.contains(shallow), "{shallow} in {h}");
+        }
     }
 
     #[test]

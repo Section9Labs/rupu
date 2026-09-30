@@ -3,8 +3,10 @@
 //! `Filename`, `Title`, `Fields`, `Heading`, `Note` and table cells are plain
 //! text and are escaped, never parsed as Markdown. Only `Prose` and `Steps`
 //! go through the Markdown → HTML converter, which neutralises raw HTML and
-//! script-ish URLs. A Content-Security-Policy `<meta>` is defence in depth
-//! against an escaping bug: it forbids scripts and network loads outright.
+//! script-ish URLs and turns images into alt text, so the markup itself loads
+//! nothing. A Content-Security-Policy `<meta>` (first in `<head>`, ahead of
+//! the title and styles) is defence in depth against an escaping bug: it
+//! forbids scripts, network loads, `<base>` and form posts outright.
 
 use crate::blocks::Block;
 use crate::prose::md_to_html;
@@ -97,7 +99,8 @@ pub fn render(title: &str, blocks: &[Block]) -> String {
     }
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">\
+<meta name=\"referrer\" content=\"no-referrer\">\
 <title>{}</title><style>{CSS}</style></head><body>\n{body}</body></html>\n",
         esc(title)
     )
