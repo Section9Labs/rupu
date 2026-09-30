@@ -41,8 +41,13 @@ pub struct LedgerRow {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache reads — a subset of `input_tokens`.
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    /// Absent on rows written before it existed (reads as `0`).
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 /// Where in the workflow an agent run sits. `step_id: None` = a dispatched
@@ -167,6 +172,7 @@ impl UsageLedger {
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
                 cached_tokens: u.cached_tokens,
+                cache_write_tokens: u.cache_write_tokens,
             });
         })
     }
@@ -184,6 +190,7 @@ mod tests {
             input_tokens: input,
             output_tokens: 3,
             cached_tokens: 1,
+            cache_write_tokens: 0,
         }
     }
 
@@ -221,6 +228,35 @@ mod tests {
         assert_eq!(rows[0].kind, LedgerKind::Turn);
         assert_eq!(counters.input.load(Ordering::Relaxed), 150);
         assert_eq!(counters.output.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn hook_copies_cache_write_tokens_into_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = UsageLedger::open(dir.path().join("usage.jsonl"));
+        let hook = led.hook(
+            LedgerTag::default(),
+            "run_W".into(),
+            None,
+            dir.path().join("run_W.jsonl"),
+            "writer".into(),
+            None,
+        );
+        hook(&rupu_agent::UsageTurn {
+            cache_write_tokens: 30,
+            ..turn(100)
+        });
+        let body = std::fs::read_to_string(led.path()).unwrap();
+        let row: LedgerRow = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row.cache_write_tokens, 30);
+        assert_eq!(row.cached_tokens, 1);
+    }
+
+    #[test]
+    fn old_ledger_row_without_cache_write_tokens_reads_as_zero() {
+        let old = r#"{"v":1,"id":"01X","at":"2026-09-29T00:00:00Z","kind":"turn","agent_run_id":"r","transcript":"/t/r.jsonl","agent":"a","provider":"p","model":"m","input_tokens":1,"output_tokens":2,"cached_tokens":0}"#;
+        let row: LedgerRow = serde_json::from_str(old).unwrap();
+        assert_eq!(row.cache_write_tokens, 0);
     }
 
     #[test]
@@ -290,6 +326,7 @@ mod tests {
             input_tokens: 1,
             output_tokens: 2,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["kind"], "compaction");

@@ -90,6 +90,7 @@ fn collapse_to_single_host_row(mut body: RemoteUsageBody) -> RemoteUsageBody {
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
         cached_tokens: s.cached_tokens,
+        cache_write_tokens: s.cache_write_tokens,
         total_tokens: s.total_tokens,
         cost_usd: s.cost_usd,
         priced: s.priced,
@@ -179,6 +180,8 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
         input_tokens: u64_at(summary_val, "total_input_tokens"),
         output_tokens: u64_at(summary_val, "total_output_tokens"),
         cached_tokens: u64_at(summary_val, "total_cached_tokens"),
+        // The CLI report carries no cache-write counts (here or per row).
+        cache_write_tokens: 0,
         total_tokens: u64_at(summary_val, "total_tokens"),
         cost_usd: summary_val.get("total_cost_usd").and_then(|x| x.as_f64()),
         priced: !partial_at(summary_val),
@@ -231,6 +234,7 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
             input_tokens,
             output_tokens,
             cached_tokens: u64_at(r, "cached_tokens"),
+            cache_write_tokens: 0,
             // The CLI report has no per-row total; cached tokens are not
             // added in, matching `crate::usage::breakdown`'s own arithmetic.
             total_tokens: input_tokens + output_tokens,
@@ -1659,6 +1663,7 @@ mod tests {
             input_tokens,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         };
         let mut buf = Vec::new();

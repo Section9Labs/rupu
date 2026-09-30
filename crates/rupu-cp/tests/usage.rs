@@ -84,6 +84,7 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
         input_tokens: 1000,
         output_tokens: 200,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         purpose: None,
     };
     let mut buf = Vec::new();
@@ -264,6 +265,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 input_tokens: 1000,
                 output_tokens: 200,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 purpose: None,
             })
             .unwrap(),
@@ -543,6 +545,7 @@ fn write_run_transcript_for(
         input_tokens,
         output_tokens,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         purpose: None,
     };
     let mut buf = Vec::new();
@@ -1048,6 +1051,7 @@ fn write_fold_transcript(
             input_tokens: *input,
             output_tokens: *output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         });
     }
@@ -1229,6 +1233,7 @@ async fn usage_endpoint_counts_inflight_step_from_ledger() {
         input_tokens: input,
         output_tokens: output,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     let mut ledger = Vec::new();
     for r in [row("u1", 1000, 100), row("u2", 2000, 200)] {
@@ -1707,6 +1712,7 @@ fn ledger_line(id: &str, step: &str, input: u64, output: u64) -> Vec<u8> {
         input_tokens: input,
         output_tokens: output,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     let mut line = serde_json::to_vec(&row).unwrap();
     line.push(b'\n');

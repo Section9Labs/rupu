@@ -6699,6 +6699,7 @@ fn compaction_usage_event(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens.saturating_add(usage.reasoning_tokens),
         cached_tokens: usage.cached_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         purpose: Some(COMPACTION_PURPOSE.to_string()),
     }
 }
@@ -8361,6 +8362,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 20,
                         cached_tokens: 0,
+                        cache_write_tokens: 0,
                         purpose: None,
                     })
                     .unwrap(),
@@ -9343,6 +9345,7 @@ mod tests {
             input_tokens: 12,
             output_tokens: 5,
             cached_tokens: 2,
+            cache_write_tokens: 0,
             purpose: None,
         });
 
@@ -9761,6 +9764,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 4,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         });
         state.push_transcript_event(&TranscriptEvent::AssistantMessage {
@@ -10269,6 +10273,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: purpose.map(str::to_string),
         }
     }
@@ -10380,6 +10385,32 @@ mod tests {
             ],
         );
         assert_eq!(last_turn_input_tokens(&path), Some(1_200));
+    }
+
+    /// A session-compaction summariser call records the prompt-cache writes
+    /// it was billed for, like the agent runner's in-run compaction.
+    #[test]
+    fn compaction_usage_event_carries_cache_write_tokens() {
+        let usage = rupu_providers::types::Usage {
+            input_tokens: 900,
+            output_tokens: 10,
+            cached_tokens: 200,
+            cache_write_tokens: 40,
+            reasoning_tokens: 2,
+        };
+        match compaction_usage_event("anthropic", "claude-x", &usage) {
+            TranscriptEvent::Usage {
+                cached_tokens,
+                cache_write_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(cached_tokens, 200);
+                assert_eq!(cache_write_tokens, 40);
+                assert_eq!(output_tokens, 12);
+            }
+            other => panic!("expected a usage event, got {other:?}"),
+        }
     }
 
     /// Ruling (Task 3 review): the TUI context gauge tracks the last TURN's

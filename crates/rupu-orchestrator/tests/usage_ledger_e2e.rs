@@ -224,6 +224,7 @@ fn write_mirrored_transcript(path: &Path, run_id: &str) {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         })
         .unwrap();

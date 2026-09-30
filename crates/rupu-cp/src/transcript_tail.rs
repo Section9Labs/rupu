@@ -204,6 +204,7 @@ mod tests {
             input_tokens: 1,
             output_tokens: 1,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         })
         .unwrap()

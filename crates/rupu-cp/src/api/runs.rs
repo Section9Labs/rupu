@@ -2448,6 +2448,7 @@ mod tests {
             input_tokens: 120,
             output_tokens: 30,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         };
         let mut line = serde_json::to_vec(&row).unwrap();
         line.push(b'\n');
@@ -3233,6 +3234,18 @@ mod tests {
 
     /// One serialized ledger row (`input`/`output` tokens) for `run_id`.
     fn write_ledger_row(store: &RunStore, run_id: &str, input: u64, output: u64) {
+        write_ledger_row_with_cache_write(store, run_id, input, output, 0);
+    }
+
+    /// [`write_ledger_row`] with `cache_write` prompt tokens written to the
+    /// provider's cache.
+    fn write_ledger_row_with_cache_write(
+        store: &RunStore,
+        run_id: &str,
+        input: u64,
+        output: u64,
+        cache_write: u64,
+    ) {
         use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
         let row = LedgerRow {
             v: LEDGER_VERSION,
@@ -3251,6 +3264,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: cache_write,
         };
         let mut line = serde_json::to_vec(&row).unwrap();
         line.push(b'\n');
@@ -3283,6 +3297,42 @@ mod tests {
         assert_eq!(v["steps"]["build"]["input_tokens"], serde_json::json!(100));
         assert!(v["epoch"].is_string(), "{v}");
         assert_eq!(v["points"].as_array().map(Vec::len), Some(1), "{v}");
+    }
+
+    /// The live endpoint reports cache writes in the run summary, each step
+    /// summary, and every series point.
+    #[tokio::test]
+    async fn run_usage_reports_cache_write_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_01CACHEWRITE"), "name: x\n")
+            .unwrap();
+        write_ledger_row_with_cache_write(&s.run_store, "run_01CACHEWRITE", 1000, 20, 30);
+
+        let v = get_run_usage(
+            State(s),
+            Path("run_01CACHEWRITE".into()),
+            Query(RunUsageQuery::default()),
+        )
+        .await
+        .expect("a local run's usage")
+        .0;
+        assert_eq!(
+            v["summary"]["cache_write_tokens"],
+            serde_json::json!(30),
+            "{v}"
+        );
+        assert_eq!(
+            v["steps"]["build"]["cache_write_tokens"],
+            serde_json::json!(30),
+            "{v}"
+        );
+        assert_eq!(
+            v["points"][0]["tokens_cache_write"],
+            serde_json::json!(30),
+            "{v}"
+        );
     }
 
     /// Same mirror rule for the usage-timeline (now built off the executor).

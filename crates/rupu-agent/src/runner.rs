@@ -120,7 +120,10 @@ pub struct UsageTurn {
     pub input_tokens: u64,
     /// Billable output (output + reasoning) — identical to the transcript.
     pub output_tokens: u64,
+    /// Cache reads — a subset of `input_tokens`.
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    pub cache_write_tokens: u64,
 }
 
 pub type OnUsageCallback = std::sync::Arc<dyn Fn(&UsageTurn) + Send + Sync>;
@@ -512,6 +515,7 @@ async fn compact_context(
                 input_tokens: cu.input_tokens,
                 output_tokens: billable as u32,
                 cached_tokens: cu.cached_tokens,
+                cache_write_tokens: cu.cache_write_tokens,
                 purpose: Some("compaction".to_string()),
             }) {
                 tracing::warn!(error = %e, "failed to write compaction usage event to transcript");
@@ -524,6 +528,7 @@ async fn compact_context(
                     input_tokens: cu.input_tokens as u64,
                     output_tokens: billable,
                     cached_tokens: cu.cached_tokens as u64,
+                    cache_write_tokens: cu.cache_write_tokens as u64,
                 });
             }
             *messages = outcome.messages;
@@ -1379,6 +1384,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     input_tokens: resp.usage.input_tokens as u64,
                     output_tokens: billable_output_tokens,
                     cached_tokens: resp.usage.cached_tokens as u64,
+                    cache_write_tokens: resp.usage.cache_write_tokens as u64,
                 });
             }
             writer.write(&Event::Usage {
@@ -1395,6 +1401,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: billable_output_tokens as u32,
                 cached_tokens: resp.usage.cached_tokens,
+                cache_write_tokens: resp.usage.cache_write_tokens,
                 purpose: None,
             })?;
             total_cached += resp.usage.cached_tokens as u64;

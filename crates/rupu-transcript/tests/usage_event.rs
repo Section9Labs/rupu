@@ -9,6 +9,7 @@ fn usage_event_serde_roundtrip() {
         input_tokens: 1234,
         output_tokens: 567,
         cached_tokens: 890,
+        cache_write_tokens: 0,
         purpose: None,
     };
     let json = serde_json::to_string(&e).unwrap();
@@ -25,6 +26,7 @@ fn usage_event_serde_roundtrip() {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_write_tokens,
             purpose,
         } => {
             assert_eq!(provider, "anthropic");
@@ -33,6 +35,7 @@ fn usage_event_serde_roundtrip() {
             assert_eq!(input_tokens, 1234);
             assert_eq!(output_tokens, 567);
             assert_eq!(cached_tokens, 890);
+            assert_eq!(cache_write_tokens, 0);
             assert_eq!(purpose, None);
         }
         _ => panic!("expected Event::Usage"),
@@ -48,6 +51,7 @@ fn usage_event_with_served_model_roundtrips() {
         input_tokens: 10,
         output_tokens: 20,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         purpose: None,
     };
     let json = serde_json::to_string(&e).unwrap();
@@ -97,6 +101,7 @@ fn usage_purpose_round_trips_and_defaults_to_none() {
         input_tokens: 10,
         output_tokens: 2,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         purpose: Some("compaction".into()),
     };
     let json = serde_json::to_string(&with).unwrap();
@@ -112,4 +117,49 @@ fn usage_purpose_round_trips_and_defaults_to_none() {
         _ => panic!("expected usage"),
     }
     assert!(!serde_json::to_string(&ev).unwrap().contains("purpose"));
+}
+
+#[test]
+fn usage_cache_write_tokens_round_trips() {
+    let e = Event::Usage {
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        served_model: None,
+        input_tokens: 1000,
+        output_tokens: 40,
+        cached_tokens: 600,
+        cache_write_tokens: 30,
+        purpose: None,
+    };
+    let json = serde_json::to_string(&e).unwrap();
+    assert!(json.contains("\"cache_write_tokens\":30"), "{json}");
+    let back: Event = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, e);
+    match back {
+        Event::Usage {
+            cache_write_tokens, ..
+        } => assert_eq!(cache_write_tokens, 30),
+        _ => panic!("expected Event::Usage"),
+    }
+}
+
+#[test]
+fn old_usage_line_without_cache_write_tokens_defaults_to_zero_and_omits_it() {
+    // A transcript line written before `cache_write_tokens` existed.
+    let old = r#"{"type":"usage","data":{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":5,"output_tokens":7,"cached_tokens":1}}"#;
+    let ev: Event = serde_json::from_str(old).unwrap();
+    match &ev {
+        Event::Usage {
+            cache_write_tokens,
+            cached_tokens,
+            ..
+        } => {
+            assert_eq!(*cache_write_tokens, 0, "missing field defaults to 0");
+            assert_eq!(*cached_tokens, 1);
+        }
+        _ => panic!("expected Event::Usage"),
+    }
+    // Zero is never written, so non-caching providers' lines are unchanged.
+    let json = serde_json::to_string(&ev).unwrap();
+    assert!(!json.contains("cache_write_tokens"), "{json}");
 }

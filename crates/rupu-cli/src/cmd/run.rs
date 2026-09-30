@@ -1410,6 +1410,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: purpose.map(str::to_string),
         }
     }

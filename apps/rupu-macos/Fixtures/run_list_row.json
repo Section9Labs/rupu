@@ -9,6 +9,7 @@
     "trigger": "cron",
     "turns": 4,
     "usage": {
+      "cache_write_tokens": 0,
       "cached_tokens": 0,
       "cost_usd": 0.12,
       "input_tokens": 1000,
@@ -30,6 +31,7 @@
     "trigger": "manual",
     "turns": 0,
     "usage": {
+      "cache_write_tokens": 0,
       "cached_tokens": 0,
       "cost_usd": null,
       "input_tokens": 0,

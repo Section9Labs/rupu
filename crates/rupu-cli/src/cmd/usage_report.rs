@@ -687,6 +687,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 purpose: None,
             })
             .unwrap();
@@ -1046,6 +1047,7 @@ mod tests {
                 input_tokens: input,
                 output_tokens: output,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
             });
         }
 

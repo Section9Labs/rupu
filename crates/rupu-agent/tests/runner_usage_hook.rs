@@ -267,3 +267,69 @@ fn final_text_turn_summary(u: Usage) -> ScriptedTurn {
         usage: u,
     }
 }
+
+/// `cache_write_tokens` of every transcript `Usage` event, in order.
+fn transcript_cache_writes(path: &Path) -> Vec<u32> {
+    JsonlReader::iter(path)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| match e {
+            Event::Usage {
+                cache_write_tokens, ..
+            } => Some(cache_write_tokens),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn cache_write_tokens_reach_the_hook_and_transcript_for_turns_and_compaction() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let target = tmp.path().join("notes.txt");
+    std::fs::write(&target, "invented file contents").unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+
+    let with_write = |input: u32, write: u32| Usage {
+        cache_write_tokens: write,
+        ..usage(input, 5, 0)
+    };
+    // Turn 1 (900 > the 500-token threshold), the compaction summariser's
+    // call, then turn 2 — each writing a different number of cache tokens.
+    let provider = MockProvider::new(vec![
+        read_file_turn(&target, with_write(900, 30)),
+        final_text_turn_summary(with_write(111, 11)),
+        final_text_turn(with_write(60, 0)),
+    ]);
+
+    let seen: Arc<Mutex<Vec<UsageTurn>>> = Default::default();
+    let seen2 = seen.clone();
+    let mut opts = build_opts(provider, &tmp, transcript.clone());
+    opts.initial_messages = vec![
+        dense_msg(Role::User, "task"),
+        dense_msg(Role::Assistant, "assistant 0"),
+        dense_msg(Role::User, "user 0"),
+        dense_msg(Role::Assistant, "assistant 1"),
+    ];
+    opts.context_window_tokens = Some(1000);
+    opts.compact_at_percent = Some(50);
+    opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+        seen2.lock().unwrap().push(u.clone());
+    }));
+    run_agent(opts).await.unwrap();
+
+    let got: Vec<(UsageKind, u64)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|u| (u.kind, u.cache_write_tokens))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (UsageKind::Turn, 30),
+            (UsageKind::Compaction, 11),
+            (UsageKind::Turn, 0),
+        ]
+    );
+    assert_eq!(transcript_cache_writes(&transcript), vec![30, 11, 0]);
+}
