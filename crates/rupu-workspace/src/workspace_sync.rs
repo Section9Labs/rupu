@@ -139,18 +139,32 @@ fn stage_tar(payload: &Payload, scratch_dir: &Path) -> Result<Baseline, SyncErro
     })
 }
 
+/// Coverage ledgers travel through the run's coverage stream (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A4), not the
+/// workspace delta: carried here they would land under a target id derived
+/// from the scratch path. Filtered at COLLECTION only — collection runs on
+/// the host, so an older host's delta still carries (and still applies) them.
+const DELTA_EXCLUDED_PREFIX: &str = ".rupu/coverage/";
+
+pub(crate) fn excluded_from_delta(rel: &str) -> bool {
+    rel.starts_with(DELTA_EXCLUDED_PREFIX)
+}
+
 fn collect_delta_tar(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, SyncError> {
     let after = hash_tree(scratch_dir)?;
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
     for (path, hash) in &after {
+        if excluded_from_delta(path) {
+            continue;
+        }
         match baseline.tar_manifest.get(path) {
             Some(old) if old == hash => {}
             _ => changed.push(path.clone()),
         }
     }
     for path in baseline.tar_manifest.keys() {
-        if !after.contains_key(path) {
+        if !excluded_from_delta(path) && !after.contains_key(path) {
             deleted.push(path.clone());
         }
     }
@@ -391,6 +405,9 @@ fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
             .or_else(|| d.old_file().path())
             .map(|p| p.to_string_lossy().replace('\\', "/"));
         if let Some(p) = path {
+            if excluded_from_delta(&p) {
+                continue;
+            }
             if d.status() == git2::Delta::Deleted {
                 deleted.push(p);
             } else {
@@ -402,7 +419,15 @@ fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
     // `line.content()` omits the leading marker, so prepend `line.origin()`;
     // file/hunk-header lines already carry their full text.
     let mut patch: Vec<u8> = Vec::new();
-    diff.print(git2::DiffFormat::Patch, |_d, _h, line| {
+    diff.print(git2::DiffFormat::Patch, |d, _h, line| {
+        let excluded = d
+            .new_file()
+            .path()
+            .or_else(|| d.old_file().path())
+            .is_some_and(|p| excluded_from_delta(&p.to_string_lossy().replace('\\', "/")));
+        if excluded {
+            return true;
+        }
         if matches!(line.origin(), '+' | '-' | ' ') {
             patch.push(line.origin() as u8);
         }
@@ -674,6 +699,22 @@ mod tests {
         let err = apply_deltas_tar(ws.path(), &[evil]).unwrap_err();
         assert!(matches!(err, SyncError::InvalidPath(_)), "got {err:?}");
     }
+
+    #[test]
+    fn tar_delta_excludes_rupu_coverage() {
+        let ws = tempfile::tempdir().unwrap();
+        write(ws.path(), "a.txt", "a");
+        let payload = pack_tar(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage_tar(&payload, scratch.path()).unwrap();
+        write(scratch.path(), "b.txt", "b");
+        write(scratch.path(), ".rupu/coverage/t1/findings.jsonl", "{}\n");
+        let delta = collect_delta_tar(scratch.path(), &baseline).unwrap();
+        assert_eq!(delta.changed, vec!["b.txt".to_string()]);
+        apply_deltas_tar(ws.path(), &[delta]).unwrap();
+        assert!(ws.path().join("b.txt").exists());
+        assert!(!ws.path().join(".rupu/coverage").exists());
+    }
 }
 
 #[cfg(test)]
@@ -817,5 +858,31 @@ mod git_sync_tests {
 
         let err = apply_deltas(ws.path(), &[da, db]).unwrap_err();
         assert!(matches!(err, SyncError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn git_delta_excludes_rupu_coverage_from_paths_and_patch() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        let payload = pack(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage(&payload, scratch.path()).unwrap();
+        let write = |dir: &std::path::Path, rel: &str, body: &str| {
+            let p = dir.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, body).unwrap();
+        };
+        write(scratch.path(), "b.txt", "b\n");
+        write(scratch.path(), ".rupu/coverage/t1/findings.jsonl", "{\"x\":1}\n");
+        let delta = collect_delta(scratch.path(), &baseline).unwrap();
+        assert!(delta.changed.contains(&"b.txt".to_string()));
+        assert!(!delta.changed.iter().any(|p| p.starts_with(".rupu/coverage/")));
+        let patch = String::from_utf8_lossy(&delta.bytes);
+        assert!(!patch.contains(".rupu/coverage"), "{patch}");
+        apply_deltas(ws.path(), &[delta]).unwrap();
+        assert_eq!(fs::read_to_string(ws.path().join("b.txt")).unwrap(), "b\n");
+        assert!(!ws.path().join(".rupu/coverage").exists());
     }
 }
