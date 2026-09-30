@@ -264,6 +264,8 @@ fn run_list_row_fixture_is_current() {
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
 
     let mut row1 = serde_json::to_value(RunListRow {
+        codename: "cobalt-harbor".into(),
+        codename_derived: false,
         id: "run-01".into(),
         workflow_name: "nightly-health".into(),
         status: RunStatus::Running,
@@ -286,6 +288,8 @@ fn run_list_row_fixture_is_current() {
     row1["host_id"] = serde_json::json!("local");
 
     let mut row2 = serde_json::to_value(RunListRow {
+        codename: "cobalt-harbor".into(),
+        codename_derived: false,
         id: "run-02".into(),
         workflow_name: "nightly-health".into(),
         status: RunStatus::AwaitingApproval,
@@ -1313,6 +1317,8 @@ fn project_detail_fixture_is_current() {
 
     let recent_runs = vec![
         RunListRow {
+            codename: "cobalt-harbor".into(),
+            codename_derived: false,
             id: "run-01".into(),
             workflow_name: "nightly-health".into(),
             status: RunStatus::Completed,
@@ -1332,6 +1338,8 @@ fn project_detail_fixture_is_current() {
             duration_ms: Some(360_000),
         },
         RunListRow {
+            codename: "cobalt-harbor".into(),
+            codename_derived: false,
             id: "run-02".into(),
             workflow_name: "issue-triage".into(),
             status: RunStatus::Running,
@@ -1385,6 +1393,8 @@ fn project_runs_fixture_is_current() {
     // local-only).
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
     let rows = vec![RunListRow {
+        codename: "cobalt-harbor".into(),
+        codename_derived: false,
         id: "run-01".into(),
         workflow_name: "nightly-health".into(),
         status: RunStatus::Completed,
@@ -1505,6 +1515,8 @@ fn findings_global_fixture_is_current() {
 
     let findings = vec![
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-1".into(),
             project: "rupu".into(),
             target_id: "auth-core".into(),
@@ -1537,6 +1549,8 @@ fn findings_global_fixture_is_current() {
             },
         },
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-1".into(),
             project: "rupu".into(),
             target_id: "web-api".into(),
@@ -1561,6 +1575,8 @@ fn findings_global_fixture_is_current() {
             },
         },
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-2".into(),
             project: "phi-cell".into(),
             target_id: "ml-pipeline".into(),
@@ -1590,6 +1606,8 @@ fn findings_global_fixture_is_current() {
             },
         },
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-2".into(),
             project: "phi-cell".into(),
             target_id: "ml-pipeline".into(),

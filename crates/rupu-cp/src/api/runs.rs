@@ -440,6 +440,7 @@ async fn fan_out_list_runs(
                         .into_iter()
                         .map(|mut v| {
                             v["host_id"] = serde_json::json!(&host_id);
+                            crate::codename::inject_codename_row(&mut v, "id", None);
                             v
                         })
                         .collect(),
@@ -486,11 +487,18 @@ pub struct RunListRow {
     pub usage: crate::usage::UsageSummary,
     pub turns: u64,
     pub duration_ms: Option<u64>,
+    /// Crew codename — stored, or derived for a legacy run (`codename_derived`).
+    pub codename: String,
+    pub codename_derived: bool,
 }
 
 impl From<&RunRecord> for RunListRow {
     fn from(r: &RunRecord) -> Self {
+        let (codename, codename_derived) =
+            crate::codename::named(r.codename.as_deref(), &r.id, None);
         Self {
+            codename,
+            codename_derived,
             id: r.id.clone(),
             workflow_name: r.workflow_name.clone(),
             status: r.status,
@@ -615,7 +623,9 @@ pub fn query_run_detail(
     let record = store.load(id)?;
     let steps = store.read_step_results(id).unwrap_or_default();
     let usage = crate::usage::summarize_run(store, id, pricing);
-    Ok(serde_json::json!({ "run": record, "steps": steps, "usage": usage }))
+    let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
+    crate::codename::inject_codename(&mut out["run"], &record.id, None);
+    Ok(out)
 }
 
 /// Query params for `GET /api/runs`: offset/limit paging plus an optional
@@ -665,6 +675,7 @@ async fn list_runs(
             .into_iter()
             .map(|mut v| {
                 v["host_id"] = serde_json::json!(host_id);
+                crate::codename::inject_codename_row(&mut v, "id", None);
                 v
             })
             .collect();
@@ -794,6 +805,7 @@ async fn list_workflow_runs(
             .into_iter()
             .map(|mut v| {
                 v["host_id"] = serde_json::json!(host_id);
+                crate::codename::inject_codename_row(&mut v, "id", None);
                 v
             })
             .collect();
@@ -926,7 +938,7 @@ pub(crate) fn synthesize_unpersisted_run(
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
-        codename: None,
+        codename: Some(rupu_codename::crew_for(id)),
     };
     let mut v = serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({ "id": id }));
     v["cycle_id"] = serde_json::json!(cycle_id);
@@ -2386,12 +2398,43 @@ mod tests {
             usage: crate::usage::UsageSummary::default(),
             turns: 0,
             duration_ms: None,
+            codename: "cobalt-harbor".into(),
+            codename_derived: false,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert!(v.get("usage").is_some());
         assert_eq!(v["usage"]["priced"], serde_json::Value::Bool(false));
         assert!(v.get("turns").is_some());
         assert!(v.get("duration_ms").is_some());
+    }
+
+    #[test]
+    fn run_list_row_and_detail_codename_stored_else_derived() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        // Legacy run: no stored codename -> derived + flagged.
+        let mut legacy = terminal_record("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W");
+        legacy.codename = None;
+        let row = RunListRow::from(&legacy);
+        assert_eq!(row.codename, "jade-reef");
+        assert!(row.codename_derived);
+        s.run_store.create(legacy, "name: x\n").unwrap();
+        let d =
+            query_run_detail(&s.run_store, "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", &s.pricing).unwrap();
+        assert_eq!(d["run"]["codename"], "jade-reef");
+        assert_eq!(d["run"]["codename_derived"], true);
+
+        // Stored codename wins.
+        let mut named = terminal_record("run_01NAMED");
+        named.codename = Some("cobalt-harbor".into());
+        let row = RunListRow::from(&named);
+        assert_eq!(row.codename, "cobalt-harbor");
+        assert!(!row.codename_derived);
+        s.run_store.create(named, "name: x\n").unwrap();
+        let d = query_run_detail(&s.run_store, "run_01NAMED", &s.pricing).unwrap();
+        assert_eq!(d["run"]["codename"], "cobalt-harbor");
+        assert_eq!(d["run"]["codename_derived"], false);
     }
 
     #[test]

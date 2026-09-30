@@ -3628,6 +3628,7 @@ dependencies = [
  "reqwest-middleware",
  "rupu-agent",
  "rupu-ast",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",

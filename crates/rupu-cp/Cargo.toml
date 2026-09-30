@@ -47,6 +47,7 @@ rupu-transcript = { path = "../rupu-transcript" }
 rupu-ast = { path = "../rupu-ast" }
 rupu-scm = { path = "../rupu-scm" }
 rupu-mcp = { path = "../rupu-mcp" }
+rupu-codename = { workspace = true }
 
 [dev-dependencies]
 chrono.workspace = true

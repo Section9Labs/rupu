@@ -38,6 +38,10 @@ pub struct FindingOut {
     /// no `file_path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,
+    /// Declaring agent instance's codename (`declared_by.codename`), or the
+    /// crew derived from `declared_by.run_id` for a legacy finding.
+    pub codename: String,
+    pub codename_derived: bool,
     #[serde(flatten)]
     pub record: FindingRecord,
 }
@@ -214,7 +218,14 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
                     ),
                     _ => None,
                 };
+                let (codename, codename_derived) = crate::codename::named(
+                    record.declared_by.codename.as_deref(),
+                    &record.declared_by.run_id,
+                    None,
+                );
                 out.push(FindingOut {
+                    codename,
+                    codename_derived,
                     ws_id: w.id.clone(),
                     project: project.clone(),
                     target_id: t.target_id.clone(),
@@ -386,6 +397,8 @@ mod tests {
         declared_at: &str,
     ) -> FindingOut {
         FindingOut {
+            codename: "jade-reef".to_string(),
+            codename_derived: true,
             ws_id: ws_id.to_string(),
             project: "proj".to_string(),
             target_id: "tgt".to_string(),
@@ -450,6 +463,8 @@ mod tests {
     fn findings_run_fixture_is_current() {
         let response = build_response(vec![
             FindingOut {
+                codename: "cobalt-harbor/heron#3".into(),
+                codename_derived: false,
                 ws_id: "ws1".into(),
                 project: "rupu".into(),
                 target_id: "tgt1".into(),
@@ -474,6 +489,8 @@ mod tests {
                 },
             },
             FindingOut {
+                codename: "jade-reef".into(),
+                codename_derived: true,
                 ws_id: "ws1".into(),
                 project: "rupu".into(),
                 target_id: "tgt1".into(),
@@ -865,6 +882,7 @@ mod tests {
         without_loc.id = "fnd_no_loc".to_string();
         without_loc.file_path = None;
         without_loc.line_range = None;
+        without_loc.declared_by.codename = Some("cobalt-harbor/heron#3".to_string());
 
         let jsonl = format!(
             "{}\n{}\n",
@@ -881,6 +899,18 @@ mod tests {
             Some("https://github.com/o/r/blob/main/src/a.rs#L17-L19")
         );
         assert_eq!(by_id("fnd_no_loc").permalink, None);
+
+        // Legacy finding (no stored codename) -> crew derived from run_id.
+        let legacy = by_id("fnd_with_loc");
+        assert_eq!(
+            legacy.codename,
+            rupu_codename::derive_legacy("run_01KS19A4MQXP", None)
+        );
+        assert!(legacy.codename_derived);
+        // Stored `declared_by.codename` wins.
+        let stored = by_id("fnd_no_loc");
+        assert_eq!(stored.codename, "cobalt-harbor/heron#3");
+        assert!(!stored.codename_derived);
     }
 
     #[test]

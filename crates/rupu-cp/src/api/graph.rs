@@ -225,6 +225,7 @@ fn merge_event_units(
                 index,
                 unit_key,
                 transcript_path,
+                codename,
                 ..
             } => {
                 let key = (step_id.clone(), index);
@@ -233,13 +234,17 @@ fn merge_event_units(
                 }
                 seen.insert(key.clone());
                 synthesized.insert(key, events_only.len());
-                events_only.push(serde_json::json!({
+                let mut unit = serde_json::json!({
                     "step_id": step_id,
                     "index": index,
                     "item": unit_key,
                     "transcript_path": transcript_path.to_string_lossy(),
                     "success": serde_json::Value::Null,
-                }));
+                });
+                if let Some(c) = codename {
+                    unit["codename"] = serde_json::Value::String(c);
+                }
+                events_only.push(unit);
             }
             Event::UnitCompleted {
                 step_id,
@@ -594,6 +599,34 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_only_unit_carries_unit_started_codename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(store.events_path("run_x").parent().unwrap()).unwrap();
+        let ev = |codename: Option<&str>, index: usize| {
+            serde_json::to_string(&Event::UnitStarted {
+                run_id: "run_x".into(),
+                step_id: "s".into(),
+                index,
+                unit_key: "a.rs".into(),
+                agent: Some("heron".into()),
+                transcript_path: "/t/u.jsonl".into(),
+                host: None,
+                codename: codename.map(str::to_string),
+            })
+            .unwrap()
+        };
+        std::fs::write(
+            store.events_path("run_x"),
+            format!("{}\n{}\n", ev(Some("jade-reef/hedgehog#1"), 0), ev(None, 1)),
+        )
+        .unwrap();
+        let units = merge_event_units("run_x", &store, Vec::new());
+        assert_eq!(units[0]["codename"], "jade-reef/hedgehog#1");
+        assert!(units[1].get("codename").is_none());
+    }
 
     /// Build a `RunRecord` from JSON — optional fields fill via serde defaults,
     /// mirroring the on-disk `run.json` shape.
