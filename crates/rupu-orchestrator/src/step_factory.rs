@@ -1427,12 +1427,13 @@ steps:
             Some(Summary) => Some("summary"),
         };
         // (step, workflow defaults, agent frontmatter) → resolved.
-        let table: &[(
+        type Row = (
             Option<FindingProfile>,
             Option<FindingProfile>,
             Option<FindingProfile>,
             FindingProfile,
-        )] = &[
+        );
+        let table: &[Row] = &[
             // The step wins over everything.
             (Some(Summary), Some(Full), Some(Full), Summary),
             (Some(Full), Some(Summary), Some(Summary), Full),
