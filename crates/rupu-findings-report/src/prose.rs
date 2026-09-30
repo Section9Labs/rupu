@@ -7,15 +7,36 @@ fn parser(md: &str) -> Parser<'_> {
     Parser::new_ext(md, Options::ENABLE_STRIKETHROUGH)
 }
 
-fn unsafe_url(url: &str) -> bool {
-    // Browsers ignore embedded tabs/newlines in a URL's scheme, so strip all
-    // whitespace and control characters before matching.
-    let u: String = url
-        .chars()
+/// A URL as a browser's scheme parser sees it: whitespace and control
+/// characters removed (browsers ignore embedded tabs/newlines in a scheme).
+fn strip_url(url: &str) -> String {
+    url.chars()
         .filter(|c| !c.is_whitespace() && !c.is_control())
-        .collect::<String>()
-        .to_ascii_lowercase();
+        .collect()
+}
+
+/// HTML denylist: script-ish schemes are neutralised, relative links are fine.
+fn unsafe_url(url: &str) -> bool {
+    let u = strip_url(url).to_ascii_lowercase();
     u.starts_with("javascript:") || u.starts_with("data:") || u.starts_with("vbscript:")
+}
+
+/// Longest link destination Typst output will carry.
+const MAX_TYPST_URL: usize = 2048;
+
+/// Typst allowlist: only `http(s)://` and `mailto:` become links. Returns the
+/// stripped destination to emit, so what is checked is what is written.
+/// Relative, empty, over-long and every other scheme are neutralised.
+fn typst_link_dest(url: &str) -> Option<String> {
+    if url.chars().count() > MAX_TYPST_URL {
+        return None;
+    }
+    let u = strip_url(url);
+    let lower = u.to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+        .then_some(u)
 }
 
 /// Markdown → HTML with raw HTML shown as text and script-ish links removed.
@@ -138,13 +159,12 @@ pub fn md_to_typst(md: &str) -> String {
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => out.push(']'),
             Event::Start(Tag::BlockQuote(_)) => out.push_str("#quote(block: true)["),
             Event::End(TagEnd::BlockQuote(_)) => out.push_str("]\n"),
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                if unsafe_url(&dest_url) {
-                    out.push('[');
-                } else {
-                    out.push_str(&format!("#link({})[", typst_str(&dest_url)));
-                }
-            }
+            Event::Start(Tag::Link { dest_url, .. }) => match typst_link_dest(&dest_url) {
+                Some(dest) => out.push_str(&format!("#link({})[", typst_str(&dest))),
+                // `#[` (not a bare `[`): after an expression such as `#"see "`
+                // a bare `[` would parse as a trailing content argument.
+                None => out.push_str("#["),
+            },
             Event::End(TagEnd::Link) => out.push(']'),
             Event::Text(t) | Event::Html(t) | Event::InlineHtml(t) => {
                 out.push('#');
@@ -201,6 +221,72 @@ mod tests {
         }
         let ok = md_to_html("[x](https://example.com/a?b=1)");
         assert!(ok.contains(r#"href="https://example.com/a?b=1""#), "{ok}");
+    }
+
+    #[test]
+    fn typst_neutralised_link_is_a_standalone_content_block() {
+        // A bare `[` right after an expression would parse as a trailing
+        // content argument to it (`#"see "[..]`), which does not compile.
+        let mid = md_to_typst("see [docs](javascript:x) now");
+        assert!(mid.contains("#\"see \"#[#\"docs\"]#\" now\""), "{mid}");
+        let after_emph = md_to_typst("*emphasis*[docs](javascript:x)");
+        assert!(
+            after_emph.contains("#emph[#\"emphasis\"]#[#\"docs\"]"),
+            "{after_emph}"
+        );
+        let after_code = md_to_typst("`x`[docs](javascript:x)");
+        assert!(
+            after_code.contains("#raw(\"x\")#[#\"docs\"]"),
+            "{after_code}"
+        );
+        for t in [&mid, &after_emph, &after_code] {
+            assert!(!t.contains("\"["), "{t}");
+            assert!(!t.contains("]["), "{t}");
+            assert!(!t.contains(")["), "{t}");
+        }
+    }
+
+    #[test]
+    fn typst_links_are_allowlisted() {
+        let ok = md_to_typst("[a](https://e.com/x) [b](HTTP://e.com) [c](mailto:a@b.co)");
+        assert!(ok.contains(r#"#link("https://e.com/x")["#), "{ok}");
+        assert!(ok.contains(r#"#link("HTTP://e.com")["#), "{ok}");
+        assert!(ok.contains(r#"#link("mailto:a@b.co")["#), "{ok}");
+        // Anything else keeps its text but loses the link, as `#[`.
+        for md in [
+            "[x]()",
+            "[x](a/b)",
+            "[x](#frag)",
+            "[x](ftp://e.com)",
+            "[x](file:///etc/passwd)",
+            "[x](javascript:alert(1))",
+            "[x](java&#9;script:alert(1))",
+        ] {
+            let t = md_to_typst(md);
+            assert!(!t.contains("#link("), "{md} -> {t}");
+            assert!(t.contains("#[#\"x\"]"), "{md} -> {t}");
+        }
+        // Whitespace/control characters are stripped before the scheme check
+        // and never reach the emitted destination.
+        let t = md_to_typst("[x](htt&#9;ps://e.com)");
+        assert!(t.contains(r#"#link("https://e.com")["#), "{t}");
+        // Over-long destinations are neutralised.
+        let long = format!("[x](https://e.com/{})", "a".repeat(2048));
+        let t = md_to_typst(&long);
+        assert!(!t.contains("#link("), "{t}");
+        let just_ok = format!(
+            "[x](https://e.com/{})",
+            "a".repeat(2048 - "https://e.com/".len())
+        );
+        let t = md_to_typst(&just_ok);
+        assert!(t.contains("#link("), "{t}");
+    }
+
+    #[test]
+    fn html_keeps_relative_links() {
+        let h = md_to_html("[x](a/b) [y](#frag)");
+        assert!(h.contains(r#"href="a/b""#), "{h}");
+        assert!(h.contains(r##"href="#frag""##), "{h}");
     }
 
     #[test]

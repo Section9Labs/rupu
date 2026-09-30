@@ -56,11 +56,25 @@ pub fn title(f: &ExportFinding) -> &str {
         .unwrap_or(&f.input.record.summary)
 }
 
+/// Bidirectional and other invisible formatting characters that can make a
+/// filename display as something it is not (e.g. right-to-left override).
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 pub fn filename(f: &ExportFinding, ext: &str) -> String {
     let cleaned: String = title(f)
         .chars()
+        // Whitespace (including newlines/tabs) becomes a space *before* control
+        // characters are stripped, so "a\nb" reads "a b", not "ab".
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| {
-            !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()
+            !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                && !c.is_control()
+                && !is_bidi_control(*c)
         })
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -144,6 +158,25 @@ mod tests {
             filename(&f, "pdf"),
             "SEC-001 - Path abc weird quoted title.pdf"
         );
+    }
+
+    #[test]
+    fn filename_turns_newlines_into_spaces() {
+        let mut r = rec("fnd_x", Severity::High, "2026-01-01T00:00:00Z");
+        r.summary = "line one\nline two\r\n\tline\u{a0}three".into();
+        let f = assign_numbers(vec![input("a", r)], "SEC").remove(0);
+        assert_eq!(
+            filename(&f, "md"),
+            "SEC-001 - line one line two line three.md"
+        );
+    }
+
+    #[test]
+    fn filename_strips_bidi_and_format_controls() {
+        let mut r = rec("fnd_x", Severity::High, "2026-01-01T00:00:00Z");
+        r.summary = "a\u{200e}b\u{200f}c\u{202a}d\u{202b}e\u{202c}f\u{202d}g\u{202e}h\u{2066}i\u{2067}j\u{2068}k\u{2069}l".into();
+        let f = assign_numbers(vec![input("a", r)], "SEC").remove(0);
+        assert_eq!(filename(&f, "md"), "SEC-001 - abcdefghijkl.md");
     }
 
     #[test]
