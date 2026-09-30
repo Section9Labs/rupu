@@ -1078,3 +1078,80 @@ fn the_exporters_labels_and_last_command_block_win() {
     );
     assert!(rt.body.contains("cargo build --tests"), "{}", rt.body);
 }
+
+// ---- fix round 2 -----------------------------------------------------------
+
+#[test]
+fn cross_reference_notes_are_bounded_on_a_line_of_many_ids() {
+    let ids: Vec<String> = (0..2000u32).map(|i| format!("fnd_{i:026}")).collect();
+    let md = MARKDOWN.replace(
+        "- NB-007 covers link revocation.",
+        &format!("- {}", ids.join(" ")),
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(x) = &r.cross_references else {
+        panic!()
+    };
+    assert_eq!(x.len(), 2001);
+    for c in &x[1..] {
+        let note = c.note.as_deref().unwrap();
+        assert!(
+            note.chars().count() <= 301,
+            "{} chars",
+            note.chars().count()
+        );
+        assert!(note.ends_with('…'));
+    }
+    // The whole line is still in the references.
+    assert!(r.references.contains(&ids.join(" ")));
+}
+
+#[test]
+fn a_deep_description_heading_in_prose_is_not_a_second_finding() {
+    let md = MARKDOWN.replace(
+        "stops sharing the note.\n",
+        "stops sharing the note.\n\n#### Description\n\nA nested sub-heading.\n",
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        r.description.contains("#### Description"),
+        "{}",
+        r.description
+    );
+}
+
+#[test]
+fn a_title_right_under_the_file_name_is_the_title() {
+    let (r, _) = report_of(&PLAIN.replacen(".pdf\n\n", ".pdf\n", 1));
+    assert_eq!(r.title, "Notes API returns another user's note by id");
+}
+
+#[test]
+fn a_plain_line_under_the_finding_id_is_kept() {
+    let md = PLAIN.replace(
+        &format!("Finding ID: {ID1}\n"),
+        &format!("Finding ID: {ID1}\nFound by the nightly scanner on staging\n"),
+    );
+    let (r, cited) = report_of(&md);
+    assert_eq!(cited, vec![ID1.to_string()]);
+    assert!(
+        other_text(&r).contains("Found by the nightly scanner on staging"),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn a_step_marker_alone_in_evidence_takes_the_next_line() {
+    let md = MARKDOWN.replace(
+        "- The token claims have no expiry",
+        "Step 1:\n- The token claims have no expiry",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.evidence.len(), 3);
+    assert_eq!(
+        r.evidence[0].claim,
+        "The token claims have no expiry (`src/share/token.rs:5-9`)."
+    );
+    assert_valid(&r, &[ID1]);
+}

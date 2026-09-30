@@ -420,8 +420,9 @@ struct Doc {
     /// `Filename: ….pdf` lines outside code: the layout starts every
     /// finding with one.
     filename_lines: usize,
-    /// Description headings at any level, not only the sections' level: a
-    /// second finding in another spelling still has one.
+    /// Description headings at levels 0–2 (bare, bold, `#`, `##`), not only
+    /// the sections' level: a second finding in another spelling still has
+    /// one.
     description_headings: usize,
 }
 
@@ -480,9 +481,11 @@ fn split(md: &str) -> Doc {
     }
 
     let mut doc = Doc {
+        // `###` and deeper is prose: the exporter shifts an author's own
+        // headings there.
         description_headings: candidates
             .iter()
-            .filter(|(_, s, _)| *s == Sec::Description)
+            .filter(|(_, s, l)| *s == Sec::Description && *l <= 2)
             .count(),
         ..Doc::default()
     };
@@ -863,16 +866,15 @@ impl Header {
     }
 }
 
-/// Whether `line` can continue the field above it: an indented line, or a
-/// plain line that is not a label, a heading or a list item (a lazy
-/// continuation of the same paragraph).
-fn continues_field(line: &str) -> bool {
-    let t = line.trim_start();
-    line.starts_with(char::is_whitespace)
-        || (labelled(line).is_none()
-            && !t.starts_with('#')
-            && !is_list_item(line)
-            && !is_thematic_break(t.trim()))
+/// Whether `line` continues the field `f` above it: an indented line or a
+/// list item that is not a field of its own. A ticket list's own labels
+/// (`Identifier:`, `URL:` …) belong to it. `Filename:` and `Finding ID:`
+/// are single values and never continue.
+fn continues_field(f: &HField, line: &str) -> bool {
+    let tickets = f.key == "existing ticket references";
+    !matches!(f.key.as_str(), "filename" | "finding id")
+        && (line.starts_with(char::is_whitespace) || is_list_item(line))
+        && (tickets || field(line).is_none())
 }
 
 fn header(lines: &[String]) -> Header {
@@ -901,19 +903,20 @@ fn header(lines: &[String]) -> Header {
             open_field = None;
             continue;
         }
-        if let Some(i) = open_field {
-            let tickets = h.fields[i].key == "existing ticket references";
-            // The structured ticket list continues its field on bulleted
-            // lines too; a ticket list's lines stay lines.
-            if continues_field(line) || (tickets && is_list_item(line)) {
-                let f = &mut h.fields[i];
-                if !f.value.is_empty() {
-                    f.value.push(if tickets { '\n' } else { ' ' });
-                }
-                f.value.push_str(t);
-                f.raw.push(line.trim_end().to_string());
-                continue;
+        if let Some(i) = open_field.filter(|i| continues_field(&h.fields[*i], line)) {
+            // A ticket list's lines stay lines.
+            let f = &mut h.fields[i];
+            let joint = if f.key == "existing ticket references" {
+                '\n'
+            } else {
+                ' '
+            };
+            if !f.value.is_empty() {
+                f.value.push(joint);
             }
+            f.value.push_str(t);
+            f.raw.push(line.trim_end().to_string());
+            continue;
         }
         open_field = None;
         if let Some((key, value)) = field(line) {
@@ -1613,8 +1616,9 @@ fn paragraphs(lines: &[String]) -> Vec<String> {
     for l in lines {
         let t = l.trim();
         // A blank line ends a paragraph, and so does a rule, which is never
-        // a claim of its own.
-        if t.is_empty() || is_thematic_break(t) {
+        // a claim of its own. A `Step N:` alone on its line ends one too:
+        // its claim starts on the next line.
+        if t.is_empty() || is_thematic_break(t) || step_marker(t) == Some("") {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
@@ -1920,6 +1924,17 @@ fn exported_cross_ref(line: &str) -> Option<CrossRef> {
     })
 }
 
+/// Longest note a cross-reference read from free text gets.
+const NOTE_MAX_CHARS: usize = 300;
+
+/// `s` cut to `max` characters, with `…` when anything was cut.
+fn capped(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 /// The cross-references (a link for every `fnd_` id the section names, the
 /// report's own included: the caller knows which id is its own and drops it
 /// with [`retain_known_cross_references`]), and the section's verbatim text
@@ -1946,12 +1961,21 @@ fn cross_refs(body: Option<&Body>) -> (OrSentinel<Vec<CrossRef>>, Option<String>
             }
             continue;
         }
-        for id in fnd_ids(line) {
+        let ids = fnd_ids(line);
+        if ids.is_empty() {
+            continue;
+        }
+        // Once per line, however many ids it names; the note is capped
+        // because every id on the line shares it, and the whole line is in
+        // `references` anyway.
+        let relation = relation(line);
+        let note = capped(&one_line(strip_marker(line)), NOTE_MAX_CHARS);
+        for id in ids {
             if seen.insert(id.clone()) {
                 refs.push(CrossRef {
                     finding_id: id,
-                    relation: relation(line),
-                    note: Some(one_line(strip_marker(line))),
+                    relation,
+                    note: Some(note.clone()),
                 });
             }
         }
