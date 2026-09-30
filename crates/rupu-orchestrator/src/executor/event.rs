@@ -87,10 +87,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
     },
-    /// One fan-out unit finished. `tokens_in` / `tokens_out` are
-    /// best-effort: the runner's per-unit dispatch result does not carry
-    /// token counts, so they are emitted as `0` (tokens still flow to the
-    /// live view via the per-unit transcript tail).
+    /// One fan-out unit finished. `tokens_in` / `tokens_out` are the unit's
+    /// real totals — from its usage hook for local units, from its mirrored
+    /// transcript for remote units (`0` only for in-memory runs with no
+    /// store, and for a remote unit whose host exposes no coordinator-side
+    /// mirror path — `UnitDispatcher::unit_transcript_path` = `None`).
     UnitCompleted {
         run_id: String,
         step_id: String,

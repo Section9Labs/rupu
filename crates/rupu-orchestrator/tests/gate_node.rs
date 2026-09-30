@@ -786,6 +786,18 @@ async fn reject_runs_on_reject_cleanup_chain() {
         vec!["notify_fail".to_string()]
     );
 
+    // …and its one LLM call landed in the run's usage ledger (spec
+    // 2026-09-29 §3.3): phase 1 ran no agent, so this is the only row.
+    let ledger_rows: Vec<rupu_orchestrator::usage_ledger::LedgerRow> =
+        std::fs::read_to_string(store.usage_ledger_path(&run_id))
+            .expect("cleanup agent run writes the usage ledger")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    assert_eq!(ledger_rows.len(), 1, "{ledger_rows:?}");
+    assert_eq!(ledger_rows[0].step_id.as_deref(), Some("notify_fail"));
+    assert_eq!(ledger_rows[0].unit_index, None);
+
     let records = store.read_step_results(&run_id).unwrap();
     assert_eq!(records.len(), 2, "gate + on_reject step both persisted");
 
