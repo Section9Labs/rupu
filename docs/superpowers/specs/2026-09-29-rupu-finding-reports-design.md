@@ -246,6 +246,13 @@ sweep followed by a deep dive).
   Returns a file, or a zip of per-finding files when `split: true`.
 - `make macos-fixtures` regenerates the new DTOs. The drift test covers them.
 
+Deviations as built (Plan 2): artifact errors use the CP's standard
+`{"error": …}` body with the usual status (`404`/`409`), not
+`{"unavailable": …}`. An artifact with a recorded `host` answers `404` — no
+code sets `host` yet and there is no `pull_finding_artifact`, so artifacts from
+remote/placed units are not viewable in the CP (tracked in `TODO.md`). Claim
+staleness hashes files up to 64 MiB only (larger reports `unknown`).
+
 ## Rendering
 
 ### Web (`crates/rupu-cp/web`)
@@ -282,6 +289,13 @@ sweep followed by a deep dive).
   are jump chips, and the stale warning is per claim.
 - **Project report export dialog:** pick by filter or checkbox, include
   summaries toggle, choose format, single document or split zip.
+
+Deviations as built (Plan 2): provenance shows run, model, and declared-at —
+the finding record carries no agent name, so none is shown. The run's Findings
+tab (`FindingRow`) links each full-profile finding to its report page rather
+than embedding the triage card or a Report column; the triage card and Report
+column live on the findings tables (global, project, coverage). Exports (and
+their buttons and dialog) are Plan 3.
 
 ### macOS (`apps/rupu-macos`)
 
