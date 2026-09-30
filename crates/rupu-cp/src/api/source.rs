@@ -25,6 +25,7 @@
 //! task brief's security note.
 
 use crate::{
+    api::fs_open::open_regular_file,
     api::run_resolve::{resolve_run_location, RunLocation},
     api::runs::{run_not_found_or_internal, validate_id},
     error::{ApiError, ApiResult},
@@ -37,6 +38,8 @@ use axum::{
 };
 use rupu_orchestrator::runs::RunStore;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path as FsPath, PathBuf};
 
 /// Files larger than this are not read for preview — return a soft
@@ -194,6 +197,41 @@ fn canonicalize_existing_prefix(p: &FsPath) -> Option<PathBuf> {
     }
 }
 
+/// Why [`read_workspace_text`] produced no text. Each endpoint words these
+/// for its own UI.
+#[derive(Debug)]
+pub(crate) enum PreviewError {
+    /// Missing, or not a regular file (see [`open_regular_file`]).
+    NotFound,
+    TooLarge,
+    NotUtf8,
+    Io(std::io::Error),
+}
+
+/// Read the workspace file at `path` (already contained by
+/// [`resolve_under_workspace`]) as UTF-8 text of at most `max` bytes.
+/// Opens via [`open_regular_file`], so a FIFO/device swapped in after the
+/// containment check is refused instead of blocking. Blocking: async
+/// callers run it under `spawn_blocking`.
+pub(crate) fn read_workspace_text(path: &FsPath, max: u64) -> Result<String, PreviewError> {
+    let file = open_regular_file(path).map_err(|_| PreviewError::NotFound)?;
+    read_text_capped(file, max)
+}
+
+/// Read `file` as UTF-8 text of at most `max` bytes. The cap applies to
+/// what is actually read rather than a size checked up front, so a file an
+/// agent grows after it was opened can't balloon the buffer.
+fn read_text_capped(file: File, max: u64) -> Result<String, PreviewError> {
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(PreviewError::Io)?;
+    if bytes.len() as u64 > max {
+        return Err(PreviewError::TooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| PreviewError::NotUtf8)
+}
+
 /// Map a file extension (or, for a handful of well-known extension-less
 /// filenames, the filename itself) to a syntax-highlighting language tag
 /// matching one of the hljs grammars registered by the frontend's
@@ -263,10 +301,8 @@ pub fn routes() -> Router<AppState> {
 /// `workspace_path` from disk; `Host` and `Unpersisted` (no local workspace
 /// to read from) soft-fail the same way; `NotFound` → 404.
 ///
-/// Once a local `workspace_path` is in hand: `path` is validated via
-/// [`resolve_under_workspace`] (400 on traversal/escape — see the module
-/// doc's security note), then size-guarded (`> 2 MiB` soft-fails), then read
-/// and windowed via [`source_window`].
+/// Once a local `workspace_path` is in hand, [`read_source_slice`] does the
+/// file work on the blocking pool.
 async fn get_source(
     Path(id): Path<String>,
     Query(q): Query<SourceQuery>,
@@ -305,21 +341,30 @@ async fn get_source(
         }
     };
 
-    let resolved = resolve_under_workspace(&workspace_path, &q.path)?;
+    let slice = tokio::task::spawn_blocking(move || read_source_slice(&workspace_path, q))
+        .await
+        .map_err(|e| ApiError::internal(format!("source read task panicked: {e}")))??;
+    Ok(Json(slice))
+}
 
-    if !resolved.is_file() {
-        return Ok(Json(SourceSlice::unavailable("file not found")));
-    }
+/// The blocking half of [`get_source`]: `q.path` is validated via
+/// [`resolve_under_workspace`] (400 on traversal/escape — see the module
+/// doc's security note), then read via [`read_workspace_text`] (missing,
+/// non-regular, `> 2 MiB` and non-UTF-8 files soft-fail), then windowed via
+/// [`source_window`].
+fn read_source_slice(workspace: &FsPath, q: SourceQuery) -> Result<SourceSlice, ApiError> {
+    let resolved = resolve_under_workspace(workspace, &q.path)?;
 
-    let meta = std::fs::metadata(&resolved).map_err(|e| ApiError::internal(e.to_string()))?;
-    if meta.len() > MAX_PREVIEW_BYTES {
-        return Ok(Json(SourceSlice::unavailable("File too large to preview")));
-    }
-
-    let Ok(content) = std::fs::read_to_string(&resolved) else {
-        return Ok(Json(SourceSlice::unavailable(
-            "file is not valid UTF-8 text",
-        )));
+    let content = match read_workspace_text(&resolved, MAX_PREVIEW_BYTES) {
+        Ok(content) => content,
+        Err(e) => {
+            return Ok(SourceSlice::unavailable(match e {
+                PreviewError::NotFound => "file not found".to_string(),
+                PreviewError::TooLarge => "File too large to preview".to_string(),
+                PreviewError::NotUtf8 => "file is not valid UTF-8 text".to_string(),
+                PreviewError::Io(e) => format!("could not read file: {e}"),
+            }))
+        }
     };
 
     let all_lines: Vec<&str> = content.lines().collect();
@@ -331,7 +376,7 @@ async fn get_source(
     // would panic, so short-circuit the empty case with a well-formed
     // zero-line slice (`totalLines: 0`, `lines: []`, line markers all 0).
     if total == 0 {
-        return Ok(Json(SourceSlice {
+        return Ok(SourceSlice {
             available: true,
             path: Some(q.path),
             language: detect_language(&resolved),
@@ -341,7 +386,7 @@ async fn get_source(
             total_lines: Some(0),
             lines: Some(Vec::new()),
             reason: None,
-        }));
+        });
     }
 
     let target = q.line.clamp(1, total);
@@ -361,7 +406,7 @@ async fn get_source(
         })
         .collect();
 
-    Ok(Json(SourceSlice {
+    Ok(SourceSlice {
         available: true,
         path: Some(q.path),
         language: detect_language(&resolved),
@@ -371,7 +416,7 @@ async fn get_source(
         total_lines: Some(total),
         lines: Some(lines),
         reason: None,
-    }))
+    })
 }
 
 /// The human-readable reason returned for any remote-run `?ast` request —
@@ -425,13 +470,9 @@ fn default_col() -> usize {
 
 /// `GET /api/runs/:id/ast?path=<rel>&line=<1-based>&col=<1-based>[&host=<id>]`
 ///
-/// Mirrors [`get_source`]'s run-resolution / local-remote branch and
-/// [`resolve_under_workspace`] path guard exactly (same security boundary,
-/// same soft-fail-vs-400 split), then adds two more soft-fail steps specific
-/// to parsing: no [`rupu_ast::Lang`] mapped for the file's extension, or
-/// [`rupu_ast::parse_slice`] itself erroring (tree-sitter language-set
-/// failure or an empty parse). On success the response is filled from the
-/// returned [`rupu_ast::AstSubtree`].
+/// Mirrors [`get_source`]'s run-resolution / local-remote branch, then hands
+/// the file work (and the tree-sitter parse) to [`read_ast`] on the blocking
+/// pool.
 async fn get_ast(
     Path(id): Path<String>,
     Query(q): Query<AstQuery>,
@@ -470,27 +511,39 @@ async fn get_ast(
         }
     };
 
-    let resolved = resolve_under_workspace(&workspace_path, &q.path)?;
+    let resp = tokio::task::spawn_blocking(move || read_ast(&workspace_path, q))
+        .await
+        .map_err(|e| ApiError::internal(format!("ast parse task panicked: {e}")))??;
+    Ok(Json(resp))
+}
 
-    if !resolved.is_file() {
-        return Ok(Json(AstResponse::unavailable("file not found")));
-    }
-
-    let meta = std::fs::metadata(&resolved).map_err(|e| ApiError::internal(e.to_string()))?;
-    if meta.len() > MAX_PREVIEW_BYTES {
-        return Ok(Json(AstResponse::unavailable("File too large to parse")));
-    }
+/// The blocking half of [`get_ast`]: the same [`resolve_under_workspace`]
+/// path guard as [`read_source_slice`] (same security boundary, same
+/// soft-fail-vs-400 split), then two soft-fail steps specific to parsing —
+/// no [`rupu_ast::Lang`] mapped for the file's extension (checked before
+/// any read), or [`rupu_ast::parse_slice`] itself erroring (tree-sitter
+/// language-set failure or an empty parse) — around a
+/// [`read_workspace_text`] read. On success the response is filled from
+/// the returned [`rupu_ast::AstSubtree`].
+fn read_ast(workspace: &FsPath, q: AstQuery) -> Result<AstResponse, ApiError> {
+    let resolved = resolve_under_workspace(workspace, &q.path)?;
 
     let Some(lang) = rupu_ast::Lang::from_path(&resolved) else {
-        return Ok(Json(AstResponse::unavailable(
+        return Ok(AstResponse::unavailable(
             "No syntax grammar for this file type.",
-        )));
+        ));
     };
 
-    let Ok(content) = std::fs::read_to_string(&resolved) else {
-        return Ok(Json(AstResponse::unavailable(
-            "file is not valid UTF-8 text",
-        )));
+    let content = match read_workspace_text(&resolved, MAX_PREVIEW_BYTES) {
+        Ok(content) => content,
+        Err(e) => {
+            return Ok(AstResponse::unavailable(match e {
+                PreviewError::NotFound => "file not found".to_string(),
+                PreviewError::TooLarge => "File too large to parse".to_string(),
+                PreviewError::NotUtf8 => "file is not valid UTF-8 text".to_string(),
+                PreviewError::Io(e) => format!("could not read file: {e}"),
+            }))
+        }
     };
 
     // `as u32` truncates rather than saturates on a huge client-supplied
@@ -501,14 +554,14 @@ async fn get_ast(
     let col = q.col.max(1).min(u32::MAX as usize) as u32;
 
     match rupu_ast::parse_slice(&content, lang, line, col) {
-        Ok(sub) => Ok(Json(AstResponse {
+        Ok(sub) => Ok(AstResponse {
             available: true,
             language: Some(sub.language),
             root: Some(sub.root),
             truncated: Some(sub.truncated),
             reason: None,
-        })),
-        Err(_) => Ok(Json(AstResponse::unavailable("Could not parse file."))),
+        }),
+        Err(_) => Ok(AstResponse::unavailable("Could not parse file.")),
     }
 }
 
@@ -674,6 +727,54 @@ mod tests {
         );
         assert_eq!(detect_language(std::path::Path::new("dockerfile")), None);
         assert_eq!(detect_language(std::path::Path::new("random")), None);
+    }
+
+    #[test]
+    fn read_text_capped_reads_up_to_the_cap_and_refuses_past_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.rs");
+        std::fs::write(&p, "abcd").unwrap();
+
+        let open = || crate::api::fs_open::open_regular_file(&p).unwrap();
+        assert_eq!(read_text_capped(open(), 4).unwrap(), "abcd");
+        assert!(matches!(
+            read_text_capped(open(), 3),
+            Err(PreviewError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn read_text_capped_refuses_a_file_that_grew_past_the_cap_after_opening() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.rs");
+        std::fs::write(&p, "ab").unwrap();
+
+        let file = crate::api::fs_open::open_regular_file(&p).unwrap();
+        // An agent appends after the handler opened (and sized) the file.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(&[b'x'; 64])
+            .unwrap();
+        assert!(matches!(
+            read_text_capped(file, 16),
+            Err(PreviewError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn read_text_capped_refuses_non_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("bin.dat");
+        std::fs::write(&p, [0xff, 0xfe, 0x00]).unwrap();
+
+        let file = crate::api::fs_open::open_regular_file(&p).unwrap();
+        assert!(matches!(
+            read_text_capped(file, 1024),
+            Err(PreviewError::NotUtf8)
+        ));
     }
 
     #[test]

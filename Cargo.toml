@@ -55,9 +55,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Process control (safe wrappers over the POSIX syscalls; the workspace
-# forbids `unsafe_code`, so signalling/liveness cannot call libc directly)
-rustix = { version = "1", features = ["process"] }
+# Process control + non-blocking/no-follow file opens (safe wrappers over the
+# POSIX syscalls; the workspace forbids `unsafe_code`, so signalling/liveness
+# and open(2) flags std doesn't expose cannot call libc directly)
+rustix = { version = "1", features = ["process", "fs"] }
 
 # IDs / time
 ulid = { version = "1", features = ["serde"] }
