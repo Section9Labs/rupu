@@ -28,6 +28,16 @@ type LoadState = 'loading' | 'ready' | 'error';
  * Appending one to the other would render the whole backlog twice, so the
  * longer prefix wins: the snapshot paints immediately, and once the stream has
  * replayed past it the stream takes over (and keeps growing).
+ *
+ * ASSUMES the tailed transcript is append-only. "Longer wins" (and the
+ * reconnect replay buffer in the live-tail effect, which swaps a replay in
+ * only once it is at least as long as what is shown) is only right while
+ * every copy is a prefix of one growing file. If the file were REPLACED by
+ * shorter content (e.g. a mirror's authoritative rewrite that drops lines),
+ * both would keep showing the old, longer stream: the view freezes on stale
+ * events until the new file outgrows them. Today's rewrite (a host mirror's
+ * terminal pull) replaces a transcript with a superset of what was tailed, so
+ * this holds; a writer that could shrink one must also reset this view.
  */
 export function mergeSnapshotAndStream<T>(snapshot: T[], stream: T[]): T[] {
   return stream.length >= snapshot.length ? stream : snapshot;
@@ -157,6 +167,9 @@ export default function TranscriptPanel({
     // caught up. So a post-error replay is buffered in `replay` and swapped in
     // only once it is at least as long as what is already on screen — the
     // previous stream stays visible until then, and the view never shrinks.
+    // Like `mergeSnapshotAndStream`, this assumes the file is append-only: a
+    // replay of a SHORTER replacement never reaches `shown.length`, so the old
+    // stream would stay on screen (see that function's note).
     let shown: TranscriptEvent[] = [];
     let replay: TranscriptEvent[] | null = null;
     let reconnected = false;

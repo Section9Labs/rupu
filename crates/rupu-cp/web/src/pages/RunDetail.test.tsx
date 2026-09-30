@@ -16,7 +16,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -1109,6 +1109,59 @@ describe('RunDetail — live usage', () => {
     await waitFor(() => expect(screen.getByText(formatTokens(1_234_567))).toBeInTheDocument());
     expect(screen.getByTestId('usage-timeline-mock')).toHaveAttribute('data-points', '2');
     expect(usageSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('keys liveness to the loaded run: navigating in-app to a just-launched run still goes live', async () => {
+    // Launching from a run page navigates /runs/run-a → /runs/run-b in place.
+    // For one render `graph` still holds run-a's (running) run; run-b's first
+    // usage request must not count as "run known", or its launch-race 404
+    // would read as an older CP and stop live usage for good.
+    const graphA = { ...RUNNING_GRAPH, run: { ...RUNNING_GRAPH.run, id: 'run-a' }, usage: EMPTY_USAGE };
+    const graphB = { ...RUNNING_GRAPH, run: { ...RUNNING_GRAPH.run, id: 'run-b' }, usage: EMPTY_USAGE };
+    let resolveB: (g: RunGraphResponse) => void = () => {};
+    vi.spyOn(api, 'getRunGraph').mockImplementation((id: string) =>
+      id === 'run-a'
+        ? Promise.resolve(graphA)
+        : new Promise<RunGraphResponse>((resolve) => {
+            resolveB = resolve;
+          }),
+    );
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    let bCalls = 0;
+    vi.spyOn(api, 'getRunUsage').mockImplementation(async (id: string) => {
+      if (id === 'run-a') {
+        return liveResp({ summary: { ...LIVE_SUMMARY, total_tokens: 111_111 } }) as never;
+      }
+      bCalls += 1;
+      // run-b's run.json has not landed yet when its page first renders.
+      if (bCalls === 1) throw new ApiError(404, 'not found');
+      return liveResp({ summary: { ...LIVE_SUMMARY, total_tokens: 7_654_321 } }) as never;
+    });
+
+    function GoToB() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/runs/run-b')}>navigate-to-run-b</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/runs/run-a']}>
+        <GoToB />
+        <Routes>
+          <Route path="/runs/:id" element={<RunDetailLoaded />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText(formatTokens(111_111))).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'navigate-to-run-b' }));
+    // run-b's first request goes out while its graph is still loading → 404.
+    await waitFor(() => expect(bCalls).toBe(1));
+    resolveB(graphB);
+
+    await waitFor(() => expect(screen.getByText(formatTokens(7_654_321))).toBeInTheDocument());
+    // …and it keeps polling (the 2 s interval), rather than being written off.
+    await waitFor(() => expect(bCalls).toBeGreaterThanOrEqual(3), { timeout: 3500 });
   });
 
   it('falls back to the graph usage + one-shot timeline when the endpoint 404s', async () => {

@@ -514,16 +514,19 @@ export default function RunDetail() {
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
 
   // Live usage (spec 2026-09-29 §7): polls GET /api/runs/:id/usage every 2s
-  // while the run is live (and once more when it turns terminal). `run` gates
-  // liveness so a not-yet-loaded graph doesn't read as a running run, and is
-  // `runKnown`: a freshly launched run 404s here until its run.json lands (the
-  // same race fetchRunGraphWithRetry rides out), so a 404 only means "older
-  // remote CP" once the graph has confirmed the run exists. When the endpoint
-  // is unavailable `liveUsage` stays null and the header/chart fall back to
-  // the graph's one-shot usage + the timeline fetch.
-  const { usage: liveUsage } = useRunUsage(id, host, run !== null && isRunning, {
-    runKnown: run !== null,
-  });
+  // while the run is live (and once more when it turns terminal). `runKnown`
+  // gates liveness so a not-yet-loaded graph doesn't read as a running run,
+  // and says the run exists: a freshly launched run 404s here until its
+  // run.json lands (the same race fetchRunGraphWithRetry rides out), so a 404
+  // only means "older remote CP" once the graph has confirmed the run. Only a
+  // graph for THIS `id` confirms it — the graph reset is an effect, so for one
+  // render after an in-app `/runs/A → /runs/B` (e.g. launching from a run
+  // page) `graph` still holds A's run, and trusting it would turn B's launch
+  // race 404 into a permanent "unavailable". When the endpoint is unavailable
+  // `liveUsage` stays null and the header/chart fall back to the graph's
+  // one-shot usage + the timeline fetch.
+  const runKnown = run !== null && run.id === id;
+  const { usage: liveUsage } = useRunUsage(id, host, runKnown && isRunning, { runKnown });
   // Usage for the header row: live summary, else the graph's one-shot numbers.
   const displayUsage = liveUsage?.summary ?? graph?.usage;
   // Pause is only offered while the run is actively `running` (not merely
