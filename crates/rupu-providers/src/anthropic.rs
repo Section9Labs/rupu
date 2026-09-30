@@ -1404,7 +1404,10 @@ impl AnthropicClient {
     /// Deliberately does NOT go through `apply_auth_headers`: that injects
     /// `X-Stainless-*` + `X-Claude-Code-Session-Id` plus a per-request beta
     /// CSV, some of which get this endpoint to reject the request.
-    async fn models_request(&self) -> Result<reqwest::Response, ProviderError> {
+    async fn models_request(
+        &self,
+        after_id: Option<&str>,
+    ) -> Result<reqwest::Response, ProviderError> {
         // Strip the `/v1/messages` (and optional `?beta=true`) suffix off
         // `api_url` to get the API root, then append `/v1/models`.
         let base = self
@@ -1415,10 +1418,15 @@ impl AnthropicClient {
             .trim_end_matches("/v1/messages")
             .trim_end_matches('/');
         let url = format!("{base}/v1/models");
+        let mut query: Vec<(&str, &str)> = vec![("limit", "1000")];
+        if let Some(a) = after_id {
+            query.push(("after_id", a));
+        }
 
         let mut req = self
             .client
             .get(&url)
+            .query(&query)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Accept", "application/json");
         match &self.auth {
@@ -2310,6 +2318,64 @@ impl AnthropicClient {
         }
         Ok(())
     }
+
+    /// Every page of `GET /v1/models`, with limits (spec 2026-09-30 §3).
+    async fn fetch_all_models(&self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        #[derive(serde::Deserialize)]
+        struct Page {
+            data: Vec<Entry>,
+            #[serde(default)]
+            has_more: bool,
+            #[serde(default)]
+            last_id: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            id: String,
+            #[serde(default)]
+            max_input_tokens: Option<u32>,
+            #[serde(default)]
+            max_tokens: Option<u32>,
+        }
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        // Bounded: a server that repeats `last_id` must not loop forever.
+        for _ in 0..50 {
+            let resp = self.models_request(after.as_deref()).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let message: String = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(500)
+                    .collect();
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message,
+                });
+            }
+            let page: Page = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            out.extend(page.data.into_iter().map(|e| crate::model_pool::ModelInfo {
+                id: e.id,
+                provider: ProviderId::Anthropic,
+                context_window: e.max_input_tokens.unwrap_or(0),
+                max_output_tokens: e.max_tokens.unwrap_or(0),
+                capabilities: Vec::new(),
+                cost: crate::model_pool::ModelCost::default(),
+                status: crate::model_pool::ModelStatus::default(),
+            }));
+            match (page.has_more, page.last_id) {
+                (true, Some(last)) => after = Some(last),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Anthropic's wire usage. Its `input_tokens` EXCLUDES cache reads and cache
@@ -2528,54 +2594,10 @@ impl crate::provider::LlmProvider for AnthropicClient {
     /// rather than propagating, so the CLI's "show what we got"
     /// fallback still renders the baked-in list.
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
-        let resp = match self.models_request().await {
-            Ok(r) => r,
+        match self.fetch_all_models().await {
+            Ok(m) => m,
             Err(e) => {
-                tracing::warn!(error = %e, "anthropic list_models: HTTP error");
-                return Vec::new();
-            }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            let body_preview = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect::<String>();
-            tracing::warn!(
-                status = status.as_u16(),
-                body = %body_preview,
-                "anthropic list_models: non-2xx response",
-            );
-            return Vec::new();
-        }
-
-        #[derive(serde::Deserialize)]
-        struct ListResp {
-            data: Vec<ModelEntry>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ModelEntry {
-            id: String,
-        }
-        match resp.json::<ListResp>().await {
-            Ok(body) => body
-                .data
-                .into_iter()
-                .map(|e| crate::model_pool::ModelInfo {
-                    id: e.id,
-                    provider: ProviderId::Anthropic,
-                    context_window: 0,
-                    max_output_tokens: 0,
-                    capabilities: Vec::new(),
-                    cost: crate::model_pool::ModelCost::default(),
-                    status: crate::model_pool::ModelStatus::default(),
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "anthropic list_models: JSON parse failed");
+                tracing::warn!(error = %e, "anthropic list_models failed");
                 Vec::new()
             }
         }
@@ -2585,7 +2607,7 @@ impl crate::provider::LlmProvider for AnthropicClient {
     /// makes — but here the status IS the answer, so nothing is swallowed. A
     /// 2xx means the credential works, even if the account lists no models.
     async fn probe(&self) -> Result<(), ProviderError> {
-        let resp = self.models_request().await?;
+        let resp = self.models_request(None).await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -2603,6 +2625,11 @@ impl crate::provider::LlmProvider for AnthropicClient {
             status: status.as_u16(),
             message,
         })
+    }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.ensure_valid_token().await?;
+        self.fetch_all_models().await
     }
 }
 
@@ -5471,6 +5498,108 @@ mod tests {
         assert!(
             matches!(err, ProviderError::Http(_)),
             "a transport failure must be Http, not an auth error; got {err:?}"
+        );
+    }
+
+    // ── fetch_models (Task 3: limits, paging, token refresh) ──────────
+
+    fn no_after_id(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        !req.query_params
+            .as_ref()
+            .is_some_and(|q| q.iter().any(|(k, _)| k == "after_id"))
+    }
+
+    #[tokio::test]
+    async fn fetch_models_reads_limits_and_follows_pages() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("limit", "1000")
+                .matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "claude-alpha-9", "type": "model", "max_input_tokens": 1000000, "max_tokens": 128000 }],
+                "has_more": true, "first_id": "claude-alpha-9", "last_id": "claude-alpha-9"
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "claude-alpha-9");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "claude-beta-2-20260101", "type": "model", "max_input_tokens": null, "max_tokens": null }],
+                "has_more": false, "first_id": "claude-beta-2-20260101", "last_id": "claude-beta-2-20260101"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert();
+        page2.assert();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            (models[0].context_window, models[0].max_output_tokens),
+            (1_000_000, 128_000)
+        );
+        assert_eq!(
+            (models[1].context_window, models[1].max_output_tokens),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_oauth_sends_bearer_and_beta() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .header("authorization", "Bearer tok-live")
+                .header("anthropic-beta", "oauth-2025-04-20");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [], "has_more": false }));
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "tok-live".into(),
+                refresh_token: "r".into(),
+                expires_ms: u64::MAX,
+            },
+            format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        m.assert();
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_models_surfaces_non_2xx_as_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(401).body("{\"error\":\"nope\"}");
+        });
+        let mut client = AnthropicClient::with_url(
+            "k".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Api { status: 401, .. }),
+            "{err:?}"
         );
     }
 
