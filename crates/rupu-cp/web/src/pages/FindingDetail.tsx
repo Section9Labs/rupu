@@ -118,6 +118,11 @@ export default function FindingDetail() {
       <article className="min-w-0 max-w-4xl space-y-7">
         <BackLink />
         <ReportHeader finding={detail} report={report} />
+        {/* The rail (and its meter) only shows from `lg` up; below that this
+            compact line carries the completeness instead. */}
+        <p data-testid="completeness-compact" className="text-note text-ink-mute lg:hidden">
+          {`Report ${c.filled}/${c.total}${c.gaps.length > 0 ? ` · gaps: ${c.gaps.join(', ')}` : ''}`}
+        </p>
         <Section id="s-desc" title="Description"><div className="text-ink-dim"><Markdown text={report.description} /></div></Section>
         <Section id="s-impact" title="Impact"><div className="text-ink-dim"><Markdown text={report.impact} /></div></Section>
         <Section id="s-loc" title="Location">

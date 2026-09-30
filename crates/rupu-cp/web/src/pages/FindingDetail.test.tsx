@@ -71,6 +71,29 @@ describe('FindingDetail page', () => {
     expect(within(rail).queryByText(/Unknown:/)).toBeNull();
   });
 
+  it('shows a compact completeness line that is hidden at lg and up (where the rail shows the meter)', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+    renderAt();
+    const line = await screen.findByText('Report 9/11 · gaps: owner, cvss_v3');
+    expect(line).toBe(screen.getByTestId('completeness-compact'));
+    expect(line).toHaveClass('lg:hidden');
+    // it lives in the article, not the rail (which is `hidden lg:block`)
+    expect(within(screen.getByRole('navigation', { name: 'Report sections' })).queryByText(/^Report 9\/11/)).toBeNull();
+  });
+
+  it('omits the gaps clause from the compact line when the report is complete', async () => {
+    const full = {
+      ...report,
+      ownership: { ...report.ownership, owner: 'Platform team' },
+      rating: { ...report.rating, cvss_v3: '7.5' },
+    };
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report: full, evidence_status: ['current'] }));
+    renderAt();
+    const line = await screen.findByTestId('completeness-compact');
+    expect(line).toHaveTextContent('Report 11/11');
+    expect(line).not.toHaveTextContent('gaps');
+  });
+
   it('lists the PoC artifacts rail anchor only when the report has artifacts', async () => {
     const spy = vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
     const first = renderAt();
