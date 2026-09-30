@@ -3713,6 +3713,7 @@ dependencies = [
  "predicates",
  "rupu-agent",
  "rupu-auth",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",
