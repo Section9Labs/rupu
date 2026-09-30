@@ -126,6 +126,7 @@ async fn the_factory_binds_the_supplied_sink_to_the_built_provider() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        disable_prompt_cache: false,
     };
 
     provider

@@ -32,6 +32,7 @@ fn minimal_request(model: &str) -> LlmRequest {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        disable_prompt_cache: false,
     }
 }
 

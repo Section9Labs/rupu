@@ -1101,6 +1101,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1143,6 +1144,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1179,6 +1181,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1215,6 +1218,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1255,6 +1259,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1292,6 +1297,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1341,6 +1347,7 @@ mod tests {
                     anthropic_task_budget: None,
                     anthropic_context_management: None,
                     anthropic_speed: None,
+                    disable_prompt_cache: false,
                 };
                 let body = client.build_request_body(&request);
                 let config = &body["request"]["generationConfig"]["thinkingConfig"];
@@ -2184,6 +2191,7 @@ mod tests {
                 anthropic_task_budget: None,
                 anthropic_context_management: None,
                 anthropic_speed: None,
+                disable_prompt_cache: false,
             };
             let body = client.build_request_body(&request);
             let config = &body["request"]["generationConfig"]["thinkingConfig"];

@@ -70,6 +70,7 @@ impl From<LlmRequestWire> for LlmRequest {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         }
     }
 }
@@ -197,6 +198,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let wire = LlmRequestWire::from(&request);
         assert_eq!(wire.model, request.model);

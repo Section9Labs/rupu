@@ -212,6 +212,15 @@ pub struct LlmRequest {
     /// enabled returns 400. Emitted as the top-level `speed: "fast"`
     /// body field. Ignored by other providers.
     pub anthropic_speed: Option<Speed>,
+    /// Per-request prompt-caching opt-out (spec 2026-09-29 §9). When `true`,
+    /// the Anthropic client emits no `cache_control` breakpoints for this
+    /// request even when caching is enabled on the client. For one-off
+    /// requests whose prefix nothing will ever re-read — e.g. the compaction
+    /// summary call, which has its own system prompt and no tools — where a
+    /// cache write would cost 1.25× input for no later read. Defaults to
+    /// `false` (the client-level setting decides). Ignored by other
+    /// providers.
+    pub disable_prompt_cache: bool,
 }
 
 /// Output-format hint passed to providers that support structured
