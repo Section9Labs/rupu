@@ -792,19 +792,19 @@ pub fn attach_and_render_interactive_with(
         let mut printer = LineStreamPrinter::new();
         match final_outcome {
             AttachOutcome::Done => match record.status {
-                rupu_orchestrator::RunStatus::Completed => {
-                    if !opts.suppress_done_line {
-                        let duration_ms = record
-                            .finished_at
-                            .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
-                            .unwrap_or(0);
-                        printer.workflow_done_priced(
-                            workflow_name,
-                            run_id,
-                            Duration::from_millis(duration_ms),
-                            spend.run(),
-                        );
-                    }
+                // Suppressed-Completed falls through to the `_ => {}` arm
+                // (prints nothing): the caller emits the shared summary.
+                rupu_orchestrator::RunStatus::Completed if !opts.suppress_done_line => {
+                    let duration_ms = record
+                        .finished_at
+                        .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
+                        .unwrap_or(0);
+                    printer.workflow_done_priced(
+                        workflow_name,
+                        run_id,
+                        Duration::from_millis(duration_ms),
+                        spend.run(),
+                    );
                 }
                 rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
                     printer.workflow_failed(
