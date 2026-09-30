@@ -67,7 +67,38 @@ describe('FindingDetail page', () => {
     expect(within(rail).getByRole('link', { name: 'Root cause' })).toHaveAttribute('href', '#s-root');
 
     expect(within(rail).getByText('9/11')).toBeInTheDocument();
-    expect(within(rail).getByText(/owner, cvss_v3/)).toBeInTheDocument();
+    expect(within(rail).getByText('Gaps: owner, cvss_v3')).toBeInTheDocument();
+    expect(within(rail).queryByText(/Unknown:/)).toBeNull();
+  });
+
+  it('lists the PoC artifacts rail anchor only when the report has artifacts', async () => {
+    const spy = vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+    const first = renderAt();
+    const rail = await screen.findByRole('navigation', { name: 'Report sections' });
+    // The fixture has no artifacts: no dead anchor, and no section for it either.
+    expect(within(rail).queryByRole('link', { name: 'PoC artifacts' })).toBeNull();
+    expect(rail.querySelector('a[href="#s-artifacts"]')).toBeNull();
+    expect(document.getElementById('s-artifacts')).toBeNull();
+    first.unmount();
+
+    spy.mockResolvedValue(base({
+      profile: 'full',
+      report: { ...report, artifacts: [{ path: 'poc/exploit.py', sha256: 'ab'.repeat(32), size: 12, kind: 'text', stored: 'copied' }] },
+      evidence_status: ['current'],
+    }));
+    renderAt();
+    const rail2 = await screen.findByRole('navigation', { name: 'Report sections' });
+    expect(within(rail2).getByRole('link', { name: 'PoC artifacts' })).toHaveAttribute('href', '#s-artifacts');
+    expect(document.getElementById('s-artifacts')).not.toBeNull();
+  });
+
+  it('has a back link to the findings list above the report header', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+    renderAt();
+    const back = await screen.findByRole('link', { name: '← Findings' });
+    expect(back).toHaveAttribute('href', '/findings');
+    const h1 = screen.getByRole('heading', { level: 1 });
+    expect(back.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it('links provenance to the originating run', async () => {
@@ -93,6 +124,15 @@ describe('FindingDetail page', () => {
     expect(screen.getByText('The lookup ignores the owner id.')).toBeInTheDocument();
     expect(screen.getByText(/This finding was recorded as a summary/)).toBeInTheDocument();
     expect(screen.queryByRole('navigation', { name: 'Report sections' })).toBeNull();
+  });
+
+  it('summary layout also has a back link to the findings list', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'summary', report: null }));
+    renderAt();
+    const back = await screen.findByRole('link', { name: '← Findings' });
+    expect(back).toHaveAttribute('href', '/findings');
+    const h1 = screen.getByRole('heading', { level: 1 });
+    expect(back.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it('shows an alert with the error text when the API fails', async () => {
