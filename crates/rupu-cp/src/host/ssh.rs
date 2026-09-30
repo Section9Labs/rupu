@@ -209,7 +209,10 @@ pub(crate) const RUN_START_EVIDENCE_NO: &str = "rupu_run_no_trace";
 /// detached launch wrapper (`detach_launch`) creates both itself, BEFORE the
 /// remote `rupu` runs — they exist just as much for a launch that died
 /// instantly, so keying on them would make the probe answer "started" for
-/// exactly the failure it must still catch.
+/// exactly the failure it must still catch. The run's `coverage.jsonl` is in
+/// the same class: `rupu run` writes its begin line before the provider
+/// pre-flight, so it survives a launch that died on missing credentials (the
+/// pump likewise does not count its `tail` header as a sign of life).
 ///
 /// The `pgrep` pattern is written `[-]-run-id` on purpose: the shell running
 /// this command has the pattern in its OWN `/proc/<pid>/cmdline`, and a
@@ -1688,7 +1691,20 @@ impl SshHostConnector {
                                             // so the run exists on the host. (stderr
                                             // is /dev/null, so an unopenable path
                                             // produces no line at all.)
-                                            run_seen_on_host = true;
+                                            //
+                                            // EXCEPT the coverage stream: `rupu run`
+                                            // writes its begin line before the provider
+                                            // pre-flight and credential resolution, so a
+                                            // launch that died right there leaves a
+                                            // `coverage.jsonl` and nothing else. Its
+                                            // header is not a sign of life (same reason
+                                            // the run dir and `launch.log` are not
+                                            // start evidence), or the startup deadline
+                                            // would never fire for it. Its lines are
+                                            // still mirrored below.
+                                            if !path.ends_with("coverage.jsonl") {
+                                                run_seen_on_host = true;
+                                            }
                                             // Route subsequent lines based on filename
                                             // suffix — the expanded absolute path from
                                             // `tail` still ends with the same basename.
@@ -6200,6 +6216,76 @@ mod tests {
         assert!(
             conn.pumps.lock().unwrap().get(run_id).is_none(),
             "the pump must deregister when it gives up"
+        );
+    }
+
+    /// `rupu run` writes the coverage stream's begin line BEFORE the provider
+    /// pre-flight and credential resolution, so a launch that dies right there
+    /// leaves a `coverage.jsonl` and nothing else (no transcript, no `run.json`
+    /// for an agent run). `tail` still emits a `==>` header for it, but that
+    /// header is not evidence the run is alive: counting it would switch the
+    /// startup deadline off for exactly the launch the deadline exists to
+    /// catch, stranding the ssh session and the mirrored run in `Running` until
+    /// `PUMP_MAX_WALL`.
+    ///
+    /// The tail yields ONLY the coverage header + begin line; the pump must
+    /// still abandon at `PUMP_STARTUP_DEADLINE` exactly as it does with no
+    /// header at all, and the begin line it did receive stays mirrored.
+    #[tokio::test(start_paused = true)]
+    async fn tail_pump_abandons_a_launch_that_only_left_a_coverage_header() {
+        let run_id = "run_01TESTPUMPCOV";
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![
+            format!("==> /home/ci/.rupu/runs/{run_id}/coverage.jsonl <=="),
+            format!(r#"{{"ledger":"begin","v":1,"run_id":"{run_id}"}}"#),
+        ]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "died-before-preflight".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let took = wait_for_pump_to_finish(
+            &run_store,
+            run_id,
+            PUMP_STARTUP_DEADLINE + std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect(
+            "a coverage header alone must not count as a sign of life; the \
+             pump must give up at the startup deadline",
+        );
+
+        assert!(
+            took >= PUMP_STARTUP_DEADLINE && took < PUMP_STARTUP_DEADLINE + PUMP_POLL_INTERVAL * 5,
+            "the pump must give up at the {}s startup deadline; took {}s",
+            PUMP_STARTUP_DEADLINE.as_secs(),
+            took.as_secs()
+        );
+        assert_eq!(
+            run_store.load(run_id).unwrap().status,
+            rupu_orchestrator::RunStatus::Failed
+        );
+        assert!(
+            conn.pumps.lock().unwrap().get(run_id).is_none(),
+            "the pump must deregister when it gives up"
+        );
+        // The begin line the tail did deliver was still routed to the mirror.
+        assert!(
+            std::fs::read_to_string(conn.mirror.coverage_path(run_id))
+                .unwrap_or_default()
+                .contains(r#""ledger":"begin""#),
+            "coverage lines are still mirrored even though the header is not a sign of life"
         );
     }
 
