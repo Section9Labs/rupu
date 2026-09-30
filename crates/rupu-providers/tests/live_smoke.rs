@@ -111,7 +111,7 @@ async fn copilot_live_round_trip() {
 //   RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... \
 //     cargo test -p rupu-providers --test live_smoke -- --ignored --nocapture prompt_cache
 //   RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... \
-//     cargo test -p rupu-providers --test live_smoke -- --ignored --nocapture cache_control_on_empty_tool_result
+//     cargo test -p rupu-providers --test live_smoke -- --ignored --nocapture empty_tool_result
 //
 // `--nocapture` matters: the usage numbers are printed with `eprintln!`, and a
 // missing env var skips (returns early, reported as "ok") rather than fails —
@@ -120,8 +120,12 @@ async fn copilot_live_round_trip() {
 /// Model for the prompt-cache checks. `claude-haiku-4-5` (used by the plain
 /// round-trip test) needs a 4096-token prefix to cache at all, which the ~3k
 /// filler below would silently miss; Sonnet 4.6's minimum cacheable prefix is
-/// 2048 tokens. Override with `RUPU_LIVE_ANTHROPIC_MODEL` (mind the minimum:
-/// 4096 for Opus 4.5/4.6 and Haiku 4.5, 1024-2048 for the Sonnet line).
+/// 1024 tokens. Override with `RUPU_LIVE_ANTHROPIC_MODEL`, minding the
+/// model's minimum cacheable prefix:
+/// - 512: Opus 5.5 / Opus 5, Fable, Sonnet 5.5;
+/// - 1024: Opus 4.8, Sonnet 5, Sonnet 4.6 / 4.5, Opus 4.1 / 4;
+/// - 2048: Opus 4.7;
+/// - 4096: Opus 4.6 / 4.5, Haiku 4.5 (the ~3k filler is too short for these).
 fn cache_test_model() -> String {
     std::env::var("RUPU_LIVE_ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into())
 }
@@ -220,17 +224,19 @@ async fn live_anthropic_prompt_cache_reads_on_second_request() {
     assert_whole_prompt_usage("second", &second.usage);
 }
 
-/// Live: the rolling breakpoint lands on the final `tool_result` even when its
-/// content is empty. This answers empirically whether Anthropic accepts
-/// `cache_control` on an empty `tool_result` block (a 400 here means the
-/// request builder must skip empty tool results as marker targets).
+/// Live: a turn whose final message is an EMPTY `tool_result` (what every
+/// silent `bash` call produces) succeeds with caching on. The request builder
+/// treats an empty `tool_result` as uncacheable and walks the rolling
+/// breakpoint back to the preceding assistant's `tool_use`, so this checks
+/// that placement end to end — whether the API would accept `cache_control`
+/// on the empty `tool_result` itself is left unverified by design.
 ///
 /// Cost: one tiny streaming request (`max_tokens = 32`) — well under a cent.
 /// Requires explicit user approval before running; see the run command in the
 /// block comment above.
 #[tokio::test]
 #[ignore = "live API: spends money; run with --ignored after approval"]
-async fn live_anthropic_cache_control_on_empty_tool_result_is_accepted() {
+async fn live_anthropic_turn_ending_in_empty_tool_result_succeeds_with_caching() {
     let Some(mut client) = live_anthropic_client() else {
         return;
     };
@@ -252,8 +258,8 @@ async fn live_anthropic_cache_control_on_empty_tool_result_is_accepted() {
                 input: serde_json::json!({}),
             }],
         },
-        // Final user message ends with an EMPTY tool_result — the block the
-        // rolling cache breakpoint is placed on.
+        // Final user message ends with an EMPTY tool_result — not a marker
+        // target, so the rolling breakpoint walks back onto the tool_use.
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
@@ -268,8 +274,8 @@ async fn live_anthropic_cache_control_on_empty_tool_result_is_accepted() {
     let resp = client
         .stream(&req, |_| {})
         .await
-        .expect("Anthropic must accept cache_control on an empty tool_result (got an error/400)");
-    eprintln!("cache_control_on_empty_tool_result usage: {:?}", resp.usage);
+        .expect("a turn ending in an empty tool_result must succeed with caching on");
+    eprintln!("empty_tool_result usage: {:?}", resp.usage);
     assert_whole_prompt_usage("empty tool_result", &resp.usage);
 }
 

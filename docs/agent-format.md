@@ -291,7 +291,11 @@ explicit `cache_control: {"type": "ephemeral"}` breakpoints (5-minute TTL):
 - one on the last content block of the final message, which moves forward
   each turn so every turn re-reads the prior conversation from the cache.
 
-Thinking blocks and empty text blocks are never marked. A prefix below the
+Thinking blocks, empty text blocks, and empty tool results are never marked.
+When the final message has nothing markable (for example the empty result of a
+silent `bash` command), the second marker moves to the last eligible block of
+the nearest earlier message — typically the preceding `tool_use` — at most
+three messages back. A prefix below the
 model's minimum cacheable length (512–4096 tokens, depending on the model) is
 simply not cached — there is no error. Cache reads and writes show up as
 `cached_tokens` and `cache_write_tokens` in usage and cost.
@@ -302,7 +306,8 @@ re-enables caching for one agent on a provider whose config turns it off. Use
 `false` when the agent's provider is an Anthropic-compatible gateway that
 rejects `cache_control`. For a whole provider, prefer
 `[providers.<name>] prompt_cache = false` (see
-[providers.md](providers.md#field-reference)). Omitted, the agent follows the
+[providers.md](providers.md#field-reference), including its caveat that
+Anthropic gateway routing is currently process-wide). Omitted, the agent follows the
 provider config, and caching is on when neither sets it.
 
 ---

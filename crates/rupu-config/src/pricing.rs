@@ -1256,7 +1256,7 @@ mod tests {
             checked += 1;
         }
         assert!(
-            checked >= 18,
+            checked >= 20,
             "expected the full Anthropic section, saw {checked}"
         );
     }

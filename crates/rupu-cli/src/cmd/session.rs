@@ -6434,8 +6434,16 @@ fn session_total_cost_detail(
     )?;
     Some(format!(
         "${:.2}",
-        // A session record's running totals carry no cache-write count.
-        pricing.cost_usd(session.total_tokens_in, session.total_tokens_out, 0, 0)
+        // Cache reads are on the record and priced at the read rate. Cache
+        // writes are not (a session record's running totals carry no
+        // cache-write count), so they bill at the plain input rate — a small
+        // underestimate where the vendor charges a write premium.
+        pricing.cost_usd(
+            session.total_tokens_in,
+            session.total_tokens_out,
+            session.total_tokens_cached,
+            0,
+        )
     ))
 }
 
@@ -9218,6 +9226,40 @@ mod tests {
         assert!(header.contains("⇣45"), "header: {header}");
         assert!(header.contains("⟳18"), "header: {header}");
         assert!(header.contains('$'), "header: {header}");
+    }
+
+    #[test]
+    fn session_cost_prices_cached_input_at_the_cache_read_rate() {
+        // 1M input, half of it cache reads: 0.5M × $10 + 0.5M × $1 = $5.50.
+        // Billing the cached half at the full input rate would show $10.00.
+        let session = SessionRecord {
+            provider_name: "anthropic".into(),
+            model: "claude-test-model".into(),
+            total_tokens_in: 1_000_000,
+            total_tokens_out: 0,
+            total_tokens_cached: 500_000,
+            ..test_session_record()
+        };
+        let mut state = fresh_completion_state();
+        state.pricing = PricingConfig::default();
+        state
+            .pricing
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert(
+                "claude-test-model".into(),
+                rupu_config::ModelPricing {
+                    input_per_mtok: 10.0,
+                    output_per_mtok: 20.0,
+                    cached_input_per_mtok: Some(1.0),
+                    cache_write_per_mtok: None,
+                },
+            );
+        assert_eq!(
+            session_total_cost_detail(&session, &state).as_deref(),
+            Some("$5.50")
+        );
     }
 
     #[test]
