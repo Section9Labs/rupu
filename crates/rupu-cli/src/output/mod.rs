@@ -4,6 +4,7 @@
 //! the default UI for long-running CLI surfaces. Works in any terminal,
 //! any pipe, and any CI runner.
 
+pub mod codename;
 pub mod diag;
 pub mod entity_table;
 pub mod fmt;

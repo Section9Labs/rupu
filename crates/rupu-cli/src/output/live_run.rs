@@ -80,6 +80,12 @@ pub struct UnitState {
     /// `None` — only `apply`'s `Dispatch*` arms set it, to find the right
     /// slot on `DispatchCompleted` without relying on index/order.
     pub sub_run_id: Option<String>,
+    /// Codename leaf source (`crew/role#n`) from `UnitStarted` /
+    /// `DispatchStarted` / `AgentStarted`. `None` on legacy event logs.
+    pub codename: Option<String>,
+    /// Provider / model from `AgentStarted` / `DispatchStarted`.
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 /// One line in the active agent's rolling activity feed.
@@ -145,6 +151,11 @@ pub struct StepState {
     pub panel_iter: Option<(u32, u32)>,
     /// Panel findings observed so far.
     pub panel_findings: usize,
+    /// Codename of the step's singleton member (`StepStarted` / `AgentStarted`).
+    pub codename: Option<String>,
+    /// Provider / model from `AgentStarted`.
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 impl StepState {
@@ -164,6 +175,9 @@ pub struct ActiveFocus {
     pub step_id: Option<String>,
     pub unit_key: Option<String>,
     pub agent: Option<String>,
+    pub codename: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     /// Transcript of the active fan-out UNIT (set by `UnitStarted`). The
     /// live loop tails this in preference to `run.json`'s active-step
     /// transcript, which is null during a fan-out. `None` for linear
@@ -210,6 +224,8 @@ pub struct LiveRunState {
     /// set (Task 1: state + nav only — Task 2 wires this to focus/render).
     /// `None` means auto-follow (today's default behavior, unchanged).
     pub selected: Option<NodeRef>,
+    /// Run crew name (`jade-reef`) for the dashboard title; `None` until known.
+    pub codename: Option<String>,
 }
 
 impl LiveRunState {
@@ -236,6 +252,9 @@ impl LiveRunState {
                         .as_ref()
                         .and_then(|p| p.gate.as_ref().map(|g| (0, g.max_iterations))),
                     panel_findings: 0,
+                    codename: None,
+                    provider: None,
+                    model: None,
                 }
             })
             .collect();
@@ -253,6 +272,7 @@ impl LiveRunState {
             coverage_pct: None,
             active: ActiveFocus::default(),
             selected: None,
+            codename: None,
         }
     }
 
@@ -385,10 +405,18 @@ impl LiveRunState {
                 self.started_at = Some(*started_at);
                 self.status = RunStatus::Running;
             }
-            WfEvent::StepStarted { step_id, agent, .. } => {
+            WfEvent::StepStarted {
+                step_id,
+                agent,
+                codename,
+                ..
+            } => {
                 self.active.step_id = Some(step_id.clone());
                 self.active.unit_key = None;
                 self.active.agent = agent.clone();
+                self.active.codename = codename.clone();
+                self.active.provider = None;
+                self.active.model = None;
                 self.active.feed.clear();
                 self.active.last_event_at = None;
                 // A new active step means the old concurrency context (and
@@ -401,6 +429,9 @@ impl LiveRunState {
                     if agent.is_some() {
                         step.agent = agent.clone();
                     }
+                    if codename.is_some() {
+                        step.codename = codename.clone();
+                    }
                 }
             }
             WfEvent::StepWorking { step_id, .. } => {
@@ -410,8 +441,51 @@ impl LiveRunState {
                     }
                 }
             }
-            // Display for agent identity lands with the codename UI work.
-            WfEvent::AgentStarted { .. } => {}
+            WfEvent::AgentStarted {
+                step_id,
+                unit_index,
+                codename,
+                agent,
+                provider,
+                model,
+                ..
+            } => {
+                let on_active_step = self.active.step_id.as_deref() == Some(step_id.as_str());
+                let active_unit_key = self.active.unit_key.clone();
+                let mut unit_is_focused = false;
+                if let Some(step) = self.step_mut(step_id) {
+                    match unit_index {
+                        Some(index) => {
+                            ensure_unit_slot(&mut step.units, *index);
+                            let unit = &mut step.units[*index];
+                            unit.codename = codename.clone();
+                            unit.provider = provider.clone();
+                            unit.model = model.clone();
+                            unit_is_focused = !unit.key.is_empty()
+                                && active_unit_key.as_deref() == Some(unit.key.as_str());
+                        }
+                        None => {
+                            step.codename = codename.clone().or(step.codename.take());
+                            step.provider = provider.clone();
+                            step.model = model.clone();
+                            if step.agent.is_none() {
+                                step.agent = Some(agent.clone());
+                            }
+                        }
+                    }
+                }
+                // Focus follows the agent only when it belongs to what is
+                // already in focus: the step itself, or the focused unit
+                // (a unit-scoped event that lands before its `UnitStarted`
+                // is reconciled when that event re-focuses).
+                if on_active_step
+                    && ((unit_index.is_none() && self.active.unit_key.is_none()) || unit_is_focused)
+                {
+                    self.active.codename = codename.clone();
+                    self.active.provider = provider.clone();
+                    self.active.model = model.clone();
+                }
+            }
             WfEvent::StepAwaitingApproval { step_id, .. } => {
                 if let Some(step) = self.step_mut(step_id) {
                     step.status = NodeStatus::Awaiting;
@@ -449,6 +523,7 @@ impl LiveRunState {
                 unit_key,
                 agent,
                 transcript_path,
+                codename,
                 ..
             } => {
                 // Re-focus on this unit: its transcript drives the feed.
@@ -458,8 +533,12 @@ impl LiveRunState {
                     self.active.agent = agent.clone();
                 }
                 self.active.active_unit_transcript = Some(transcript_path.clone());
+                self.active.codename = codename.clone();
+                self.active.provider = None;
+                self.active.model = None;
                 self.active.feed.clear();
                 self.active.last_event_at = None;
+                let mut focus_meta = None;
                 if let Some(step) = self.step_mut(step_id) {
                     if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
                         step.status = NodeStatus::Working;
@@ -469,6 +548,21 @@ impl LiveRunState {
                     unit.key = unit_key.clone();
                     unit.status = NodeStatus::Working;
                     unit.transcript_path = Some(transcript_path.clone());
+                    if codename.is_some() {
+                        unit.codename = codename.clone();
+                    }
+                    // `AgentStarted` may have landed first (it carries
+                    // provider/model); keep whatever it recorded.
+                    focus_meta = Some((
+                        unit.codename.clone(),
+                        unit.provider.clone(),
+                        unit.model.clone(),
+                    ));
+                }
+                if let Some((c, p, m)) = focus_meta {
+                    self.active.codename = c.or_else(|| codename.clone());
+                    self.active.provider = p;
+                    self.active.model = m;
                 }
             }
             WfEvent::UnitCompleted {
@@ -544,6 +638,9 @@ impl LiveRunState {
                 sub_run_id,
                 agent,
                 transcript_path,
+                codename,
+                provider,
+                model,
                 ..
             } => {
                 // Dispatch carries no `step_id` (it fires from inside the
@@ -563,6 +660,9 @@ impl LiveRunState {
                     self.active.agent = agent.clone();
                 }
                 self.active.active_unit_transcript = Some(transcript_path.clone());
+                self.active.codename = codename.clone();
+                self.active.provider = provider.clone();
+                self.active.model = model.clone();
                 self.active.feed.clear();
                 self.active.last_event_at = None;
                 if let Some(step) = self.step_mut(&step_id) {
@@ -580,6 +680,9 @@ impl LiveRunState {
                             unit.key = key;
                             unit.status = NodeStatus::Working;
                             unit.transcript_path = Some(transcript_path.clone());
+                            unit.codename = codename.clone();
+                            unit.provider = provider.clone();
+                            unit.model = model.clone();
                         }
                         None => {
                             step.units.push(UnitState {
@@ -589,6 +692,9 @@ impl LiveRunState {
                                 elapsed_secs: 0,
                                 transcript_path: Some(transcript_path.clone()),
                                 sub_run_id: Some(sub_run_id.clone()),
+                                codename: codename.clone(),
+                                provider: provider.clone(),
+                                model: model.clone(),
                             });
                         }
                     }
@@ -749,6 +855,9 @@ fn ensure_unit_slot(units: &mut Vec<UnitState>, index: usize) {
             elapsed_secs: 0,
             transcript_path: None,
             sub_run_id: None,
+            codename: None,
+            provider: None,
+            model: None,
         });
     }
 }
@@ -841,6 +950,10 @@ pub fn render_dashboard(state: &LiveRunState, now: DateTime<Utc>, width: usize) 
     let right = format!("{label} · {elapsed}");
     let mut title = String::new();
     let _ = palette::write_bold_colored(&mut title, &state.workflow_name, BRAND);
+    if let Some(c) = state.codename.as_deref() {
+        title.push_str("  ");
+        super::codename::write_crew(&mut title, c.split('/').next().unwrap_or(c));
+    }
     let used = visible_len(&title) + visible_len(&right);
     let pad = width.saturating_sub(used);
     title.push_str(&" ".repeat(pad));
@@ -1056,7 +1169,22 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                         let right = unit_right(unit);
                         let unit_selected = is_active_step
                             && matches!(state.selected, Some(NodeRef::Unit { index }) if index == ui);
-                        let unit_label = mark_selected(&unit.key, unit_selected);
+                        let unit_text = match unit.codename.as_deref() {
+                            Some(c) => {
+                                let label = super::codename::member_label(
+                                    Some(c),
+                                    &unit.key,
+                                    unit.provider.as_deref(),
+                                    unit.model.as_deref(),
+                                );
+                                match super::codename::badge_glyph(c) {
+                                    Some(g) => format!("{g} {label}"),
+                                    None => label,
+                                }
+                            }
+                            None => unit.key.clone(),
+                        };
+                        let unit_label = mark_selected(&unit_text, unit_selected);
                         rows.push(leader_line(
                             &prefix,
                             unit.status,
@@ -1107,6 +1235,17 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                 };
                 let label = if agent.is_empty() {
                     step.id.clone()
+                } else if step.codename.is_some() || step.provider.is_some() {
+                    format!(
+                        "{} · {}",
+                        step.id,
+                        super::codename::member_label(
+                            step.codename.as_deref(),
+                            &agent,
+                            step.provider.as_deref(),
+                            step.model.as_deref(),
+                        )
+                    )
                 } else {
                     format!("{} · {agent}", step.id)
                 };
@@ -1181,7 +1320,19 @@ pub fn render_focus(
         .clone()
         .or_else(|| state.active.step_id.clone())
         .unwrap_or_else(|| "—".to_string());
-    let header_left = format!("{unit} · {agent}");
+    let header_left = if state.active.codename.is_some() || state.active.provider.is_some() {
+        format!(
+            "{unit} · {}",
+            super::codename::member_label(
+                state.active.codename.as_deref(),
+                &agent,
+                state.active.provider.as_deref(),
+                state.active.model.as_deref(),
+            )
+        )
+    } else {
+        format!("{unit} · {agent}")
+    };
 
     let heartbeat = match state.active.last_event_at {
         Some(ts) => {
@@ -1590,6 +1741,13 @@ pub async fn run_live_view(
         // `UnitStarted`) wins; `run.json`'s active_step_transcript_path
         // is null then. For a linear step, fall back to that path.
         if let Ok(record) = store.load(&run_id) {
+            if state.codename.is_none() {
+                state.codename = Some(crate::output::codename::display_codename(
+                    record.codename.as_deref(),
+                    &run_id,
+                    None,
+                ));
+            }
             if let Some(step_id) = record.active_step_id.clone() {
                 // Don't clobber a fan-out unit focus set by UnitStarted.
                 if state.active.active_unit_transcript.is_none() {
@@ -1814,6 +1972,9 @@ mod tests {
     fn fanout_state(active: bool) -> LiveRunState {
         let units = vec![
             UnitState {
+                codename: None,
+                provider: None,
+                model: None,
                 key: "conf-manager".into(),
                 status: NodeStatus::Complete,
                 tokens: 210_000,
@@ -1822,6 +1983,9 @@ mod tests {
                 sub_run_id: None,
             },
             UnitState {
+                codename: None,
+                provider: None,
+                model: None,
                 key: "tlb-agent".into(),
                 status: NodeStatus::Complete,
                 tokens: 180_000,
@@ -1830,6 +1994,9 @@ mod tests {
                 sub_run_id: None,
             },
             UnitState {
+                codename: None,
+                provider: None,
+                model: None,
                 key: "app-gw".into(),
                 status: NodeStatus::Working,
                 tokens: 120_000,
@@ -1838,6 +2005,9 @@ mod tests {
                 sub_run_id: None,
             },
             UnitState {
+                codename: None,
+                provider: None,
+                model: None,
                 key: "rtc".into(),
                 status: NodeStatus::Waiting,
                 tokens: 0,
@@ -1846,6 +2016,9 @@ mod tests {
                 sub_run_id: None,
             },
             UnitState {
+                codename: None,
+                provider: None,
+                model: None,
                 key: "auth".into(),
                 status: NodeStatus::Waiting,
                 tokens: 0,
@@ -1855,6 +2028,9 @@ mod tests {
             },
         ];
         let assess = StepState {
+            codename: None,
+            provider: None,
+            model: None,
             id: "assess".into(),
             kind: StepKind::ForEach,
             agent: Some("for_each".into()),
@@ -1872,6 +2048,7 @@ mod tests {
             panel_findings: 0,
         };
         LiveRunState {
+            codename: None,
             workflow_name: "oracle-assessor-workflow".into(),
             run_id: "run_01ABC".into(),
             status: RunStatus::Running,
@@ -1879,6 +2056,9 @@ mod tests {
             finished_at: None,
             steps: vec![
                 StepState {
+                    codename: None,
+                    provider: None,
+                    model: None,
                     id: "understand".into(),
                     kind: StepKind::Linear,
                     agent: Some("oracle-recon".into()),
@@ -1893,6 +2073,9 @@ mod tests {
                 },
                 assess,
                 StepState {
+                    codename: None,
+                    provider: None,
+                    model: None,
                     id: "sweep".into(),
                     kind: StepKind::Panel,
                     agent: None,
@@ -1906,6 +2089,9 @@ mod tests {
                     panel_findings: 2,
                 },
                 StepState {
+                    codename: None,
+                    provider: None,
+                    model: None,
                     id: "report".into(),
                     kind: StepKind::Linear,
                     agent: None,
@@ -1925,6 +2111,9 @@ mod tests {
             findings_count: Some(12),
             coverage_pct: Some(78),
             active: ActiveFocus {
+                codename: None,
+                provider: None,
+                model: None,
                 step_id: Some("assess".into()),
                 unit_key: Some("app-gw".into()),
                 agent: Some("oracle-assessor".into()),
@@ -2091,6 +2280,81 @@ mod tests {
             rows.iter()
                 .any(|r| r.contains("↳ rupu workflow resume run_01ABC")),
             "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn agent_started_shows_name_provider_model_in_focus_and_graph() {
+        let mut state = fanout_state(true);
+        state.apply(&WfEvent::StepStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "report".into(),
+            kind: StepKind::Linear,
+            agent: Some("reporter".into()),
+            host: None,
+            codename: Some("jade-reef/heron".into()),
+        });
+        state.apply(&WfEvent::AgentStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "report".into(),
+            unit_index: None,
+            codename: Some("jade-reef/heron".into()),
+            agent: "reporter".into(),
+            provider: Some("anthropic".into()),
+            model: Some("claude-opus-5-5".into()),
+            agent_run_id: "run_x".into(),
+            transcript_path: std::path::PathBuf::from("/tmp/x.jsonl"),
+        });
+        let focus = stripped(render_focus(&state, ts(33), 100, 6));
+        assert!(
+            focus
+                .iter()
+                .any(|r| r.contains("heron · reporter · anthropic/claude-opus-5-5")),
+            "{focus:#?}"
+        );
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn unit_started_then_agent_started_labels_unit_row() {
+        let mut state = fanout_state(true);
+        let step_id = state
+            .steps
+            .iter()
+            .find(|s| matches!(s.kind, StepKind::ForEach | StepKind::Parallel))
+            .map(|s| s.id.clone())
+            .unwrap();
+        state.apply(&WfEvent::UnitStarted {
+            run_id: "run_01ABC".into(),
+            step_id: step_id.clone(),
+            index: 0,
+            unit_key: "src/a.rs".into(),
+            agent: Some("reviewer".into()),
+            transcript_path: std::path::PathBuf::from("/tmp/u.jsonl"),
+            host: None,
+            codename: Some("jade-reef/lynx#1".into()),
+        });
+        state.apply(&WfEvent::AgentStarted {
+            run_id: "run_01ABC".into(),
+            step_id: step_id.clone(),
+            unit_index: Some(0),
+            codename: Some("jade-reef/lynx#1".into()),
+            agent: "reviewer".into(),
+            provider: Some("openai".into()),
+            model: Some("gpt-5".into()),
+            agent_run_id: "run_y".into(),
+            transcript_path: std::path::PathBuf::from("/tmp/u.jsonl"),
+        });
+        let unit = &state.steps.iter().find(|s| s.id == step_id).unwrap().units[0];
+        assert_eq!(unit.codename.as_deref(), Some("jade-reef/lynx#1"));
+        assert_eq!(state.active.model.as_deref(), Some("gpt-5"));
+        let focus = stripped(render_focus(&state, ts(33), 100, 6));
+        assert!(
+            focus
+                .iter()
+                .any(|r| r.contains("src/a.rs · lynx#1 · reviewer · openai/gpt-5")),
+            "{focus:#?}"
         );
     }
 
@@ -2680,6 +2944,9 @@ mod tests {
             let mut units = Vec::new();
             for u in 0..6 {
                 units.push(UnitState {
+                    codename: None,
+                    provider: None,
+                    model: None,
                     key: format!("very-long-unit-name-that-overflows-{i}-{u}"),
                     status: NodeStatus::Working,
                     tokens: 120_000,
@@ -2689,6 +2956,9 @@ mod tests {
                 });
             }
             steps.push(StepState {
+                codename: None,
+                provider: None,
+                model: None,
                 id: format!("step-with-a-deliberately-long-identifier-{i}"),
                 kind: StepKind::ForEach,
                 agent: Some("for_each".into()),
@@ -3074,12 +3344,16 @@ mod tests {
         // step on first press, and further presses are idempotent rather
         // than a special-cased no-op — same algorithm, no branching.
         let mut state = LiveRunState {
+            codename: None,
             workflow_name: "w".into(),
             run_id: "run_1".into(),
             status: RunStatus::Running,
             started_at: Some(ts(0)),
             finished_at: None,
             steps: vec![StepState {
+                codename: None,
+                provider: None,
+                model: None,
                 id: "only".into(),
                 kind: StepKind::Linear,
                 agent: Some("solo-agent".into()),
@@ -3098,6 +3372,9 @@ mod tests {
             findings_count: None,
             coverage_pct: None,
             active: ActiveFocus {
+                codename: None,
+                provider: None,
+                model: None,
                 step_id: Some("only".into()),
                 unit_key: None,
                 agent: Some("solo-agent".into()),
@@ -3135,12 +3412,16 @@ mod tests {
     /// length 1: `[Step]` only).
     fn solo_step_state() -> LiveRunState {
         LiveRunState {
+            codename: None,
             workflow_name: "w".into(),
             run_id: "run_1".into(),
             status: RunStatus::Running,
             started_at: Some(ts(0)),
             finished_at: None,
             steps: vec![StepState {
+                codename: None,
+                provider: None,
+                model: None,
                 id: "only".into(),
                 kind: StepKind::Linear,
                 agent: Some("solo-agent".into()),
@@ -3159,6 +3440,9 @@ mod tests {
             findings_count: None,
             coverage_pct: None,
             active: ActiveFocus {
+                codename: None,
+                provider: None,
+                model: None,
                 step_id: Some("only".into()),
                 unit_key: None,
                 agent: Some("solo-agent".into()),

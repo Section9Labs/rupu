@@ -673,6 +673,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let mut printer = crate::output::LineStreamPrinter::new();
         printer.agent_header(
             &agent_header_name,
+            Some(&codename.to_string()),
             &agent_header_provider,
             &agent_header_model,
             &run_id,

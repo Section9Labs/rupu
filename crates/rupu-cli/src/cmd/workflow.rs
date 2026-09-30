@@ -586,6 +586,8 @@ struct WorkflowListRow {
 #[derive(Serialize)]
 struct WorkflowRunsRow {
     run_id: String,
+    /// Crew codename (stored, else derived for legacy runs).
+    codename: String,
     status: String,
     started_at: String,
     duration_seconds: Option<i64>,
@@ -900,6 +902,7 @@ impl CollectionOutput for WorkflowRunsOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "run_id",
+            "name",
             "status",
             "started_at",
             "duration_seconds",
@@ -941,7 +944,8 @@ fn render_workflow_runs_table(
         prefs,
         opts,
         vec![
-            "RUN ID", "STATUS", "STARTED", "DURATION", "EXPIRES", "TOKENS", "COST", "WORKFLOW",
+            "RUN ID", "NAME", "STATUS", "STARTED", "DURATION", "EXPIRES", "TOKENS", "COST",
+            "WORKFLOW",
         ],
     )
     .with_summary("run");
@@ -963,6 +967,7 @@ fn render_workflow_runs_table(
             .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
         table = table.row(vec![
             CellValue::Id(row.run_id.clone()),
+            CellValue::Name(row.codename.clone()),
             CellValue::Status(row.status.clone()),
             started,
             match row.duration_seconds {
@@ -2402,6 +2407,11 @@ async fn runs(
             let agg = aggregate_run_usage_from_store(&store, &run.id);
             WorkflowRunsRow {
                 run_id: run.id.clone(),
+                codename: crate::output::codename::display_codename(
+                    run.codename.as_deref(),
+                    &run.id,
+                    None,
+                ),
                 status: run.status.as_str().to_string(),
                 started_at: run.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                 duration_seconds: run
@@ -6258,6 +6268,7 @@ steps:
     ) -> WorkflowRunsRow {
         WorkflowRunsRow {
             run_id: run_id.to_string(),
+            codename: "cobalt-harbor".to_string(),
             status: status.to_string(),
             started_at: started_at.to_string(),
             duration_seconds: Some(194),

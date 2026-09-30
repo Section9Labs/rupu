@@ -71,6 +71,9 @@ pub struct RunSummary {
     /// most aborted runs still emit at least one chunk before the
     /// abort).
     pub first_assistant_text: Option<String>,
+    /// Codename recorded on `run_start`; `None` on pre-codename transcripts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 /// What a transcript's `run_start` event carries — everything knowable
@@ -133,6 +136,7 @@ impl JsonlReader {
             model,
             started_at,
             mode,
+            codename,
             ..
         }) = start
         else {
@@ -170,6 +174,7 @@ impl JsonlReader {
             duration_ms,
             error,
             first_assistant_text: first_assistant,
+            codename,
         })
     }
 

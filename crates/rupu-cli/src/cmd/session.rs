@@ -467,6 +467,8 @@ impl SessionRecord {
 #[derive(Serialize)]
 struct SessionListRow {
     session_id: String,
+    /// Codename (stored, else derived for legacy sessions).
+    codename: String,
     agent: String,
     scope: String,
     status: String,
@@ -478,6 +480,7 @@ struct SessionListRow {
 #[derive(Serialize)]
 struct SessionListCsvRow {
     session_id: String,
+    codename: String,
     agent: String,
     scope: String,
     status: String,
@@ -611,6 +614,7 @@ impl CollectionOutput for SessionListOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "session_id",
+            "name",
             "agent",
             "scope",
             "status",
@@ -643,7 +647,7 @@ fn render_session_list_table(
         prefs,
         prefs.render_opts(),
         vec![
-            "SESSION", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
+            "SESSION", "NAME", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
         ],
     )
     .with_summary("session");
@@ -657,6 +661,7 @@ fn render_session_list_table(
         };
         table = table.row(vec![
             CellValue::Id(row.session_id.clone()),
+            CellValue::Name(row.codename.clone()),
             CellValue::Text(row.agent.clone()),
             CellValue::Status(row.scope.clone()),
             CellValue::Status(row.status.clone()),
@@ -1191,6 +1196,11 @@ async fn list(
             }
             rows.push(SessionListRow {
                 session_id: session.session_id.clone(),
+                codename: crate::output::codename::display_codename(
+                    session.codename.as_deref(),
+                    &session.session_id,
+                    Some(&session.agent_name),
+                ),
                 agent: session.agent_name.clone(),
                 scope: scope.as_str().to_string(),
                 status: session.status.as_str().to_string(),
@@ -1205,6 +1215,7 @@ async fn list(
         .iter()
         .map(|row| SessionListCsvRow {
             session_id: row.session_id.clone(),
+            codename: row.codename.clone(),
             agent: row.agent.clone(),
             scope: row.scope.clone(),
             status: row.status.clone(),
@@ -6282,7 +6293,12 @@ fn render_session_attach_intro(
     printer: &mut crate::output::LineStreamPrinter,
     session: &SessionRecord,
 ) {
-    printer.session_header(&session.session_id, &session.agent_name);
+    let codename = crate::output::codename::display_codename(
+        session.codename.as_deref(),
+        &session.session_id,
+        Some(&session.agent_name),
+    );
+    printer.session_header(&session.session_id, &session.agent_name, Some(&codename));
     printer.sideband_event(
         session_attach_status(session.status),
         "session",
@@ -10681,6 +10697,7 @@ mod tests {
     ) -> SessionListRow {
         SessionListRow {
             session_id: session_id.to_string(),
+            codename: "cobalt-harbor/heron".to_string(),
             agent: agent.to_string(),
             scope: scope.to_string(),
             status: status.to_string(),

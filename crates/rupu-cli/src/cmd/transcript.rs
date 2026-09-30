@@ -204,6 +204,8 @@ fn one_line_preview(s: &str, max: usize) -> String {
 #[derive(Serialize)]
 struct TranscriptListRow {
     run_id: String,
+    /// Codename from `run_start`; legacy transcripts derive one.
+    codename: String,
     scope: String,
     title: Option<String>,
     agent: String,
@@ -215,6 +217,7 @@ struct TranscriptListRow {
 #[derive(Serialize)]
 struct TranscriptListCsvRow {
     run_id: String,
+    codename: String,
     scope: String,
     title: String,
     agent: String,
@@ -316,6 +319,7 @@ impl CollectionOutput for TranscriptListOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "run_id",
+            "name",
             "scope",
             "title",
             "agent",
@@ -370,7 +374,7 @@ fn build_transcript_list_table<'a>(
         prefs,
         prefs.render_opts(),
         vec![
-            "RUN ID", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
+            "RUN ID", "NAME", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
         ],
     )
     .with_summary("transcript");
@@ -393,6 +397,7 @@ fn build_transcript_list_table<'a>(
             .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
         table = table.row(vec![
             CellValue::Id(row.run_id.clone()),
+            CellValue::Name(row.codename.clone()),
             CellValue::Status(row.scope.clone()),
             row.title
                 .clone()
@@ -1349,10 +1354,16 @@ pub(crate) fn render_pretty_transcript_event(
             model,
             started_at,
             mode,
+            codename,
             ..
         } => {
             if context == TranscriptPrettyContext::Standalone {
-                printer.agent_header(agent, provider, model, run_id);
+                let display = crate::output::codename::display_codename(
+                    codename.as_deref(),
+                    run_id,
+                    Some(agent),
+                );
+                printer.agent_header(agent, Some(&display), provider, model, run_id);
             }
             let detail = format!(
                 "{}  ·  workspace {workspace_id}  ·  mode {}  ·  {}",
@@ -1768,6 +1779,7 @@ async fn list(
 
     struct Row {
         run_id: String,
+        codename: Option<String>,
         scope: TranscriptScope,
         title: Option<String>,
         agent: String,
@@ -1825,6 +1837,7 @@ async fn list(
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
                 run_id: s.run_id,
+                codename: s.codename,
                 scope: *scope,
                 title: s.first_assistant_text,
                 agent: s.agent,
@@ -1868,6 +1881,11 @@ async fn list(
         .iter()
         .map(|row| TranscriptListRow {
             run_id: row.run_id.clone(),
+            codename: crate::output::codename::display_codename(
+                row.codename.as_deref(),
+                &row.run_id,
+                Some(&row.agent),
+            ),
             scope: row.scope.as_str().to_string(),
             title: row.title.clone(),
             agent: row.agent.clone(),
@@ -1884,6 +1902,7 @@ async fn list(
         .iter()
         .map(|row| TranscriptListCsvRow {
             run_id: row.run_id.clone(),
+            codename: row.codename.clone(),
             scope: row.scope.clone(),
             title: row.title.clone().unwrap_or_default(),
             agent: row.agent.clone(),
@@ -2625,6 +2644,7 @@ mod tests {
     ) -> TranscriptListRow {
         TranscriptListRow {
             run_id: run_id.to_string(),
+            codename: "cobalt-harbor/heron".to_string(),
             scope: scope.to_string(),
             title: title.map(str::to_string),
             agent: agent.to_string(),
@@ -2839,7 +2859,11 @@ mod tests {
             &transcript_list_test_prefs(),
             transcript_list_test_now(),
         )
-        .render_at_width(transcript_list_test_now(), 80);
+        // 100 cols, not 80: the NAME column (fixed-width, no-wrap, ~19
+        // chars) added alongside RUN ID leaves 80 too cramped for ANY
+        // wrapping column to fit; 100 keeps the same squeeze pressure
+        // from the 63-char AGENT that this guard is about.
+        .render_at_width(transcript_list_test_now(), 100);
         assert!(
             out.contains("1200"),
             "TOKENS column collapsed under a long AGENT name: {out}"
