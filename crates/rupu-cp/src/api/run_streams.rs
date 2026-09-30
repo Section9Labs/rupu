@@ -767,6 +767,7 @@ async fn list_agent_runs(
                 .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
+                    crate::codename::inject_codename_row(&mut row, "run_id", Some("agent"));
                     row
                 })
                 .collect(),
@@ -816,6 +817,11 @@ async fn list_agent_runs(
     .await;
 
     sort_values_newest_first(&mut all_values, "started_at");
+    // Rows from older remotes carry no codename; local rows already do (a
+    // no-op for them, flag preserved).
+    for row in &mut all_values {
+        crate::codename::inject_codename_row(row, "run_id", Some("agent"));
+    }
 
     // Lifecycle filter after merge
     let lifecycle = q.lifecycle.as_deref();
@@ -2445,6 +2451,67 @@ mod tests {
         .await
         .expect("a malformed since must degrade, never error");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_agent_run_rows_get_derived_codename_on_single_host_and_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: "host_fake".into(),
+                name: "fake".into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let registry = std::sync::Arc::new(crate::host::registry::HostRegistry::new(
+            host_store,
+            std::sync::Arc::new(crate::api::runs::tests::FakeHostConnector {
+                run_json: serde_json::json!({ "agent_runs": [
+                    {"run_id": "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", "agent": "triage",
+                     "started_at": "2026-08-01T00:00:00Z", "status": "ok"},
+                    {"run_id": "run_named", "agent": "triage",
+                     "started_at": "2026-08-02T00:00:00Z", "status": "ok",
+                     "codename": "cobalt-harbor/heron", "codename_derived": false},
+                ]}),
+            }),
+        ));
+        for host in ["host_fake", "all"] {
+            let s = crate::state::AppState::new(
+                tmp.path().to_path_buf(),
+                rupu_config::PricingConfig::default(),
+            )
+            .with_hosts(registry.clone());
+            let Json(rows) = list_agent_runs(
+                State(s),
+                Query(AgentRunsQuery {
+                    offset: None,
+                    limit: None,
+                    lifecycle: None,
+                    host: Some(host.into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+            .await
+            .expect("ok");
+            let by = |id: &str| rows.iter().find(|r| r["run_id"] == id).cloned().unwrap();
+            let legacy = by("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W");
+            assert_eq!(
+                legacy["codename"],
+                rupu_codename::derive_legacy("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", Some("triage")),
+                "host={host}"
+            );
+            assert_eq!(legacy["codename_derived"], true, "host={host}");
+            let named = by("run_named");
+            assert_eq!(named["codename"], "cobalt-harbor/heron", "host={host}");
+            assert_eq!(named["codename_derived"], false, "host={host}");
+        }
     }
 
     #[tokio::test]

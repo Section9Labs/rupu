@@ -860,7 +860,13 @@ fn host_connector_err(id: &str, host_id: &str, e: HostConnectorError) -> ApiErro
 async fn get_run_from_host(s: &AppState, host_id: &str, id: &str) -> ApiResult<serde_json::Value> {
     let conn = resolve_host(s, host_id)?;
     match conn.get_run(id).await {
-        Ok(v) => Ok(v),
+        Ok(mut v) => {
+            // An older remote's run record carries no codename; fill it.
+            if let Some(run) = v.get_mut("run") {
+                crate::codename::inject_codename_row(run, "id", None);
+            }
+            Ok(v)
+        }
         Err(e) => {
             if conn.serves_runs_from_local_mirror() && s.run_store.load(id).is_ok() {
                 return query_run_detail(&s.run_store, id, &s.pricing)
@@ -1395,7 +1401,7 @@ async fn list_archived_runs(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::path::PathBuf;
@@ -2691,8 +2697,8 @@ mod tests {
     /// without any real network. Only `get_run`/`proxy_get_json` are
     /// exercised by these tests; every other method panics loudly if
     /// accidentally called, rather than silently no-opping.
-    struct FakeHostConnector {
-        run_json: serde_json::Value,
+    pub(crate) struct FakeHostConnector {
+        pub(crate) run_json: serde_json::Value,
     }
 
     #[async_trait::async_trait]
@@ -2732,6 +2738,14 @@ mod tests {
         }
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
             Ok(self.run_json.clone())
+        }
+        /// Rows for agent-run listing come from `run_json["agent_runs"]`
+        /// when present (else the trait default `Unsupported`).
+        async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            match self.run_json.get("agent_runs").and_then(|v| v.as_array()) {
+                Some(rows) => Ok(rows.clone()),
+                None => Err(HostConnectorError::Unsupported("agent-run listing".into())),
+            }
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!("not exercised by this test")
@@ -2828,7 +2842,46 @@ mod tests {
         )
         .await
         .expect("host-resolved run should proxy, not 404");
-        assert_eq!(resp.0, fake_run_json);
+        // The proxied payload is unchanged apart from the derived codename
+        // this coordinator fills in for an older remote.
+        let mut got = resp.0;
+        assert_eq!(got["run"]["codename_derived"], true);
+        assert!(got["run"]["codename"].is_string());
+        got["run"].as_object_mut().unwrap().remove("codename");
+        got["run"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codename_derived");
+        assert_eq!(got, fake_run_json);
+    }
+
+    #[tokio::test]
+    async fn get_run_from_host_injects_derived_codename_for_older_remote() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mk = |run: serde_json::Value| {
+            let fake: Arc<dyn crate::host::connector::HostConnector> =
+                Arc::new(FakeHostConnector {
+                    run_json: serde_json::json!({"run": run, "steps": [], "usage": {}}),
+                });
+            test_state(&tmp).with_hosts(Arc::new(crate::host::registry::HostRegistry::new(
+                rupu_workspace::HostStore {
+                    root: tmp.path().join("hosts"),
+                },
+                fake,
+            )))
+        };
+        // Older remote: no codename -> derived + flagged.
+        let s = mk(serde_json::json!({"id": "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W"}));
+        let d = get_run_from_host(&s, "local", "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W")
+            .await
+            .unwrap();
+        assert_eq!(d["run"]["codename"], "jade-reef");
+        assert_eq!(d["run"]["codename_derived"], true);
+        // Newer remote: stored name kept, not derived.
+        let s = mk(serde_json::json!({"id": "run_x", "codename": "cobalt-harbor"}));
+        let d = get_run_from_host(&s, "local", "run_x").await.unwrap();
+        assert_eq!(d["run"]["codename"], "cobalt-harbor");
+        assert_eq!(d["run"]["codename_derived"], false);
     }
 
     /// Fake `HostConnector` that mimics an SSH host whose remote `rupu`

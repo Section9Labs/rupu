@@ -17,6 +17,11 @@ pub fn inject_codename(obj: &mut serde_json::Value, id: &str, agent: Option<&str
         return;
     };
     let stored = map.get("codename").and_then(|v| v.as_str());
+    // A row that already carries both keys (a newer remote, or one of our own
+    // rows that was itself derived) is authoritative: keep its flag.
+    if stored.is_some() && map.get("codename_derived").is_some_and(|v| v.is_boolean()) {
+        return;
+    }
     let (name, derived) = named(stored, id, agent);
     map.insert("codename".into(), serde_json::Value::String(name));
     map.insert("codename_derived".into(), serde_json::Value::Bool(derived));
@@ -61,6 +66,10 @@ mod tests {
         inject_codename(&mut b, "run_X", None);
         assert_eq!(b["codename"], "cobalt-harbor");
         assert_eq!(b["codename_derived"], false);
+        // Already-flagged rows keep their flag (a derived name stays derived).
+        let mut d = serde_json::json!({"codename": "jade-reef", "codename_derived": true});
+        inject_codename(&mut d, "run_X", None);
+        assert_eq!(d["codename_derived"], true);
         let mut n = serde_json::json!("x");
         inject_codename(&mut n, "run_X", None);
         assert_eq!(n, "x");
