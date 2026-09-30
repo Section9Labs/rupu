@@ -9308,6 +9308,7 @@ mod tests {
                 input_tokens: 123,
                 output_tokens: 7,
                 cached_tokens: 9,
+                cache_write_tokens: 0,
                 reasoning_tokens: 0,
             },))
         );

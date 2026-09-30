@@ -15,6 +15,7 @@ fn usage(input: u32, output: u32, cached: u32) -> Usage {
         input_tokens: input,
         output_tokens: output,
         cached_tokens: cached,
+        cache_write_tokens: 0,
         reasoning_tokens: 0,
     }
 }
@@ -165,6 +166,7 @@ async fn on_usage_reports_billable_output_including_reasoning() {
             input_tokens: 40,
             output_tokens: 6,
             cached_tokens: 3,
+            cache_write_tokens: 0,
             reasoning_tokens: 9,
         },
     }]);

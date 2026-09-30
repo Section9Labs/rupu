@@ -962,6 +962,7 @@ fn process_gemini_sse(
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: acc.reasoning_tokens,
         }));
     }
@@ -1984,7 +1985,7 @@ mod tests {
         assert_eq!(response.usage.output_tokens, 5);
         assert_eq!(response.usage.reasoning_tokens, 120);
         assert!(events.iter().any(|event| event.contains(
-            "UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 0, reasoning_tokens: 120"
+            "UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 120"
         )));
     }
 

@@ -2305,6 +2305,7 @@ mod on_tool_call_tests {
                     input_tokens: 15,
                     output_tokens: 8,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                     reasoning_tokens,
                 },
             }]);

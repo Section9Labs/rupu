@@ -686,6 +686,7 @@ impl OpenAiCodexClient {
                             input_tokens: acc.input_tokens,
                             output_tokens: acc.output_tokens,
                             cached_tokens: acc.cached_tokens,
+                            cache_write_tokens: 0,
                             reasoning_tokens: 0,
                         }));
                     }

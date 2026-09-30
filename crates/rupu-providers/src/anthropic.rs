@@ -1936,24 +1936,11 @@ impl AnthropicClient {
                         .unwrap_or_default()
                         .to_string();
                     if let Some(usage) = msg.get("usage") {
-                        acc.input_tokens = usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        acc.cached_tokens = usage
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as u32)
-                            .unwrap_or(0);
+                        acc.wire = serde_json::from_value(usage.clone()).unwrap_or_default();
                         // Anthropic's output_tokens already includes reasoning
                         // tokens, so reasoning_tokens stays at 0 — see the
                         // contrast note on `Usage::reasoning_tokens`.
-                        on_event(StreamEvent::UsageSnapshot(Usage {
-                            input_tokens: acc.input_tokens,
-                            output_tokens: acc.output_tokens,
-                            cached_tokens: acc.cached_tokens,
-                            reasoning_tokens: 0,
-                        }));
+                        on_event(StreamEvent::UsageSnapshot(acc.wire.normalize()));
                     }
                 }
             }
@@ -2118,19 +2105,23 @@ impl AnthropicClient {
                     }
                 }
                 if let Some(usage) = data.get("usage") {
-                    acc.output_tokens = usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
+                    let field = |k: &str| usage.get(k).and_then(|v| v.as_u64());
+                    acc.wire.output_tokens = field("output_tokens").unwrap_or(0) as u32;
+                    // Newer API versions repeat the input/cache fields in the
+                    // delta with their final values — overwrite when present.
+                    if let Some(n) = field("input_tokens") {
+                        acc.wire.input_tokens = n as u32;
+                    }
+                    if let Some(n) = field("cache_read_input_tokens") {
+                        acc.wire.cache_read_input_tokens = n as u32;
+                    }
+                    if let Some(n) = field("cache_creation_input_tokens") {
+                        acc.wire.cache_creation_input_tokens = n as u32;
+                    }
                     // Anthropic's output_tokens already includes reasoning
                     // tokens, so reasoning_tokens stays at 0 — see the
                     // contrast note on `Usage::reasoning_tokens`.
-                    on_event(StreamEvent::UsageSnapshot(Usage {
-                        input_tokens: acc.input_tokens,
-                        output_tokens: acc.output_tokens,
-                        cached_tokens: acc.cached_tokens,
-                        reasoning_tokens: 0,
-                    }));
+                    on_event(StreamEvent::UsageSnapshot(acc.wire.normalize()));
                 }
             }
             "message_stop" | "ping" => {}
@@ -2139,6 +2130,36 @@ impl AnthropicClient {
             }
         }
         Ok(())
+    }
+}
+
+/// Anthropic's wire usage. Its `input_tokens` EXCLUDES cache reads and cache
+/// writes; `normalize` folds both back in so every provider's
+/// `Usage.input_tokens` means "the whole prompt".
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AnthropicWireUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+}
+
+impl AnthropicWireUsage {
+    fn normalize(&self) -> Usage {
+        Usage {
+            input_tokens: self
+                .input_tokens
+                .saturating_add(self.cache_read_input_tokens)
+                .saturating_add(self.cache_creation_input_tokens),
+            output_tokens: self.output_tokens,
+            cached_tokens: self.cache_read_input_tokens,
+            cache_write_tokens: self.cache_creation_input_tokens,
+            reasoning_tokens: 0,
+        }
     }
 }
 
@@ -2158,9 +2179,7 @@ struct StreamAccumulator {
     text: String,
     content_blocks: Vec<ContentBlock>,
     stop_reason: Option<StopReason>,
-    input_tokens: u32,
-    output_tokens: u32,
-    cached_tokens: u32,
+    wire: AnthropicWireUsage,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
@@ -2197,12 +2216,7 @@ impl StreamAccumulator {
             model: self.model,
             content: self.content_blocks,
             stop_reason: self.stop_reason,
-            usage: Usage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                cached_tokens: self.cached_tokens,
-                reasoning_tokens: 0,
-            },
+            usage: self.wire.normalize(),
         })
     }
 }
@@ -2278,7 +2292,7 @@ struct AnthropicResponse {
     model: String,
     content: Vec<serde_json::Value>,
     stop_reason: Option<StopReason>,
-    usage: Usage,
+    usage: AnthropicWireUsage,
 }
 
 impl AnthropicResponse {
@@ -2289,7 +2303,7 @@ impl AnthropicResponse {
             model: self.model,
             content,
             stop_reason: self.stop_reason,
-            usage: self.usage,
+            usage: self.usage.normalize(),
         }
     }
 }
@@ -3362,8 +3376,8 @@ mod tests {
         acc.model = "claude-sonnet-4-6".into();
         acc.text = "Hello world".into();
         acc.stop_reason = Some(StopReason::EndTurn);
-        acc.input_tokens = 10;
-        acc.output_tokens = 5;
+        acc.wire.input_tokens = 10;
+        acc.wire.output_tokens = 5;
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.id, "msg_123");
@@ -3707,8 +3721,122 @@ mod tests {
         let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
         let resp: LlmResponse = parsed.into_llm_response();
         assert_eq!(resp.usage.cached_tokens, 200);
-        assert_eq!(resp.usage.input_tokens, 10);
+        // Anthropic's wire `input_tokens` (10) EXCLUDES cache reads; the
+        // provider boundary normalizes it to the whole prompt: 10 + 200.
+        assert_eq!(resp.usage.input_tokens, 210);
         assert_eq!(resp.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn decode_response_normalizes_cache_reads_and_writes_into_input() {
+        let body = r#"{
+            "id": "msg_x", "model": "claude-opus-5-5",
+            "content": [{"type":"text","text":"hi"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let resp = parsed.into_llm_response();
+        assert_eq!(resp.usage.input_tokens, 240);
+        assert_eq!(resp.usage.cached_tokens, 200);
+        assert_eq!(resp.usage.cache_write_tokens, 30);
+        assert_eq!(resp.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn stream_usage_normalizes_and_message_delta_cache_fields_win_when_present() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let mut snapshots: Vec<Usage> = Vec::new();
+
+        // message_start carries input 10 / read 200 / write 30; message_delta
+        // carries output 7 and (newer API) repeats the cache fields.
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_c","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    if let StreamEvent::UsageSnapshot(u) = se {
+                        snapshots.push(u);
+                    }
+                })
+                .unwrap();
+        }
+
+        // message_start snapshot is already normalized.
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].input_tokens, 240);
+        assert_eq!(snapshots[0].cached_tokens, 200);
+        assert_eq!(snapshots[0].cache_write_tokens, 30);
+        // Final usage.
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 240);
+        assert_eq!(response.usage.cached_tokens, 200);
+        assert_eq!(response.usage.cache_write_tokens, 30);
+        assert_eq!(response.usage.output_tokens, 7);
+        assert_eq!(snapshots[1].input_tokens, 240);
+        assert_eq!(snapshots[1].output_tokens, 7);
+    }
+
+    #[test]
+    fn stream_message_delta_cache_fields_overwrite_message_start_values() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_d","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"input_tokens":12,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+        let response = acc.into_response().unwrap();
+        // 12 + 100 + 50
+        assert_eq!(response.usage.input_tokens, 162);
+        assert_eq!(response.usage.cached_tokens, 100);
+        assert_eq!(response.usage.cache_write_tokens, 50);
+        assert_eq!(response.usage.output_tokens, 4);
+    }
+
+    #[test]
+    fn stream_message_delta_without_cache_fields_keeps_message_start_values() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_e","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 240);
+        assert_eq!(response.usage.cached_tokens, 200);
+        assert_eq!(response.usage.cache_write_tokens, 30);
+        assert_eq!(response.usage.output_tokens, 9);
     }
 
     #[test]

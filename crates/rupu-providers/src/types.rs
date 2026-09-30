@@ -121,8 +121,18 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    // The `cache_read_input_tokens` alias is legacy and harmless: Anthropic
+    // wire usage is now parsed by `anthropic::AnthropicWireUsage`, which
+    // normalizes at the provider boundary. Never normalize in this
+    // Deserialize — the broker also uses it for already-normalized values.
     #[serde(default, alias = "cache_read_input_tokens")]
     pub cached_tokens: u32,
+    /// Prompt tokens written to the provider's prompt cache on this call — a
+    /// SUBSET of `input_tokens`, like `cached_tokens` (cache reads). Only
+    /// Anthropic reports it (`cache_creation_input_tokens`); billed at the
+    /// cache-write rate (1.25x input for the 5-minute TTL).
+    #[serde(default)]
+    pub cache_write_tokens: u32,
     /// Reasoning/"thinking" tokens, billed separately from `output_tokens`.
     ///
     /// Only Gemini populates this (from `usageMetadata.thoughtsTokenCount`,
@@ -542,6 +552,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 reasoning_tokens: 0,
             },
         }
