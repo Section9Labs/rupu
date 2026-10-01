@@ -240,6 +240,7 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
         &global_config_path()?,
         &resolver,
         filter.as_deref(),
+        rupu_runtime::model_limits::FETCH_TIMEOUT,
     )
     .await?;
     for o in outcomes {

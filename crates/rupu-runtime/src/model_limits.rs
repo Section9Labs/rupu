@@ -22,23 +22,32 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `resolve` needs from config. Owned, so long-lived holders (the step
 /// factory, the dispatcher) keep it without the whole `Config`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LimitsContext {
     pub cache_dir: PathBuf,
     /// `[providers.<name>].models`, keyed by provider/account name.
     pub custom: HashMap<String, Vec<rupu_config::CustomModel>>,
+    /// Bound on a stale-cache refetch. [`FETCH_TIMEOUT`] everywhere but tests,
+    /// which inject a short one instead of pausing the clock.
+    pub fetch_timeout: Duration,
+}
+
+impl Default for LimitsContext {
+    fn default() -> Self {
+        Self::for_cache_dir(PathBuf::new())
+    }
 }
 
 impl LimitsContext {
     pub fn from_config(cfg: &rupu_config::Config, global_dir: &Path) -> Self {
         Self {
-            cache_dir: cache_dir(global_dir),
             custom: cfg
                 .providers
                 .iter()
                 .filter(|(_, p)| !p.models.is_empty())
                 .map(|(n, p)| (n.clone(), p.models.clone()))
                 .collect(),
+            ..Self::for_cache_dir(cache_dir(global_dir))
         }
     }
 
@@ -46,7 +55,17 @@ impl LimitsContext {
         Self {
             cache_dir,
             custom: HashMap::new(),
+            fetch_timeout: FETCH_TIMEOUT,
         }
+    }
+}
+
+/// `10s`, or `50ms` for a sub-second (test-injected) timeout.
+fn fmt_timeout(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
     }
 }
 
@@ -95,7 +114,7 @@ pub async fn resolve(
     }
     let mut note: Option<String> = None;
     if registry.cache_is_stale(provider_name).await {
-        match tokio::time::timeout(FETCH_TIMEOUT, provider.fetch_models()).await {
+        match tokio::time::timeout(ctx.fetch_timeout, provider.fetch_models()).await {
             // A listing that parsed to zero models is a failed refresh, not an
             // answer: caching it would replace a good entry (and make every
             // model "missing from the list" for an hour).
@@ -116,8 +135,8 @@ pub async fn resolve(
             Ok(Err(e)) => note = Some(format!("model list refresh failed: {e}")),
             Err(_) => {
                 note = Some(format!(
-                    "model list refresh timed out after {}s",
-                    FETCH_TIMEOUT.as_secs()
+                    "model list refresh timed out after {}",
+                    fmt_timeout(ctx.fetch_timeout)
                 ))
             }
         }
@@ -244,28 +263,29 @@ pub struct RefreshOutcome {
 }
 
 /// Refetch live model lists (spec §8). Providers run in parallel, each
-/// bounded by [`FETCH_TIMEOUT`] as a whole (client build, credential
-/// resolution and any token refresh included, not just the HTTP listing);
-/// one failing or hanging never fails the others.
+/// bounded by `fetch_timeout` ([`FETCH_TIMEOUT`] outside tests) as a whole
+/// (client build, credential resolution and any token refresh included, not
+/// just the HTTP listing); one failing or hanging never fails the others.
 pub async fn refresh(
     cfg: &rupu_config::Config,
     cache_dir: &Path,
     cfg_path: &Path,
     resolver: &dyn rupu_auth::CredentialResolver,
     only: Option<&str>,
+    fetch_timeout: Duration,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
     let names = resolve_targets(only, cfg, cfg_path)?;
     let registry = ModelRegistry::with_cache_dir(cache_dir);
     let registry = &registry;
     let jobs = names.iter().map(|name| async move {
-        match tokio::time::timeout(FETCH_TIMEOUT, refresh_one(name, cfg, resolver, registry)).await
+        match tokio::time::timeout(fetch_timeout, refresh_one(name, cfg, resolver, registry)).await
         {
             Ok(outcome) => outcome,
             Err(_) => RefreshOutcome {
                 provider: name.clone(),
                 ok: false,
                 count: 0,
-                error: Some(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
+                error: Some(format!("timed out after {}", fmt_timeout(fetch_timeout))),
             },
         }
     });

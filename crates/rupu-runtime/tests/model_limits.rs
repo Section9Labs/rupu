@@ -14,8 +14,9 @@ struct Fake {
     calls: Arc<AtomicUsize>,
     shares: bool,
     id: ProviderId,
-    /// Sleep this long (tokio time, so `start_paused` tests are instant)
-    /// before answering.
+    /// Sleep this long (real time) before answering. Timeout tests pair a
+    /// short injected fetch timeout with a longer delay, so no test needs a
+    /// paused clock (which would also have to cover real filesystem I/O).
     delay: Option<std::time::Duration>,
 }
 
@@ -361,12 +362,30 @@ async fn refresh_with(
     resolver: &dyn rupu_auth::CredentialResolver,
     only: Option<&str>,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
+    refresh_with_timeout(
+        cfg,
+        tmp,
+        resolver,
+        only,
+        rupu_runtime::model_limits::FETCH_TIMEOUT,
+    )
+    .await
+}
+
+async fn refresh_with_timeout(
+    cfg: &rupu_config::Config,
+    tmp: &tempfile::TempDir,
+    resolver: &dyn rupu_auth::CredentialResolver,
+    only: Option<&str>,
+    fetch_timeout: std::time::Duration,
+) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
     rupu_runtime::model_limits::refresh(
         cfg,
         &cache_of(tmp),
         &tmp.path().join("config.toml"),
         resolver,
         only,
+        fetch_timeout,
     )
     .await
 }
@@ -618,7 +637,7 @@ async fn fetch_error_with_no_cache_is_unknown_with_a_note() {
     assert!(note.contains("connection refused"), "{note}");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn slow_fetch_times_out_to_unknown_with_a_note() {
     let tmp = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -627,23 +646,30 @@ async fn slow_fetch_times_out_to_unknown_with_a_note() {
         calls: calls.clone(),
         shares: true,
         id: ProviderId::Anthropic,
-        delay: Some(std::time::Duration::from_secs(3600)),
+        delay: Some(std::time::Duration::from_secs(1)),
     };
+    let mut c = ctx(&tmp);
+    c.fetch_timeout = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
     let l = resolve(
         LimitOverrides::default(),
         "anthropic",
         "claude-a",
         &mut p,
-        &ctx(&tmp),
+        &c,
     )
     .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the injected timeout, not the fetch, ends the wait"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         (l.input.tokens, &l.input.source),
         (None, &LimitSource::Unknown)
     );
     let note = l.note.as_deref().unwrap();
-    assert!(note.contains("timed out after 10s"), "{note}");
+    assert!(note.contains("timed out after 50ms"), "{note}");
     // The late answer was dropped, never cached.
     assert!(!tmp.path().join("cache/models/anthropic.json").exists());
 }
@@ -687,7 +713,7 @@ impl rupu_auth::CredentialResolver for SlowResolver {
         rupu_providers::AuthMode,
         rupu_providers::auth::AuthCredentials,
     )> {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         anyhow::bail!("credential store answered too late")
     }
     async fn refresh(
@@ -699,17 +725,43 @@ impl rupu_auth::CredentialResolver for SlowResolver {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn refresh_bounds_the_whole_provider_job_not_just_the_fetch() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = rupu_config::Config::default();
-    let out = refresh_with(&cfg, &tmp, &SlowResolver, Some("anthropic"))
-        .await
-        .unwrap();
+    let started = std::time::Instant::now();
+    let out = refresh_with_timeout(
+        &cfg,
+        &tmp,
+        &SlowResolver,
+        Some("anthropic"),
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
     assert_eq!(out.len(), 1);
     assert!(!out[0].ok);
     assert_eq!(out[0].count, 0);
-    assert_eq!(out[0].error.as_deref(), Some("timed out after 10s"));
+    assert_eq!(out[0].error.as_deref(), Some("timed out after 50ms"));
+}
+
+/// Production callers get the spec's 10s fetch timeout unless they inject
+/// another.
+#[test]
+fn the_fetch_timeout_defaults_to_10s() {
+    use rupu_runtime::model_limits::FETCH_TIMEOUT;
+    assert_eq!(FETCH_TIMEOUT, std::time::Duration::from_secs(10));
+    assert_eq!(LimitsContext::default().fetch_timeout, FETCH_TIMEOUT);
+    assert_eq!(
+        LimitsContext::for_cache_dir("/x".into()).fetch_timeout,
+        FETCH_TIMEOUT
+    );
+    assert_eq!(
+        LimitsContext::from_config(&rupu_config::Config::default(), std::path::Path::new("/x"))
+            .fetch_timeout,
+        FETCH_TIMEOUT
+    );
 }
 
 /// Mock an openai-compatible `/v1/models` and refresh `oracle` from it.

@@ -37,6 +37,7 @@ impl ModelCatalog for RuntimeModelCatalog {
             &cfg_path,
             &resolver,
             provider.as_deref(),
+            rupu_runtime::model_limits::FETCH_TIMEOUT,
         )
         .await
         .map_err(|e| ModelCatalogError::UnknownProvider(e.to_string()))
