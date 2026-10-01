@@ -336,16 +336,27 @@ fn make_model_info(id: &str) -> crate::model_pool::ModelInfo {
 
 /// Copilot `GET {api}/models` → `ModelInfo`s (spec 2026-09-30 §3). Input is
 /// `max_prompt_tokens` (often far below the window), else
-/// `max_context_window_tokens`; non-chat models are skipped.
+/// `max_context_window_tokens`; non-chat models are skipped. A reported limit
+/// of 0 means "not given" and never shadows the fallback.
+///
+/// A body with neither a `data` array nor a top-level array is an `Err` —
+/// never an empty catalog, which would read as "this account has no models".
 pub(crate) fn copilot_models_from_listing(
     v: &serde_json::Value,
-) -> Vec<crate::model_pool::ModelInfo> {
-    let arr = v
+) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+    let Some(arr) = v
         .get("data")
         .and_then(|d| d.as_array())
-        .or_else(|| v.as_array());
-    arr.into_iter()
-        .flatten()
+        .or_else(|| v.as_array())
+    else {
+        return Err(crate::error::listing_shape_error(
+            "github_copilot",
+            "a `data` array or a top-level array",
+            v,
+        ));
+    };
+    Ok(arr
+        .iter()
         .filter_map(|e| {
             let id = e.get("id")?.as_str()?;
             let caps = e.get("capabilities");
@@ -359,6 +370,7 @@ pub(crate) fn copilot_models_from_listing(
                 limits
                     .and_then(|l| l.get(k))
                     .and_then(|x| x.as_u64())
+                    .filter(|x| *x > 0)
                     .map(|x| x.min(u32::MAX as u64) as u32)
             };
             let mut mi = make_model_info(id);
@@ -368,7 +380,7 @@ pub(crate) fn copilot_models_from_listing(
             mi.max_output_tokens = n("max_output_tokens").unwrap_or(0);
             Some(mi)
         })
-        .collect()
+        .collect())
 }
 
 #[async_trait::async_trait]
@@ -421,11 +433,12 @@ impl crate::provider::LlmProvider for GithubCopilotClient {
                 message,
             });
         }
-        let v: serde_json::Value = resp
-            .json()
+        let body = resp
+            .text()
             .await
             .map_err(|e| ProviderError::Http(e.to_string()))?;
-        Ok(copilot_models_from_listing(&v))
+        let v: serde_json::Value = crate::error::parse_listing_json("github_copilot", &body)?;
+        copilot_models_from_listing(&v)
     }
 
     fn output_shares_context(&self) -> bool {
@@ -1029,6 +1042,28 @@ mod tests {
         assert!(!<GithubCopilotClient as LlmProvider>::output_shares_context(&client));
     }
 
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use crate::provider::LlmProvider;
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200).body("not json");
+        });
+        let mut client =
+            GithubCopilotClient::new(test_creds(), None, Arc::new(rupu_netflow::NullSink)).unwrap();
+        client.copilot_token = "cop-tok".into();
+        client.copilot_expires_ms = u64::MAX;
+        client.api_url = server.url("");
+        let err = <GithubCopilotClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
     #[tokio::test]
     async fn fetch_models_surfaces_non_2xx_as_error() {
         use crate::provider::LlmProvider;
@@ -1105,7 +1140,7 @@ mod baked_in_tests {
             { "id": "chat-b", "capabilities": { "type": "chat", "limits": { "max_context_window_tokens": 200000 } } },
             { "id": "embed-x", "capabilities": { "type": "embeddings", "limits": { "max_prompt_tokens": 8000 } } }
         ]});
-        let ms = copilot_models_from_listing(&v);
+        let ms = copilot_models_from_listing(&v).unwrap();
         assert_eq!(ms.len(), 2, "embeddings are not chat models");
         assert_eq!(
             (ms[0].context_window, ms[0].max_output_tokens),
@@ -1114,6 +1149,73 @@ mod baked_in_tests {
         assert_eq!(
             (ms[1].context_window, ms[1].max_output_tokens),
             (200_000, 0)
+        );
+    }
+
+    /// A reported 0 means "no limit given", not "a zero-token prompt": it
+    /// must not shadow the window fallback (or surface as a real limit).
+    #[test]
+    fn copilot_listing_treats_zero_limits_as_absent() {
+        let v = serde_json::json!({ "data": [
+            { "id": "zero-prompt", "capabilities": { "type": "chat", "limits": {
+                "max_prompt_tokens": 0, "max_context_window_tokens": 200000, "max_output_tokens": 0 } } },
+            { "id": "all-zero", "capabilities": { "type": "chat", "limits": {
+                "max_prompt_tokens": 0, "max_context_window_tokens": 0, "max_output_tokens": 0 } } }
+        ]});
+        let ms = copilot_models_from_listing(&v).unwrap();
+        assert_eq!(ms.len(), 2);
+        assert_eq!(
+            (ms[0].context_window, ms[0].max_output_tokens),
+            (200_000, 0)
+        );
+        assert_eq!((ms[1].context_window, ms[1].max_output_tokens), (0, 0));
+    }
+
+    /// No `data` array and not a bare array: an error, not "no models".
+    #[test]
+    fn copilot_listing_without_data_is_a_shape_error() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({ "models": [{ "id": "x" }] }),
+            serde_json::json!({ "data": "nope" }),
+            serde_json::json!("a string"),
+        ] {
+            assert!(
+                matches!(copilot_models_from_listing(&v), Err(ProviderError::Json(_))),
+                "{v}"
+            );
+        }
+        // An empty `data` array is a genuinely empty catalog.
+        assert!(
+            copilot_models_from_listing(&serde_json::json!({ "data": [] }))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn copilot_listing_accepts_a_top_level_array() {
+        let v = serde_json::json!([
+            { "id": "chat-a", "capabilities": { "type": "chat", "limits": { "max_prompt_tokens": 1000 } } }
+        ]);
+        let ms = copilot_models_from_listing(&v).unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!((ms[0].id.as_str(), ms[0].context_window), ("chat-a", 1000));
+    }
+
+    #[test]
+    fn copilot_listing_keeps_entries_without_limits_or_type() {
+        let v = serde_json::json!({ "data": [
+            { "id": "no-limits", "capabilities": { "type": "chat" } },
+            { "id": "no-caps" },
+            { "id": "no-type", "capabilities": { "limits": { "max_prompt_tokens": 4000 } } }
+        ]});
+        let ms = copilot_models_from_listing(&v).unwrap();
+        assert_eq!(
+            ms.iter()
+                .map(|m| (m.id.as_str(), m.context_window, m.max_output_tokens))
+                .collect::<Vec<_>>(),
+            [("no-limits", 0, 0), ("no-caps", 0, 0), ("no-type", 4000, 0)]
         );
     }
 }
