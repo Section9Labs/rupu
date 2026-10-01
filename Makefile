@@ -113,7 +113,7 @@ macos-gen:
 # "notifications are not allowed for this application" and the app never
 # appears in System Settings > Notifications, so the Settings > Notifications
 # toggles could never work from a `make macos-run` build. Ad-hoc needs no
-# identity/keychain, so CI's macos-app job builds identically.
+# identity/keychain.
 macos-build: macos-gen
 	xcodebuild -project apps/rupu-macos/rupu.xcodeproj -scheme rupu \
 		-configuration Debug -derivedDataPath apps/rupu-macos/DerivedData \

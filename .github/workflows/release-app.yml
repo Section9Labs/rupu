@@ -214,25 +214,22 @@ jobs:
     # assets of its own, so there is no `web-dist` artifact to download.
     needs: [meta]
     # Pinned, NOT macos-latest, deliberately diverging from release.yml's `macos`
-    # job: the PR gate (`macos-app` in ci.yml) pins macos-15, and a
-    # released .app must be built by the same Xcode/SDK that gate actually
-    # exercised — a floating image would ship a bundle no PR ever compiled,
-    # with a Swift or SDK version bump landing first in a release rather than
-    # in a pull request. The CLI job is immaterial to this: cargo pins its own
-    # toolchain, so the image underneath it does not change the product.
+    # job: a floating image would ship a bundle built by a Swift/SDK no one
+    # ever compiled it with. There is no PR gate for rupu.app any more (the
+    # app is deprecated and ci.yml's `macos-app` job was removed), so this
+    # pin is the only thing holding the toolchain still. The CLI job is
+    # immaterial to this: cargo pins its own toolchain, so the image
+    # underneath it does not change the product.
     runs-on: macos-15
     timeout-minutes: 60
     env:
       # One definition of the product path, read by every step below.
       # `make macos-release` writes the bundle here (see the Makefile target).
       APP: apps/rupu-macos/DerivedData/Build/Products/Release/rupu.app
-      # Pin the SAME Xcode ci.yml's macos-app gate pins (the gate/release
-      # same-toolchain invariant this job's runs-on comment describes). The
-      # image default (16.4, Swift 6.1.2) stack-overflows swift-frontend's
+      # The image default (16.4, Swift 6.1.2) stack-overflows swift-frontend's
       # deserializer on RupuShell's cross-module generic nesting under the
       # Release configuration — the failure that shipped v0.76.0-beta.2/.3
-      # without a .app (ISSUES.md I-91). Bump this and the gate's copy
-      # TOGETHER, never one alone.
+      # without a .app (ISSUES.md I-91). Keep this pin.
       DEVELOPER_DIR: /Applications/Xcode_26.3.app
     steps:
       - uses: actions/checkout@v5
@@ -249,8 +246,7 @@ jobs:
 
       # `apps/rupu-macos/rupu.xcodeproj` is gitignored and regenerated from
       # project.yml by `make macos-gen` (which `macos-release` depends on),
-      # so xcodegen has to exist before anything can build. Same line the
-      # PR gate uses — `macos-app` in ci.yml.
+      # so xcodegen has to exist before anything can build.
       - name: Install XcodeGen
         run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
 
