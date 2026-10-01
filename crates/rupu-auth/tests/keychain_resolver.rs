@@ -956,6 +956,115 @@ async fn a_persist_failure_after_the_token_post_still_returns_the_new_token() {
     );
 }
 
+/// After a persist failure the file still holds the rotated-out refresh
+/// token, so every later refresh in this process that re-read the file
+/// would post the dead token (`invalid_grant`, and possibly a revoked
+/// grant). The rotation the file could not take is kept in a process-wide
+/// overlay, consulted under the lock before the file: a later `get` hands
+/// it out with no token request, a refresher adopts it, a forced refresh
+/// rotates FROM it, and the first write that succeeds lands it and drops
+/// the overlay — after which the file is the truth again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_unpersisted_rotation_is_used_by_later_refreshes_in_the_process() {
+    use httpmock::prelude::*;
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start();
+    let rotate = |from: &'static str, access: &'static str, refresh: &'static str| {
+        server.mock(move |when, then| {
+            when.method(POST).path("/token").body_contains(from);
+            then.status(200).json_body(serde_json::json!({
+                "access_token": access,
+                "refresh_token": refresh,
+                "expires_in": 3600
+            }));
+        })
+    };
+    let from_1 = rotate("refresh-1", "access-2", "refresh-2");
+    let from_2 = rotate("refresh-2", "access-3", "refresh-3");
+    let from_9 = rotate("refresh-9", "access-10", "refresh-10");
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let dir = tmp.path().join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth_path = dir.join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    store_near_expiry_sso(&r).await;
+    let before = std::fs::read_to_string(&auth_path).unwrap();
+    let access_of = |creds: rupu_providers::auth::AuthCredentials| match creds {
+        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
+        other => panic!("expected OAuth creds, got {other:?}"),
+    };
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let restore = RestoreMode(dir.clone());
+    if std::fs::File::create(dir.join("probe")).is_ok() {
+        eprintln!("skipping: directory modes are not enforced for this user (root?)");
+        return;
+    }
+
+    // The rotation lands in memory only.
+    let (_, creds) = r.get("anthropic", Some(AuthMode::Sso)).await.unwrap();
+    assert_eq!(access_of(creds), "access-2");
+    from_1.assert_hits(1);
+    assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), before);
+
+    // A later `get` (the file still says near-expiry `refresh-1`) hands out
+    // the rotation with no token request.
+    let (_, creds) = r.get("anthropic", Some(AuthMode::Sso)).await.unwrap();
+    assert_eq!(access_of(creds), "access-2");
+    from_1.assert_hits(1);
+
+    // A client refreshing through the store (another step's factory client,
+    // still holding `refresh-1`) adopts it too.
+    let refresher = r.oauth_refresher("anthropic", "anthropic").unwrap();
+    let adopted = refresher
+        .refresh(rupu_providers::auth::AuthCredentials::OAuth {
+            access: "access-1".into(),
+            refresh: "refresh-1".into(),
+            expires: 1,
+            extra: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(access_of(adopted), "access-2");
+    from_1.assert_hits(1);
+
+    // A forced refresh rotates FROM the rotation, never from the file's
+    // dead token — and its own persist fails the same way.
+    let creds = r.refresh("anthropic", AuthMode::Sso).await.unwrap();
+    assert_eq!(access_of(creds), "access-3");
+    from_2.assert_hits(1);
+    assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), before);
+
+    // The directory is writable again: the next refresh lands the pending
+    // rotation first (no token request) and the file is the truth again.
+    drop(restore);
+    let (_, creds) = r.get("anthropic", Some(AuthMode::Sso)).await.unwrap();
+    assert_eq!(access_of(creds), "access-3");
+    from_2.assert_hits(1);
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(saved.contains("refresh-3"), "persisted on retry: {saved}");
+
+    // Another process rotates the file: a refresh now posts THAT token —
+    // the overlay no longer shadows the file.
+    write_atomic(
+        &auth_path,
+        &serde_json::json!({
+            "anthropic/sso": sso_payload("access-9", "refresh-9", chrono::Duration::hours(1))
+        })
+        .to_string(),
+    );
+    let creds = r.refresh("anthropic", AuthMode::Sso).await.unwrap();
+    assert_eq!(access_of(creds), "access-10");
+    from_9.assert_hits(1);
+    assert!(std::fs::read_to_string(&auth_path)
+        .unwrap()
+        .contains("refresh-10"));
+}
+
 // ---- refresh request formats (per provider, as the vendor's own client) ------
 
 /// Store a near-expiry SSO credential for `kind` with the given `extra`.

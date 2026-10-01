@@ -193,10 +193,10 @@ impl KeychainResolver {
         crate::private_file::resolve_symlink(&self.path)
     }
 
-    /// Run `f` on the auth file under its [`AuthFileLock`], on the blocking
-    /// pool (the lock waits — bounded — while another holder, in this or
-    /// another process, is mid-way through its read-modify-write or
-    /// refresh).
+    /// Run `f` on the auth file under its locks — the process-wide
+    /// [`file_mutex`] in front, then the [`AuthFileLock`] on the blocking
+    /// pool (it waits — bounded — while another process is mid-way through
+    /// its read-modify-write or refresh).
     async fn with_file_lock<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -204,6 +204,8 @@ impl KeychainResolver {
     {
         let path = self.auth_file();
         let lock_timeout = self.lock_timeout;
+        let mutex = file_mutex(&path);
+        let _in_process = mutex.lock().await;
         tokio::task::spawn_blocking(move || {
             let _lock = AuthFileLock::acquire(&path, lock_timeout)?;
             f(&path)
@@ -212,21 +214,33 @@ impl KeychainResolver {
         .map_err(|e| anyhow::anyhow!("auth file task failed: {e}"))?
     }
 
-    /// Insert one entry. The caller holds the [`AuthFileLock`].
+    /// Insert one entry. The caller holds the [`AuthFileLock`]. Rotations an
+    /// earlier write could not land ([`unpersisted`]) ride along, and leave
+    /// the overlay once the file holds them; this write supersedes any
+    /// pending one for its own account.
     fn write_account_at(path: &std::path::Path, account: &str, payload: &str) -> Result<()> {
         let mut map = Self::read_file_map(path)?;
+        let folded = unpersisted::fold_into(path, &mut map);
         map.insert(account.to_string(), payload.to_string());
         Self::write_file_map(path, &map)?;
+        unpersisted::clear_folded(path, &folded);
+        unpersisted::remove(path, account);
         Ok(())
     }
 
-    /// Remove one entry, under the [`AuthFileLock`].
+    /// Remove one entry, under the [`AuthFileLock`]. A pending rotation of
+    /// that account ([`unpersisted`]) is dropped with it — the logout
+    /// supersedes it — and the other accounts' pending ones ride along.
     async fn delete_account(&self, account: &str) -> Result<()> {
         let account = account.to_string();
         self.with_file_lock(move |path| {
             let mut map = Self::read_file_map(path)?;
-            if map.remove(&account).is_some() {
+            let removed = map.remove(&account).is_some();
+            unpersisted::remove(path, &account);
+            let folded = unpersisted::fold_into(path, &mut map);
+            if removed || !folded.is_empty() {
                 Self::write_file_map(path, &map)?;
+                unpersisted::clear_folded(path, &folded);
             }
             Ok(())
         })
@@ -341,8 +355,8 @@ impl KeychainResolver {
 
     /// Refresh `account`'s stored `mode` credential and persist it — as a
     /// tracked task ([`rupu_providers::credential_writes`], which the binary
-    /// drains before exit), holding the auth file's [`AuthFileLock`] (and a
-    /// process-local per-account lock in front of it) across re-read → token
+    /// drains before exit), holding the auth file's [`AuthFileLock`] (and the
+    /// process-wide [`file_mutex`] in front of it) across re-read → token
     /// request → write.
     ///
     /// Cancel-safe: the OAuth server rotates the refresh token, so a refresh
@@ -357,6 +371,12 @@ impl KeychainResolver {
     /// token request (one carrying the rotated-out refresh token would get
     /// `invalid_grant`, and reuse detection can revoke the whole grant). See
     /// [`RefreshWhen`] for when a request is still made.
+    ///
+    /// A rotation the file could not take (the write failed after the token
+    /// endpoint answered) is the live credential, kept in [`unpersisted`]:
+    /// it is what this re-read finds, ahead of the file, and the persist is
+    /// retried here first — so no later refresh in this process posts the
+    /// dead token the file still holds.
     async fn refresh_and_store_at(
         path: PathBuf,
         account: String,
@@ -368,21 +388,43 @@ impl KeychainResolver {
     ) -> Result<StoredCredential> {
         let legacy = Self::legacy_base(&account).map(str::to_string);
         let job = rupu_providers::credential_writes::spawn(async move {
-            let local = refresh_lock(&path, &account);
-            let _local = local.lock().await;
+            let mutex = file_mutex(&path);
+            let _in_process = mutex.lock().await;
             let _file = {
                 let path = path.clone();
                 tokio::task::spawn_blocking(move || AuthFileLock::acquire(&path, lock_timeout))
                     .await
                     .map_err(|e| anyhow::anyhow!("auth file lock task failed: {e}"))??
             };
-            let sc = Self::read_account_at(&path, &account, legacy.as_deref(), mode)?
-                .ok_or_else(|| anyhow::anyhow!("no stored credential for {account}/{mode:?}"))?;
+            let key = format!("{account}/{}", mode.as_str());
+            let sc = match unpersisted::get(&path, &key) {
+                Some(pending) => {
+                    let sc = parse_stored_credential(&pending, mode)?;
+                    // Land it now if the file will take it; the overlay
+                    // entry goes with a successful write.
+                    if let Err(e) = Self::store_named_at(&path, &account, mode, &sc) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            account,
+                            error = %e,
+                            "the refreshed OAuth token still could not be persisted"
+                        );
+                    }
+                    sc
+                }
+                None => Self::read_account_at(&path, &account, legacy.as_deref(), mode)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no stored credential for {account}/{mode:?}")
+                    })?,
+            };
             if when.already_satisfied(&sc) {
                 return Ok(sc);
             }
             let new = Self::refresh_inner(&account, kind, &sc, timeout).await?;
             if let Err(e) = Self::store_named_at(&path, &account, mode, &new) {
+                let payload =
+                    serde_json::to_string(&new).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+                unpersisted::set(&path, &key, payload);
                 report_unpersisted_rotation(&path, &account, &e);
             }
             Ok(new)
@@ -429,6 +471,9 @@ impl KeychainResolver {
     /// so `--all` on a fresh install doesn't create an empty auth.json.
     pub async fn forget_all(&self) -> Result<usize> {
         self.with_file_lock(|path| {
+            // Pending rotations of this file go too: nothing is left to
+            // persist them for.
+            unpersisted::clear_file(path);
             let map = Self::read_file_map(path)?;
             let count = map.len();
             if count > 0 {
@@ -700,37 +745,124 @@ impl Default for KeychainResolver {
 /// The token endpoint has already rotated the refresh token when the write
 /// of the new credential fails (a read-only directory, a full disk): the
 /// credential in hand is the only live one. It is handed back so the run
-/// continues, and the loss is reported loudly — the next process will find
-/// the dead refresh token in the file and need `rupu auth login`.
+/// continues and kept in [`unpersisted`] for every later refresh and write
+/// in this process (which retry the write), and the loss is reported loudly
+/// — the next process will find the dead refresh token in the file and need
+/// `rupu auth login` unless a later write in this one lands it first.
 fn report_unpersisted_rotation(path: &std::path::Path, account: &str, error: &anyhow::Error) {
     tracing::error!(
         path = %path.display(),
         account,
         error = %error,
-        "the refreshed OAuth token could not be persisted; this process keeps using it, the \
-         next one will need `rupu auth login`"
+        "the refreshed OAuth token could not be persisted; this process keeps using it and \
+         retries the write on its next credential write or refresh, the next process will need \
+         `rupu auth login` unless one lands"
     );
     eprintln!(
         "rupu: the '{account}' token was refreshed but could not be written to {}: {error}. This \
-         process keeps using the new token; if the next rupu command cannot authenticate, run: \
-         rupu auth login --account {account} --mode sso",
+         process keeps using the new token and retries the write on its next credential write \
+         or refresh; if the next rupu command cannot authenticate, run: rupu auth login \
+         --account {account} --mode sso",
         path.display()
     );
 }
 
-/// The process-wide lock serializing refreshes of one account's stored
-/// credentials, keyed by auth file and account. Every `KeychainResolver` in
-/// the process shares it: the CLI builds a fresh resolver per command and
-/// per step.
-fn refresh_lock(path: &std::path::Path, account: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    type Locks = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+/// The process-wide lock serializing this process's holders of one auth
+/// file, keyed by the resolved file, taken in front of the [`AuthFileLock`]
+/// by every writer and refresher. Every `KeychainResolver` in the process
+/// shares it (the CLI builds a fresh resolver per command and per step), so
+/// in-process exclusion holds even where `flock` is per-process (an NFS
+/// mount on Linux). A holder keeps it only for bounded work — the lock
+/// wait, one token request, a write — so a wait on it is bounded too.
+fn file_mutex(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>;
     static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
-    let key = format!("{}#{account}", path.display());
     let mut locks = LOCKS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks.entry(key).or_default().clone()
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// Rotated credentials the auth file could not take: the token endpoint had
+/// already rotated the refresh token when the write failed (a read-only
+/// directory, a full disk), so the credential in hand is the only live one
+/// and the file keeps a dead refresh token. Keyed by the resolved auth file
+/// and the file-map key (`<account>/<mode>`); process-wide, like the file
+/// mutex, and only ever touched under the [`AuthFileLock`]. Every later
+/// refresh reads it ahead of the file, every later write of the file folds
+/// it in, and an entry leaves once the file holds it (or the account is
+/// forgotten). Without it, every later refresh in the process re-read the
+/// file and posted the dead token — `invalid_grant`, and reuse detection
+/// can revoke the whole grant.
+mod unpersisted {
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    type Overlay = HashMap<(PathBuf, String), String>;
+
+    fn entries() -> MutexGuard<'static, Overlay> {
+        static ENTRIES: OnceLock<Mutex<Overlay>> = OnceLock::new();
+        ENTRIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pending payload for `key` in `path`, if any.
+    pub(super) fn get(path: &Path, key: &str) -> Option<String> {
+        entries()
+            .get(&(path.to_path_buf(), key.to_string()))
+            .cloned()
+    }
+
+    /// Record a rotation the file could not take (a newer one replaces an
+    /// older one for the same key).
+    pub(super) fn set(path: &Path, key: &str, payload: String) {
+        entries().insert((path.to_path_buf(), key.to_string()), payload);
+    }
+
+    /// Drop the pending rotation for `key`, if any (superseded by a write
+    /// of that account, or by its logout).
+    pub(super) fn remove(path: &Path, key: &str) {
+        entries().remove(&(path.to_path_buf(), key.to_string()));
+    }
+
+    /// Put every pending rotation for `path` into `map` (they are newer
+    /// than what the file holds). Returns what was folded, for
+    /// [`clear_folded`] once the write succeeded.
+    pub(super) fn fold_into(
+        path: &Path,
+        map: &mut BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let folded: Vec<(String, String)> = entries()
+            .iter()
+            .filter(|((p, _), _)| p == path)
+            .map(|((_, key), payload)| (key.clone(), payload.clone()))
+            .collect();
+        for (key, payload) in &folded {
+            map.insert(key.clone(), payload.clone());
+        }
+        folded
+    }
+
+    /// Drop the entries `folded` that are still exactly what was folded —
+    /// the file holds them now. A rotation recorded since stays.
+    pub(super) fn clear_folded(path: &Path, folded: &[(String, String)]) {
+        let mut entries = entries();
+        for (key, payload) in folded {
+            let k = (path.to_path_buf(), key.clone());
+            if entries.get(&k) == Some(payload) {
+                entries.remove(&k);
+            }
+        }
+    }
+
+    /// Drop every pending rotation for `path` (`forget_all`).
+    pub(super) fn clear_file(path: &Path) {
+        entries().retain(|(p, _), _| p != path);
+    }
 }
 
 /// An exclusive advisory lock (flock) on `<auth file>.lock`, released when
