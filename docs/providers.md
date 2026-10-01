@@ -243,10 +243,12 @@ See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 
 ## Model resolution
 
-`rupu models list`, and the limit lookup every run does for its `model:`, resolve a model id through three sources in order:
+`rupu models list` (and the control plane's Models tab) build their catalog of known models from three sources, in order:
 1. **Custom** — `[[providers.<name>.models]]` entries from `~/.rupu/config.toml`.
-2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches. A listing that returns no models counts as a failed refresh and never overwrites the cache.
+2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap; a file with any other schema is ignored and refetched). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches. A listing that returns no models counts as a failed refresh and never overwrites the cache.
 3. **Baked-in** — Copilot and Gemini ship a small built-in id list (limits unknown). Baked-in entries are merged beneath the live and custom rows and only fill ids the live list doesn't contain, so `rupu models list` can still show a few `baked-in` rows after a successful fetch; they never supply limits.
+
+That three-source order is the catalog view only. The limits a **run** uses for its `model:` follow a different precedence — the agent's frontmatter, then the config entry, then the live list, then unknown — and baked-in rows never supply a limit; see [Model limits](#model-limits).
 
 `rupu models list` and the control plane's Models tab read only the **global** `~/.rupu/config.toml`, while a run also layers the project's `.rupu/config.toml` on top, so a project-level `[[providers.<name>.models]]` entry affects runs but does not appear in the catalog view.
 
@@ -271,6 +273,10 @@ An `openai-compatible` account is refreshed like any other: `rupu models
 refresh` fetches its `/v1/models` with the account's Bearer key. A server with
 no usable `/v1/models` reports the error for that account; its models are then
 whatever `[[providers.<name>.models]]` declares.
+
+`rupu models refresh` fetches the targeted providers in parallel and prints one line for each: `rupu: refreshed <provider> (N models)`, or `rupu: skip <provider>: <reason>` — for example a missing credential, a provider with no listing endpoint (a Gemini CLI login, a `kind = "local"` account), or an empty listing. Each provider gets 10 seconds for the whole job, credential lookup and any OAuth token refresh included. A job that outlives that is reported as `timed out after 10s` but is not cancelled, because it may be part-way through rotating a token that still has to be saved. The command keeps waiting for such jobs under one shared 30-second deadline (`rupu: waiting for N provider job(s) to finish…`), prints each as it lands (`rupu: refreshed <provider> (N models) after the wait`), and names any still running when the deadline passes. A job that finishes during that wait counts as refreshed.
+
+The command **exits non-zero when no targeted provider was refreshed**, and zero when at least one was; the providers that failed are still printed. A script can therefore rely on the exit code to tell "refreshed" from "nothing worked".
 
 A `model:` id that appears in none of these sources is not rejected by rupu: the id is sent to the provider as written (a provider that doesn't serve it returns its own error), and the run's `model_limits` notice flags that the model isn't in the provider's list. Run `rupu models list --provider <name>` to see the ids rupu knows, or add a `[[providers.<name>.models]]` entry.
 
