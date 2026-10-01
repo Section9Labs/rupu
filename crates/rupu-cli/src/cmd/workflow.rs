@@ -94,7 +94,7 @@ const PAUSE_MARKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// [`PAUSE_MARKER_POLL_INTERVAL`] until the marker is seen; the caller
 /// aborts the returned handle once the run finishes so the poller never
 /// outlives its run.
-fn spawn_pause_marker_poller(
+pub(crate) fn spawn_pause_marker_poller(
     store: Arc<rupu_orchestrator::RunStore>,
     run_id: String,
     token: tokio_util::sync::CancellationToken,
@@ -5460,7 +5460,7 @@ async fn post_run_summary_to_issue(
 ///
 /// The real protection is `[workflow].run_step_enabled`, which defaults
 /// to false and which `bypass` cannot override.
-fn run_step_policy_for(
+pub(crate) fn run_step_policy_for(
     mode_str: &str,
     cfg: &rupu_config::Config,
     workspace_path: PathBuf,
