@@ -2329,7 +2329,7 @@ async fn resume_reruns_only_failed_fanout_units() {
             approved_step_id: String::new(),
             completed_units,
             reason: rupu_orchestrator::PauseReason::Approval,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             ..Default::default()
         }),

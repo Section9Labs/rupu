@@ -802,7 +802,7 @@ async fn run_resume_worker(
             // `AwaitingApproval` → `workflow approve` (approval-gate resume,
             // unchanged); `Paused` → `workflow resume` (cooperative-pause
             // resume, T4 — that command now also accepts `Paused` and reads
-            // the persisted mid-step seed via `RunStore::read_paused_seed`).
+            // the persisted mid-step seeds via `RunStore::read_paused_seeds`).
             let subcommand = match run.status {
                 rupu_orchestrator::RunStatus::Paused => "resume",
                 _ => "approve",

@@ -3041,7 +3041,7 @@ impl RunStore {
     /// later continue it. `awaiting_step_id` is best-effort copied from
     /// `active_step_id` (if any) purely for observability — the actual
     /// resume-with-seed decision is driven by
-    /// [`read_paused_seed`](Self::read_paused_seed), not this field.
+    /// [`read_paused_seeds`](Self::read_paused_seeds), not this field.
     ///
     /// # Delivery
     ///
@@ -3120,14 +3120,64 @@ impl RunStore {
         Ok(serde_json::from_slice(&body)?)
     }
 
-    /// Best-effort remove the paused-step seed sidecar (idempotent — a
-    /// missing file is not an error). Called once the seed has been
-    /// consumed by a resume, and defensively when a run reaches a terminal
-    /// state, so a later unrelated pause never sees a stale seed.
-    pub fn clear_paused_seed(&self, run_id: &str) -> Result<(), RunStoreError> {
-        let path = self.paused_seed_path(run_id);
+    fn paused_seeds_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("paused_seeds.json")
+    }
+
+    /// Persist the seed transcript of EVERY step that paused mid-turn
+    /// (keyed by step id) — a DAG run's manual-pause drain can catch
+    /// several concurrent steps pausing at once, which the single
+    /// [`write_paused_seed`](Self::write_paused_seed) sidecar (paired with
+    /// `RunRecord.awaiting_step_id`) can't hold. `run_workflow` writes
+    /// both: this one for [`read_paused_seeds`](Self::read_paused_seeds),
+    /// the single primary seed for a binary that predates it.
+    pub fn write_paused_seeds(
+        &self,
+        run_id: &str,
+        seeds: &std::collections::BTreeMap<String, Vec<Message>>,
+    ) -> Result<(), RunStoreError> {
+        write_atomic(&self.paused_seeds_path(run_id), &serde_json::to_vec(seeds)?)?;
+        Ok(())
+    }
+
+    /// Every persisted mid-turn seed, keyed by step id. Prefers the
+    /// multi-step `paused_seeds.json`; when absent (a run paused by a
+    /// binary that predates it), falls back to the legacy single
+    /// `paused_seed.json`, attributed to `legacy_step_id` (the record's
+    /// `awaiting_step_id`). Empty — not an error — when neither exists, the
+    /// common case for a step-boundary pause.
+    pub fn read_paused_seeds(
+        &self,
+        run_id: &str,
+        legacy_step_id: Option<&str>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<Message>>, RunStoreError> {
+        let path = self.paused_seeds_path(run_id);
         if path.is_file() {
-            std::fs::remove_file(&path)?;
+            let body = std::fs::read(&path)?;
+            return Ok(serde_json::from_slice(&body)?);
+        }
+        let seed = self.read_paused_seed(run_id)?;
+        Ok(match legacy_step_id {
+            Some(step_id) if !seed.is_empty() => {
+                std::collections::BTreeMap::from([(step_id.to_string(), seed)])
+            }
+            _ => std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Best-effort remove the paused-step seed sidecars — both the legacy
+    /// single seed and the multi-step map (idempotent — a missing file is
+    /// not an error). Called once the seeds have been consumed by a resume,
+    /// and defensively when a run reaches a terminal state, so a later
+    /// unrelated pause never sees a stale seed.
+    pub fn clear_paused_seed(&self, run_id: &str) -> Result<(), RunStoreError> {
+        for path in [
+            self.paused_seed_path(run_id),
+            self.paused_seeds_path(run_id),
+        ] {
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
         }
         Ok(())
     }
@@ -5288,7 +5338,7 @@ mod tests {
         // The crux of T4: a mid-step manual pause's seed transcript must
         // survive a process restart (the CP-driven resume worker spawns a
         // FRESH `rupu workflow resume` subprocess) so the resume can
-        // reconstruct `ResumeState::paused_step` from disk, not memory.
+        // reconstruct `ResumeState::paused_steps` from disk, not memory.
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = sample_record("run_seed");
@@ -5313,6 +5363,47 @@ mod tests {
         // Clearing an already-cleared (or never-written) seed is a no-op,
         // not an error.
         store.clear_paused_seed(&rec.id).unwrap();
+    }
+
+    #[test]
+    fn paused_seeds_round_trip_and_fall_back_to_the_legacy_single_seed() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_seeds");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store
+            .read_paused_seeds(&rec.id, Some("a"))
+            .unwrap()
+            .is_empty());
+
+        // A run paused by a binary that only wrote the legacy single seed:
+        // attributed to the record's `awaiting_step_id`.
+        let legacy = vec![Message::user("legacy")];
+        store.write_paused_seed(&rec.id, &legacy).unwrap();
+        let read = store.read_paused_seeds(&rec.id, Some("a")).unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["a"]);
+        assert!(store.read_paused_seeds(&rec.id, None).unwrap().is_empty());
+
+        // The multi-step map wins over the legacy file once present.
+        let seeds = BTreeMap::from([
+            ("a".to_string(), vec![Message::user("a")]),
+            (
+                "b".to_string(),
+                vec![Message::user("b"), Message::assistant("b1")],
+            ),
+        ]);
+        store.write_paused_seeds(&rec.id, &seeds).unwrap();
+        let read = store.read_paused_seeds(&rec.id, Some("a")).unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(read["b"].len(), 2);
+
+        // Clearing removes BOTH sidecars.
+        store.clear_paused_seed(&rec.id).unwrap();
+        assert!(store
+            .read_paused_seeds(&rec.id, Some("a"))
+            .unwrap()
+            .is_empty());
+        assert!(store.read_paused_seed(&rec.id).unwrap().is_empty());
     }
 
     #[test]
