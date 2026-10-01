@@ -514,6 +514,10 @@ mod tests {
     /// non-zero after a refresh that worked).
     #[tokio::test]
     async fn a_job_that_finishes_during_the_wait_counts_as_refreshed() {
+        // The provider factory swaps in a `MockProvider` (which has no
+        // listing) whenever `RUPU_MOCK_PROVIDER_SCRIPT` is set, and other
+        // tests in this binary set it process-wide under this lock.
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         let server = httpmock::MockServer::start();
         server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v1/models");
