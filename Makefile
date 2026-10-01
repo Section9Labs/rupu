@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release macos-fixtures cp-codename-palette
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release cp-codename-palette
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -142,15 +142,6 @@ macos-release: macos-gen
 	@echo "Built: apps/rupu-macos/DerivedData/Build/Products/Release/rupu.app"
 	@echo "Version: $(or $(RUPU_RELEASE_VERSION),0.0.0-dev)"
 
-# Regenerate the golden JSON fixtures the Swift app's decode/encode tests
-# check against (apps/rupu-macos/Fixtures/*.json,
-# apps/rupu-macos/Fixtures/requests/*.json). Run this after changing
-# rupu_orchestrator::executor::Event, HostInfoResponse, or any of the
-# write-path DTOs/request bodies, then update the Swift models to match.
-macos-fixtures:
-	REGEN_FIXTURES=1 cargo test -p rupu-cp fixture_is_current
-	REGEN_FIXTURES=1 cargo test -p rupu-cp request_fixture_roundtrips
-
 # Regenerate the web UI's codename palette from rupu-codename.
 cp-codename-palette:
 	REGEN_CODENAME_PALETTE=1 cargo test -p rupu-cp codename_palette_ts_is_current
@@ -179,7 +170,6 @@ help:
 	@echo "  macos-release  macos-gen + xcodebuild Release, ad-hoc signed, hardened runtime on"
 	@echo "                 (usage: make macos-release RUPU_RELEASE_VERSION=X.Y.Z)"
 	@echo "  cp-codename-palette regenerate crates/rupu-cp/web/src/lib/codenamePalette.gen.ts"
-	@echo "  macos-fixtures regenerate apps/rupu-macos/Fixtures/*.json golden fixtures"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"
 	@echo ""
