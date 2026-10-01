@@ -58,6 +58,10 @@ pub struct OpenAiCompatibleModel {
     pub max_output: u32,
 }
 
+/// `max_tokens` sent on a non-streaming request that carries no cap (the
+/// pre-discovery default).
+const NON_STREAMING_FALLBACK_MAX_TOKENS: u32 = 8192;
+
 /// Client for an OpenAI-compatible `/v1/chat/completions` endpoint.
 pub struct OpenAiCompatibleClient {
     base_url: String,
@@ -130,7 +134,15 @@ impl OpenAiCompatibleClient {
     }
 
     fn request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
-        crate::openai_wire::build_chat_request_body(request, stream)
+        let mut body = crate::openai_wire::build_chat_request_body(request, stream);
+        // A non-streaming exchange is one HTTP response, so an unbounded
+        // generation (servers default `max_tokens` to the whole remaining
+        // context) could outlive the read timeout. Streaming requests keep an
+        // unknown cap omitted, as the runner now sends `None` for it.
+        if request.max_tokens.is_none() && !(stream && self.stream) {
+            body["max_tokens"] = serde_json::json!(NON_STREAMING_FALLBACK_MAX_TOKENS);
+        }
+        body
     }
 
     fn headers(&self, stream: bool) -> Result<reqwest::header::HeaderMap, ProviderError> {
@@ -380,6 +392,56 @@ mod tests {
         assert_eq!(body["stream"], false);
         // Non-streaming requests must not carry stream_options.
         assert!(body.get("stream_options").is_none());
+    }
+
+    fn client_with_stream(stream: bool) -> OpenAiCompatibleClient {
+        OpenAiCompatibleClient::new(
+            "http://host:8080",
+            "sk-test",
+            "m",
+            vec![],
+            stream,
+            Arc::new(rupu_netflow::NullSink),
+        )
+    }
+
+    fn uncapped_request() -> LlmRequest {
+        LlmRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn non_streaming_client_defaults_an_unset_cap_to_8192() {
+        let body = client_with_stream(false).request_body(&uncapped_request(), false);
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn streaming_client_omits_an_unset_cap() {
+        let body = client_with_stream(true).request_body(&uncapped_request(), true);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn non_streaming_request_on_a_streaming_client_defaults_an_unset_cap() {
+        // `no_stream` runs go through `send`, which builds a stream=false body
+        // even when the server supports SSE.
+        let body = client_with_stream(true).request_body(&uncapped_request(), false);
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn an_explicit_cap_is_never_replaced() {
+        let mut req = uncapped_request();
+        req.max_tokens = Some(4096);
+        for (cfg, call) in [(false, false), (true, false), (true, true)] {
+            let body = client_with_stream(cfg).request_body(&req, call);
+            assert_eq!(body["max_tokens"], 4096, "cfg={cfg} call={call}");
+        }
     }
 
     #[test]

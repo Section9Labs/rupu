@@ -317,3 +317,103 @@ async fn overflow_with_a_max_that_does_not_lower_the_limit_still_compacts() {
     );
     assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
 }
+
+/// Run one turn with the given limits and streaming mode; returns the
+/// captured request's `max_tokens` and the run-start `model_limits` notice.
+async fn first_request_cap_and_notice(
+    limits: ModelLimits,
+    no_stream: bool,
+) -> (Option<u32>, String) {
+    let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+        text: "done".into(),
+        stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.no_stream = no_stream;
+    opts.suppress_stream_stdout = true;
+    opts.limits = limits;
+    run_agent(opts).await.unwrap();
+    let max_tokens = captured.lock().unwrap()[0].max_tokens;
+    let notice = notices(&transcript)
+        .into_iter()
+        .find(|(k, _)| k == "model_limits")
+        .map(|(_, m)| m)
+        .expect("model_limits notice");
+    (max_tokens, notice)
+}
+
+const CAP_TEXT: &str = "output capped at 16,384 for non-streaming requests";
+
+fn discovered(input: u32, output: u32, src: LimitSource) -> ModelLimits {
+    let mut l = ModelLimits::unknown();
+    l.input = Limit::new(input, src.clone());
+    l.output = Limit::new(output, src);
+    l
+}
+
+/// Non-streaming requests must not outlive the HTTP timeout: a discovered
+/// 128K output cap is clamped to `NON_STREAMING_MAX_TOKENS`, and the notice
+/// says so.
+#[tokio::test]
+async fn non_streaming_clamps_a_discovered_output_cap() {
+    for src in [
+        LimitSource::Config,
+        LimitSource::Live {
+            fetched_at: chrono::Utc::now(),
+            stale: false,
+        },
+    ] {
+        let (cap, notice) =
+            first_request_cap_and_notice(discovered(1_000_000, 128_000, src.clone()), true).await;
+        assert_eq!(cap, Some(16_384), "source {src:?}");
+        assert!(notice.contains(CAP_TEXT), "{notice}");
+        assert!(
+            notice.contains("output 128,000"),
+            "the notice still reports the discovered limit: {notice}"
+        );
+    }
+}
+
+/// An agent `maxTokens` pin is the operator's explicit choice — honoured as-is
+/// even for a non-streaming request.
+#[tokio::test]
+async fn non_streaming_honours_an_agent_output_pin() {
+    let (cap, notice) =
+        first_request_cap_and_notice(ModelLimits::fixed(1_000_000, 100_000), true).await;
+    assert_eq!(cap, Some(100_000));
+    assert!(!notice.contains(CAP_TEXT), "{notice}");
+}
+
+/// Streaming requests send the discovered cap unchanged.
+#[tokio::test]
+async fn streaming_sends_the_full_discovered_output_cap() {
+    let (cap, notice) =
+        first_request_cap_and_notice(discovered(1_000_000, 128_000, LimitSource::Config), false)
+            .await;
+    assert_eq!(cap, Some(128_000));
+    assert!(!notice.contains(CAP_TEXT), "{notice}");
+}
+
+/// A discovered cap already under the non-streaming ceiling is not touched,
+/// and the notice does not claim a cap that did not apply.
+#[tokio::test]
+async fn non_streaming_leaves_a_small_discovered_cap_alone() {
+    let (cap, notice) =
+        first_request_cap_and_notice(discovered(200_000, 8_192, LimitSource::Config), true).await;
+    assert_eq!(cap, Some(8_192));
+    assert!(!notice.contains(CAP_TEXT), "{notice}");
+}
+
+/// An unknown output stays `None` on the wire (the provider's own handling
+/// applies); no cap text.
+#[tokio::test]
+async fn non_streaming_unknown_output_stays_none() {
+    let (cap, notice) = first_request_cap_and_notice(ModelLimits::unknown(), true).await;
+    assert_eq!(cap, None);
+    assert!(!notice.contains(CAP_TEXT), "{notice}");
+}

@@ -1119,9 +1119,18 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).
+    let mut limits_notice = opts.limits.describe(&opts.provider_name, Utc::now());
+    if opts.no_stream && opts.limits.non_streaming_cap_applies() {
+        limits_notice.push_str(&format!(
+            "; output capped at {} for non-streaming requests",
+            rupu_providers::model_limits::group_thousands(
+                rupu_providers::model_limits::NON_STREAMING_MAX_TOKENS as u64
+            )
+        ));
+    }
     writer.write(&Event::Notice {
         kind: "model_limits".into(),
-        message: opts.limits.describe(&opts.provider_name, Utc::now()),
+        message: limits_notice,
     })?;
     writer.flush()?;
 
@@ -1317,7 +1326,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
                 messages: messages.clone(),
-                max_tokens: opts.limits.output.tokens,
+                // Non-streaming requests clamp a discovered output cap so one
+                // response cannot outlive the HTTP timeout; an agent pin is
+                // honoured as-is (`ModelLimits::request_max_tokens`).
+                max_tokens: opts.limits.request_max_tokens(!opts.no_stream),
                 tools: tool_defs.clone(),
                 cell_id: None,
                 trace_id: None,
