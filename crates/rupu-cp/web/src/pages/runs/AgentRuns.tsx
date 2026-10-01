@@ -5,10 +5,12 @@
 // pill group (All / Standalone / Session, defaulting to Standalone — an
 // agent-runs read is a standalone invocation by default; session work lives
 // on the Sessions page instead — 2026-07-23 operator feedback amendment #2)
-// + a Find search box, fetch/paginate/poll machinery owned by the shared
-// `usePagedList` hook. Running polls every 5 s (page 0 only, spliced back
-// over the head of the list — see `usePagedList`'s doc comment for why that
-// doesn't reset a scrolled view).
+// + a Find search box. Fetch/paginate/poll is owned by `usePerHostPagedList`
+// (per-host progressive loading, spec 2026-10-01): All hosts by default,
+// local paints at once and each remote merges in as it answers. Running polls
+// (local every 5 s, remotes every 60 s, page 0 only, spliced back over the
+// head of the list — see the hook's docs for why that doesn't reset a
+// scrolled view).
 //
 // Backend dedupe (`crates/rupu-cp/src/api/run_streams.rs`,
 // `dedupe_agent_runs_by_run_id`) already collapses a session-turn run's
@@ -17,7 +19,7 @@
 // single merged row's `source` field, it does not need to dedupe anything
 // itself.
 
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { api, ApiError, type AgentRunRow, type RunStatusStr } from '../../lib/api';
@@ -40,7 +42,9 @@ import { shortId } from '../../lib/shortId';
 import { relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
-import { usePagedList } from '../../lib/usePagedList';
+import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import { PagingFailures, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
+import { notIncluded, waitingLabel } from '../../lib/perHost/status';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -105,21 +109,28 @@ export default function AgentRuns() {
   // default; session-bound runs live on the Sessions page instead (operator
   // feedback, 2026-07-23 amendment #2).
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('standalone');
-  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
-  const [hostFilter, setHostFilter] = useState<string>('local');
+  // All hosts by default: local paints at once, each remote merges in as it
+  // answers (usePerHostPagedList). A picked host lists only that host.
+  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
-  const { rows, loading, error, hasMore, sentinelRef, refresh } = usePagedList<AgentRunRow>({
-    fetch: ({ offset, limit }) => {
-      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      return api.getAgentRuns({ lifecycle: tab, offset, limit, host });
-    },
-    deps: [tab, hostFilter],
-    poll: tab === 'active',
-  });
+  const fetchRows = useCallback(
+    ({ host, offset, limit, signal }: PerHostFetchParams) =>
+      api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal }),
+    [tab],
+  );
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
+    usePerHostPagedList<AgentRunRow>({
+      host: hostFilter === ALL_HOSTS ? null : hostFilter,
+      fetch: fetchRows,
+      timeField: 'started_at',
+      idField: 'run_id',
+      deps: [tab],
+      poll: tab === 'active',
+    });
 
   // Row-level actions (runs-section row-actions plan, Task 3). Keyed off
   // `source`:
@@ -143,7 +154,8 @@ export default function AgentRuns() {
     try {
       await api.archiveSession(sessionId, host);
       setActionError(null);
-      refresh();
+      // The whole session changed (maybe several rows); re-sync just its host.
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
@@ -153,7 +165,8 @@ export default function AgentRuns() {
     try {
       await api.restoreSession(sessionId, host);
       setActionError(null);
-      refresh();
+      // The whole session changed (maybe several rows); re-sync just its host.
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Restore failed');
     }
@@ -169,7 +182,8 @@ export default function AgentRuns() {
     try {
       await api.deleteSession(sessionId, host);
       setActionError(null);
-      refresh();
+      // The whole session changed (maybe several rows); re-sync just its host.
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
@@ -185,7 +199,9 @@ export default function AgentRuns() {
     try {
       await api.archiveTranscript(runId, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', runId);
+      refreshHost(host ?? 'local');
     } catch (e) {
       // PID-reuse escape hatch: the server refused because the run still
       // looks live. Offer a SECOND, explicit confirmation naming the risk
@@ -194,7 +210,8 @@ export default function AgentRuns() {
         try {
           await api.archiveTranscript(runId, host, true);
           setActionError(null);
-          refresh();
+          removeRow(host ?? 'local', runId);
+          refreshHost(host ?? 'local');
           return;
         } catch (e2) {
           setActionError(e2 instanceof Error ? e2.message : 'Archive failed');
@@ -211,14 +228,17 @@ export default function AgentRuns() {
     try {
       await api.deleteTranscript(runId, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', runId);
+      refreshHost(host ?? 'local');
     } catch (e) {
       // See handleStandaloneArchive's comment on the liveness-override retry.
       if (isLivenessRefusal(e) && confirmLivenessOverride(runId, e)) {
         try {
           await api.deleteTranscript(runId, host, true);
           setActionError(null);
-          refresh();
+          removeRow(host ?? 'local', runId);
+          refreshHost(host ?? 'local');
           return;
         } catch (e2) {
           setActionError(e2 instanceof Error ? e2.message : 'Delete failed');
@@ -306,6 +326,9 @@ export default function AgentRuns() {
         }
         scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
       />
+      <div className="mt-3">
+        <PerHostStrip slices={slices} />
+      </div>
 
       <div className="mt-5">
         {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
@@ -314,13 +337,25 @@ export default function AgentRuns() {
           <div className="py-16 flex items-center justify-center">
             <Spinner label="Loading agent runs…" />
           </div>
+        ) : rows.length === 0 && waitingLabel(slices) ? (
+          <div className="py-16 flex items-center justify-center">
+            <Spinner label={waitingLabel(slices) ?? ''} />
+          </div>
         ) : sorted.length === 0 ? (
           <EmptyState
-            title={rows.length > 0 ? 'No agent runs match this filter' : 'No agent runs yet'}
+            title={
+              rows.length > 0
+                ? 'No agent runs match this filter'
+                : notIncluded(slices)
+                  ? 'No agent runs on the hosts that answered'
+                  : 'No agent runs yet'
+            }
             hint={
               rows.length > 0
                 ? 'Try a different lifecycle, source, or host filter above.'
-                : 'Standalone and session-bound agent invocations will appear here once they run.'
+                : notIncluded(slices)
+                  ? `Not included: ${notIncluded(slices)}.`
+                  : 'Standalone and session-bound agent invocations will appear here once they run.'
             }
           />
         ) : visible.length === 0 ? (
@@ -339,19 +374,16 @@ export default function AgentRuns() {
             <SortableTable<AgentRunRow>
               columns={columns}
               rows={visible}
-              rowKey={(r) => r.run_id}
+              rowKey={(r) => `${r.host_id ?? 'local'}:${r.run_id}`}
               rowHref={agentRunHref}
               initialSort={{ key: 'started', dir: 'desc' }}
             />
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               {q
                 ? `${visible.length} matches of ${sorted.length} loaded`
-                : loading
-                  ? 'loading more…'
-                  : hasMore
-                    ? 'scroll for more'
-                    : `— end of ${sorted.length} —`}
+                : perHostFooterText({ slices, loading, hasMore, ended, count: sorted.length })}
             </div>
+            <PagingFailures slices={slices} onRetry={retryPaging} />
           </section>
         )}
       </div>
