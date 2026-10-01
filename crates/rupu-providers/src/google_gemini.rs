@@ -582,8 +582,12 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
             .api_base_override
             .clone()
             .unwrap_or_else(|| self.variant.endpoint().to_string());
+        let provider = self.provider_id().to_string();
         let mut out = Vec::new();
         let mut page_token: Option<String> = None;
+        // Every token already requested: a server that cycles (A -> B -> A)
+        // would otherwise re-collect the same models until the page cap.
+        let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
         for i in 0..50 {
             let mut query: Vec<(&str, String)> = vec![("pageSize", "1000".to_string())];
             if let Some(t) = &page_token {
@@ -612,21 +616,34 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
                     message,
                 });
             }
-            let v: serde_json::Value = resp
-                .json()
+            let body = resp
+                .text()
                 .await
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let v: serde_json::Value = crate::error::parse_listing_json(&provider, &body)?;
             let (models, next) = gemini_models_from_listing(&v, self.variant.provider_id());
             out.extend(models);
             match next {
                 Some(t) => {
-                    if Some(&t) == page_token.as_ref() {
-                        warn!("duplicate page token, stopping early");
+                    // The token just requested, or any earlier one (a cycle).
+                    if !seen_tokens.insert(t.clone()) {
+                        warn!(
+                            provider = %provider,
+                            page_token = %t,
+                            collected = out.len(),
+                            "model listing stopped: page token already seen; \
+                             returning the models collected so far"
+                        );
                         break;
                     }
                     // If this is the last iteration and we still have a next token, we hit the cap
                     if i == 49 {
-                        warn!("page limit (50) reached while next token present, stopping early");
+                        warn!(
+                            provider = %provider,
+                            collected = out.len(),
+                            "model listing stopped: page limit (50) reached while a next \
+                             token is present; returning the models collected so far"
+                        );
                     }
                     page_token = Some(t);
                 }
@@ -1256,6 +1273,13 @@ mod tests {
             ..Default::default()
         };
         let body = client.build_request_body(&request);
+        // `Value::get` on a missing/null `generationConfig` would also be
+        // `None`; prove the object is really there and only the cap is absent.
+        assert!(
+            body["request"]["generationConfig"].is_object(),
+            "generationConfig must still be sent: {}",
+            body["request"]
+        );
         assert!(body["request"]["generationConfig"]
             .get("maxOutputTokens")
             .is_none());
@@ -2409,9 +2433,9 @@ mod llm_provider_impl_tests {
     }
 
     #[tokio::test]
-    async fn list_models_returns_empty_until_ai_studio_wired() {
-        // fetch_models still defaults to empty for legacy list_models, and
-        // live limits come from `fetch_models`.
+    async fn list_models_is_empty_for_code_assist() {
+        // `list_models` is not overridden, so it keeps the trait default
+        // (empty); live limits come from `fetch_models`.
         let client = GoogleGeminiClient::new(
             oauth_creds(),
             GeminiVariant::GeminiCli,
@@ -2422,7 +2446,7 @@ mod llm_provider_impl_tests {
         let models = <GoogleGeminiClient as LlmProvider>::list_models(&client).await;
         assert!(
             models.is_empty(),
-            "Gemini list_models should be empty until AI Studio endpoint is wired; got {} entries",
+            "Gemini list_models keeps the empty trait default; got {} entries",
             models.len()
         );
     }
@@ -2578,6 +2602,118 @@ mod llm_provider_impl_tests {
         p1.assert_hits(1);
         // Second page with pageToken=t should be hit exactly once (duplicate token stops loop)
         p2.assert_hits(1);
+    }
+
+    fn ai_studio_client(base: String) -> GoogleGeminiClient {
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(base);
+        client
+    }
+
+    /// An A -> B -> A page-token cycle (not just an immediate repeat) must
+    /// stop before re-requesting a page, so no model is collected twice.
+    #[tokio::test]
+    async fn fetch_models_stops_on_an_a_b_a_token_cycle() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let entry = |id: &str| {
+            serde_json::json!({ "name": format!("models/{id}"), "inputTokenLimit": 10,
+                "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] })
+        };
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(
+                serde_json::json!({ "models": [entry("g-one")], "nextPageToken": "tok-a" }),
+            );
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok-a");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [entry("g-two")], "nextPageToken": "tok-b" }),
+            );
+        });
+        let p3 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok-b");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [entry("g-three")], "nextPageToken": "tok-a" }),
+            );
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert_hits(1);
+        p2.assert_hits(1);
+        p3.assert_hits(1);
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one", "g-two", "g-three"],
+            "no duplicates"
+        );
+    }
+
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(200).body("not json");
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// Every page — not just the first — asks for `pageSize=1000` and
+    /// authenticates with `x-goog-api-key`.
+    #[tokio::test]
+    async fn fetch_models_page_two_keeps_page_size_and_api_key_header() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok2" }));
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok2")
+                .query_param("pageSize", "1000")
+                .header("x-goog-api-key", "g-key");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-two", "inputTokenLimit": 20, "outputTokenLimit": 6, "supportedGenerationMethods": ["generateContent"] }
+            ]}));
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert_hits(1);
+        p2.assert_hits(1);
+        assert_eq!(ms.len(), 2);
     }
 
     #[tokio::test]
