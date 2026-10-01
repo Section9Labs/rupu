@@ -2351,6 +2351,10 @@ impl AnthropicClient {
         // Every cursor already requested: a server that cycles (A -> B -> A)
         // would otherwise re-collect the same models until the page cap.
         let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every model id already collected: a server that ignores `after_id`
+        // and re-sends a page must not leave its models in the result twice
+        // (the first occurrence wins).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Bounded as well: a server that never repeats a cursor must not loop
         // forever either.
         for page_num in 0..50 {
@@ -2376,15 +2380,20 @@ impl AnthropicClient {
                 .await
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
             let page: Page = crate::error::parse_listing_json("anthropic", &body)?;
-            out.extend(page.data.into_iter().map(|e| crate::model_pool::ModelInfo {
-                id: e.id,
-                provider: ProviderId::Anthropic,
-                context_window: e.max_input_tokens.unwrap_or(0),
-                max_output_tokens: e.max_tokens.unwrap_or(0),
-                capabilities: Vec::new(),
-                cost: crate::model_pool::ModelCost::default(),
-                status: crate::model_pool::ModelStatus::default(),
-            }));
+            out.extend(
+                page.data
+                    .into_iter()
+                    .filter(|e| seen_ids.insert(e.id.clone()))
+                    .map(|e| crate::model_pool::ModelInfo {
+                        id: e.id,
+                        provider: ProviderId::Anthropic,
+                        context_window: e.max_input_tokens.unwrap_or(0),
+                        max_output_tokens: e.max_tokens.unwrap_or(0),
+                        capabilities: Vec::new(),
+                        cost: crate::model_pool::ModelCost::default(),
+                        status: crate::model_pool::ModelStatus::default(),
+                    }),
+            );
             match (page.has_more, page.last_id) {
                 (false, _) => break, // Normal end: has_more is false
                 (true, None) => {
@@ -5789,6 +5798,54 @@ mod tests {
         page3.assert_hits(1);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["model-1", "model-2", "model-3"], "no duplicates");
+    }
+
+    /// A server that ignores `after_id` and answers every request with the
+    /// same page: the repeated cursor stops the loop, but the repeated page
+    /// must not leave its models in the result twice.
+    #[tokio::test]
+    async fn fetch_models_dedupes_ids_when_the_server_ignores_the_cursor() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET).path("/v1/models").matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "max_input_tokens": 100, "max_tokens": 10 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        // Same page again, same cursor again.
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "cursor-a");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "max_input_tokens": 999, "max_tokens": 99 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert_hits(1);
+        page2.assert_hits(1);
+        assert_eq!(
+            models.len(),
+            1,
+            "ids: {:?}",
+            models.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        assert_eq!(models[0].id, "model-1");
+        // The first occurrence wins.
+        assert_eq!(
+            (models[0].context_window, models[0].max_output_tokens),
+            (100, 10)
+        );
     }
 
     /// A 200 whose body is not JSON is a decode failure, not a transport

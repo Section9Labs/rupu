@@ -588,6 +588,10 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
         // Every token already requested: a server that cycles (A -> B -> A)
         // would otherwise re-collect the same models until the page cap.
         let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every model id already collected: a server that ignores `pageToken`
+        // and re-sends a page must not leave its models in the result twice
+        // (the first occurrence wins).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for i in 0..50 {
             let mut query: Vec<(&str, String)> = vec![("pageSize", "1000".to_string())];
             if let Some(t) = &page_token {
@@ -622,7 +626,7 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
             let v: serde_json::Value = crate::error::parse_listing_json(&provider, &body)?;
             let (models, next) = gemini_models_from_listing(&v, self.variant.provider_id());
-            out.extend(models);
+            out.extend(models.into_iter().filter(|m| seen_ids.insert(m.id.clone())));
             match next {
                 Some(t) => {
                     // The token just requested, or any earlier one (a cycle).
@@ -2664,6 +2668,45 @@ mod llm_provider_impl_tests {
             ["g-one", "g-two", "g-three"],
             "no duplicates"
         );
+    }
+
+    /// A server that ignores `pageToken` and answers every request with the
+    /// same page: the repeated token stops the loop, but the repeated page
+    /// must not leave its models in the result twice.
+    #[tokio::test]
+    async fn fetch_models_dedupes_ids_when_the_server_ignores_the_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok-a" }));
+        });
+        // Same page again, same token again.
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok-a");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 999, "outputTokenLimit": 99, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok-a" }));
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert_hits(1);
+        p2.assert_hits(1);
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one"],
+            "no duplicate ids"
+        );
+        // The first occurrence wins.
+        assert_eq!((ms[0].context_window, ms[0].max_output_tokens), (10, 5));
     }
 
     /// A 200 whose body is not JSON is a decode failure, not a transport
