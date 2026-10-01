@@ -289,6 +289,8 @@ See `docs/coverage.md` for what a complete report requires. Every field is requi
 
 Per-request output-token cap (the LLM request's `max_tokens`). You rarely need to set it: rupu discovers each model's real output cap from the provider's model list, where the provider reports one (Codex/OpenAI and OpenAI-compatible servers report none), and sends that on every turn. A `maxTokens` value overrides the discovered cap. When neither is known, Anthropic requests carry `8192` (the API requires a cap) and every other provider gets no cap, so the model's own maximum applies. Extended thinking (`effort`) draws from this same budget, so a low `maxTokens` can starve an agent that both reasons heavily and produces long output.
 
+On Anthropic, the `max` effort level's thinking budget scales with the output cap (cap − 2,000 tokens), so a discovered 64K cap raises both the budget and its cost; pin a smaller `maxTokens` to bound it. Non-streaming requests (`rupu run --no-stream`) cap a *discovered* output at 16,384 tokens so a single response cannot outlive the HTTP timeout, and the run's `model_limits` notice says when that cap applies; a `maxTokens` pin is honoured as-is. A non-streaming OpenAI-compatible request with no known cap carries `8192` instead of omitting the field, for the same reason.
+
 ### `contextWindowTokens` and `compactAtPercent`
 
 `contextWindowTokens` is the model's input-token limit, used for proactive context compaction. rupu discovers it from the provider's model list; set it only to override the discovered value (for example to compact earlier than the model requires, or on a provider that reports no limits). Compaction is off only when neither a pin nor a discovered value is available.
@@ -302,7 +304,7 @@ Where the limits come from, per field, in precedence order:
 3. the provider's live model list, cached for 1 hour in `~/.rupu/cache/models/` (see [providers.md](providers.md#model-resolution) for each provider's source);
 4. unknown.
 
-Every run writes a `model_limits` notice to its transcript stating the input limit, output cap and compaction threshold it will use and where each came from, including an explicit "unknown" when a limit could not be discovered. If the provider later rejects a request as "prompt too long" and reports the real maximum, rupu lowers the input limit to that value for the rest of the run (a `model_limits_clamped` notice), compacts with a summary, and retries. When the input limit is known, rupu compacts once per turn this way even if the error carries no number; dropping the oldest turns is the last resort. A session resolves its limits on its first turn and keeps them, including a lowered limit, for later turns.
+Every run writes a `model_limits` notice to its transcript stating the input limit, output cap and compaction threshold it will use and where each came from, including an explicit "unknown" when a limit could not be discovered. If the provider later rejects a request as "prompt too long" and reports the real maximum, rupu lowers the input limit to that value for the rest of the run (a `model_limits_clamped` notice), compacts with a summary, and retries. When the input limit is known, rupu compacts once per turn this way even if the error carries no number; dropping the oldest turns is the last resort. A session resolves its limits on its first turn and keeps them, including a lowered limit, for later turns (a first turn that found no limit at all is resolved again on the next turn).
 
 ### Anthropic-specific fields
 

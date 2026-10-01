@@ -245,8 +245,10 @@ See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 
 `rupu models list`, and the limit lookup every run does for its `model:`, resolve a model id through three sources in order:
 1. **Custom** — `[[providers.<name>.models]]` entries from `~/.rupu/config.toml`.
-2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches.
+2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches. A listing that returns no models counts as a failed refresh and never overwrites the cache.
 3. **Baked-in** — Copilot and Gemini ship a small built-in id list (limits unknown). Baked-in entries are merged beneath the live and custom rows and only fill ids the live list doesn't contain, so `rupu models list` can still show a few `baked-in` rows after a successful fetch; they never supply limits.
+
+`rupu models list` and the control plane's Models tab read only the **global** `~/.rupu/config.toml`, while a run also layers the project's `.rupu/config.toml` on top, so a project-level `[[providers.<name>.models]]` entry affects runs but does not appear in the catalog view.
 
 ```sh
 rupu models list              # built-in vendors + every declared account
@@ -295,11 +297,12 @@ Where each provider's limits come from:
 | gemini (Gemini CLI / Antigravity SSO) | none — Code Assist has no listing | unknown | unknown |
 | openai-compatible (vLLM, …) | `GET {base_url}/v1/models` | `max_model_len` (fills only the values config left unset) | not reported |
 
+- **OpenAI with an API key** also sends the key, as a Bearer token, to `chatgpt.com/backend-api/codex/models` — the only endpoint beyond `api.openai.com` — to read the Codex catalog's limits; if that call fails or lists nothing it falls back to the ids-only `GET /v1/models`.
 - **Gemini CLI / Code Assist login** exposes no model limits. Declare them yourself with `[[providers.gemini.models]]` (or pin `contextWindowTokens` / `maxTokens` on the agent); with that login, `rupu models refresh --provider gemini` reports that there is no listing rather than pretending to fetch one.
 - **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit. Its built-in ids only fill gaps beneath the live list and carry no limits.
 - **OpenAI-compatible** limits are unknown unless config or the server provides them — there are no made-up defaults.
 
-A provider's "prompt too long" error that reports the real maximum lowers the input limit for the rest of the run (a `model_limits_clamped` notice) and triggers compaction; the observed value is never written to the model cache, because it reflects the account rather than the model. A session resolves its limits on its first turn and keeps them.
+A provider's "prompt too long" error that reports the real maximum lowers the input limit for the rest of the run (a `model_limits_clamped` notice) and triggers compaction; the observed value is never written to the model cache, because it reflects the account rather than the model. A session resolves its limits on its first turn and keeps them (a first turn that found no limit at all is resolved again on the next turn).
 
 **In the control plane:** Settings → Models lists every provider's cached models with input limit, output cap, source and fetch age, with a **Refetch** button per provider and a **Refetch all** button. It is backed by `GET /api/models` and `POST /api/models/refresh` (body `{}` for all providers, or `{"provider": "<name>"}` for one) and refreshes the control-plane machine's cache only — remote hosts keep their own caches and refresh them when a run launches there.
 

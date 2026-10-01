@@ -33,7 +33,7 @@ to `<root>/v1/chat/completions`.
 
 Set `stream = false` for servers (or server versions) that do not implement
 the server-sent-event (SSE) streaming endpoint. rupu will send a standard
-blocking request and synthesise the same event sequence for the agent loop.
+blocking request and synthesise the same event sequence for the agent loop. A blocking request with no known output cap carries `max_tokens: 8192`, so one response cannot outlive the HTTP timeout; streaming requests omit the field.
 
 Each `[[providers.oracle.models]]` entry requires `id`; `context_window`
 and `max_output` are optional. When omitted, rupu reads `max_model_len` from
