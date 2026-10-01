@@ -737,18 +737,25 @@ pub struct AwaitingInfo {
     /// Why the run paused (approval gate vs manual/cooperative pause).
     pub reason: PauseReason,
     /// Seed transcript for a paused-*incomplete* step (a manual pause that
-    /// landed mid-step). The caller round-trips this into
-    /// [`ResumeState::paused_step`] so the resumed run re-runs that exact step
-    /// from where the agent left off. Empty for approval and step-boundary
+    /// landed mid-step) — the primary element of `paused_steps`, mirrored
+    /// for single-step callers. Empty for approval and step-boundary
     /// pauses (nothing to seed — the step runs fresh / was fully completed).
     pub resume_seed: Vec<Message>,
+    /// Every linear step that paused mid-turn with a seed. The caller
+    /// round-trips this into [`ResumeState::paused_steps`] so the resumed
+    /// run re-runs each of those exact steps from where its agent left off.
+    /// More than one when a DAG run's manual-pause drain caught several
+    /// concurrent steps pausing in the same wave.
+    pub paused_steps: Vec<PausedStep>,
     /// Units of the paused fan-out (`for_each`/`distribute:`) step that
     /// SUCCEEDED before the pause landed (merged with any units already
     /// replayed from an earlier resume). Keyed by 0-based unit index. The
     /// caller round-trips this into `ResumeState::completed_units[step_id]`
     /// so the resumed run re-dispatches ONLY the paused / not-yet-started
     /// units. Empty for every pause shape except a manual pause that landed
-    /// mid-fan-out.
+    /// mid-fan-out. When the pause is `step_id`'s own; every fan-out that
+    /// paused in the same wave also has its finished units checkpointed to
+    /// `unit_checkpoints.jsonl`, which is what `rupu workflow resume` reads.
     pub fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
     /// Every gate parked in this pause (Phase 2, Task 5b-1, spec §7).
     /// `step_id`/`prompt`/`expires_at` above mirror this set's FIRST
@@ -788,11 +795,12 @@ pub struct ResumeState {
     /// approval-resume behavior unchanged; `Manual` marks a cooperative-pause
     /// resume (emits `RunResumed` / `StepResumed`).
     pub reason: PauseReason,
-    /// The step that paused mid-run (a manual pause that landed inside a
-    /// linear step). On resume this exact step re-runs seeded with its
-    /// persisted transcript (role-alternation-safe). `None` for approval and
-    /// step-boundary pauses.
-    pub paused_step: Option<PausedStep>,
+    /// The steps that paused mid-run (a manual pause that landed inside a
+    /// linear step — several when a DAG run's manual-pause drain caught
+    /// concurrent steps pausing together). On resume each of these exact
+    /// steps re-runs seeded with its persisted transcript (role-alternation-
+    /// safe). Empty for approval and step-boundary pauses.
+    pub paused_steps: Vec<PausedStep>,
     /// The operator's rejection reason, when this `ResumeState` was built by
     /// [`ResumeState::from_rejection`]. `None` for every other constructor.
     /// Not consulted by [`run_reject_cleanup`] itself (its caller already
@@ -829,6 +837,34 @@ pub struct PausedStep {
     pub seed_messages: Vec<Message>,
 }
 
+impl PausedStep {
+    /// The `paused_steps` list for ONE node's manual pause: that node when
+    /// it paused mid-turn with a seed, nothing otherwise (a step-boundary
+    /// pause has no seed, and a fan-out's finished units are checkpointed
+    /// per unit to `unit_checkpoints.jsonl` instead).
+    fn list_for(step_id: &str, seed: &[Message]) -> Vec<PausedStep> {
+        if seed.is_empty() {
+            Vec::new()
+        } else {
+            vec![PausedStep {
+                step_id: step_id.to_string(),
+                seed_messages: seed.to_vec(),
+            }]
+        }
+    }
+}
+
+/// Ids of the steps a manual-pause resume re-runs seeded
+/// ([`ResumeState::paused_steps`]): each one's `approval:` gate is
+/// suppressed and it emits `StepResumed`. Empty for a fresh run.
+fn resume_paused_step_ids(opts: &OrchestratorRunOpts) -> std::collections::BTreeSet<&str> {
+    opts.resume_from
+        .iter()
+        .flat_map(|r| r.paused_steps.iter())
+        .map(|ps| ps.step_id.as_str())
+        .collect()
+}
+
 impl ResumeState {
     /// Resume context that only carries prior step results + the
     /// approved step id (the original approval-resume shape). No
@@ -844,7 +880,7 @@ impl ResumeState {
             approved_step_id,
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             approver: None,
             via_timeout: false,
@@ -890,7 +926,7 @@ impl ResumeState {
             approved_step_id: rejected_step_id,
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: Some(reason),
             approver: None,
             via_timeout: false,
@@ -1161,6 +1197,7 @@ pub async fn run_workflow(
                 prompt,
                 reason,
                 seed,
+                paused_steps,
                 fanout_completed_units,
                 gates,
                 // `timeout_seconds` is superseded by `gates` (each gate
@@ -1181,11 +1218,11 @@ pub async fn run_workflow(
                 // several for a DAG run whose wave reached concurrent gates
                 // on independent paths). All gates in one wave share the
                 // same `since` (this `now`) — the run paused once. A Manual
-                // pause is a single-step concept orthogonal to the gate
-                // model (`gates` is always empty for it, by construction —
-                // see `GateParked`'s doc) — `record.awaiting` stays EMPTY
-                // and only the legacy compat fields carry the paused-mid-
-                // step id, exactly as before this task.
+                // pause is orthogonal to the gate model (`gates` is always
+                // empty for it, by construction — see `GateParked`'s doc) —
+                // `record.awaiting` stays EMPTY and only the legacy compat
+                // fields carry the primary paused-mid-step id (every paused
+                // step's seed goes to `paused_seeds.json` below).
                 // Task 5b-2a (5b-1 Minor #3): a gate that was ALREADY parked
                 // before this resume cycle must keep its ORIGINAL `since`/
                 // `expires_at` rather than restarting its timeout clock. On
@@ -1239,14 +1276,27 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
-                // Persist the mid-step seed transcript (if any) so a resume
+                // Persist the mid-step seed transcripts (if any) so a resume
                 // in a fresh process (the CP-driven resume worker spawns a
                 // new `rupu workflow resume` subprocess) can reconstruct
-                // `ResumeState::paused_step` from disk. Empty for approval
-                // and step-boundary pauses — nothing to persist.
+                // `ResumeState::paused_steps` from disk: every paused
+                // step's seed in `paused_seeds.json`, plus the primary one
+                // (paired with `awaiting_step_id`) in the legacy single
+                // sidecar a binary predating the multi-step map still
+                // reads. Empty for approval and step-boundary pauses —
+                // nothing to persist.
                 if *reason == PauseReason::Manual && !seed.is_empty() {
                     if let Err(e) = store.write_paused_seed(&record.id, seed) {
                         warn!(error = %e, "failed to persist paused-step seed");
+                    }
+                }
+                if *reason == PauseReason::Manual && !paused_steps.is_empty() {
+                    let seeds: std::collections::BTreeMap<String, Vec<Message>> = paused_steps
+                        .iter()
+                        .map(|ps| (ps.step_id.clone(), ps.seed_messages.clone()))
+                        .collect();
+                    if let Err(e) = store.write_paused_seeds(&record.id, &seeds) {
+                        warn!(error = %e, "failed to persist paused-step seeds");
                     }
                 }
                 // Don't set finished_at — the run hasn't ended.
@@ -1256,6 +1306,7 @@ pub async fn run_workflow(
                     expires_at: record.expires_at,
                     reason: *reason,
                     resume_seed: seed.clone(),
+                    paused_steps: paused_steps.clone(),
                     fanout_completed_units: fanout_completed_units.clone(),
                     gates: record.awaiting.clone(),
                 });
@@ -1283,6 +1334,7 @@ pub async fn run_workflow(
         timeout_seconds,
         reason,
         seed,
+        paused_steps,
         fanout_completed_units,
         gates,
     }) = &outcome
@@ -1311,6 +1363,7 @@ pub async fn run_workflow(
             expires_at,
             reason: *reason,
             resume_seed: seed.clone(),
+            paused_steps: paused_steps.clone(),
             fanout_completed_units: fanout_completed_units.clone(),
             gates: gate_set,
         });
@@ -1471,6 +1524,12 @@ enum InnerOutcome {
         /// paused-incomplete linear step's `final_messages`). Empty for
         /// approval and step-boundary pauses.
         seed: Vec<Message>,
+        /// Every linear step that paused mid-turn with a resume seed (a
+        /// manual pause only); `step_id`/`seed` above mirror its primary
+        /// element — the same single-element convenience `gates` offers.
+        /// More than one only when `run_scheduler`'s manual-pause drain
+        /// caught several concurrent steps pausing in the same wave.
+        paused_steps: Vec<PausedStep>,
         /// Units of a paused fan-out step that already succeeded (see
         /// [`AwaitingInfo::fanout_completed_units`]). Empty except for a
         /// manual pause that landed mid-fan-out.
@@ -1491,14 +1550,85 @@ enum InnerOutcome {
 /// timestamp `run_workflow`, not the scheduler, computes — see that
 /// function's Paused-handling arm). Deliberately NOT reused for a
 /// `PauseReason::Manual` pause: the awaiting-SET model (spec §7) is
-/// specific to approval gates, a manual/cooperative pause is a single-step
-/// concept, so every Manual return site leaves this empty rather than
-/// synthesizing a manual "gate."
+/// specific to approval gates — a manual/cooperative pause carries its
+/// paused steps as [`PausedStep`] seeds instead — so every Manual return
+/// site leaves this empty rather than synthesizing a manual "gate."
 #[derive(Debug, Clone)]
 struct GateParked {
     step_id: String,
     prompt: String,
     timeout_seconds: Option<u64>,
+}
+
+/// A manual (cooperative) pause [`run_scheduler_scoped`] is draining toward
+/// — the cooperative-pause counterpart of its `parked` gate set. Once a
+/// pause is requested nothing new launches; every in-flight node runs to
+/// its own completion (recorded) or safe pause boundary (noted here), and
+/// the run pauses once `in_flight` is empty.
+struct ManualPause {
+    /// The step reported in the single-step fields (`step_id`/`seed`/
+    /// `fanout_completed_units`) — preferring one that paused mid-turn
+    /// with a seed (so the legacy single seed sidecar pairs with
+    /// `awaiting_step_id`), then a fan-out with checkpointed units, then
+    /// the first step a step-boundary pause stopped in front of.
+    step_id: String,
+    seed: Vec<Message>,
+    fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    /// Every step that paused mid-turn with a seed, in the order each
+    /// surfaced.
+    paused_steps: Vec<PausedStep>,
+}
+
+impl ManualPause {
+    /// Fold one pause into `pending` (starting it on the first).
+    fn note(
+        pending: &mut Option<ManualPause>,
+        step_id: String,
+        seed: Vec<Message>,
+        fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+        paused_steps: Vec<PausedStep>,
+    ) {
+        let rank = |seed: &[Message], units: &std::collections::BTreeMap<usize, ItemResult>| {
+            if !seed.is_empty() {
+                2
+            } else if !units.is_empty() {
+                1
+            } else {
+                0
+            }
+        };
+        match pending {
+            None => {
+                *pending = Some(ManualPause {
+                    step_id,
+                    seed,
+                    fanout_completed_units,
+                    paused_steps,
+                })
+            }
+            Some(p) => {
+                if rank(&seed, &fanout_completed_units) > rank(&p.seed, &p.fanout_completed_units) {
+                    p.step_id = step_id;
+                    p.seed = seed;
+                    p.fanout_completed_units = fanout_completed_units;
+                }
+                p.paused_steps.extend(paused_steps);
+            }
+        }
+    }
+
+    fn into_outcome(self) -> InnerOutcome {
+        InnerOutcome::Paused {
+            step_id: self.step_id,
+            prompt: String::new(),
+            timeout_seconds: None,
+            reason: PauseReason::Manual,
+            seed: self.seed,
+            paused_steps: self.paused_steps,
+            fanout_completed_units: self.fanout_completed_units,
+            gates: Vec::new(),
+        }
+    }
 }
 
 /// The actual per-step loop, factored out so the surrounding
@@ -1620,13 +1750,15 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// [`LoopNodeOutcome::Paused`]) — batch-parks (`parked`, spec §7): the
 /// scheduler keeps dispatching every other ready node and drains the
 /// `JoinSet` to completion, then pauses with the full gate set, so a
-/// sibling on an unrelated path is recorded rather than aborted. A hard
-/// failure (`run_node` returning `Err` — i.e. NOT `continue_on_error`) or
-/// a manual pause (the step-boundary check, or a mid-dispatch pause
-/// bubbling out as `NodeOutcome::Paused`) stops launching new nodes and
-/// returns immediately; any sibling tasks still in the `JoinSet` are
-/// ABORTED when it drops (tokio's documented `JoinSet` drop behavior), not
-/// gracefully drained to a safe boundary. A whole-run cancel goes through
+/// sibling on an unrelated path is recorded rather than aborted. A manual
+/// pause (the step-boundary check, a mid-dispatch pause bubbling out as
+/// `NodeOutcome::Paused`, or either inside a loop) stops launching new
+/// nodes but likewise drains the `JoinSet` (`manual_pause`): each sibling
+/// completes or reaches its own pause boundary, and the run pauses with
+/// every paused step's seed. A hard failure (`run_node` returning `Err` —
+/// i.e. NOT `continue_on_error`) returns immediately; any sibling tasks
+/// still in the `JoinSet` are ABORTED when it drops (tokio's documented
+/// `JoinSet` drop behavior). A whole-run cancel goes through
 /// [`cancel_finalize`] instead (spec §8). Every sample this task's golden
 /// test covers has graph width 1, so there is never another task in
 /// flight when any of this fires — unobservable there.
@@ -2046,11 +2178,7 @@ async fn run_scheduler_scoped(
         );
     }
 
-    let resume_paused_step_id: Option<&str> = opts
-        .resume_from
-        .as_ref()
-        .and_then(|r| r.paused_step.as_ref())
-        .map(|ps| ps.step_id.as_str());
+    let resume_paused_step_ids = resume_paused_step_ids(opts);
 
     let max_concurrency = wf
         .max_concurrency
@@ -2074,6 +2202,20 @@ async fn run_scheduler_scoped(
     // possible (both `ready` and `in_flight` empty); it just pauses with
     // EVERY gate reached in the wave in the set, not only the first.
     let mut parked: Vec<GateParked> = Vec::new();
+
+    // The cooperative-pause counterpart of `parked`: set once a manual
+    // pause is requested (a step boundary, a node pausing mid-dispatch, or
+    // a loop member doing either). From then on nothing new launches — the
+    // step-boundary check below fires for every node that becomes ready —
+    // but `in_flight` still drains, so a sibling either completes (its
+    // result recorded, never re-run on resume) or reaches its own pause
+    // boundary (its seed noted here) instead of being aborted mid-flight.
+    // The drain is bounded: every linear agent / fan-out unit honours the
+    // shared pause token at its next safe boundary, and the steps that
+    // don't (`run:`, `action:`, panel / parallel, placed units) are the
+    // same ones a single-step pause already waits out. A whole-run cancel
+    // still interrupts it through `cancel_finalize`.
+    let mut manual_pause: Option<ManualPause> = None;
 
     // Task 4 (spec §3): which bounded-loop iteration THIS call's own
     // dispatches belong to, if any. Non-empty (exactly one entry) only
@@ -2175,29 +2317,24 @@ async fn run_scheduler_scoped(
                 continue;
             }
 
-            if pause_triggered(&opts.pause) {
+            if manual_pause.is_some() || pause_triggered(&opts.pause) {
                 if workflow_has_sync_step(opts) {
                     return Err(RunWorkflowError::PauseWithWorkspaceSync);
                 }
                 info!(step = %step.id, "cooperative pause at step boundary");
-                // Manual pause is a hard, immediate return (unlike the
-                // approval-gate batch-park above) — the awaiting-set model
-                // is specific to approval gates (spec §7), so any gate
-                // ALREADY collected into `parked` this wave is dropped
-                // here rather than folded into this Manual-reason pause
-                // (which the `gates` field below leaves empty). Nothing is
-                // corrupted: a dropped-but-parked gate was never persisted
-                // (no `StepResult`), so it simply re-parks on the next
-                // resume exactly as if this wave had reached it first.
-                return Ok(InnerOutcome::Paused {
-                    step_id: step.id.clone(),
-                    prompt: String::new(),
-                    timeout_seconds: None,
-                    reason: PauseReason::Manual,
-                    seed: Vec::new(),
-                    fanout_completed_units: std::collections::BTreeMap::new(),
-                    gates: Vec::new(),
-                });
+                // Don't launch `i` (or anything after it) — but don't
+                // return either: stop draining `ready` and let `in_flight`
+                // drain (see `manual_pause`'s declaration). `i` is simply
+                // left undispatched; resume recomputes the ready set from
+                // `step_results`.
+                ManualPause::note(
+                    &mut manual_pause,
+                    step.id.clone(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                );
+                break;
             }
 
             // Task 3 (spec §2d/§2e): `scope.extra_context` (empty for
@@ -2443,7 +2580,7 @@ async fn run_scheduler_scoped(
 
             if let Some(approval) = &step.approval {
                 let gate_suppressed = approved_step_id == Some(step.id.as_str())
-                    || resume_paused_step_id == Some(step.id.as_str());
+                    || resume_paused_step_ids.contains(step.id.as_str());
                 if approval.required && !gate_suppressed {
                     let prompt = match &approval.prompt {
                         Some(template) => {
@@ -2643,10 +2780,10 @@ async fn run_scheduler_scoped(
             // task's report for the tradeoff (Task 4 may revisit). The
             // cost of awaiting inline: an outer sibling that finishes while
             // the loop runs is not drained until the loop resolves — so
-            // the approval-pause and cancel exits below hand `in_flight`
-            // to the normal drain / `cancel_finalize` rather than
-            // returning over it (a hard failure or a manual pause still
-            // returns immediately, like every other site here).
+            // the pause and cancel exits below hand `in_flight` to the
+            // normal drain / `cancel_finalize` rather than returning over
+            // it (a hard failure still returns immediately, like every
+            // other site here).
             //
             // Phase 3 fix: this `StepStarted` (and the `StepResult`
             // `run_loop_node` returns below) now carries
@@ -2738,18 +2875,23 @@ async fn run_scheduler_scoped(
                         // `JoinSet` drop a hard return would cause. The
                         // loop super-node stays not-done, so nothing
                         // downstream of it becomes ready. Its `seed`/
-                        // `fanout_completed_units` are always empty here —
-                        // only a manual pause produces either.
+                        // `paused_steps`/`fanout_completed_units` are always
+                        // empty here — only a manual pause produces them.
                         Ok(LoopNodeOutcome::Paused {
                             step_id,
                             prompt,
                             timeout_seconds,
                             reason: PauseReason::Approval,
                             seed,
+                            paused_steps,
                             fanout_completed_units,
                             gates,
                         }) => {
-                            debug_assert!(seed.is_empty() && fanout_completed_units.is_empty());
+                            debug_assert!(
+                                seed.is_empty()
+                                    && paused_steps.is_empty()
+                                    && fanout_completed_units.is_empty()
+                            );
                             if gates.is_empty() {
                                 parked.push(GateParked {
                                     step_id,
@@ -2760,29 +2902,26 @@ async fn run_scheduler_scoped(
                                 parked.extend(gates);
                             }
                         }
-                        // A manual pause keeps the same hard-return
-                        // contract as every other manual pause site in
-                        // this function (it carries a single paused
-                        // step's seed / fan-out checkpoint, which the
-                        // awaiting-set model can't merge).
+                        // A manual pause from the loop folds into this
+                        // call's own `manual_pause` drain the same way —
+                        // the loop super-node stays not-done, and the
+                        // outer siblings drain to completion or their own
+                        // pause boundaries.
                         Ok(LoopNodeOutcome::Paused {
                             step_id,
-                            prompt,
-                            timeout_seconds,
-                            reason,
+                            reason: PauseReason::Manual,
                             seed,
+                            paused_steps,
                             fanout_completed_units,
-                            gates,
+                            ..
                         }) => {
-                            return Ok(InnerOutcome::Paused {
+                            ManualPause::note(
+                                &mut manual_pause,
                                 step_id,
-                                prompt,
-                                timeout_seconds,
-                                reason,
                                 seed,
                                 fanout_completed_units,
-                                gates,
-                            });
+                                paused_steps,
+                            );
                         }
                         Err(e) => {
                             if let Some(sink) = opts.event_sink.as_ref() {
@@ -2853,7 +2992,7 @@ async fn run_scheduler_scoped(
                     },
                 );
             }
-            if resume_paused_step_id == Some(step.id.as_str()) {
+            if resume_paused_step_ids.contains(step.id.as_str()) {
                 if let Some(sink) = opts.event_sink.as_ref() {
                     sink.emit(
                         run_id,
@@ -3023,18 +3162,23 @@ async fn run_scheduler_scoped(
                 seed,
                 fanout_completed_units,
             } => {
-                // Manual/mid-dispatch pause — same hard-return, `parked`-
-                // dropping contract as the step-boundary Manual pause
-                // above.
-                return Ok(InnerOutcome::Paused {
+                if cancel_state.cancelled_by_us.remove(&i) {
+                    // A join loser we already wrote off paused instead of
+                    // finishing — as moot as the `Completed` straggler
+                    // below; nothing to resume.
+                    continue;
+                }
+                // Mid-dispatch manual pause: note it (seed / fan-out
+                // checkpoint) and keep draining the other in-flight nodes
+                // — see `manual_pause`'s declaration.
+                let paused_steps = PausedStep::list_for(&step_id, &seed);
+                ManualPause::note(
+                    &mut manual_pause,
                     step_id,
-                    prompt: String::new(),
-                    timeout_seconds: None,
-                    reason: PauseReason::Manual,
                     seed,
                     fanout_completed_units,
-                    gates: Vec::new(),
-                });
+                    paused_steps,
+                );
             }
             NodeOutcome::Completed(mut result) => {
                 let done_step_id = wf.steps[i].id.clone();
@@ -3074,8 +3218,18 @@ async fn run_scheduler_scoped(
         }
     }
 
-    // The loop above only `break`s once BOTH `ready` and `in_flight` are
-    // empty — i.e. no further non-gate progress is possible (the batch-
+    // The loop above only `break`s once `in_flight` is empty and nothing
+    // more can launch — `ready` drained too, or a manual pause stopped
+    // launching. A manual pause wins over any gates parked in the same
+    // wave: as before the drain existed, those are dropped rather than
+    // folded into a Manual-reason pause (the awaiting-set model is
+    // specific to approval gates, spec §7). Nothing is corrupted: a
+    // dropped-but-parked gate was never persisted (no `StepResult`), so it
+    // simply re-parks on the next resume.
+    if let Some(manual) = manual_pause {
+        return Ok(manual.into_outcome());
+    }
+    // Otherwise no further non-gate progress is possible (the batch-
     // parking non-goal stated on `parked`'s declaration: this is NOT
     // "keep computing while a gate waits", it's "pause once nothing else
     // CAN run"). If any gate was reached along the way, the run pauses now
@@ -3089,6 +3243,7 @@ async fn run_scheduler_scoped(
             timeout_seconds: first.timeout_seconds,
             reason: PauseReason::Approval,
             seed: Vec::new(),
+            paused_steps: Vec::new(),
             fanout_completed_units: std::collections::BTreeMap::new(),
             gates: parked,
         });
@@ -3424,6 +3579,7 @@ async fn run_loop_node(
                 timeout_seconds,
                 reason,
                 seed,
+                paused_steps,
                 fanout_completed_units,
                 gates,
             } => {
@@ -3446,6 +3602,7 @@ async fn run_loop_node(
                     timeout_seconds,
                     reason,
                     seed,
+                    paused_steps,
                     fanout_completed_units,
                     gates,
                 });
@@ -3544,10 +3701,11 @@ async fn run_loop_node(
 /// can't also carry `InnerOutcome::Done`, which `run_loop_node` never
 /// produces this way — it uses `Completed` instead). The caller
 /// (`run_scheduler_scoped`'s loop-supernode dispatch interception)
-/// batch-parks an approval `Paused` alongside any direct gates (draining
-/// the outer in-flight siblings first) and hard-returns a manual one —
-/// either way a normal, resumable `InnerOutcome::Paused` instead of the
-/// fail-loud `LoopIterationPaused` Task 3 shipped (now removed).
+/// folds `Paused` into its own drain — an approval one alongside any direct
+/// gates, a manual one into its `manual_pause` — draining the outer
+/// in-flight siblings first; either way a normal, resumable
+/// `InnerOutcome::Paused` instead of the fail-loud `LoopIterationPaused`
+/// Task 3 shipped (now removed).
 enum LoopNodeOutcome {
     Completed(StepResult, crate::templates::LoopProgress),
     Paused {
@@ -3556,6 +3714,7 @@ enum LoopNodeOutcome {
         timeout_seconds: Option<u64>,
         reason: PauseReason,
         seed: Vec<Message>,
+        paused_steps: Vec<PausedStep>,
         fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
         gates: Vec<GateParked>,
     },
@@ -4267,14 +4426,10 @@ async fn run_steps_over(
     let already_done: std::collections::BTreeSet<String> =
         step_results.iter().map(|sr| sr.step_id.clone()).collect();
 
-    // The step (if any) that paused mid-run in a prior process and is being
-    // re-run now. Its `approval:` gate is suppressed and it is re-seeded from
-    // its persisted transcript (see `run_linear_step`).
-    let resume_paused_step_id: Option<&str> = opts
-        .resume_from
-        .as_ref()
-        .and_then(|r| r.paused_step.as_ref())
-        .map(|ps| ps.step_id.as_str());
+    // The steps (if any) that paused mid-run in a prior process and are
+    // being re-run now. Their `approval:` gates are suppressed and each is
+    // re-seeded from its persisted transcript (see `run_linear_step`).
+    let resume_paused_step_ids = resume_paused_step_ids(opts);
 
     // Step ids on branch arms that were NOT taken. Populated when a
     // `branch:` step's condition renders (see the branch arm below); each
@@ -4361,6 +4516,7 @@ async fn run_steps_over(
                 timeout_seconds: None,
                 reason: PauseReason::Manual,
                 seed: Vec::new(),
+                paused_steps: Vec::new(),
                 fanout_completed_units: std::collections::BTreeMap::new(),
                 gates: Vec::new(),
             });
@@ -4509,6 +4665,7 @@ async fn run_steps_over(
                 timeout_seconds: ap.timeout_seconds,
                 reason: PauseReason::Approval,
                 seed: Vec::new(),
+                paused_steps: Vec::new(),
                 fanout_completed_units: std::collections::BTreeMap::new(),
                 gates: vec![GateParked {
                     step_id: step.id.clone(),
@@ -4528,7 +4685,7 @@ async fn run_steps_over(
             // paused-mid-run step being re-run (it already cleared its gate
             // in the prior process).
             let gate_suppressed = approved_step_id == Some(step.id.as_str())
-                || resume_paused_step_id == Some(step.id.as_str());
+                || resume_paused_step_ids.contains(step.id.as_str());
             if approval.required && !gate_suppressed {
                 let prompt = match &approval.prompt {
                     Some(template) => {
@@ -4560,6 +4717,7 @@ async fn run_steps_over(
                     timeout_seconds: approval.timeout_seconds,
                     reason: PauseReason::Approval,
                     seed: Vec::new(),
+                    paused_steps: Vec::new(),
                     fanout_completed_units: std::collections::BTreeMap::new(),
                     gates: vec![GateParked {
                         step_id: step.id.clone(),
@@ -4651,7 +4809,7 @@ async fn run_steps_over(
             );
         }
         // Resume: announce the paused-mid-run step is picking back up.
-        if resume_paused_step_id == Some(step.id.as_str()) {
+        if resume_paused_step_ids.contains(step.id.as_str()) {
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
                     run_id,
@@ -4669,6 +4827,7 @@ async fn run_steps_over(
                 fanout_completed_units,
             } => {
                 return Ok(InnerOutcome::Paused {
+                    paused_steps: PausedStep::list_for(&step_id, &seed),
                     step_id,
                     prompt: String::new(),
                     timeout_seconds: None,
@@ -6453,8 +6612,7 @@ async fn run_linear_step(
             let resume_seed = opts
                 .resume_from
                 .as_ref()
-                .and_then(|r| r.paused_step.as_ref())
-                .filter(|ps| ps.step_id == step.id)
+                .and_then(|r| r.paused_steps.iter().find(|ps| ps.step_id == step.id))
                 .map(|ps| split_seed_for_resume(ps.seed_messages.clone()));
 
             let on_usage = ledger_hook(
@@ -10167,7 +10325,7 @@ steps:
             approved_step_id: String::new(),
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             ..Default::default()
         });
@@ -10447,10 +10605,10 @@ steps:
             approved_step_id: String::new(),
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Manual,
-            paused_step: Some(PausedStep {
+            paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: awaiting.resume_seed,
-            }),
+            }],
             rejected_reason: None,
             ..Default::default()
         });
@@ -10544,7 +10702,7 @@ steps:
             approved_step_id: String::new(),
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Manual,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             ..Default::default()
         });
@@ -10670,10 +10828,10 @@ steps:
             approved_step_id: String::new(),
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Manual,
-            paused_step: Some(PausedStep {
+            paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
-            }),
+            }],
             rejected_reason: None,
             ..Default::default()
         });
@@ -10744,10 +10902,10 @@ steps:
             approved_step_id: String::new(),
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Manual,
-            paused_step: Some(PausedStep {
+            paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
-            }),
+            }],
             rejected_reason: None,
             ..Default::default()
         });
@@ -10968,7 +11126,7 @@ steps:
                 approved_step_id: String::new(),
                 completed_units,
                 reason: PauseReason::Manual,
-                paused_step: None,
+                paused_steps: Vec::new(),
                 rejected_reason: None,
                 ..Default::default()
             }),
@@ -11136,7 +11294,7 @@ steps:
             approved_step_id: String::new(),
             completed_units,
             reason: PauseReason::Manual,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             ..Default::default()
         });
@@ -13655,7 +13813,7 @@ loops:
                 approved_step_id: String::new(),
                 completed_units: std::collections::BTreeMap::new(),
                 reason: PauseReason::Manual,
-                paused_step: None,
+                paused_steps: Vec::new(),
                 rejected_reason: None,
                 ..Default::default()
             }),
@@ -13837,7 +13995,7 @@ loops:
                 approved_step_id: String::new(),
                 completed_units: std::collections::BTreeMap::new(),
                 reason: PauseReason::Manual,
-                paused_step: None,
+                paused_steps: Vec::new(),
                 rejected_reason: None,
                 ..Default::default()
             }),
@@ -17050,7 +17208,7 @@ steps:
                 approved_step_id: String::new(),
                 completed_units,
                 reason: PauseReason::Manual,
-                paused_step: None,
+                paused_steps: Vec::new(),
                 rejected_reason: None,
                 ..Default::default()
             }),
@@ -17471,5 +17629,763 @@ steps:
             seen.iter().all(|(_, ok, _)| *ok),
             "no step may be reported failed on a clean run; got {seen:?}"
         );
+    }
+}
+
+/// A manual (cooperative) pause must drain the DAG scheduler's in-flight
+/// siblings — each either completes (recorded, never re-run on resume) or
+/// reaches its own safe pause boundary (seed captured) — instead of
+/// hard-returning and dropping the `JoinSet`, which aborts every sibling
+/// mid-flight.
+#[cfg(test)]
+mod manual_pause_drain {
+    use super::*;
+    use rupu_agent::runner::{
+        BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
+    };
+    use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, StreamEvent};
+    use rupu_providers::{LlmProvider, ProviderError, ProviderId};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Turn 1 is a real `read_file` tool call, so a pause seed carries a
+    /// complete tool round-trip; every later call never returns, so the
+    /// pause token always wins `run_agent`'s provider-call race. Reaching
+    /// that hanging call bumps the shared `hung` counter, fires `on_hang`,
+    /// and — once `trip.0` agents have hung — trips the pause token.
+    struct ToolThenHang {
+        first: Option<MockProvider>,
+        hung: Arc<AtomicUsize>,
+        trip: Option<(usize, CancellationToken)>,
+        on_hang: Option<Arc<tokio::sync::Notify>>,
+    }
+    impl ToolThenHang {
+        fn new(hung: &Arc<AtomicUsize>) -> Self {
+            Self {
+                first: Some(MockProvider::new(vec![ScriptedTurn::AssistantToolUse {
+                    text: None,
+                    tool_id: "call_read_1".into(),
+                    tool_name: "read_file".into(),
+                    tool_input: serde_json::json!({ "path": "notes.txt" }),
+                    stop: StopReason::ToolUse,
+                }])),
+                hung: Arc::clone(hung),
+                trip: None,
+                on_hang: None,
+            }
+        }
+        fn trips_at(mut self, n: usize, token: &CancellationToken) -> Self {
+            self.trip = Some((n, token.clone()));
+            self
+        }
+        fn notifies(mut self, on_hang: &Arc<tokio::sync::Notify>) -> Self {
+            self.on_hang = Some(Arc::clone(on_hang));
+            self
+        }
+    }
+    #[async_trait]
+    impl LlmProvider for ToolThenHang {
+        async fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            if let Some(mut first) = self.first.take() {
+                return first.send(req).await;
+            }
+            let hung = self.hung.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(on_hang) = &self.on_hang {
+                on_hang.notify_one();
+            }
+            if let Some((at, token)) = &self.trip {
+                if hung >= *at {
+                    token.cancel();
+                }
+            }
+            std::future::pending().await
+        }
+        async fn stream(
+            &mut self,
+            req: &LlmRequest,
+            _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            self.send(req).await
+        }
+        fn default_model(&self) -> &str {
+            "mock-1"
+        }
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Anthropic
+        }
+    }
+
+    fn done_provider() -> CapturingMockProvider {
+        CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }])
+    }
+
+    /// Hands each local step the next provider queued for its id (a step
+    /// with none left gets a plain completing mock) and records every
+    /// dispatch.
+    #[derive(Default)]
+    struct QueuedFactory {
+        providers: Mutex<BTreeMap<String, VecDeque<Box<dyn LlmProvider>>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    impl QueuedFactory {
+        fn with(self, step_id: &str, provider: impl LlmProvider + 'static) -> Self {
+            self.providers
+                .lock()
+                .unwrap()
+                .entry(step_id.to_string())
+                .or_default()
+                .push_back(Box::new(provider));
+            self
+        }
+    }
+    #[async_trait]
+    impl StepFactory for QueuedFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            let provider = self
+                .providers
+                .lock()
+                .unwrap()
+                .get_mut(step_id)
+                .and_then(|q| q.pop_front())
+                .unwrap_or_else(|| Box::new(done_provider()));
+            AgentRunOpts {
+                seed_source: None,
+                agent_name: agent_name.to_string(),
+                agent_system_prompt: "test".into(),
+                agent_tools: None,
+                provider,
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: rupu_tools::ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                // The one-shot path races `provider.send` against the pause
+                // token — the deterministic pause boundary for these tests.
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                on_usage: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                scope_name: None,
+                surface_tag: None,
+                pause: None,
+                codename: None,
+            }
+        }
+    }
+
+    /// Placed (`host:`) steps — dispatched with no pause token, so they
+    /// always run to completion. A step in `gates` first waits on its
+    /// signal (a `Notify` nobody fires blocks it forever) and then `delay`;
+    /// `trip_on` trips the pause token when that step is dispatched (after
+    /// `trip_after` fires, when set).
+    #[derive(Default)]
+    struct PlacedDispatcher {
+        calls: Arc<Mutex<Vec<String>>>,
+        gates: BTreeMap<String, (Arc<tokio::sync::Notify>, Duration)>,
+        trip_on: Option<(String, CancellationToken, Option<Arc<tokio::sync::Notify>>)>,
+    }
+    #[async_trait]
+    impl UnitDispatcher for PlacedDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.calls.lock().unwrap().push(unit.step_id.clone());
+            if let Some((id, token, after)) = &self.trip_on {
+                if *id == unit.step_id {
+                    if let Some(after) = after {
+                        after.notified().await;
+                    }
+                    token.cancel();
+                }
+            }
+            if let Some((gate, delay)) = self.gates.get(&unit.step_id) {
+                gate.notified().await;
+                tokio::time::sleep(*delay).await;
+            }
+            Ok(UnitOutcome {
+                output: format!("out-{}", unit.step_id),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            })
+        }
+    }
+
+    /// Records every event and runs `hook` on each.
+    struct HookSink {
+        events: Mutex<Vec<crate::executor::Event>>,
+        hook: Box<dyn Fn(&crate::executor::Event) + Send + Sync>,
+    }
+    impl HookSink {
+        fn new(hook: impl Fn(&crate::executor::Event) + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Vec::new()),
+                hook: Box::new(hook),
+            })
+        }
+        fn position(&self, pred: impl Fn(&crate::executor::Event) -> bool) -> Option<usize> {
+            self.events.lock().unwrap().iter().position(pred)
+        }
+    }
+    impl crate::executor::EventSink for HookSink {
+        fn emit(&self, _run_id: &str, ev: &crate::executor::Event) {
+            self.events.lock().unwrap().push(ev.clone());
+            (self.hook)(ev);
+        }
+    }
+    fn is_paused(ev: &crate::executor::Event, id: &str) -> bool {
+        matches!(ev, crate::executor::Event::StepPaused { step_id, .. } if step_id == id)
+    }
+    fn is_completed(ev: &crate::executor::Event, id: &str) -> bool {
+        matches!(ev, crate::executor::Event::StepCompleted { step_id, .. } if step_id == id)
+    }
+
+    /// Releases `gate` the moment `step` emits `StepPaused`.
+    fn release_on_pause(step: &'static str, gate: &Arc<tokio::sync::Notify>) -> Arc<HookSink> {
+        let gate = Arc::clone(gate);
+        HookSink::new(move |ev| {
+            if is_paused(ev, step) {
+                gate.notify_one();
+            }
+        })
+    }
+
+    struct Harness {
+        tmp: tempfile::TempDir,
+        store: Arc<crate::runs::RunStore>,
+        wf_yaml: &'static str,
+    }
+    impl Harness {
+        fn new(wf_yaml: &'static str) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+            Self {
+                tmp,
+                store,
+                wf_yaml,
+            }
+        }
+        fn opts(
+            &self,
+            factory: QueuedFactory,
+            dispatcher: PlacedDispatcher,
+            sink: Option<Arc<HookSink>>,
+            pause: Option<CancellationToken>,
+            resume_from: Option<ResumeState>,
+        ) -> OrchestratorRunOpts {
+            OrchestratorRunOpts {
+                run_step: Default::default(),
+                workflow: Workflow::parse(self.wf_yaml).unwrap(),
+                inputs: BTreeMap::new(),
+                workspace_id: "ws_manual_drain".into(),
+                workspace_path: self.tmp.path().to_path_buf(),
+                transcript_dir: self.tmp.path().to_path_buf(),
+                factory: Arc::new(factory),
+                event: None,
+                issue: None,
+                issue_ref: None,
+                run_store: Some(Arc::clone(&self.store)),
+                workflow_yaml: Some(self.wf_yaml.to_string()),
+                resume_from,
+                run_id_override: None,
+                strict_templates: false,
+                event_sink: sink.map(|s| s as Arc<dyn crate::executor::EventSink>),
+                unit_dispatcher: Some(Arc::new(dispatcher)),
+                action_dispatcher: None,
+                pause,
+                naming: None,
+            }
+        }
+        /// A `ResumeState` built the way `rupu workflow resume` builds one:
+        /// prior results and every paused seed read back from disk.
+        fn manual_resume(&self, run_id: &str) -> ResumeState {
+            let record = self.store.load(run_id).unwrap();
+            assert_eq!(record.status, crate::runs::RunStatus::Paused);
+            let paused_steps = self
+                .store
+                .read_paused_seeds(run_id, record.awaiting_step_id.as_deref())
+                .unwrap()
+                .into_iter()
+                .map(|(step_id, seed_messages)| PausedStep {
+                    step_id,
+                    seed_messages,
+                })
+                .collect();
+            ResumeState {
+                run_id: run_id.to_string(),
+                prior_step_results: self
+                    .store
+                    .read_step_results(run_id)
+                    .unwrap()
+                    .iter()
+                    .map(StepResult::from)
+                    .collect(),
+                reason: PauseReason::Manual,
+                paused_steps,
+                ..Default::default()
+            }
+        }
+        fn persisted(&self, run_id: &str, step_id: &str) -> usize {
+            self.store
+                .read_step_results(run_id)
+                .unwrap()
+                .iter()
+                .filter(|r| r.step_id == step_id)
+                .count()
+        }
+    }
+
+    fn ids(paused: &[PausedStep]) -> Vec<&str> {
+        let mut ids: Vec<&str> = paused.iter().map(|p| p.step_id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+    fn has_tool_result(messages: &[Message]) -> bool {
+        messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        })
+    }
+    /// `true` when the provider's FIRST request was seeded with a paused
+    /// tool round-trip (a fresh run's first request has only the prompt).
+    fn first_request_was_seeded(captured: &Arc<Mutex<Vec<LlmRequest>>>) -> bool {
+        captured
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|req| has_tool_result(&req.messages))
+    }
+
+    const PAUSER_AND_FINISHER_WF: &str = r#"
+name: pauser-and-finisher
+steps:
+  - id: fanout
+    split: [pauser, finisher]
+  - id: pauser
+    agent: thinker
+    prompt: "think"
+  - id: finisher
+    agent: helper
+    prompt: "help"
+    host: worker-1
+"#;
+
+    /// `pauser` pauses mid-turn while `finisher` (placed — no pause token)
+    /// is still running; `finisher` only finishes AFTER `pauser` has
+    /// paused. It must be drained and recorded (terminal event + persisted
+    /// result) and must NOT be re-dispatched on resume, while `pauser`
+    /// resumes from its seed.
+    #[tokio::test]
+    async fn manual_pause_drains_a_running_sibling_instead_of_aborting_it() {
+        let h = Harness::new(PAUSER_AND_FINISHER_WF);
+        let token = CancellationToken::new();
+        let hung = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sink = release_on_pause("pauser", &release);
+        let factory =
+            QueuedFactory::default().with("pauser", ToolThenHang::new(&hung).trips_at(1, &token));
+        let dispatcher = PlacedDispatcher {
+            gates: BTreeMap::from([("finisher".into(), (release, Duration::from_millis(50)))]),
+            ..Default::default()
+        };
+        let res1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(
+                factory,
+                dispatcher,
+                Some(Arc::clone(&sink)),
+                Some(token),
+                None,
+            )),
+        )
+        .await
+        .expect("phase 1 must not hang")
+        .expect("phase 1 must pause, not error");
+
+        let awaiting = res1.awaiting.clone().expect("the run must pause");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(awaiting.step_id, "pauser");
+        assert_eq!(ids(&awaiting.paused_steps), vec!["pauser"]);
+        assert!(has_tool_result(&awaiting.paused_steps[0].seed_messages));
+
+        let finisher = res1
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "finisher")
+            .expect("finisher must be drained and recorded, not aborted");
+        assert!(finisher.success);
+        assert_eq!(h.persisted(&res1.run_id, "finisher"), 1);
+        let paused_at = sink.position(|ev| is_paused(ev, "pauser")).unwrap();
+        let completed_at = sink
+            .position(|ev| is_completed(ev, "finisher"))
+            .expect("finisher must emit a terminal StepCompleted");
+        assert!(
+            completed_at > paused_at,
+            "finisher finished after the pause"
+        );
+
+        // --- Resume: `pauser` re-runs seeded; `finisher` is done.
+        let provider2 = done_provider();
+        let captured = Arc::clone(&provider2.captured);
+        let dispatcher2 = PlacedDispatcher::default();
+        let placed_calls2 = Arc::clone(&dispatcher2.calls);
+        let resume = h.manual_resume(&res1.run_id);
+        let res2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(
+                QueuedFactory::default().with("pauser", provider2),
+                dispatcher2,
+                None,
+                None,
+                Some(resume),
+            )),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must complete");
+        assert!(res2.awaiting.is_none());
+        assert!(
+            placed_calls2.lock().unwrap().is_empty(),
+            "finisher already completed and must not re-run"
+        );
+        assert!(
+            first_request_was_seeded(&captured),
+            "pauser resumes from its seed"
+        );
+        assert_eq!(h.persisted(&res1.run_id, "finisher"), 1);
+        assert_eq!(h.persisted(&res1.run_id, "pauser"), 1);
+    }
+
+    const TWO_PAUSERS_WF: &str = r#"
+name: two-pausers
+steps:
+  - id: fanout
+    split: [p1, p2]
+  - id: p1
+    agent: thinker
+    prompt: "one"
+  - id: p2
+    agent: thinker
+    prompt: "two"
+"#;
+
+    /// Two concurrent agents both mid-turn when the pause lands: BOTH
+    /// seeds are captured, persisted (`paused_seeds.json`) and re-seeded on
+    /// resume — not just whichever paused first, with the other aborted.
+    #[tokio::test]
+    async fn manual_pause_captures_every_concurrently_paused_steps_seed() {
+        let h = Harness::new(TWO_PAUSERS_WF);
+        let token = CancellationToken::new();
+        let hung = Arc::new(AtomicUsize::new(0));
+        let factory = QueuedFactory::default()
+            .with("p1", ToolThenHang::new(&hung).trips_at(2, &token))
+            .with("p2", ToolThenHang::new(&hung).trips_at(2, &token));
+        let res1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(
+                factory,
+                PlacedDispatcher::default(),
+                None,
+                Some(token),
+                None,
+            )),
+        )
+        .await
+        .expect("phase 1 must not hang")
+        .expect("phase 1 must pause, not error");
+        let awaiting = res1.awaiting.clone().expect("the run must pause");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(ids(&awaiting.paused_steps), vec!["p1", "p2"]);
+        assert!(awaiting
+            .paused_steps
+            .iter()
+            .all(|p| has_tool_result(&p.seed_messages)));
+
+        // --- Resume: both re-run from their own seeds.
+        let resume = h.manual_resume(&res1.run_id);
+        assert_eq!(ids(&resume.paused_steps), vec!["p1", "p2"]);
+        let (p1, p2) = (done_provider(), done_provider());
+        let (c1, c2) = (Arc::clone(&p1.captured), Arc::clone(&p2.captured));
+        let res2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(
+                QueuedFactory::default().with("p1", p1).with("p2", p2),
+                PlacedDispatcher::default(),
+                None,
+                None,
+                Some(resume),
+            )),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must complete");
+        assert!(res2.awaiting.is_none());
+        assert!(first_request_was_seeded(&c1), "p1 resumes from its seed");
+        assert!(first_request_was_seeded(&c2), "p2 resumes from its seed");
+    }
+
+    const BOUNDARY_WF: &str = r#"
+name: boundary-pause
+steps:
+  - id: fanout
+    split: [first, side]
+  - id: first
+    agent: builder
+    prompt: "first"
+    host: worker-1
+  - id: next
+    agent: builder
+    prompt: "next"
+    depends_on: [first]
+  - id: side
+    agent: thinker
+    prompt: "side"
+"#;
+
+    /// A step-boundary pause (the token trips while `next` is about to be
+    /// dispatched) must not launch `next`, but must let the in-flight
+    /// `side` agent reach its own pause boundary — seed captured, resumed
+    /// from it — instead of aborting it.
+    #[tokio::test]
+    async fn step_boundary_manual_pause_lets_an_in_flight_agent_pause_with_its_seed() {
+        let h = Harness::new(BOUNDARY_WF);
+        let token = CancellationToken::new();
+        let hung = Arc::new(AtomicUsize::new(0));
+        let side_hung = Arc::new(tokio::sync::Notify::new());
+        let factory =
+            QueuedFactory::default().with("side", ToolThenHang::new(&hung).notifies(&side_hung));
+        let calls1 = Arc::clone(&factory.calls);
+        let dispatcher = PlacedDispatcher {
+            trip_on: Some(("first".into(), token.clone(), Some(side_hung))),
+            ..Default::default()
+        };
+        let res1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(factory, dispatcher, None, Some(token), None)),
+        )
+        .await
+        .expect("phase 1 must not hang")
+        .expect("phase 1 must pause, not error");
+        let awaiting = res1.awaiting.clone().expect("the run must pause");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(ids(&awaiting.paused_steps), vec!["side"]);
+        assert_eq!(awaiting.step_id, "side", "the seeded step is the primary");
+        assert!(
+            !calls1.lock().unwrap().iter().any(|s| s == "next"),
+            "nothing new launches once the pause is requested"
+        );
+        assert_eq!(h.persisted(&res1.run_id, "first"), 1);
+
+        let provider2 = done_provider();
+        let captured = Arc::clone(&provider2.captured);
+        let dispatcher2 = PlacedDispatcher::default();
+        let placed_calls2 = Arc::clone(&dispatcher2.calls);
+        let resume = h.manual_resume(&res1.run_id);
+        let res2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(
+                QueuedFactory::default().with("side", provider2),
+                dispatcher2,
+                None,
+                None,
+                Some(resume),
+            )),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must complete");
+        assert!(res2.awaiting.is_none());
+        assert!(
+            first_request_was_seeded(&captured),
+            "side resumes from its seed"
+        );
+        assert_eq!(
+            placed_calls2.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "first already completed; next is local"
+        );
+        assert_eq!(h.persisted(&res1.run_id, "next"), 1);
+        assert_eq!(h.persisted(&res1.run_id, "first"), 1);
+    }
+
+    const LOOP_WITH_SIBLING_WF: &str = r#"
+name: loop-manual-pause
+steps:
+  - id: work
+    agent: worker
+    prompt: "work"
+  - id: check
+    agent: checker
+    prompt: "check {{ steps.work.output }}"
+    depends_on: [work]
+  - id: side
+    agent: helper
+    prompt: "side"
+    host: worker-1
+loops:
+  refine:
+    nodes: [work, check]
+    until: "{{ steps.check.output }}"
+    max_iterations: 2
+"#;
+
+    /// A manual pause landing on a loop member drains the OUTER scheduler's
+    /// in-flight siblings too (the loop super-node is awaited inline).
+    #[tokio::test]
+    async fn manual_pause_inside_a_loop_drains_an_outer_sibling() {
+        let h = Harness::new(LOOP_WITH_SIBLING_WF);
+        let token = CancellationToken::new();
+        let hung = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sink = release_on_pause("work", &release);
+        let factory =
+            QueuedFactory::default().with("work", ToolThenHang::new(&hung).trips_at(1, &token));
+        let dispatcher = PlacedDispatcher {
+            gates: BTreeMap::from([("side".into(), (release, Duration::from_millis(50)))]),
+            ..Default::default()
+        };
+        let res1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(factory, dispatcher, Some(sink), Some(token), None)),
+        )
+        .await
+        .expect("phase 1 must not hang")
+        .expect("phase 1 must pause, not error");
+        let awaiting = res1.awaiting.clone().expect("the run must pause");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(ids(&awaiting.paused_steps), vec!["work"]);
+        assert_eq!(
+            h.persisted(&res1.run_id, "side"),
+            1,
+            "side drained, not aborted"
+        );
+
+        let provider2 = done_provider();
+        let captured = Arc::clone(&provider2.captured);
+        let dispatcher2 = PlacedDispatcher::default();
+        let placed_calls2 = Arc::clone(&dispatcher2.calls);
+        let resume = h.manual_resume(&res1.run_id);
+        let res2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_workflow(h.opts(
+                QueuedFactory::default().with("work", provider2),
+                dispatcher2,
+                None,
+                None,
+                Some(resume),
+            )),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must converge and complete");
+        assert!(res2.awaiting.is_none());
+        assert!(
+            first_request_was_seeded(&captured),
+            "work resumes from its seed"
+        );
+        assert!(
+            placed_calls2.lock().unwrap().is_empty(),
+            "side already completed and must not re-run"
+        );
+    }
+
+    /// Pause-vs-cancel: a whole-run cancel during the manual-pause drain
+    /// still tears the remaining siblings down through `cancel_finalize`
+    /// rather than waiting on one that would never finish.
+    #[tokio::test]
+    async fn cancel_during_manual_pause_drain_aborts_the_waiting_sibling() {
+        let h = Harness::new(PAUSER_AND_FINISHER_WF);
+        let token = CancellationToken::new();
+        let hung = Arc::new(AtomicUsize::new(0));
+        let paused = Arc::new(tokio::sync::Notify::new());
+        let sink = release_on_pause("pauser", &paused);
+        let factory =
+            QueuedFactory::default().with("pauser", ToolThenHang::new(&hung).trips_at(1, &token));
+        let dispatcher = PlacedDispatcher {
+            // Never released: only a cancel can stop it.
+            gates: BTreeMap::from([(
+                "finisher".into(),
+                (Arc::new(tokio::sync::Notify::new()), Duration::ZERO),
+            )]),
+            ..Default::default()
+        };
+        let opts = h.opts(factory, dispatcher, Some(sink), Some(token), None);
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            paused.notified().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancel must stop the drain, not await the sibling forever");
+        match outcome {
+            Err(RunWorkflowError::RunCancelled { aborted }) => {
+                assert_eq!(aborted, 1, "only the waiting finisher was still in flight");
+            }
+            other => panic!("expected Err(RunCancelled), got {other:?}"),
+        }
+        assert!(!step_results.iter().any(|sr| sr.step_id == "finisher"));
     }
 }
