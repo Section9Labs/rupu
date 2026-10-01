@@ -2006,7 +2006,10 @@ impl AnthropicClient {
             .max_tokens
             .unwrap_or(crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS);
         let mut body = serde_json::json!({
-            "model": request.model,
+            // `[1m]` is a client-side opt-in marker (it decides the 1M beta,
+            // see `sends_1m_beta`), never part of the model id: claude-cli
+            // strips it too (`normalizeModelStringForAPI`).
+            "model": crate::model_registry::strip_1m(&request.model),
             "max_tokens": max_tokens,
             "messages": messages_value,
             "stream": stream,
@@ -2960,6 +2963,27 @@ mod tests {
             csv.contains("context-1m-2025-08-07"),
             "context-1m must be sent when [1m] suffix is present; got: {csv}"
         );
+    }
+
+    /// `[1m]` is a client-side opt-in marker, not part of the model id:
+    /// claude-cli strips it before the API call (`normalizeModelStringForAPI`
+    /// removes `[1m]`/`[2m]`). It must never reach the wire `model` field —
+    /// on either auth path — while still deciding the 1M beta.
+    #[test]
+    fn the_1m_suffix_is_stripped_from_the_wire_model() {
+        let mut request = make_request(None);
+        request.model = "claude-sonnet-4-6[1m]".into();
+        for client in [
+            oauth_client(),
+            AnthropicClient::new("sk".into(), Arc::new(rupu_netflow::NullSink)),
+        ] {
+            let body = client.build_request_body(&request, false);
+            assert_eq!(body["model"], "claude-sonnet-4-6");
+            let body = client.build_request_body(&request, true);
+            assert_eq!(body["model"], "claude-sonnet-4-6", "stream body too");
+        }
+        // The suffix still opts the OAuth path into the beta.
+        assert!(oauth_client().sends_1m_beta(&request.model, None));
     }
 
     #[test]
