@@ -234,45 +234,102 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
     // be read but never refreshed on near-expiry (the defect
     // `crate::accounts::account_specs` exists to prevent).
     let resolver = std::sync::Arc::new(crate::accounts::resolver_for(&cfg));
-    let report = rupu_runtime::model_limits::refresh(
+    let refreshed = run_refresh(
         &cfg,
         &rupu_runtime::model_limits::cache_dir(&global),
         &global_config_path()?,
         resolver,
         filter.as_deref(),
-        rupu_runtime::model_limits::FETCH_TIMEOUT,
-    )
-    .await?;
-    let (lines, any_refreshed) = refresh_report(report.outcomes);
-    for line in lines {
-        match line {
+        RefreshTimings {
+            fetch: rupu_runtime::model_limits::FETCH_TIMEOUT,
+            unfinished_wait: UNFINISHED_JOB_WAIT,
+        },
+        &mut |line| match line {
             ReportLine::Out(l) => println!("{l}"),
             ReportLine::Err(l) => eprintln!("{l}"),
-        }
-    }
-    // A timed-out provider job is still running — possibly mid-way through
-    // an OAuth token refresh whose rotated token must be persisted. This
-    // process's runtime would cancel it on exit, so give it time to finish.
-    if !report.unfinished.is_empty() {
-        eprintln!(
-            "rupu: waiting for {} provider job(s) to finish…",
-            report.unfinished.len()
-        );
-        let all = futures_util::future::join_all(report.unfinished);
-        if tokio::time::timeout(UNFINISHED_JOB_WAIT, all)
-            .await
-            .is_err()
-        {
-            eprintln!(
-                "rupu: gave up waiting after {}s",
-                UNFINISHED_JOB_WAIT.as_secs()
-            );
-        }
-    }
-    if !any_refreshed {
+        },
+    )
+    .await?;
+    if !refreshed {
         anyhow::bail!("no provider was refreshed");
     }
     Ok(())
+}
+
+/// The listing timeout, and how long to wait afterwards for provider jobs
+/// that outlived it.
+struct RefreshTimings {
+    fetch: std::time::Duration,
+    unfinished_wait: std::time::Duration,
+}
+
+/// Refresh, report each provider as it settles through `emit`, and say
+/// whether anything was refreshed.
+async fn run_refresh(
+    cfg: &rupu_config::Config,
+    cache_dir: &std::path::Path,
+    cfg_path: &std::path::Path,
+    resolver: std::sync::Arc<dyn rupu_auth::CredentialResolver>,
+    filter: Option<&str>,
+    timings: RefreshTimings,
+    emit: &mut (dyn FnMut(ReportLine) + Send),
+) -> anyhow::Result<bool> {
+    let report = rupu_runtime::model_limits::refresh(
+        cfg,
+        cache_dir,
+        cfg_path,
+        resolver,
+        filter,
+        timings.fetch,
+    )
+    .await?;
+    let (lines, mut any_refreshed) = refresh_report(report.outcomes);
+    lines.into_iter().for_each(&mut *emit);
+    // A timed-out provider job is still running — possibly mid-way through
+    // an OAuth token refresh whose rotated token must be persisted. This
+    // process's runtime would cancel it on exit, so give it time to finish,
+    // and report how it ended: a job that finishes here did refresh.
+    if !report.unfinished.is_empty() {
+        emit(ReportLine::Err(format!(
+            "rupu: waiting for {} provider job(s) to finish…",
+            report.unfinished.len()
+        )));
+        let all = futures_util::future::join_all(report.unfinished);
+        match tokio::time::timeout(timings.unfinished_wait, all).await {
+            Ok(finished) => {
+                for late in finished {
+                    match late {
+                        Ok(outcome) => {
+                            any_refreshed |= outcome.ok;
+                            emit(late_report_line(outcome));
+                        }
+                        Err(e) => emit(ReportLine::Err(format!(
+                            "rupu: a provider job failed after the wait: {e}"
+                        ))),
+                    }
+                }
+            }
+            Err(_) => emit(ReportLine::Err(format!(
+                "rupu: gave up waiting after {}s",
+                timings.unfinished_wait.as_secs()
+            ))),
+        }
+    }
+    Ok(any_refreshed)
+}
+
+/// The line for a provider job that finished during the exit wait.
+fn late_report_line(o: rupu_runtime::model_limits::RefreshOutcome) -> ReportLine {
+    match (o.ok, o.error) {
+        (true, _) => ReportLine::Out(format!(
+            "rupu: refreshed {} ({} models) after the wait",
+            o.provider, o.count
+        )),
+        (false, Some(e)) => {
+            ReportLine::Err(format!("rupu: skip {}: {e} (after the wait)", o.provider))
+        }
+        (false, None) => ReportLine::Err(format!("rupu: skip {} (after the wait)", o.provider)),
+    }
 }
 
 /// How long `rupu models refresh` waits, before exiting, for provider jobs
@@ -348,6 +405,83 @@ mod tests {
         let (lines, ok) = refresh_report(vec![outcome("oracle", false), outcome("boxy", false)]);
         assert!(!ok);
         assert_eq!(lines.len(), 2, "every failure is still reported");
+    }
+
+    /// Hands every account the same API key; the mock never checks it.
+    struct AnyKey;
+
+    #[async_trait::async_trait]
+    impl rupu_auth::CredentialResolver for AnyKey {
+        async fn get(
+            &self,
+            _provider: &str,
+            _hint: Option<rupu_providers::AuthMode>,
+        ) -> anyhow::Result<(
+            rupu_providers::AuthMode,
+            rupu_providers::auth::AuthCredentials,
+        )> {
+            Ok((
+                rupu_providers::AuthMode::ApiKey,
+                rupu_providers::auth::AuthCredentials::ApiKey { key: "k".into() },
+            ))
+        }
+        async fn refresh(
+            &self,
+            _provider: &str,
+            _mode: rupu_providers::AuthMode,
+        ) -> anyhow::Result<rupu_providers::auth::AuthCredentials> {
+            unreachable!()
+        }
+    }
+
+    /// A provider job that misses the listing timeout but finishes within
+    /// the exit wait DID refresh: its late outcome is reported and counts
+    /// toward success (it used to be discarded, and the command exited
+    /// non-zero after a refresh that worked).
+    #[tokio::test]
+    async fn a_job_that_finishes_during_the_wait_counts_as_refreshed() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/models");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "data": [{ "id": "box-model", "max_model_len": 4096 }]
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = rupu_config::Config::default();
+        cfg.providers.insert(
+            "boxy".into(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some(format!("{}/v1", server.url(""))),
+                default_model: Some("box-model".into()),
+                ..Default::default()
+            },
+        );
+        let mut lines = Vec::new();
+        let refreshed = run_refresh(
+            &cfg,
+            &tmp.path().join("cache"),
+            &tmp.path().join("config.toml"),
+            std::sync::Arc::new(AnyKey),
+            Some("boxy"),
+            RefreshTimings {
+                fetch: std::time::Duration::from_millis(100),
+                unfinished_wait: std::time::Duration::from_secs(5),
+            },
+            &mut |line| lines.push(line),
+        )
+        .await
+        .unwrap();
+        assert!(refreshed, "the late refresh succeeded: {lines:?}");
+        assert!(
+            lines.contains(&ReportLine::Out(
+                "rupu: refreshed boxy (1 models) after the wait".into()
+            )),
+            "{lines:?}"
+        );
     }
 
     #[test]
