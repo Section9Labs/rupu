@@ -643,7 +643,7 @@ fn join_dot(mut line: Line, parts: Vec<Line>, lead: bool) -> Line {
 
 /// Wire text for a single-line row: control characters (ESC, newlines, …)
 /// become U+FFFD so they can neither reach the terminal nor break the row.
-fn printable(s: &str) -> String {
+pub(super) fn printable(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()

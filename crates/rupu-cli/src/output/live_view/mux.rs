@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use rupu_transcript::{Event, FileEditKind};
 
+use crate::output::live_view::layout::printable;
 use crate::output::live_view::row::{truncate_to, Line};
 
 /// Display-column budget for the body of a feed row (everything after the
@@ -27,7 +28,10 @@ pub struct FeedLine {
 /// Project one transcript event onto at most one feed row. Returns `None`
 /// for events with no feed representation (run/turn boundaries, usage,
 /// seeds, tool results, unknowns, …) and for text events with nothing to
-/// show.
+/// show. Streamed `AssistantDelta`/`ThinkingDelta` chunks are intentionally
+/// dropped: the committed `AssistantMessage`/`Thinking` event that follows
+/// carries the whole block, so projecting both would duplicate it as
+/// fragment rows.
 pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
     let body = match ev {
         Event::ToolCall { tool, input, .. } => {
@@ -50,11 +54,7 @@ pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
             };
             Some(Line::new().dim(format!("◇ thinking {shown}")))
         }
-        Event::ThinkingDelta { content } => {
-            let shown = squash(content);
-            non_empty(&shown).then(|| Line::new().dim(format!("◇ thinking {shown}")))
-        }
-        Event::AssistantMessage { content, .. } | Event::AssistantDelta { content } => {
+        Event::AssistantMessage { content, .. } => {
             let shown = squash(content);
             non_empty(&shown).then(|| Line::new().plain(format!("▪ {shown}")))
         }
@@ -117,6 +117,13 @@ pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
         line = line.role(role_word(name), name.to_string()).plain(" ");
     }
     line.segments.extend(body.segments);
+    // Choke point: every field above is untrusted wire text (model output,
+    // paths, titles, tool names, the codename). Control characters (ESC
+    // sequences, stray newlines) become U+FFFD so they can neither reach the
+    // terminal nor break the single-row guarantee.
+    for seg in &mut line.segments {
+        seg.text = printable(&seg.text);
+    }
     Some(FeedLine {
         ts: None,
         codename: codename.map(str::to_string),
@@ -225,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_and_thinking_delta_project_dim_with_text() {
+    fn committed_thinking_projects_dim_with_text() {
         let think = Event::Thinking {
             text: Some("weighing the two options".into()),
             provider: "anthropic".into(),
@@ -236,12 +243,22 @@ mod tests {
             plain(&think, Some("otter#3")),
             "otter#3 ◇ thinking weighing the two options"
         );
-        let delta = Event::ThinkingDelta {
+        let fl = project_event(&think, None).unwrap();
+        assert!(fl.line.segments.iter().all(|s| s.style == Style::Dim));
+    }
+
+    #[test]
+    fn streamed_deltas_are_dropped_because_the_committed_event_carries_the_block() {
+        let assistant = Event::AssistantDelta {
+            content: "partial".into(),
+        };
+        let thinking = Event::ThinkingDelta {
             content: "hmm".into(),
         };
-        assert_eq!(plain(&delta, None), "◇ thinking hmm");
-        let fl = project_event(&delta, None).unwrap();
-        assert!(fl.line.segments.iter().all(|s| s.style == Style::Dim));
+        for codename in [None, Some("otter#3")] {
+            assert_eq!(project_event(&assistant, codename), None);
+            assert_eq!(project_event(&thinking, codename), None);
+        }
     }
 
     #[test]
@@ -256,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_projects_and_collapses_to_one_row() {
+    fn committed_assistant_message_projects_and_collapses_to_one_row() {
         let msg = Event::AssistantMessage {
             content: "Found the bug.\n\n  It is in   the parser.".into(),
             thinking: None,
@@ -265,27 +282,55 @@ mod tests {
             plain(&msg, Some("otter#3")),
             "otter#3 ▪ Found the bug. It is in the parser."
         );
-        let delta = Event::AssistantDelta {
-            content: "partial".into(),
-        };
-        assert_eq!(plain(&delta, None), "▪ partial");
     }
 
     #[test]
-    fn blank_assistant_or_thinking_text_has_no_feed_row() {
-        for ev in [
-            Event::AssistantMessage {
-                content: "  \n ".into(),
-                thinking: None,
-            },
-            Event::AssistantDelta {
-                content: String::new(),
-            },
-            Event::ThinkingDelta {
-                content: "\n".into(),
-            },
+    fn blank_assistant_message_has_no_feed_row() {
+        let ev = Event::AssistantMessage {
+            content: "  \n ".into(),
+            thinking: None,
+        };
+        assert_eq!(project_event(&ev, Some("otter#3")), None);
+    }
+
+    #[test]
+    fn control_characters_are_scrubbed_from_every_field() {
+        // ESC sequences and stray newlines in untrusted text (paths, model
+        // output, notices, even the codename) must never reach the terminal
+        // raw nor break the single-row guarantee.
+        let edit = Event::FileEdit {
+            path: "a\x1b[2Jb\nc.rs".into(),
+            kind: FileEditKind::Create,
+            diff: String::new(),
+        };
+        let msg = Event::AssistantMessage {
+            content: "ok\x1b[2J\x1b]0;pwned\x07done\nnext".into(),
+            thinking: None,
+        };
+        let notice = Event::Notice {
+            kind: "provider_retry".into(),
+            message: "retry\x1b[2J\nnow".into(),
+        };
+        let call = Event::ToolCall {
+            call_id: "c1".into(),
+            tool: "bash".into(),
+            input: json!({"command": "ls\x1b[2J"}),
+        };
+        for (ev, expected) in [
+            (&edit, "✎ create a\u{FFFD}[2Jb\u{FFFD}c.rs"),
+            // Whitespace collapses first, so the newline here is a space.
+            (&msg, "▪ ok\u{FFFD}[2J\u{FFFD}]0;pwned\u{FFFD}done next"),
+            (&notice, "! retry\u{FFFD}[2J now"),
+            (&call, "▸ bash ls\u{FFFD}[2J"),
         ] {
-            assert!(project_event(&ev, Some("otter#3")).is_none(), "{ev:?}");
+            let fl = project_event(ev, Some("ot\x1b[2Jter#3\n")).unwrap();
+            let rendered = render_plain(&[fl.line]);
+            assert_eq!(
+                rendered,
+                format!("ot\u{FFFD}[2Jter#3\u{FFFD} {expected}"),
+                "{ev:?}"
+            );
+            assert!(!rendered.chars().any(char::is_control), "{ev:?}");
         }
     }
 
