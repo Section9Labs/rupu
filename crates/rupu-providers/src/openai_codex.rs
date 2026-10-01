@@ -1103,7 +1103,7 @@ pub(crate) fn codex_input_limit(entry: &serde_json::Value) -> u32 {
         .and_then(|v| v.as_u64())
         .unwrap_or(95)
         .clamp(1, 100);
-    u32::try_from(window * pct / 100).unwrap_or(u32::MAX)
+    u32::try_from(window.saturating_mul(pct) / 100).unwrap_or(u32::MAX)
 }
 
 /// Model listing → `ModelInfo`s. The Codex `models` array carries limits;
@@ -3275,6 +3275,23 @@ mod fetch_models_tests {
             190_000
         );
         assert_eq!(codex_input_limit(&serde_json::json!({ "slug": "x" })), 0);
+    }
+
+    #[test]
+    fn codex_input_limit_does_not_overflow_on_an_absurd_window() {
+        // `window * pct` would wrap (release) or panic (debug) in u64; the
+        // saturating multiply keeps the result clamped to u32::MAX instead.
+        for window in [u64::MAX, u64::MAX / 50, 1u64 << 63] {
+            for pct in [95u64, 100] {
+                let e = serde_json::json!({
+                    "context_window": window,
+                    "effective_context_window_percent": pct
+                });
+                assert_eq!(codex_input_limit(&e), u32::MAX, "window={window} pct={pct}");
+            }
+        }
+        let e = serde_json::json!({ "max_context_window": u64::MAX });
+        assert_eq!(codex_input_limit(&e), u32::MAX);
     }
 
     #[test]
