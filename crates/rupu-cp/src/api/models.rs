@@ -4,6 +4,7 @@ use crate::{
     state::AppState,
 };
 use axum::{
+    body::Bytes,
     extract::State,
     routing::{get, post},
     Json, Router,
@@ -17,10 +18,27 @@ pub fn routes() -> Router<AppState> {
         .route("/api/models/refresh", post(refresh_models))
 }
 
+/// `deny_unknown_fields`: a misspelled `provider` key must be a 400, not a
+/// silent "refresh every provider".
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefreshBody {
     #[serde(default)]
     pub provider: Option<String>,
+}
+
+/// Parse a refresh request body. An empty (or all-whitespace) body is "no
+/// narrowing" = refresh every provider, which keeps a bodyless
+/// `curl -X POST` working. Anything else must be a valid `RefreshBody`:
+/// a malformed body is a 400, never a silent refresh-all (a request meant to
+/// narrow to one provider would otherwise fan out to every vendor with real
+/// credentials). Content-Type is deliberately not required.
+fn parse_refresh_body(raw: &[u8]) -> ApiResult<RefreshBody> {
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return Ok(RefreshBody::default());
+    }
+    serde_json::from_slice(raw)
+        .map_err(|e| ApiError::bad_request(format!("invalid refresh body: {e}")))
 }
 
 fn map_err(e: ModelCatalogError) -> ApiError {
@@ -39,7 +57,8 @@ async fn list_with(p: Option<Arc<dyn ModelCatalog>>) -> ApiResult<Vec<CatalogPro
 }
 
 /// Synchronous: providers are fetched in parallel, each bounded by the
-/// runtime's 10s timeout, so a 200 means refreshed, not merely recorded.
+/// runtime's 10s timeout. A 200 means the refresh ran; each provider's
+/// `ok`/`error` outcome is authoritative.
 async fn refresh_with(
     p: Option<Arc<dyn ModelCatalog>>,
     body: RefreshBody,
@@ -53,9 +72,9 @@ async fn list_models(State(s): State<AppState>) -> ApiResult<Json<Vec<CatalogPro
 
 async fn refresh_models(
     State(s): State<AppState>,
-    body: Option<Json<RefreshBody>>,
+    body: Bytes,
 ) -> ApiResult<Json<Vec<RefreshOutcome>>> {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = parse_refresh_body(&body)?;
     Ok(Json(refresh_with(s.model_catalog.clone(), body).await?))
 }
 

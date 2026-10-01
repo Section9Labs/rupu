@@ -124,6 +124,79 @@ async fn refresh_accepts_empty_object_named_provider_and_no_body() {
     );
 }
 
+/// A request meant to narrow the refresh to one provider must never fan out
+/// to every vendor because its body was malformed: it is a 400 and the port
+/// is not called.
+#[tokio::test]
+async fn refresh_rejects_a_malformed_body_without_calling_the_port() {
+    let fake = Arc::new(Fake::default());
+    let addr = spawn(Some(fake.clone()), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/models/refresh");
+
+    for (label, raw) in [
+        ("truncated json", r#"{"provider":"openai""#),
+        ("wrong field type", r#"{"provider": 5}"#),
+        ("misspelled field", r#"{"provder":"openai"}"#),
+        ("not an object", r#""openai""#),
+    ] {
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(raw)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{label}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid refresh body: "),
+            "{label}: {body}"
+        );
+    }
+    assert!(
+        fake.asked.lock().unwrap().is_empty(),
+        "a rejected body must not reach the port"
+    );
+}
+
+/// Content-Type is not required: `curl -d '{"provider":"openai"}'` style
+/// callers (and wrong-header clients) still narrow to the named provider.
+#[tokio::test]
+async fn refresh_honours_a_provider_sent_without_a_content_type() {
+    let fake = Arc::new(Fake::default());
+    let addr = spawn(Some(fake.clone()), None).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/models/refresh"))
+        .body(r#"{"provider":"openai"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        fake.asked.lock().unwrap().as_slice(),
+        [Some("openai".to_string())]
+    );
+}
+
+/// An all-whitespace body is "no body": refresh everything.
+#[tokio::test]
+async fn refresh_treats_a_whitespace_body_as_refresh_all() {
+    let fake = Arc::new(Fake::default());
+    let addr = spawn(Some(fake.clone()), None).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/models/refresh"))
+        .body("  \n\t ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(fake.asked.lock().unwrap().as_slice(), [None]);
+}
+
 #[tokio::test]
 async fn refresh_unknown_provider_is_400_with_the_message() {
     let addr = spawn(Some(Arc::new(Fake::default())), None).await;
