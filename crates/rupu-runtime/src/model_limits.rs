@@ -51,7 +51,10 @@ impl LimitsContext {
 }
 
 /// `<global>/cache/models`, or `$RUPU_CACHE_DIR_OVERRIDE` (the existing
-/// `rupu models` test seam).
+/// `rupu models` test seam). Read at the edge only — the CLI, the CP adapter
+/// and [`LimitsContext::from_config`] call it; [`refresh`] and [`catalog`]
+/// take the resulting directory explicitly, so the library's behavior never
+/// depends on the environment.
 pub fn cache_dir(global_dir: &Path) -> PathBuf {
     std::env::var("RUPU_CACHE_DIR_OVERRIDE")
         .map(PathBuf::from)
@@ -246,13 +249,13 @@ pub struct RefreshOutcome {
 /// one failing or hanging never fails the others.
 pub async fn refresh(
     cfg: &rupu_config::Config,
-    global_dir: &Path,
+    cache_dir: &Path,
     cfg_path: &Path,
     resolver: &dyn rupu_auth::CredentialResolver,
     only: Option<&str>,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
     let names = resolve_targets(only, cfg, cfg_path)?;
-    let registry = ModelRegistry::with_cache_dir(cache_dir(global_dir));
+    let registry = ModelRegistry::with_cache_dir(cache_dir);
     let registry = &registry;
     let jobs = names.iter().map(|name| async move {
         match tokio::time::timeout(FETCH_TIMEOUT, refresh_one(name, cfg, resolver, registry)).await
@@ -353,12 +356,12 @@ pub struct CatalogProvider {
 /// The cached catalog, with no network (spec §8).
 pub async fn catalog(
     cfg: &rupu_config::Config,
-    global_dir: &Path,
+    cache_dir: &Path,
     cfg_path: &Path,
     only: Option<&str>,
 ) -> Result<Vec<CatalogProvider>, UnknownProvider> {
     let names = resolve_targets(only, cfg, cfg_path)?;
-    let registry = build_registry(cfg, global_dir).await;
+    let registry = build_registry(cfg, cache_dir).await;
     let mut out = Vec::new();
     for p in names {
         let fetched_at = registry.fetched_at(&p).await;
@@ -404,8 +407,8 @@ pub async fn catalog(
     Ok(out)
 }
 
-async fn build_registry(cfg: &rupu_config::Config, global_dir: &Path) -> ModelRegistry {
-    let registry = ModelRegistry::with_cache_dir(cache_dir(global_dir));
+async fn build_registry(cfg: &rupu_config::Config, cache_dir: &Path) -> ModelRegistry {
+    let registry = ModelRegistry::with_cache_dir(cache_dir);
 
     // Baked-in id fallbacks: Copilot, and Gemini's Code Assist (OAuth) path,
     // which has no model listing (an AI Studio API key lists live).

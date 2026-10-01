@@ -173,7 +173,7 @@ async fn list(filter: Option<String>, global_format: Option<OutputFormat>) -> an
     let global = crate::paths::global_dir()?;
     let cats = rupu_runtime::model_limits::catalog(
         &cfg,
-        &global,
+        &rupu_runtime::model_limits::cache_dir(&global),
         &global_config_path()?,
         filter.as_deref(),
     )
@@ -236,7 +236,7 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
     let resolver = crate::accounts::resolver_for(&cfg);
     let outcomes = rupu_runtime::model_limits::refresh(
         &cfg,
-        &global,
+        &rupu_runtime::model_limits::cache_dir(&global),
         &global_config_path()?,
         &resolver,
         filter.as_deref(),

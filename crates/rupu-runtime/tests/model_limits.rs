@@ -4,7 +4,9 @@ use std::sync::Arc;
 use rupu_providers::model_limits::LimitSource;
 use rupu_providers::types::{LlmRequest, LlmResponse, StreamEvent};
 use rupu_providers::{LlmProvider, ModelCost, ModelInfo, ModelStatus, ProviderError, ProviderId};
-use rupu_runtime::model_limits::{resolve, LimitOverrides, LimitsContext};
+use rupu_runtime::model_limits::{
+    resolve, CatalogProvider, LimitOverrides, LimitsContext, RefreshOutcome, UnknownProvider,
+};
 
 /// A provider whose `fetch_models` result is scripted and counted.
 struct Fake {
@@ -347,6 +349,37 @@ impl rupu_auth::CredentialResolver for AnyKey {
     }
 }
 
+/// `<tmp>/cache/models`: the explicit cache dir every refresh/catalog test
+/// hands the library (it never reads `RUPU_CACHE_DIR_OVERRIDE` itself).
+fn cache_of(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    tmp.path().join("cache/models")
+}
+
+async fn refresh_with(
+    cfg: &rupu_config::Config,
+    tmp: &tempfile::TempDir,
+    resolver: &dyn rupu_auth::CredentialResolver,
+    only: Option<&str>,
+) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
+    rupu_runtime::model_limits::refresh(
+        cfg,
+        &cache_of(tmp),
+        &tmp.path().join("config.toml"),
+        resolver,
+        only,
+    )
+    .await
+}
+
+async fn catalog_of(
+    cfg: &rupu_config::Config,
+    tmp: &tempfile::TempDir,
+    only: Option<&str>,
+) -> Result<Vec<CatalogProvider>, UnknownProvider> {
+    rupu_runtime::model_limits::catalog(cfg, &cache_of(tmp), &tmp.path().join("config.toml"), only)
+        .await
+}
+
 fn oracle_cfg(base_url: String) -> rupu_config::Config {
     let mut cfg = rupu_config::Config::default();
     cfg.providers.insert(
@@ -373,21 +406,17 @@ async fn refresh_writes_the_cache_that_catalog_reads() {
     });
     let tmp = tempfile::tempdir().unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
-    let cfg_path = tmp.path().join("config.toml");
 
-    let out =
-        rupu_runtime::model_limits::refresh(&cfg, tmp.path(), &cfg_path, &AnyKey, Some("oracle"))
-            .await
-            .unwrap();
+    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle"))
+        .await
+        .unwrap();
     listing.assert();
     assert_eq!(out.len(), 1);
     assert!(out[0].ok, "{:?}", out[0]);
     assert_eq!((out[0].provider.as_str(), out[0].count), ("oracle", 1));
     assert!(out[0].error.is_none());
 
-    let cat = rupu_runtime::model_limits::catalog(&cfg, tmp.path(), &cfg_path, Some("oracle"))
-        .await
-        .unwrap();
+    let cat = catalog_of(&cfg, &tmp, Some("oracle")).await.unwrap();
     assert_eq!(cat.len(), 1);
     assert!(cat[0].fetched_at.is_some());
     assert!(!cat[0].stale);
@@ -408,12 +437,10 @@ async fn refresh_reports_a_failing_provider_without_failing_the_call() {
     });
     let tmp = tempfile::tempdir().unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
-    let cfg_path = tmp.path().join("config.toml");
 
-    let out =
-        rupu_runtime::model_limits::refresh(&cfg, tmp.path(), &cfg_path, &AnyKey, Some("oracle"))
-            .await
-            .unwrap();
+    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle"))
+        .await
+        .unwrap();
     assert!(!out[0].ok);
     assert_eq!(out[0].count, 0);
     assert!(out[0].error.as_deref().unwrap().contains("401"));
@@ -425,15 +452,11 @@ async fn refresh_reports_a_failing_provider_without_failing_the_call() {
 async fn refresh_and_catalog_reject_an_unknown_provider() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = rupu_config::Config::default();
-    let cfg_path = tmp.path().join("config.toml");
-    let err =
-        rupu_runtime::model_limits::refresh(&cfg, tmp.path(), &cfg_path, &AnyKey, Some("nope"))
-            .await
-            .unwrap_err();
-    assert!(err.to_string().contains("unknown provider 'nope'"));
-    let err = rupu_runtime::model_limits::catalog(&cfg, tmp.path(), &cfg_path, Some("nope"))
+    let err = refresh_with(&cfg, &tmp, &AnyKey, Some("nope"))
         .await
         .unwrap_err();
+    assert!(err.to_string().contains("unknown provider 'nope'"));
+    let err = catalog_of(&cfg, &tmp, Some("nope")).await.unwrap_err();
     assert!(err.to_string().contains("unknown provider 'nope'"));
 }
 
@@ -459,10 +482,7 @@ async fn catalog_lists_custom_models_with_unknown_limits_as_none() {
             ..Default::default()
         },
     );
-    let cfg_path = tmp.path().join("config.toml");
-    let cat = rupu_runtime::model_limits::catalog(&cfg, tmp.path(), &cfg_path, Some("anthropic"))
-        .await
-        .unwrap();
+    let cat = catalog_of(&cfg, &tmp, Some("anthropic")).await.unwrap();
     assert!(cat[0].fetched_at.is_none());
     assert!(!cat[0].stale, "never fetched is not stale");
     let by_id = |id: &str| cat[0].models.iter().find(|m| m.id == id).unwrap();
@@ -683,16 +703,9 @@ impl rupu_auth::CredentialResolver for SlowResolver {
 async fn refresh_bounds_the_whole_provider_job_not_just_the_fetch() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = rupu_config::Config::default();
-    let cfg_path = tmp.path().join("config.toml");
-    let out = rupu_runtime::model_limits::refresh(
-        &cfg,
-        tmp.path(),
-        &cfg_path,
-        &SlowResolver,
-        Some("anthropic"),
-    )
-    .await
-    .unwrap();
+    let out = refresh_with(&cfg, &tmp, &SlowResolver, Some("anthropic"))
+        .await
+        .unwrap();
     assert_eq!(out.len(), 1);
     assert!(!out[0].ok);
     assert_eq!(out[0].count, 0);
@@ -713,15 +726,9 @@ async fn refreshed_oracle(
     });
     let mut cfg = oracle_cfg(format!("{}/v1", server.url("")));
     cfg.providers.get_mut("oracle").unwrap().models = models;
-    let out = rupu_runtime::model_limits::refresh(
-        &cfg,
-        tmp.path(),
-        &tmp.path().join("config.toml"),
-        &AnyKey,
-        Some("oracle"),
-    )
-    .await
-    .unwrap();
+    let out = refresh_with(&cfg, tmp, &AnyKey, Some("oracle"))
+        .await
+        .unwrap();
     assert!(out[0].ok, "{:?}", out[0]);
     cfg
 }
@@ -739,14 +746,7 @@ async fn catalog_fills_a_config_models_unset_limits_from_live() {
         }],
     )
     .await;
-    let cat = rupu_runtime::model_limits::catalog(
-        &cfg,
-        tmp.path(),
-        &tmp.path().join("config.toml"),
-        Some("oracle"),
-    )
-    .await
-    .unwrap();
+    let cat = catalog_of(&cfg, &tmp, Some("oracle")).await.unwrap();
     let m = cat[0].models.iter().find(|m| m.id == "base-model").unwrap();
     assert_eq!(
         m.input_tokens,
@@ -779,14 +779,7 @@ async fn catalog_merges_config_and_live_per_field() {
         context_window: Some(9000),
         max_output: None,
     }];
-    let cat = rupu_runtime::model_limits::catalog(
-        &cfg,
-        tmp.path(),
-        &tmp.path().join("config.toml"),
-        Some("oracle"),
-    )
-    .await
-    .unwrap();
+    let cat = catalog_of(&cfg, &tmp, Some("oracle")).await.unwrap();
     let m = cat[0].models.iter().find(|m| m.id == "base-model").unwrap();
     assert_eq!(m.input_tokens, Some(9000), "config wins where set");
     assert_eq!(
@@ -884,14 +877,38 @@ async fn refresh_reports_an_empty_listing_and_keeps_the_cache() {
     let good = r#"{"schema":2,"fetched_at":"2020-01-01T00:00:00Z","models":[{"id":"base-model","context_window":4096,"max_output_tokens":0}]}"#;
     std::fs::write(&cache_file, good).unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
-    let cfg_path = tmp.path().join("config.toml");
 
-    let out =
-        rupu_runtime::model_limits::refresh(&cfg, tmp.path(), &cfg_path, &AnyKey, Some("oracle"))
-            .await
-            .unwrap();
+    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle"))
+        .await
+        .unwrap();
     assert!(!out[0].ok, "{:?}", out[0]);
     assert_eq!(out[0].count, 0);
     assert_eq!(out[0].error.as_deref(), Some("provider returned no models"));
     assert_eq!(std::fs::read_to_string(&cache_file).unwrap(), good);
+}
+
+/// The library never reads `RUPU_CACHE_DIR_OVERRIDE`: `refresh` and `catalog`
+/// use exactly the cache dir they are handed, so a test's result can't depend
+/// on the environment (the CLI and the CP resolve that seam at the edge).
+#[tokio::test]
+async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200).json_body(serde_json::json!({
+            "data": [{ "id": "base-model", "max_model_len": 4096 }]
+        }));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    let cfg = oracle_cfg(format!("{}/v1", server.url("")));
+    std::env::set_var("RUPU_CACHE_DIR_OVERRIDE", &elsewhere);
+    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle")).await;
+    let cat = catalog_of(&cfg, &tmp, Some("oracle")).await;
+    std::env::remove_var("RUPU_CACHE_DIR_OVERRIDE");
+    assert!(out.unwrap()[0].ok);
+    assert!(cache_of(&tmp).join("oracle.json").exists());
+    assert!(!elsewhere.exists(), "the env seam is the caller's business");
+    assert_eq!(cat.unwrap()[0].models[0].input_tokens, Some(4096));
 }

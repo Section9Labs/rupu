@@ -19,7 +19,8 @@ impl RuntimeModelCatalog {
 impl ModelCatalog for RuntimeModelCatalog {
     async fn list(&self) -> Result<Vec<CatalogProvider>, ModelCatalogError> {
         let (cfg, cfg_path) = self.config()?;
-        rupu_runtime::model_limits::catalog(&cfg, &self.global_dir, &cfg_path, None)
+        let cache_dir = rupu_runtime::model_limits::cache_dir(&self.global_dir);
+        rupu_runtime::model_limits::catalog(&cfg, &cache_dir, &cfg_path, None)
             .await
             .map_err(|e| ModelCatalogError::UnknownProvider(e.to_string()))
     }
@@ -32,7 +33,7 @@ impl ModelCatalog for RuntimeModelCatalog {
         let resolver = crate::accounts::resolver_for(&cfg);
         rupu_runtime::model_limits::refresh(
             &cfg,
-            &self.global_dir,
+            &rupu_runtime::model_limits::cache_dir(&self.global_dir),
             &cfg_path,
             &resolver,
             provider.as_deref(),
