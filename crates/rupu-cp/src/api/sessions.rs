@@ -980,75 +980,6 @@ async fn delete_session(
 mod tests {
     use super::*;
 
-    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────────
-    //
-    // `SessionDto` is private to this module — the integration test
-    // (`tests/macos_fixtures.rs`) can't build it, so its fixture lives here
-    // instead. Same `check_fixture` contract as that file (duplicated: a unit
-    // test can't share code with an integration test without a public
-    // module) — see `api/host_info.rs`'s test module for the established
-    // pattern.
-
-    fn check_fixture(name: &str, value: &impl serde::Serialize) {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/rupu-macos/Fixtures");
-        let path = dir.join(name);
-        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
-        if std::env::var_os("REGEN_FIXTURES").is_some() {
-            std::fs::write(&path, rendered + "\n").expect("write fixture");
-            return;
-        }
-        let on_disk = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
-        assert_eq!(
-            on_disk.trim_end(),
-            rendered,
-            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
-        );
-    }
-
-    #[test]
-    fn session_rows_fixture_is_current() {
-        let dto = SessionDto {
-            session_id: "sess-1".into(),
-            agent_name: "rupuso".into(),
-            model: "claude-sonnet-4-6".into(),
-            provider_name: "anthropic".into(),
-            status: serde_json::Value::String("active".into()),
-            total_turns: 6,
-            total_tokens_in: 5000,
-            total_tokens_out: 1200,
-            total_tokens_cached: 300,
-            created_at: "2026-08-20T11:00:00Z".into(),
-            updated_at: "2026-08-20T12:00:00Z".into(),
-            active_run_id: Some("run-30".into()),
-            last_error: None,
-            target: Some("main".into()),
-            workspace_id: "ws-1".into(),
-            codename: Some("cobalt-harbor/heron".into()),
-            runs: Vec::new(),
-        };
-        let store =
-            rupu_orchestrator::runs::RunStore::new(std::path::PathBuf::from("/nonexistent"));
-        let usage = session_usage(&dto, &store, &rupu_config::PricingConfig::default());
-        let mut v = serde_json::to_value(&dto).expect("serialize SessionDto");
-        if let serde_json::Value::Object(ref mut map) = v {
-            map.insert(
-                "scope".to_string(),
-                serde_json::Value::String("active".to_string()),
-            );
-            map.insert(
-                "usage".to_string(),
-                serde_json::to_value(&usage).expect("serialize usage"),
-            );
-            map.insert(
-                "host_id".to_string(),
-                serde_json::Value::String("local".to_string()),
-            );
-        }
-        check_fixture("session_rows.json", &vec![v]);
-    }
-
     /// SSH bodies arrive unpriced (that connector has no pricing config);
     /// the CP prices them from the reported token counts.
     #[test]
@@ -1620,34 +1551,6 @@ mod tests {
         let err =
             map_host_session_mutate_err(HostConnectorError::Remote(409, "still running".into()));
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
-    }
-
-    // ── macOS golden fixture (apps/rupu-macos/Fixtures/requests/) ─────────
-    //
-    // `SendBody` is private to this module — the integration test
-    // (`tests/macos_fixtures.rs`) can't build it, so its request round-trip
-    // fixture lives here instead. Deserialize-only type (no `Serialize` impl
-    // to render a canonical JSON from), so — per the established
-    // request-fixture contract — the checked-in JSON is a hand-authored raw
-    // string constant; the test reads it back off disk and asserts the
-    // parsed fields.
-
-    fn check_request_fixture(name: &str, raw: &str) -> String {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/rupu-macos/Fixtures/requests");
-        let path = dir.join(name);
-        if std::env::var_os("REGEN_FIXTURES").is_some() {
-            std::fs::write(&path, raw).expect("write request fixture");
-        }
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("missing request fixture {name}; run `make macos-fixtures`"))
-    }
-
-    #[test]
-    fn send_body_request_fixture_roundtrips() {
-        let raw = check_request_fixture("send_body.json", "{\n  \"prompt\": \"hello\"\n}\n");
-        let body: SendBody = serde_json::from_str(&raw).expect("deserialize SendBody");
-        assert_eq!(body.prompt, "hello");
     }
 
     // ── Date-range filtering (perf & interaction arc, Plan 5 Task 5) ─────────

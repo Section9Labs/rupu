@@ -43,11 +43,6 @@ fn wake_store(s: &AppState) -> WakeStore {
 /// Slim wire DTO for an autoflow claim. `status` is the lowercase
 /// `snake_case` form of [`ClaimStatus`] (e.g. `"await_human"`) so the
 /// frontend gets a stable string.
-///
-/// `pub`, not `pub(crate)`: `tests/macos_fixtures.rs` compiles as a separate
-/// crate linking against `rupu-cp` as an external dependency, so
-/// `pub(crate)` items stay invisible to it (same reason `ConfigView` was
-/// hoisted in Phase 6A — see that fixture's doc comment).
 #[derive(Serialize)]
 pub struct ClaimRow {
     pub issue_ref: String,
