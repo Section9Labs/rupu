@@ -1,18 +1,31 @@
-//! Secret-bearing files: created private, replaced atomically.
+//! Secret-bearing files: created private, replaced atomically, written
+//! under a bounded sidecar lock.
 //!
 //! `auth.json` holds tokens, so no byte of it may ever be visible with a
 //! mode looser than 0600 — not even its temp file for the few microseconds
 //! between creation and a chmod. Every file this module creates gets its
 //! mode on the `open(2)` that creates it (`O_CREAT` with mode 0600, under
 //! the umask), so there is no window to close.
+//!
+//! Shared by rupu-auth's `KeychainResolver` (rupu's credential store) and
+//! the legacy phi-cell writers in this crate (`save_provider_auth`,
+//! `save_auth_json`, `CredentialStore`), so every writer of a credential
+//! file behaves the same way.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Bound on waiting for a file's [`SidecarLock`]. A holder that never lets
+/// go — a SIGSTOPped process, a hung NFS lockd, a co-tenant flocking the
+/// file — must fail the operation with a clear error, not hang every
+/// refresh, login and logout (and, through them, a runtime's shutdown).
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Open a brand-new file at `path`, private (0600) from the moment it
 /// exists. Fails if `path` already exists.
-pub(crate) fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -25,7 +38,7 @@ pub(crate) fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Open `path` for locking, creating it private (0600) if it does not
 /// exist. An existing file keeps its mode: the lock file holds no secret.
-pub(crate) fn open_private_for_lock(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_private_for_lock(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -39,7 +52,7 @@ pub(crate) fn open_private_for_lock(path: &Path) -> std::io::Result<std::fs::Fil
 /// Follow `path` through any symlinks to the file they finally name, so a
 /// write replaces the target rather than the link. A dangling link resolves
 /// to its (not yet existing) target; a non-link resolves to itself.
-pub(crate) fn resolve_symlink(path: &Path) -> PathBuf {
+pub fn resolve_symlink(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     // Bounded: a link cycle must not spin forever.
     for _ in 0..32 {
@@ -75,7 +88,7 @@ pub(crate) fn resolve_symlink(path: &Path) -> PathBuf {
 /// under a umask that strips owner bits; on a filesystem without POSIX
 /// modes (vfat, exfat, some CIFS mounts) it fails, and that is a warning,
 /// not an error — the data is written.
-pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+pub fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let target = resolve_symlink(path);
     if let Some(parent) = target.parent() {
@@ -134,6 +147,80 @@ pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// An exclusive advisory lock (flock) on `<file>.lock`, released when
+/// dropped (the fd closes). Every writer of a credential file holds it
+/// across its whole read-modify-write — a refresher across re-read → token
+/// request → write — so concurrent processes never clobber each other's
+/// writes or refresh the same token twice. flock locks belong to an open
+/// file description, so two holders in one process exclude each other too
+/// (except where `flock` is emulated per process, as on a Linux NFS mount).
+/// The lock file is created private (0600) like the file itself, and it is
+/// never deleted: unlinking it while another holder waits would hand that
+/// holder a lock on an orphaned inode and let a third one lock a fresh
+/// file at the same time.
+#[derive(Debug)]
+pub struct SidecarLock {
+    _file: std::fs::File,
+}
+
+impl SidecarLock {
+    /// `<file>.lock`, next to `file` (so `auth.json` locks `auth.json.lock`).
+    pub fn path_for(file: &Path) -> PathBuf {
+        let mut s = file.as_os_str().to_owned();
+        s.push(".lock");
+        s.into()
+    }
+
+    /// Blocks (the calling thread) until the lock on `file`'s sidecar is
+    /// held, for at most `timeout`: a non-blocking `flock` polled with a
+    /// short backoff, so a holder that never lets go yields an error
+    /// (`credential store is locked by another process (…)`) instead of a
+    /// hang.
+    pub fn acquire(file: &Path, timeout: Duration) -> std::io::Result<Self> {
+        use fs2::FileExt;
+        let path = Self::path_for(file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("mkdir {}: {e}", parent.display()))
+            })?;
+        }
+        let file = open_private_for_lock(&path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("open {}: {e}", path.display())))?;
+        let deadline = Instant::now() + timeout;
+        let contended = fs2::lock_contended_error();
+        let mut backoff = Duration::from_millis(5);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e)
+                    if e.kind() == contended.kind()
+                        && e.raw_os_error() == contended.raw_os_error() =>
+                {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "credential store is locked by another process ({}); retry, or \
+                                 find and stop the process holding it",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(backoff.min(deadline - now));
+                    backoff = (backoff * 2).min(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("lock {}: {e}", path.display()),
+                    ))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +299,48 @@ mod tests {
         std::os::unix::fs::symlink("real/creds.json", &rel).unwrap();
         assert_eq!(resolve_symlink(&rel), target);
         assert_eq!(resolve_symlink(&target), target, "a plain file is itself");
+    }
+
+    /// The sidecar sits next to the file, is private, survives its holder
+    /// (never unlinked), and a second holder's wait is bounded, failing
+    /// with an error that names the lock file.
+    #[test]
+    fn a_held_sidecar_lock_times_out_with_a_clear_error_and_is_never_unlinked() {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth.json");
+        let lock_path = SidecarLock::path_for(&file);
+        assert_eq!(lock_path, dir.path().join("auth.json.lock"));
+
+        let held = SidecarLock::acquire(&file, Duration::from_millis(100)).unwrap();
+        #[cfg(unix)]
+        assert_eq!(mode_of(&lock_path), 0o600);
+        let started = Instant::now();
+        let err = SidecarLock::acquire(&file, Duration::from_millis(100)).unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_millis(100)
+                && started.elapsed() < Duration::from_secs(2),
+            "bounded: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            err.to_string()
+                .contains("credential store is locked by another process")
+                && err.to_string().contains("auth.json.lock"),
+            "{err}"
+        );
+        drop(held);
+        assert!(lock_path.exists(), "the sidecar is never unlinked");
+
+        // Released: the next holder gets it at once — on the same inode
+        // another waiter would be polling.
+        let again = SidecarLock::acquire(&file, Duration::from_millis(100)).unwrap();
+        let other = open_private_for_lock(&lock_path).unwrap();
+        assert!(
+            other.try_lock_exclusive().is_err(),
+            "held through the same sidecar file"
+        );
+        drop(again);
     }
 }

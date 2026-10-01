@@ -31,6 +31,7 @@ pub mod model_tier;
 pub mod openai_codex;
 pub mod openai_compatible;
 pub mod openai_wire;
+pub mod private_file;
 pub mod provider;
 pub mod provider_id;
 pub mod registry;

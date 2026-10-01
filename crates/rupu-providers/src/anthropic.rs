@@ -876,22 +876,15 @@ async fn refresh_and_persist_anthropic_token(
 }
 
 /// Write updated credentials back to auth.json (preserving other providers).
-/// Uses atomic write (temp + rename) with 0o600 permissions set on temp BEFORE rename.
+/// The read-modify-write runs under the file's bounded
+/// [`crate::private_file::SidecarLock`] (`<path>.lock`, shared with every
+/// other writer of the file, never unlinked) and the file is replaced
+/// through a private temp file + rename
+/// ([`crate::private_file::write_private_atomic`]): 0600 from the moment
+/// it exists.
 pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), ProviderError> {
-    use fs2::FileExt;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot create dir: {e}")))?;
-    }
-
-    // File-locked read-modify-write to prevent race with CredentialStore
-    let lock_path = path.with_extension("lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot create lock: {e}")))?;
-    lock_file
-        .lock_exclusive()
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot acquire lock: {e}")))?;
+    let _lock = crate::private_file::SidecarLock::acquire(path, crate::private_file::LOCK_TIMEOUT)
+        .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
 
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
     let mut auth: serde_json::Value =
@@ -920,23 +913,8 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
 
     let updated = serde_json::to_string_pretty(&auth)
         .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
-
-    let temp = path.with_extension(format!("tmp.{:?}", std::thread::current().id()));
-    std::fs::write(&temp, updated.as_bytes())
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot write {}: {e}", temp.display())))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot set permissions: {e}")))?;
-    }
-
-    std::fs::rename(&temp, path)
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot rename: {e}")))?;
-
-    drop(lock_file);
-    let _ = std::fs::remove_file(&lock_path);
+    crate::private_file::write_private_atomic(path, updated.as_bytes())
+        .map_err(|e| ProviderError::AuthConfig(format!("cannot write auth.json: {e}")))?;
 
     info!(path = %path.display(), "auth.json updated");
     Ok(())

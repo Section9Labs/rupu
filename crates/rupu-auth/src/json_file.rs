@@ -52,7 +52,7 @@ impl JsonFileBackend {
     /// the moment it exists and a reader never sees a half-written one.
     fn write(&self, s: &Stored) -> Result<(), AuthError> {
         let body = serde_json::to_string_pretty(s)?;
-        crate::private_file::write_private_atomic(&self.path, body.as_bytes())?;
+        rupu_providers::private_file::write_private_atomic(&self.path, body.as_bytes())?;
         Ok(())
     }
 

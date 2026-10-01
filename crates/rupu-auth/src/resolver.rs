@@ -19,8 +19,9 @@ pub const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// that never lets go — a SIGSTOPped process, a hung NFS lockd, a co-tenant
 /// flocking the file — must fail the operation with a clear error, not hang
 /// every refresh, login and logout (and, through them, the runtime's
-/// shutdown).
-pub const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// shutdown). The same bound every credential-file writer uses
+/// ([`rupu_providers::private_file::LOCK_TIMEOUT`]).
+pub const LOCK_TIMEOUT: std::time::Duration = rupu_providers::private_file::LOCK_TIMEOUT;
 
 #[async_trait]
 pub trait CredentialResolver: Send + Sync {
@@ -171,7 +172,7 @@ impl KeychainResolver {
     }
 
     /// Write the whole map through a private temp file + rename
-    /// ([`crate::private_file::write_private_atomic`]): a reader (in any
+    /// ([`rupu_providers::private_file::write_private_atomic`]): a reader (in any
     /// process) never sees a half-written file, and no byte of it is ever
     /// visible with a mode looser than 0600. Callers hold the
     /// [`AuthFileLock`] around their read-modify-write.
@@ -181,7 +182,7 @@ impl KeychainResolver {
     ) -> Result<()> {
         let body =
             serde_json::to_string_pretty(map).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        crate::private_file::write_private_atomic(path, body.as_bytes())
+        rupu_providers::private_file::write_private_atomic(path, body.as_bytes())
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
@@ -190,7 +191,7 @@ impl KeychainResolver {
     /// change between two calls), so a write replaces the link's target —
     /// never the link — and the lock sits next to that target.
     fn auth_file(&self) -> PathBuf {
-        crate::private_file::resolve_symlink(&self.path)
+        rupu_providers::private_file::resolve_symlink(&self.path)
     }
 
     /// Run `f` on the auth file under its locks — the process-wide
@@ -874,63 +875,14 @@ mod unpersisted {
     }
 }
 
-/// An exclusive advisory lock (flock) on `<auth file>.lock`, released when
-/// dropped (the fd closes). Every writer of the auth file and every
-/// refresher holds it across its whole read-modify-write — a refresher
-/// across re-read → token request → write — so concurrent `rupu` processes
-/// never clobber each other's writes or refresh the same token twice. flock
-/// locks belong to an open file description, so two holders in one process
-/// exclude each other too. The lock file is created private (0600) like
-/// the auth file itself.
-struct AuthFileLock {
-    _file: std::fs::File,
-}
-
-impl AuthFileLock {
-    fn path_for(auth_file: &std::path::Path) -> PathBuf {
-        let mut s = auth_file.as_os_str().to_owned();
-        s.push(".lock");
-        s.into()
-    }
-
-    /// Blocks (the calling thread) until the lock is held, for at most
-    /// `timeout`: a non-blocking `flock` polled with a short backoff, so a
-    /// holder that never lets go yields an error instead of a hang.
-    fn acquire(auth_file: &std::path::Path, timeout: std::time::Duration) -> Result<Self> {
-        use fs2::FileExt;
-        let path = Self::path_for(auth_file);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("mkdir {}: {e}", parent.display()))?;
-        }
-        let file = crate::private_file::open_private_for_lock(&path)
-            .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-        let deadline = std::time::Instant::now() + timeout;
-        let contended = fs2::lock_contended_error();
-        let mut backoff = std::time::Duration::from_millis(5);
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(e)
-                    if e.kind() == contended.kind()
-                        && e.raw_os_error() == contended.raw_os_error() =>
-                {
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        anyhow::bail!(
-                            "credential store is locked by another process ({}); retry, or \
-                             find and stop the process holding it",
-                            path.display()
-                        );
-                    }
-                    std::thread::sleep(backoff.min(deadline - now));
-                    backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
-                }
-                Err(e) => anyhow::bail!("lock {}: {e}", path.display()),
-            }
-        }
-    }
-}
+/// The exclusive advisory lock (flock) on `<auth file>.lock` every writer
+/// of the auth file and every refresher holds across its whole
+/// read-modify-write — a refresher across re-read → token request → write
+/// — so concurrent `rupu` processes never clobber each other's writes or
+/// refresh the same token twice. The shared
+/// [`rupu_providers::private_file::SidecarLock`]: created private, never
+/// unlinked, and acquired with a bounded wait ([`LOCK_TIMEOUT`]).
+type AuthFileLock = rupu_providers::private_file::SidecarLock;
 
 /// When [`KeychainResolver::refresh_and_store_at`] still makes a token
 /// request after re-reading the stored credential under the lock.

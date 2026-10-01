@@ -1,18 +1,17 @@
 //! CredentialStore — concrete implementation of CredentialSource.
 //!
 //! Backs credentials with `cortex/auth.json` (source of truth) and
-//! provider health state with `cortex/auth_status.json`. Uses fs2 file
-//! locking for atomic writes and notify for fsnotify watching.
+//! provider health state with `cortex/auth_status.json`. Writes go under
+//! the file's bounded sidecar lock through a private temp file + rename
+//! (`crate::private_file`, shared with every other writer of such a file).
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 // Note: fsnotify-based automatic reload is a future enhancement.
 // Currently, reload() must be called explicitly (by the router on
 // provider exhaustion, or by a supervisor). The watcher needs Arc<Self>
@@ -23,6 +22,7 @@ use tracing::{info, warn};
 use crate::auth::{AuthCredentials, AuthFile};
 use crate::credential_source::{CredentialSource, ProviderAuthStatus};
 use crate::error::ProviderError;
+use crate::private_file::{write_private_atomic, SidecarLock, LOCK_TIMEOUT};
 use crate::provider_id::ProviderId;
 
 /// Persisted invalidation entry for auth_status.json.
@@ -174,13 +174,11 @@ impl CredentialStore {
         let creds_value =
             serde_json::to_value(&creds).map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
 
-        // File-locked read-modify-write (no RwLock held during I/O)
-        let lock_path = self.auth_path.with_extension("lock");
-        let lock_file = File::create(&lock_path)
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot create lock file: {e}")))?;
-        lock_file
-            .lock_exclusive()
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot acquire file lock: {e}")))?;
+        // Read-modify-write under the file's bounded sidecar lock (no RwLock
+        // held during I/O), written through a private temp file + rename —
+        // the same lock and writer as every other writer of the file.
+        let _lock = SidecarLock::acquire(&self.auth_path, LOCK_TIMEOUT)
+            .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
 
         // Read current disk state (another process may have updated)
         let disk_content = fs::read_to_string(&self.auth_path).unwrap_or_else(|_| "{}".into());
@@ -190,32 +188,10 @@ impl CredentialStore {
         // Write only the specific provider
         disk[provider.auth_key()] = creds_value;
 
-        // Write atomically: temp → fsync → rename
-        // Use thread ID in temp name to avoid collisions under the file lock
-        let tmp = self
-            .auth_path
-            .with_extension(format!("tmp.{:?}", std::thread::current().id()));
-        let mut file = File::create(&tmp)
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot create temp file: {e}")))?;
         let json = serde_json::to_string_pretty(&disk)
             .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| ProviderError::AuthConfig(format!("write failed: {e}")))?;
-        file.sync_all()
-            .map_err(|e| ProviderError::AuthConfig(format!("fsync failed: {e}")))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-                .map_err(|e| ProviderError::AuthConfig(format!("chmod failed: {e}")))?;
-        }
-
-        fs::rename(&tmp, &self.auth_path)
-            .map_err(|e| ProviderError::AuthConfig(format!("rename failed: {e}")))?;
-
-        drop(lock_file);
-        let _ = fs::remove_file(&lock_path);
+        write_private_atomic(&self.auth_path, json.as_bytes())
+            .map_err(|e| ProviderError::AuthConfig(format!("cannot write auth.json: {e}")))?;
 
         info!(path = %self.auth_path.display(), provider = %provider, "auth.json updated");
         Ok(())

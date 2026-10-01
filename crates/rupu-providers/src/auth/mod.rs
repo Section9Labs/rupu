@@ -455,6 +455,46 @@ mod tests {
         }
     }
 
+    /// The legacy writers share the credential file's sidecar lock and
+    /// private writer: `<path>.lock` (0600) stays behind for the next
+    /// holder — never unlinked — the file is private, and no temp file is
+    /// left over. A held lock bounds the write instead of hanging it.
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_writers_lock_the_sidecar_and_write_private() {
+        use crate::provider_id::ProviderId;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let lock = dir.path().join("auth.json.lock");
+
+        save_provider_auth(
+            &path,
+            ProviderId::OpenaiCodex,
+            &AuthCredentials::ApiKey {
+                key: "sk-legacy".into(),
+            },
+        )
+        .unwrap();
+        assert!(lock.exists(), "the sidecar survives the write");
+        assert_eq!(mode(&lock), 0o600);
+        assert_eq!(mode(&path), 0o600);
+
+        save_auth_json(&path, &AuthMethod::ApiKey("sk-anthropic".into())).unwrap();
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(content["openai-codex"]["key"], "sk-legacy", "both landed");
+        assert_eq!(content["anthropic"]["key"], "sk-anthropic");
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_save_provider_auth_sets_0o600_permissions() {
