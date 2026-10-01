@@ -951,9 +951,10 @@ async fn refresh_reports_an_empty_listing_and_keeps_the_cache() {
     assert_eq!(std::fs::read_to_string(&cache_file).unwrap(), good);
 }
 
-/// The library never reads `RUPU_CACHE_DIR_OVERRIDE`: `refresh` and `catalog`
-/// use exactly the cache dir they are handed, so a test's result can't depend
-/// on the environment (the CLI and the CP resolve that seam at the edge).
+/// `refresh` and `catalog` use exactly the cache dir they are handed — not
+/// `<dir>/cache/models`, and not `RUPU_CACHE_DIR_OVERRIDE` (the CLI and the CP
+/// resolve that seam at the edge). Proved with a dir no derivation would
+/// produce, without touching the process environment.
 #[tokio::test]
 async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
     use httpmock::prelude::*;
@@ -965,16 +966,26 @@ async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
         }));
     });
     let tmp = tempfile::tempdir().unwrap();
-    let elsewhere = tmp.path().join("elsewhere");
+    let explicit = tmp.path().join("explicit-cache");
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
-    std::env::set_var("RUPU_CACHE_DIR_OVERRIDE", &elsewhere);
-    let out = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("oracle")).await;
-    let cat = catalog_of(&cfg, &tmp, Some("oracle")).await;
-    std::env::remove_var("RUPU_CACHE_DIR_OVERRIDE");
-    assert!(out.unwrap()[0].ok);
-    assert!(cache_of(&tmp).join("oracle.json").exists());
-    assert!(!elsewhere.exists(), "the env seam is the caller's business");
-    assert_eq!(cat.unwrap()[0].models[0].input_tokens, Some(4096));
+    let cfg_path = tmp.path().join("config.toml");
+    let out = rupu_runtime::model_limits::refresh(
+        &cfg,
+        &explicit,
+        &cfg_path,
+        Arc::new(AnyKey),
+        Some("oracle"),
+        rupu_runtime::model_limits::FETCH_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(out.outcomes[0].ok, "{:?}", out.outcomes[0]);
+    assert!(explicit.join("oracle.json").exists());
+    assert!(!explicit.join("cache").exists(), "no derived sub-path");
+    let cat = rupu_runtime::model_limits::catalog(&cfg, &explicit, &cfg_path, Some("oracle"))
+        .await
+        .unwrap();
+    assert_eq!(cat[0].models[0].input_tokens, Some(4096));
 }
 
 /// A provider job that outlives the refresh timeout is reported as timed out
