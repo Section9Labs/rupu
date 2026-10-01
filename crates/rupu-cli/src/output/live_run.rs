@@ -526,10 +526,19 @@ async fn run_follow_up(
             via,
             approver,
         } => {
-            let (opts, _chain_len) =
-                crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, None)
-                    .await
-                    .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
+            // `runs_dir` is `<global>/runs`: the chain reads its config from,
+            // and writes its results under, that same rupu home.
+            let global = runs_dir.parent().ok_or_else(|| {
+                format!(
+                    "on_reject cleanup unavailable: {} has no parent",
+                    runs_dir.display()
+                )
+            })?;
+            let (opts, _chain_len) = crate::resume::build_reject_cleanup_opts(
+                &store, global, run_id, &step_id, &reason, None,
+            )
+            .await
+            .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
             rupu_orchestrator::runner::run_reject_cleanup(
                 opts,
                 &step_id,
