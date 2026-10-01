@@ -3357,6 +3357,40 @@ impl RunStore {
         Ok(())
     }
 
+    /// [`clear_resume`](Self::clear_resume) for the marker a spawner looked
+    /// at, and that one only: the resume worker and the gate sweep read the
+    /// marker (its gate, mode, approver) without the lock, spawn the child
+    /// that consumes it, and only then clear — and a web decision recorded
+    /// in between overwrote the marker with one the child was not spawned
+    /// for. `marked_at` is the `resume_requested_at` the spawner read
+    /// (`None` when it read no marker). Under the run lock, on the record
+    /// as it is now: while the marker is still the one read, the marker and
+    /// the claim are cleared (`Ok(true)`); otherwise only the claim is given
+    /// back ([`release_resume_claim`](Self::release_resume_claim)) and the
+    /// newer marker stays for the resume worker (`Ok(false)`). A cancel is
+    /// left alone. The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn clear_resume_if_marked_at(
+        &self,
+        run_id: &str,
+        marked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, RunStoreError> {
+        let cleared = std::cell::Cell::new(false);
+        self.modify_unless_cancelled(run_id, |record| {
+            record.resume_claimed_at = None;
+            record.resume_claimed_by = None;
+            if marked_at.is_some() && record.resume_requested_at == marked_at {
+                record.resume_requested_at = None;
+                record.resume_mode = None;
+                record.resume_gate_id = None;
+                record.resume_approver = None;
+                cleared.set(true);
+            }
+            true
+        })?;
+        Ok(cleared.get())
+    }
+
     /// Runs the `cp serve` gate sweep must still run an `on_reject`
     /// cleanup chain for (I-35): still `Rejected` AND carrying an
     /// unconsumed [`RejectCleanupMarker`]. Mirrors
@@ -6691,6 +6725,102 @@ mod tests {
             store.release_resume_claim("run_missing"),
             Err(RunStoreError::NotFound(_))
         ));
+    }
+
+    /// `clear_resume_if_marked_at` clears the marker the spawner read and
+    /// no other: a marker written since the spawner's look (a web approve
+    /// of another gate, overwriting request time, gate, approver and mode)
+    /// is kept, and only the claim is given back.
+    #[test]
+    fn clear_resume_if_marked_at_clears_only_the_marker_that_was_read() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let read_at = Utc::now();
+        let mut rec = sample_record("run_clear_if_marked");
+        rec.resume_requested_at = Some(read_at);
+        rec.resume_gate_id = Some("gate_a".into());
+        rec.resume_approver = Some("web".into());
+        rec.resume_mode = Some("ask".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store.claim_resume(&rec.id, "worker", read_at).unwrap());
+
+        // Overwritten since the spawner read it: kept, claim released.
+        let since = read_at + chrono::Duration::seconds(1);
+        let mut current = store.load(&rec.id).unwrap();
+        current.resume_requested_at = Some(since);
+        current.resume_gate_id = Some("gate_b".into());
+        current.resume_approver = Some("web".into());
+        current.resume_mode = Some("bypass".into());
+        store.update(&current).unwrap();
+        assert!(!store
+            .clear_resume_if_marked_at(&rec.id, Some(read_at))
+            .unwrap());
+        let kept = store.load(&rec.id).unwrap();
+        assert_eq!(
+            kept.resume_requested_at,
+            Some(since),
+            "the newer marker stays"
+        );
+        assert_eq!(kept.resume_gate_id.as_deref(), Some("gate_b"));
+        assert_eq!(kept.resume_approver.as_deref(), Some("web"));
+        assert_eq!(kept.resume_mode.as_deref(), Some("bypass"));
+        assert_eq!(kept.resume_claimed_at, None, "the claim is given back");
+        assert_eq!(kept.resume_claimed_by, None);
+
+        // A spawner that read no marker clears none either.
+        assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
+        assert!(!store.clear_resume_if_marked_at(&rec.id, None).unwrap());
+        let kept = store.load(&rec.id).unwrap();
+        assert_eq!(kept.resume_requested_at, Some(since));
+        assert_eq!(kept.resume_claimed_at, None);
+
+        // Still the marker that was read: marker and claim cleared.
+        assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
+        assert!(store
+            .clear_resume_if_marked_at(&rec.id, Some(since))
+            .unwrap());
+        let cleared = store.load(&rec.id).unwrap();
+        assert_eq!(cleared.resume_requested_at, None);
+        assert_eq!(cleared.resume_gate_id, None);
+        assert_eq!(cleared.resume_approver, None);
+        assert_eq!(cleared.resume_mode, None);
+        assert_eq!(cleared.resume_claimed_at, None);
+        assert_eq!(cleared.resume_claimed_by, None);
+
+        // Nothing to clear: the claim alone is given back.
+        assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
+        assert!(!store
+            .clear_resume_if_marked_at(&rec.id, Some(since))
+            .unwrap());
+        assert_eq!(store.load(&rec.id).unwrap().resume_claimed_at, None);
+
+        assert!(matches!(
+            store.clear_resume_if_marked_at("run_missing", Some(since)),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// A cancel that landed is left alone by the conditional clear too:
+    /// its marker fields are not touched and the record is not rewritten.
+    #[test]
+    fn clear_resume_if_marked_at_leaves_a_cancelled_run_alone() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_clear_if_marked_cancelled");
+        rec.status = RunStatus::Cancelled;
+        rec.finished_at = Some(now);
+        rec.resume_requested_at = Some(now);
+        rec.resume_claimed_at = Some(now);
+        rec.resume_claimed_by = Some("worker".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(!store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap());
+        let untouched = store.load(&rec.id).unwrap();
+        assert_eq!(untouched.status, RunStatus::Cancelled);
+        assert_eq!(untouched.resume_requested_at, Some(now));
+        assert_eq!(untouched.resume_claimed_at, Some(now));
+        assert_eq!(untouched.resume_claimed_by.as_deref(), Some("worker"));
     }
 
     /// `modify_fields` writes its fields onto the record whatever its
