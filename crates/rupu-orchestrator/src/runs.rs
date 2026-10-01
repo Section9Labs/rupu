@@ -1489,6 +1489,9 @@ impl RunStore {
     /// pre-lock behavior) rather than hanging — logged. The lock is held
     /// while the returned file is alive.
     fn lock_run_json(&self, run_id: &str) -> Option<File> {
+        if !self.run_dir(run_id).is_dir() {
+            return None;
+        }
         let path = self.run_dir(run_id).join("run.json.lock");
         let file = match OpenOptions::new()
             .create(true)
@@ -5552,6 +5555,7 @@ mod tests {
         cancelled.error_message = Some("stop it".into());
         // Another process: holds the lock, writes its cancel 300ms later,
         // then releases.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             let file = OpenOptions::new()
                 .create(true)
@@ -5560,12 +5564,12 @@ mod tests {
                 .open(&lock_path)
                 .unwrap();
             rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            locked_tx.send(()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(300));
             other_store.update(&cancelled).unwrap();
             drop(file);
         });
-        // Give the holder time to take the lock.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        locked_rx.recv().unwrap();
         let mut done = rec.clone();
         done.status = RunStatus::Completed;
         let started = std::time::Instant::now();
