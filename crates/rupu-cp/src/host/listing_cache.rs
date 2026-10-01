@@ -13,9 +13,12 @@
 //!   for a fresh fetch. Stale data is never served.
 //! - Concurrent callers for one key share ONE in-flight fetch, including its
 //!   error. An error is never stored past that fetch.
-//! - A fetch whose every waiter went away (cancelled, or unwound by a panic)
-//!   is dropped, never resumed for a later caller: the remote command is torn
-//!   down and its old answer is never served as fresh.
+//! - A fetch whose every waiter went away (cancelled) is dropped, never
+//!   resumed for a later caller, so its old answer is never served as fresh.
+//!   Dropping it closes the remote command's pipes; it does not kill the
+//!   child (`SshExec::run` is `Command::output()` without `kill_on_drop`),
+//!   which exits on its next write (EPIPE/SIGPIPE).
+//! - A fetch that panics fails every waiter with an error and stores nothing.
 //! - [`ListingCache::clear`], which every mutating connector method calls via
 //!   [`ClearOnDrop`], drops everything. A fetch that STARTED before the clear
 //!   never stores its (pre-mutation) answer, and a caller arriving after the
@@ -25,6 +28,7 @@ use crate::host::connector::HostConnectorError;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -119,7 +123,22 @@ impl ListingCache {
             } else {
                 s.next_id += 1;
                 let id = s.next_id;
-                let fut: Fetch = fetch().map(|r| r.map(Arc::new)).boxed().shared();
+                // The panic is caught INSIDE the shared future: `Shared` marks
+                // itself poisoned on a panic but never wakes the waiters
+                // already parked on it, which would hang them and leave the
+                // key joined to a dead fetch. Caught, the future completes,
+                // so every waiter is woken with the same error. (The panic
+                // message itself still reaches the panic hook.)
+                let fut: Fetch = AssertUnwindSafe(fetch())
+                    .catch_unwind()
+                    .map(|r| match r {
+                        Ok(rows) => rows.map(Arc::new),
+                        Err(_) => Err(HostConnectorError::Unreachable(
+                            "listing fetch panicked".into(),
+                        )),
+                    })
+                    .boxed()
+                    .shared();
                 s.inflight.insert(
                     key.to_string(),
                     InFlight {
@@ -131,8 +150,7 @@ impl ListingCache {
                 (id, fut)
             }
         };
-        // Armed before the await: it runs if this future is dropped there or
-        // a panic unwinds out of it.
+        // Armed before the await: it runs if this future is dropped there.
         let mut waiter = Waiter {
             cache: self,
             key,
@@ -157,8 +175,8 @@ impl ListingCache {
 }
 
 /// One caller's claim on an in-flight fetch. If it is dropped before the fetch
-/// answered (cancelled, or unwound by a panic), it gives the claim back, and
-/// the last claim to go drops the fetch itself.
+/// answered (the caller was cancelled), it gives the claim back, and the last
+/// claim to go drops the fetch itself.
 struct Waiter<'a> {
     cache: &'a ListingCache,
     key: &'a str,
@@ -187,8 +205,8 @@ impl Drop for Waiter<'_> {
                 None
             }
         };
-        // Dropping the fetch tears down whatever it owns (an `ssh` child and
-        // its pipes), so do it outside the lock.
+        // Dropping the fetch runs the destructors of whatever it owns (for
+        // `ssh`, its child handle and pipes), so do it outside the lock.
         drop(orphaned);
     }
 }
@@ -450,7 +468,7 @@ mod tests {
         assert_eq!(a.unwrap().len(), 1, "A still gets its own answer");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_cancelled_fetch_is_not_resumed_later() {
         let cache = ListingCache::default();
         let calls = Arc::new(AtomicU32::new(0));
@@ -469,7 +487,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_cancelled_waiter_leaves_the_fetch_to_the_others() {
         let cache = ListingCache::default();
         let calls = Arc::new(AtomicU32::new(0));
@@ -500,15 +518,101 @@ mod tests {
     async fn a_panicking_fetch_does_not_wedge_its_key() {
         let cache = ListingCache::default();
         let calls = Arc::new(AtomicU32::new(0));
-        let blew_up = std::panic::AssertUnwindSafe(cache.get("k", panicking(&calls)))
-            .catch_unwind()
-            .await;
-        assert!(blew_up.is_err());
+        let blew_up = cache.get("k", panicking(&calls)).await;
+        assert!(
+            matches!(blew_up, Err(HostConnectorError::Unreachable(_))),
+            "the panic surfaces as an error to its caller, not as a panic"
+        );
         let ok = cache
             .get("k", counted(&calls, Ok(rows(3)), 0))
             .await
             .unwrap();
         assert_eq!(ok.len(), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// `Shared` does not wake its other waiters when the inner future panics,
+    /// so a waiter parked on the fetch at that moment would hang forever and
+    /// keep the key joined to a dead fetch. Needs two threads: the fetch blocks
+    /// INSIDE its poll (std channels), so the shared future stays mid-poll
+    /// while a second caller polls it, registers and parks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panic_with_a_parked_waiter_fails_both_and_does_not_wedge_the_key() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        const BOUND: Duration = Duration::from_secs(5);
+        let cache = Arc::new(ListingCache::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+
+        let a = {
+            let (cache, calls) = (Arc::clone(&cache), Arc::clone(&calls));
+            tokio::spawn(async move {
+                cache
+                    .get("k", move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        started_tx.send(()).unwrap();
+                        go_rx.recv_timeout(BOUND).expect("released by the test");
+                        boom()
+                    })
+                    .await
+            })
+        };
+        // A's fetch is now blocking inside its poll: the shared future is
+        // mid-poll and cannot finish until released.
+        started_rx.recv_timeout(BOUND).expect("A's fetch started");
+
+        let parked = Arc::new(AtomicBool::new(false));
+        let b = {
+            let (cache, calls, parked) =
+                (Arc::clone(&cache), Arc::clone(&calls), Arc::clone(&parked));
+            tokio::spawn(async move {
+                let mut get = Box::pin(cache.get("k", counted(&calls, Ok(rows(9)), 0)));
+                std::future::poll_fn(move |cx| {
+                    let r = get.as_mut().poll(cx);
+                    // B's first poll found the shared future mid-poll,
+                    // registered its waker and returned Pending.
+                    if r.is_pending() {
+                        parked.store(true, Ordering::SeqCst);
+                    }
+                    r
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(BOUND, async {
+            while !parked.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("B parks on the in-flight fetch");
+        assert_eq!(
+            lock(&cache.state).inflight.get("k").map(|f| f.waiters),
+            Some(2),
+            "B joined A's fetch"
+        );
+
+        go_tx.send(()).unwrap();
+        let (ra, rb) = tokio::time::timeout(BOUND, async { tokio::join!(a, b) })
+            .await
+            .expect("both callers must complete, none may hang on the dead fetch");
+        assert!(matches!(
+            ra.unwrap(),
+            Err(HostConnectorError::Unreachable(_))
+        ));
+        assert!(matches!(
+            rb.unwrap(),
+            Err(HostConnectorError::Unreachable(_))
+        ));
+
+        let third = tokio::time::timeout(BOUND, cache.get("k", counted(&calls, Ok(rows(3)), 0)))
+            .await
+            .expect("a third caller must not join the dead fetch")
+            .unwrap();
+        assert_eq!(third.len(), 3, "the third caller got its own rows");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
