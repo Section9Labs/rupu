@@ -3664,6 +3664,29 @@ mod tests {
         assert!(budget >= 1024, "budget {budget} should be >= minimum 1024");
     }
 
+    /// With no cap pinned, the thinking budget is computed against the
+    /// effective cap — the 8192 fallback that actually goes on the wire — not
+    /// against a missing value.
+    #[test]
+    fn thinking_budget_uses_the_fallback_cap_when_max_tokens_is_unset() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let fallback = crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS;
+        let mut request = make_request(None);
+        request.max_tokens = None;
+
+        request.thinking = Some(crate::model_tier::ThinkingLevel::Max);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["max_tokens"], fallback);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], fallback - 2000);
+        assert_eq!(body["thinking"]["budget_tokens"], 8192 - 2000);
+
+        // High asks for 10_000, more than the effective cap: clamped to it.
+        request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["thinking"]["budget_tokens"], fallback);
+    }
+
     #[test]
     fn test_build_request_body_thinking_skipped_when_max_tokens_too_small() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));

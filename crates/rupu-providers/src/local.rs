@@ -312,6 +312,32 @@ mod tests {
         assert_eq!(messages[1]["content"], "Hello");
     }
 
+    /// An unset cap is omitted (the server's own limit applies); a pinned
+    /// cap goes through verbatim.
+    #[test]
+    fn max_tokens_is_omitted_when_unset_and_sent_when_pinned() {
+        let provider = LocalModelProvider::new(
+            "http://localhost:8080",
+            "phi-local",
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
+        let mut request = LlmRequest {
+            model: "test".into(),
+            messages: vec![Message::user("Hello")],
+            max_tokens: None,
+            ..Default::default()
+        };
+        let body = provider.build_openai_request(&request);
+        assert!(
+            body.get("max_tokens").is_none(),
+            "no cap must mean no max_tokens: {body}"
+        );
+
+        request.max_tokens = Some(321);
+        let body = provider.build_openai_request(&request);
+        assert_eq!(body["max_tokens"], 321);
+    }
+
     #[test]
     fn test_local_model_provider_builds_request_without_system() {
         let provider = LocalModelProvider::new(
