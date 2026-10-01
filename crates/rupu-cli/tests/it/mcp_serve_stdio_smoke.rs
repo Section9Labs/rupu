@@ -6,8 +6,12 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn mcp_serve_stdio_returns_tools_list() {
+    // A rupu home of its own: the server creates its home directory at
+    // start-up, and without this it would be the real `~/.rupu`.
+    let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_rupu"))
         .args(["mcp", "serve", "--transport", "stdio"])
+        .env("RUPU_HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
