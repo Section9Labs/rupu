@@ -970,6 +970,13 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 Some("session") => rupu_coverage::Surface::Session,
                 _ => rupu_coverage::Surface::Agent,
             };
+            let engagement_profiles = opts
+                .tool_context
+                .findings
+                .as_ref()
+                .and_then(|f| f.engagement.as_ref())
+                .map(|e| e.ids().into_iter().map(String::from).collect())
+                .unwrap_or_default();
             let manifest = rupu_coverage::RunManifest {
                 run_id: opts.run_id.clone(),
                 started_at: chrono::Utc::now(),
@@ -982,7 +989,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 concerns: block.clone(),
                 scope_name: resolved_scope.to_string(),
                 workspace_path: opts.workspace_path.clone(),
-                engagement_profiles: vec![],
+                engagement_profiles,
             };
             if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
                 tracing::warn!(error = %e, "failed to write coverage run manifest");

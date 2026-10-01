@@ -1230,7 +1230,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         tmp: false,
         run_id: None,
         findings_profile: None,
-        engagement_profiles: Vec::new(),
+        engagement_profiles: invocation.engagement_profiles.clone(),
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),
@@ -1499,6 +1499,46 @@ mod tests {
         assert!(
             plan_rerun(&loaded).is_err(),
             "session rerun must be rejected"
+        );
+    }
+
+    #[test]
+    fn rerun_carries_engagement_profiles() {
+        use rupu_coverage::{
+            append_manifest, find_manifest, plan_rerun, CatalogMode, ConcernsBlock,
+            ConcernsEntry, CoveragePaths, IncludeDirective, RunManifest, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let m = RunManifest {
+            run_id: "run_engaged".to_string(),
+            started_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            surface: Surface::Agent,
+            agent_name: "reviewer".to_string(),
+            provider: "anthropic".to_string(),
+            model: "m".to_string(),
+            permission_mode: "bypass".to_string(),
+            user_prompt: "Review for binary issues.".to_string(),
+            concerns: ConcernsBlock {
+                entries: vec![ConcernsEntry::Include(IncludeDirective {
+                    include: "stride".to_string(),
+                    overrides: vec![],
+                    mode: CatalogMode::Auto,
+                    filter: None,
+                })],
+            },
+            scope_name: "reviewer".to_string(),
+            workspace_path: tmp.path().to_path_buf(),
+            engagement_profiles: vec!["binary".to_string()],
+        };
+        append_manifest(&paths, &m).unwrap();
+        let loaded = find_manifest(&paths, "run_engaged").unwrap().unwrap();
+        let inv = plan_rerun(&loaded).unwrap();
+        assert_eq!(
+            inv.engagement_profiles,
+            vec!["binary".to_string()],
+            "rerun must carry recorded engagement profiles"
         );
     }
 

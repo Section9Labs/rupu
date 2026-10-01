@@ -25,7 +25,7 @@ pub struct RunManifest {
     /// (agent name for agent runs, session id for session runs, etc.).
     pub scope_name: String,
     pub workspace_path: std::path::PathBuf,
-    /// The engagement profiles selected for this run (e.g., ["code-review", "security"]).
+    /// The engagement profiles selected for this run (e.g., ["binary"] or ["network", "web"]).
     /// Omitted from JSON if empty (backwards compatible).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engagement_profiles: Vec<String>,
@@ -165,6 +165,29 @@ mod tests {
         let manifest = sample("run_a");
         assert!(manifest.engagement_profiles.is_empty());
 
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(!serialized.contains("engagement_profiles"));
+    }
+
+    #[test]
+    fn manifest_records_active_engagement_profiles() {
+        // A manifest created with engagement_profiles records them correctly.
+        let mut manifest = sample("run_a");
+        manifest.engagement_profiles = vec!["binary".to_string()];
+        assert_eq!(manifest.engagement_profiles, vec!["binary".to_string()]);
+
+        // Verify serialization includes the profiles
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(serialized.contains("\"engagement_profiles\":[\"binary\"]"));
+    }
+
+    #[test]
+    fn manifest_code_path_has_empty_engagement_profiles() {
+        // A manifest for a code-only run (no engagement) has empty engagement_profiles.
+        let manifest = sample("run_a");
+        assert_eq!(manifest.engagement_profiles, vec![] as Vec<String>);
+
+        // Verify the field is omitted from serialization (skip_serializing_if behavior)
         let serialized = serde_json::to_string(&manifest).unwrap();
         assert!(!serialized.contains("engagement_profiles"));
     }
