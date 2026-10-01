@@ -15,5 +15,10 @@ async fn main() -> ExitCode {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let args = std::env::args().collect::<Vec<_>>();
-    rupu_cli::run(args).await
+    let code = rupu_cli::run(args).await;
+    // Last, before the runtime shuts down and cancels what it still owns:
+    // let an OAuth token refresh in flight finish persisting its rotated
+    // token (e.g. `rupu workflow run` exiting right after a pause).
+    rupu_cli::exit::drain_credential_writes(rupu_cli::exit::CREDENTIAL_WRITE_DRAIN).await;
+    code
 }
