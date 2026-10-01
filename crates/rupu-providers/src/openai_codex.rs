@@ -764,34 +764,39 @@ impl OpenAiCodexClient {
     /// adopts the refresh in flight (or its finished result) instead of
     /// starting a second one with the rotated-out refresh token.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        if self.pending_refresh.is_none() {
-            if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
-                return Ok(());
+        // Two rounds at most: an adopted refresh is checked like any other
+        // token — one that finished long ago on an idle client can itself
+        // be expired already, and is then refreshed once more.
+        for _ in 0..2 {
+            if self.pending_refresh.is_none() {
+                if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
+                    return Ok(());
+                }
+                self.pending_refresh = Some(crate::credential_writes::spawn(
+                    refresh_and_persist_openai_token(
+                        self.client.clone(),
+                        self.token_url.clone(),
+                        self.refresh_token.clone(),
+                        self.account_id.clone(),
+                        self.credential_store.clone(),
+                        self.auth_json_path.clone(),
+                    ),
+                ));
             }
-            self.pending_refresh = Some(crate::credential_writes::spawn(
-                refresh_and_persist_openai_token(
-                    self.client.clone(),
-                    self.token_url.clone(),
-                    self.refresh_token.clone(),
-                    self.account_id.clone(),
-                    self.credential_store.clone(),
-                    self.auth_json_path.clone(),
-                ),
-            ));
+            let Some(job) = self.pending_refresh.as_mut() else {
+                return Ok(());
+            };
+            // A cancellation point: dropped here, the handle stays on `self`.
+            let finished = job.await;
+            self.pending_refresh = None;
+            let refreshed = finished.map_err(|e| {
+                ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+            })??;
+            self.access_token = refreshed.access_token;
+            self.refresh_token = refreshed.refresh_token;
+            self.expires_ms = refreshed.expires_ms;
+            self.account_id = refreshed.account_id;
         }
-        let Some(job) = self.pending_refresh.as_mut() else {
-            return Ok(());
-        };
-        // A cancellation point: dropped here, the handle stays on `self`.
-        let finished = job.await;
-        self.pending_refresh = None;
-        let refreshed = finished.map_err(|e| {
-            ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
-        })??;
-        self.access_token = refreshed.access_token;
-        self.refresh_token = refreshed.refresh_token;
-        self.expires_ms = refreshed.expires_ms;
-        self.account_id = refreshed.account_id;
         Ok(())
     }
 
@@ -3667,6 +3672,61 @@ mod fetch_models_tests {
         token.assert_hits(1);
         assert_eq!(client.access_token, "access-2");
         assert_eq!(client.refresh_token, "refresh-2");
+    }
+
+    /// An adopted refresh is checked like any other token: one that
+    /// finished long ago on an idle client (or was issued short-lived) may
+    /// already be expired, and must be refreshed again rather than sent.
+    #[tokio::test]
+    async fn an_adopted_refresh_that_is_already_expired_is_refreshed_again() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth/token")
+                .body_contains("refresh-1");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                // Already inside the 5-minute expiry buffer when it lands.
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 1
+                }));
+        });
+        let second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth/token")
+                .body_contains("refresh-2");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-3",
+                "refresh_token": "refresh-3",
+                "expires_in": 3600
+            }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: std::collections::HashMap::new(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.ensure_valid_token(),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        client.ensure_valid_token().await.unwrap();
+        first.assert_hits(1);
+        second.assert_hits(1);
+        assert_eq!(client.access_token, "access-3");
     }
 
     #[test]

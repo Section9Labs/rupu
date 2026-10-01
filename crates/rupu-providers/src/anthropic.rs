@@ -1229,38 +1229,43 @@ impl AnthropicClient {
     /// adopts the refresh in flight (or its finished result) instead of
     /// starting a second one with the rotated-out refresh token.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        if self.pending_refresh.is_none() {
-            let AuthMethod::OAuth {
-                refresh_token,
-                expires_ms,
-                ..
-            } = &self.auth
-            else {
+        // Two rounds at most: an adopted refresh is checked like any other
+        // token — one that finished long ago on an idle client can itself
+        // be expired already, and is then refreshed once more.
+        for _ in 0..2 {
+            if self.pending_refresh.is_none() {
+                let AuthMethod::OAuth {
+                    refresh_token,
+                    expires_ms,
+                    ..
+                } = &self.auth
+                else {
+                    return Ok(());
+                };
+                if refresh_token.is_empty() || !is_token_expired(*expires_ms) {
+                    return Ok(());
+                }
+                info!("OAuth token expired, refreshing");
+                self.pending_refresh = Some(crate::credential_writes::spawn(
+                    refresh_and_persist_anthropic_token(
+                        self.client.clone(),
+                        self.token_url.clone(),
+                        refresh_token.clone(),
+                        self.credential_store.clone(),
+                        self.auth_json_path.clone(),
+                    ),
+                ));
+            }
+            let Some(job) = self.pending_refresh.as_mut() else {
                 return Ok(());
             };
-            if refresh_token.is_empty() || !is_token_expired(*expires_ms) {
-                return Ok(());
-            }
-            info!("OAuth token expired, refreshing");
-            self.pending_refresh = Some(crate::credential_writes::spawn(
-                refresh_and_persist_anthropic_token(
-                    self.client.clone(),
-                    self.token_url.clone(),
-                    refresh_token.clone(),
-                    self.credential_store.clone(),
-                    self.auth_json_path.clone(),
-                ),
-            ));
+            // A cancellation point: dropped here, the handle stays on `self`.
+            let finished = job.await;
+            self.pending_refresh = None;
+            self.auth = finished.map_err(|e| {
+                ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+            })??;
         }
-        let Some(job) = self.pending_refresh.as_mut() else {
-            return Ok(());
-        };
-        // A cancellation point: dropped here, the handle stays on `self`.
-        let finished = job.await;
-        self.pending_refresh = None;
-        self.auth = finished.map_err(|e| {
-            ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
-        })??;
         Ok(())
     }
 
@@ -5654,6 +5659,62 @@ mod tests {
             matches!(&client.auth, AuthMethod::OAuth { access_token, refresh_token, .. }
                 if access_token == "access-2" && refresh_token == "refresh-2"),
             "the client adopted the rotated token"
+        );
+    }
+
+    /// An adopted refresh is checked like any other token: one that
+    /// finished long ago on an idle client (or was issued short-lived) may
+    /// already be expired, and must be refreshed again rather than sent.
+    #[tokio::test]
+    async fn an_adopted_refresh_that_is_already_expired_is_refreshed_again() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                .body_contains("refresh-1");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                // Already inside the 5-minute expiry buffer when it lands.
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 1
+                }));
+        });
+        let second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                .body_contains("refresh-2");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-3",
+                "refresh_token": "refresh-3",
+                "expires_in": 3600
+            }));
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1,
+            },
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        client.token_url = server.url("/v1/oauth/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.ensure_valid_token(),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        client.ensure_valid_token().await.unwrap();
+        first.assert_hits(1);
+        second.assert_hits(1);
+        assert!(
+            matches!(&client.auth, AuthMethod::OAuth { access_token, .. } if access_token == "access-3"),
+            "the expired adopted token was refreshed again"
         );
     }
 
