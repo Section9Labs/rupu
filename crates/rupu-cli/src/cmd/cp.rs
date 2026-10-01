@@ -873,6 +873,17 @@ fn build_resume_argv<'a>(
     argv
 }
 
+/// `RunStore::clear_resume` on the blocking pool: it takes the run lock,
+/// whose bounded wait blocks its thread.
+async fn clear_resume_marker(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), rupu_orchestrator::RunStoreError> {
+    let id = run_id.to_string();
+    store.blocking(move |s| s.clear_resume(&id, now)).await
+}
+
 /// Resolve + spawn the detached `rupu workflow <subcommand> <run_id> [...]`
 /// child for ONE already-claimed run (the resume worker's per-run body,
 /// extracted so tests can drive it directly instead of waiting out the
@@ -888,17 +899,6 @@ fn build_resume_argv<'a>(
 /// default, used when `None`) — e.g. a capture script that records its
 /// argv, so a test can assert on the EXACT argv the real `rupu` binary
 /// would have received, rather than just on marker-field plumbing.
-/// `RunStore::clear_resume` on the blocking pool: it takes the run lock,
-/// whose bounded wait blocks its thread.
-async fn clear_resume_marker(
-    store: &rupu_orchestrator::RunStore,
-    run_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), rupu_orchestrator::RunStoreError> {
-    let id = run_id.to_string();
-    store.blocking(move |s| s.clear_resume(&id, now)).await
-}
-
 async fn resume_one_run(
     store: Arc<RunStore>,
     run_id: String,

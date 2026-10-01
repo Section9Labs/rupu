@@ -1459,7 +1459,10 @@ steps:
             .profile
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`) through `profile_for`'s `factory()`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn findings_profile_resolves_step_then_defaults_then_agent() {
         use rupu_coverage::FindingProfile::{Full, Summary};
         let tmp = assert_fs::TempDir::new().unwrap();
@@ -1721,7 +1724,10 @@ steps:
         }
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`) through `factory()`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn on_reject_cleanup_sub_steps_resolve_their_own_profile() {
         use rupu_coverage::FindingProfile::{Full, Summary};
         let tmp = assert_fs::TempDir::new().unwrap();
