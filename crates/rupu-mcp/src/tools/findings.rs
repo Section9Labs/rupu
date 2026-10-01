@@ -31,8 +31,9 @@ pub struct FindingsContext {
     /// Profile + artifact store + limits. The profile here is the run
     /// default (workflow `defaults.findings_profile`, else `full`); the
     /// dispatcher is built once per run, so an `action:` step's own
-    /// `findings_profile` reaches `findings.record` per call through
-    /// `ToolDispatcher::call_with_findings_profile`.
+    /// `findings_profile` — and the engagement set it records under
+    /// (`options.engagement`) — reach `findings.record` per call through
+    /// `ToolDispatcher::call_with_findings`.
     pub options: rupu_coverage::FindingWriteOptions,
     /// The run's **crew** codename (e.g. `jade-reef`), stamped on
     /// `Attribution.codename`. Crew only, never a per-agent instance: one
@@ -80,7 +81,32 @@ pub fn specs() -> Vec<ToolSpec> {
                 "type": "array", "items": { "type": "string" },
                 "description": "Supporting links — an issue URL, an advisory. Summary profile only."
             },
-            "concern_id": { "type": "string", "description": "Catalog concern id, when one applies." }
+            "concern_id": { "type": "string", "description": "Catalog concern id, when one applies." },
+            "asset": {
+                "type": "object",
+                "required": ["kind", "locator"],
+                "description": "The asset this finding is about. Only accepted when the step records under an engagement profile (`engagement_profiles` on the step or the workflow defaults): the kind routes the finding to the profile that owns it, and the asset is registered in the project's asset graph. Omit it for a plain code finding.",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "Profile-namespaced asset kind, e.g. `binary:function`. It must be one the active engagement profiles declare."
+                    },
+                    "locator": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "object" },
+                        "description": "The coordinates that identify the asset: a list of single-key objects, e.g. [{\"sha256\": \"<hex>\"}, {\"address\": 4198400}, {\"symbol\": \"main\"}]. Coordinates: path, line_range {start,end}, symbol, commit, sha256, offset, address, host, port {number,proto}, url, http_route {method,path}, param, resource_id {scheme,id}. Use the coordinates the kind declares."
+                    },
+                    "parent": {
+                        "type": "string",
+                        "description": "Id of this asset's parent asset, if it has one."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "A human-readable name for the asset. Omit it to derive one from the kind's label template."
+                    }
+                }
+            }
         }
     });
     // `json!` cannot embed a function call as a value inside the literal, so
@@ -123,6 +149,11 @@ pub struct RecordArgs {
     pub concern_id: Option<String>,
     #[serde(default)]
     pub report: Option<rupu_coverage::FindingReport>,
+    /// The asset this finding is about (kind + typed locator). Meaningful
+    /// only under an engagement profile, which routes the finding by the
+    /// asset's kind; see [`dispatch_record`].
+    #[serde(default)]
+    pub asset: Option<rupu_coverage::AssetInput>,
 }
 
 /// Write the finding. Returns the new finding id.
@@ -154,6 +185,21 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
                 .to_string(),
         );
     }
+    // `asset` only means something under an engagement: with none,
+    // `report_finding` takes the native `code` path and IGNORES the asset (the
+    // agent builtin gets away with that because it advertises `asset` only
+    // when an engagement is active). This tool's schema is static and always
+    // lists it, so an ignored asset would read as a recorded one. Refuse it
+    // instead.
+    if args.asset.is_some() && ctx.options.engagement.is_none() {
+        return Err(
+            "`asset` is only accepted when this step records under an engagement profile \
+             (set `engagement_profiles` on the step or in the workflow `defaults`); without \
+             one the finding is recorded under the native code rules and an asset would be \
+             dropped"
+                .to_string(),
+        );
+    }
     // A missing `rationale` leaves `evidence` unset, which the summary profile
     // reports as a missing `evidence` (renamed by `record_error` to the field
     // name this tool exposes).
@@ -174,7 +220,7 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         concern_id: args.concern_id,
         evidence,
         report: args.report,
-        asset: None,
+        asset: args.asset,
     };
     // Locator, profile and report validation live in `report_finding` so both
     // the agent builtin and this tool enforce the same rule. Two paths

@@ -770,6 +770,36 @@
     "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports. Under the full findings profile (the step's `findings_profile`, else the workflow default, else full) send `report` (a complete finding report) and omit summary/severity/rationale; under the summary profile send summary, severity and rationale.",
     "inputSchema": {
       "properties": {
+        "asset": {
+          "description": "The asset this finding is about. Only accepted when the step records under an engagement profile (`engagement_profiles` on the step or the workflow defaults): the kind routes the finding to the profile that owns it, and the asset is registered in the project's asset graph. Omit it for a plain code finding.",
+          "properties": {
+            "kind": {
+              "description": "Profile-namespaced asset kind, e.g. `binary:function`. It must be one the active engagement profiles declare.",
+              "type": "string"
+            },
+            "label": {
+              "description": "A human-readable name for the asset. Omit it to derive one from the kind's label template.",
+              "type": "string"
+            },
+            "locator": {
+              "description": "The coordinates that identify the asset: a list of single-key objects, e.g. [{\"sha256\": \"<hex>\"}, {\"address\": 4198400}, {\"symbol\": \"main\"}]. Coordinates: path, line_range {start,end}, symbol, commit, sha256, offset, address, host, port {number,proto}, url, http_route {method,path}, param, resource_id {scheme,id}. Use the coordinates the kind declares.",
+              "items": {
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "parent": {
+              "description": "Id of this asset's parent asset, if it has one.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "locator"
+          ],
+          "type": "object"
+        },
         "code_excerpt": {
           "description": "Relevant excerpt, if any. Summary profile only.",
           "type": "string"

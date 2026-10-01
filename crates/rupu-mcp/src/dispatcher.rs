@@ -9,6 +9,13 @@ use rupu_scm::Registry;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// What one call overrides in the run-level findings options — see
+/// [`ToolDispatcher::call_with_findings`].
+struct FindingsOverride {
+    profile: rupu_coverage::FindingProfile,
+    engagement: Option<Arc<rupu_coverage::profile::ActiveSet>>,
+}
+
 pub struct ToolDispatcher {
     registry: Arc<Registry>,
     permission: McpPermission,
@@ -57,28 +64,43 @@ impl ToolDispatcher {
     }
 
     /// [`call`](Self::call), but `findings.record` records under `profile`
-    /// instead of the run default carried in [`FindingsContext::options`].
+    /// and `engagement` instead of what [`FindingsContext::options`] carries.
     ///
     /// The action dispatcher is built once per run, while the findings
-    /// profile is per step (`step.findings_profile` → `defaults` → `full`),
-    /// so the orchestrator's action-step path passes each step's resolved
-    /// profile here. Every other tool ignores it.
+    /// profile and the engagement set are per step (`step.findings_profile`
+    /// → `defaults` → `full`; the workflow's `engagement_profiles` narrowed
+    /// by the step), so the orchestrator's action-step path passes each
+    /// step's resolved pair here. Both are authoritative for the call:
+    /// `engagement: None` is the native `code` path, not "keep whatever the
+    /// context holds" — the step factory is the single authority on what an
+    /// action step records under, and one step's engagement can never leak
+    /// into the next (the context is cloned per call). Every other tool
+    /// ignores both.
     ///
     /// [`FindingsContext::options`]: tools::findings::FindingsContext::options
-    pub async fn call_with_findings_profile(
+    pub async fn call_with_findings(
         &self,
         name: &str,
         args: Value,
         profile: rupu_coverage::FindingProfile,
+        engagement: Option<Arc<rupu_coverage::profile::ActiveSet>>,
     ) -> Result<String, McpError> {
-        self.dispatch(name, args, Some(profile)).await
+        self.dispatch(
+            name,
+            args,
+            Some(FindingsOverride {
+                profile,
+                engagement,
+            }),
+        )
+        .await
     }
 
     async fn dispatch(
         &self,
         name: &str,
         args: Value,
-        findings_profile: Option<rupu_coverage::FindingProfile>,
+        findings_override: Option<FindingsOverride>,
     ) -> Result<String, McpError> {
         let kind = self.kind_for(name)?;
         self.permission.check(name, kind)?;
@@ -122,8 +144,13 @@ impl ToolDispatcher {
                 let parsed: tools::findings::RecordArgs = serde_path_to_error::deserialize(args)
                     .map_err(|e| McpError::Tool(format!("invalid findings.record input: {e}")))?;
                 let mut ctx = ctx.clone();
-                if let Some(profile) = findings_profile {
+                if let Some(FindingsOverride {
+                    profile,
+                    engagement,
+                }) = findings_override
+                {
                     ctx.options.profile = profile;
+                    ctx.options.engagement = engagement;
                 }
                 // The write is synchronous and can be long (hashing and
                 // copying artifacts up to the configured caps): run it on the

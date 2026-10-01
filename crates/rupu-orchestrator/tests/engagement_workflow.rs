@@ -462,19 +462,90 @@ async fn an_action_step_with_no_engagement_records_as_before() {
     assert!(res.step_results[0].output.starts_with("finding_id: fnd_"));
 }
 
+fn binary_set() -> Arc<rupu_coverage::profile::ActiveSet> {
+    Arc::new(
+        rupu_coverage::profile::builtin_registry()
+            .unwrap()
+            .active_set(&["binary".to_string()])
+            .unwrap(),
+    )
+}
+
+fn action_ledger(workspace: &std::path::Path) -> rupu_coverage::CoveragePaths {
+    rupu_coverage::CoveragePaths::new(
+        workspace,
+        &rupu_coverage::target_id(workspace, "action-engagement"),
+    )
+}
+
+/// `WF_ACTION`'s shape (summary profile, binary default), plus the `asset`
+/// the engagement routes by.
+const WF_ACTION_ASSET: &str = r#"
+name: action-engagement
+defaults:
+  engagement_profiles: [binary]
+steps:
+  - id: record
+    action: findings.record
+    findings_profile: summary
+    with:
+      scope: repo
+      summary: "Stack buffer overflow in the request parser"
+      severity: high
+      rationale: "memcpy copies an attacker-controlled length into a 64-byte buffer."
+      asset:
+        kind: "binary:function"
+        locator:
+          - sha256: "abababababababababababababababababababababababababababababababab"
+          - address: 4198400
+          - symbol: parse_request
+"#;
+
 #[tokio::test]
-async fn an_action_step_under_a_real_engagement_is_not_recorded_on_the_native_path() {
-    // The `findings.record` dispatcher cannot yet carry a per-step engagement
-    // set (MCP-side delivery is the next task in this plan). Until it does,
-    // recording under a non-default engagement must FAIL rather than quietly
-    // file the finding under the native `code` rules.
-    let set = rupu_coverage::profile::builtin_registry()
-        .unwrap()
-        .active_set(&["binary".to_string()])
-        .unwrap();
+async fn an_action_step_under_a_real_engagement_records_it_for_real() {
+    // The engagement reaches the dispatcher: the finding is routed to the
+    // `binary` profile that owns `binary:function`, and the asset it names is
+    // registered. (Task 9 refused this outright until the dispatcher could
+    // carry an engagement.)
     let tmp_ws = tempfile::tempdir().unwrap();
     let factory = Arc::new(ActionEngagementFactory {
-        answer: Ok(Some(Arc::new(set))),
+        answer: Ok(Some(binary_set())),
+    });
+    let (o, _tmp) = opts(
+        WF_ACTION_ASSET,
+        factory,
+        None,
+        Some(action_dispatcher(tmp_ws.path())),
+    );
+    let res = run_workflow(o)
+        .await
+        .expect("a binary-engagement findings.record records");
+    assert!(
+        res.step_results[0].success,
+        "{}",
+        res.step_results[0].output
+    );
+    assert!(res.step_results[0].output.starts_with("finding_id: fnd_"));
+
+    let paths = action_ledger(tmp_ws.path());
+    let recs = rupu_coverage::read_findings(&paths).unwrap();
+    assert_eq!(recs.len(), 1);
+    let asset = recs[0].asset.clone().expect("routed: the asset is stamped");
+    assert_eq!(asset.kind, "binary:function");
+    let graph = rupu_coverage::read_asset_graph(&paths);
+    let labels: Vec<_> = graph.iter().map(|a| a.label.clone()).collect();
+    assert_eq!(labels, vec!["parse_request @ 0x401000".to_string()]);
+}
+
+#[tokio::test]
+async fn an_action_step_under_a_real_engagement_is_gated_by_the_profile() {
+    // WF_ACTION names no `asset`, so its scope maps to the legacy
+    // `code:file` kind — which the active `binary` profile does not own. The
+    // engagement is enforced on the record (not refused up front, not
+    // silently recorded under the native rules).
+    let tmp_ws = tempfile::tempdir().unwrap();
+    let factory = Arc::new(ActionEngagementFactory {
+        answer: Ok(Some(binary_set())),
     });
     let (o, _tmp) = opts(
         WF_ACTION,
@@ -482,11 +553,64 @@ async fn an_action_step_under_a_real_engagement_is_not_recorded_on_the_native_pa
         None,
         Some(action_dispatcher(tmp_ws.path())),
     );
-    let err = run_workflow(o).await.expect_err("refused, not downgraded");
-    assert!(err.to_string().contains("engagement"), "{err}");
-    let paths = rupu_coverage::CoveragePaths::new(
-        tmp_ws.path(),
-        &rupu_coverage::target_id(tmp_ws.path(), "action-engagement"),
+    let err = run_workflow(o)
+        .await
+        .expect_err("gated by the binary profile, not downgraded to code");
+    assert!(
+        matches!(err, RunWorkflowError::Action { .. }),
+        "a failed action step: {err:?}"
     );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("belongs to no active engagement profile"),
+        "{msg}"
+    );
+    assert!(msg.contains("binary"), "names the active profile: {msg}");
+    assert!(rupu_coverage::read_findings(&action_ledger(tmp_ws.path()))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_full_profile_action_step_is_held_to_the_engagements_completeness_checks() {
+    // The binary profile requires a disassembly/hexdump listing. A full report
+    // without one is refused with the profile's own check named.
+    let report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    let with = serde_json::json!({
+        "scope": "repo",
+        "report": report,
+        "asset": {
+            "kind": "binary:function",
+            "locator": [
+                { "sha256": "ab".repeat(32) },
+                { "address": 4198400 },
+                { "symbol": "main" }
+            ]
+        }
+    });
+    // JSON is YAML: embed the `with:` object as a flow mapping.
+    let yaml = format!(
+        "name: action-engagement\n\
+         defaults:\n  engagement_profiles: [binary]\n\
+         steps:\n  - id: record\n    action: findings.record\n    findings_profile: full\n    with: {}\n",
+        serde_json::to_string(&with).unwrap()
+    );
+    let tmp_ws = tempfile::tempdir().unwrap();
+    let factory = Arc::new(ActionEngagementFactory {
+        answer: Ok(Some(binary_set())),
+    });
+    let (o, _tmp) = opts(&yaml, factory, None, Some(action_dispatcher(tmp_ws.path())));
+    let err = run_workflow(o)
+        .await
+        .expect_err("no disasm/hexdump listing: the completeness gate refuses");
+    assert!(err.to_string().contains("evidence_has_listing"), "{err}");
+    let paths = action_ledger(tmp_ws.path());
     assert!(rupu_coverage::read_findings(&paths).unwrap().is_empty());
+    assert!(
+        !paths.assets.exists(),
+        "a refused record registers no asset"
+    );
 }

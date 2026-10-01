@@ -5480,24 +5480,16 @@ async fn execute_action_step(
         Ok(None)
     };
     let call_result = match engagement {
-        // Native `code` path: exactly today's call.
-        Ok(None) => {
+        // `None` is the native `code` path (exactly today's call); `Some` is
+        // a real engagement, which rides to `findings.record` alongside the
+        // profile so the finding is routed to the profile that owns its
+        // asset kind and held to that profile's completeness checks.
+        Ok(set) => {
             dispatcher
                 .narrowed_to(tool)
-                .call_with_findings_profile(tool, args.clone(), findings_profile)
+                .call_with_findings(tool, args.clone(), findings_profile, set)
                 .await
         }
-        // A real engagement cannot reach `findings.record` yet: the
-        // dispatcher carries a per-call findings PROFILE but no engagement
-        // set (delivery is wired MCP-side in the next task). Recording
-        // anyway would file the finding under the native `code` rules —
-        // the wrong domain — so refuse instead of silently downgrading.
-        Ok(Some(set)) => Err(rupu_mcp::McpError::Tool(format!(
-            "step `{}`: engagement profile(s) [{}] cannot be delivered to `{tool}` yet; \
-             refusing rather than recording under the native `code` rules",
-            step.id,
-            set.ids().join(", "),
-        ))),
         // The selection itself was refused at launch (unknown id, a step
         // widening the run's set): the same failed-action shape as any other
         // call failure, honoring `continue_on_error`.
