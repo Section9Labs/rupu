@@ -29,8 +29,17 @@ pub fn active_set(
     selected: &[String],
     agent_profiles: &[String],
 ) -> Result<Option<Arc<ActiveSet>>> {
+    // Drop blank CLI ids BEFORE resolving: a purely-blank `--engagement-profile
+    // ""` is "no CLI selection" and must fall through to the agent's
+    // frontmatter, not win the precedence as `[""]` and then clean to nothing
+    // (a silent downgrade to the native `code` path).
+    let selected: Vec<String> = selected
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
+        .collect();
     let mut ids: Vec<String> = Vec::new();
-    for id in EngagementProfile::resolve(None, selected, agent_profiles) {
+    for id in EngagementProfile::resolve(None, &selected, agent_profiles) {
         let id = id.trim().to_string();
         if !id.is_empty() && !ids.contains(&id) {
             ids.push(id);
@@ -152,6 +161,27 @@ mod tests {
         // CLI says `code`, so the agent's `binary` is overridden: native path.
         let got = active_set(home.path(), None, &ids(&["code"]), &ids(&["binary"])).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn a_blank_cli_value_falls_through_to_the_agent_not_a_downgrade() {
+        let home = tempfile::tempdir().unwrap();
+        for blank in [ids(&[""]), ids(&["  "]), ids(&["", " \t "])] {
+            let set = active_set(home.path(), None, &blank, &ids(&["binary"]))
+                .unwrap()
+                .unwrap_or_else(|| panic!("blank cli {blank:?} must not drop the agent's binary"));
+            assert_eq!(set.ids(), vec!["binary"], "cli={blank:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_still_selects_the_real_id() {
+        let home = tempfile::tempdir().unwrap();
+        // `--engagement-profiles binary,` splits to ["binary", ""].
+        let set = active_set(home.path(), None, &ids(&["binary", ""]), &[])
+            .unwrap()
+            .expect("binary survives the trailing blank");
+        assert_eq!(set.ids(), vec!["binary"]);
     }
 
     #[test]

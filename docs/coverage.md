@@ -480,7 +480,7 @@ Only two profiles are built in:
 | Id | Asset kinds | Depth ladder | Notes |
 |----|-------------|--------------|-------|
 | `code` | `code:file` | `unreviewed` → `reviewed` | The native path. Selecting only `code`, or nothing, means no engagement is active. |
-| `binary` | `binary:binary`, `binary:function` | `located` → `disassembled` → `analyzed` | Reverse engineering. A finding on a `binary:*` asset needs a `disasm` or `hexdump` evidence block, a `root_cause`, and a CWE classification. |
+| `binary` | `binary:binary`, `binary:function` | `located` → `disassembled` → `analyzed` | Reverse engineering. Under the `full` findings profile, a finding on a `binary:*` asset needs a `disasm` or `hexdump` evidence block, a `root_cause`, and a CWE classification. |
 
 There is no built-in `network` or `web` profile. A `network` profile is
 planned but does not ship yet; until then, anything else is a profile you
@@ -638,9 +638,11 @@ engagementProfiles: [binary]
 ---
 ```
 
-When an engagement is active rupu appends an "Engagement profiles" section to
-the agent's system prompt listing the active profiles' asset kinds and their
-coordinates, evidence block kinds, classification systems and depth ladder. It
+When an engagement is active and the agent records findings (`report_finding`
+or `concerns:`) or has `asset_mark`, rupu appends an "Engagement profiles"
+section to the agent's system prompt listing the active profiles' asset kinds
+and their coordinates, evidence block kinds, classification systems and depth
+ladder. It
 does not list the completeness checks, so say in the agent's prompt what a
 finding must carry (the sample `binary-analyst` does), or the agent learns it
 from rejections. `asset` is advertised on `report_finding` only under an
@@ -690,8 +692,8 @@ Under an engagement, `report_finding` and `findings.record` check:
 - **Always: the no-asset default.** A finding that names no `asset` is filed as
   `code:file` (its `file_path` becomes the locator). That is accepted only when
   `code` is active (for example `[code, binary]`); under `[binary]` alone it is
-  rejected with `names no asset, so its scope maps to code:file, which belongs
-  to no active engagement profile`.
+  rejected with ``this finding names no `asset`, so its scope maps to
+  `code:file`, which belongs to no active engagement profile``.
 - **Under the `full` findings profile only: the completeness checks.** Every
   `required` check of the owning profile must be satisfied, and every unmet
   check is listed at once. Under the `summary` findings profile only the two
@@ -735,8 +737,8 @@ A profile has the same shape as the built-in `binary` profile
 id = "firmware"
 name = "Firmware image review"
 # Top-level keys come first. After a `[[asset_kinds]]` header they would belong
-# to that kind and be silently ignored, leaving the profile with no permitted
-# evidence blocks or classification systems.
+# to that kind and be silently ignored, leaving the profile with no
+# evidence-block or classification guidance.
 evidence_blocks = ["text", "hexdump", "disasm"]
 classification_systems = ["CWE", "CVE"]
 
@@ -805,7 +807,8 @@ have their own header, so where they sit does not matter.
 
 An unknown field or tag in a predicate makes every finding of that profile fail
 (`engagement profile ... has an invalid completeness check`), rather than
-letting findings through.
+letting findings through. Completeness only runs under the `full` findings
+profile, so this applies there; `summary` findings never evaluate the checks.
 
 **Composites.** A profile with `includes` is a selection shorthand. It may
 declare kinds of its own (namespaced by its own id) and a `[bundle]`:

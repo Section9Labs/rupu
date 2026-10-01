@@ -66,7 +66,7 @@ pub struct Args {
     #[arg(long, value_name = "PROFILE", value_parser = parse_findings_profile)]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
     /// Engagement profile(s) for this run (`--engagement-profile binary`,
-    /// repeatable, or `--engagement-profiles binary,web`), overriding the
+    /// repeatable, or `--engagement-profiles code,binary`), overriding the
     /// agent's `engagementProfiles`. Omitted or `code` keeps the native
     /// code-review path.
     #[arg(

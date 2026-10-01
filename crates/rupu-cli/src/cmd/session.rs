@@ -160,7 +160,7 @@ pub struct StartArgs {
     pub view: Option<LiveViewMode>,
     /// Engagement profile(s) for every turn of this session
     /// (`--engagement-profile binary`, repeatable, or
-    /// `--engagement-profiles binary,web`), overriding the agent's
+    /// `--engagement-profiles code,binary`), overriding the agent's
     /// `engagementProfiles`. Snapshotted at start. Omitted or `code` keeps the
     /// native code-review path.
     #[arg(
