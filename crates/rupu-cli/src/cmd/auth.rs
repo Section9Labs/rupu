@@ -368,7 +368,12 @@ async fn login(
 
     let global = crate::paths::global_dir()?;
     let cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files_locked(Some(&cfg_path), None).unwrap_or_default();
+    let cfg_loaded = rupu_config::layer_files_locked(Some(&cfg_path), None);
+    // Kept for the logins that take settings from the config (a GitLab
+    // account's instance and OAuth application): those refuse an
+    // unreadable config rather than fall back to the defaults.
+    let cfg_error = cfg_loaded.as_ref().err().map(ToString::to_string);
+    let cfg = cfg_loaded.unwrap_or_default();
 
     // The genuine config declaration, if any — kept apart from any
     // name-derived vendor guess. See `resolve_login_kind`'s doc comment
@@ -478,6 +483,13 @@ async fn login(
                 .ok_or_else(|| anyhow::anyhow!("vendor {kind} has no SSO flow"))?;
             let stored = match oauth.flow {
                 rupu_auth::oauth::providers::OAuthFlow::Callback => {
+                    if let (ProviderId::Gitlab, Some(e)) = (pid, &cfg_error) {
+                        anyhow::bail!(
+                            "can't read {}: {e}. A GitLab login takes its instance and OAuth \
+                             application from [scm.{account}] there; fix the file and retry",
+                            cfg_path.display()
+                        );
+                    }
                     let app = sso_client(&cfg, account, pid)?;
                     rupu_auth::oauth::callback::run_with_client(pid, app).await?
                 }

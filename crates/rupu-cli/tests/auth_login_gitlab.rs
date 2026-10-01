@@ -38,3 +38,29 @@ fn sso_for_a_self_managed_account_without_a_client_id_says_what_to_register() {
         );
     assert!(!tmp.path().join("auth.json").exists(), "nothing was stored");
 }
+
+/// The instance and application come from the global config, so a config
+/// that can't be read can't silently become gitlab.com and glab's
+/// application — the token would be stored under the account's name for
+/// the wrong instance.
+#[test]
+fn sso_for_gitlab_with_an_unreadable_global_config_is_refused() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[scm.gitlab]\nbase_url = \"https://gitlab.example.com/api/v4\"\noauth_client_id = \n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env("RUPU_OAUTH_SKIP_BROWSER", "1")
+        .env("RUPU_OAUTH_FORCE_PORT", "0")
+        .timeout(Duration::from_secs(20))
+        .args(["auth", "login", "--account", "gitlab", "--mode", "sso"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config.toml"));
+    assert!(!tmp.path().join("auth.json").exists(), "nothing was stored");
+}
