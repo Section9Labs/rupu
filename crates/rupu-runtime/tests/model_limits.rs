@@ -1232,3 +1232,174 @@ async fn a_manual_refresh_ignores_and_clears_the_marker() {
     assert!(out[0].ok, "{:?}", out[0]);
     assert!(!failure_marker_exists(&tmp, "oracle"));
 }
+
+// ---- resolve notes: every unknown or ignored value says why ------------------
+
+/// A model the provider LISTS, with both limits 0, used to resolve to "no
+/// limit source" with no reason given.
+#[tokio::test]
+async fn a_listed_model_without_limits_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, _) = fake(Ok(vec![("claude-a", 0, 0)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert!(l.is_unresolved());
+    assert_eq!(
+        l.note.as_deref(),
+        Some(
+            "anthropic lists 'claude-a' without limits; set contextWindowTokens/maxTokens or [[providers.anthropic.models]]"
+        )
+    );
+}
+
+/// A config entry with no limits of its own is no reason to hide that the
+/// model is missing from the provider's list: nothing supplied a value.
+#[tokio::test]
+async fn a_limitless_config_entry_does_not_hide_a_model_missing_from_the_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = ctx(&tmp);
+    c.custom.insert(
+        "anthropic".into(),
+        vec![rupu_config::CustomModel {
+            id: "claude-zzz".into(),
+            context_window: None,
+            max_output: None,
+        }],
+    );
+    let (mut p, _) = fake(Ok(vec![("claude-a", 1, 1)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-zzz",
+        &mut p,
+        &c,
+    )
+    .await;
+    assert!(
+        l.note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not in anthropic's model list"),
+        "{:?}",
+        l.note
+    );
+
+    // A config entry that DOES supply a value is the answer: no note.
+    c.custom.get_mut("anthropic").unwrap()[0].context_window = Some(50_000);
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-zzz",
+        &mut p,
+        &c,
+    )
+    .await;
+    assert_eq!(l.input.tokens, Some(50_000));
+    assert_eq!(l.note, None);
+}
+
+/// An agent pin of 0 would compact every turn (window 0) or send
+/// `max_tokens: 0`. It is treated as unset — discovery decides — and the
+/// notice says it was ignored.
+#[tokio::test]
+async fn a_zero_agent_pin_is_ignored_with_a_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, _) = fake(Ok(vec![("claude-a", 1_000_000, 128_000)]));
+    let o = LimitOverrides {
+        context_window_tokens: Some(0),
+        max_tokens: Some(0),
+        compact_at_percent: None,
+    };
+    let l = resolve(o, "anthropic", "claude-a", &mut p, &ctx(&tmp)).await;
+    assert_eq!(l.input.tokens, Some(1_000_000));
+    assert!(matches!(l.input.source, LimitSource::Live { .. }));
+    assert_eq!(l.output.tokens, Some(128_000));
+    let note = l.note.as_deref().unwrap();
+    assert!(note.contains("ignored contextWindowTokens: 0"), "{note}");
+    assert!(note.contains("ignored maxTokens: 0"), "{note}");
+}
+
+/// A cache that could not be written is said in the notice, not only logged:
+/// every later launch will refetch.
+#[tokio::test]
+async fn a_cache_write_failure_is_in_the_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A regular file where the cache directory should be.
+    let not_a_dir = tmp.path().join("cache-is-a-file");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let (mut p, _) = fake(Ok(vec![("claude-a", 1_000_000, 128_000)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &LimitsContext::for_cache_dir(not_a_dir),
+    )
+    .await;
+    assert_eq!(
+        l.input.tokens,
+        Some(1_000_000),
+        "the fetched value is still used"
+    );
+    assert!(
+        l.note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("could not write the model cache"),
+        "{:?}",
+        l.note
+    );
+}
+
+/// Captures what a `tracing` subscriber writes.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A corrupt cache file reads as "never fetched" in the catalog; it must at
+/// least be logged with its path, not swallowed.
+#[tokio::test]
+async fn catalog_warns_about_a_corrupt_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = cache_of(&tmp);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("anthropic.json"), "{ not json").unwrap();
+    let log = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let cat = catalog_of(&rupu_config::Config::default(), &tmp, Some("anthropic"))
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(cat[0].fetched_at.is_none());
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("WARN") && text.contains("anthropic.json"),
+        "{text}"
+    );
+}

@@ -184,14 +184,31 @@ pub async fn resolve(
     if let Err(e) = registry.load_cache(provider_name).await {
         tracing::warn!(error = %e, provider = provider_name, "unreadable model cache; refetching");
     }
-    let mut note: Option<String> = None;
+    // Every reason a limit is unknown, stale, or an input was ignored; joined
+    // into the run-start notice.
+    let mut notes: Vec<String> = Vec::new();
+    // An agent pin of 0 would compact every turn or send `max_tokens: 0`:
+    // treat it as unset and say so.
+    let pin = |value: Option<u32>, field: &str, notes: &mut Vec<String>| match value {
+        Some(0) => {
+            notes.push(format!("ignored {field}: 0"));
+            None
+        }
+        other => other,
+    };
+    let pinned_input = pin(
+        overrides.context_window_tokens,
+        "contextWindowTokens",
+        &mut notes,
+    );
+    let pinned_output = pin(overrides.max_tokens, "maxTokens", &mut notes);
     if registry.cache_is_stale(provider_name).await {
         if let Some((age, error)) =
             recent_refresh_failure(&ctx.cache_dir, provider_name, Utc::now())
         {
             // A refetch failed moments ago: don't pay the fetch timeout again
             // on every launch while the provider stays down.
-            note = Some(format!(
+            notes.push(format!(
                 "model list refresh failed {} ({error}); retrying after {}m",
                 fmt_age(age),
                 REFRESH_RETRY_AFTER.as_secs() / 60
@@ -204,13 +221,16 @@ pub async fn resolve(
                 // an answer: caching it would replace a good entry (and make
                 // every model "missing from the list" for an hour).
                 Ok(Ok(models)) if models.is_empty() => {
-                    note = Some("model list refresh returned no models".to_string());
+                    notes.push("model list refresh returned no models".to_string());
                     Some("returned no models".to_string())
                 }
                 Ok(Ok(models)) => {
                     registry.set_live_cache(provider_name, models).await;
                     if let Err(e) = registry.save_cache(provider_name).await {
                         tracing::warn!(error = %e, provider = provider_name, "failed to write model cache");
+                        notes.push(format!(
+                            "could not write the model cache ({e}); every launch will refetch"
+                        ));
                     }
                     clear_refresh_failure(&ctx.cache_dir, provider_name);
                     None
@@ -218,18 +238,18 @@ pub async fn resolve(
                 // Not a failure: the provider has no listing. Instant, so
                 // nothing to suppress.
                 Ok(Err(ProviderError::NotImplemented { .. })) => {
-                    note = Some(format!(
+                    notes.push(format!(
                         "{provider_name} exposes no model limits; set contextWindowTokens/maxTokens on the agent or [[providers.{provider_name}.models]]"
                     ));
                     None
                 }
                 Ok(Err(e)) => {
-                    note = Some(format!("model list refresh failed: {e}"));
+                    notes.push(format!("model list refresh failed: {e}"));
                     Some(e.to_string())
                 }
                 Err(_) => {
                     let why = format!("timed out after {}", fmt_timeout(ctx.fetch_timeout));
-                    note = Some(format!("model list refresh {why}"));
+                    notes.push(format!("model list refresh {why}"));
                     Some(why)
                 }
             };
@@ -245,16 +265,25 @@ pub async fn resolve(
         let id = match_model_id(ms.iter().map(|m| m.id.as_str()), model)?;
         ms.iter().find(|m| m.id == id)
     });
-    if note.is_none() && live.is_none() && fetched_at.is_some() && custom.is_none() {
-        note = Some(format!(
+    let config_input = custom.and_then(|c| c.context_window).filter(|n| *n > 0);
+    let config_output = custom.and_then(|c| c.max_output).filter(|n| *n > 0);
+    // Config answers for the model only when it supplies a value; a bare
+    // entry is no reason to hide that the provider doesn't list it.
+    let config_answers = config_input.is_some() || config_output.is_some();
+    match &live {
+        None if fetched_at.is_some() && !config_answers => notes.push(format!(
             "model '{model}' is not in {provider_name}'s model list"
-        ));
+        )),
+        Some(m) if m.context_window == 0 && m.max_output_tokens == 0 => notes.push(format!(
+            "{provider_name} lists '{model}' without limits; set contextWindowTokens/maxTokens or [[providers.{provider_name}.models]]"
+        )),
+        _ => {}
     }
     let pick = |pin: Option<u32>, cfg: Option<u32>, live: Option<u32>| -> Limit {
         if let Some(n) = pin {
             return Limit::new(n, LimitSource::Agent);
         }
-        if let Some(n) = cfg.filter(|n| *n > 0) {
+        if let Some(n) = cfg {
             return Limit::new(n, LimitSource::Config);
         }
         match (live.filter(|n| *n > 0), fetched_at) {
@@ -262,17 +291,19 @@ pub async fn resolve(
             _ => Limit::unknown(),
         }
     };
+    let input = pick(
+        pinned_input,
+        config_input,
+        live.as_ref().map(|m| m.context_window),
+    );
+    let output = pick(
+        pinned_output,
+        config_output,
+        live.as_ref().map(|m| m.max_output_tokens),
+    );
     ModelLimits {
-        input: pick(
-            overrides.context_window_tokens,
-            custom.and_then(|c| c.context_window),
-            live.as_ref().map(|m| m.context_window),
-        ),
-        output: pick(
-            overrides.max_tokens,
-            custom.and_then(|c| c.max_output),
-            live.as_ref().map(|m| m.max_output_tokens),
-        ),
+        input,
+        output,
         compact_at_percent: overrides
             .compact_at_percent
             .unwrap_or(DEFAULT_COMPACT_AT_PERCENT)
@@ -280,7 +311,7 @@ pub async fn resolve(
         output_shares_context: provider.output_shares_context(),
         output_fallback: (provider.provider_id() == ProviderId::Anthropic)
             .then_some(ANTHROPIC_FALLBACK_MAX_TOKENS),
-        note,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
     }
 }
 
@@ -605,7 +636,14 @@ async fn build_registry(cfg: &rupu_config::Config, cache_dir: &Path) -> ModelReg
     // writes, or a named account's freshly-refreshed cache would be written
     // and then never read back.
     for p in &provider_names(cfg) {
-        registry.load_cache(p).await.ok();
+        if let Err(e) = registry.load_cache(p).await {
+            tracing::warn!(
+                provider = %p,
+                path = %cache_dir.join(format!("{p}.json")).display(),
+                error = %e,
+                "unreadable model cache; listing the provider as never fetched"
+            );
+        }
     }
     registry
 }
