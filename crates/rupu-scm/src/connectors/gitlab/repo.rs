@@ -480,14 +480,20 @@ impl RepoConnector for GitlabRepoConnector {
     }
     async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError> {
         let protocol = self.client.clone_protocol();
-        // GitLab PAT-as-password convention with username "oauth2" (HTTPS only;
-        // the ssh form drops the token entirely).
+        // GitLab token-as-password convention with username "oauth2" (HTTPS
+        // only; the ssh form drops the token entirely). Taken fresh: a clone
+        // can run for minutes, and an OAuth token near expiry is refreshed
+        // first.
+        let token = match protocol {
+            crate::client_options::CloneProtocol::Https => self.client.access_token().await?,
+            crate::client_options::CloneProtocol::Ssh => String::new(),
+        };
         let url = crate::client_options::clone_url(
             GITLAB_CLONE_HOST,
             &r.owner,
             &r.repo,
             protocol,
-            &format!("oauth2:{}", self.client.token),
+            &format!("oauth2:{token}"),
         );
         let dir = dir.to_path_buf();
         crate::client_options::run_clone(url, dir, protocol).await

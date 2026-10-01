@@ -20,19 +20,37 @@ use tracing::debug;
 use crate::error::{classify_scm_error, ScmError};
 use crate::event_connector::{EventConnector, EventPollResult, PolledEvent};
 use crate::platform::Platform;
+use crate::token::TokenSource;
 use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 
 pub struct GitlabEventConnector {
     http: reqwest_middleware::ClientWithMiddleware,
-    token: String,
+    /// Asked before every poll: an OAuth token is refreshed through the
+    /// credential store when it nears expiry (see [`TokenSource`]).
+    token: std::sync::Arc<TokenSource>,
     /// API root, default `https://gitlab.com/api/v4` — the same
     /// interpretation of `[scm.gitlab].base_url` as `GitlabClient`.
     base_url: String,
 }
 
 impl GitlabEventConnector {
+    /// A connector polling with `token` as-is.
     pub fn new(
         token: String,
+        base_url: Option<String>,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        Self::with_token_source(
+            std::sync::Arc::new(TokenSource::fixed(Platform::Gitlab, token)),
+            base_url,
+            sink,
+        )
+    }
+
+    /// [`Self::new`] with the credential behind `token`, which keeps an
+    /// OAuth token current.
+    pub fn with_token_source(
+        token: std::sync::Arc<TokenSource>,
         base_url: Option<String>,
         sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
@@ -101,9 +119,10 @@ impl EventConnector for GitlabEventConnector {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(USER_AGENT, HeaderValue::from_static("rupu/0"));
+        let token = self.token.token().await?;
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token))
+            HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|e| ScmError::Transient(anyhow::anyhow!("invalid token: {e}")))?,
         );
 
@@ -332,17 +351,20 @@ pub async fn try_build(
         Ok((_mode, creds)) => creds,
         Err(_) => return Ok(None),
     };
-    let token = match creds {
-        rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
-        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
-    };
+    let token = std::sync::Arc::new(TokenSource::resolved(
+        resolver,
+        Platform::Gitlab,
+        account,
+        creds,
+    ));
     let base_url = cfg
         .scm
         .platforms
         .get(account)
         .and_then(|p| p.base_url.clone());
-    let connector: std::sync::Arc<dyn EventConnector> =
-        std::sync::Arc::new(GitlabEventConnector::new(token, base_url, sink));
+    let connector: std::sync::Arc<dyn EventConnector> = std::sync::Arc::new(
+        GitlabEventConnector::with_token_source(token, base_url, sink),
+    );
     Ok(Some(connector))
 }
 

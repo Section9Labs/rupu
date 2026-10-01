@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use crate::client_options::{CloneProtocol, ScmClientOptions};
 use crate::error::{classify_scm_error, ScmError};
 use crate::platform::Platform;
+use crate::token::TokenSource;
 
 const CACHE_CAP: usize = 256;
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -33,7 +34,9 @@ const MAX_RETRIES: u32 = 5;
 pub struct GitlabClient {
     pub(crate) http: reqwest_middleware::ClientWithMiddleware,
     pub(crate) base_url: String,
-    pub(crate) token: String,
+    /// Asked before every request: an OAuth token is refreshed through the
+    /// credential store when it nears expiry (see [`TokenSource`]).
+    token: Arc<TokenSource>,
     semaphore: Arc<Semaphore>,
     cache: Arc<Mutex<LruCache<String, CacheEntry>>>,
     /// `[scm.gitlab].clone_protocol` (ISSUES.md I-16).
@@ -67,9 +70,23 @@ impl GitlabClient {
 
     /// Build from resolved `[scm.gitlab]` options — `base_url`,
     /// `max_concurrency`, `timeout_ms` (I-17, previously hardcoded 30s),
-    /// `clone_protocol` (I-16).
+    /// `clone_protocol` (I-16) — with a token used as-is.
     pub fn with_options(
         token: String,
+        opts: &ScmClientOptions,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        Self::with_token_source(
+            Arc::new(TokenSource::fixed(Platform::Gitlab, token)),
+            opts,
+            sink,
+        )
+    }
+
+    /// [`Self::with_options`] with the credential behind `token`, which
+    /// keeps an OAuth token current.
+    pub fn with_token_source(
+        token: Arc<TokenSource>,
         opts: &ScmClientOptions,
         sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
@@ -96,6 +113,13 @@ impl GitlabClient {
             cache,
             clone_protocol: opts.clone_protocol,
         }
+    }
+
+    /// The token to send now (refreshed first if it is an expiring OAuth
+    /// token). Read by every request here and by `clone_to`, which puts it
+    /// in the clone URL.
+    pub async fn access_token(&self) -> Result<String, ScmError> {
+        self.token.token().await
     }
 
     /// The configured clone protocol, read by `GitlabRepoConnector::clone_to`.
@@ -167,15 +191,18 @@ impl GitlabClient {
         }
     }
 
-    /// Issue a JSON GET against `<base_url><path>` with the GitLab
-    /// `PRIVATE-TOKEN` auth header, honoring the LRU ETag cache and
-    /// classifying error responses via `classify_scm_error(Platform::Gitlab, ...)`.
+    /// Issue a JSON GET against `<base_url><path>` with the token as
+    /// `Authorization: Bearer` (the one header GitLab accepts for OAuth
+    /// tokens and access tokens alike; `PRIVATE-TOKEN` rejects OAuth
+    /// tokens), honoring the LRU ETag cache and classifying error
+    /// responses via `classify_scm_error(Platform::Gitlab, ...)`.
     pub async fn get_json(&self, path: &str) -> Result<serde_json::Value, ScmError> {
         let url = format!("{}{}", self.base_url, path);
         let cache_key = url.clone();
         let cached = self.cache_get(&cache_key);
 
-        let mut req = self.http.get(&url).header("PRIVATE-TOKEN", &self.token);
+        let token = self.access_token().await?;
+        let mut req = self.http.get(&url).bearer_auth(token);
         if let Some((etag, _)) = &cached {
             req = req.header("If-None-Match", etag);
         }
@@ -234,10 +261,11 @@ impl GitlabClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ScmError> {
         let url = format!("{}{}", self.base_url, path);
+        let token = self.access_token().await?;
         let resp = self
             .http
             .request(method, &url)
-            .header("PRIVATE-TOKEN", &self.token)
+            .bearer_auth(token)
             .json(&body)
             .send()
             .await
@@ -266,10 +294,11 @@ impl GitlabClient {
     /// Fetch a non-JSON text body (e.g. the raw-diff endpoint).
     pub async fn get_text(&self, path: &str) -> Result<String, ScmError> {
         let url = format!("{}{}", self.base_url, path);
+        let token = self.access_token().await?;
         let resp = self
             .http
             .get(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|e| {
