@@ -26,6 +26,7 @@ async-trait.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+fs2.workspace = true
 rupu-providers = { path = "../rupu-providers" }
 rupu-netflow = { workspace = true, features = ["http"] }
 

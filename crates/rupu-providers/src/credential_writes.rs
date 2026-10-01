@@ -19,6 +19,23 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+/// Refreshes an OAuth credential on a provider client's behalf, through the
+/// store that owns it (rupu-auth's `KeychainResolver`): under that store's
+/// cross-process lock, re-reading what is stored, and persisting the rotated
+/// token. A client that refreshed on its own would keep the rotated token
+/// only in memory, leaving a dead refresh token in the store for the next
+/// process; with a refresher it never does.
+#[async_trait::async_trait]
+pub trait OAuthRefresher: Send + Sync {
+    /// A fresh credential for `stale` (the one the client holds). If another
+    /// holder already rotated the stored credential, that one comes back with
+    /// no token request; otherwise the stored one is refreshed and persisted.
+    async fn refresh(
+        &self,
+        stale: crate::auth::AuthCredentials,
+    ) -> Result<crate::auth::AuthCredentials, crate::error::ProviderError>;
+}
+
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
 fn idle() -> &'static Notify {

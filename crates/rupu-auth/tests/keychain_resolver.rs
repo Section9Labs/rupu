@@ -389,3 +389,251 @@ fn the_refresh_timeout_defaults_to_30s() {
         std::time::Duration::from_secs(30)
     );
 }
+
+// ---- cross-process: the auth.json.lock sidecar ------------------------------
+
+/// `<auth file>.lock`, the sidecar every credential writer and refresher
+/// locks.
+fn sidecar(auth_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = auth_path.as_os_str().to_owned();
+    s.push(".lock");
+    s.into()
+}
+
+/// A StoredCredential JSON for the raw file map.
+fn sso_payload(access: &str, refresh: &str, expires_in: chrono::Duration) -> String {
+    serde_json::to_string(&StoredCredential {
+        credentials: rupu_providers::auth::AuthCredentials::OAuth {
+            access: access.into(),
+            refresh: refresh.into(),
+            expires: 1,
+            extra: Default::default(),
+        },
+        refresh_token: Some(refresh.into()),
+        expires_at: Some(chrono::Utc::now() + expires_in),
+    })
+    .unwrap()
+}
+
+/// Another process (here: a second open file description on a std thread)
+/// holds the lock while it rotates the stored token. A near-expiry `get`
+/// must wait for it, re-read under the lock, and adopt the rotation — with
+/// no token request of its own (that request would carry the rotated-out
+/// refresh token).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_refresh_waits_for_another_process_and_adopts_its_rotation() {
+    use fs2::FileExt;
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .json_body(serde_json::json!({ "access_token": "mine" }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    store_near_expiry_sso(&r).await;
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let other = {
+        let auth_path = auth_path.clone();
+        std::thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(sidecar(&auth_path))
+                .unwrap();
+            lock.lock_exclusive().unwrap();
+            locked_tx.send(()).unwrap();
+            // The other process's rotation.
+            let map = serde_json::json!({
+                "anthropic/sso": sso_payload("theirs", "refresh-theirs", chrono::Duration::hours(1)),
+            });
+            std::fs::write(&auth_path, serde_json::to_string(&map).unwrap()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            lock.unlock().unwrap();
+        })
+    };
+    locked_rx.recv().unwrap();
+
+    let started = std::time::Instant::now();
+    let (_, creds) = r
+        .get("anthropic", Some(AuthMode::Sso))
+        .await
+        .expect("get succeeds");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "waited for the other holder ({:?})",
+        started.elapsed()
+    );
+    other.join().unwrap();
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth {
+            access, refresh, ..
+        } => {
+            assert_eq!(
+                (access.as_str(), refresh.as_str()),
+                ("theirs", "refresh-theirs")
+            );
+        }
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+    token.assert_hits(0);
+}
+
+/// Plain writes (login, logout) take the same lock: a store waits for
+/// another process's read-modify-write instead of clobbering it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_store_waits_for_another_process_holding_the_lock() {
+    use fs2::FileExt;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let other = {
+        let auth_path = auth_path.clone();
+        std::thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(sidecar(&auth_path))
+                .unwrap();
+            lock.lock_exclusive().unwrap();
+            locked_tx.send(()).unwrap();
+            let map = serde_json::json!({ "openai/api-key": "{\"credentials\":{\"type\":\"api_key\",\"key\":\"sk-theirs\"}}" });
+            std::fs::write(&auth_path, serde_json::to_string(&map).unwrap()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            lock.unlock().unwrap();
+        })
+    };
+    locked_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    KeychainResolver::new()
+        .store(
+            ProviderId::Anthropic,
+            AuthMode::ApiKey,
+            &StoredCredential::api_key("sk-mine"),
+        )
+        .await
+        .expect("store");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    other.join().unwrap();
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(
+        saved.contains("sk-theirs") && saved.contains("sk-mine"),
+        "the other writer's entry survives: {saved}"
+    );
+    // Written through a temp file + rename: nothing left behind.
+    let stray: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(stray.is_empty(), "{stray:?}");
+}
+
+/// A provider client whose own token is due (its 5-minute buffer) asks the
+/// resolver's refresher. When another holder already rotated the stored
+/// credential, the refresher hands that back — no token request.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_refresher_adopts_another_holder_s_rotation() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .json_body(serde_json::json!({ "access_token": "mine" }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    std::fs::write(
+        &auth_path,
+        serde_json::to_string(&serde_json::json!({
+            "anthropic/sso": sso_payload("access-2", "refresh-2", chrono::Duration::hours(1)),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let refresher = r
+        .oauth_refresher("anthropic")
+        .expect("a vendor account has a refresher");
+    let fresh = refresher
+        .refresh(rupu_providers::auth::AuthCredentials::OAuth {
+            access: "access-1".into(),
+            refresh: "refresh-1".into(),
+            expires: 1,
+            extra: Default::default(),
+        })
+        .await
+        .expect("refresh");
+    match fresh {
+        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => {
+            assert_eq!(access, "access-2")
+        }
+        other => panic!("{other:?}"),
+    }
+    token.assert_hits(0);
+}
+
+/// When the stored credential is still the one the client holds, the
+/// refresher refreshes it — and persists the rotation, which a client
+/// refreshing on its own would have kept only in memory.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_refresher_refreshes_and_persists_the_token_its_client_holds() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token").body_contains("refresh-1");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "expires_in": 3600
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    // Outside the resolver's 60s buffer, inside a provider's 5 minutes.
+    std::fs::write(
+        &auth_path,
+        serde_json::to_string(&serde_json::json!({
+            "anthropic/sso": sso_payload("access-1", "refresh-1", chrono::Duration::minutes(3)),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = r
+        .oauth_refresher("anthropic")
+        .unwrap()
+        .refresh(rupu_providers::auth::AuthCredentials::OAuth {
+            access: "access-1".into(),
+            refresh: "refresh-1".into(),
+            expires: 1,
+            extra: Default::default(),
+        })
+        .await
+        .expect("refresh");
+    token.assert_hits(1);
+    match fresh {
+        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => {
+            assert_eq!(access, "access-2")
+        }
+        other => panic!("{other:?}"),
+    }
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(saved.contains("refresh-2"), "persisted: {saved}");
+}
