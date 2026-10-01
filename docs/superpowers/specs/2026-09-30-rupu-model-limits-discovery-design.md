@@ -163,6 +163,8 @@ Placed and remote units run `rupu run` on their host, so they resolve there with
 
 When the output limit is known, the runner sends `limits.output.tokens` on every turn.
 
+The agent loop always streams on the wire. `--no-stream` only changes display: a quiet sink still forwards each event to `on_stream_event` but prints nothing, and the transcript keeps its final-message-only shape. A long response therefore can't hit the HTTP request timeout, and the discovered cap never needs clamping for it. The one client that can't stream is an OpenAI-compatible server configured `stream = false`: with no known output cap it carries `max_tokens: 8192` (`NO_SSE_FALLBACK_MAX_TOKENS`), since a blocking request with an unbounded generation could outlive the read timeout.
+
 Safety of the Anthropic max, verified against the API docs:
 - `max_tokens` doesn't count toward output rate limits (OTPM), which count only generated tokens.
 - On Claude 4.5+, input + `max_tokens` larger than the window is accepted.
@@ -294,7 +296,7 @@ These came up here and belong to the companion spec:
 **Interim risk, until that spec lands:**
 - A `max_tokens` stop still ends a run as `Ok`. That's pre-existing, and it becomes rarer, because the cap rises from 8192 to the model max.
 - On shared-window providers, `model_context_window_exceeded` is prevented by §6.4's headroom rule rather than handled.
-- `--no-stream` still fails to decode an Anthropic response with an unrecognized stop reason.
+- The non-streaming `send` path (the compaction summariser's call, for one) still fails to decode an Anthropic response with an unrecognized stop reason. The agent loop is not exposed to it, since it always streams (§6.3) and a streamed unrecognized stop reason is read as none.
 
 ## 10. Testing
 
