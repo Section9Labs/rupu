@@ -1154,12 +1154,14 @@ fn footer_line(view: &RunView, nav: &NavState, w: usize) -> Line {
         ("enter drill", 2),
         ("← back", 3),
         ("/ filter", 4),
+        ("Esc pause", 5),
         ("q quit", 0),
     ];
     const AT_GATE: &[(&str, u8)] = &[
         ("a approve", 1),
         ("r reject", 2),
         ("v findings", 3),
+        ("Esc pause", 4),
         ("q quit", 0),
     ];
     // The same predicate the key dispatch uses, so the legend never
@@ -2280,8 +2282,8 @@ mod tests {
             let out = live_layout(v, nav, &feed(6), now(), w, 24);
             render_plain(&out[out.len() - 1..])
         };
-        let normal = "↑↓ move · enter drill · ← back · / filter · q quit";
-        let at_gate = "a approve · r reject · v findings · q quit";
+        let normal = "↑↓ move · enter drill · ← back · / filter · Esc pause · q quit";
+        let at_gate = "a approve · r reject · v findings · Esc pause · q quit";
         assert_eq!(footer_of(&v, &NavState::default(), W), normal);
         assert_eq!(footer_of(&v, &nav_at(&v, 1), W), normal);
 
@@ -2757,7 +2759,7 @@ mod tests {
         // The footer advertises the modal gate keys, not navigation.
         assert_eq!(
             lines.last().unwrap(),
-            "a approve · r reject · v findings · q quit",
+            "a approve · r reject · v findings · Esc pause · q quit",
             "{s}"
         );
         assert!(!s.contains("↑↓ move"), "{s}");

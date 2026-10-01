@@ -13,4 +13,4 @@ step 2/5  ██████████░░░░░░░░░░░░░�
 lynx#2 ▸ read_file src/release.rs
 lynx#2 ▸ grep unwrap
 heron#1 ▸ bash cargo build
-a approve · r reject · v findings · q quit
+a approve · r reject · v findings · Esc pause · q quit

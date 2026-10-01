@@ -25,4 +25,4 @@ otter#59 ▸ bash cargo test -p billing
 otter#56 ▸ write_file findings/svc-56.md
 otter#57 ▸ bash git diff --stat
 otter#58 ▸ read_file services/auth/src/token.rs
-↑↓ move · enter drill · ← back · / filter · q quit
+↑↓ move · enter drill · ← back · / filter · Esc pause · q quit

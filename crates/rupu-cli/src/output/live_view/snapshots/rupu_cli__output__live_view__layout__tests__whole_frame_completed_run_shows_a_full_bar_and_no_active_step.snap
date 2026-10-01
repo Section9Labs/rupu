@@ -11,4 +11,4 @@ step 4/4  ███████████████████████�
   ✓ smoke · builder · anthropic/claude-opus-5-5 ···· ✓ 1m 01s
 heron#1 ▸ bash make smoke
 heron#1 ▸ write_file reports/release-4.2.0.md
-↑↓ move · enter drill · ← back · / filter · q quit
+↑↓ move · enter drill · ← back · / filter · Esc pause · q quit
