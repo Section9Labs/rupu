@@ -152,3 +152,40 @@ async fn gemini_login_sends_the_client_secret_on_the_code_exchange() {
     token_mock.assert();
     assert_eq!(stored.refresh_token.as_deref(), Some("g-refresh"));
 }
+
+/// Gemini requests `openid` + `email`, so Google's token response carries
+/// an ID token with the user's email in it. Only OpenAI's ID token is
+/// persisted (the Codex client needs it for its account id); Gemini's is
+/// not stored — the same PII rule that keeps Anthropic's account block
+/// down to the uuid.
+#[tokio::test]
+#[serial]
+async fn gemini_login_does_not_persist_the_id_token() {
+    let (stored, token_mock) = run_flow(ProviderId::Gemini, |when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({
+                "access_token": "g-access",
+                "refresh_token": "g-refresh",
+                "id_token": "eyJ.email-bearing.id-token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            }));
+    })
+    .await;
+
+    token_mock.assert();
+    match &stored.credentials {
+        rupu_providers::auth::AuthCredentials::OAuth { access, extra, .. } => {
+            assert_eq!(access, "g-access");
+            assert!(
+                !extra.contains_key("id_token"),
+                "Gemini's ID token is not stored: {extra:?}"
+            );
+        }
+        other => panic!("expected OAuth, got {other:?}"),
+    }
+    let json = serde_json::to_string(&stored).unwrap();
+    assert!(!json.contains("id-token"), "{json}");
+}

@@ -713,7 +713,8 @@ impl KeychainResolver {
             /// OpenAI's ChatGPT grant rotates the ID token with the access
             /// token; it is persisted (`extra.id_token`) as codex-rs does,
             /// since the Codex client takes its account id from it when
-            /// the access token carries no claim.
+            /// the access token carries no claim. OpenAI's only: any other
+            /// provider's (Gemini's carries the user's email) is dropped.
             #[serde(default)]
             id_token: Option<String>,
         }
@@ -730,8 +731,14 @@ impl KeychainResolver {
             rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => extra.clone(),
             _ => Default::default(),
         };
-        if let Some(id_token) = r.id_token {
-            prior_extra.insert("id_token".into(), serde_json::Value::String(id_token));
+        if kind == ProviderId::Openai {
+            if let Some(id_token) = r.id_token {
+                prior_extra.insert("id_token".into(), serde_json::Value::String(id_token));
+            }
+        } else {
+            // Not stored for any other provider — and one a login stored
+            // before this rule does not survive the refresh either.
+            prior_extra.remove("id_token");
         }
         // `credentials.expires` is the SAME field the provider crates'
         // `is_token_expired(expires_ms)` checks, and they all interpret

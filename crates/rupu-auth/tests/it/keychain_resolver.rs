@@ -1388,6 +1388,56 @@ async fn an_openai_refresh_persists_the_id_token() {
     );
 }
 
+/// Only OpenAI's ID token is persisted. Gemini requests `openid` + `email`,
+/// so its refresh response carries an email-bearing ID token too: the
+/// resolver's refresh neither stores it nor keeps one a pre-rule login
+/// stored — the credential ends up with no `id_token` at all.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_gemini_refresh_does_not_persist_the_id_token() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "id_token": "id-token-2",
+            "expires_in": 3600
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    let mut prior = std::collections::HashMap::new();
+    prior.insert(
+        "id_token".to_string(),
+        serde_json::Value::String("id-token-1".into()),
+    );
+    prior.insert(
+        "variant".to_string(),
+        serde_json::Value::String("antigravity".into()),
+    );
+    store_near_expiry_sso_for(&r, ProviderId::Gemini, prior).await;
+    let (_, creds) = r.get("gemini", Some(AuthMode::Sso)).await.expect("refresh");
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth { access, extra, .. } => {
+            assert_eq!(access, "access-2");
+            assert!(!extra.contains_key("id_token"), "{extra:?}");
+            assert_eq!(
+                extra.get("variant").and_then(|v| v.as_str()),
+                Some("antigravity"),
+                "the rest of `extra` is carried forward"
+            );
+        }
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(!saved.contains("id-token"), "{saved}");
+}
+
 /// Anthropic's refresh grant goes as JSON — what Claude Code's own
 /// `refreshOAuthToken` sends (oboard/claude-code-rev,
 /// `src/services/oauth/client.ts`: `axios.post(TOKEN_URL, { grant_type:
