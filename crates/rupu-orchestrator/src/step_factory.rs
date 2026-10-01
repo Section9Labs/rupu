@@ -1898,7 +1898,11 @@ steps:
     actions: ["issues.get", "issues.list"]
 "#;
 
+    // `#[serial]`: `build_opts_for_step` builds the provider through the
+    // factory, which reads `RUPU_MOCK_PROVIDER_SCRIPT` — set by
+    // `generate.rs`'s tests in this same binary.
     #[tokio::test]
+    #[serial_test::serial]
     async fn declared_and_blocked_call_writes_the_correct_tool_audit_fields() {
         // `issues.list` IS declared (in `actions:`) and IS granted (agent's
         // `tools:`) — a normal, allowed call.
@@ -1949,7 +1953,11 @@ steps:
         assert_eq!(lines[0]["data"]["blocked"], false);
     }
 
+    // `#[serial]`: `build_opts_for_step` builds the provider through the
+    // factory, which reads `RUPU_MOCK_PROVIDER_SCRIPT` — set by
+    // `generate.rs`'s tests in this same binary.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_step_declaring_an_ungranted_tool_emits_granted_false() {
         // `issues.get` IS declared (in `actions:`) but the agent's `tools:`
         // grant (`[issues.list, issues.create]`) does NOT cover it — spec
@@ -2025,7 +2033,11 @@ steps:
     actions: ["scm.prs.get"]
 "#;
 
+    // `#[serial]`: `build_opts_for_step` builds the provider through the
+    // factory, which reads `RUPU_MOCK_PROVIDER_SCRIPT` — set by
+    // `generate.rs`'s tests in this same binary.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wildcard_granted_agent_reports_granted_true_not_a_naive_match_false() {
         // Regression for the naive-exact-match bug narrow_agent_tools
         // itself guards on the enforcement side (spec §2's rewrite): an
