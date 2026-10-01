@@ -342,7 +342,7 @@ mod tests {
     /// writer would, and ask git itself whether it would be tracked. Shelling
     /// out to `git` in tests is an established pattern in this workspace
     /// (`crates/rupu-workspace/src/store.rs`, `crates/rupu-workspace/src/autoflow_worktree.rs`,
-    /// `crates/rupu-cli/tests/cli_run.rs`, `crates/rupu-cli/src/cmd/init.rs`),
+    /// `crates/rupu-cli/tests/serial/cli_run.rs`, `crates/rupu-cli/src/cmd/init.rs`),
     /// so this is exercised directly rather than faked.
     #[test]
     fn flows_jsonl_is_git_ignored_in_a_real_repo() {

@@ -137,7 +137,7 @@ pub fn exit_by_signal_if_terminating() {
 
 /// Test seam: with `RUPU_TEST_HOLD_CREDENTIAL_WRITE_MS=<ms>` set, keep one
 /// tracked credential write open for that long, so an integration test can
-/// observe the exit path with a write pending (`tests/sigterm_exit.rs`).
+/// observe the exit path with a write pending (`tests/it/sigterm_exit.rs`).
 /// Unset in production; a value that does not parse is ignored.
 pub fn hold_test_credential_write() {
     let Some(ms) = std::env::var("RUPU_TEST_HOLD_CREDENTIAL_WRITE_MS")

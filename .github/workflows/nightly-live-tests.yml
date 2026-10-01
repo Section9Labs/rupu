@@ -24,6 +24,6 @@ jobs:
       - name: Cargo build (providers + scm)
         run: cargo build -p rupu-providers -p rupu-scm --tests
       - name: Live smoke (LLM providers)
-        run: cargo test -p rupu-providers --test live_smoke -- --nocapture
+        run: cargo test -p rupu-providers --test it live_smoke:: -- --nocapture
       - name: Live smoke (SCM connectors)
-        run: cargo test -p rupu-scm --test live_smoke -- --nocapture
+        run: cargo test -p rupu-scm --test it live_smoke:: -- --nocapture

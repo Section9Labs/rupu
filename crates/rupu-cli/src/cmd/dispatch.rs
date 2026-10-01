@@ -715,7 +715,7 @@ mod tests {
     /// Exercises `CliAgentDispatcher::dispatch()` end to end against the
     /// `RUPU_MOCK_PROVIDER_SCRIPT` seam (the same test-only provider
     /// factory hook `rupu-cli`'s own CLI integration tests use — see
-    /// `tests/cli_run.rs`) so the child's agent loop runs for real
+    /// `tests/serial/cli_run.rs`) so the child's agent loop runs for real
     /// without any network access. Asserts `DispatchStarted` lands
     /// before `DispatchCompleted`, both carrying the same `sub_run_id`
     /// as the returned `DispatchOutcome`, and that token counts flow

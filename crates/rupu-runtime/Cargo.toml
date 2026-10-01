@@ -41,3 +41,4 @@ rupu-providers = { path = "../rupu-providers" }
 httpmock.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serial_test.workspace = true
