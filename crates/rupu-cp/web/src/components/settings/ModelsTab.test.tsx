@@ -68,6 +68,21 @@ describe('ModelsTab', () => {
     expect(await screen.findByText(/requires `rupu cp serve`/)).toBeInTheDocument();
   });
 
+  it('offers Retry when the initial load fails and recovers on success', async () => {
+    const list = vi
+      .spyOn(api, 'getModelCatalog')
+      .mockRejectedValueOnce(new ApiError(500, 'boom', '{"error":"catalog exploded"}'))
+      .mockResolvedValueOnce(CATALOG);
+    render(<ModelsTab />);
+    expect(await screen.findByText('catalog exploded')).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('claude-demo-1')).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText('catalog exploded')).not.toBeInTheDocument();
+  });
+
   it('renders the stale badge only for a stale provider', async () => {
     vi.spyOn(api, 'getModelCatalog').mockResolvedValue([
       { ...CATALOG[0], stale: true },

@@ -65,7 +65,22 @@ export function ModelsTab() {
   };
 
   if (unavailable) return <EmptyTabState text="The model catalog requires `rupu cp serve`." />;
-  if (!catalog) return loadError ? <ErrorBanner>{loadError}</ErrorBanner> : <Spinner label="Loading models…" />;
+  if (!catalog) {
+    // First load failed (non-501): nothing to show yet, so give the operator a
+    // way back in without leaving the Settings page.
+    return loadError ? (
+      <ErrorBanner>
+        <div className="flex items-center justify-between gap-3">
+          <span>{loadError}</span>
+          <Button variant="secondary" size="sm" onClick={() => void load()}>
+            Retry
+          </Button>
+        </div>
+      </ErrorBanner>
+    ) : (
+      <Spinner label="Loading models…" />
+    );
+  }
 
   return (
     <div className="space-y-6">
