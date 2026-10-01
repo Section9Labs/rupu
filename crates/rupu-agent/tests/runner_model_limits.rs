@@ -860,3 +860,34 @@ async fn compaction_seq_counts_only_compactions_that_ran() {
         .collect();
     assert_eq!(seqs, vec![1], "the first compaction that ran is #1");
 }
+
+/// Anthropic's extra-usage 429 on a request WITHOUT the 1M beta (so the
+/// client surfaces the plain 429, not `LongContextUnavailable`) is refused
+/// the same way on every attempt: the runner must not burn its transient
+/// retries (with backoff) on it. One attempt, then the error.
+#[tokio::test]
+async fn a_plain_extra_usage_429_is_not_retried() {
+    let inner = CapturingMockProvider::new(vec![final_text_turn(usage(1, 1, 0))]);
+    let captured = inner.captured.clone();
+    let provider = FailFirst {
+        err: Some(ProviderError::Api {
+            status: 429,
+            message: r#"{"error":{"message":"Extra usage is required for long context requests"}}"#
+                .into(),
+        }),
+        inner,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    let result = run_agent(opts).await;
+    assert!(
+        matches!(&result, Err(RunError::Provider(m)) if m.contains("Extra usage")),
+        "surfaces as an error: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(captured.lock().unwrap().len(), 0, "never retried");
+    assert!(!notices(&transcript)
+        .iter()
+        .any(|(k, _)| k == "provider_retry"));
+}

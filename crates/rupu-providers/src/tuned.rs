@@ -115,17 +115,18 @@ impl LlmProvider for ThrottledProvider {
 /// auth failure, or a malformed request is permanent — retrying it just burns
 /// the user's time.
 pub fn is_retryable(e: &ProviderError) -> bool {
+    // Anthropic's extra-usage 429 is triggered by the 1M-context beta header,
+    // not by load: the same request is refused on every attempt. Surface it
+    // at once (the Anthropic client turns a beta-carrying one into
+    // `LongContextUnavailable`, which the agent runner falls back on).
+    if e.is_long_context_refusal() {
+        return false;
+    }
     match e {
         ProviderError::RateLimited { .. }
         | ProviderError::Transient(_)
         | ProviderError::Http(_) => true,
-        // Anthropic's long-context entitlement 429 is refused the same way on
-        // every attempt; surface it for the runner's overflow handling.
-        ProviderError::Api {
-            status: 429,
-            message,
-        } => !crate::error::is_long_context_refusal(message),
-        ProviderError::Api { status, .. } => *status == 529 || *status >= 500,
+        ProviderError::Api { status, .. } => *status == 429 || *status == 529 || *status >= 500,
         _ => false,
     }
 }

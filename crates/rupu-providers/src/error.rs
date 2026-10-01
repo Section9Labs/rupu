@@ -98,6 +98,25 @@ impl From<serde_json::Error> for ProviderError {
     }
 }
 
+impl ProviderError {
+    /// Anthropic's long-context refusal in either shape: the extra-usage 429
+    /// on a request without the 1M beta (`Api { status: 429 }`), or
+    /// [`ProviderError::LongContextUnavailable`] after one with it. The same
+    /// request is refused the same way every time, so no retry layer — the
+    /// providers' (`tuned::is_retryable`) or the agent runner's — retries
+    /// it. The one predicate both use.
+    pub fn is_long_context_refusal(&self) -> bool {
+        match self {
+            ProviderError::LongContextUnavailable { .. } => true,
+            ProviderError::Api {
+                status: 429,
+                message,
+            } => is_long_context_refusal(message),
+            _ => false,
+        }
+    }
+}
+
 /// Anthropic's refusal of a long-context request on an account without
 /// extra-usage billing: a 429 whose body says "Extra usage is required for
 /// long context requests" (see the `anthropic-beta` comment in

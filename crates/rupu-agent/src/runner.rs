@@ -58,6 +58,12 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
 /// model unavailable, …) fail fast so we don't spin on a permanent problem.
 fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
     use rupu_providers::ProviderError as E;
+    // Anthropic's extra-usage 429 is refused the same way on every attempt
+    // (the 1M beta triggers it, not load) — the same predicate
+    // `tuned::is_retryable` uses.
+    if e.is_long_context_refusal() {
+        return false;
+    }
     match e {
         E::Http(_)
         | E::SseParse(_)
