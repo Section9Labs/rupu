@@ -1006,3 +1006,54 @@ async fn a_timed_out_refresh_job_still_finishes_in_the_background() {
     let body = std::fs::read_to_string(&cache_file).expect("the job finished and wrote its cache");
     assert!(body.contains("base-model"), "{body}");
 }
+
+/// A credential store with nothing in it.
+struct NoCredentials;
+
+#[async_trait::async_trait]
+impl rupu_auth::CredentialResolver for NoCredentials {
+    async fn get(
+        &self,
+        _provider: &str,
+        _hint: Option<rupu_providers::AuthMode>,
+    ) -> anyhow::Result<(
+        rupu_providers::AuthMode,
+        rupu_providers::auth::AuthCredentials,
+    )> {
+        anyhow::bail!("no credential stored")
+    }
+    async fn refresh(
+        &self,
+        _provider: &str,
+        _mode: rupu_providers::AuthMode,
+    ) -> anyhow::Result<rupu_providers::auth::AuthCredentials> {
+        unreachable!()
+    }
+}
+
+/// `kind = "local"` has no listing wired, and that is what a refresh reports —
+/// not a misleading "missing credential" from a credential lookup that never
+/// needed to run.
+#[tokio::test]
+async fn refresh_reports_a_local_provider_as_not_wired_without_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = rupu_config::Config::default();
+    cfg.providers.insert(
+        "lm".into(),
+        rupu_config::ProviderConfig {
+            kind: Some("local".into()),
+            ..Default::default()
+        },
+    );
+    for name in ["lm", "local"] {
+        let out = refresh_with(&cfg, &tmp, Arc::new(NoCredentials), Some(name))
+            .await
+            .unwrap();
+        assert!(!out[0].ok, "{name}");
+        assert_eq!(
+            out[0].error.as_deref(),
+            Some("provider kind \"local\" is not wired for listing"),
+            "{name}"
+        );
+    }
+}

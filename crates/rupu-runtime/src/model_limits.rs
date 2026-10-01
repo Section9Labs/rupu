@@ -324,6 +324,11 @@ async fn refresh_one(
         count: 0,
         error: Some(error),
     };
+    // Kind first: a kind with no listing wired fails here, before any
+    // credential lookup could misreport it as a missing credential.
+    if kind_of(name, cfg) == "local" {
+        return fail("provider kind \"local\" is not wired for listing".to_string());
+    }
     let pcfg = provider_factory::provider_config_for(name, &cfg.providers);
     let model = provider_factory::resolve_model(
         None,
