@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 import { StrictMode } from 'react';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { api, ApiError, type CatalogProvider, type RefreshOutcome } from '../../lib/api';
 import { ModelsTab } from './ModelsTab';
 
@@ -271,6 +271,92 @@ describe('ModelsTab', () => {
       await new Promise((r) => setTimeout(r, 20));
       expect(screen.queryByText('stale failure')).not.toBeInTheDocument();
       expect(screen.getByText('claude-demo-2')).toBeInTheDocument();
+    });
+  });
+
+  it('clears a failed Refetch all banner when the next refetch starts', async () => {
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    vi.spyOn(api, 'refreshModels')
+      .mockRejectedValueOnce(new ApiError(500, 'boom', '{"error":"refresh exploded"}'))
+      .mockResolvedValueOnce([{ provider: 'anthropic', ok: true, count: 1 }]);
+    render(<ModelsTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Refetch all' }));
+    expect(await screen.findByText('refresh exploded')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch anthropic' })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refetch anthropic' }));
+    await waitFor(() => expect(screen.queryByText('refresh exploded')).not.toBeInTheDocument());
+    // ...and it stays gone once the successful refetch has fully settled.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch anthropic' })).toBeEnabled());
+    expect(screen.queryByText('refresh exploded')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  describe('inline provider error vs aria-busy', () => {
+    /** Records every alert that was ever present inside a still-busy section. */
+    function watchBusyAlerts(container: HTMLElement) {
+      const seen: string[] = [];
+      const check = () => {
+        container
+          .querySelectorAll('section[aria-busy="true"] [role="alert"]')
+          .forEach((a) => seen.push(a.textContent ?? ''));
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(container, { childList: true, subtree: true, attributes: true, characterData: true });
+      return {
+        seen,
+        stop: () => {
+          check();
+          observer.disconnect();
+        },
+      };
+    }
+
+    it('does not insert the alert while its section is still aria-busy (failed outcome, slow reload)', async () => {
+      let resolveReload: (c: CatalogProvider[]) => void = () => {};
+      vi.spyOn(api, 'getModelCatalog')
+        .mockResolvedValueOnce(CATALOG)
+        .mockReturnValueOnce(
+          new Promise<CatalogProvider[]>((resolve) => {
+            resolveReload = resolve;
+          }),
+        );
+      const refresh = vi
+        .spyOn(api, 'refreshModels')
+        .mockResolvedValue([{ provider: 'gemini', ok: false, count: 0, error: 'no live model-list endpoint' }]);
+      const { container } = render(<ModelsTab />);
+      const watch = watchBusyAlerts(container);
+      fireEvent.click(await screen.findByRole('button', { name: 'Refetch gemini' }));
+      await waitFor(() => expect(refresh).toHaveBeenCalled());
+      // Let React commit whatever is pending while the reload is still outstanding.
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 30));
+      });
+      expect(sectionFor('gemini')).toHaveAttribute('aria-busy', 'true');
+      expect(within(sectionFor('gemini')).queryByRole('alert')).not.toBeInTheDocument();
+
+      resolveReload(CATALOG);
+      const alert = await within(sectionFor('gemini')).findByRole('alert');
+      expect(alert).toHaveTextContent('gemini: no live model-list endpoint');
+      // The moment the alert is in the DOM, its section is no longer busy.
+      expect(sectionFor('gemini')).not.toHaveAttribute('aria-busy', 'true');
+      watch.stop();
+      expect(watch.seen).toEqual([]);
+    });
+
+    it('does not insert the alert while its section is still aria-busy (thrown refresh)', async () => {
+      vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+      vi.spyOn(api, 'refreshModels').mockRejectedValue(
+        new ApiError(400, 'bad request', '{"error":"unknown provider \'nope\'"}'),
+      );
+      const { container } = render(<ModelsTab />);
+      const watch = watchBusyAlerts(container);
+      fireEvent.click(await screen.findByRole('button', { name: 'Refetch anthropic' }));
+      const alert = await within(sectionFor('anthropic')).findByRole('alert');
+      expect(alert).toHaveTextContent("unknown provider 'nope'");
+      expect(sectionFor('anthropic')).not.toHaveAttribute('aria-busy', 'true');
+      watch.stop();
+      expect(watch.seen).toEqual([]);
     });
   });
 

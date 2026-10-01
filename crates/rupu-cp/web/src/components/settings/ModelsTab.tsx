@@ -72,25 +72,35 @@ export function ModelsTab() {
 
   const refetch = async (provider?: string) => {
     setBusy(provider ?? '*');
+    // A failed Refetch all's banner is about that attempt; starting another
+    // refetch retires it (nothing else clears it — it isn't a load error).
     setRefreshError(null);
+    // The inline provider errors this refetch produced. They are applied in the
+    // `finally`, in the same React batch that clears `busy`, so an alert is
+    // never inserted into a section that is still aria-busy="true" (assistive
+    // tech may not announce an alert added to a busy region).
+    let applyErrors: ((prev: Record<string, string>) => Record<string, string>) | null = null;
     try {
       const outcomes = await api.refreshModels(provider);
-      setErrors((prev) => {
+      applyErrors = (prev) => {
         const next = { ...prev };
         for (const o of outcomes) {
           if (o.ok) delete next[o.provider];
           else next[o.provider] = o.error ?? 'refresh failed';
         }
         return next;
-      });
+      };
       await load();
     } catch (e) {
       // A single-provider refetch that throws (400 unknown provider, 500,
       // network) lands inline under that provider (spec §8.3); only a thrown
       // Refetch all falls back to the page-level banner.
-      if (provider) setErrors((prev) => ({ ...prev, [provider]: apiErrorMessage(e) }));
-      else setRefreshError(apiErrorMessage(e));
+      if (provider) {
+        const message = apiErrorMessage(e);
+        applyErrors = (prev) => ({ ...prev, [provider]: message });
+      } else setRefreshError(apiErrorMessage(e));
     } finally {
+      if (applyErrors) setErrors(applyErrors);
       setBusy(null);
     }
   };
