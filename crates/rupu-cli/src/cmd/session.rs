@@ -10758,6 +10758,93 @@ mod tests {
         );
     }
 
+    /// The run-start `model_limits` notice message from a turn's transcript.
+    fn model_limits_notice(transcript: &Path) -> String {
+        let notices: Vec<String> = JsonlReader::iter(transcript)
+            .expect("open turn transcript")
+            .filter_map(Result::ok)
+            .filter_map(|e| match e {
+                TranscriptEvent::Notice { kind, message } if kind == "model_limits" => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "exactly one model_limits notice per run");
+        notices.into_iter().next().unwrap()
+    }
+
+    /// Spec 2026-09-30 §6.5: limits stored on the session record are REUSED by
+    /// later turns, never re-resolved mid-session. The stored value
+    /// (`fixed(123_456, 7_890)`, no pins) must reach the turn's run — visible in
+    /// its `model_limits` notice — even though re-resolving against the mock
+    /// provider would yield "input unknown … exposes no model limits". The
+    /// control session (no stored limits) proves the assertion discriminates:
+    /// it resolves on its first turn and persists the result.
+    #[tokio::test]
+    async fn stored_session_limits_are_reused_not_re_resolved() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+
+        let (global, mut stored) = idle_dense_session(&tmp, "ses_limits_reuse1");
+        let (_, mut control) = idle_dense_session(&tmp, "ses_limits_ctrl01");
+        for r in [&mut stored, &mut control] {
+            // No agent pins: only the stored/resolved limits can speak.
+            r.message_history = Vec::new();
+            r.compact_at_percent = None;
+            r.context_window_tokens = None;
+            r.max_tokens = None;
+        }
+        stored.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
+            123_456, 7_890,
+        ));
+        control.model_limits = None;
+        write_session(&global, SessionScope::Active, &stored).expect("write stored session");
+        write_session(&global, SessionScope::Active, &control).expect("write control session");
+
+        for (rec, run_id) in [(&stored, "run_limits_reuse"), (&control, "run_limits_ctrl")] {
+            with_mock_home(
+                &global,
+                r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+                run_turn(RunTurnArgs {
+                    session_id: rec.session_id.clone(),
+                    run_id: run_id.into(),
+                    prompt: "go".into(),
+                }),
+            )
+            .await
+            .expect("turn completes");
+        }
+
+        let stored_notice =
+            model_limits_notice(&stored.transcripts_dir.join("run_limits_reuse.jsonl"));
+        assert!(
+            stored_notice.contains("input 123,456 · output 7,890"),
+            "the stored limits must be reused verbatim: {stored_notice}"
+        );
+        assert!(
+            !stored_notice.contains("exposes no model limits"),
+            "a stored session must not re-resolve against the provider: {stored_notice}"
+        );
+        let (after, _) = read_session(&global, &stored.session_id).expect("read stored");
+        let kept = after.model_limits.expect("stored limits survive the turn");
+        assert_eq!(kept.input.tokens, Some(123_456));
+        assert_eq!(kept.output.tokens, Some(7_890));
+
+        let control_notice =
+            model_limits_notice(&control.transcripts_dir.join("run_limits_ctrl.jsonl"));
+        assert!(
+            control_notice.contains("input unknown")
+                && control_notice.contains("exposes no model limits"),
+            "a session with no stored limits resolves on its first turn: {control_notice}"
+        );
+        let (after, _) = read_session(&global, &control.session_id).expect("read control");
+        assert!(
+            after.model_limits.is_some(),
+            "the first turn's resolution is persisted for later turns"
+        );
+    }
+
     /// A turn's cached tokens come from its `RunResult` — the summed
     /// provider-reported figure — not the worker's streaming snapshot
     /// (which a non-streaming or snapshot-less provider never fills).

@@ -1242,9 +1242,31 @@ steps:
     actions: []
 "#;
 
+    /// A limits context for tests that build a step through the REAL factory.
+    ///
+    /// These agents pin no provider, so they fall back to `anthropic`; on a
+    /// machine with a stored (or env) Anthropic credential the provider build
+    /// SUCCEEDS and limit discovery (spec 2026-09-30 §6.1) would then run a
+    /// live `GET /v1/models` with that credential. Seeding a FRESH (empty) v2
+    /// model-list cache for the fallback provider makes `resolve` read the
+    /// cache and never fetch, whatever credentials the machine has — no env
+    /// mutation needed. (Fresh = `fetched_at` now, inside the 1h TTL.)
+    fn hermetic_limits_ctx(global: &std::path::Path) -> rupu_runtime::model_limits::LimitsContext {
+        let cache_dir = global.join("cache/models");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("anthropic.json"),
+            format!(
+                r#"{{"schema":2,"fetched_at":"{}","models":[]}}"#,
+                chrono::Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+        rupu_runtime::model_limits::LimitsContext::for_cache_dir(cache_dir)
+    }
+
     fn factory(global: std::path::PathBuf) -> DefaultStepFactory {
-        let limits_ctx =
-            rupu_runtime::model_limits::LimitsContext::for_cache_dir(global.join("cache/models"));
+        let limits_ctx = hermetic_limits_ctx(&global);
         DefaultStepFactory {
             workflow: Workflow::parse(WF).expect("workflow must parse"),
             global,
@@ -1853,9 +1875,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
-            limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
-                tmp.path().join("cache/models"),
-            ),
+            limits_ctx: hermetic_limits_ctx(tmp.path()),
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -1911,9 +1931,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
-            limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
-                tmp.path().join("cache/models"),
-            ),
+            limits_ctx: hermetic_limits_ctx(tmp.path()),
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -1993,9 +2011,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
-            limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
-                tmp.path().join("cache/models"),
-            ),
+            limits_ctx: hermetic_limits_ctx(tmp.path()),
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
