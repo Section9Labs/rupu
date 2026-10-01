@@ -1,0 +1,23 @@
+---
+source: crates/rupu-cli/src/output/live_view/structure.rs
+expression: s
+---
+  ✓  s01  scanner ···· ✓ 1s
+  │
+  ✓  s02  scanner ···· ✓ 1s
+  │
+  ◈  recon  split ···· ✓ 2s
+  ╭─ hunt
+  ╰─ probe
+  │
+▸ ├─╭─ ⊞ hunt  for_each · runtime fan-out · filter: failed ···· ◐ running
+  │ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26
+▸ │ ✗├─ svc-7  otter#8 · anthropic/claude-opus-5-5 ···· ✗ failed
+  │ ✗├─ svc-31  otter#32 · anthropic/claude-opus-5-5 ···· ✗ failed
+  │ ◄─╰─
+  │
+  ✓  probe  prober ···· ✓ 5s
+  │
+  ◈◄─ gather  join · wait:all
+  │
+  ○  report  reporter
