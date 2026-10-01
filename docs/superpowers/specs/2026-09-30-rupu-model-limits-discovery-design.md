@@ -85,7 +85,7 @@ pub async fn refresh(
     resolver: Arc<dyn CredentialResolver>,
     provider: Option<&str>,
     fetch_timeout: Duration,                  // FETCH_TIMEOUT (10s) outside tests
-) -> Result<Vec<RefreshOutcome>, UnknownProvider>;
+) -> Result<RefreshReport, UnknownProvider>;  // { outcomes, unfinished: Vec<JoinHandle<_>> }
 pub async fn resolve(
     overrides: LimitOverrides,   // spec.context_window_tokens / max_tokens / compact_at_percent
     provider_name: &str,
@@ -238,7 +238,7 @@ pub trait ModelCatalog: Send + Sync {
 - **`POST /api/models/refresh`**, body `{ provider?: string }`, returns `[{ provider, ok, count, error? }]`.
   - It uses the same auth as the other CP mutation endpoints.
   - It's synchronous: providers are fetched in parallel, each with the 10s timeout. So a 200 means refreshed, unlike run mutations, where a 200 only means recorded.
-  - Each provider's job is a spawned task and the timeout bounds only the wait: a job that outlives it is reported as `timed out after 10s` but is not cancelled, so an OAuth/SSO token refresh in flight still persists its rotated token.
+  - Each provider's job is a spawned task and the timeout bounds only the wait: a job that outlives it is reported as `timed out after 10s` but is not cancelled, so an OAuth/SSO token refresh in flight still persists its rotated token. Its `JoinHandle` comes back in `RefreshReport.unfinished`: `cp serve` drops it (the task finishes detached), while the one-shot `rupu models refresh` prints `rupu: waiting for N provider job(s) to finish…` and awaits them for up to 30s, because its runtime's shutdown on exit would otherwise cancel them.
   - One provider failing doesn't fail the others.
 
 ### 8.3 CP web — Settings → Models tab

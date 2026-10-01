@@ -40,6 +40,9 @@ impl ModelCatalog for RuntimeModelCatalog {
             rupu_runtime::model_limits::FETCH_TIMEOUT,
         )
         .await
+        // `cp serve` keeps running: a job that outlived its wait finishes
+        // detached (dropping a `JoinHandle` never aborts the task).
+        .map(|report| report.outcomes)
         .map_err(ModelCatalogError::from)
     }
 }

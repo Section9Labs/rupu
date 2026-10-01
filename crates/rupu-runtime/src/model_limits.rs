@@ -396,18 +396,28 @@ pub struct RefreshOutcome {
     pub error: Option<String>,
 }
 
+/// What [`refresh`] produced.
+#[derive(Debug)]
+pub struct RefreshReport {
+    /// One per targeted provider, in target order. A job still running when
+    /// its wait timed out is reported as `timed out after …`.
+    pub outcomes: Vec<RefreshOutcome>,
+    /// Those still-running jobs. They are never aborted: one may be mid-way
+    /// through an OAuth/SSO token refresh whose rotated token must still be
+    /// persisted. A long-lived caller (`cp serve`) drops them and they finish
+    /// detached; a one-shot process must await them before it exits, or its
+    /// runtime's shutdown cancels them.
+    pub unfinished: Vec<tokio::task::JoinHandle<RefreshOutcome>>,
+}
+
 /// Refetch live model lists (spec §8). Providers run in parallel, each
 /// bounded by `fetch_timeout` ([`FETCH_TIMEOUT`] outside tests) as a whole
 /// (client build, credential resolution and any token refresh included, not
 /// just the HTTP listing); one failing or hanging never fails the others.
 ///
 /// Each provider's job is its own spawned task, and the timeout bounds only
-/// the WAIT for it: a job that outlives it is reported as timed out but runs
-/// to completion in the background. Cancelling it could abandon an OAuth/SSO
-/// token refresh after the provider already rotated the refresh token,
-/// before the new one was persisted. (A one-shot `rupu models refresh`
-/// process still ends any such job when it exits; the long-lived `cp serve`
-/// lets it finish.)
+/// the WAIT for it: a job that outlives it is reported as timed out, keeps
+/// running, and comes back in [`RefreshReport::unfinished`].
 pub async fn refresh(
     cfg: &rupu_config::Config,
     cache_dir: &Path,
@@ -415,11 +425,11 @@ pub async fn refresh(
     resolver: Arc<dyn rupu_auth::CredentialResolver>,
     only: Option<&str>,
     fetch_timeout: Duration,
-) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
+) -> Result<RefreshReport, UnknownProvider> {
     let names = resolve_targets(only, cfg, cfg_path)?;
     let cfg = Arc::new(cfg.clone());
     let jobs = names.into_iter().map(|name| {
-        let job = tokio::spawn({
+        let mut job = tokio::spawn({
             let (name, cfg, resolver) = (name.clone(), Arc::clone(&cfg), Arc::clone(&resolver));
             let cache_dir = cache_dir.to_path_buf();
             async move { refresh_one(&name, &cfg, resolver.as_ref(), &cache_dir).await }
@@ -431,15 +441,25 @@ pub async fn refresh(
                 count: 0,
                 error: Some(error),
             };
-            match tokio::time::timeout(fetch_timeout, job).await {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(e)) => fail(format!("refresh task failed: {e}")),
-                // Dropping a `JoinHandle` detaches the task; it is not aborted.
-                Err(_) => fail(format!("timed out after {}", fmt_timeout(fetch_timeout))),
+            match tokio::time::timeout(fetch_timeout, &mut job).await {
+                Ok(Ok(outcome)) => (outcome, None),
+                Ok(Err(e)) => (fail(format!("refresh task failed: {e}")), None),
+                // Still running: hand the job back, never abort it.
+                Err(_) => (
+                    fail(format!("timed out after {}", fmt_timeout(fetch_timeout))),
+                    Some(job),
+                ),
             }
         }
     });
-    Ok(futures_util::future::join_all(jobs).await)
+    let (outcomes, unfinished): (Vec<_>, Vec<_>) = futures_util::future::join_all(jobs)
+        .await
+        .into_iter()
+        .unzip();
+    Ok(RefreshReport {
+        outcomes,
+        unfinished: unfinished.into_iter().flatten().collect(),
+    })
 }
 
 /// One provider's refresh: build the client, fetch, write the cache. The

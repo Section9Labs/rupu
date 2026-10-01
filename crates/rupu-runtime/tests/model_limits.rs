@@ -379,6 +379,18 @@ async fn refresh_with_timeout(
     only: Option<&str>,
     fetch_timeout: std::time::Duration,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
+    Ok(refresh_report(cfg, tmp, resolver, only, fetch_timeout)
+        .await?
+        .outcomes)
+}
+
+async fn refresh_report(
+    cfg: &rupu_config::Config,
+    tmp: &tempfile::TempDir,
+    resolver: Arc<dyn rupu_auth::CredentialResolver>,
+    only: Option<&str>,
+    fetch_timeout: std::time::Duration,
+) -> Result<rupu_runtime::model_limits::RefreshReport, UnknownProvider> {
     rupu_runtime::model_limits::refresh(
         cfg,
         &cache_of(tmp),
@@ -967,10 +979,11 @@ async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
 
 /// A provider job that outlives the refresh timeout is reported as timed out
 /// but NOT cancelled: it may be mid-way through an OAuth token refresh whose
-/// rotated token must still be persisted. It finishes in the background —
-/// observable here as the cache file it writes after the call returned.
+/// rotated token must still be persisted. Its handle comes back in
+/// `unfinished`, so a one-shot caller (the CLI, whose runtime would cancel
+/// it on exit) can wait for it; awaiting it completes its cache write.
 #[tokio::test]
-async fn a_timed_out_refresh_job_still_finishes_in_the_background() {
+async fn a_timed_out_refresh_job_comes_back_unfinished_and_completes() {
     use httpmock::prelude::*;
     let server = MockServer::start();
     server.mock(|when, then| {
@@ -983,7 +996,7 @@ async fn a_timed_out_refresh_job_still_finishes_in_the_background() {
     });
     let tmp = tempfile::tempdir().unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
-    let out = refresh_with_timeout(
+    let mut report = refresh_report(
         &cfg,
         &tmp,
         Arc::new(AnyKey),
@@ -992,19 +1005,53 @@ async fn a_timed_out_refresh_job_still_finishes_in_the_background() {
     )
     .await
     .unwrap();
-    assert!(!out[0].ok);
-    assert_eq!(out[0].error.as_deref(), Some("timed out after 100ms"));
+    assert!(!report.outcomes[0].ok);
+    assert_eq!(
+        report.outcomes[0].error.as_deref(),
+        Some("timed out after 100ms")
+    );
     let cache_file = cache_of(&tmp).join("oracle.json");
     assert!(
         !cache_file.exists(),
         "not written yet when the call returns"
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !cache_file.exists() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let body = std::fs::read_to_string(&cache_file).expect("the job finished and wrote its cache");
+    assert_eq!(report.unfinished.len(), 1, "the still-running job");
+    let late = report
+        .unfinished
+        .pop()
+        .unwrap()
+        .await
+        .expect("the job ran to completion");
+    assert!(late.ok, "{late:?}");
+    assert_eq!(late.provider, "oracle");
+    let body = std::fs::read_to_string(&cache_file).expect("the job wrote its cache");
     assert!(body.contains("base-model"), "{body}");
+}
+
+/// A job that finishes in time leaves nothing unfinished.
+#[tokio::test]
+async fn a_refresh_that_finishes_in_time_leaves_nothing_unfinished() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200).json_body(serde_json::json!({
+            "data": [{ "id": "base-model", "max_model_len": 4096 }]
+        }));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = oracle_cfg(format!("{}/v1", server.url("")));
+    let report = refresh_report(
+        &cfg,
+        &tmp,
+        Arc::new(AnyKey),
+        Some("oracle"),
+        rupu_runtime::model_limits::FETCH_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(report.outcomes[0].ok);
+    assert!(report.unfinished.is_empty());
 }
 
 /// A credential store with nothing in it.

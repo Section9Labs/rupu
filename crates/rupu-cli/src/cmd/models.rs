@@ -234,7 +234,7 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
     // be read but never refreshed on near-expiry (the defect
     // `crate::accounts::account_specs` exists to prevent).
     let resolver = std::sync::Arc::new(crate::accounts::resolver_for(&cfg));
-    let outcomes = rupu_runtime::model_limits::refresh(
+    let report = rupu_runtime::model_limits::refresh(
         &cfg,
         &rupu_runtime::model_limits::cache_dir(&global),
         &global_config_path()?,
@@ -243,11 +243,30 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
         rupu_runtime::model_limits::FETCH_TIMEOUT,
     )
     .await?;
-    let (lines, any_refreshed) = refresh_report(outcomes);
+    let (lines, any_refreshed) = refresh_report(report.outcomes);
     for line in lines {
         match line {
             ReportLine::Out(l) => println!("{l}"),
             ReportLine::Err(l) => eprintln!("{l}"),
+        }
+    }
+    // A timed-out provider job is still running — possibly mid-way through
+    // an OAuth token refresh whose rotated token must be persisted. This
+    // process's runtime would cancel it on exit, so give it time to finish.
+    if !report.unfinished.is_empty() {
+        eprintln!(
+            "rupu: waiting for {} provider job(s) to finish…",
+            report.unfinished.len()
+        );
+        let all = futures_util::future::join_all(report.unfinished);
+        if tokio::time::timeout(UNFINISHED_JOB_WAIT, all)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "rupu: gave up waiting after {}s",
+                UNFINISHED_JOB_WAIT.as_secs()
+            );
         }
     }
     if !any_refreshed {
@@ -255,6 +274,10 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// How long `rupu models refresh` waits, before exiting, for provider jobs
+/// that outlived the listing timeout.
+const UNFINISHED_JOB_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One printed line of a `rupu models refresh` report.
 #[derive(Debug, PartialEq, Eq)]
