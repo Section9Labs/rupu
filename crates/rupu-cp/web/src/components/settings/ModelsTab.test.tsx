@@ -109,6 +109,32 @@ describe('ModelsTab', () => {
     expect(within(row).getAllByText('—')).toHaveLength(2);
   });
 
+  it('gives a long model id a full-id title tooltip on its truncating cell', async () => {
+    const longId = 'claude-demo-with-an-extremely-long-model-identifier-2026-09-30-preview-extended-context';
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue([
+      {
+        provider: 'anthropic',
+        fetched_at: new Date().toISOString(),
+        stale: false,
+        models: [{ id: longId, input_tokens: 1_000_000, output_tokens: 128_000, source: 'live' }],
+      },
+    ]);
+    render(<ModelsTab />);
+    const idCell = (await screen.findByText(longId)).closest('td') as HTMLElement;
+    expect(within(idCell).getByTitle(longId)).toHaveAttribute('title', longId);
+  });
+
+  it('shrinks the numeric and source columns to their content', async () => {
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    render(<ModelsTab />);
+    const row = (await screen.findByText('claude-demo-1')).closest('tr') as HTMLElement;
+    for (const text of ['1,000,000', '128,000', 'live']) {
+      expect(within(row).getByText(text).closest('td')).toHaveClass('w-[1%]', 'whitespace-nowrap');
+    }
+    // The model column is the one flexible column.
+    expect(within(row).getByText('claude-demo-1').closest('td')).not.toHaveClass('whitespace-nowrap');
+  });
+
   it('disables every Refetch button while a refetch is in flight', async () => {
     vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
     let resolveRefresh: (o: RefreshOutcome[]) => void = () => {};

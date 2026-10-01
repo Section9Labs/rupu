@@ -13,10 +13,19 @@ import { EmptyTabState } from '../ConfigEditor';
 const fmt = (n: number | null) => (n == null ? '—' : n.toLocaleString('en-US'));
 
 const COLUMNS: Column<CatalogModel>[] = [
-  { key: 'id', header: 'Model', subject: true, sortable: true, sortValue: (m) => m.id, render: (m) => <span className="font-mono">{m.id}</span> },
-  { key: 'input', header: 'Input limit', align: 'right', sortable: true, sortValue: (m) => m.input_tokens, render: (m) => fmt(m.input_tokens) },
-  { key: 'output', header: 'Output cap', align: 'right', sortable: true, sortValue: (m) => m.output_tokens, render: (m) => fmt(m.output_tokens) },
-  { key: 'source', header: 'Source', render: (m) => m.source },
+  {
+    key: 'id',
+    header: 'Model',
+    subject: true,
+    sortable: true,
+    sortValue: (m) => m.id,
+    // The subject column truncates; the tooltip is how a long id stays readable.
+    titleValue: (m) => m.id,
+    render: (m) => <span className="font-mono">{m.id}</span>,
+  },
+  { key: 'input', header: 'Input limit', align: 'right', fit: true, sortable: true, sortValue: (m) => m.input_tokens, render: (m) => fmt(m.input_tokens) },
+  { key: 'output', header: 'Output cap', align: 'right', fit: true, sortable: true, sortValue: (m) => m.output_tokens, render: (m) => fmt(m.output_tokens) },
+  { key: 'source', header: 'Source', fit: true, render: (m) => m.source },
 ];
 
 export function ModelsTab() {
