@@ -1498,13 +1498,14 @@ impl RunStore {
     ///
     /// The wait blocks the calling thread (a polled non-blocking flock with
     /// a short sleep), so the methods that take it (`cancel`, `pause`,
-    /// `reap_if_orphaned`, `expire_if_overdue`, `approve_gate`,
-    /// `reject_gate`, `request_resume_approval`, `claim_resume`,
-    /// `clear_resume`, `clear_reject_cleanup`, `update_unless_cancelled`,
-    /// `modify_unless_cancelled`, `modify_if_status`) are called from an
-    /// async context through [`RunStore::blocking`], never directly on a
-    /// runtime worker. Not re-entrant: a holder calls the `_locked`
-    /// variants, never a method that takes it again.
+    /// `reap_if_orphaned`, `expire_if_overdue`, `expire_gate_if_overdue`,
+    /// `approve_gate`, `reject_gate`, `request_resume_approval`,
+    /// `claim_resume`, `clear_resume`, `clear_reject_cleanup`,
+    /// `update_unless_cancelled`, `modify_unless_cancelled`,
+    /// `modify_if_status`, `modify_fields`) are called from an async
+    /// context through [`RunStore::blocking`], never directly on a runtime
+    /// worker. Not re-entrant: a holder calls the `_locked` variants, never
+    /// a method that takes it again.
     fn lock_run_json(&self, run_id: &str) -> Option<File> {
         if !self.run_dir(run_id).is_dir() {
             return None;
@@ -1609,6 +1610,30 @@ impl RunStore {
         modify(&mut record);
         self.update(&record)?;
         Ok(Ok(record))
+    }
+
+    /// Load → `modify` → write `run.json` under the run lock, whatever the
+    /// run's status: for the fields no status transition owns and every
+    /// status carries — the portable-run metadata written after a workflow
+    /// run (backend, worker, wake, manifest path), which a run cancelled or
+    /// failed meanwhile needs as much as a completed one (`source_wake_id`
+    /// is what labels its trigger). `modify` touches only such fields,
+    /// never the status, the terminal fields or the gate set, so a cancel
+    /// (or any other write) that landed since the caller's last look is
+    /// kept exactly as it is; it returns whether the record is to be
+    /// written. Returns the record after `modify`. The wait blocks its
+    /// thread: async callers go through [`RunStore::blocking`].
+    pub fn modify_fields(
+        &self,
+        run_id: &str,
+        modify: impl FnOnce(&mut RunRecord) -> bool,
+    ) -> Result<RunRecord, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if modify(&mut record) {
+            self.update(&record)?;
+        }
+        Ok(record)
     }
 
     /// Run `f` with a handle to this store on the blocking pool — for the
@@ -6226,6 +6251,72 @@ mod tests {
 
         assert!(matches!(
             store.modify_if_status("run_missing", RunStatus::Paused, |_| {}),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// `modify_fields` writes its fields onto the record whatever its
+    /// status — here a cancel that landed under the run lock while the
+    /// writer waited for it: the cancel's status, message and terminal time
+    /// stay exactly as written, and the fields land next to them. `false`
+    /// from `modify` writes nothing.
+    #[test]
+    fn modify_fields_writes_onto_a_cancel_that_landed_under_the_run_lock() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_fields_vs_cancel");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let mut cancelled = rec.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        cancelled.finished_at = Some(Utc::now());
+        let holder = another_process_writes_under_the_lock(
+            tmp.path().to_path_buf(),
+            cancelled.clone(),
+            std::time::Duration::from_millis(200),
+        );
+        let started = std::time::Instant::now();
+        let written = store
+            .modify_fields(&rec.id, |r| {
+                r.source_wake_id = Some("wake_1".into());
+                r.backend_id = Some("local_worktree".into());
+                true
+            })
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the cancel holding the lock ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(
+            written.status,
+            RunStatus::Cancelled,
+            "modified the cancelled record"
+        );
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Cancelled);
+        assert_eq!(on_disk.error_message.as_deref(), Some("stop it"));
+        assert_eq!(on_disk.finished_at, cancelled.finished_at);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_1"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+
+        let before = std::fs::read(store.run_json(&rec.id)).unwrap();
+        let untouched = store
+            .modify_fields(&rec.id, |r| {
+                r.worker_id = Some("not written".into());
+                false
+            })
+            .unwrap();
+        assert_eq!(untouched.worker_id.as_deref(), Some("not written"));
+        assert_eq!(
+            std::fs::read(store.run_json(&rec.id)).unwrap(),
+            before,
+            "`false`: nothing written"
+        );
+        assert!(matches!(
+            store.modify_fields("run_missing", |_| true),
             Err(RunStoreError::NotFound(_))
         ));
     }

@@ -4846,10 +4846,13 @@ async fn persist_portable_run_metadata(
     };
     let manifest = build_artifact_manifest(run_store, &run, prepared)?;
     let manifest_path = run_store.write_artifact_manifest(&prepared.run_id, &manifest)?;
-    // Under the run lock, on the blocking pool, touching only these fields
-    // on the record as it is now: a cancel that landed since the load is
-    // left alone, and the result then reports the status the disk holds.
-    let written = {
+    // Under the run lock, on the blocking pool, onto the record as it is
+    // now whatever its status: these four fields belong to no status
+    // transition (`source_wake_id` is what labels the run's trigger in
+    // `rupu workflow runs` and the CP), so a run cancelled or failed
+    // meanwhile gets them too and keeps its cancel — only these fields are
+    // touched. The result then reports the status the disk holds.
+    let run = {
         let (id, backend_id, worker_id, wake, path) = (
             prepared.run_id.clone(),
             prepared.backend_id.clone(),
@@ -4859,7 +4862,7 @@ async fn persist_portable_run_metadata(
         );
         run_store
             .blocking(move |s| {
-                s.modify_unless_cancelled(&id, |run| {
+                s.modify_fields(&id, |run| {
                     run.backend_id = Some(backend_id);
                     run.worker_id = worker_id;
                     run.source_wake_id = wake;
@@ -4868,10 +4871,6 @@ async fn persist_portable_run_metadata(
                 })
             })
             .await?
-    };
-    let run = match written {
-        Some(run) => run,
-        None => run_store.load(&prepared.run_id)?,
     };
 
     let result = RunResult {
@@ -5422,22 +5421,45 @@ async fn execute_workflow_invocation(
         }
     }
 
-    let workflow_result = run_outcome?;
-
-    let artifact_manifest_path = persist_portable_run_metadata(
+    finish_invocation(
         run_store_for_resume.as_ref(),
         &prepared_run,
         run_envelope.trigger.wake_id.as_deref(),
+        run_outcome,
     )
-    .await?
-    .map(|(path, _)| path);
+    .await
+}
+
+/// `execute_workflow_invocation`'s last step, run whatever the run
+/// returned: the portable metadata (backend, worker, wake, manifest path)
+/// is persisted first — a run cancelled or failed mid-way carries it too;
+/// `source_wake_id` is what labels its trigger — and the run's own error,
+/// if any, is what the caller gets: a metadata failure on that path is
+/// logged, never masks it.
+async fn finish_invocation(
+    run_store: &rupu_orchestrator::RunStore,
+    prepared: &PreparedRun,
+    source_wake_id: Option<&str>,
+    run_outcome: anyhow::Result<OrchestratorRunResult>,
+) -> anyhow::Result<RunOutcomeSummary> {
+    let persisted = persist_portable_run_metadata(run_store, prepared, source_wake_id).await;
+    let workflow_result = match run_outcome {
+        Ok(result) => result,
+        Err(e) => {
+            if let Err(pe) = persisted {
+                tracing::warn!(run_id = %prepared.run_id, error = %pe, "portable run metadata not persisted after the run's error");
+            }
+            return Err(e);
+        }
+    };
+    let artifact_manifest_path = persisted?.map(|(path, _)| path);
 
     Ok(RunOutcomeSummary {
         run_id: workflow_result.run_id,
         awaiting_step_id: workflow_result.awaiting.map(|a| a.step_id),
         artifact_manifest_path,
-        backend_id: Some(prepared_run.backend_id.clone()),
-        worker_id: prepared_run.worker_id.clone(),
+        backend_id: Some(prepared.backend_id.clone()),
+        worker_id: prepared.worker_id.clone(),
     })
 }
 
@@ -5832,6 +5854,99 @@ mod tests {
             loop_progress: Default::default(),
             codename: None,
         }
+    }
+
+    fn prepared_for(rec: &RunRecord) -> PreparedRun {
+        PreparedRun {
+            version: PreparedRun::VERSION,
+            run_id: rec.id.clone(),
+            backend_id: "local_worktree".into(),
+            workspace_path: rec.workspace_path.clone(),
+            project_root: None,
+            repo_ref: None,
+            issue_ref: None,
+            workspace_strategy: None,
+            worker_id: Some("worker-1".into()),
+        }
+    }
+
+    /// A cancelled run in a store of its own: status, message and terminal
+    /// time set, as a cancel writes them.
+    fn cancelled_run_in(tmp: &std::path::Path) -> (rupu_orchestrator::RunStore, RunRecord) {
+        let store = rupu_orchestrator::RunStore::new(tmp.join("runs"));
+        let mut rec = sample_run_record(RunStatus::Cancelled, None);
+        rec.error_message = Some("cancelled by operator".into());
+        rec.finished_at = Some(Utc::now());
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
+        (store, rec)
+    }
+
+    /// The portable metadata lands on a cancelled run too — `source_wake_id`
+    /// is what labels its trigger in `rupu workflow runs` and the CP — and
+    /// the cancel is kept: only those four fields are touched, and the
+    /// result reports the cancel.
+    #[tokio::test]
+    async fn portable_metadata_lands_on_a_cancelled_run_and_keeps_the_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, rec) = cancelled_run_in(tmp.path());
+        let (path, result) =
+            persist_portable_run_metadata(&store, &prepared_for(&rec), Some("wake_42"))
+                .await
+                .unwrap()
+                .expect("the run exists");
+        assert!(path.is_file(), "the manifest was written");
+        assert_eq!(
+            result.status,
+            RunResultStatus::Failed,
+            "a cancel reports as failed"
+        );
+        assert_eq!(result.source_wake_id.as_deref(), Some("wake_42"));
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Cancelled);
+        assert_eq!(
+            on_disk.error_message.as_deref(),
+            Some("cancelled by operator")
+        );
+        assert_eq!(on_disk.finished_at, rec.finished_at);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_42"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+        assert_eq!(on_disk.worker_id.as_deref(), Some("worker-1"));
+        assert_eq!(
+            on_disk.artifact_manifest_path.as_deref(),
+            Some(path.as_path())
+        );
+    }
+
+    /// A run that ended in an error — here cancelled mid-run — still gets
+    /// its portable metadata: the invocation persists it before it returns
+    /// the error, and the caller still gets the run's error.
+    #[tokio::test]
+    async fn the_invocation_persists_the_metadata_on_the_error_path_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, rec) = cancelled_run_in(tmp.path());
+        let err = finish_invocation(
+            &store,
+            &prepared_for(&rec),
+            Some("wake_42"),
+            Err(RunWorkflowError::RunCancelled { aborted: 0 }.into()),
+        )
+        .await
+        .expect_err("the run's error is the caller's");
+        assert!(
+            run_was_cancelled(&err),
+            "the cancel, not a metadata error: {err:#}"
+        );
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Cancelled);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_42"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+        assert_eq!(on_disk.worker_id.as_deref(), Some("worker-1"));
+        assert!(
+            on_disk.artifact_manifest_path.is_some_and(|p| p.is_file()),
+            "the manifest was written and recorded"
+        );
     }
 
     #[test]
