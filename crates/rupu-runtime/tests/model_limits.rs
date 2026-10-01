@@ -249,6 +249,74 @@ fn provider_names_and_targets() {
     assert!(err.to_string().contains("unknown provider 'nope'"));
 }
 
+fn declared_account(kind: &str) -> rupu_config::ProviderConfig {
+    rupu_config::ProviderConfig {
+        kind: Some(kind.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn provider_names_appends_declared_accounts_after_the_builtins() {
+    let mut cfg = rupu_config::Config::default();
+    for (name, p) in [
+        ("anthropic-work", declared_account("anthropic")),
+        (
+            "oracle",
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://127.0.0.1:9".into()),
+                ..Default::default()
+            },
+        ),
+        // Declared but not dispatchable by the LLM factory — excluded.
+        ("gh-work", declared_account("github")),
+        // A builtin that also has a config section must not be listed twice.
+        ("anthropic", rupu_config::ProviderConfig::default()),
+    ] {
+        cfg.providers.insert(name.to_string(), p);
+    }
+    assert_eq!(
+        rupu_runtime::model_limits::provider_names(&cfg),
+        vec![
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "gemini".to_string(),
+            "copilot".to_string(),
+            "anthropic-work".to_string(),
+            "oracle".to_string(),
+        ]
+    );
+}
+
+/// The silent-success defect: an unresolvable name must be an Err (which the
+/// CLI turns into a non-zero exit), not an empty target list that loops zero
+/// times and reports nothing.
+#[test]
+fn an_unresolvable_name_is_an_error_naming_both_remedies() {
+    let cfg = rupu_config::Config::default();
+    let err = rupu_runtime::model_limits::resolve_targets(
+        Some("anthropc"),
+        &cfg,
+        std::path::Path::new("/tmp/config.toml"),
+    )
+    .expect_err("a typo must not resolve");
+    let msg = err.to_string();
+    assert!(msg.contains("anthropc"), "names what it tried: {msg}");
+    assert!(
+        msg.contains("rupu auth login"),
+        "remedy 1 — declare the account: {msg}"
+    );
+    assert!(
+        msg.contains("openai-compatible"),
+        "remedy 2 — declare an endpoint: {msg}"
+    );
+    assert!(
+        msg.contains("config.toml"),
+        "points at the file to edit: {msg}"
+    );
+}
+
 // ---- refresh + catalog ----------------------------------------------------
 
 /// Hands every account the same API key: `refresh` only needs a credential to

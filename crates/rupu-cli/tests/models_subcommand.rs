@@ -69,6 +69,12 @@ fn models_refresh_named_account_is_not_a_silent_no_op() {
     let home = dir.path();
     write_cfg(home, "[providers.anthropic-work]\nkind = \"anthropic\"\n");
     models_cmd(home)
+        // Hermetic even if the developer's shell exports a real key: the
+        // listing can only reach a closed local port, never the vendor.
+        .env(
+            "RUPU_ANTHROPIC_BASE_URL_OVERRIDE",
+            "http://127.0.0.1:9/v1/messages",
+        )
         .args(["models", "refresh", "--provider", "anthropic-work"])
         .assert()
         .success()
@@ -173,24 +179,116 @@ fn models_list_surfaces_a_declared_openai_compatible_accounts_models() {
         .stdout(predicate::str::contains("custom"));
 }
 
-/// An openai-compatible account has no live model-list endpoint — its models
-/// are whatever config declares. Refreshing it must say so rather than
-/// reporting a successful refresh of nothing.
+/// An openai-compatible account with a vLLM-style `GET /v1/models` endpoint
+/// is refreshable like any other vendor: the listing's `max_model_len` becomes
+/// the model's input limit and is then visible through `models list`.
 #[test]
-fn models_refresh_openai_compatible_account_says_it_has_no_live_endpoint() {
+fn models_refresh_openai_compatible_account_fetches_its_v1_models() {
+    let server = httpmock::MockServer::start();
+    let m = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/models");
+        then.status(200).json_body(serde_json::json!({
+            "data": [{ "id": "box-model", "max_model_len": 65536 }]
+        }));
+    });
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     write_cfg(
         home,
-        "[providers.oracle]\nkind = \"openai-compatible\"\n\
-         base_url = \"http://127.0.0.1:9\"\ndefault_model = \"glm\"\n",
+        &format!(
+            "[providers.boxy]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\n",
+            server.url("")
+        ),
     );
     models_cmd(home)
-        .args(["models", "refresh", "--provider", "oracle"])
+        // An openai-compatible account still authenticates: the factory
+        // resolves a credential before it builds the client.
+        .env("RUPU_BOXY_API_KEY", "sk-boxy-test-key")
+        .args(["models", "refresh", "--provider", "boxy"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("oracle"))
-        .stderr(predicate::str::contains("config"));
+        .stdout(predicate::str::contains("refreshed boxy (1 models)"));
+    m.assert();
+    models_cmd(home)
+        .args(["models", "list", "--provider", "boxy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("65536").and(predicate::str::contains("live")));
+}
+
+/// An openai-compatible account whose endpoint serves no model list (the
+/// vendor is real, the route is not) reports that failure against the
+/// account instead of claiming a refresh of nothing.
+#[test]
+fn models_refresh_openai_compatible_account_reports_a_missing_listing() {
+    let server = httpmock::MockServer::start();
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/models");
+        then.status(404);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_cfg(
+        home,
+        &format!(
+            "[providers.boxy]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\n",
+            server.url("")
+        ),
+    );
+    models_cmd(home)
+        .env("RUPU_BOXY_API_KEY", "sk-boxy-test-key")
+        .args(["models", "refresh", "--provider", "boxy"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("skip boxy"))
+        .stderr(predicate::str::contains("404"));
+}
+
+/// `list` surfaces both limits and when the live list was fetched, even with
+/// nothing cached (the table header is the contract).
+#[test]
+fn models_list_shows_output_and_fetched_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    models_cmd(dir.path())
+        .args(["models", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OUTPUT").and(predicate::str::contains("FETCHED")));
+}
+
+/// The JSON report carries the new fields too (version 2): an absent limit is
+/// `null`, not `0`, and `fetched_at` is only set for rows that came from a
+/// live fetch.
+#[test]
+fn models_list_json_carries_output_and_fetched_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = models_cmd(dir.path())
+        .args([
+            "models",
+            "list",
+            "--provider",
+            "copilot",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["version"], 2);
+    let row = &v["rows"][0];
+    assert!(row.get("output").is_some(), "{row}");
+    assert!(row.get("fetched_at").is_some(), "{row}");
+    assert!(
+        row["output"].is_null(),
+        "baked-in has no known output cap: {row}"
+    );
+    assert!(
+        row["fetched_at"].is_null(),
+        "baked-in rows were never fetched: {row}"
+    );
 }
 
 /// Builtins are untouched by any of this.
@@ -202,6 +300,11 @@ fn models_refresh_builtin_name_still_resolves() {
     // No credentials, so the refresh reports a skip — but it must resolve
     // the name and attempt it, exiting 0 as it always has.
     models_cmd(home)
+        // Same hermetic seam as above: never the real vendor endpoint.
+        .env(
+            "RUPU_ANTHROPIC_BASE_URL_OVERRIDE",
+            "http://127.0.0.1:9/v1/messages",
+        )
         .args(["models", "refresh", "--provider", "anthropic"])
         .assert()
         .success()
