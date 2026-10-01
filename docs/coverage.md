@@ -456,6 +456,136 @@ and the same global-config prefix as the CLI. At most two PDF exports render at
 once in `cp serve` (a Typst compile is CPU- and memory-heavy); further PDF
 requests wait their turn, while Markdown and HTML are never held up.
 
+## Engagement profiles
+
+An engagement profile is a named scope for evidence collection — e.g., `network`, `web`, `binary` — that organizes findings into domains and guides what a completeness checklist should verify. A profile is purely declarative; it declares asset kinds, evidence blocks, classification systems, and a completeness checklist. The agent is not restricted by a profile's declarations — a profile instead validates that findings recorded under it are thorough and well-classified per profile guidelines.
+
+### Selecting an engagement profile
+
+Engagement profiles are selected at three levels (narrowing at each step):
+
+1. **CLI:** `rupu run --engagement-profile <id>` (singular, repeatable) or `--engagement-profiles a,b` (plural, comma-separated)
+2. **Workflow:** `defaults.engagement_profiles: [a, b]` at the workflow level; `engagement_profiles: [a]` per step (can only narrow)
+3. **Agent:** `engagementProfiles: [a, b]` in the agent frontmatter
+
+Precedence (most specific first): step → workflow defaults → agent frontmatter → `code` (native path, no engagement).
+
+A step's `engagement_profiles` can only **narrow** the set inherited from workflow defaults or the agent — naming a profile not present in the parent set has no effect, preventing silent scope elevation.
+
+```yaml
+# Agent
+---
+name: security-scanner
+engagementProfiles: [binary, network]   # agent handles two scopes
+---
+
+# Workflow
+defaults:
+  engagement_profiles: [binary, network]
+steps:
+  - id: binary-audit
+    agent: security-scanner
+    engagement_profiles: [binary]        # narrowed to binary only
+  - id: full-audit
+    agent: security-scanner
+    # inherits [binary, network] from defaults
+
+# CLI
+rupu run security-scanner "audit the repo" --engagement-profiles binary,network
+```
+
+### Per-origin routing
+
+When a finding is recorded with an asset, that asset has a `kind` (e.g., `network:service`, `web:endpoint`, `binary:function`). The finding is validated against the engagement profile that **owns** the asset kind's namespace. For example, a `network:*` asset is owned by the `network` profile, even if the run is also under `web`.
+
+Composite profiles (e.g., `pentest = includes [network, web]`) route findings to the owning profile for validation, allowing one run to gather evidence across multiple domains:
+
+```yaml
+# Custom profile in ~/.rupu/profiles/pentest.toml
+[bundle]
+name = "pentest"
+includes = ["network", "web"]
+
+# Workflow
+defaults:
+  engagement_profiles: [pentest]
+steps:
+  - id: assess
+    agent: pentester
+    # Records both network:service and web:endpoint assets;
+    # each finding is validated per the profile that owns its asset kind
+```
+
+### Assets
+
+When an agent calls `report_finding` or `action: findings.record` with an `asset`, the asset is recorded in `assets.jsonl` under `<workspace>/.rupu/coverage/<target_id>/` (not in the run directory). Assets persist across runs, forming a long-lived inventory tied to the target, not a single run.
+
+An asset input carries:
+
+```yaml
+asset:
+  kind: "network:service"            # e.g., protocol:type, required
+  locator: "192.168.1.1:8080"       # asset identifier (address, endpoint, path, etc.)
+  parent: "asset_id_of_parent"      # optional: hierarchical parent
+  label: "Admin service"             # optional: human name
+```
+
+The `locator` field cannot be filled from step-output templates (`{{ steps.x.output }}`); use literal values only in a workflow's `with:`.
+
+Asset coverage depth (`<RUPU_HOME>/coverage-depth.json`) tracks how thoroughly each asset has been examined (depths like `surface`, `shallow`, `thorough`). The depth is last-write-wins (not monotonic).
+
+### Built-in and custom profiles
+
+**Built-in `binary` profile:** ships with rupu. Covers binary-analysis scopes.
+
+**Custom profiles:** author under:
+
+- `~/.rupu/profiles/<id>.toml` (global)
+- `.rupu/profiles/<id>.toml` (project)
+
+Project profiles shadow global profiles by name.
+
+Profile TOML shape:
+
+```toml
+[bundle]
+name = "network"                        # canonical id
+includes = []                           # composite: include other profiles
+
+[[asset_kinds]]
+kind = "network:service"
+label = "Network service"
+
+[[asset_kinds]]
+kind = "network:endpoint"
+label = "Network endpoint"
+
+[[evidence_blocks]]
+name = "reachability"
+label = "Can the service be reached?"
+
+[[classification_systems]]
+name = "iana-ports"
+label = "IANA registered port classification"
+
+[completeness]
+required_evidence = ["reachability"]
+required_classifications = ["iana-ports"]
+
+[coverage]
+depth_ladder = ["touched", "shallow", "thorough"]
+```
+
+**Important:** profile-level keys (`evidence_blocks`, `classification_systems`, `completeness`, `coverage`) **must come BEFORE the first `[[asset_kinds]]` table in the TOML**, or they will be absorbed into the table and dropped. Group your metadata declarations first, then list asset kinds.
+
+### Known limits
+
+- **Manifest records:** a run `MANIFEST` (used by `rupu coverage rerun`) is only written when the agent has a `concerns:` block. A findings-only engaged run records findings and assets but no manifest; replay is not yet supported for such runs.
+- **Remote/placed runs:** launching an agent on a remote host with `host:` or `distribute:` and specifying `engagement_profiles` is refused with an error (fail-closed). Remote engagement delivery is not yet wired.
+- **Control-plane workflow editor:** the `engagement_profiles` field is not yet exposed in the CP's workflow editor UI (`rupu cp serve`). Author it directly in YAML.
+- **Numeric locators in workflows:** a step's `with.asset.locator` field cannot be filled from step-output templates (`{{ steps.x.output }}`); the same limitation applies to the `report_finding` tool's `asset.locator` parameter.
+- **Coverage depth:** depth is last-write-wins, not monotonic. Recording an asset with depth `thorough` and later with `shallow` leaves it at `shallow`.
+
 ## CLI
 
 All inspection commands take the global `--format table|json|csv` flag
@@ -516,8 +646,9 @@ deterministic; sampling is not.
 
 ## See also
 
-- `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:` and `findingsProfile`)
-- `docs/workflow-format.md` — workflow `findings_profile` (step and `defaults`)
+- `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:`, `findingsProfile`, `engagementProfiles`)
+- `docs/workflow-format.md` — workflow `findings_profile` and `engagement_profiles` (step and `defaults`)
 - `docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md` — the finding report design
+- `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-design.md` — the engagement profiles design
 - `docs/agent-authoring.md` — writing good agents
-- Slice specs/plans under `docs/superpowers/{specs,plans}/` (search `coverage-harness`)
+- Slice specs/plans under `docs/superpowers/{specs,plans}/` (search `coverage-harness` or `engagement`)

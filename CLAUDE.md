@@ -34,6 +34,7 @@
 - Finding reports Plan 1 (contract: model, schema, validator, profiles, artifact store, `rupu findings schema`): `docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-1-contract.md`
 - Finding reports Plan 2 (web UI: `/findings/:id` report page, list triage card, Code-tab tabs, workflow-editor `findings_profile`): `docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-2-web-ui.md`
 - Finding reports Plan 3 (exports: `rupu-findings-report` crate, `rupu findings export`, CP download endpoints + web export dialog): `docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-3-exports.md`
+- Engagement profiles spec + Plan 2 (wiring, shipped): `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-design.md`, `docs/superpowers/plans/2026-09-30-rupu-engagement-profiles-plan-2-wiring.md`; docs in `docs/coverage.md`, `docs/workflow-format.md`, `docs/agent-format.md`
 
 ## Architecture rules (enforced)
 1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.

@@ -73,6 +73,7 @@ Everything after the closing `---` is the system prompt.
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
+| `engagementProfiles` | array<string> | no | `[code]` | Engagement profile ids for evidence scoping; a workflow step's `engagement_profiles` or `defaults.engagement_profiles` overrides it |
 | `maxTokens` | integer | no | `8192` | Per-request output-token budget (`max_tokens` in the LLM request); extended thinking (`effort`) draws from this same budget |
 | `contextWindowTokens` | integer | no | none (compaction disabled) | Model context-window size in tokens; when set, enables proactive LLM context compaction |
 | `compactAtPercent` | integer | no | `80` when `contextWindowTokens` is set | Percentage of `contextWindowTokens` at which compaction triggers; clamped to `[10, 95]` |
@@ -284,6 +285,33 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 ```
 
 See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
+
+### `engagementProfiles`
+
+Selects engagement profiles for evidence collection. Profiles define named scopes — e.g., `network`, `web`, `binary` — that organize findings and guide evidence taxonomy. A profile itself is declarative (asset kinds, completeness checklist) and does not restrict what an agent can record; the completeness checker enforces findings are thorough *per profile*.
+
+- `[code]` or omit the field (default) — the native path with no engagement active. Backward-compatible with agents written before engagement profiles existed.
+- `[binary]` or other profile ids — enables those profiles for this agent. When a run records findings, each finding is validated per the profile that owns its asset kind.
+- `[]` (empty array) — equivalent to `[code]` (no engagement active).
+
+A workflow step's `engagement_profiles` or the workflow's `defaults.engagement_profiles` overrides this value. The order is step → workflow defaults → agent `engagementProfiles` → `code`; see [workflow-format.md](workflow-format.md#engagement_profiles). A standalone `rupu run <agent>` uses `--engagement-profile <id>` or `--engagement-profiles a,b` when given, then the agent's value, then `code`. The flag is how a remote workflow step's profile reaches the host that runs the agent. Sub-agents started through `dispatch_agent` resolve only from their own agent file.
+
+**Authoring:** use agent's `engagementProfiles: [binary]` or leave it unset for the native path. Narrow further per step in a workflow if needed. See [coverage.md#engagement-profiles](coverage.md#engagement-profiles) for profile definitions and authoring.
+
+**Remote hosts:** like `findingsProfile`, agent frontmatter rejects unknown keys, so upgrade rupu on every remote host before adding `engagementProfiles` to agents they run.
+
+```yaml
+---
+name: binary-auditor
+provider: anthropic
+model: claude-sonnet-4-6
+tools: [read_file, grep, report_finding]
+engagementProfiles: [binary]   # run this agent under the binary profile
+---
+
+You audit binary executables for security issues.
+Record each finding via report_finding with proper asset references…
+```
 
 ### `maxTokens`
 

@@ -129,12 +129,15 @@ Currently supported:
 ```yaml
 defaults:
   continue_on_error: true
-  findings_profile: full     # full | summary — see `findings_profile` below
+  findings_profile: full                      # full | summary — see `findings_profile` below
+  engagement_profiles: [code]                 # ids, or omit for `code` (native path)
 ```
 
 If a step does not set `continue_on_error`, it inherits the workflow default.
 
 `defaults.findings_profile` sets the findings contract for every step that runs an agent, and for `action:` steps that call `findings.record`. A step's own `findings_profile` overrides it. See [`findings_profile`](#findings_profile).
+
+`defaults.engagement_profiles` sets the engagement profiles for steps that run an agent or call `action: findings.record`, allowing each run to record evidence within defined scopes (e.g., `network`, `web`, `binary`). A step's own `engagement_profiles` can only narrow this set. See [`engagement_profiles`](#engagement_profiles).
 
 ---
 
@@ -311,6 +314,7 @@ Common fields:
 | `approval` | object | all steps | Human pause before the step dispatches |
 | `contract` | object | linear steps | Optional documentation for a structured step output |
 | `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Findings contract for this step — see below |
+| `engagement_profiles` | array<string> | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Engagement profile ids for evidence scoping — see below |
 
 ### `actions`
 
@@ -391,6 +395,46 @@ Rules:
 The control-plane workflow editor (`rupu cp serve`) authors both levels. Where the server accepts the field (steps that run a local agent, and a local `action: findings.record` step), the step form has a **Findings** select: *Inherit* (omits the key, so the step falls back through the precedence above), *Full report*, or *Summary*. The Settings inspector has a **Defaults** card for `defaults.findings_profile` (unset omits the key, and `defaults:` itself when it ends up empty; other `defaults:` keys are preserved and listed read-only). The editor validates the same placement rules as the parser before saving: a `findings_profile` on a step that runs no agent, on a non-`findings.record` action, or on a remote step, and a `defaults.findings_profile` alongside a remote step, are flagged in the editor and would be rejected by the server. A profile set on a step that cannot take one stays visible in the form so it can be cleared.
 
 > **Upgrading:** the built-in profile is `full`, so an existing `action: findings.record` step that sends `summary` / `severity` / `rationale` now fails to parse. Add `findings_profile: summary` to that step (or `defaults.findings_profile: summary` to the workflow), or change its `with:` to send a `report`.
+
+### `engagement_profiles`
+
+Engagement profiles scope which evidence-collection frameworks (e.g., `network`, `web`, `binary`) are active for this step's run. See `docs/coverage.md` for profiles and authoring.
+
+Precedence, most specific first:
+
+1. the step's `engagement_profiles`
+2. the workflow's `defaults.engagement_profiles`
+3. the agent's `engagementProfiles` frontmatter (see [agent-format.md](agent-format.md#engagementprofiles))
+4. `code` (the native path; no engagement is active)
+
+```yaml
+defaults:
+  engagement_profiles: [network, web]    # every step uses network and web profiles
+steps:
+  - id: network-scan
+    agent: scanner
+    prompt: "Scan the network"
+    engagement_profiles: [network]       # narrowed to network only for this step
+  - id: web-audit
+    agent: web-auditor
+    prompt: "Audit the web app"
+    # inherits [network, web] from defaults
+```
+
+Rules:
+
+- A step's own `engagement_profiles` can **only narrow** the set inherited from `defaults` or the agent — naming a profile not present in the parent set has no effect. This prevents silent elevation of scope.
+- An empty `engagement_profiles: []` resets to the native `code` path (no engagement active for this step).
+- An `engagement_profiles: [code]` is equivalent to an empty array — `code` is a pseudo-profile representing the absence of engagement.
+- If you omit `engagement_profiles` entirely at the step and workflow level, the agent's `engagementProfiles` frontmatter is consulted; if that is also absent, the run uses the native `code` path.
+- `parallel:` sub-steps inherit their parent step's profiles; a sub-step has no `engagement_profiles` of its own.
+- An `action: findings.record` step resolves as: step's own `engagement_profiles` → `defaults.engagement_profiles` → `full` (no agent frontmatter to consult).
+- Remote steps (`host:` / `distribute:`) currently refuse engagement-profile selection (fail-closed) — remote/placed delivery of engagement-scoped runs is not yet wired. A step with a non-empty `engagement_profiles` on a remote run is rejected with an error message.
+- The field must never be silently ignored, so these are parse errors:
+  - `engagement_profiles` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
+  - `engagement_profiles` on an `action:` step that calls any tool other than `findings.record`.
+
+The control-plane workflow editor (`rupu cp serve`) does not yet expose an `engagement_profiles` field; author it directly in YAML.
 
 ### `when`
 
