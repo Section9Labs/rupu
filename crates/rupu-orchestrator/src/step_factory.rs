@@ -1344,7 +1344,10 @@ steps:
         assert_eq!(opts.limits.note, None);
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn step_actions_narrows_the_agent_grant() {
         let tmp = assert_fs::TempDir::new().unwrap();
         write_agent(tmp.path());
@@ -1370,7 +1373,10 @@ steps:
         );
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn empty_step_actions_leave_the_agent_grant_unrestricted() {
         let tmp = assert_fs::TempDir::new().unwrap();
         write_agent(tmp.path());
@@ -1473,7 +1479,10 @@ steps:
         );
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn findings_base_limits_reach_the_step() {
         let tmp = assert_fs::TempDir::new().unwrap();
         write_summary_agent(tmp.path());
@@ -1521,7 +1530,10 @@ steps:
         }
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn findings_profile_precedence_table() {
         use rupu_coverage::FindingProfile::{self, Full, Summary};
         let tmp = assert_fs::TempDir::new().unwrap();
@@ -1678,7 +1690,10 @@ steps:
         }
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn for_each_units_resolve_their_steps_profile() {
         use rupu_coverage::FindingProfile::Summary;
         let tmp = assert_fs::TempDir::new().unwrap();
@@ -1741,7 +1756,10 @@ steps:
         );
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn bash_config_reaches_the_step_opts() {
         // Regression for ISSUES.md I-18: the workflow path hardcoded a 120s
         // bash timeout and an empty env allowlist at build_opts_for_step's
@@ -1794,7 +1812,10 @@ steps:
             .collect()
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn on_tool_call_is_always_wired_even_when_the_caller_passes_none() {
         // `build_opts_for_step` must ALWAYS return `Some(...)` for
         // `on_tool_call` — the tool_audit trail must exist even for
@@ -1843,7 +1864,10 @@ steps:
         assert_eq!(lines[0]["data"]["blocked"], false);
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn builtin_tool_call_on_a_narrowed_step_emits_no_tool_audit() {
         // Regression (tool_audit IMPORTANT 3): spec §4a/§4b say "per
         // **catalog** call", and §2 (revised) exempts builtins from

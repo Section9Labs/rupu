@@ -165,6 +165,42 @@ pub fn is_token_expired(expires_ms: u64) -> bool {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate process-global environment
+    /// variables (`HOME`, `OPENAI_API_KEY`), the workspace's `ENV_LOCK`
+    /// idiom.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets an environment variable for the guard's lifetime and restores
+    /// what was there on drop — also on a panic, so a failed assertion
+    /// cannot leak the value into the next test.
+    struct EnvVar {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_detect_oauth_token() {
         let auth = AuthMethod::detect("sk-ant-oat01-abc123");
@@ -312,19 +348,14 @@ mod tests {
         let path = dir.path().join("auth.json");
         std::fs::write(&path, r#"{"anthropic":{"type":"api_key","key":"sk-test"}}"#).unwrap();
         // Temporarily clear env var and HOME to block all fallback paths
-        // (including ~/.codex/auth.json Codex CLI discovery)
-        let prev_key = std::env::var("OPENAI_API_KEY").ok();
-        let prev_home = std::env::var("HOME").ok();
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::set_var("HOME", dir.path());
+        // (including ~/.codex/auth.json Codex CLI discovery); both are
+        // process-global, so under the lock and restored by guards.
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _key = EnvVar::unset("OPENAI_API_KEY");
+        let _home = EnvVar::set("HOME", dir.path());
         let result = resolve_provider_auth(ProviderId::OpenaiCodex, Some(&path), None);
-        // Restore
-        if let Some(val) = prev_key {
-            std::env::set_var("OPENAI_API_KEY", val);
-        }
-        if let Some(val) = prev_home {
-            std::env::set_var("HOME", val);
-        }
         assert!(result.is_err());
     }
 
