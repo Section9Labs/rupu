@@ -7567,7 +7567,9 @@ async fn run_parallel_step(
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
         let parent_step_id = step.id.clone();
-        // Usage-ledger hook, built before the spawn (it needs `opts`).
+        // Usage accounting, built before the spawn (it needs `opts`); the
+        // counters feed this sub-step's `UnitCompleted` (spec 2026-09-29 §3.4).
+        let counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
         let on_usage = ledger_hook(
             opts,
             workflow_run_id,
@@ -7579,7 +7581,7 @@ async fn run_parallel_step(
             &run_id_clone,
             &transcript_clone,
             &sub_agent_name,
-            None,
+            Some(counters.clone()),
         );
         let codename = opts
             .naming
@@ -7593,6 +7595,27 @@ async fn run_parallel_step(
                 .acquire_owned()
                 .await
                 .expect("semaphore not closed");
+            // Per-unit live-view events, like `for_each` and panel steps: each
+            // declared sub-step is a unit of its parallel step (`index` = its
+            // declared position, `unit_key` = its sub-step id — the same pair
+            // the usage ledger tags it with). Without them the live view has
+            // no record of the sub-steps and shows them un-started under a
+            // finished parent.
+            if let Some(sink) = event_sink.as_ref() {
+                sink.emit(
+                    &workflow_run_id,
+                    &crate::executor::Event::UnitStarted {
+                        run_id: workflow_run_id.clone(),
+                        step_id: parent_step_id.clone(),
+                        index: idx,
+                        unit_key: sub_id.clone(),
+                        agent: Some(sub_agent_name.clone()),
+                        transcript_path: transcript_clone.clone(),
+                        host: None,
+                        codename: codename.as_ref().map(ToString::to_string),
+                    },
+                );
+            }
             let outcome = dispatch_one(
                 &factory,
                 // Parent step id (for the factory's step lookup)
@@ -7628,6 +7651,22 @@ async fn run_parallel_step(
                 &run_id_clone,
                 &parent_step_id,
             );
+            if let Some(sink) = event_sink.as_ref() {
+                // Real totals from this unit's usage hook (spec 2026-09-29 §3.4).
+                sink.emit(
+                    &workflow_run_id,
+                    &crate::executor::Event::UnitCompleted {
+                        run_id: workflow_run_id.clone(),
+                        step_id: parent_step_id.clone(),
+                        index: idx,
+                        unit_key: sub_id.clone(),
+                        success,
+                        tokens_in: counters.input.load(std::sync::atomic::Ordering::Relaxed),
+                        tokens_out: counters.output.load(std::sync::atomic::Ordering::Relaxed),
+                        host: None,
+                    },
+                );
+            }
             ParallelSubOutcome {
                 idx,
                 sub_id,

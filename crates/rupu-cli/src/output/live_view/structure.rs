@@ -251,57 +251,71 @@ struct Block<'a> {
     live: Option<&'a StepView>,
     /// `(anchor id, agent)` of each member, in declared order.
     members: Vec<(&'a str, &'a str)>,
+    /// Members are `parallel:` sub-steps, whose unit index is their declared
+    /// position — not panelists, which are matched by agent.
+    by_index: bool,
     taken: usize,
 }
 
 impl<'a> Block<'a> {
     /// A block for `step`, or `None` when `step` has no member rows.
     fn open(step: &'a Step, live: Option<&'a StepView>) -> Option<Self> {
-        let members: Vec<(&str, &str)> = match (&step.panel, &step.parallel) {
-            (Some(panel), _) => panel
-                .panelists
-                .iter()
-                .map(|p| (p.as_str(), p.as_str()))
-                .collect(),
-            (None, Some(subs)) => subs
-                .iter()
-                .map(|s| (s.id.as_str(), s.agent.as_str()))
-                .collect(),
+        let (members, by_index): (Vec<(&str, &str)>, bool) = match (&step.panel, &step.parallel) {
+            (Some(panel), _) => (
+                panel
+                    .panelists
+                    .iter()
+                    .map(|p| (p.as_str(), p.as_str()))
+                    .collect(),
+                false,
+            ),
+            (None, Some(subs)) => (
+                subs.iter()
+                    .map(|s| (s.id.as_str(), s.agent.as_str()))
+                    .collect(),
+                true,
+            ),
             (None, None) => return None,
         };
         Some(Self {
             live,
             members,
+            by_index,
             taken: 0,
         })
     }
 
-    /// The agent of the next member row, if the row anchored on `anchor` is
-    /// that member. Anything else — the members exhausted, or a row that is
-    /// not the one app-canvas should emit next — is not a member, so a drift
-    /// in app-canvas's block shape degrades to plain rows, never to another
-    /// node wearing a member's status.
-    fn next_member(&mut self, anchor: &str) -> Option<&'a str> {
-        let (id, agent) = self.members.get(self.taken).copied()?;
-        if id != anchor {
+    /// The declared position of the next member row, if the row anchored on
+    /// `anchor` is that member. Anything else — the members exhausted, or a
+    /// row that is not the one app-canvas should emit next — is not a member,
+    /// so a drift in app-canvas's block shape degrades to plain rows, never
+    /// to another node wearing a member's status.
+    fn next_member(&mut self, anchor: &str) -> Option<usize> {
+        let (id, _) = self.members.get(self.taken)?;
+        if *id != anchor {
             return None;
         }
         self.taken += 1;
-        Some(agent)
+        Some(self.taken - 1)
     }
 
-    /// Facts of the member row running `agent`. A panelist is a fan-out unit
-    /// of its panel step, so its status and identity come from the newest
-    /// unit of that agent (a later gate round has a higher index). Parallel
-    /// sub-steps leave no unit in the run view, so they keep the status
-    /// app-canvas baked in — except under a skipped parent, which skipped
-    /// them too.
-    fn member_facts(&self, agent: &str) -> Facts<'a> {
+    /// Facts of the member row at declared position `pos`. Every member is a
+    /// fan-out unit of its step, so its status and identity come from that
+    /// unit: a `parallel:` sub-step's unit index is its declared position; a
+    /// panelist is the newest unit of its agent (a later gate round has a
+    /// higher index). A member with no unit yet keeps the status app-canvas
+    /// baked in — except under a skipped parent, which skipped it too.
+    fn member_facts(&self, pos: usize) -> Facts<'a> {
+        let agent = self.members.get(pos).map_or("", |(_, agent)| *agent);
         let unit = self.live.and_then(|step| {
-            step.units
-                .values()
-                .rev()
-                .find(|u| u.agent.as_deref() == Some(agent))
+            if self.by_index {
+                step.units.get(&pos)
+            } else {
+                step.units
+                    .values()
+                    .rev()
+                    .find(|u| u.agent.as_deref() == Some(agent))
+            }
         });
         if let Some(u) = unit {
             return Facts {
@@ -563,9 +577,9 @@ pub fn structure_rows(view: &RunView, wf: &Workflow, nav: &NavState) -> Vec<Line
             },
             (None, None) => Facts::default(),
             (None, Some(id)) => match block.as_mut().and_then(|b| b.next_member(id)) {
-                Some(agent) => block
+                Some(pos) => block
                     .as_ref()
-                    .map_or_else(Facts::default, |b| b.member_facts(agent)),
+                    .map_or_else(Facts::default, |b| b.member_facts(pos)),
                 None => {
                     let step = wf.steps.iter().find(|s| s.id == id);
                     let live = find_step(view, id);
@@ -675,6 +689,23 @@ steps:
   - id: hold
     agent: holder
     prompt: p
+"#;
+
+    /// A `parallel:` step whose first two sub-steps run the SAME agent.
+    const PARALLEL_WF: &str = r#"
+name: par
+steps:
+  - id: lanes
+    parallel:
+      - id: spec
+        agent: writer
+        prompt: a
+      - id: draft
+        agent: writer
+        prompt: b
+      - id: verify
+        agent: reviewer
+        prompt: c
 "#;
 
     fn wf() -> Workflow {
@@ -1216,6 +1247,88 @@ steps:
         let rows = structure_rows(&v, &wf(), &NavState::default());
         assert_eq!(*style_of(row(&rows, "generator"), "│"), Style::Dim);
         assert_eq!(*style_of(row(&rows, "↺ loop:refine"), "◄─"), Style::Dim);
+    }
+
+    /// A `parallel:` step as the runner reports it: every declared sub-step
+    /// is a unit of it (`index` = declared position), announced with its
+    /// agent's identity.
+    fn parallel_view(subs: &[(&str, Option<bool>)]) -> RunView {
+        let mut v = RunView::default();
+        start(&mut v, "lanes", StepKind::Parallel, None, None, None);
+        for (i, (agent, outcome)) in subs.iter().enumerate() {
+            unit_started(&mut v, "lanes", i, agent, &format!("otter#{}", i + 1));
+            agent_started(&mut v, "lanes", Some(i), "anthropic", "claude-sonnet-5-5");
+            if let Some(success) = outcome {
+                unit_completed(&mut v, "lanes", i, *success);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn a_completed_parallel_step_shows_its_sub_steps_done_not_waiting() {
+        let mut v = parallel_view(&[
+            ("writer", Some(true)),
+            ("writer", Some(true)),
+            ("reviewer", Some(true)),
+        ]);
+        complete(&mut v, "lanes", 9_000, None);
+        let par = Workflow::parse(PARALLEL_WF).unwrap();
+        let rows = structure_rows(&v, &par, &NavState::default());
+
+        // The parent and every sub-step read finished — none un-started.
+        assert_eq!(
+            *style_of(row(&rows, "⇉ lanes"), "⇉ "),
+            Style::Status(Status::Complete)
+        );
+        for sub in ["├─ spec", "├─ draft", "├─ verify"] {
+            let line = row(&rows, sub);
+            assert_eq!(
+                *style_of(line, "✓"),
+                Style::Status(Status::Complete),
+                "{sub}"
+            );
+            assert!(plain(line).ends_with("···· ✓ done"), "{}", plain(line));
+        }
+        let text = render_plain(&rows);
+        assert!(
+            !text.contains('○'),
+            "no sub-step may read un-started:\n{text}"
+        );
+        // Identity comes from the sub-step's unit.
+        let spec = row(&rows, "├─ spec");
+        assert_eq!(*style_of(spec, "otter"), Style::Role("otter".into()));
+        assert!(plain(spec).contains("anthropic/claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn parallel_sub_steps_sharing_an_agent_are_told_apart_by_position() {
+        // Two sub-steps run `writer`: one done, one failed; `verify` runs.
+        let v = parallel_view(&[
+            ("writer", Some(true)),
+            ("writer", Some(false)),
+            ("reviewer", None),
+        ]);
+        let par = Workflow::parse(PARALLEL_WF).unwrap();
+        let rows = structure_rows(&v, &par, &NavState::default());
+        assert_eq!(
+            *style_of(row(&rows, "├─ spec"), "✓"),
+            Style::Status(Status::Complete)
+        );
+        assert_eq!(
+            *style_of(row(&rows, "├─ draft"), "✗"),
+            Style::Status(Status::Failed)
+        );
+        assert_eq!(
+            *style_of(row(&rows, "├─ verify"), "◐"),
+            Style::Status(Status::Working)
+        );
+        // Each sub-step's own rail follows its status (running lights up).
+        assert_eq!(
+            *style_of(row(&rows, "├─ verify"), "├─"),
+            Style::Status(Status::Working)
+        );
+        assert_eq!(*style_of(row(&rows, "├─ spec"), "├─"), Style::Dim);
     }
 
     #[test]
