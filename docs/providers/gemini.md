@@ -15,13 +15,16 @@ The two differ in what they can tell rupu about the model: AI Studio publishes p
 rupu auth login --provider gemini --mode sso
 ```
 
-A browser opens to `accounts.google.com/o/oauth2/v2/auth`. Authorize the rupu OAuth app for the `cloud-platform` scope. The redirect populates rupu's localhost listener; the OAuth token is stored at `rupu/gemini/sso`.
+A browser opens to `accounts.google.com/o/oauth2/v2/auth`. rupu signs in as the Gemini CLI's installed-app OAuth client and asks for the `cloud-platform`, `openid` and `email` scopes. The redirect populates rupu's localhost listener; the OAuth token is stored in `~/.rupu/auth.json` (mode 0600).
 
-The token works against the Vertex AI endpoint. You'll need a Google Cloud project with the Vertex AI API enabled and billing configured — the OAuth scope grants access but doesn't substitute for project setup.
+The token is used against Google's **Cloud Code Assist** API, the backend the Gemini CLI itself talks to — not Vertex AI, and not `generativelanguage.googleapis.com` (that one is the API-key path). No Vertex AI project setup is involved, and rupu never calls a Vertex endpoint.
+
+- **Gemini CLI** (what `rupu auth login` gives you, and what any stored credential without a `variant` field uses): requests go to `https://cloudcode-pa.googleapis.com` (`/v1internal:generateContent` and `/v1internal:streamGenerateContent`), and the token is refreshed with the Gemini CLI client's id and secret.
+- **Antigravity**: requests go to the sandbox endpoint `https://daily-cloudcode-pa.sandbox.googleapis.com`, with Antigravity's own client id and secret. rupu selects it only when the stored credential carries `"variant": "antigravity"`; `rupu auth login` does not write that field.
+
+Every Code Assist request carries a `project` field. rupu takes it from the stored credential's `project_id` and sends an empty string when the credential has none. `rupu auth login` does not discover or store a project id, and `config.toml` has no key for one.
 
 ## Configuration
-
-Set the `project_id` if your token doesn't carry one in its `extra` claims:
 
 ```toml
 [providers.gemini]
@@ -32,7 +35,7 @@ default_model = "gemini-2.5-pro"
 for a Vertex AI regional endpoint, and none of rupu's Gemini paths (AI Studio,
 Gemini CLI, Antigravity) is region-scoped. See `docs/providers.md`.
 
-The `project_id` is read from the OAuth token's `extra` field (populated during the SSO flow). For headless setups where you can't run the SSO flow, use the AI Studio API-key path.
+For headless setups where you can't run the SSO flow, use the AI Studio API-key path.
 
 ## Example agent file
 
@@ -69,7 +72,7 @@ Every run needs the model's input limit (for compaction) and output cap. Where t
   max_output = 65536
   ```
 
-  or on the agent with `contextWindowTokens` / `maxTokens`. With neither, the run's `model_limits` notice says the limits are unknown and compaction is off, and `rupu models refresh --provider gemini` reports that there is no listing. Gemini requests carry no output cap when none is known, so the model's own maximum applies.
+  or on the agent with `contextWindowTokens` / `maxTokens` (a `0` is ignored). With neither, the run's `model_limits` notice says the limits are unknown and compaction is off, and `rupu models refresh --provider gemini` reports that there is no listing (and exits non-zero when Gemini is the only provider you targeted, because nothing was refreshed). Gemini requests carry no output cap when none is known, so the model's own maximum applies.
 
 Gemini budgets input and output independently, so compaction triggers at `compactAtPercent` of the input limit alone. See [providers.md](../providers.md#model-limits) for the full precedence (agent → config → live list → unknown).
 
@@ -77,4 +80,4 @@ Gemini budgets input and output independently, so compaction triggers at `compac
 
 - **Vertex AI region** — `region` in config is parsed but unused; no shipped Gemini client targets a regional Vertex endpoint. Setting it changes nothing.
 - **AI Studio vs Code Assist** — two different APIs behind one `gemini` provider. AI Studio (API key) has a model listing and reports limits; Code Assist (SSO) has neither, so declare limits in `[[providers.gemini.models]]` (see [Model limits](#model-limits)).
-- **Project ID required** — Google's API rejects requests without a billing-enabled project; the SSO flow captures this in token claims, but ensure your Google Cloud project has Vertex AI enabled before first run.
+- **Code Assist project** — SSO requests carry a `project` taken from the stored credential's `project_id`, which `rupu auth login` does not populate (see [SSO via Google account](#sso-via-google-account)). There is no Vertex AI setup step.
