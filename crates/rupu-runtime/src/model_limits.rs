@@ -407,7 +407,8 @@ pub async fn catalog(
 async fn build_registry(cfg: &rupu_config::Config, global_dir: &Path) -> ModelRegistry {
     let registry = ModelRegistry::with_cache_dir(cache_dir(global_dir));
 
-    // Baked-in fallback for Copilot (and Gemini until AI Studio is wired).
+    // Baked-in id fallbacks: Copilot, and Gemini's Code Assist (OAuth) path,
+    // which has no model listing (an AI Studio API key lists live).
     registry
         .set_baked_in(
             "copilot",
