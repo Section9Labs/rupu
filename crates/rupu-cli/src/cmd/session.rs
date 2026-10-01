@@ -11025,6 +11025,57 @@ mod tests {
         assert_eq!(l.input, Limit::new(150_000, LimitSource::Observed));
     }
 
+    /// An all-unknown stored value re-resolves on every turn (above). While
+    /// the provider's model list is down that must not cost every turn the
+    /// full fetch timeout: the re-resolve honours the refresh-failure marker
+    /// like any launch, and says so in the notice.
+    #[tokio::test]
+    async fn re_resolving_an_unknown_session_honours_the_refresh_failure_marker() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_limits_neg01");
+        record.message_history = Vec::new();
+        record.compact_at_percent = None;
+        record.context_window_tokens = None;
+        record.max_tokens = None;
+        record.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let cache = global.join("cache/models");
+        std::fs::create_dir_all(&cache).expect("create cache dir");
+        std::fs::write(
+            cache.join("anthropic.failed"),
+            serde_json::json!({
+                "failed_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                "error": "connection refused",
+            })
+            .to_string(),
+        )
+        .expect("write marker");
+
+        with_mock_home(
+            &global,
+            r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_limits_neg".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("turn completes");
+
+        let notice = model_limits_notice(&record.transcripts_dir.join("run_limits_neg.jsonl"));
+        assert!(
+            notice.contains("model list refresh failed 1m ago (connection refused)")
+                && notice.contains("retrying after 5m"),
+            "the marker suppressed the refetch: {notice}"
+        );
+        assert!(
+            !notice.contains("exposes no model limits"),
+            "the provider was not asked: {notice}"
+        );
+    }
+
     /// A turn that learns a limit from an overflow and then FAILS must still
     /// persist it, or the next turn starts from the stale limit and overflows
     /// the same way again. A one-message history can be neither compacted nor

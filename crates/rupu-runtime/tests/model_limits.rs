@@ -1057,3 +1057,178 @@ async fn refresh_reports_a_local_provider_as_not_wired_without_credentials() {
         );
     }
 }
+
+// ---- negative cache: a failed refetch is not retried for 5 minutes ---------
+
+/// Write a refresh-failure marker for `provider`, `age` old.
+fn write_failure_marker(tmp: &tempfile::TempDir, provider: &str, age: chrono::Duration) {
+    let dir = cache_of(tmp);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{provider}.failed")),
+        serde_json::json!({
+            "failed_at": (chrono::Utc::now() - age).to_rfc3339(),
+            "error": "connection refused",
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn failure_marker_exists(tmp: &tempfile::TempDir, provider: &str) -> bool {
+    cache_of(tmp).join(format!("{provider}.failed")).exists()
+}
+
+/// A failed refetch is remembered: every launch within the next 5 minutes
+/// uses the stale entry (or unknown) without calling the provider again —
+/// otherwise each launch pays the full fetch timeout while it stays down.
+#[tokio::test]
+async fn a_failed_refetch_is_not_retried_within_5_minutes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, calls) = fake(Err("connection refused"));
+    let first = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert!(first.note.as_deref().unwrap().contains("refresh failed"));
+    assert!(failure_marker_exists(&tmp, "anthropic"));
+
+    let second = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second fetch");
+    assert_eq!(second.input, rupu_providers::model_limits::Limit::unknown());
+    let note = second.note.as_deref().unwrap();
+    assert!(
+        note.contains("model list refresh failed just now (")
+            && note.contains("connection refused")
+            && note.contains("retrying after 5m"),
+        "{note}"
+    );
+}
+
+/// A timeout is a failure like any other: it must not cost the next launch
+/// another full timeout.
+#[tokio::test]
+async fn a_timed_out_refetch_is_not_retried_within_5_minutes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut p = Fake {
+        result: Ok(vec![("claude-a", 1_000_000, 128_000)]),
+        calls: calls.clone(),
+        shares: true,
+        id: ProviderId::Anthropic,
+        delay: Some(std::time::Duration::from_secs(1)),
+    };
+    let mut c = ctx(&tmp);
+    c.fetch_timeout = std::time::Duration::from_millis(50);
+    resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &c,
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &c,
+    )
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let note = l.note.as_deref().unwrap();
+    assert!(
+        note.contains("timed out after 50ms") && note.contains("retrying after 5m"),
+        "{note}"
+    );
+}
+
+/// The stale entry is still used while the refetch is suppressed.
+#[tokio::test]
+async fn a_suppressed_refetch_still_uses_the_stale_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = cache_of(&tmp);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("anthropic.json"), GOOD_CACHE).unwrap();
+    write_failure_marker(&tmp, "anthropic", chrono::Duration::minutes(2));
+    let (mut p, calls) = fake(Ok(vec![("claude-a", 1, 1)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(l.input.tokens, Some(200_000));
+    assert!(matches!(
+        l.input.source,
+        LimitSource::Live { stale: true, .. }
+    ));
+    assert!(
+        l.note
+            .as_deref()
+            .unwrap()
+            .contains("model list refresh failed 2m ago"),
+        "{:?}",
+        l.note
+    );
+}
+
+/// After the 5-minute window the next resolve fetches again, and a
+/// successful fetch clears the marker.
+#[tokio::test]
+async fn the_negative_cache_expires_after_5_minutes() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_failure_marker(&tmp, "anthropic", chrono::Duration::minutes(6));
+    let (mut p, calls) = fake(Ok(vec![("claude-a", 1_000_000, 128_000)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(l.input.tokens, Some(1_000_000));
+    assert!(!failure_marker_exists(&tmp, "anthropic"));
+}
+
+/// A manual refresh (`rupu models refresh`, the CP's Refetch) ignores the
+/// marker — the user asked — and clears it on success.
+#[tokio::test]
+async fn a_manual_refresh_ignores_and_clears_the_marker() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let listing = server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200).json_body(serde_json::json!({
+            "data": [{ "id": "base-model", "max_model_len": 4096 }]
+        }));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write_failure_marker(&tmp, "oracle", chrono::Duration::minutes(1));
+    let cfg = oracle_cfg(format!("{}/v1", server.url("")));
+    let out = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("oracle"))
+        .await
+        .unwrap();
+    listing.assert();
+    assert!(out[0].ok, "{:?}", out[0]);
+    assert!(!failure_marker_exists(&tmp, "oracle"));
+}

@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rupu_providers::model_limits::{
-    Limit, LimitSource, ModelLimits, ANTHROPIC_FALLBACK_MAX_TOKENS, DEFAULT_COMPACT_AT_PERCENT,
+    fmt_age, Limit, LimitSource, ModelLimits, ANTHROPIC_FALLBACK_MAX_TOKENS,
+    DEFAULT_COMPACT_AT_PERCENT,
 };
 use rupu_providers::model_registry::match_model_id;
 use rupu_providers::{LlmProvider, ModelRegistry, ModelSource, ProviderError, ProviderId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::provider_factory;
 
@@ -57,6 +58,76 @@ impl LimitsContext {
             cache_dir,
             custom: HashMap::new(),
             fetch_timeout: FETCH_TIMEOUT,
+        }
+    }
+}
+
+/// How long a failed (or timed-out) stale-cache refetch in [`resolve`]
+/// suppresses the next one. A manual [`refresh`] ignores it.
+pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// `<cache_dir>/<provider>.failed`: when `resolve`'s last refetch for
+/// `provider` failed, and why.
+#[derive(Debug, Serialize, Deserialize)]
+struct RefreshFailure {
+    failed_at: DateTime<Utc>,
+    error: String,
+}
+
+fn refresh_failure_path(cache_dir: &Path, provider: &str) -> PathBuf {
+    cache_dir.join(format!("{provider}.failed"))
+}
+
+/// The recorded failure's age and reason, when it is inside
+/// [`REFRESH_RETRY_AFTER`]. A missing, unreadable or future-dated marker
+/// suppresses nothing.
+fn recent_refresh_failure(
+    cache_dir: &Path,
+    provider: &str,
+    now: DateTime<Utc>,
+) -> Option<(chrono::Duration, String)> {
+    let body = std::fs::read_to_string(refresh_failure_path(cache_dir, provider)).ok()?;
+    let failure: RefreshFailure = serde_json::from_str(&body).ok()?;
+    let age = now - failure.failed_at;
+    let window = chrono::Duration::from_std(REFRESH_RETRY_AFTER).ok()?;
+    (age >= chrono::Duration::zero() && age < window).then_some((age, failure.error))
+}
+
+/// Record a failed refetch, atomically (temp file + rename, like the cache
+/// itself). Best effort: an unwritable marker only costs a retry.
+fn record_refresh_failure(cache_dir: &Path, provider: &str, error: &str) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let body = match serde_json::to_string(&RefreshFailure {
+        failed_at: Utc::now(),
+        error: error.to_string(),
+    }) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(error = %e, provider, "could not encode the refresh-failure marker");
+            return;
+        }
+    };
+    let tmp = cache_dir.join(format!(
+        ".{provider}.failed.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = std::fs::create_dir_all(cache_dir)
+        .and_then(|()| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, refresh_failure_path(cache_dir, provider)));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, provider, "could not record the refresh-failure marker");
+    }
+}
+
+/// Forget a recorded failure (a refetch or manual refresh succeeded).
+fn clear_refresh_failure(cache_dir: &Path, provider: &str) {
+    match std::fs::remove_file(refresh_failure_path(cache_dir, provider)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, provider, "could not clear the refresh-failure marker")
         }
     }
 }
@@ -115,30 +186,55 @@ pub async fn resolve(
     }
     let mut note: Option<String> = None;
     if registry.cache_is_stale(provider_name).await {
-        match tokio::time::timeout(ctx.fetch_timeout, provider.fetch_models()).await {
-            // A listing that parsed to zero models is a failed refresh, not an
-            // answer: caching it would replace a good entry (and make every
-            // model "missing from the list" for an hour).
-            Ok(Ok(models)) if models.is_empty() => {
-                note = Some("model list refresh returned no models".to_string());
-            }
-            Ok(Ok(models)) => {
-                registry.set_live_cache(provider_name, models).await;
-                if let Err(e) = registry.save_cache(provider_name).await {
-                    tracing::warn!(error = %e, provider = provider_name, "failed to write model cache");
+        if let Some((age, error)) =
+            recent_refresh_failure(&ctx.cache_dir, provider_name, Utc::now())
+        {
+            // A refetch failed moments ago: don't pay the fetch timeout again
+            // on every launch while the provider stays down.
+            note = Some(format!(
+                "model list refresh failed {} ({error}); retrying after {}m",
+                fmt_age(age),
+                REFRESH_RETRY_AFTER.as_secs() / 60
+            ));
+        } else {
+            let failed = match tokio::time::timeout(ctx.fetch_timeout, provider.fetch_models())
+                .await
+            {
+                // A listing that parsed to zero models is a failed refresh, not
+                // an answer: caching it would replace a good entry (and make
+                // every model "missing from the list" for an hour).
+                Ok(Ok(models)) if models.is_empty() => {
+                    note = Some("model list refresh returned no models".to_string());
+                    Some("returned no models".to_string())
                 }
-            }
-            Ok(Err(ProviderError::NotImplemented { .. })) => {
-                note = Some(format!(
-                    "{provider_name} exposes no model limits; set contextWindowTokens/maxTokens on the agent or [[providers.{provider_name}.models]]"
-                ));
-            }
-            Ok(Err(e)) => note = Some(format!("model list refresh failed: {e}")),
-            Err(_) => {
-                note = Some(format!(
-                    "model list refresh timed out after {}",
-                    fmt_timeout(ctx.fetch_timeout)
-                ))
+                Ok(Ok(models)) => {
+                    registry.set_live_cache(provider_name, models).await;
+                    if let Err(e) = registry.save_cache(provider_name).await {
+                        tracing::warn!(error = %e, provider = provider_name, "failed to write model cache");
+                    }
+                    clear_refresh_failure(&ctx.cache_dir, provider_name);
+                    None
+                }
+                // Not a failure: the provider has no listing. Instant, so
+                // nothing to suppress.
+                Ok(Err(ProviderError::NotImplemented { .. })) => {
+                    note = Some(format!(
+                        "{provider_name} exposes no model limits; set contextWindowTokens/maxTokens on the agent or [[providers.{provider_name}.models]]"
+                    ));
+                    None
+                }
+                Ok(Err(e)) => {
+                    note = Some(format!("model list refresh failed: {e}"));
+                    Some(e.to_string())
+                }
+                Err(_) => {
+                    let why = format!("timed out after {}", fmt_timeout(ctx.fetch_timeout));
+                    note = Some(format!("model list refresh {why}"));
+                    Some(why)
+                }
+            };
+            if let Some(error) = failed {
+                record_refresh_failure(&ctx.cache_dir, provider_name, &error);
             }
         }
     }
@@ -288,8 +384,8 @@ pub async fn refresh(
     let jobs = names.into_iter().map(|name| {
         let job = tokio::spawn({
             let (name, cfg, resolver) = (name.clone(), Arc::clone(&cfg), Arc::clone(&resolver));
-            let registry = ModelRegistry::with_cache_dir(cache_dir);
-            async move { refresh_one(&name, &cfg, resolver.as_ref(), &registry).await }
+            let cache_dir = cache_dir.to_path_buf();
+            async move { refresh_one(&name, &cfg, resolver.as_ref(), &cache_dir).await }
         });
         async move {
             let fail = |error: String| RefreshOutcome {
@@ -316,8 +412,9 @@ async fn refresh_one(
     name: &str,
     cfg: &rupu_config::Config,
     resolver: &dyn rupu_auth::CredentialResolver,
-    registry: &ModelRegistry,
+    cache_dir: &Path,
 ) -> RefreshOutcome {
+    let registry = ModelRegistry::with_cache_dir(cache_dir);
     let fail = |error: String| RefreshOutcome {
         provider: name.to_string(),
         ok: false,
@@ -364,6 +461,9 @@ async fn refresh_one(
                     "fetched {count} models but could not write the cache: {e}"
                 ));
             }
+            // A manual refresh ignores `resolve`'s failure marker; success
+            // clears it.
+            clear_refresh_failure(cache_dir, name);
             RefreshOutcome {
                 provider: name.to_string(),
                 ok: true,

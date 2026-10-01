@@ -34,7 +34,7 @@ Non-goals:
 |---|---|---|---|
 | Anthropic (api-key + OAuth) | `GET /v1/models?limit=1000`, following `has_more` / `after_id` | `max_input_tokens` (null → 0) | `max_tokens` (null → 0) |
 | Codex / ChatGPT (OAuth) | `GET /backend-api/codex/models?client_version=…` (already called) | `context_window × effective_context_window_percent / 100`; if `context_window` is absent, `max_context_window` | 0; OpenAI Responses omits it (§6.3) |
-| OpenAI (api-key) | first `GET chatgpt.com/backend-api/codex/models` with the API key, keeping only `supported_in_api: true`; if that fails, `GET /v1/models` for ids only | same as the row above | 0 |
+| OpenAI (api-key) | first `GET chatgpt.com/backend-api/codex/models` with the API key, keeping only `supported_in_api: true`, bounded by its own 3s timeout so the fallback still fits the 10s budget; if that fails, `GET /v1/models` for ids only | same as the row above | 0 |
 | GitHub Copilot | live `GET {api}/models` (new; the built-in list becomes an offline fallback with limits of 0) | `capabilities.limits.max_prompt_tokens`; if absent, `max_context_window_tokens` | `capabilities.limits.max_output_tokens` |
 | Gemini AI Studio (api-key) | `GET /v1beta/models`, following `nextPageToken` (new); strip the `models/` prefix from `name` | `inputTokenLimit` | `outputTokenLimit` |
 | Gemini CLI / Antigravity (OAuth) | none; Code Assist has no listing method | 0 | 0 |
@@ -98,6 +98,7 @@ pub async fn resolve(
 
 - **Precedence**, per field: agent frontmatter, then config, then live cache, then unknown.
 - **Refetching.** If the cache is stale or missing, `resolve` refetches through `provider` (§3 timeout). If the fetch fails, it uses the stale entry with `stale: true`. If there's no entry at all, the limit is `Unknown`. `resolve` never errors: an unknown limit is a valid, reported outcome.
+- **Negative cache.** A failed or timed-out refetch (an empty listing counts as failed) is recorded in `<cache_dir>/<provider>.failed` (`{ failed_at, error }`, written atomically). For the next 5 minutes `resolve` skips the refetch and uses the stale entry or `Unknown`, noting `model list refresh failed 3m ago (<error>); retrying after 5m`. Otherwise every launch, and every turn of a session still re-resolving all-unknown limits (§6.5), would pay the full timeout while a provider stays down. A successful refetch clears the marker. A manual `refresh` (CLI, CP Refetch) ignores the marker and clears it on success. A provider with no listing at all (`NotImplemented`) is not a failure and isn't recorded.
 - **Model lookup:**
   1. Strip a `[1m]` suffix, case-insensitive.
   2. Try an exact id match.
