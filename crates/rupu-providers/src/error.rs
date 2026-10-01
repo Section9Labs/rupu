@@ -64,6 +64,15 @@ pub enum ProviderError {
 
     #[error("provider error: {0}")]
     Other(#[source] anyhow::Error),
+
+    /// A request carrying the 1M-context beta (`context-1m-2025-08-07`) was
+    /// refused with Anthropic's 429 "Extra usage is required for long context
+    /// requests": this account has no extra-usage entitlement for 1M context.
+    /// The client has stopped sending the beta, so a retry goes out at the
+    /// standard window. Never retryable as-is — the agent runner clamps the
+    /// input limit and retries once.
+    #[error("long context unavailable (1M beta disabled): {message}")]
+    LongContextUnavailable { message: String },
 }
 
 impl From<reqwest::Error> for ProviderError {
@@ -92,9 +101,11 @@ impl From<serde_json::Error> for ProviderError {
 /// Anthropic's refusal of a long-context request on an account without
 /// extra-usage billing: a 429 whose body says "Extra usage is required for
 /// long context requests" (see the `anthropic-beta` comment in
-/// `anthropic.rs`). Deterministic for the request that drew it — not a rate
-/// limit — so the retry layers must not spend their budget on it; the agent
-/// runner treats it as a context overflow at the account's standard window.
+/// `anthropic.rs`). It is triggered by the 1M-context beta header, not by
+/// the request's size, so it is refused the same way on every attempt — not
+/// a rate limit, and the retry layers must not spend their budget on it. The
+/// Anthropic client turns it into [`ProviderError::LongContextUnavailable`]
+/// and stops sending the beta.
 pub fn is_long_context_refusal(message: &str) -> bool {
     message
         .to_ascii_lowercase()

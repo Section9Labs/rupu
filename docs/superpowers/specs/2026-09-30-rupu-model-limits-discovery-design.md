@@ -20,7 +20,7 @@ Every run uses the real limits of the model it talks to, discovered from the pro
 
 Non-goals:
 - Handling refusals, `pause_turn`, `model_context_window_exceeded`, and the other stop and finish reasons. These belong to the response-outcomes spec (§9).
-- Removing the `contextWindow: 1m` / `[1m]` beta-header gating. That's a follow-up. Discovery never changes which headers are sent.
+- Removing the `contextWindow: 1m` / `[1m]` beta-header gating. That's a follow-up. Discovery never changes which headers are sent; the one exception is the extra-usage fallback in §7, which stops sending the 1M beta after the account refused it.
 - Per-host refetch from the CP.
 - `local.rs` (llama.cpp / Ollama).
 
@@ -186,7 +186,6 @@ The live value describes the model, not the account's entitlement. For example, 
 |---|---|
 | Anthropic | `prompt is too long: N tokens > M maximum` |
 | Anthropic (pre-4.5 validation) | `` input length and `max_tokens` exceed context limit: A + B > C `` — see below; carries `tokens = A` and no max |
-| Anthropic (OAuth, no extra-usage billing) | 429 `Extra usage is required for long context requests` → `max = 200,000`, the account's standard window |
 | OpenAI / Copilot | `maximum context length is M tokens … resulted in N tokens` |
 | Copilot (CAPI `model_max_prompt_tokens_exceeded`) | `prompt token count of N exceeds the limit of M` |
 | vLLM | `Input length (N) exceeds model's maximum context length (M)` |
@@ -194,11 +193,11 @@ The live value describes the model, not the account's entitlement. For example, 
 
 Plus today's three phrases, which match overflow but carry no max.
 
-Sources for the formats added after the first table: the Anthropic validation error is quoted verbatim from real API responses in anthropics/claude-code#42 and #228; the Copilot error from microsoft/vscode `extensions/copilot/test/inline/inlineEditCode.stest.ts`; the 429 from the `anthropic-beta` comment in `anthropic.rs`.
+Sources for the formats added after the first table: the Anthropic validation error is quoted verbatim from real API responses in anthropics/claude-code#42 and #228; the Copilot error from microsoft/vscode `extensions/copilot/test/inline/inlineEditCode.stest.ts`.
 
 **`input + max_tokens > window`.** Raising `max_tokens` to the model's real cap makes Anthropic's pre-4.5 validation error reachable. It means the input fits and the output reservation doesn't, so it never clamps the input limit. The runner retries the turn once with `max_tokens = C − A − 1000` for that request only and writes a `model_limits_clamped` notice saying the output cap was lowered for this request. If `C − A − 1000` is below 1024 (or the retry fails the same way), the error is handled as an overflow with no max: compact, then trim.
 
-**The 429 is not a rate limit.** It refuses the same request every time, so the retry layers (`tuned::is_retryable`, the Anthropic client's own 429 loop) surface it at once, and the runner checks for overflow before its transient-error retry.
+**The extra-usage 429 is not an overflow.** Anthropic answers 429 `Extra usage is required for long context requests` when a request carries the 1M-context beta (`context-1m-2025-08-07`: the `[1m]` suffix on OAuth, `context_window: OneMillion` with an API key) and the account has no extra-usage billing (see the `anthropic-beta` comment in `anthropic.rs`). The header triggers it, not the request's size, so every retry with the beta — the compaction summariser included — is refused the same way; it is not a rate limit either. The retry layers (`tuned::is_retryable`, the Anthropic client's own 429 loop) surface it at once. When the refused request carried the beta, the client disables the beta for the rest of its life and returns `ProviderError::LongContextUnavailable`. The runner then clamps the input limit to 200,000 (`Observed`), writes `Notice { kind: "model_limits_clamped" }` (`this account has no extra-usage entitlement for 1M context — using the 200,000 window (1M beta disabled); input 1,000,000 → 200,000`), and retries the turn once, now without the beta. If the input still exceeds 200K, the server answers `prompt is too long` and the overflow handling above compacts. This is the one case where a run changes which headers it sends.
 
 None of these formats are documented, so each is pinned by a fixture test. OpenAI's wording doesn't match any of today's three phrases (a gap the parsing audit found), and this table closes it.
 

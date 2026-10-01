@@ -718,14 +718,70 @@ impl LlmProvider for FailFirst {
     }
 }
 
-/// Anthropic's 429 "Extra usage is required for long context requests" (an
-/// account without extra-usage billing that sent > 200K) is an overflow at
-/// the account's standard 200K window, not a rate limit: the run clamps to
-/// 200K and compacts instead of burning retries and failing. A real
-/// `Api { status: 429 }` proves the overflow check runs before the
-/// transient-error retry classifier.
+/// The client's `LongContextUnavailable`: a request carrying the 1M beta was
+/// refused with Anthropic's extra-usage 429, so this account has no
+/// entitlement for 1M context, and the client has stopped sending the beta.
+fn long_context_unavailable() -> ProviderError {
+    ProviderError::LongContextUnavailable {
+        message: "Extra usage is required for long context requests".into(),
+    }
+}
+
+fn live_1m_limits() -> ModelLimits {
+    discovered(
+        1_000_000,
+        128_000,
+        LimitSource::Live {
+            fetched_at: chrono::Utc::now(),
+            stale: false,
+        },
+    )
+    .with_percent(50)
+}
+
+/// On `LongContextUnavailable` the run falls back to the standard window:
+/// it clamps the input limit to 200,000 (`Observed`), says why, and retries
+/// the turn once — the retry goes out without the beta. It is neither
+/// treated as a rate limit nor compacted for (nothing overflowed).
 #[tokio::test]
-async fn long_context_entitlement_429_clamps_to_200k_and_compacts() {
+async fn long_context_unavailable_clamps_to_200k_and_retries_once() {
+    let inner = CapturingMockProvider::new(vec![final_text_turn(usage(300, 6, 0))]);
+    let captured = inner.captured.clone();
+    let provider = FailFirst {
+        err: Some(long_context_unavailable()),
+        inner,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.limits = live_1m_limits();
+    let result = run_agent(opts).await.expect("the retry succeeds");
+
+    assert_eq!(
+        result.final_limits.input,
+        Limit::new(200_000, LimitSource::Observed)
+    );
+    let n = notices(&transcript);
+    assert!(
+        n.iter().any(|(k, m)| k == "model_limits_clamped"
+            && m.contains("no extra-usage entitlement for 1M context")
+            && m.contains("1M beta disabled")
+            && m.contains("1,000,000 → 200,000")),
+        "{n:?}"
+    );
+    assert!(
+        !n.iter().any(|(k, _)| k == "provider_retry"),
+        "not retried as a rate limit: {n:?}"
+    );
+    assert_eq!(compaction_count(&transcript), 0);
+    assert_eq!(captured.lock().unwrap().len(), 1, "exactly one retry");
+}
+
+/// If the retried turn (now without the beta) still overflows the 200K
+/// window, the server answers `prompt is too long` and the existing overflow
+/// handling compacts.
+#[tokio::test]
+async fn long_context_unavailable_then_overflow_reaches_compaction() {
     let big = |role: Role, label: &str| Message {
         role,
         content: vec![ContentBlock::Text {
@@ -733,15 +789,13 @@ async fn long_context_entitlement_429_clamps_to_200k_and_compacts() {
         }],
     };
     let inner = CapturingMockProvider::new(vec![
+        ScriptedTurn::ProviderError("prompt is too long: 250000 tokens > 200000 maximum".into()),
         summary_turn(usage(100, 10, 0)),
         final_text_turn(usage(300, 6, 0)),
     ]);
     let captured = inner.captured.clone();
     let provider = FailFirst {
-        err: Some(ProviderError::Api {
-            status: 429,
-            message: "Extra usage is required for long context requests".into(),
-        }),
+        err: Some(long_context_unavailable()),
         inner,
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -753,35 +807,18 @@ async fn long_context_entitlement_429_clamps_to_200k_and_compacts() {
         big(Role::User, "u0"),
         big(Role::Assistant, "a1"),
     ];
-    opts.limits = discovered(
-        1_000_000,
-        128_000,
-        LimitSource::Live {
-            fetched_at: chrono::Utc::now(),
-            stale: false,
-        },
-    )
-    .with_percent(50);
+    opts.limits = live_1m_limits();
     let result = run_agent(opts).await.expect("compaction recovers");
 
     assert_eq!(
         result.final_limits.input,
         Limit::new(200_000, LimitSource::Observed)
     );
-    let n = notices(&transcript);
-    assert!(
-        n.iter()
-            .any(|(k, m)| k == "model_limits_clamped" && m.contains("1,000,000 → 200,000")),
-        "{n:?}"
-    );
-    assert!(
-        !n.iter().any(|(k, _)| k == "provider_retry"),
-        "not retried as a rate limit: {n:?}"
-    );
     assert_eq!(compaction_count(&transcript), 1);
-    let reqs = captured.lock().unwrap().clone();
-    assert_eq!(reqs.len(), 2, "the summariser call, then the retried turn");
-    assert!(message_text(&reqs[1].messages[0]).contains(SUMMARY));
+    assert!(!notices(&transcript)
+        .iter()
+        .any(|(k, _)| k == "context_trim"));
+    assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
 }
 
 /// `Compaction.seq` numbers the compactions that actually ran, with no gaps:

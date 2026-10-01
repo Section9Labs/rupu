@@ -935,6 +935,10 @@ pub struct AnthropicClient {
     /// client's own 429 backoff sleep instead of starving every other
     /// concurrent Anthropic call for the whole ladder.
     semaphore: Option<Arc<Semaphore>>,
+    /// Set once a request carrying the 1M-context beta was refused with the
+    /// extra-usage 429: the account has no entitlement, so the beta is never
+    /// sent again by this client (the run falls back to the standard window).
+    long_context_disabled: bool,
 }
 
 impl AnthropicClient {
@@ -956,6 +960,7 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
         }
     }
 
@@ -1051,6 +1056,7 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
         }
     }
 
@@ -1076,6 +1082,7 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
         }
     }
 
@@ -1115,6 +1122,7 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
         }
     }
 
@@ -1142,6 +1150,7 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
         }
     }
 
@@ -1187,6 +1196,51 @@ impl AnthropicClient {
             }
         }
         Ok(())
+    }
+
+    /// Whether a request for `model` / `context_window` goes out with the
+    /// 1M-context beta: the `[1m]` suffix on the OAuth path,
+    /// `context_window: OneMillion` on the api-key path — and never once an
+    /// extra-usage refusal disabled it.
+    fn sends_1m_beta(
+        &self,
+        model: &str,
+        context_window: Option<crate::model_tier::ContextWindow>,
+    ) -> bool {
+        if self.long_context_disabled {
+            return false;
+        }
+        match &self.auth {
+            AuthMethod::ApiKey(_) => matches!(
+                context_window,
+                Some(crate::model_tier::ContextWindow::OneMillion)
+            ),
+            AuthMethod::OAuth { .. } => model_has_1m_suffix(model),
+        }
+    }
+
+    /// The error for a 429 that refuses long context ("Extra usage is
+    /// required for long context requests"). It is triggered by the 1M beta,
+    /// not by the request's size, so when this request carried the beta the
+    /// account has no extra-usage entitlement for it: stop sending the beta
+    /// for the rest of this client's life and report
+    /// [`ProviderError::LongContextUnavailable`] for the runner to fall back
+    /// on. Without the beta it is surfaced as the plain 429 it is. Either way
+    /// it is not retried — the same request is refused every time.
+    fn long_context_refusal(&mut self, request: &LlmRequest, body: String) -> ProviderError {
+        if self.sends_1m_beta(&request.model, request.context_window) {
+            warn!(
+                model = request.model.as_str(),
+                "no extra-usage entitlement for 1M context; disabling the context-1m beta"
+            );
+            self.long_context_disabled = true;
+            ProviderError::LongContextUnavailable { message: body }
+        } else {
+            ProviderError::Api {
+                status: 429,
+                message: body,
+            }
+        }
     }
 
     /// Apply auth headers to a request builder based on auth method.
@@ -1241,10 +1295,7 @@ impl AnthropicClient {
                 // `context-1m-2025-08-07` beta. OAuth path always sends
                 // it via the static beta CSV; the api-key path opts in
                 // per-request based on `LlmRequest.context_window`.
-                if matches!(
-                    context_window,
-                    Some(crate::model_tier::ContextWindow::OneMillion)
-                ) {
+                if self.sends_1m_beta(model, context_window) {
                     b = b.header("anthropic-beta", "context-1m-2025-08-07");
                 }
                 b
@@ -1256,7 +1307,12 @@ impl AnthropicClient {
                 // an api-key-path-only opt-in (the OAuth path uses the
                 // suffix because that's what claude-cli does and what the
                 // server gates on).
-                let _ = context_window;
+                // After an extra-usage refusal the suffix no longer opts in.
+                let model = if self.long_context_disabled {
+                    crate::model_registry::strip_1m(model)
+                } else {
+                    model
+                };
                 let beta_csv = build_oauth_beta_csv(model, wants_context_management);
                 b.header("Authorization", format!("Bearer {access_token}"))
                     .header("anthropic-beta", beta_csv)
@@ -1582,10 +1638,7 @@ impl AnthropicClient {
                 );
                 // Not a rate limit: the same request is refused every time.
                 if crate::error::is_long_context_refusal(&text) {
-                    return Err(ProviderError::Api {
-                        status: 429,
-                        message: text,
-                    });
+                    return Err(self.long_context_refusal(request, text));
                 }
                 last_err = Some(ProviderError::Api {
                     status: 429,
@@ -1753,10 +1806,7 @@ impl AnthropicClient {
                         // Not a rate limit: the same request is refused
                         // every time.
                         if crate::error::is_long_context_refusal(&text) {
-                            return Err(ProviderError::Api {
-                                status: 429,
-                                message: text,
-                            });
+                            return Err(self.long_context_refusal(request, text));
                         }
                         last_err = Some(ProviderError::Api {
                             status: 429,
@@ -5417,6 +5467,129 @@ mod tests {
             );
         }
         m.assert_hits(2);
+    }
+
+    fn no_beta_header(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        !req.headers.as_ref().is_some_and(|h| {
+            h.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+        })
+    }
+
+    const EXTRA_USAGE_429: &str =
+        r#"{"error":{"message":"Extra usage is required for long context requests"}}"#;
+
+    /// The extra-usage 429 on a request that carried the 1M beta means the
+    /// account has no extra-usage entitlement for 1M context — every request
+    /// with the beta is refused the same way. The client reports
+    /// `LongContextUnavailable` and stops sending the beta for the rest of its
+    /// life, so the next request goes out without it. OAuth: the beta comes
+    /// from the `[1m]` suffix (send and stream paths).
+    #[tokio::test]
+    async fn oauth_long_context_refusal_disables_the_1m_beta() {
+        use httpmock::prelude::*;
+        let model = "claude-sonnet-4-6[1m]";
+        let with_1m = build_oauth_beta_csv(model, false);
+        let without_1m = build_oauth_beta_csv("claude-sonnet-4-6", false);
+        assert!(with_1m.contains("context-1m-2025-08-07"));
+        for streamed in [false, true] {
+            let server = MockServer::start();
+            let refused = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .header("anthropic-beta", with_1m.clone());
+                then.status(429).body(EXTRA_USAGE_429);
+            });
+            let without = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .header("anthropic-beta", without_1m.clone());
+                then.status(400).body("served without the beta");
+            });
+            let mut client = AnthropicClient::from_auth_with_url(
+                AuthMethod::OAuth {
+                    access_token: "tok".into(),
+                    refresh_token: "r".into(),
+                    expires_ms: u64::MAX,
+                },
+                format!("{}/v1/messages", server.url("")),
+                Arc::new(rupu_netflow::NullSink),
+            );
+            let mut request = make_request(None);
+            request.model = model.into();
+            async fn call(
+                client: &mut AnthropicClient,
+                request: &LlmRequest,
+                streamed: bool,
+            ) -> Result<LlmResponse, ProviderError> {
+                if streamed {
+                    client.stream(request, |_ev| {}).await
+                } else {
+                    client.send(request).await
+                }
+            }
+            let first = call(&mut client, &request, streamed).await.unwrap_err();
+            assert!(
+                matches!(&first, ProviderError::LongContextUnavailable { .. }),
+                "streamed={streamed}: {first:?}"
+            );
+            let second = call(&mut client, &request, streamed).await.unwrap_err();
+            assert!(
+                matches!(&second, ProviderError::Api { status: 400, .. }),
+                "streamed={streamed}: the retry goes out without the beta: {second:?}"
+            );
+            refused.assert_hits(1);
+            without.assert_hits(1);
+        }
+    }
+
+    /// Same on the api-key path, where the beta comes from
+    /// `context_window: OneMillion`.
+    #[tokio::test]
+    async fn api_key_long_context_refusal_disables_the_1m_beta() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let refused = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("anthropic-beta", "context-1m-2025-08-07");
+            then.status(429).body(EXTRA_USAGE_429);
+        });
+        let without = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .matches(no_beta_header);
+            then.status(400).body("served without the beta");
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let mut request = make_request(None);
+        request.context_window = Some(crate::model_tier::ContextWindow::OneMillion);
+        let first = client.send(&request).await.unwrap_err();
+        assert!(
+            matches!(first, ProviderError::LongContextUnavailable { .. }),
+            "{first:?}"
+        );
+        let second = client.send(&request).await.unwrap_err();
+        assert!(
+            matches!(second, ProviderError::Api { status: 400, .. }),
+            "{second:?}"
+        );
+        refused.assert_hits(1);
+        without.assert_hits(1);
+    }
+
+    /// `LongContextUnavailable` is not retried by the retry layers either.
+    #[test]
+    fn long_context_unavailable_is_not_retryable() {
+        assert!(!crate::tuned::is_retryable(
+            &ProviderError::LongContextUnavailable {
+                message: EXTRA_USAGE_429.into()
+            }
+        ));
     }
 
     // ── I-84: stream()'s idle-restart / 429-retry loops share one budget ──

@@ -75,6 +75,7 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
         | E::BadRequest { .. }
         | E::ModelUnavailable { .. }
         | E::Preflight(_)
+        | E::LongContextUnavailable { .. }
         | E::Other(_) => false,
     }
 }
@@ -184,10 +185,9 @@ pub(crate) struct Overflow {
     pub max: Option<u32>,
 }
 
-/// The input limit to assume when Anthropic refuses a long-context request
-/// with a 429 "Extra usage is required for long context requests": the
-/// account's standard window.
-const LONG_CONTEXT_REFUSAL_WINDOW: u32 = 200_000;
+/// The input limit a run falls back to on `ProviderError::LongContextUnavailable`
+/// (no extra-usage entitlement for 1M context): the standard window.
+const STANDARD_CONTEXT_WINDOW: u32 = 200_000;
 
 pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
     let e = err.to_ascii_lowercase();
@@ -209,16 +209,6 @@ pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
         return Some(Overflow {
             tokens: Some(cap.input),
             max: None,
-        });
-    }
-    // Anthropic: a 429 "Extra usage is required for long context requests" on
-    // an account without extra-usage billing (see the `anthropic-beta`
-    // comment in rupu-providers/src/anthropic.rs). The account's window is
-    // the standard one, whatever the model's.
-    if rupu_providers::error::is_long_context_refusal(err) {
-        return Some(Overflow {
-            tokens: None,
-            max: Some(LONG_CONTEXT_REFUSAL_WINDOW),
         });
     }
     // GitHub Copilot (CAPI `model_max_prompt_tokens_exceeded`): "prompt token
@@ -1433,6 +1423,9 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // An `input + max_tokens > window` error lowers this request's
             // output cap and retries at most once per turn.
             let mut output_cap_lowered = false;
+            // `LongContextUnavailable` falls back to the standard window and
+            // retries at most once per turn.
+            let mut long_context_fallback = false;
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
                 let step: CallStep = if opts.no_stream {
@@ -1531,6 +1524,40 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     CallStep::Paused => break CallOutcome::Paused,
                     CallStep::Err(e) => {
                         let e_str = e.to_string();
+                        // The account has no extra-usage entitlement for 1M
+                        // context, and the client has stopped sending the 1M
+                        // beta. Fall back to the standard window and retry
+                        // once; if the input is still too large, the server
+                        // answers `prompt is too long` and the overflow
+                        // handling below compacts.
+                        if matches!(e, rupu_providers::ProviderError::LongContextUnavailable { .. })
+                            && !long_context_fallback
+                        {
+                            use rupu_providers::model_limits::group_thousands;
+                            long_context_fallback = true;
+                            let before = opts.limits.input.tokens;
+                            let clamped = opts.limits.clamp_input(STANDARD_CONTEXT_WINDOW);
+                            writer.write(&Event::Notice {
+                                kind: "model_limits_clamped".into(),
+                                message: format!(
+                                    "this account has no extra-usage entitlement for 1M context — using the {} window (1M beta disabled){}",
+                                    group_thousands(u64::from(STANDARD_CONTEXT_WINDOW)),
+                                    if clamped {
+                                        format!(
+                                            "; input {} → {}",
+                                            before.map_or("unknown".to_string(), |b| {
+                                                group_thousands(u64::from(b))
+                                            }),
+                                            group_thousands(u64::from(STANDARD_CONTEXT_WINDOW)),
+                                        )
+                                    } else {
+                                        String::new()
+                                    }
+                                ),
+                            })?;
+                            writer.flush()?;
+                            continue;
+                        }
                         // `input + max_tokens > window`: the input fits, the
                         // output reservation does not. Lower THIS request's
                         // cap and retry once; the input limit is untouched.
@@ -3148,20 +3175,18 @@ mod context_trim_tests {
         );
     }
 
-    /// Anthropic's 429 for an account without extra-usage billing that sent a
-    /// long-context request (see the `anthropic-beta` comment in
-    /// rupu-providers/src/anthropic.rs). The account's window is the
-    /// standard 200K, so the run clamps there and compacts.
+    /// Anthropic's extra-usage 429 is triggered by the 1M beta header, not by
+    /// the request's size (see the `anthropic-beta` comment in
+    /// rupu-providers/src/anthropic.rs), so it is no overflow: compacting
+    /// cannot make the same request acceptable. The client turns it into
+    /// `ProviderError::LongContextUnavailable`, handled on its own.
     #[test]
-    fn long_context_entitlement_429_is_an_overflow_at_200k() {
+    fn long_context_entitlement_429_is_not_an_overflow() {
         assert_eq!(
             parse_context_overflow(
                 "API error 429: Extra usage is required for long context requests"
             ),
-            Some(Overflow {
-                tokens: None,
-                max: Some(200_000)
-            })
+            None
         );
     }
 
