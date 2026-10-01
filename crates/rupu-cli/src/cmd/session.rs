@@ -7776,7 +7776,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // (timeout, network blip), not an answer: resolve again — a cache read
         // unless stale — and persist the result below.
         let limits = match session.model_limits.clone() {
-            Some(l) if !l.is_unresolved() => l,
+            // Without its note: a note describes the resolution that wrote
+            // it, often relative to that moment ("refresh failed 2m ago"),
+            // and would otherwise be repeated by every later turn.
+            Some(l) if !l.is_unresolved() => {
+                rupu_providers::model_limits::ModelLimits { note: None, ..l }
+            }
             _ => {
                 rupu_runtime::model_limits::resolve(
                     rupu_runtime::model_limits::LimitOverrides {
@@ -7862,8 +7867,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.last_run_id = Some(args.run_id.clone());
         session.last_transcript_path = Some(transcript_path.clone());
         // On success AND failure: the limits carry to every later turn
-        // without refetching.
-        session.model_limits = Some(final_limits);
+        // without refetching. The note stays with this turn's notice: it
+        // describes this resolution, not the limits.
+        session.model_limits = Some(rupu_providers::model_limits::ModelLimits {
+            note: None,
+            ..final_limits
+        });
 
         let mut run_status = Some(RunStatus::Error);
         let mut duration_ms = 0;
@@ -11076,6 +11085,49 @@ mod tests {
         let (after, _) = read_session(&global, &learned.session_id).expect("read learned");
         let l = after.model_limits.expect("limits kept");
         assert_eq!(l.input, Limit::new(150_000, LimitSource::Observed));
+    }
+
+    /// A note is about the resolution that produced it — often relative to
+    /// that moment ("model list refresh failed 2m ago …"). Reused verbatim,
+    /// every later turn's notice would repeat the stale "2m ago" for hours.
+    /// Stored limits are persisted without their note, and a note on an older
+    /// stored value is not repeated.
+    #[tokio::test]
+    async fn a_stored_note_is_not_repeated_by_later_turns() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_limits_note01");
+        record.message_history = Vec::new();
+        record.compact_at_percent = None;
+        record.context_window_tokens = None;
+        record.max_tokens = None;
+        let mut stored = rupu_providers::model_limits::ModelLimits::fixed(123_456, 7_890);
+        stored.note =
+            Some("model list refresh failed 2m ago (connection refused); retrying after 5m".into());
+        record.model_limits = Some(stored);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        with_mock_home(
+            &global,
+            r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_limits_note".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("turn completes");
+
+        let notice = model_limits_notice(&record.transcripts_dir.join("run_limits_note.jsonl"));
+        assert!(notice.contains("input 123,456"), "reused: {notice}");
+        assert!(!notice.contains("2m ago"), "stale note repeated: {notice}");
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(
+            after.model_limits.expect("limits kept").note,
+            None,
+            "persisted without the note"
+        );
     }
 
     /// An all-unknown stored value re-resolves on every turn (above). While
