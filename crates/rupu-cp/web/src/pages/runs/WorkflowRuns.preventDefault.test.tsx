@@ -33,7 +33,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../lib/api';
-import type { HostView, RunListRow } from '../../lib/api';
+import type { RunListRow } from '../../lib/api';
+import { REG_LOCAL } from '../../lib/perHost/testUtils';
 import WorkflowRuns from './WorkflowRuns';
 
 afterEach(() => {
@@ -41,16 +42,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
-
 function stubDeps() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
 }
 
 function makeRun(overrides: Partial<RunListRow>): RunListRow {

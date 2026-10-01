@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-// WorkflowRuns — One Control Language migration (Phase 2, Task C).
-// Covers: host filter drives the server request (not client-side fan-out
-// filtering); the FilterBar slot order; lifecycle/trigger FilterPills
+// WorkflowRuns — One Control Language migration (Phase 2, Task C), then
+// per-host progressive loading (spec 2026-10-01).
+// Covers: All hosts by default with one request per registered host and
+// honest per-host loading/offline state; the FilterBar slot order; lifecycle/trigger FilterPills
 // driving fetch params + client-side filtering; kit empty/loading states;
 // and the row-action (archive/restore/delete) ring buttons.
 
@@ -9,8 +10,9 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api } from '../../lib/api';
-import type { HostView, RunListRow } from '../../lib/api';
+import { api, ApiError } from '../../lib/api';
+import type { RunListRow } from '../../lib/api';
+import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import WorkflowRuns from './WorkflowRuns';
 
 afterEach(() => {
@@ -18,23 +20,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
-const REMOTE_HOST: HostView = {
-  id: 'host_prod',
-  name: 'prod',
-  transport_kind: 'http_cp',
-  status: 'online',
-  active_run_count: 2,
-};
-
 function stubDeps() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
 }
 
 function renderPage() {
@@ -88,57 +75,65 @@ describe('WorkflowRuns archived mode — kind-filtered fetch', () => {
   });
 });
 
-describe('WorkflowRuns host filter — server-driven', () => {
-  it('default fetch is called with host: "local" (fast path, not fan-out)', async () => {
+describe('WorkflowRuns host filter — per-host loading (spec 2026-10-01)', () => {
+  it('defaults to All hosts and fetches every registered host with its own host param', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
-
     renderPage();
-
-    await waitFor(() =>
-      expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' })),
-    );
+    await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
+    expect(screen.getByLabelText('Host filter')).toHaveValue('__all__');
   });
 
-  it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
+  it('renders This host, All hosts, then registered (non-local) hosts', async () => {
     stubDeps();
     vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
-
     renderPage();
     await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-
     const options = screen.getAllByRole('option') as HTMLOptionElement[];
     expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
   });
 
-  it('"All hosts" option fetches without a host param (fan-out branch)', async () => {
+  it('paints local rows while a remote host is still loading, naming it in the strip', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([makeRun({ id: 'run_l' })]) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
+    expect(screen.getByText('loading…')).toBeInTheDocument();
+  });
+
+  it('shows an offline remote honestly without hiding local rows', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([makeRun({ id: 'run_l' })])
+        : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/not included: prod \(offline\)/)).toBeInTheDocument());
+    expect(screen.getByText('deploy-prod')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('This host fetches only local', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
-
     renderPage();
-    await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: '__all__' } });
-
-    await waitFor(() => {
-      const calls = runsSpy.mock.calls;
-      const lastParams = calls[calls.length - 1]?.[0];
-      expect(lastParams?.host).toBeUndefined();
-    });
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
+    runsSpy.mockClear();
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'local' } });
+    await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(0);
   });
 
   it('remote host option fetches with that host id', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
-
     renderPage();
-    // Wait for the remote host option to appear (fetched from api.getHosts).
-    await waitFor(() =>
-      expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument(),
-    );
-
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'host_prod' } });
-
     await waitFor(() =>
       expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })),
     );
@@ -195,17 +190,15 @@ describe('WorkflowRuns — lifecycle FilterPills drives the fetch', () => {
     );
   });
 
-  it('only the active/Running lifecycle polls every 5s (unchanged semantics)', async () => {
-    vi.useFakeTimers();
+  it('only the active/Running lifecycle polls local every 5s', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
     renderPage();
-
-    await vi.waitFor(() => expect(runsSpy).toHaveBeenCalledTimes(1));
-
+    await vi.waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
     await vi.advanceTimersByTimeAsync(5000);
-    expect(runsSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
-
+    expect(callsFor(runsSpy, 'local').length).toBeGreaterThanOrEqual(2);
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1); // remotes wait for the 60s cadence
     vi.useRealTimers();
   });
 });
@@ -268,6 +261,33 @@ describe('WorkflowRuns — kit empty/loading states', () => {
 
     resolveFn([]);
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+  });
+});
+
+describe('WorkflowRuns — per-host empty states', () => {
+  it('names the host that is still loading while nothing has painted yet', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No workflow runs yet')).not.toBeInTheDocument();
+  });
+
+  it('does not claim "no runs yet" when a host could not be reached', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([])
+        : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByText('No workflow runs on the hosts that answered')).toBeInTheDocument(),
+    );
+    expect(screen.getByText('Not included: prod (offline).')).toBeInTheDocument();
+    expect(screen.queryByText('No workflow runs yet')).not.toBeInTheDocument();
   });
 });
 
@@ -385,6 +405,23 @@ describe('WorkflowRuns — row actions (ring buttons)', () => {
     fireEvent.click(screen.getByLabelText('Delete run run_remote'));
 
     await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('run_remote', 'host_prod'));
+  });
+
+  it('Archive on a remote-host row re-syncs only that host, not every host', async () => {
+    stubDeps();
+    const runsSpy = vi
+      .spyOn(api, 'getWorkflowRuns')
+      .mockImplementation(onlyHost('host_prod', [makeRun({ id: 'run_remote', host_id: 'host_prod' })]));
+    vi.spyOn(api, 'archiveRun').mockResolvedValue(undefined);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
+    expect(callsFor(runsSpy, 'local')).toHaveLength(1);
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
+
+    fireEvent.click(screen.getByLabelText('Archive run run_remote'));
+
+    await waitFor(() => expect(callsFor(runsSpy, 'host_prod')).toHaveLength(2));
+    expect(callsFor(runsSpy, 'local')).toHaveLength(1);
   });
 });
 
