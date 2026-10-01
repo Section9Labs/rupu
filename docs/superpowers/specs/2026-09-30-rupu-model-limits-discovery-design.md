@@ -59,11 +59,12 @@ Notes:
 
 ## 4. Registry cache v2
 
-`ModelRegistry` (`crates/rupu-providers/src/model_registry.rs`) keeps its sources and order: Custom (config), then Live (cache, 1h TTL), then BakedIn (Copilot only).
+`ModelRegistry` (`crates/rupu-providers/src/model_registry.rs`) keeps its sources and order: Custom (config), then Live (cache, 1h TTL), then BakedIn (Copilot, and Gemini, whose Code Assist path has no listing). That order is the catalog view (`rupu models list`, the CP). `resolve` (§5) takes limits from Custom and Live only: baked-in rows carry no limits and never supply one.
 
 - **v2 cache file.** `~/.rupu/cache/models/<provider>.json` becomes `{ "schema": 2, "fetched_at", "models": [{ "id", "context_window", "max_output_tokens" }] }`.
-- **v1 files are stale.** A v1 file (ids only, no `schema`) is treated as stale and refetched, never read as "limits 0".
-- **Atomic writes.** Writes go to a temp file in the same directory, then rename, so fan-out units launching together can't tear the file. Two units refetching at the same moment is acceptable.
+- **Any other schema is stale.** A v1 file (ids only, no `schema`) and a file written by a newer rupu (`schema: 3`) are ignored and refetched, never read as "limits 0".
+- **Atomic writes.** Writes go to a temp file in the same directory, then rename, so fan-out units launching together can't tear the file; a failed write or rename removes its temp file. Two units refetching at the same moment is acceptable.
+- **A bad listing never becomes a cache.** A body that isn't JSON, or has none of the arrays the provider documents (Anthropic, Codex, Copilot, OpenAI-compatible), is a `ProviderError::Json`, not an empty catalog; a listing that parses but holds no models is a failed refresh (§5). Neither overwrites the cache. Paged listings (Anthropic `after_id`, Gemini `pageToken`) stop on a repeated cursor and keep the first occurrence of a repeated model id. A discovered 0 means "the listing did not say": `ModelPool::merge_discovered` never overwrites a known limit with it, and Copilot treats a 0 limit as absent.
 - **Cache key.** The cache is keyed by the **configured provider name** (`anthropic`, `openai`, a custom alias), never by `LlmProvider::provider_id()`. `provider_id()` is known to be wrong for `local.rs` and `broker_client.rs`, which both return `Anthropic`. That bug is tracked in the response-outcomes spec.
 - **Config entries.** `[[providers.X.models]]` entries (`CustomModel { id, context_window, max_output }`, `crates/rupu-config/src/provider_config.rs:44`) stay the Custom source. When both exist for the same id, the config value wins over the live value, field by field.
 
