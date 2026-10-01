@@ -1158,8 +1158,17 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                             loaded.finished_at = Some(finished_at);
                             loaded.final_output = final_output;
                             loaded.error_message = error_message;
-                            if let Err(e) = store.update(&loaded) {
-                                warn!(error = %e, "failed to update agent run.json");
+                            // Under the run lock, on the blocking pool: a cancel
+                            // that landed since the load is kept.
+                            match store
+                                .blocking(move |s| s.update_unless_cancelled(&loaded))
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => warn!(
+                                    "the agent run was cancelled on disk while finishing; keeping that status"
+                                ),
+                                Err(e) => warn!(error = %e, "failed to update agent run.json"),
                             }
                         }
                         Err(e) => warn!(error = %e, "failed to load agent run for update"),

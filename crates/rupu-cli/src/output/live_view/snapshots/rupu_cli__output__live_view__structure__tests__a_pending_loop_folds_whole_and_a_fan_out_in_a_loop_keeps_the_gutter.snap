@@ -1,0 +1,16 @@
+---
+source: crates/rupu-cli/src/output/live_view/structure.rs
+expression: s
+---
+  ├─╭─ ↻ loop:again  until {{ steps.judge.output }} · max 3 ···· ◐ running
+  │ ├─╭─ ⊞ hunt  for_each · runtime fan-out ···· ◐ running
+  │ │ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26
+  │ │ ◐├─ svc-56  otter#57 · anthropic/claude-opus-5-5 ···· ◐ running
+  │ │ ◐├─ svc-57  anthropic/claude-opus-5-5 ···· ◐ running
+  │ │ ◐├─ svc-58  otter#59 · anthropic/claude-opus-5-5 ···· ◐ running
+  │ │ ◐├─ svc-59  otter#60 · anthropic/claude-opus-5-5 ···· ◐ running
+  │ │ │ … +82 more · [enter] expand
+  │ │ ◄─╰─
+  │ │
+  │ ○  judge  judge
+  │ ◄─ ↺ loop:again  loop-back

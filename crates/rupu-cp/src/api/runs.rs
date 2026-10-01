@@ -172,12 +172,11 @@ async fn approve_run(
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.0.mode);
-    // On the blocking pool: the decision is recorded under the run lock,
-    // whose (bounded) wait blocks its thread.
-    let (run_id, gate) = (id.clone(), q.gate.clone());
+    // On the blocking pool: the gate methods take the run lock.
+    let (rid, gate) = (id.clone(), q.gate.clone());
     s.run_store
         .blocking(move |store| {
-            store.request_resume_approval(&run_id, "web", mode.as_deref(), now, gate.as_deref())
+            store.request_resume_approval(&rid, "web", mode.as_deref(), now, gate.as_deref())
         })
         .await
         .map_err(|e| map_approval_err(&id, e))?;
@@ -233,11 +232,11 @@ async fn reject_run(
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let reason = body.reason.unwrap_or_default();
-    // On the blocking pool, as `approve_run`.
-    let (run_id, gate) = (id.clone(), q.gate.clone());
+    // On the blocking pool: the gate methods take the run lock.
+    let (rid, gate) = (id.clone(), q.gate.clone());
     s.run_store
         .blocking(move |store| {
-            store.request_resume_rejection(&run_id, "web", &reason, now, gate.as_deref())
+            store.request_resume_rejection(&rid, "web", &reason, now, gate.as_deref())
         })
         .await
         .map_err(|e| map_approval_err(&id, e))?;
@@ -419,8 +418,11 @@ async fn resume_run(
         )));
     }
     let now = chrono::Utc::now();
+    // On the blocking pool: the gate methods take the run lock.
+    let rid = id.clone();
     s.run_store
-        .request_resume_approval(&id, "web", None, now, None)
+        .blocking(move |store| store.request_resume_approval(&rid, "web", None, now, None))
+        .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");

@@ -176,3 +176,79 @@ steps:
     });
     insta::assert_yaml_snapshot!(rows);
 }
+
+#[test]
+fn snapshot_branch_with_then_and_else_arms() {
+    // The not-taken arm is Skipped; the taken arm Complete — the lanes
+    // are coloured by their target so taken vs skipped is visible.
+    let wf = fixture(
+        r#"
+name: branchy
+steps:
+  - id: classify
+    agent: classifier
+    prompt: hi
+    next: [route]
+  - id: route
+    branch:
+      condition: "{{ steps.classify.output == 'bug' }}"
+      then: [fix, notify]
+      else: [close]
+  - id: fix
+    agent: fixer
+    prompt: hi
+  - id: notify
+    agent: notifier
+    prompt: hi
+  - id: close
+    agent: closer
+    prompt: hi
+"#,
+    );
+    let rows = render_rows(&wf, |id| match id {
+        "classify" | "route" | "fix" | "notify" => rupu_app_canvas::NodeStatus::Complete,
+        "close" => rupu_app_canvas::NodeStatus::Skipped,
+        _ => rupu_app_canvas::NodeStatus::Waiting,
+    });
+    insta::assert_yaml_snapshot!("branch_with_then_and_else_arms", rows);
+}
+
+#[test]
+fn snapshot_loop_framing_members() {
+    let wf = fixture(
+        r#"
+name: looped
+steps:
+  - id: seed
+    agent: seeder
+    prompt: hi
+    next: [gen]
+  - id: gen
+    agent: generator
+    prompt: hi
+  - id: test
+    agent: tester
+    prompt: hi
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: hi
+    depends_on: [test]
+  - id: ship
+    agent: shipper
+    prompt: hi
+    depends_on: [critique]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#,
+    );
+    let rows = render_rows(&wf, |id| match id {
+        "seed" | "gen" => rupu_app_canvas::NodeStatus::Complete,
+        "test" => rupu_app_canvas::NodeStatus::Working,
+        _ => rupu_app_canvas::NodeStatus::Waiting,
+    });
+    insta::assert_yaml_snapshot!("loop_framing_members", rows);
+}

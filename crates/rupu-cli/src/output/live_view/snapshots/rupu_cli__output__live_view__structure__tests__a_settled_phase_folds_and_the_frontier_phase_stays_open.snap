@@ -1,0 +1,19 @@
+---
+source: crates/rupu-cli/src/output/live_view/structure.rs
+expression: s
+---
+  ✓  pre  scanner ···· ✓ 3s
+  │
+  ⟦ recon1 … join1 ⟧  phase · 4 steps ···· ✓ 3 done · 1 skipped
+  │
+  ◈  recon2  split ···· ✓ 1s
+  ╭─ c
+  ╰─ d
+  │
+  ◐  c  cx ···· ◐ running
+  │
+  ○  d  dx
+  │
+  ◈◄─ join2  join · wait:all
+  │
+  ○  post  poster

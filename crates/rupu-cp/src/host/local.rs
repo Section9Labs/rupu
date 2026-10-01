@@ -263,9 +263,8 @@ impl HostConnector for LocalHostConnector {
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
         let mode_opt = (!mode.is_empty()).then(|| mode.to_string());
         let now = chrono::Utc::now();
-        // On the blocking pool: recorded under the run lock, whose wait
-        // blocks its thread.
         // TODO(task-5): replace hardcoded "connector" actor with identity from AppState
+        // On the blocking pool: the gate methods take the run lock.
         let id = run_id.to_string();
         self.run_store
             .blocking(move |store| {
@@ -284,7 +283,7 @@ impl HostConnector for LocalHostConnector {
         let now = chrono::Utc::now();
         // A path-scoped rejection is a decision a runner applies (spec §7);
         // this asks the resume worker for one, as `approve_run` does. On the
-        // blocking pool, as there.
+        // blocking pool: the gate methods take the run lock.
         let (id, reason) = (run_id.to_string(), reason.unwrap_or("").to_string());
         self.run_store
             .blocking(move |store| {
@@ -346,6 +345,7 @@ impl HostConnector for LocalHostConnector {
         // AFTER its duplicate-execution guard confirms the original process
         // has exited (`runner_pid` no longer live), so clearing the marker
         // can't un-pause an original that hasn't yet honored the pause.
+        // On the blocking pool: the gate methods take the run lock.
         let id = run_id.to_string();
         self.run_store
             .blocking(move |store| store.request_resume_approval(&id, "connector", None, now, None))

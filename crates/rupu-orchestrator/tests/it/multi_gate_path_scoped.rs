@@ -682,20 +682,27 @@ async fn a_web_rejection_asks_for_a_runner_and_prunes_only_its_path() {
 }
 
 #[tokio::test]
-async fn a_decided_gate_cannot_be_decided_the_other_way() {
+async fn a_decided_gate_cannot_be_decided_again() {
     let h = Harness::new(TWO_GATES);
     let run_id = h.park_both().await;
     h.reject(&run_id, "gate_b");
-    let err = h
-        .store
-        .approve_gate(&run_id, "op", chrono::Utc::now(), Some("gate_b"))
-        .unwrap_err();
-    assert!(
-        matches!(err, ApprovalError::GateAlreadyDecided { ref step_id, verdict: GateVerdict::Rejected, .. } if step_id == "gate_b"),
-        "{err:?}"
-    );
-    // Re-recording the same decision is harmless (a retried request).
-    h.reject(&run_id, "gate_b");
+    // The first decision stands — the other way, or the same way again (a
+    // stale view, a retried request): refused, never applied twice.
+    for verdict_tried in ["approve", "reject"] {
+        let err = if verdict_tried == "approve" {
+            h.store
+                .approve_gate(&run_id, "op", chrono::Utc::now(), Some("gate_b"))
+                .unwrap_err()
+        } else {
+            h.store
+                .reject_gate(&run_id, "op", "again", chrono::Utc::now(), Some("gate_b"))
+                .unwrap_err()
+        };
+        assert!(
+            matches!(err, ApprovalError::GateAlreadyDecided { ref step_id, verdict: GateVerdict::Rejected, .. } if step_id == "gate_b"),
+            "{verdict_tried}: {err:?}"
+        );
+    }
     assert_eq!(h.store.load(&run_id).unwrap().gate_decisions.len(), 1);
 }
 

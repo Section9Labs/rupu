@@ -415,6 +415,127 @@ impl StepFactory for GatePanelFactory {
     }
 }
 
+/// A `parallel:` step's declared sub-steps are units of it, exactly like a
+/// `for_each` item or a panelist: one `UnitStarted` / `UnitCompleted` pair per
+/// sub-step, `index` = its declared position and `unit_key` = its sub-step id.
+/// Without them a live view has no record of the sub-steps and shows them
+/// un-started under a finished parent.
+#[tokio::test]
+async fn parallel_emits_per_sub_step_unit_events() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let sink: Arc<CollectSink> = Arc::new(CollectSink::default());
+    // A run store makes the usage hook real, so the completion carries tokens.
+    let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+
+    let wf_yaml = r#"
+name: parallel-units
+steps:
+  - id: lanes
+    parallel:
+      - id: spec
+        agent: writer
+        prompt: "write the spec"
+      - id: verify
+        agent: reviewer
+        prompt: "review it"
+"#;
+
+    let wf = Workflow::parse(wf_yaml).unwrap();
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_parallel".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(store.clone()),
+        workflow_yaml: Some(wf_yaml.into()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: Some("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W".into()),
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+
+    run_workflow(opts).await.unwrap();
+
+    let events = sink.events.lock().unwrap();
+    let started: Vec<(usize, String, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UnitStarted {
+                step_id,
+                index,
+                unit_key,
+                agent,
+                ..
+            } if step_id == "lanes" => Some((*index, unit_key.clone(), agent.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![
+            (0, "spec".to_string(), Some("writer".to_string())),
+            (1, "verify".to_string(), Some("reviewer".to_string())),
+        ],
+        "one UnitStarted per declared sub-step, in declared order"
+    );
+
+    let completed: Vec<(usize, String, bool, u64, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UnitCompleted {
+                step_id,
+                index,
+                unit_key,
+                success,
+                tokens_in,
+                tokens_out,
+                ..
+            } if step_id == "lanes" => {
+                Some((*index, unit_key.clone(), *success, *tokens_in, *tokens_out))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completed,
+        vec![
+            (0, "spec".to_string(), true, 1, 1),
+            (1, "verify".to_string(), true, 1, 1),
+        ],
+        "one UnitCompleted per sub-step carrying its real usage totals"
+    );
+
+    // Each unit starts before it completes, and the per-unit AgentStarted
+    // (which `RunView` can only attach to an existing unit) comes after the
+    // unit was announced.
+    for idx in [0usize, 1] {
+        let pos = |want: &dyn Fn(&Event) -> bool| events.iter().position(want).unwrap();
+        let unit_started = pos(
+            &|e| matches!(e, Event::UnitStarted { step_id, index, .. } if step_id == "lanes" && *index == idx),
+        );
+        let agent_started = pos(
+            &|e| matches!(e, Event::AgentStarted { step_id, unit_index: Some(i), .. } if step_id == "lanes" && *i == idx),
+        );
+        let unit_completed = pos(
+            &|e| matches!(e, Event::UnitCompleted { step_id, index, .. } if step_id == "lanes" && *index == idx),
+        );
+        assert!(
+            unit_started < agent_started && agent_started < unit_completed,
+            "unit {idx}: UnitStarted({unit_started}) < AgentStarted({agent_started}) < UnitCompleted({unit_completed})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn panel_gate_emits_panel_round_events() {
     // A panel with a gate that cannot clear (panelist always emits a `high`
