@@ -1946,7 +1946,7 @@ impl RunStore {
     ) -> Result<Option<TimeoutAction>, RunStoreError> {
         if record.status != RunStatus::AwaitingApproval
             || record.awaiting_gates().len() > 1
-            || !record.expires_at.is_some_and(|expires_at| now > expires_at)
+            || record.expires_at.is_none_or(|expires_at| now <= expires_at)
         {
             return Ok(None);
         }
