@@ -76,8 +76,10 @@ The refresh logic moves out of the CLI (`crates/rupu-cli/src/cmd/models.rs:285`,
 pub struct ModelLimits {
     pub input: Limit,              // usable input tokens (§3 semantics)
     pub output: Limit,             // max output tokens
-    pub compact_at_percent: u8,    // agent value, else 80; clamped to [10, 95]
+    pub compact_at_percent: u8,    // agent value, else 80; clamped to [10, 95] (clamp_compact_percent)
     pub output_shares_context: bool,
+    pub output_fallback: Option<u32>, // what the provider sends when output is unknown (Anthropic: 8192); display only
+    pub note: Option<String>,      // why a limit is unknown or an input was set aside; notice only
 }
 pub struct Limit { pub tokens: Option<u32>, pub source: LimitSource }
 pub enum LimitSource {
@@ -95,21 +97,36 @@ pub async fn refresh(
     resolver: Arc<dyn CredentialResolver>,
     provider: Option<&str>,
     fetch_timeout: Duration,                  // FETCH_TIMEOUT (10s) outside tests
-) -> Result<RefreshReport, UnknownProvider>;  // { outcomes, unfinished: Vec<JoinHandle<_>> }
+) -> Result<RefreshReport, UnknownProvider>;  // { outcomes, unfinished: Vec<UnfinishedRefresh> }
+pub async fn catalog(
+    cfg: &Config,
+    cache_dir: &Path,                         // no network: the cached catalog view (§4)
+    cfg_path: &Path,
+    provider: Option<&str>,
+) -> Result<Vec<CatalogProvider>, UnknownProvider>;
 pub async fn resolve(
     overrides: LimitOverrides,   // spec.context_window_tokens / max_tokens / compact_at_percent
     provider_name: &str,
     model: &str,
     provider: &mut dyn LlmProvider,  // the run's own instance: same auth, same host
-    cfg: &Config,
-    cache_dir: &Path,
+    ctx: &LimitsContext,
 ) -> ModelLimits;
+
+pub struct LimitsContext {
+    pub cache_dir: PathBuf,
+    pub custom: HashMap<String, Vec<CustomModel>>,  // [[providers.X.models]], keyed by provider name
+    pub fetch_timeout: Duration,                    // FETCH_TIMEOUT (10s); tests inject a short one
+}
 ```
 
+- **The edges own the environment.** `refresh` and `catalog` take the cache directory explicitly, so the library's behavior never depends on `RUPU_CACHE_DIR_OVERRIDE`. The CLI (`rupu models`) and the CP adapter compute it with `model_limits::cache_dir(&global)`, which reads the variable; so does `LimitsContext::from_config`, the launch sites' constructor.
+- **The fetch timeout is injectable.** `LimitsContext.fetch_timeout` (default `FETCH_TIMEOUT`, 10s) bounds `resolve`'s refetch, and `refresh` takes it as a parameter, so tests pass a short real timeout against a slower fake (50ms against 1s) instead of pausing the clock around real filesystem I/O.
+- **`refresh` and kinds with no listing.** A provider whose resolved kind is `local` is reported as `provider kind "local" is not wired for listing` before any credential lookup, so a credential-less `local` account is not misreported as a missing credential.
+
 - **Precedence**, per field: agent frontmatter, then config, then live cache, then unknown. An agent pin of 0 (`contextWindowTokens: 0`, `maxTokens: 0`) is treated as unset, since it would compact every turn or send `max_tokens: 0`; the note says `ignored contextWindowTokens: 0`. A config value of 0 is likewise unset.
-- **Notes.** Every reason a limit is unknown or an input was ignored goes into the notice (§6.6), joined with `; `: no listing (`<provider> exposes no model limits; …`), a failed, timed-out or empty refresh, the negative cache (below), a model missing from the list (`model '<m>' is not in <provider>'s model list`; suppressed only when config supplies a value for it, not by a bare config entry), a listed model with both limits 0 (`<provider> lists '<m>' without limits; set contextWindowTokens/maxTokens or [[providers.<name>.models]]`), an ignored 0 pin, and a cache that couldn't be written (`could not write the model cache (…); every launch will refetch`). `catalog` logs a corrupt cache file with its path instead of silently treating it as never fetched.
+- **Notes.** Every reason a limit is unknown or an input was ignored goes into the notice (§6.6), joined with `; `: no listing (`<provider> exposes no model limits; …`), a failed, timed-out or empty refresh, the negative cache (below), a model missing from the list (`model '<m>' is not in <provider>'s model list`; suppressed only when config supplies a value for it, not by a bare config entry), a listed model with both limits 0 that leaves a limit unknown (`<provider> lists '<m>' without limits; set contextWindowTokens/maxTokens or [[providers.<name>.models]]`), an ignored 0 pin, and a cache that couldn't be written (`could not write the model cache (…); every launch will refetch`). `catalog` logs a corrupt cache file with its path instead of silently treating it as never fetched.
 - **Refetching.** If the cache is stale or missing, `resolve` refetches through `provider` (§3 timeout). If the fetch fails, it uses the stale entry with `stale: true`. If there's no entry at all, the limit is `Unknown`. `resolve` never errors: an unknown limit is a valid, reported outcome.
-- **Negative cache.** A failed or timed-out refetch (an empty listing counts as failed) is recorded in `<cache_dir>/<provider>.failed` (`{ failed_at, error }`, written atomically). For the next 5 minutes `resolve` skips the refetch and uses the stale entry or `Unknown`, noting `model list refresh failed 3m ago (<error>); retrying after 5m`. Otherwise every launch, and every turn of a session still re-resolving all-unknown limits (§6.5), would pay the full timeout while a provider stays down. A successful refetch clears the marker. A manual `refresh` (CLI, CP Refetch) ignores the marker and clears it on success. A provider with no listing at all (`NotImplemented`) is not a failure and isn't recorded.
+- **Negative cache.** A failed or timed-out refetch (an empty listing counts as failed) is recorded in `<cache_dir>/<provider>.failed` (`{ failed_at, error }`, written atomically, best effort). While the cache is stale and the marker is under 5 minutes old (`REFRESH_RETRY_AFTER`), `resolve` skips the refetch and uses the stale entry or `Unknown`, noting `model list refresh failed 3m ago (<error>); retrying after 5m` (`just now` under a minute). A missing, unreadable or future-dated marker suppresses nothing. Otherwise every launch, and every turn of a session still re-resolving all-unknown limits (§6.5), would pay the full timeout while a provider stays down. A successful refetch clears the marker. A manual `refresh` (CLI, CP Refetch) never reads the marker and clears it on success. A provider with no listing at all (`NotImplemented`) is not a failure and isn't recorded.
 - **Model lookup:**
   1. Strip a `[1m]` suffix, case-insensitive.
   2. Try an exact id match.
