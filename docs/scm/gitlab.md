@@ -11,12 +11,55 @@
 ### OAuth (browser-callback PKCE)
 
 `rupu auth login --provider gitlab --mode sso` opens gitlab.com's authorize
-endpoint in the default browser; rupu listens on a fixed loopback port for the
-redirect, completes the PKCE exchange, stores the access token in `~/.rupu/auth.json`.
+endpoint in the default browser; rupu listens on `localhost:7171` for the
+redirect, completes the PKCE exchange, and stores the token in
+`~/.rupu/auth.json`.
 
-> **Note**: gitlab.com OAuth currently uses a placeholder client_id pending
-> registration of a rupu-specific OAuth app (TODO.md item). Use the API-key path
-> for now; the SSO flow's UX will improve once the app is registered.
+On gitlab.com rupu logs in as GitLab's own CLI's public OAuth application —
+glab's, the way GitHub SSO uses `gh`'s — so the consent screen names glab. Its
+registration fixes the redirect URI (`http://localhost:7171/auth/redirect`) and
+the scopes rupu requests (`openid profile read_user write_repository api`); port
+7171 must be free while you log in.
+
+GitLab OAuth access tokens expire two hours after issue and the refresh token
+rotates on every refresh. Every GitLab connector checks its token before each
+request and refreshes it through the credential store when it is within five
+minutes of expiry. The refresh happens under `auth.json.lock`, so concurrent rupu
+processes don't spend the same refresh token twice, and the rotated token is
+persisted. A long-running `rupu cp serve`, `rupu mcp serve` or session keeps
+working past the two hours. If a refresh fails (the grant was revoked, say),
+requests fail as unauthorized with the command that fixes it:
+`rupu auth login --account <account> --mode sso`.
+
+#### Self-managed GitLab
+
+glab's application exists only on gitlab.com, so a self-managed instance needs
+its own:
+
+1. On the instance, create an OAuth application (Admin Area → Applications for
+   an instance-wide one, or User settings → Applications) with redirect URI
+   `http://localhost:7171/auth/redirect`, scopes `openid profile read_user
+   write_repository api`, and **Confidential** unchecked.
+2. Put its Application ID next to the instance's API root in
+   `~/.rupu/config.toml` (the global config, the only one `auth login` reads):
+
+   ```toml
+   [scm.gl-corp]
+   kind = "gitlab"
+   base_url = "https://gitlab.example.com/api/v4"
+   oauth_client_id = "<Application ID>"
+   ```
+
+3. `rupu auth login --account gl-corp --mode sso`.
+
+The OAuth endpoints are derived from `base_url` (`<instance>/oauth/authorize`,
+`<instance>/oauth/token`, keeping a relative URL root such as
+`https://example.com/gitlab`). The login records the application and token
+endpoint on the stored credential, so refreshes go back to the instance and
+application that issued it, even if the config changes later. Without
+`oauth_client_id`, SSO for a self-managed account is refused up front with these
+instructions. `oauth_client_id` also works on gitlab.com, to log in as an
+application of your own instead of glab's.
 
 ## Sample agent
 
