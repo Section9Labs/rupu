@@ -40,8 +40,9 @@ pub use runner::{
     WorkspaceConflict, WorkspaceDelta,
 };
 pub use runs::{
-    ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,
-    RunStore, RunStoreError, StepKind, StepResultRecord, UnitCheckpoint,
+    ApprovalDecision, ApprovalError, FindingRecord, GateDecision, GateVerdict, ItemResultRecord,
+    RunRecord, RunStatus, RunStore, RunStoreError, RunnerClaim, RunnerFinish, RunnerGuard,
+    StepKind, StepResultRecord, UnitCheckpoint,
 };
 pub use step_factory::DefaultStepFactory;
 pub use templates::{

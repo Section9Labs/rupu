@@ -2213,6 +2213,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();

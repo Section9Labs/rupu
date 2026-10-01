@@ -293,6 +293,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             permission_mode: None,
                             final_output: None,
                             loop_progress: BTreeMap::new(),
+                            gate_decisions: Vec::new(),
                             codename: Some(rupu_codename::crew_for(id)),
                         },
                     );

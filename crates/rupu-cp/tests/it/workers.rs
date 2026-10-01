@@ -58,6 +58,7 @@ fn seed_run(
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     }
 }

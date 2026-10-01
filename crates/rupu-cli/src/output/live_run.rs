@@ -526,10 +526,27 @@ async fn run_follow_up(
             via,
             approver,
         } => {
-            let (opts, _chain_len) =
-                crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, None)
+            // A path-scoped (DAG) run recorded the rejection for a runner to
+            // apply (spec §7): it prunes only the gate's own path, runs the
+            // gate's `on_reject` chain, and carries on with every other path —
+            // exactly what `rupu workflow reject` resumes into.
+            if store
+                .load(run_id)
+                .is_ok_and(|r| r.pending_decision(&step_id).is_some())
+            {
+                return crate::resume::resume_decided(&store, run_id, None)
                     .await
-                    .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
+                    .map(|_| ())
+                    .map_err(|e| format!("resume failed: {e:#}"));
+            }
+            let global = runs_dir
+                .parent()
+                .ok_or_else(|| "on_reject cleanup unavailable: no rupu home".to_string())?;
+            let (opts, _chain_len) = crate::resume::build_reject_cleanup_opts(
+                &store, global, run_id, &step_id, &reason, None,
+            )
+            .await
+            .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
             rupu_orchestrator::runner::run_reject_cleanup(
                 opts,
                 &step_id,

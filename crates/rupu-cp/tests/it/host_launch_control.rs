@@ -543,6 +543,7 @@ fn local_terminal_record(id: &str) -> rupu_orchestrator::RunRecord {
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     }
 }

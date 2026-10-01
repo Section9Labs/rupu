@@ -103,6 +103,7 @@ fn seed_run(id: &str, workflow: &str, workspace: &std::path::Path) -> RunRecord 
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     }
 }

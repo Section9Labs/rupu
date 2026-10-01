@@ -91,6 +91,7 @@ fn base_record(id: &str) -> RunRecord {
         permission_mode: None,
         final_output: None,
         loop_progress: BTreeMap::new(),
+        gate_decisions: Vec::new(),
         codename: None,
     }
 }

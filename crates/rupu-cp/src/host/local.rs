@@ -261,11 +261,11 @@ impl HostConnector for LocalHostConnector {
     // Deliberately out of scope here; a cross-host per-gate protocol is a
     // separate, larger design (T5b-2b handoff).
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
-        let mode_opt = if mode.is_empty() { None } else { Some(mode) };
+        let mode_opt = (!mode.is_empty()).then(|| mode.to_string());
         let now = chrono::Utc::now();
         // TODO(task-5): replace hardcoded "connector" actor with identity from AppState
         // On the blocking pool: the gate methods take the run lock.
-        let (id, mode_opt) = (run_id.to_string(), mode_opt.map(str::to_string));
+        let id = run_id.to_string();
         self.run_store
             .blocking(move |store| {
                 store.request_resume_approval(&id, "connector", mode_opt.as_deref(), now, None)
@@ -281,10 +281,14 @@ impl HostConnector for LocalHostConnector {
         reason: Option<&str>,
     ) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
-        // On the blocking pool: the gate methods take the run lock.
+        // A path-scoped rejection is a decision a runner applies (spec §7);
+        // this asks the resume worker for one, as `approve_run` does. On the
+        // blocking pool: the gate methods take the run lock.
         let (id, reason) = (run_id.to_string(), reason.unwrap_or("").to_string());
         self.run_store
-            .blocking(move |store| store.reject(&id, "connector", &reason, now))
+            .blocking(move |store| {
+                store.request_resume_rejection(&id, "connector", &reason, now, None)
+            })
             .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
@@ -682,6 +686,7 @@ mod pause_resume_tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }
