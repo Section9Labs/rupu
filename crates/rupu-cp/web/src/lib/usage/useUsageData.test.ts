@@ -2,9 +2,9 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, getConfig, renderHook, waitFor } from '@testing-library/react';
-import { api, type UsageResponse, type UsageWindow } from '../api';
+import { ApiError, api, type UsageResponse, type UsageWindow } from '../api';
 import { USAGE_REMOTE_POLL_MS, useUsageData } from './useUsageData';
-import { REG_LOCAL, REG_PROD, callsFor, flush } from '../perHost/testUtils';
+import { REG_LOCAL, REG_PROD, callsFor, deferred, flush } from '../perHost/testUtils';
 
 const WIN: UsageWindow = { since: '2026-09-01T00:00:00.000Z', until: '2026-09-30T00:00:00.000Z' };
 
@@ -164,5 +164,132 @@ describe('useUsageData', () => {
     expect(signals.host_prod?.aborted).toBe(true);
     await flush();
     expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("drops a superseded request's late answer even when it resolves with data", async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    // The first remote request ignores its abort signal and answers only when told to.
+    const lateA = deferred<UsageResponse>();
+    let remoteCalls = 0;
+    vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) => {
+      if (host === 'local') return Promise.resolve(resp('local', 1));
+      remoteCalls += 1;
+      return remoteCalls === 1 ? lateA.promise : Promise.resolve(resp('host_prod', 20));
+    });
+    const { result, rerender } = renderHook(({ key }) => useUsageData(WIN, key, 'user'), {
+      initialProps: { key: 'preset:30d' },
+    });
+    await waitFor(() => expect(remoteCalls).toBe(1));
+    rerender({ key: 'preset:7d' });
+    await waitFor(() => expect(result.current.data?.summary.runs).toBe(21));
+
+    lateA.resolve(resp('host_prod', 10)); // the old window's answer, arriving after the new one
+    await flush();
+    await flush();
+    expect(result.current.data?.summary.runs).toBe(21);
+    expect(result.current.data?.excluded).toEqual([]);
+    expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'ok']);
+  });
+
+  describe('a host that answered for an old window then fails for the current one', () => {
+    /** Both hosts answer `preset:30d`, then the mode is switched and the window moved. */
+    function setup(mode: { current: (host: string) => Promise<UsageResponse> }) {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) => mode.current(host ?? 'local'));
+      return renderHook(({ key }) => useUsageData(WIN, key, 'user'), { initialProps: { key: 'preset:30d' } });
+    }
+    const answer = (host: string) => Promise.resolve(resp(host, host === 'local' ? 1 : 10));
+    const down = () => Promise.reject(new Error('down'));
+
+    it('is failed, not loading forever, once every host has failed for the new window', async () => {
+      const mode = { current: answer };
+      const { result, rerender } = setup(mode);
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      mode.current = down;
+      rerender({ key: 'preset:7d' });
+      await waitFor(() => expect(result.current.error).not.toBeNull());
+      expect(result.current.error?.message).toMatch(/Local: down · prod: down/);
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['offline', 'offline']);
+      expect(result.current.hosts.map((h) => h.reason)).toEqual(['down', 'down']);
+      expect(result.current.data).toBeNull();
+    });
+
+    it('is labelled (stale) and offline while the other hosts answer', async () => {
+      const mode = { current: answer };
+      const { result, rerender } = setup(mode);
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      mode.current = (host) => (host === 'local' ? answer(host) : down());
+      rerender({ key: 'preset:7d' });
+      await waitFor(() => expect(result.current.hosts[1]?.state).toBe('offline'));
+      expect(result.current.data?.summary.runs).toBe(1);
+      expect(result.current.data?.excluded).toEqual(['prod (stale)']);
+      expect(result.current.error).toBeNull();
+    });
+
+    it('reads loading, not stale, while its refetch is in flight', async () => {
+      const mode = { current: answer };
+      const { result, rerender } = setup(mode);
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+      mode.current = (host) => (host === 'local' ? answer(host) : down());
+      rerender({ key: 'preset:7d' });
+      await waitFor(() => expect(result.current.hosts[1]?.state).toBe('offline'));
+
+      // Move again; nothing answers yet. Nothing failed for THIS window, so nothing reads failed.
+      const localC = deferred<UsageResponse>();
+      mode.current = (host) => (host === 'local' ? localC.promise : new Promise(() => {}));
+      rerender({ key: 'preset:90d' });
+      await flush();
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['loading', 'loading']);
+      expect(result.current.error).toBeNull();
+
+      localC.resolve(resp('local', 1));
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(1));
+      expect(result.current.data?.excluded).toEqual(['prod (loading)']);
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'loading']);
+    });
+  });
+
+  it('drops a remote host the CP no longer knows (404); local is never dropped', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>
+      host === 'local' ? Promise.resolve(resp('local', 1)) : Promise.reject(new ApiError(404, 'x', '{"error":"no such host"}')),
+    );
+    const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+    await waitFor(() => expect(result.current.hosts.map((h) => h.name)).toEqual(['Local']));
+    expect(result.current.data?.summary.runs).toBe(1);
+    expect(result.current.data?.excluded).toEqual([]);
+    expect(result.current.error).toBeNull();
+  });
+
+  it('a 404 for local shows it offline instead of dropping it', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+    vi.spyOn(api, 'getUsage').mockRejectedValue(new ApiError(404, 'x', '{"error":"gone"}'));
+    const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+    await waitFor(() => expect(result.current.hosts.map((h) => h.state)).toEqual(['offline']));
+    expect(result.current.error?.message).toMatch(/Local: gone/);
+  });
+
+  it('the 60s poll and the focus refetch leave a still-pending request alone', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    const remoteSignals: AbortSignal[] = [];
+    vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host, signal) => {
+      if (host === 'local') return Promise.resolve(resp('local', 1));
+      if (signal) remoteSignals.push(signal);
+      return hangUntilAborted(signal);
+    });
+    renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+    await until(() => expect(remoteSignals).toHaveLength(1));
+
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(usageCallsFor('host_prod')).toHaveLength(1);
+    expect(remoteSignals[0]?.aborted).toBe(false);
   });
 });

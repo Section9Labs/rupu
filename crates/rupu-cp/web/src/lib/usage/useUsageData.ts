@@ -15,14 +15,23 @@
 //
 // Cadence: local follows the page's 30 s preset tick; remotes refetch
 // every 60 s while visible, on focus, and immediately on a user window
-// change.
+// change. The 60 s poll and the focus refetch leave a host whose request is
+// still in flight alone (restarting it would mean a host slower than the poll
+// never answers); a user window change and the tick supersede it on purpose.
+//
+// A host that answered for window A and then fails its refetch for window B
+// keeps its old answer (stale-on-error) but is EXCLUDED from B's headline. With
+// no request left in flight it counts as failed for B: shown `offline` in the
+// strip, labelled `(stale)` in `excluded`, and counted toward `error` -
+// otherwise a page whose every host ended up that way would read `loading`
+// forever. While its refetch IS in flight it is `loading`.
 //
 // Abandoned requests are aborted: a host's newer request aborts its previous
 // one, and unmount aborts everything still in flight. A hung remote would
 // otherwise hold one of the browser's six connections per origin for as long as
 // it lives, and enough of them starve every other request the page makes.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { api, apiErrorMessage, type UsageResponse, type UsageWindow } from '../api';
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSeed } from '../perHost/types';
@@ -67,7 +76,6 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
   windowRef.current = usageWindow;
   const keyRef = useRef(windowKey);
   keyRef.current = windowKey;
-  const hostIdsRef = useRef<string[]>([]);
   const statesRef = useRef<HostUsage[]>([]);
   statesRef.current = hosts;
   /** Latest request id per host: an older, slower answer never overwrites a newer one. */
@@ -76,6 +84,12 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
   const controllersRef = useRef(new Map<string, AbortController>());
   /** Set on unmount: a handler that runs after it must not touch state. */
   const disposedRef = useRef(false);
+  /**
+   * Whether a request is in flight is read from `controllersRef` while rendering, so a
+   * request STARTING (which changes no host state) bumps this to re-render. Settling
+   * needs no bump: the handlers' `setHosts` already re-renders.
+   */
+  const [inflightRev, bumpInflight] = useReducer((n: number) => n + 1, 0);
 
   const fetchHost = useRef((hostId: string) => {
     if (disposedRef.current) return;
@@ -85,6 +99,7 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     controllersRef.current.get(hostId)?.abort();
     const controller = new AbortController();
     controllersRef.current.set(hostId, controller);
+    bumpInflight();
     const key = keyRef.current;
     const update = (f: (h: HostUsage) => HostUsage) =>
       setHosts((prev) => prev.map((h) => (h.hostId === hostId ? f(h) : h)));
@@ -107,6 +122,12 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
         if (disposedRef.current || seqRef.current.get(hostId) !== seq) return;
         settled();
         const f = classifyFailure(e);
+        if (f.kind === 'gone' && hostId !== 'local') {
+          // The host is no longer registered: drop it, as the list engine does. Local is never
+          // dropped; it falls through and shows as offline.
+          setHosts((prev) => prev.filter((h) => h.hostId !== hostId));
+          return;
+        }
         update((h) =>
           h.response
             ? { ...h, reason: f.reason } // stale-on-error: keep last good
@@ -138,14 +159,12 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     api.getRegisteredHosts().then(
       (hs) => {
         if (cancelled) return;
-        hostIdsRef.current = hs.map((h) => h.id);
         setHosts(hs.map(seedOf));
         for (const h of hs) fetchHost(h.id);
       },
       (e: unknown) => {
         if (cancelled) return;
         setListError(new Error(`Could not list hosts (${apiErrorMessage(e)}); showing this host only.`));
-        hostIdsRef.current = ['local'];
         setHosts([seedOf({ id: 'local', name: 'Local', transport_kind: 'local' })]);
         fetchHost('local');
       },
@@ -174,12 +193,15 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
 
   // Remote cadence: 60 s while visible, plus on focus (unavailable hosts wait for a reload).
   useEffect(() => {
-    const remote = (h: HostUsage) => h.hostId !== 'local' && h.state !== 'unavailable';
+    // A request still in flight is left alone: restarting it would mean a host slower than
+    // the poll never answers.
+    const idle = (h: HostUsage) => !controllersRef.current.has(h.hostId);
+    const remote = (h: HostUsage) => h.hostId !== 'local' && h.state !== 'unavailable' && idle(h);
     const t = setInterval(() => {
       if (document.visibilityState === 'visible') fetchWhere(remote);
     }, USAGE_REMOTE_POLL_MS);
     const onVisible = () => {
-      if (document.visibilityState === 'visible') fetchWhere((h) => h.state !== 'unavailable');
+      if (document.visibilityState === 'visible') fetchWhere((h) => h.state !== 'unavailable' && idle(h));
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
@@ -190,27 +212,34 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
   }, []);
 
   const current = (h: HostUsage) => h.state === 'ok' && h.response !== null && h.windowKey === windowKey;
+  /**
+   * Answered for another window, then failed its refetch for this one, with nothing left in
+   * flight: it has failed for the current window, whatever stale data it still holds.
+   */
+  const staleFailed = (h: HostUsage) =>
+    h.state === 'ok' && h.windowKey !== windowKey && h.reason != null && !controllersRef.current.has(h.hostId);
 
   const data = useMemo(() => {
     const ok = hosts.filter(current);
     if (ok.length === 0) return null;
     const excluded = hosts
       .filter((h) => !current(h))
-      .map((h) => `${h.name} (${h.state === 'ok' ? (h.reason ? 'stale' : 'loading') : h.state})`);
+      .map((h) => `${h.name} (${h.state === 'ok' ? (staleFailed(h) ? 'stale' : 'loading') : h.state})`);
     return { ...mergeUsage(ok.map((h) => h.response as UsageResponse)), excluded };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `current` closes over windowKey
-  }, [hosts, windowKey]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `current`/`staleFailed` close over windowKey and the in-flight map (inflightRev)
+  }, [hosts, windowKey, inflightRev]);
 
   const entries: HostFreshnessEntry[] = hosts.map((h) => ({
     host_id: h.hostId,
     name: h.name,
     transport_kind: h.transportKind,
-    state: h.state === 'ok' && h.windowKey !== windowKey ? 'loading' : h.state,
+    state: staleFailed(h) ? 'offline' : h.state === 'ok' && h.windowKey !== windowKey ? 'loading' : h.state,
     captured_at: current(h) && h.receivedAt != null ? new Date(h.receivedAt).toISOString() : null,
     reason: h.reason,
   }));
 
-  const allFailed = hosts.length > 0 && hosts.every((h) => h.state === 'offline' || h.state === 'unavailable');
+  const allFailed =
+    hosts.length > 0 && hosts.every((h) => h.state === 'offline' || h.state === 'unavailable' || staleFailed(h));
   const error =
     listError ?? (allFailed ? new Error(hosts.map((h) => `${h.name}: ${h.reason ?? h.state}`).join(' · ')) : null);
 
