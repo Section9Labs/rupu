@@ -244,10 +244,11 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
     .await?;
     for o in outcomes {
         match (o.ok, o.count, o.error) {
-            // Provider returned no models — almost always a
-            // silently-swallowed HTTP error (401 / 404 / etc.). Tell the
-            // operator to enable `RUST_LOG=warn` so the provider client's
-            // tracing logs surface.
+            // The fetch succeeded but the listing was empty. A failing
+            // fetch surfaces as `skip …` below, so this is a provider that
+            // genuinely answered with nothing (or one whose client swallows
+            // a body it cannot parse); `RUST_LOG=warn` surfaces that client's
+            // tracing logs.
             (true, 0, _) => eprintln!(
                 "rupu: refreshed {} (0 models — re-run with `RUST_LOG=warn` to see why)",
                 o.provider
@@ -258,4 +259,25 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetched_age_is_a_dash_when_there_is_no_timestamp() {
+        assert_eq!(fetched_age(None), "-");
+        assert_eq!(fetched_age(Some("not a timestamp")), "-");
+    }
+
+    #[test]
+    fn fetched_age_renders_the_relative_age() {
+        let now = chrono::Utc::now();
+        assert_eq!(fetched_age(Some(&now.to_rfc3339())), "just now");
+        // 2h and a minute: well inside the 2h bucket whatever the test's own
+        // scheduling jitter.
+        let two_hours = now - chrono::Duration::minutes(121);
+        assert_eq!(fetched_age(Some(&two_hours.to_rfc3339())), "2h ago");
+    }
 }

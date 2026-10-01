@@ -209,11 +209,30 @@ fn models_refresh_openai_compatible_account_fetches_its_v1_models() {
         .success()
         .stdout(predicate::str::contains("refreshed boxy (1 models)"));
     m.assert();
+    // Table: the row is live, carries its limit, and shows a relative age.
     models_cmd(home)
         .args(["models", "list", "--provider", "boxy"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("65536").and(predicate::str::contains("live")));
+        .stdout(
+            predicate::str::contains("65536")
+                .and(predicate::str::contains("live"))
+                .and(predicate::str::contains("just now")),
+        );
+    // JSON: a live row carries a real RFC 3339 `fetched_at`, never null.
+    let out = models_cmd(home)
+        .args(["models", "list", "--provider", "boxy", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let row = &v["rows"][0];
+    assert_eq!(row["source"], "live", "{row}");
+    assert_eq!(row["context"], 65536, "{row}");
+    let fetched = row["fetched_at"].as_str().expect("live row has fetched_at");
+    chrono::DateTime::parse_from_rfc3339(fetched).expect("fetched_at is RFC 3339");
 }
 
 /// An openai-compatible account whose endpoint serves no model list (the
@@ -254,6 +273,52 @@ fn models_list_shows_output_and_fetched_columns() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OUTPUT").and(predicate::str::contains("FETCHED")));
+}
+
+/// A config-declared row was never fetched: its FETCHED cell is `-` and its
+/// JSON `fetched_at` is null, even though it sits beside live rows' timestamps.
+#[test]
+fn models_list_custom_row_has_no_fetched_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_cfg(
+        home,
+        "[providers.oracle]\nkind = \"openai-compatible\"\n\
+         base_url = \"http://127.0.0.1:9\"\ndefault_model = \"glm\"\n\
+         [[providers.oracle.models]]\nid = \"glm\"\ncontext_window = 4096\n",
+    );
+    let out = models_cmd(home)
+        .args(["models", "list", "--provider", "oracle", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let row = &v["rows"][0];
+    assert_eq!(row["source"], "custom", "{row}");
+    assert_eq!(row["context"], 4096, "{row}");
+    assert!(row["output"].is_null(), "{row}");
+    assert!(row["fetched_at"].is_null(), "{row}");
+}
+
+/// CSV is a stable contract: the header is exactly these six columns, in order.
+#[test]
+fn models_list_csv_header_is_exactly_the_documented_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = models_cmd(dir.path())
+        .args(["models", "list", "--provider", "copilot", "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text.lines().next(),
+        Some("provider,model,source,context,output,fetched_at"),
+        "{text}"
+    );
 }
 
 /// The JSON report carries the new fields too (version 2): an absent limit is
