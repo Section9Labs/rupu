@@ -67,6 +67,19 @@ describe('usePerHostPagedList', () => {
     expect(fetch.mock.calls.map((c) => c[0].host)).toEqual(['local']);
   });
 
+  it("hands fetch the engine's abort signal untouched, and aborts it on unmount", async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+    // A host that never answers: the request is still open when the page goes away.
+    const fetch = vi.fn((_p: { host: string; signal?: AbortSignal }) => new Promise<Row[]>(() => {}));
+    const { unmount } = renderHook(() => useList(fetch));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const signal = fetch.mock.calls[0][0].signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(false);
+    unmount();
+    expect(signal?.aborted).toBe(true);
+  });
+
   it('polls local every 5s and remotes every 60s, remotes only while visible', async () => {
     // Only intervals are faked: waitFor and the engine's promise chains run on real timers.
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
