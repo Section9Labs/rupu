@@ -1,10 +1,16 @@
-//! Transcript-event → live-feed-line projection and (Task 2) the bounded
+//! Transcript-event → live-feed-line projection and the bounded
 //! multi-transcript firehose that merges those lines (Plan 3, spec
-//! 2026-09-30). `project_event` is pure: no I/O, no clock.
+//! 2026-09-30). `project_event` is pure: no I/O, no clock; `TranscriptMux`
+//! owns the (bounded) transcript I/O.
+
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rupu_transcript::{Event, FileEditKind};
 
+use crate::output::jsonl_reader::TranscriptTailer;
 use crate::output::live_view::layout::printable;
 use crate::output::live_view::row::{truncate_to, Line};
 
@@ -176,6 +182,266 @@ fn tool_key_arg(tool: &str, input: &serde_json::Value) -> String {
         .and_then(|v| v.as_str())
         .map(squash)
         .unwrap_or_default()
+}
+
+/// Floor / ceiling on how many transcripts are tailed at once, whatever the
+/// caller derived from the fd budget.
+const MIN_TAILS: usize = 4;
+const MAX_TAILS: usize = 64;
+/// Merged feed ring capacity (oldest rows drop first).
+const RING_CAP: usize = 500;
+/// Descriptors left untouched when deciding whether another tail may open.
+const FD_RESERVE: u64 = 16;
+
+/// Per-transcript bookkeeping, kept for every observed path (open or not).
+struct Observed {
+    /// Grouping / lookup key handed to [`project_event`]; never display text
+    /// of its own.
+    codename: Option<String>,
+    /// Registration order: the stable drain order within one tick.
+    order: u64,
+    /// LRU stamp (larger = more recently active). Eviction drops the
+    /// smallest unpinned one.
+    last_active: u64,
+    /// Stamp of the last time this path was drained. A closed path that has
+    /// changed on disk is re-ranked least-recently-served first, so a busy
+    /// fan-out larger than the budget rotates instead of starving the
+    /// early-registered units.
+    served: u64,
+    /// Raw transcript events already consumed. A re-opened tailer restarts at
+    /// byte 0 and skips this many events, so an evict/re-open cycle never
+    /// re-projects rows already in the ring.
+    consumed: usize,
+    /// File length when last drained: a closed path whose length differs has
+    /// new output and competes for a slot again.
+    seen_len: u64,
+}
+
+struct OpenTail {
+    tailer: TranscriptTailer,
+    /// Events still to skip after a (re-)open from offset 0.
+    skip: usize,
+}
+
+struct RingEntry {
+    path: PathBuf,
+    feed: FeedLine,
+}
+
+/// Bounded multi-transcript tail: merges the unit / sub-agent transcripts a
+/// run produces into one arrival-ordered firehose without ever touching more
+/// than `max_tails` files per tick, and without opening any more when the
+/// process is short of file descriptors. The pinned (drilled) transcript is
+/// always tailed and never evicted. Display-only: token / usage totals live
+/// elsewhere.
+pub struct TranscriptMux {
+    /// Concurrently tailed transcripts, pinned included (clamped 4..=64).
+    max_tails: usize,
+    pinned: Option<PathBuf>,
+    observed: HashMap<PathBuf, Observed>,
+    open: HashMap<PathBuf, OpenTail>,
+    ring: VecDeque<RingEntry>,
+    /// Monotonic stamp source for `order` / `last_active` / `served`.
+    seq: u64,
+    /// `(open descriptors, limit)`; injectable so tests don't depend on the
+    /// test process's real descriptor table.
+    fd_probe: fn() -> Option<(u64, u64)>,
+}
+
+impl TranscriptMux {
+    /// `max_tails` is clamped to `4..=64`; callers derive it from the fd
+    /// budget and leave headroom.
+    pub fn new(max_tails: usize) -> Self {
+        Self {
+            max_tails: max_tails.clamp(MIN_TAILS, MAX_TAILS),
+            pinned: None,
+            observed: HashMap::new(),
+            open: HashMap::new(),
+            ring: VecDeque::new(),
+            seq: 0,
+            fd_probe: rupu_agent::fd_budget::fd_usage,
+        }
+    }
+
+    /// Register a transcript the run produced. Idempotent: a repeat keeps the
+    /// existing state and only upgrades the codename when a new one is given.
+    /// Registering counts as activity (a brand-new unit is the most recently
+    /// active), but does not open anything by itself; [`drain`](Self::drain)
+    /// decides who gets a slot.
+    pub fn observe(&mut self, path: PathBuf, codename: Option<String>) {
+        self.register(path, codename);
+    }
+
+    /// Pin the drilled unit's transcript (or clear the pin). A pinned path is
+    /// always tailed and exempt from eviction.
+    pub fn pin(&mut self, path: Option<PathBuf>) {
+        if let Some(p) = &path {
+            self.register(p.clone(), None);
+        }
+        self.pinned = path;
+    }
+
+    /// Advance the open tails: the pinned one plus the most-recently-active
+    /// observed paths that fit the budget. New events are projected, tagged
+    /// with their path's codename, and appended to the capped ring in arrival
+    /// order. A transcript that cannot be read (not created yet, fd
+    /// exhaustion) is swallowed and simply contributes nothing this tick.
+    pub fn drain(&mut self) {
+        self.bump_changed_closed();
+        let wanted = self.wanted();
+        self.open.retain(|p, _| wanted.contains(p));
+
+        let probe = self.fd_probe;
+        let mut headroom: Option<bool> = None;
+        for path in &wanted {
+            if !self.open.contains_key(path) {
+                let pinned = self.pinned.as_ref() == Some(path);
+                // The pinned stream is what the operator is looking at: it
+                // always tries. Everything else waits for descriptor headroom.
+                if !pinned && !*headroom.get_or_insert_with(|| fd_headroom(probe)) {
+                    continue;
+                }
+            }
+            self.drain_one(path);
+        }
+    }
+
+    /// The merged cross-unit ring, oldest to newest.
+    pub fn firehose_lines(&self) -> Vec<Line> {
+        self.ring.iter().map(|e| e.feed.line.clone()).collect()
+    }
+
+    /// Only the pinned transcript's rows still in the ring (its stream);
+    /// empty when nothing is pinned.
+    pub fn pinned_lines(&self) -> Vec<Line> {
+        let Some(pinned) = self.pinned.as_ref() else {
+            return Vec::new();
+        };
+        self.ring
+            .iter()
+            .filter(|e| e.path == *pinned)
+            .map(|e| e.feed.line.clone())
+            .collect()
+    }
+
+    fn register(&mut self, path: PathBuf, codename: Option<String>) {
+        if let Some(entry) = self.observed.get_mut(&path) {
+            if codename.is_some() {
+                entry.codename = codename;
+            }
+            return;
+        }
+        self.seq += 1;
+        self.observed.insert(
+            path,
+            Observed {
+                codename,
+                order: self.seq,
+                last_active: self.seq,
+                served: 0,
+                consumed: 0,
+                seen_len: 0,
+            },
+        );
+    }
+
+    /// A closed path whose file grew since it was last drained is "newly
+    /// active": re-stamp it so it can displace the least-recently-active open
+    /// tail. Among several, the least recently served gets the newest stamp.
+    fn bump_changed_closed(&mut self) {
+        let mut changed: Vec<(PathBuf, u64, u64)> = self
+            .observed
+            .iter()
+            .filter(|(p, o)| {
+                !self.open.contains_key(*p)
+                    && self.pinned.as_ref() != Some(*p)
+                    && file_len(p) != o.seen_len
+            })
+            .map(|(p, o)| (p.clone(), o.served, o.order))
+            .collect();
+        changed.sort_by_key(|&(_, served, order)| (Reverse(served), order));
+        for (path, _, _) in changed {
+            self.seq += 1;
+            if let Some(o) = self.observed.get_mut(&path) {
+                o.last_active = self.seq;
+            }
+        }
+    }
+
+    /// The paths to tail this tick: the pinned one, then the most recently
+    /// active others filling the remaining slots, in registration order.
+    fn wanted(&self) -> Vec<PathBuf> {
+        let slots = self.max_tails - usize::from(self.pinned.is_some());
+        let mut rest: Vec<(&PathBuf, &Observed)> = self
+            .observed
+            .iter()
+            .filter(|(p, _)| self.pinned.as_ref() != Some(*p))
+            .collect();
+        rest.sort_by_key(|(_, o)| Reverse(o.last_active));
+        rest.truncate(slots);
+        rest.sort_by_key(|(_, o)| o.order);
+        let mut wanted = Vec::with_capacity(slots + 1);
+        wanted.extend(self.pinned.clone());
+        wanted.extend(rest.into_iter().map(|(p, _)| p.clone()));
+        wanted
+    }
+
+    /// Open (if needed) and drain one transcript, projecting its new events
+    /// into the ring.
+    fn drain_one(&mut self, path: &Path) {
+        let Some(entry) = self.observed.get_mut(path) else {
+            return;
+        };
+        let tail = self
+            .open
+            .entry(path.to_path_buf())
+            .or_insert_with(|| OpenTail {
+                tailer: TranscriptTailer::new(path),
+                skip: entry.consumed,
+            });
+        // Measured BEFORE the read so a write racing the drain still shows
+        // up as a change on the next probe.
+        entry.seen_len = file_len(path);
+        self.seq += 1;
+        entry.served = self.seq;
+
+        let mut fresh = false;
+        for ev in tail.tailer.drain() {
+            if tail.skip > 0 {
+                tail.skip -= 1;
+                continue;
+            }
+            fresh = true;
+            entry.consumed += 1;
+            if let Some(feed) = project_event(&ev, entry.codename.as_deref()) {
+                if self.ring.len() >= RING_CAP {
+                    self.ring.pop_front();
+                }
+                self.ring.push_back(RingEntry {
+                    path: path.to_path_buf(),
+                    feed,
+                });
+            }
+        }
+        if fresh {
+            self.seq += 1;
+            entry.last_active = self.seq;
+        }
+    }
+}
+
+/// Current length of `path`, `0` when it can't be stat'ed (missing file).
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Whether the process has descriptors to spare for another tail. An
+/// unknowable budget (`None`) is treated as fine.
+fn fd_headroom(probe: fn() -> Option<(u64, u64)>) -> bool {
+    match probe() {
+        Some((used, limit)) => used.saturating_add(FD_RESERVE) < limit,
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -511,5 +777,338 @@ mod tests {
             None
         )
         .is_none());
+    }
+
+    // ---- TranscriptMux -------------------------------------------------
+
+    use std::io::Write;
+
+    fn msg(text: &str) -> Event {
+        Event::AssistantMessage {
+            content: text.into(),
+            thinking: None,
+        }
+    }
+
+    fn write_events(path: &Path, events: &[Event]) {
+        let mut f = std::fs::File::create(path).unwrap();
+        for ev in events {
+            writeln!(f, "{}", serde_json::to_string(ev).unwrap()).unwrap();
+        }
+    }
+
+    fn append_event(path: &Path, ev: &Event) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{}", serde_json::to_string(ev).unwrap()).unwrap();
+    }
+
+    /// A mux that never trips the fd guard (the real probe reads this test
+    /// process's descriptor table, which parallel tests make unpredictable).
+    fn mux(max_tails: usize) -> TranscriptMux {
+        let mut m = TranscriptMux::new(max_tails);
+        m.fd_probe = || None;
+        m
+    }
+
+    fn plain_lines(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| render_plain(std::slice::from_ref(l)))
+            .collect()
+    }
+
+    /// `n` transcripts under `dir`, `names[i]` with two uniquely-worded
+    /// messages each: `"{name} first"` / `"{name} second"`.
+    fn seed(dir: &Path, names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| {
+                let path = dir.join(format!("{name}.jsonl"));
+                write_events(
+                    &path,
+                    &[
+                        msg(&format!("{name} first")),
+                        msg(&format!("{name} second")),
+                    ],
+                );
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn new_clamps_the_tail_budget_to_a_sane_range() {
+        assert_eq!(TranscriptMux::new(0).max_tails, 4);
+        assert_eq!(TranscriptMux::new(1).max_tails, 4);
+        assert_eq!(TranscriptMux::new(16).max_tails, 16);
+        assert_eq!(TranscriptMux::new(10_000).max_tails, 64);
+    }
+
+    #[test]
+    fn merges_three_transcripts_into_one_firehose_tagged_by_codename() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a", "b", "c"]);
+        let mut m = mux(8);
+        for (p, name) in paths.iter().zip(["otter#1", "heron#2", "lynx#3"]) {
+            m.observe(p.clone(), Some(name.to_string()));
+        }
+        m.drain();
+        let lines = plain_lines(&m.firehose_lines());
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        for (name, word) in [("otter#1", "a"), ("heron#2", "b"), ("lynx#3", "c")] {
+            assert!(
+                lines.contains(&format!("{name} ▪ {word} first")),
+                "{lines:?}"
+            );
+            assert!(
+                lines.contains(&format!("{name} ▪ {word} second")),
+                "{lines:?}"
+            );
+        }
+        // Within one transcript, order is preserved.
+        let first = lines.iter().position(|l| l == "otter#1 ▪ a first").unwrap();
+        let second = lines
+            .iter()
+            .position(|l| l == "otter#1 ▪ a second")
+            .unwrap();
+        assert!(first < second);
+    }
+
+    #[test]
+    fn observe_is_idempotent_and_keeps_the_codename_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a"]);
+        let mut m = mux(8);
+        m.observe(paths[0].clone(), Some("otter#1".into()));
+        m.observe(paths[0].clone(), None);
+        m.observe(paths[0].clone(), Some("otter#1".into()));
+        m.drain();
+        m.drain();
+        let lines = plain_lines(&m.firehose_lines());
+        assert_eq!(
+            lines,
+            vec!["otter#1 ▪ a first".to_string(), "otter#1 ▪ a second".into()]
+        );
+        assert_eq!(m.open.len(), 1);
+    }
+
+    #[test]
+    fn drain_only_projects_new_events_each_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a"]);
+        let mut m = mux(8);
+        m.observe(paths[0].clone(), Some("otter#1".into()));
+        m.drain();
+        assert_eq!(m.firehose_lines().len(), 2);
+        m.drain();
+        assert_eq!(m.firehose_lines().len(), 2, "nothing new, nothing added");
+        append_event(&paths[0], &msg("a third"));
+        m.drain();
+        let lines = plain_lines(&m.firehose_lines());
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "otter#1 ▪ a third");
+    }
+
+    #[test]
+    fn open_set_stays_within_budget_and_every_unit_is_still_served() {
+        let dir = tempfile::tempdir().unwrap();
+        // new(1) clamps to the floor of 4; six units overflow it.
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let paths = seed(dir.path(), &names);
+        let mut m = mux(1);
+        assert_eq!(m.max_tails, 4);
+        for p in &paths {
+            m.observe(p.clone(), None);
+        }
+        for _ in 0..6 {
+            m.drain();
+            assert!(m.open.len() <= 4, "open {}", m.open.len());
+        }
+        // Rotation reached every unit exactly once: 12 rows, no duplicates
+        // from the evict -> re-open cycle.
+        let lines = plain_lines(&m.firehose_lines());
+        assert_eq!(lines.len(), 12, "{lines:?}");
+        for name in names {
+            for ord in ["first", "second"] {
+                let want = format!("▪ {name} {ord}");
+                assert_eq!(
+                    lines.iter().filter(|l| **l == want).count(),
+                    1,
+                    "{want} in {lines:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_recently_active_tail_is_evicted_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["p0", "p1", "p2", "p3", "p4"]);
+        let mut m = mux(4);
+        for p in &paths[..4] {
+            m.observe(p.clone(), None);
+        }
+        m.drain();
+        assert_eq!(m.open.len(), 4);
+        // p0 is written to; p1..p3 go quiet. A fifth unit then appears.
+        append_event(&paths[0], &msg("p0 third"));
+        m.drain();
+        m.observe(paths[4].clone(), None);
+        m.drain();
+        assert_eq!(m.open.len(), 4);
+        assert!(m.open.contains_key(&paths[0]), "active p0 survives");
+        assert!(m.open.contains_key(&paths[4]), "new p4 is opened");
+        // p1 went quiet first -> it is the one dropped.
+        assert!(!m.open.contains_key(&paths[1]), "LRU p1 evicted");
+        assert!(m.open.contains_key(&paths[2]));
+        assert!(m.open.contains_key(&paths[3]));
+        // The new unit's rows made it into the firehose.
+        let lines = plain_lines(&m.firehose_lines());
+        assert!(lines.contains(&"▪ p4 first".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn evicted_tail_reopens_when_it_gets_new_output_without_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let paths = seed(dir.path(), &names);
+        let mut m = mux(1);
+        for p in &paths {
+            m.observe(p.clone(), None);
+        }
+        for _ in 0..6 {
+            m.drain();
+        }
+        let before = m.firehose_lines().len();
+        assert_eq!(before, 12);
+        // Every unit speaks once more; the budget forces rotation again.
+        for (p, name) in paths.iter().zip(names) {
+            append_event(p, &msg(&format!("{name} third")));
+        }
+        for _ in 0..6 {
+            m.drain();
+            assert!(m.open.len() <= 4);
+        }
+        let lines = plain_lines(&m.firehose_lines());
+        assert_eq!(lines.len(), 18, "{lines:?}");
+        for name in names {
+            let want = format!("▪ {name} third");
+            assert_eq!(lines.iter().filter(|l| **l == want).count(), 1, "{want}");
+            let old = format!("▪ {name} first");
+            assert_eq!(lines.iter().filter(|l| **l == old).count(), 1, "{old}");
+        }
+    }
+
+    #[test]
+    fn pinned_tail_is_never_evicted_and_pinned_lines_are_only_its_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let paths = seed(dir.path(), &names);
+        let mut m = mux(1);
+        for (p, name) in paths.iter().zip(names) {
+            m.observe(p.clone(), Some(format!("{name}#1")));
+        }
+        assert!(m.pinned_lines().is_empty(), "nothing pinned yet");
+        // Pin the oldest-registered (so LRU would normally drop it first).
+        m.pin(Some(paths[0].clone()));
+        for _ in 0..6 {
+            for p in &paths[1..] {
+                append_event(p, &msg("noise"));
+            }
+            m.drain();
+            assert!(m.open.len() <= 4, "open {}", m.open.len());
+            assert!(m.open.contains_key(&paths[0]), "pinned stays open");
+        }
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec!["a#1 ▪ a first".to_string(), "a#1 ▪ a second".into()]
+        );
+        // The firehose still carries the other units.
+        let all = plain_lines(&m.firehose_lines());
+        assert!(all.iter().any(|l| l.starts_with("b#1")), "{all:?}");
+
+        m.pin(None);
+        assert!(m.pinned_lines().is_empty());
+    }
+
+    #[test]
+    fn pinning_an_unobserved_path_still_tails_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a"]);
+        let mut m = mux(8);
+        m.pin(Some(paths[0].clone()));
+        m.drain();
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec!["▪ a first".to_string(), "▪ a second".into()]
+        );
+    }
+
+    #[test]
+    fn missing_transcripts_are_swallowed_and_picked_up_once_they_appear() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = dir.path().join("not-yet.jsonl");
+        let ghost_pinned = dir.path().join("pinned-not-yet.jsonl");
+        let mut m = mux(8);
+        m.observe(ghost.clone(), Some("otter#1".into()));
+        m.pin(Some(ghost_pinned.clone()));
+        m.drain();
+        m.drain();
+        assert!(m.firehose_lines().is_empty());
+        assert!(m.pinned_lines().is_empty());
+
+        write_events(&ghost, &[msg("hello")]);
+        write_events(&ghost_pinned, &[msg("pinned hello")]);
+        m.drain();
+        // Both land in the firehose (order within one tick is unspecified).
+        let mut all = plain_lines(&m.firehose_lines());
+        all.sort();
+        assert_eq!(
+            all,
+            vec!["otter#1 ▪ hello".to_string(), "▪ pinned hello".into()]
+        );
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec!["▪ pinned hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn fd_pressure_skips_opening_unpinned_tails_but_never_the_pinned_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a", "b"]);
+        let mut m = TranscriptMux::new(8);
+        m.fd_probe = || Some((250, 256));
+        m.observe(paths[0].clone(), None);
+        m.pin(Some(paths[1].clone()));
+        m.drain();
+        assert!(m.open.contains_key(&paths[1]), "pinned always opens");
+        assert!(!m.open.contains_key(&paths[0]), "no headroom for others");
+        assert_eq!(
+            plain_lines(&m.firehose_lines()),
+            vec!["▪ b first".to_string(), "▪ b second".into()]
+        );
+
+        // Pressure eases: the held-back unit opens on the next tick.
+        m.fd_probe = || Some((10, 256));
+        m.drain();
+        assert!(m.open.contains_key(&paths[0]));
+        assert_eq!(m.firehose_lines().len(), 4);
+    }
+
+    #[test]
+    fn ring_is_capped_oldest_dropped_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        let events: Vec<Event> = (0..600).map(|i| msg(&format!("m{i}"))).collect();
+        write_events(&path, &events);
+        let mut m = mux(8);
+        m.pin(Some(path.clone()));
+        m.drain();
+        let lines = plain_lines(&m.firehose_lines());
+        assert_eq!(lines.len(), 500);
+        assert_eq!(lines[0], "▪ m100");
+        assert_eq!(lines[499], "▪ m599");
+        assert_eq!(m.pinned_lines().len(), 500);
     }
 }
