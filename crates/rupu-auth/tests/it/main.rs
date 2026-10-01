@@ -8,6 +8,7 @@
 //! `RUPU_OAUTH_*` / `RUPU_DEVICE_*` seams) is `#[serial]`: all of these tests
 //! share one process, so an unserialized one would leak into its neighbours.
 
+mod gitlab_refresh;
 mod json_file;
 mod keychain_resolver;
 mod netflow_capture;

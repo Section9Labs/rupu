@@ -20,6 +20,8 @@ use rupu_auth::CredentialResolver;
 use rupu_config::Config;
 
 use crate::connectors::{IssueConnector, RepoConnector};
+use crate::platform::Platform;
+use crate::token::TokenSource;
 
 /// Try to build the GitLab Repo + Issue connectors + extras handle from
 /// configured credentials. Returns `Ok(None)` if no GitLab credential
@@ -44,14 +46,16 @@ pub async fn try_build(
         Ok((_mode, creds)) => creds,
         Err(_) => return Ok(None),
     };
-    let token = match creds {
-        rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
-        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
-    };
+    let token = Arc::new(TokenSource::resolved(
+        resolver,
+        Platform::Gitlab,
+        account,
+        creds,
+    ));
     let opts = crate::client_options::ScmClientOptions::from_platform_config(
         cfg.scm.platforms.get(account),
     );
-    let client = GitlabClient::with_options(token, &opts, sink);
+    let client = GitlabClient::with_token_source(token, &opts, sink);
     let repo: Arc<dyn RepoConnector> = Arc::new(GitlabRepoConnector::new(client.clone()));
     let issues: Arc<dyn IssueConnector> = Arc::new(GitlabIssueConnector::new(client.clone()));
     let extras = Arc::new(GitlabExtras::new(client));

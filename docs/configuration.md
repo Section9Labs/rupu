@@ -76,7 +76,7 @@ Full narrative reference: [scm.md](scm.md#configuration).
 |----------------------|--------|---------|-------|
 | `[scm.default]`      | table  | none    | `platform`, `owner`, `repo` — fallback repo when a tool call omits `platform?` |
 | `[issues.default]`   | table  | none    | `tracker`, `project` — fallback tracker when a tool call omits `tracker?` |
-| `[scm.<platform>]`   | table  | none    | Per-platform override for `github` / `gitlab` (`base_url`, `timeout_ms` default `30000`, `max_concurrency` default github `8` / gitlab `6`, `clone_protocol` default `https`) |
+| `[scm.<platform>]`   | table  | none    | Per-platform override for `github` / `gitlab` (`base_url`, `timeout_ms` default `30000`, `max_concurrency` default github `8` / gitlab `6`, `clone_protocol` default `https`; GitLab only: `oauth_client_id`, the OAuth application SSO logs in as — default glab's on gitlab.com, required for self-managed) |
 
 ---
 

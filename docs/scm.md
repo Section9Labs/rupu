@@ -47,7 +47,18 @@ scopes:
 | Platform | Scopes                                              |
 |----------|-----------------------------------------------------|
 | GitHub   | `read:user`, `repo`, `workflow`, `gist`, `read:org` |
-| GitLab   | `api`, `read_user`, `read_repository`, `write_repository` |
+| GitLab   | `api`, `read_user`, `read_repository`, `write_repository` (PAT); SSO requests `openid profile read_user write_repository api` |
+
+GitLab SSO logs in as GitLab's own CLI's (glab's) gitlab.com OAuth application,
+the way GitHub SSO uses `gh`'s; a self-managed instance needs its own application
+(`oauth_client_id` below, walkthrough in `docs/scm/gitlab.md`). GitLab OAuth access
+tokens expire two hours after issue: every GitLab connector refreshes its token
+through the credential store before a request when it is within five minutes of
+expiry, so a long-lived `rupu cp serve` / `rupu mcp serve` / session keeps working,
+and the rotated token is persisted (under `auth.json.lock`) for every other process.
+A request GitLab refuses (401) is retried once with the token now in the store, so a
+`rupu auth login` reaches processes that are already running. GitHub SSO tokens don't
+expire.
 
 Linear and Jira currently use API-key mode only:
 
@@ -133,10 +144,11 @@ clone_protocol = "https"
 
 ### Field reference
 
-- **`base_url`** (`Option<String>`): API root — override for GHES / self-hosted GitLab. Note the *clone* paths still use the public host; self-hosted clone URLs are tracked separately in `TODO.md`. Until then GitHub's `clone_to` refuses an account whose `base_url` is off github.com rather than send its token there.
+- **`base_url`** (`Option<String>`): API root — override for GHES / self-hosted GitLab. Note the *clone* paths still use the public host; self-hosted clone URLs are tracked separately in `TODO.md`. Until then GitHub's and GitLab's `clone_to` refuse an account whose `base_url` is off their public host (github.com / gitlab.com) rather than send its token there.
 - **`timeout_ms`** (`Option<u64>`): total per-request deadline for this platform's HTTP calls. Default: `30000`. `0` is treated as unset.
 - **`max_concurrency`** (`Option<usize>`): per-platform semaphore size. Defaults: github 8, gitlab 6.
 - **`clone_protocol`** (`"https" | "ssh"`): how `clone_to` reaches the remote. Default `https` (token embedded in the URL). `ssh` produces `git@<host>:<owner>/<repo>.git` and drops the token entirely — authentication is your SSH agent and `~/.ssh/config`. SSH clones shell out to the system `git` so host aliases, `IdentityFile`, `ProxyJump`, and agent forwarding apply; `git` must be on `PATH`. An unrecognized value logs a warning and falls back to `https`.
+- **`oauth_client_id`** (`Option<String>`, GitLab only): the Application ID of the OAuth application `rupu auth login --mode sso` logs this account in as. Unset on gitlab.com means glab's public application. Required for a self-managed instance (a `base_url` off gitlab.com), whose OAuth endpoints are derived from `base_url` (`<instance>/oauth/authorize`, `<instance>/oauth/token`). Read from the global `~/.rupu/config.toml`, as `auth login` reads nothing else. The login records the application and token endpoint on the credential, and its refreshes go there.
 - **`kind`** (`Option<String>`, `"github"` | `"gitlab"`): the vendor a *named* account talks to — see "Multi-account routing" below. `None` means the table name itself is the vendor (`[scm.github]`, `[scm.gitlab]`), which is why every example above needs no `kind` at all.
 
 ## Multi-account routing

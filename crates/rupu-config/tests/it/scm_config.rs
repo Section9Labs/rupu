@@ -68,3 +68,27 @@ fn scm_platform_config_serialize_omits_none() {
     assert!(s.contains("base_url = \"https://x.test\""));
     assert!(!s.contains("timeout_ms"));
 }
+
+/// A GitLab account's own OAuth application (a self-managed instance's, or
+/// one registered on gitlab.com in place of glab's default).
+#[test]
+fn scm_platform_config_parses_an_oauth_client_id() {
+    let toml = r#"
+[scm.gl-corp]
+kind = "gitlab"
+base_url = "https://gitlab.example.com/api/v4"
+oauth_client_id = "corp-app"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("parse");
+    let gl = cfg.scm.platforms.get("gl-corp").expect("gl-corp account");
+    assert_eq!(gl.oauth_client_id.as_deref(), Some("corp-app"));
+    assert_eq!(
+        cfg.scm.platforms.get("gl-corp"),
+        Some(&ScmPlatformConfig {
+            kind: Some("gitlab".into()),
+            base_url: Some("https://gitlab.example.com/api/v4".into()),
+            oauth_client_id: Some("corp-app".into()),
+            ..Default::default()
+        })
+    );
+}

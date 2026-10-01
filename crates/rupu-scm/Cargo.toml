@@ -43,6 +43,7 @@ test-helpers = []
 [dev-dependencies]
 tempfile.workspace = true
 httpmock.workspace = true
+serial_test.workspace = true
 serde_json.workspace = true
 # Self-dependency so `tests/*.rs` integration tests (compiled against a
 # separate, non-`cfg(test)` build of this crate) can reach the

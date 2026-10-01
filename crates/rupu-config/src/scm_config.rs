@@ -117,6 +117,13 @@ pub struct ScmPlatformConfig {
     /// "https" or "ssh"; default chosen by the connector at clone time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone_protocol: Option<String>,
+    /// GitLab only: the Application ID of the OAuth application
+    /// `rupu auth login --mode sso` logs in as. Unset on gitlab.com means
+    /// glab's public application; a self-managed instance (`base_url` off
+    /// gitlab.com) has no default and needs one registered on it. Read from
+    /// the global config only, like the rest of `auth login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
 }
 
 mod platforms_serde {

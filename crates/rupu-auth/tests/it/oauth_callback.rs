@@ -16,6 +16,7 @@
 use httpmock::prelude::*;
 use rupu_auth::backend::ProviderId;
 use rupu_auth::oauth::callback;
+use rupu_auth::oauth::providers::OAuthClient;
 use rupu_auth::stored::StoredCredential;
 use serial_test::serial;
 
@@ -26,6 +27,22 @@ async fn run_flow(
     provider: ProviderId,
     token: impl FnOnce(httpmock::When, httpmock::Then),
 ) -> (StoredCredential, httpmock::Mock<'static>) {
+    // Leaked on purpose: the mock's lifetime is tied to the server's, and
+    // the caller asserts on it after the flow returns.
+    let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
+    let token_mock = server.mock(token);
+    let stored = drive("/callback", &server.url("/token"), callback::run(provider)).await;
+    (stored, token_mock)
+}
+
+/// Drive a started callback `flow` through its redirect: wait for its
+/// listener, hit `redirect_path` with the state it exposed, and return what
+/// it stored. `token_url_override` is the built-in endpoints' test seam.
+async fn drive(
+    redirect_path: &str,
+    token_url_override: &str,
+    flow: impl std::future::Future<Output = anyhow::Result<StoredCredential>> + Send + 'static,
+) -> StoredCredential {
     // Each test run uses a unique suffix to avoid env-var collisions when
     // tests run in parallel.
     let suffix = std::time::SystemTime::now()
@@ -42,15 +59,10 @@ async fn run_flow(
     std::env::set_var("RUPU_OAUTH_SKIP_BROWSER", "1");
     std::env::set_var("RUPU_OAUTH_PORT_FILE", &port_file);
 
-    // ── Mock token endpoint ──────────────────────────────────────────────
-    // Leaked on purpose: the mock's lifetime is tied to the server's, and
-    // the caller asserts on it after the flow returns.
-    let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
-    let token_mock = server.mock(token);
-    std::env::set_var("RUPU_OAUTH_TOKEN_URL_OVERRIDE", server.url("/token"));
+    std::env::set_var("RUPU_OAUTH_TOKEN_URL_OVERRIDE", token_url_override);
 
     // ── Spawn the flow ───────────────────────────────────────────────────
-    let flow_handle = tokio::spawn(async move { callback::run(provider).await });
+    let flow_handle = tokio::spawn(flow);
 
     // ── Poll for the port file ───────────────────────────────────────────
     let mut bound_port = 0u16;
@@ -80,7 +92,7 @@ async fn run_flow(
     assert!(!state.is_empty(), "flow never set RUPU_OAUTH_LAST_STATE");
 
     // ── POST the fake redirect ───────────────────────────────────────────
-    let url = format!("http://127.0.0.1:{bound_port}/callback?code=stub-code&state={state}");
+    let url = format!("http://127.0.0.1:{bound_port}{redirect_path}?code=stub-code&state={state}");
     let _resp = reqwest::get(&url)
         .await
         .expect("redirect GET should succeed");
@@ -94,7 +106,7 @@ async fn run_flow(
     std::env::remove_var("RUPU_OAUTH_PORT_FILE");
     std::env::remove_var("RUPU_OAUTH_LAST_STATE");
     let _ = std::fs::remove_file(&port_file);
-    (stored, token_mock)
+    stored
 }
 
 #[tokio::test]
@@ -188,4 +200,61 @@ async fn gemini_login_does_not_persist_the_id_token() {
     }
     let json = serde_json::to_string(&stored).unwrap();
     assert!(!json.contains("id-token"), "{json}");
+}
+
+/// A GitLab login with a chosen application — a self-managed instance's, or
+/// a configured one — exchanges the code at that instance's token endpoint
+/// as that application, and records both on the credential: a refresh
+/// token is only good with the application that issued it, at the endpoint
+/// that issued it.
+#[tokio::test]
+#[serial]
+async fn a_gitlab_login_uses_and_records_the_chosen_application() {
+    let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
+    let token_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/oauth/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body_contains("grant_type=authorization_code")
+            .body_contains("code=stub-code")
+            .body_contains("client_id=corp-app")
+            .body_contains("%2Fauth%2Fredirect");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({
+                "access_token": "gl-access",
+                "refresh_token": "gl-refresh",
+                "expires_in": 7200,
+                "token_type": "Bearer",
+            }));
+    });
+    let client = OAuthClient {
+        client_id: "corp-app".into(),
+        authorize_url: server.url("/oauth/authorize"),
+        token_url: server.url("/oauth/token"),
+    };
+    // glab's application is registered on port 7171; any free port will do
+    // here.
+    std::env::set_var("RUPU_OAUTH_FORCE_PORT", "0");
+    // The built-in endpoints' seam points elsewhere: the chosen
+    // application's endpoint is the one that must be used.
+    let stored = drive(
+        "/auth/redirect",
+        &server.url("/not-this-one"),
+        callback::run_with_client(ProviderId::Gitlab, Some(client)),
+    )
+    .await;
+    std::env::remove_var("RUPU_OAUTH_FORCE_PORT");
+
+    token_mock.assert();
+    let rupu_providers::auth::AuthCredentials::OAuth { access, extra, .. } = stored.credentials
+    else {
+        panic!("expected an OAuth credential");
+    };
+    assert_eq!(access, "gl-access");
+    assert_eq!(extra["oauth_client_id"], "corp-app");
+    assert_eq!(
+        extra["oauth_token_url"],
+        server.url("/oauth/token").as_str()
+    );
 }
