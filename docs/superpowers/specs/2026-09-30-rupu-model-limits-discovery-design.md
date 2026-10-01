@@ -78,7 +78,14 @@ pub enum LimitSource {
     Unknown,
 }
 
-pub async fn refresh(cfg: &Config, provider: Option<&str>) -> Vec<RefreshOutcome>;
+pub async fn refresh(
+    cfg: &Config,
+    cache_dir: &Path,                         // computed at the edge (CLI, CP adapter)
+    cfg_path: &Path,
+    resolver: Arc<dyn CredentialResolver>,
+    provider: Option<&str>,
+    fetch_timeout: Duration,                  // FETCH_TIMEOUT (10s) outside tests
+) -> Result<Vec<RefreshOutcome>, UnknownProvider>;
 pub async fn resolve(
     overrides: LimitOverrides,   // spec.context_window_tokens / max_tokens / compact_at_percent
     provider_name: &str,
@@ -224,6 +231,7 @@ pub trait ModelCatalog: Send + Sync {
 - **`POST /api/models/refresh`**, body `{ provider?: string }`, returns `[{ provider, ok, count, error? }]`.
   - It uses the same auth as the other CP mutation endpoints.
   - It's synchronous: providers are fetched in parallel, each with the 10s timeout. So a 200 means refreshed, unlike run mutations, where a 200 only means recorded.
+  - Each provider's job is a spawned task and the timeout bounds only the wait: a job that outlives it is reported as `timed out after 10s` but is not cancelled, so an OAuth/SSO token refresh in flight still persists its rotated token.
   - One provider failing doesn't fail the others.
 
 ### 8.3 CP web — Settings → Models tab

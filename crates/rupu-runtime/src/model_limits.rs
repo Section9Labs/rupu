@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -266,35 +267,51 @@ pub struct RefreshOutcome {
 /// bounded by `fetch_timeout` ([`FETCH_TIMEOUT`] outside tests) as a whole
 /// (client build, credential resolution and any token refresh included, not
 /// just the HTTP listing); one failing or hanging never fails the others.
+///
+/// Each provider's job is its own spawned task, and the timeout bounds only
+/// the WAIT for it: a job that outlives it is reported as timed out but runs
+/// to completion in the background. Cancelling it could abandon an OAuth/SSO
+/// token refresh after the provider already rotated the refresh token,
+/// before the new one was persisted. (A one-shot `rupu models refresh`
+/// process still ends any such job when it exits; the long-lived `cp serve`
+/// lets it finish.)
 pub async fn refresh(
     cfg: &rupu_config::Config,
     cache_dir: &Path,
     cfg_path: &Path,
-    resolver: &dyn rupu_auth::CredentialResolver,
+    resolver: Arc<dyn rupu_auth::CredentialResolver>,
     only: Option<&str>,
     fetch_timeout: Duration,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
     let names = resolve_targets(only, cfg, cfg_path)?;
-    let registry = ModelRegistry::with_cache_dir(cache_dir);
-    let registry = &registry;
-    let jobs = names.iter().map(|name| async move {
-        match tokio::time::timeout(fetch_timeout, refresh_one(name, cfg, resolver, registry)).await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => RefreshOutcome {
+    let cfg = Arc::new(cfg.clone());
+    let jobs = names.into_iter().map(|name| {
+        let job = tokio::spawn({
+            let (name, cfg, resolver) = (name.clone(), Arc::clone(&cfg), Arc::clone(&resolver));
+            let registry = ModelRegistry::with_cache_dir(cache_dir);
+            async move { refresh_one(&name, &cfg, resolver.as_ref(), &registry).await }
+        });
+        async move {
+            let fail = |error: String| RefreshOutcome {
                 provider: name.clone(),
                 ok: false,
                 count: 0,
-                error: Some(format!("timed out after {}", fmt_timeout(fetch_timeout))),
-            },
+                error: Some(error),
+            };
+            match tokio::time::timeout(fetch_timeout, job).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(e)) => fail(format!("refresh task failed: {e}")),
+                // Dropping a `JoinHandle` detaches the task; it is not aborted.
+                Err(_) => fail(format!("timed out after {}", fmt_timeout(fetch_timeout))),
+            }
         }
     });
     Ok(futures_util::future::join_all(jobs).await)
 }
 
 /// One provider's refresh: build the client, fetch, write the cache. The
-/// caller bounds all of it with [`FETCH_TIMEOUT`]; the cache write is an
-/// atomic rename, so being dropped mid-write leaves the old file intact.
+/// caller bounds its wait with the fetch timeout but never cancels it; the
+/// cache write is an atomic rename either way.
 async fn refresh_one(
     name: &str,
     cfg: &rupu_config::Config,
@@ -321,7 +338,7 @@ async fn refresh_one(
         None,
         resolver,
         &pcfg,
-        std::sync::Arc::new(rupu_netflow::NullSink),
+        Arc::new(rupu_netflow::NullSink),
     )
     .await
     {

@@ -233,12 +233,12 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
     // knows no declared accounts, so a named account's SSO credential would
     // be read but never refreshed on near-expiry (the defect
     // `crate::accounts::account_specs` exists to prevent).
-    let resolver = crate::accounts::resolver_for(&cfg);
+    let resolver = std::sync::Arc::new(crate::accounts::resolver_for(&cfg));
     let outcomes = rupu_runtime::model_limits::refresh(
         &cfg,
         &rupu_runtime::model_limits::cache_dir(&global),
         &global_config_path()?,
-        &resolver,
+        resolver,
         filter.as_deref(),
         rupu_runtime::model_limits::FETCH_TIMEOUT,
     )

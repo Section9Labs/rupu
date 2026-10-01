@@ -359,7 +359,7 @@ fn cache_of(tmp: &tempfile::TempDir) -> std::path::PathBuf {
 async fn refresh_with(
     cfg: &rupu_config::Config,
     tmp: &tempfile::TempDir,
-    resolver: &dyn rupu_auth::CredentialResolver,
+    resolver: Arc<dyn rupu_auth::CredentialResolver>,
     only: Option<&str>,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
     refresh_with_timeout(
@@ -375,7 +375,7 @@ async fn refresh_with(
 async fn refresh_with_timeout(
     cfg: &rupu_config::Config,
     tmp: &tempfile::TempDir,
-    resolver: &dyn rupu_auth::CredentialResolver,
+    resolver: Arc<dyn rupu_auth::CredentialResolver>,
     only: Option<&str>,
     fetch_timeout: std::time::Duration,
 ) -> Result<Vec<RefreshOutcome>, UnknownProvider> {
@@ -426,7 +426,7 @@ async fn refresh_writes_the_cache_that_catalog_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
 
-    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle"))
+    let out = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("oracle"))
         .await
         .unwrap();
     listing.assert();
@@ -457,7 +457,7 @@ async fn refresh_reports_a_failing_provider_without_failing_the_call() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
 
-    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle"))
+    let out = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("oracle"))
         .await
         .unwrap();
     assert!(!out[0].ok);
@@ -471,7 +471,7 @@ async fn refresh_reports_a_failing_provider_without_failing_the_call() {
 async fn refresh_and_catalog_reject_an_unknown_provider() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = rupu_config::Config::default();
-    let err = refresh_with(&cfg, &tmp, &AnyKey, Some("nope"))
+    let err = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("nope"))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unknown provider 'nope'"));
@@ -733,7 +733,7 @@ async fn refresh_bounds_the_whole_provider_job_not_just_the_fetch() {
     let out = refresh_with_timeout(
         &cfg,
         &tmp,
-        &SlowResolver,
+        Arc::new(SlowResolver),
         Some("anthropic"),
         std::time::Duration::from_millis(50),
     )
@@ -778,7 +778,7 @@ async fn refreshed_oracle(
     });
     let mut cfg = oracle_cfg(format!("{}/v1", server.url("")));
     cfg.providers.get_mut("oracle").unwrap().models = models;
-    let out = refresh_with(&cfg, tmp, &AnyKey, Some("oracle"))
+    let out = refresh_with(&cfg, tmp, Arc::new(AnyKey), Some("oracle"))
         .await
         .unwrap();
     assert!(out[0].ok, "{:?}", out[0]);
@@ -930,7 +930,7 @@ async fn refresh_reports_an_empty_listing_and_keeps_the_cache() {
     std::fs::write(&cache_file, good).unwrap();
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
 
-    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle"))
+    let out = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("oracle"))
         .await
         .unwrap();
     assert!(!out[0].ok, "{:?}", out[0]);
@@ -956,11 +956,53 @@ async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
     let elsewhere = tmp.path().join("elsewhere");
     let cfg = oracle_cfg(format!("{}/v1", server.url("")));
     std::env::set_var("RUPU_CACHE_DIR_OVERRIDE", &elsewhere);
-    let out = refresh_with(&cfg, &tmp, &AnyKey, Some("oracle")).await;
+    let out = refresh_with(&cfg, &tmp, Arc::new(AnyKey), Some("oracle")).await;
     let cat = catalog_of(&cfg, &tmp, Some("oracle")).await;
     std::env::remove_var("RUPU_CACHE_DIR_OVERRIDE");
     assert!(out.unwrap()[0].ok);
     assert!(cache_of(&tmp).join("oracle.json").exists());
     assert!(!elsewhere.exists(), "the env seam is the caller's business");
     assert_eq!(cat.unwrap()[0].models[0].input_tokens, Some(4096));
+}
+
+/// A provider job that outlives the refresh timeout is reported as timed out
+/// but NOT cancelled: it may be mid-way through an OAuth token refresh whose
+/// rotated token must still be persisted. It finishes in the background —
+/// observable here as the cache file it writes after the call returned.
+#[tokio::test]
+async fn a_timed_out_refresh_job_still_finishes_in_the_background() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200)
+            .delay(std::time::Duration::from_millis(400))
+            .json_body(serde_json::json!({
+                "data": [{ "id": "base-model", "max_model_len": 4096 }]
+            }));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = oracle_cfg(format!("{}/v1", server.url("")));
+    let out = refresh_with_timeout(
+        &cfg,
+        &tmp,
+        Arc::new(AnyKey),
+        Some("oracle"),
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+    assert!(!out[0].ok);
+    assert_eq!(out[0].error.as_deref(), Some("timed out after 100ms"));
+    let cache_file = cache_of(&tmp).join("oracle.json");
+    assert!(
+        !cache_file.exists(),
+        "not written yet when the call returns"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !cache_file.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let body = std::fs::read_to_string(&cache_file).expect("the job finished and wrote its cache");
+    assert!(body.contains("base-model"), "{body}");
 }

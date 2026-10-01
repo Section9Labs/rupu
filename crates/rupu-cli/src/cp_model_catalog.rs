@@ -30,12 +30,12 @@ impl ModelCatalog for RuntimeModelCatalog {
         provider: Option<String>,
     ) -> Result<Vec<RefreshOutcome>, ModelCatalogError> {
         let (cfg, cfg_path) = self.config()?;
-        let resolver = crate::accounts::resolver_for(&cfg);
+        let resolver = std::sync::Arc::new(crate::accounts::resolver_for(&cfg));
         rupu_runtime::model_limits::refresh(
             &cfg,
             &rupu_runtime::model_limits::cache_dir(&self.global_dir),
             &cfg_path,
-            &resolver,
+            resolver,
             provider.as_deref(),
             rupu_runtime::model_limits::FETCH_TIMEOUT,
         )
