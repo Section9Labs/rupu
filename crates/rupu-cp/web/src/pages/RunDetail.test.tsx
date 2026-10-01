@@ -1304,3 +1304,36 @@ describe('RunDetail — live usage', () => {
     expect(timelineSpy).toHaveBeenCalledWith('run-1', undefined);
   });
 });
+
+// A manual pause records the paused step in `awaiting_step_id` with no
+// prompt. That is not a gate: neither the paused run nor the run resumed
+// from it may show an approval banner.
+describe('RunDetail: pause leftovers are not approval gates', () => {
+  function stubWith(status: 'running' | 'paused') {
+    const graph: RunGraphResponse = {
+      run: {
+        id: 'run-1',
+        workflow_name: 'review',
+        status,
+        started_at: '2026-06-01T00:00:00Z',
+        awaiting_step_id: 'assess',
+      } as RunGraphResponse['run'],
+      workflow: { steps: [{ id: 'assess', kind: 'for_each', agent: 'assessor' }] },
+      step_results: [],
+      units: [],
+      usage: EMPTY_USAGE,
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+  }
+
+  it.each(['running', 'paused'] as const)('a %s run shows no approval banner', async (status) => {
+    stubWith(status);
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Approve run' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Awaiting approval/)).not.toBeInTheDocument();
+  });
+});

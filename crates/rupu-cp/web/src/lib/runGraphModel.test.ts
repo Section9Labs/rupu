@@ -1021,3 +1021,61 @@ describe('derived codenames', () => {
     expect(buildRunGraphModel(g, []).nodeById('a')!.codenameDerived).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// In-flight work left behind by an attempt that ended (resume / pause / fail)
+// ---------------------------------------------------------------------------
+
+describe('superseded attempts', () => {
+  const doneCheckpoint: UnitCheckpoint = {
+    step_id: 'b', index: 0, item: 'u0',
+    run_id: runId(), transcript_path: '/tmp/u0.jsonl',
+    output: 'ok', success: true, finished_at: '2026-06-18T00:01:00Z',
+  };
+  const runStarted: RunEvent = {
+    type: 'run_started', run_id: runId(), workflow_path: '/w', started_at: '2026-06-18T00:00:00Z',
+  } as RunEvent;
+  const started = (index: number): RunEvent => ({
+    type: 'unit_started', run_id: runId(), step_id: 'b', index, unit_key: `u${index}`, transcript_path: `/tmp/u${index}.jsonl`,
+  });
+
+  it('a resume settles units the dead attempt left running back to their checkpoint (or pending)', () => {
+    const g = makeGraph({ units: [doneCheckpoint] });
+    const events: RunEvent[] = [
+      runStarted,
+      started(0), // a re-run of an already-done unit, killed mid-way
+      started(1), // never finished
+      runStarted, // the resume
+      started(2),
+    ];
+    const b = buildRunGraphModel(g, events).nodeById('b')!;
+    const state = (i: number) => b.fanout!.units.find((u) => u.index === i)!.state;
+    expect(state(0)).toBe('done');
+    expect(state(1)).toBe('pending');
+    expect(state(2)).toBe('running');
+    expect(b.fanout!.byState.running).toBe(1);
+    expect(b.fanout!.byState.done).toBe(1);
+  });
+
+  it('a pause settles the units it interrupted', () => {
+    const g = makeGraph({});
+    const events: RunEvent[] = [
+      runStarted,
+      started(0),
+      started(1),
+      { type: 'unit_completed', run_id: runId(), step_id: 'b', index: 0, unit_key: 'u0', success: true, tokens_in: 1, tokens_out: 1 },
+      { type: 'run_paused', run_id: runId() } as RunEvent,
+    ];
+    const b = buildRunGraphModel(g, events).nodeById('b')!;
+    expect(b.fanout!.units.find((u) => u.index === 0)!.state).toBe('done');
+    expect(b.fanout!.units.find((u) => u.index === 1)!.state).toBe('pending');
+    expect(b.fanout!.byState.running).toBe(0);
+  });
+
+  it("the live attempt's in-flight units stay running", () => {
+    const events: RunEvent[] = [runStarted, started(0)];
+    const b = buildRunGraphModel(makeGraph({}), events).nodeById('b')!;
+    expect(b.fanout!.units[0].state).toBe('running');
+    expect(b.state).toBe('running');
+  });
+});

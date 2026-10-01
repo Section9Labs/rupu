@@ -781,3 +781,65 @@ steps:
         "no command_run for a command that never ran"
     );
 }
+
+/// A runner that dies mid-fan-out must keep the `run:` units that already
+/// finished: each unit checkpoints itself the moment it exits, not when the
+/// whole fan-out joins.
+#[tokio::test]
+async fn for_each_run_unit_checkpoint_is_durable_while_siblings_still_run() {
+    let yaml = r#"
+name: bench-durable
+steps:
+  - id: score
+    for_each: '["fast", "slow"]'
+    max_parallel: 2
+    run:
+      cmd: sh
+      args: ["-c", "if [ \"$1\" = slow ]; then sleep 30; fi; echo \"$1 done\"", "sh", "{{ item }}"]
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let run_id = "run_durable_run_fanout".to_string();
+    let run = tokio::spawn(run_workflow(OrchestratorRunOpts {
+        run_step: bypass(),
+        workflow: Workflow::parse(yaml).expect("workflow parses"),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_durable_run_fanout".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(NoAgentFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: Some(run_id.clone()),
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    }));
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let checkpoints = loop {
+        let cps = store.read_unit_checkpoints(&run_id).unwrap_or_default();
+        if !cps.is_empty() || tokio::time::Instant::now() >= deadline {
+            break cps;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(
+        !run.is_finished(),
+        "the sleeping `slow` unit keeps the fan-out in flight"
+    );
+    run.abort();
+
+    assert_eq!(checkpoints.len(), 1, "got {checkpoints:?}");
+    assert_eq!(checkpoints[0].step_id, "score");
+    assert_eq!(checkpoints[0].index, 0);
+    assert!(checkpoints[0].success);
+    assert_eq!(checkpoints[0].output.trim(), "fast done");
+}

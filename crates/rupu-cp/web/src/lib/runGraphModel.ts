@@ -292,6 +292,30 @@ export function buildRunGraphModel(
     unitIdentities.set(stepId, m);
   }
 
+  // What a superseded attempt's in-flight work falls back to: the durable
+  // state from Phases 2-3 (a unit's checkpoint / a step's result), else
+  // pending. A runner that ended — resumed over, paused, or failed — leaves
+  // `*_started` events with no completion; without this they read as
+  // "running" forever and a resume that re-runs a done unit drops it from
+  // the done count.
+  const nodeBaseline = new Map<string, StepState>();
+  for (const node of nodeMap.values()) nodeBaseline.set(node.id, node.state);
+  const unitBaseline = new Map<string, Map<number, StepState>>();
+  for (const [stepId, units] of unitsByStep) {
+    unitBaseline.set(stepId, new Map(Array.from(units.values(), (u) => [u.index, u.state])));
+  }
+  const settled = (s: StepState | undefined): StepState => (s && s !== 'running' ? s : 'pending');
+  function settleInFlight() {
+    for (const node of nodeMap.values()) {
+      if (node.state === 'running') node.state = settled(nodeBaseline.get(node.id));
+    }
+    for (const [stepId, units] of unitsByStep) {
+      for (const unit of units.values()) {
+        if (unit.state === 'running') unit.state = settled(unitBaseline.get(stepId)?.get(unit.index));
+      }
+    }
+  }
+
   for (const ev of events) {
     if (!isKnownRunEvent(ev)) continue;
 
@@ -402,14 +426,16 @@ export function buildRunGraphModel(
         if (node) node.state = 'running';
         break;
       }
-      case 'run_started':
-      case 'run_completed':
-      case 'run_failed':
+      case 'run_started': // a resume: the previous attempt's runner is gone
       case 'run_paused':
+      case 'run_failed':
+        settleInFlight();
+        break;
+      case 'run_completed':
       case 'run_resumed':
-        // Run-level events — no per-step state change needed here (the
-        // in-flight step's own `step_paused`/`step_resumed` event, above,
-        // carries the per-node transition).
+        // No per-step change (the in-flight step's own
+        // `step_paused`/`step_resumed` event, above, carries the per-node
+        // transition; a completed run is reconciled in Phase 5b).
         break;
     }
   }

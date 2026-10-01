@@ -469,7 +469,9 @@ export default function RunDetail() {
   );
 
   // Live awaiting info: prefer a live awaiting node from the model, else the
-  // persisted record.
+  // persisted record — but only a record that is actually parked at a gate.
+  // A manual pause also stores its paused step in `awaiting_step_id` (no
+  // prompt), and older runners left it set after a resume; neither is a gate.
   const awaiting = useMemo(() => {
     if (model) {
       const node = model.nodes.find((n) => n.state === 'awaiting_approval');
@@ -477,7 +479,7 @@ export default function RunDetail() {
         return { stepId: node.id, reason: run?.approval_prompt ?? 'Awaiting approval' };
       }
     }
-    return run?.awaiting_step_id
+    return run?.awaiting_step_id && run.status === 'awaiting_approval'
       ? { stepId: run.awaiting_step_id, reason: run.approval_prompt ?? 'Awaiting approval' }
       : undefined;
   }, [model, run]);

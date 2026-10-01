@@ -1015,3 +1015,118 @@ async fn fanout_pause_resumes_only_incomplete_units() {
         "got {labels2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A finished fan-out unit is durable while its siblings are still running
+// ---------------------------------------------------------------------------
+
+const WF_FANOUT_ONE_HANGS: &str = r#"
+name: fanout-durable
+steps:
+  - id: process
+    for_each: "fast\nslow"
+    agent: worker
+    prompt: "Process {{ item }}"
+    max_parallel: 2
+"#;
+
+/// `fast` units answer at once; `slow` units never return, keeping the
+/// fan-out in flight for as long as the test needs.
+struct FastOrHangFactory;
+#[async_trait]
+impl StepFactory for FastOrHangFactory {
+    async fn build_opts_for_step(
+        &self,
+        _step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: PathBuf,
+        transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> AgentRunOpts {
+        let provider: Box<dyn LlmProvider> = if rendered_prompt.contains("slow") {
+            Box::new(BlockingProvider)
+        } else {
+            Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: "fast done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]))
+        };
+        linear_agent_opts(
+            provider,
+            agent_name,
+            rendered_prompt,
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            on_tool_call,
+        )
+    }
+}
+
+/// A runner that dies mid-fan-out (terminal closed, process killed, gate
+/// sweep reap) must not take its finished units with it: each unit's
+/// checkpoint has to land the moment that unit finishes, not when the
+/// whole fan-out joins — otherwise a resume re-runs every finished unit.
+#[tokio::test]
+async fn fanout_unit_checkpoint_is_durable_while_siblings_still_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_FANOUT_ONE_HANGS).unwrap();
+    let run_id = "run_durable_fanout".to_string();
+
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_durable_fanout".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FastOrHangFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_FANOUT_ONE_HANGS.to_string()),
+        resume_from: None,
+        run_id_override: Some(run_id.clone()),
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let run = tokio::spawn(run_workflow(opts));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let checkpoints = loop {
+        let cps = store.read_unit_checkpoints(&run_id).unwrap_or_default();
+        if !cps.is_empty() || tokio::time::Instant::now() >= deadline {
+            break cps;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        !run.is_finished(),
+        "the hanging `slow` unit must keep the fan-out in flight"
+    );
+    // The runner dies here, with `slow` still running.
+    run.abort();
+
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "the finished `fast` unit must be checkpointed before its sibling finishes, got {checkpoints:?}"
+    );
+    let cp = &checkpoints[0];
+    assert_eq!(cp.step_id, "process");
+    assert_eq!(cp.index, 0);
+    assert!(cp.success);
+    assert_eq!(cp.output, "fast done");
+}

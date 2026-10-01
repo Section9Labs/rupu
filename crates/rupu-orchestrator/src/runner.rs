@@ -6912,6 +6912,8 @@ async fn run_fanout_run_step(
         let transcript_dir = opts.transcript_dir.clone();
         let strict = opts.strict_templates;
         let item_value = item.clone();
+        let store = opts.run_store.clone();
+        let workflow_run_id = workflow_run_id.to_string();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem
@@ -6930,22 +6932,46 @@ async fn run_fanout_run_step(
                 &transcript_dir,
             )
             .await;
-            (idx, item_value, res)
+            let (output, success, transcript_path) = match res {
+                Ok(sr) => (sr.output, sr.success, sr.transcript_path),
+                // A refusal (gate denial) or render error is a real unit
+                // failure, recorded rather than dropped.
+                Err(e) => (format!("{e}"), false, PathBuf::new()),
+            };
+            // Durable the moment this unit finishes, not when the whole
+            // fan-out joins, so a runner that dies mid-fan-out keeps its
+            // finished units for `rupu workflow resume`. Replayed units
+            // never reach here (they're already on disk).
+            if let Some(store) = store.as_ref().filter(|_| !workflow_run_id.is_empty()) {
+                let checkpoint = crate::runs::UnitCheckpoint {
+                    step_id: step_clone.id.clone(),
+                    index: idx,
+                    item: item_value.clone(),
+                    // `run:` units have no agent run id and never run
+                    // remotely (validation rejects `distribute:`).
+                    run_id: String::new(),
+                    transcript_path: transcript_path.clone(),
+                    output: output.clone(),
+                    success,
+                    finished_at: chrono::Utc::now(),
+                    host: None,
+                    codename: None,
+                };
+                if let Err(e) = store.append_unit_checkpoint(&workflow_run_id, &checkpoint) {
+                    warn!(step = %step_clone.id, index = idx, error = %e, "failed to append unit checkpoint");
+                }
+            }
+            (idx, item_value, output, success, transcript_path)
         }));
     }
 
     let mut collected: Vec<(usize, ItemResult)> = Vec::with_capacity(total);
     for h in handles {
-        let (idx, item_value, res) = h.await.map_err(|source| RunWorkflowError::FanoutJoin {
-            step: step.id.clone(),
-            source,
-        })?;
-        let (output, success, transcript_path) = match res {
-            Ok(sr) => (sr.output, sr.success, sr.transcript_path),
-            // A refusal (gate denial) or render error is a real unit
-            // failure, recorded rather than dropped.
-            Err(e) => (format!("{e}"), false, PathBuf::new()),
-        };
+        let (idx, item_value, output, success, transcript_path) =
+            h.await.map_err(|source| RunWorkflowError::FanoutJoin {
+                step: step.id.clone(),
+                source,
+            })?;
         collected.push((
             idx,
             ItemResult {
@@ -6962,34 +6988,6 @@ async fn run_fanout_run_step(
             },
         ));
     }
-    // Checkpoint every unit that ran to completion in THIS pass, before
-    // the failure check below — so a crash or an early return mid-fan-out
-    // still leaves finished units durable for `rupu workflow resume`.
-    // Replayed units are already on disk, so they are not re-appended.
-    if let Some(store) = &opts.run_store {
-        if !workflow_run_id.is_empty() {
-            for (idx, r) in &collected {
-                let checkpoint = crate::runs::UnitCheckpoint {
-                    step_id: step.id.clone(),
-                    index: *idx,
-                    item: r.item.clone(),
-                    // `run:` units have no agent run id and never run
-                    // remotely (validation rejects `distribute:`).
-                    run_id: String::new(),
-                    transcript_path: r.transcript_path.clone(),
-                    output: r.output.clone(),
-                    success: r.success,
-                    finished_at: chrono::Utc::now(),
-                    host: None,
-                    codename: None,
-                };
-                if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
-                    warn!(step = %step.id, index = idx, error = %e, "failed to append unit checkpoint");
-                }
-            }
-        }
-    }
-
     // Fold the replayed units back in so the step's result covers the
     // whole list, not just what re-ran.
     collected.extend(resumed);
@@ -7284,6 +7282,8 @@ async fn run_fanout_step(
             .naming
             .as_ref()
             .map(|n| n.unit(&step.id, &agent_name_root, idx));
+        // Each unit checkpoints itself the moment it finishes (below).
+        let store_for_task = opts.run_store.clone();
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -7320,7 +7320,6 @@ async fn run_fanout_step(
                     success: false,
                     error: None,
                     raw_error: None,
-                    host: placement_host,
                     workspace_delta: None,
                     paused: true,
                     codename: unit_codename.map(|c| c.to_string()),
@@ -7648,6 +7647,35 @@ async fn run_fanout_step(
                     );
                 }
             }
+            let codename = unit_codename.map(|c| c.to_string());
+            // Durable the moment THIS unit finishes (success or failure), not
+            // when the whole fan-out joins: a runner that dies mid-fan-out
+            // (terminal closed, process killed, reaped by the gate sweep)
+            // must not take its finished units with it, or `rupu workflow
+            // resume` re-runs every one of them. A paused unit did NOT finish
+            // — no entry, so the next resume redispatches it ("absent =
+            // incomplete"). Replayed units never reach here: they're already
+            // on disk from the prior run. `workflow_run_id` is empty in the
+            // in-memory (no run-store) mode.
+            if !paused && !workflow_run_id.is_empty() {
+                if let Some(store) = store_for_task.as_ref() {
+                    let checkpoint = crate::runs::UnitCheckpoint {
+                        step_id: step_id.clone(),
+                        index: idx,
+                        item: item_value.clone(),
+                        run_id: run_id.clone(),
+                        transcript_path: transcript_path.clone(),
+                        output: output.clone(),
+                        success,
+                        finished_at: chrono::Utc::now(),
+                        host: placement_host.clone(),
+                        codename: codename.clone(),
+                    };
+                    if let Err(e) = store.append_unit_checkpoint(&workflow_run_id, &checkpoint) {
+                        warn!(step = %step_id, index = idx, error = %e, "failed to append unit checkpoint");
+                    }
+                }
+            }
             FanoutItemOutcome {
                 idx,
                 item: item_value,
@@ -7658,10 +7686,9 @@ async fn run_fanout_step(
                 success,
                 error: error_str,
                 raw_error,
-                host: placement_host,
                 workspace_delta,
                 paused,
-                codename: unit_codename.map(|c| c.to_string()),
+                codename,
             }
         }));
     }
@@ -7685,39 +7712,7 @@ async fn run_fanout_step(
     }
     item_outcomes.sort_by_key(|o| o.idx);
 
-    // Persist every freshly-dispatched, NON-PAUSED unit's checkpoint as soon
-    // as the fan-out's tasks have joined — BEFORE the `continue_on_error`
-    // abort check below, so a crash/early-return mid-fan-out still
-    // leaves the finished units (success AND failure) durable on disk
-    // for `rupu workflow resume`. Replayed (`resumed`) units are
-    // already on disk from the prior run, so we don't re-append them. A
-    // paused unit (skipped outright, or cancelled mid-turn) did NOT
-    // finish — it gets no checkpoint entry, so a subsequent `read_unit_
-    // checkpoints` naturally omits it and the next resume redispatches it
-    // fresh (same "absent = incomplete" contract the existing failed-unit
-    // path already relies on). `workflow_run_id` is empty in the in-memory
-    // (no run-store) mode.
-    if let Some(store) = &opts.run_store {
-        if !workflow_run_id.is_empty() {
-            for o in item_outcomes.iter().filter(|o| !o.paused) {
-                let checkpoint = crate::runs::UnitCheckpoint {
-                    step_id: step.id.clone(),
-                    index: o.idx,
-                    item: o.item.clone(),
-                    run_id: o.run_id.clone(),
-                    transcript_path: o.transcript_path.clone(),
-                    output: o.output.clone(),
-                    success: o.success,
-                    finished_at: chrono::Utc::now(),
-                    host: o.host.clone(),
-                    codename: o.codename.clone(),
-                };
-                if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
-                    warn!(step = %step.id, index = o.idx, error = %e, "failed to append unit checkpoint");
-                }
-            }
-        }
-    }
+    // Every finished unit already checkpointed itself inside its task.
 
     // Apply `continue_on_error`: if not set, the first REAL failure (not a
     // paused unit — that's incomplete, not failed) aborts the workflow. We
@@ -8085,10 +8080,6 @@ struct FanoutItemOutcome {
     #[allow(dead_code)]
     error: Option<String>,
     raw_error: Option<RunError>,
-    /// Host placement for this unit (`None` = local). Threaded through
-    /// from the per-unit `placement` computed in `run_fanout_step` so
-    /// the checkpoint writer can record it without re-computing it.
-    host: Option<String>,
     /// File-change set returned by a sync-mode unit. `None` for local
     /// (non-sync) units or when the unit returned no delta.
     workspace_delta: Option<WorkspaceDelta>,

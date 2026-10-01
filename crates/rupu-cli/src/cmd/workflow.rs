@@ -3120,6 +3120,24 @@ fn resume_refused_by_status_change(
     }
 }
 
+/// The record edit `resume_run` makes when it takes a run back: `Running`
+/// under this process, with every leftover of the pause or terminal state
+/// it came from cleared. A manual pause stores the paused step in
+/// `awaiting_step_id` (with no prompt), and the web reads any
+/// `awaiting_step_id` as a parked gate — leaving it set showed a phantom
+/// "Awaiting approval" on a run that was running again.
+fn mark_resumed(record: &mut rupu_orchestrator::runs::RunRecord, pid: u32) {
+    record.status = rupu_orchestrator::RunStatus::Running;
+    record.finished_at = None;
+    record.error_message = None;
+    record.runner_pid = Some(pid);
+    record.awaiting.clear();
+    record.awaiting_step_id = None;
+    record.approval_prompt = None;
+    record.awaiting_since = None;
+    record.expires_at = None;
+}
+
 pub(crate) async fn resume_run(
     run_id: &str,
     mode: Option<&str>,
@@ -3261,17 +3279,16 @@ pub(crate) async fn resume_run(
     // blocking pool: it writes only while the record still has the status
     // it was loaded with, so a cancel (or another resume) that landed
     // since is not overwritten — and the run does not start.
+    // A cooperative pause records the paused step in `awaiting_step_id`;
+    // the legacy single-seed lookup below still needs it after the flip
+    // clears it.
+    let paused_step_id = record.awaiting_step_id.clone();
     let flipped = {
         let run_id = run_id.to_string();
         let pid = std::process::id();
         store
             .blocking(move |s| {
-                s.modify_if_status(&run_id, original_status, |record| {
-                    record.status = RunStatus::Running;
-                    record.finished_at = None;
-                    record.error_message = None;
-                    record.runner_pid = Some(pid);
-                })
+                s.modify_if_status(&run_id, original_status, |record| mark_resumed(record, pid))
             })
             .await
             .map_err(|e| anyhow::anyhow!("flip run to running: {e}"))?
@@ -3428,7 +3445,7 @@ pub(crate) async fn resume_run(
         // transcripts. Several seeds when a DAG run's manual-pause drain
         // caught concurrent steps pausing together; a run paused by an
         // older binary falls back to its single seed + `awaiting_step_id`.
-        let seeds = match store.read_paused_seeds(run_id, record.awaiting_step_id.as_deref()) {
+        let seeds = match store.read_paused_seeds(run_id, paused_step_id.as_deref()) {
             Ok(seeds) => seeds,
             Err(e) => {
                 tracing::warn!(
@@ -5989,6 +6006,30 @@ mod tests {
             err.to_string(),
             "run run_x is now `running` (it was `paused` when loaded); not resuming it"
         );
+    }
+
+    /// A manual pause leaves the paused step in `awaiting_step_id` (no
+    /// prompt) — the web reads that as a parked gate. Taking the run back
+    /// must clear it, or a running run shows "Awaiting approval".
+    #[test]
+    fn mark_resumed_clears_the_pause_leftovers() {
+        let mut record = sample_run_record(RunStatus::Paused, Some(4242));
+        record.awaiting_step_id = Some("assess".into());
+        record.awaiting_since = Some(Utc::now());
+        record.error_message = Some("runner process 4242 is no longer alive".into());
+        record.finished_at = Some(Utc::now());
+
+        mark_resumed(&mut record, 7);
+
+        assert_eq!(record.status, RunStatus::Running);
+        assert_eq!(record.runner_pid, Some(7));
+        assert_eq!(record.awaiting_step_id, None);
+        assert_eq!(record.awaiting_since, None);
+        assert_eq!(record.approval_prompt, None);
+        assert_eq!(record.expires_at, None);
+        assert!(record.awaiting.is_empty());
+        assert_eq!(record.error_message, None);
+        assert_eq!(record.finished_at, None);
     }
 
     /// A cancel that lands between the resume's load and its flip to
