@@ -1,0 +1,28 @@
+---
+source: crates/rupu-cli/src/output/live_view/structure.rs
+expression: render_plain(&rows)
+---
+  ✗  build  run · make ···· ✗ failed
+  │
+  ◆  comment  action · scm.prs.comment ···· ✓ 1s @kuki
+  │
+  ├─╭─ ⊞ hunt  for_each · runtime fan-out ···· ◐ running
+  │ │
+  │ ○├─ runtime items
+  │ │
+  │ ◄─╰─
+  │
+  ├─╭─ ⇉ lanes  parallel · 2 sub-steps ···· ⊘ skipped
+  │ │
+  │ ⊘├─ spec  writer
+  │ ⊘├─ verify  reviewer
+  │ │
+  │ ◄─╰─
+  │
+  ◇  pick  branch · when: {{ steps.build.output }} ···· ✓ 2s
+  ╰─ ▶ then → ship
+  ╰─ ⊘ else → hold
+  │
+  ◐  ship  shipper ···· ◐ running
+  │
+  ⊘  hold  holder ···· ⊘ skipped

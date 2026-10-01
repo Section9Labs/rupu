@@ -132,10 +132,40 @@ fn resume_blocked_by_live_runner(runner_pid: Option<u32>, own_pid: u32) -> Optio
     }
 }
 
-/// Drive `run_workflow(opts)` while painting the live three-zone view in
-/// a sibling task, returning the workflow result. The view tails
-/// `events.jsonl` + the active (unit or step) transcript and stops when
-/// the run reaches a terminal state. Shared by `run` and `resume_run`.
+/// True when the run stopped at an approval gate (not a cooperative pause):
+/// the live view is then the operator's approval surface and must outlive the
+/// runner, which has already returned.
+fn parked_at_gate(result: &OrchestratorRunResult) -> bool {
+    result
+        .awaiting
+        .as_ref()
+        .is_some_and(|a| a.reason == rupu_orchestrator::PauseReason::Approval)
+}
+
+/// A gate decided from inside the live view (approve → resumed in-process,
+/// reject → cleanup) leaves the first runner's result still saying
+/// "awaiting". Clear that when the run record has moved on, so downstream
+/// consumers (`RunOutcomeSummary::awaiting_step_id`, the issue summary
+/// comment) never report a settled run as parked.
+fn settle_awaiting(result: &mut OrchestratorRunResult, runs_dir: &Path) {
+    let store = rupu_orchestrator::RunStore::new(runs_dir.to_path_buf());
+    let moved_on = store
+        .load(&result.run_id)
+        .is_ok_and(|rec| rec.status != rupu_orchestrator::RunStatus::AwaitingApproval);
+    if moved_on {
+        result.awaiting = None;
+    }
+}
+
+/// Drive `run_workflow(opts)` while painting the live view in a sibling task,
+/// returning the workflow result. The view tails `events.jsonl` + the run's
+/// transcripts and stops when the run reaches a terminal state. Shared by
+/// `run` and `resume_run`.
+///
+/// A run that parks at an approval gate is the exception: the runner returns
+/// at the park, but the view stays up as the approval surface (`a` / `r`
+/// decide the gate in-view, `q` leaves) until the operator is done — it is
+/// awaited, not given a 300 ms grace.
 async fn run_workflow_with_live_view(
     opts: OrchestratorRunOpts,
     view_workflow: Workflow,
@@ -143,19 +173,21 @@ async fn run_workflow_with_live_view(
     run_id: String,
     pricing: rupu_config::PricingConfig,
 ) -> Result<OrchestratorRunResult, RunWfErr> {
+    let settle_dir = runs_dir.clone();
     let runner_task = tokio::spawn(run_workflow(opts));
     let mut view_task = tokio::spawn(async move {
         let _ =
             crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id, pricing).await;
     });
-    let result = match runner_task.await {
+    let mut result = match runner_task.await {
         Ok(r) => r,
         Err(e) => {
             // A panicked runner task is a hard failure; surface it as an
             // io error (the closest typed variant) so the caller's
             // existing error mapping applies. Await the aborted view so its
-            // `AltScreenGuard` has restored the normal screen before the caller
-            // prints the completion summary (same as the timeout branch below).
+            // alternate-screen guard has restored the normal screen before the
+            // caller prints the completion summary (same as the timeout branch
+            // below).
             view_task.abort();
             let _ = view_task.await;
             return Err(RunWfErr::Io(std::io::Error::other(format!(
@@ -163,10 +195,18 @@ async fn run_workflow_with_live_view(
             ))));
         }
     };
+    if matches!(&result, Ok(r) if parked_at_gate(r)) {
+        // Parked at a gate: wait for the operator. The view returns on its
+        // own (quit, or the decided run finishing) with the screen restored.
+        let _ = (&mut view_task).await;
+        if let Ok(r) = result.as_mut() {
+            settle_awaiting(r, &settle_dir);
+        }
+        return result;
+    }
     // Give the view a brief moment to paint the final frame, then stop it.
-    // A view that has not exited by then (e.g. the run parked at an approval
-    // gate, which the view does not treat as terminal) is aborted AND awaited:
-    // dropping its future runs `AltScreenGuard`'s drop, so the normal screen is
+    // A view that has not exited by then is aborted AND awaited: dropping its
+    // future drops the alternate-screen guard, so the normal screen is
     // guaranteed restored before the caller prints the completion summary.
     // Merely dropping the join handle would detach the task and leave the
     // alt-screen up while the summary was written into it.
@@ -3565,8 +3605,9 @@ pub(crate) async fn resume_run(
     // The view seeds step status live from `events.jsonl` going forward:
     // resumed steps emit `StepSkipped`, re-run units emit `UnitStarted` /
     // `UnitCompleted`, so the spine fills in as the run progresses. We do
-    // NOT pre-seed prior ✓ from the run-store into LiveRunState here
-    // (the events stream re-establishes status as it replays).
+    // NOT pre-seed prior ✓ from the run-store into the view here (the events
+    // stream re-establishes status as it replays, and the view ignores the
+    // previous generation's replayed terminal event).
     let outcome = if live_view_enabled(io::stdout().is_terminal(), plain) {
         run_workflow_with_live_view(
             opts,
@@ -5167,12 +5208,11 @@ async fn execute_workflow_invocation(
         naming: Some(Arc::clone(&naming)),
     };
 
-    // Opt-in live three-zone view (dashboard + git-graph spine + focus
-    // feed). Gated behind `RUPU_LIVE_VIEW=1` + a tty so the default
-    // line-printer path (with its approval loop) is unchanged. The live
-    // view does not handle approval gates; runs that pause render the
-    // awaiting glyph and the loop exits when the run reaches a terminal
-    // state.
+    // The live view (dashboard + collapsed graph + firehose feed, drill
+    // navigation) on a tty; `--plain` / `RUPU_LIVE_VIEW=0` / non-tty use the
+    // line-printer path (with its approval loop). A run that parks at an
+    // approval gate keeps the live view up: `a` / `r` decide the gate in-view
+    // (`run_workflow_with_live_view` waits for the operator).
     let use_live_view = ctx.attach_ui
         && ctx.shared_printer.is_none()
         && live_view_enabled(io::stdout().is_terminal(), ctx.plain);
@@ -6163,6 +6203,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("only a running run can be paused"));
+    }
+
+    // ── live view outlives the runner at an approval gate ───────────────
+
+    fn gate_result(run_id: &str, reason: rupu_orchestrator::PauseReason) -> OrchestratorRunResult {
+        OrchestratorRunResult {
+            step_results: Vec::new(),
+            run_id: run_id.to_string(),
+            awaiting: Some(rupu_orchestrator::AwaitingInfo {
+                step_id: "step_approve".into(),
+                prompt: "approve?".into(),
+                expires_at: None,
+                reason,
+                resume_seed: Vec::new(),
+                paused_steps: Vec::new(),
+                fanout_completed_units: Default::default(),
+                gates: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_live_view_outlives_the_runner_only_at_an_approval_gate() {
+        use rupu_orchestrator::PauseReason;
+        assert!(parked_at_gate(&gate_result("r", PauseReason::Approval)));
+        // A cooperative pause ends the view with the run (it resumes elsewhere).
+        assert!(!parked_at_gate(&gate_result("r", PauseReason::Manual)));
+        let mut done = gate_result("r", PauseReason::Approval);
+        done.awaiting = None;
+        assert!(!parked_at_gate(&done));
+    }
+
+    #[test]
+    fn settle_awaiting_clears_a_gate_decided_in_view_but_keeps_a_parked_one() {
+        use rupu_orchestrator::PauseReason;
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path().join("runs");
+        let store = rupu_orchestrator::RunStore::new(runs.clone());
+        let mut rec = sample_run_record(RunStatus::AwaitingApproval, None);
+        rec.id = "run_settle".into();
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
+
+        // Still parked (the operator quit the view): keep reporting it.
+        let mut result = gate_result("run_settle", PauseReason::Approval);
+        settle_awaiting(&mut result, &runs);
+        assert!(result.awaiting.is_some());
+
+        // Approved in-view: the record moved on, so the result must not claim
+        // the run is still awaiting approval.
+        store
+            .approve_gate("run_settle", "op", Utc::now(), None)
+            .unwrap();
+        settle_awaiting(&mut result, &runs);
+        assert!(result.awaiting.is_none());
+
+        // An unreadable record changes nothing.
+        let mut other = gate_result("run_missing", PauseReason::Approval);
+        settle_awaiting(&mut other, &runs);
+        assert!(other.awaiting.is_some());
     }
 
     /// The refusal names what the run is now: a cancel, with its reason,

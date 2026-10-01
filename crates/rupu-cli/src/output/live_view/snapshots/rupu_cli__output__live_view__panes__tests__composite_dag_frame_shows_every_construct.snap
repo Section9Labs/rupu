@@ -1,0 +1,57 @@
+---
+source: crates/rupu-cli/src/output/live_view/panes.rs
+expression: s
+---
+assess-fleet  ● mint-tundra  ◐ running · 3m 40s
+step 3/13  ██████░░░░░░░░░░░░░░░░░░  ◐ hunt +1
+⇡3400000 ⇣210000 $9.85 · ⚑3
+─ structure ────────────────────────────────────┬─ stream · sweep ──────────────────────────────────────────────────────
+  ✓  preflight  scanner · her… ···· ✓ 18s @kuki │ otter#2 ▸ list_files
+  │                                             │ otter#2 ▸ read_file deploy/ingress.yaml
+  ◈  recon  split ···· ✓ 2s                     │ otter#2 ◇ thinking the ingress exposes the admin port
+  ╭─ sweep                                      │ otter#2 ⚑ MEDIUM admin port reachable from the edge
+  ├─ hunt                                       │ otter#2 ▪ Swept 14 services; one exposure noted.
+  ╰─ lanes                                      │
+  │                                             │
+▸ ✓  sweep  sweeper · otter#2… ···· ✓ 41s @mini │
+  │                                             │
+  ├─╭─ ⊞ hunt  for_each · runti… ···· ◐ running │
+  │ │ ▓▓▓▓▓░░░░░░░░░░░░░░░ 1/4 ✓1 ◐2 ○1         │
+  │ ◐├─ svc-1  wren#1 ···· ◐ running @kuki      │
+  │ ◐├─ svc-2  egret#1 ···· ◐ running @mini     │
+  │ ✓├─ svc-0  lynx#1 ···· ✓ done @mini         │
+  │ ○├─ svc-3 ···· ○ queued                     │
+  │ ◄─╰─                                        │
+  │                                             │
+  ├─╭─ ⇉ lanes  parallel · 2 su… ···· ◐ running │
+  │ │ ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░ 1/2 ✓1 ◐1            │
+  │ ✓├─ spec  writer · otter#3 ···· ✓ done      │
+  │ ◐├─ verify  reviewer … ···· ◐ running @kuki │
+  │ │                                           │
+  │ ◄─╰─                                        │
+  │                                             │
+  ◈◄─ gather  join · wait:all                   │
+  │                                             │
+  ◇  pick  branch · when: {{ steps.sweep.outpu… │
+  ╰─ ▶ then → ship                              │
+  ╰─ ⊘ else → hold                              ├─ live · 3 active · 2 hosts ───────────────────────────────────────────
+  │                                             │ lynx#1 ▸ read_file svc/auth/handler.rs
+  ○  ship  shipper                              │ heron#2 ▸ grep TODO
+  │                                             │ wren#1 ▸ read_file svc/billing/ledger.rs
+  ○  hold  holder                               │ egret#1 ▸ read_file svc/search/index.rs
+  │                                             │ wren#1 ⚑ HIGH ledger totals lose cents
+  ⏸  approve  gate                              │ heron#2 ▸ read_file docs/runbook.md
+  │                                             │
+  ├─╭─ ↻ loop:refine  until {{ steps.critique.… │
+  │ ○  gen  generator                           │
+  │ │                                           │
+  │ ○  critique  critic                         │
+  │ ◄─ ↺ loop:refine  loop-back                 │
+  │                                             │
+  ├─╭─ ⟲ review  panel · 2 panelists            │
+  │ │                                           │
+  │ ○├─ security-reviewer                       │
+  │ ○├─ perf-reviewer                           │
+  │ │                                           │
+  │ ◄─╰─                                        │
+↑↓ move · enter drill · ← back · / filter · tab pane · Esc pause · q quit

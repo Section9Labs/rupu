@@ -3,13 +3,20 @@
 //!
 //! Depth axis: run → step → unit → sub-agent. The cursor at each depth moves
 //! over the in-view list for that depth (steps at `Run`, the filtered units
-//! at `Step`, sub-agents at `Unit`/`SubAgent`). No terminal I/O: Plan 3 maps
-//! crossterm key events onto [`NavKey`] and feeds them to [`NavState::apply`]
+//! at `Step`, sub-agents at `Unit`/`SubAgent`). No terminal I/O: `output::live_run`
+//! maps crossterm key events onto [`NavKey`] and feeds them to [`NavState::apply`]
 //! together with the current [`RunView`]. A run grows steps / units /
 //! dispatches between ticks, so every call re-clamps the cursors to the lists
 //! that exist *now* and never indexes out of range.
+//!
+//! The dashboard adds a second axis: which [`Pane`] has focus (structure |
+//! stream | firehose). Drill / move / filter keys act only on the structure
+//! pane; with the stream or firehose focused the arrows scroll that pane
+//! instead. The structure selection keeps driving the stream pane from any
+//! focus, so changing focus never changes what the stream shows.
 
-use crate::output::run_model::{DispatchView, RunView, StepView, UnitStatus, UnitView};
+use crate::output::run_model::{DispatchView, GateView, RunView, StepView, UnitStatus, UnitView};
+use rupu_orchestrator::runs::RunStatus;
 
 /// A navigation input, already decoded from the terminal by Plan 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +33,46 @@ pub enum NavKey {
     Filter,
     Quit,
     Pause,
+    /// Focus the next pane (structure → stream → firehose → structure).
+    PaneNext,
+    /// Focus the previous pane.
+    PanePrev,
+    /// Scroll the focused stream / firehose pane toward older lines by a
+    /// page. A no-op with the structure pane focused (it windows itself).
+    ScrollUp,
+    /// Scroll the focused stream / firehose pane toward the live tail by a
+    /// page. A no-op with the structure pane focused.
+    ScrollDown,
 }
+
+/// Which pane of the dashboard has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pane {
+    /// The workflow structure graph — the drill/selection pane.
+    #[default]
+    Structure,
+    /// The transcript of the structure selection.
+    Stream,
+    /// The run-wide event firehose.
+    Firehose,
+}
+
+impl Pane {
+    /// The next pane in `Structure → Stream → Firehose → Structure` order,
+    /// or the previous one when `fwd` is false.
+    fn cycled(self, fwd: bool) -> Pane {
+        match (self, fwd) {
+            (Pane::Structure, true) | (Pane::Firehose, false) => Pane::Stream,
+            (Pane::Stream, true) | (Pane::Structure, false) => Pane::Firehose,
+            (Pane::Firehose, true) | (Pane::Stream, false) => Pane::Structure,
+        }
+    }
+}
+
+/// Lines moved by one arrow press on a scrolling pane.
+const SCROLL_LINE: usize = 1;
+/// Lines moved by one [`NavKey::ScrollUp`] / [`NavKey::ScrollDown`].
+const SCROLL_PAGE: usize = 10;
 
 /// How deep the operator has drilled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +134,14 @@ pub enum NavAction {
     Pause,
 }
 
-/// Drill position + cursors. Fields are private; construct with
-/// [`NavState::default`] (`Run` depth, following, `All` filter, cursors 0).
+/// Drill position + cursors + pane focus. Fields are private; construct with
+/// [`NavState::default`] (`Run` depth, following, `All` filter, cursors 0,
+/// structure pane focused, both scrolling panes at their live tail).
+///
+/// A scroll offset is the number of lines the pane is held *above its live
+/// tail*: `0` shows the newest lines, larger values show older ones. Nav does
+/// not know the buffer lengths, so the offset is only bounded below here; the
+/// renderer, which does, must call [`NavState::clamp_scroll`] each frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NavState {
     depth: Depth,
@@ -98,6 +150,9 @@ pub struct NavState {
     sub_idx: usize,
     follow: bool,
     filter: UnitFilter,
+    pane: Pane,
+    stream_scroll: usize,
+    firehose_scroll: usize,
 }
 
 impl Default for NavState {
@@ -109,6 +164,9 @@ impl Default for NavState {
             sub_idx: 0,
             follow: true,
             filter: UnitFilter::All,
+            pane: Pane::Structure,
+            stream_scroll: 0,
+            firehose_scroll: 0,
         }
     }
 }
@@ -140,9 +198,88 @@ impl NavState {
         self.filter
     }
 
+    /// The pane that currently has keyboard focus.
+    pub fn pane(&self) -> Pane {
+        self.pane
+    }
+
+    /// Move focus to the next pane, or the previous one when `fwd` is false
+    /// (`Structure → Stream → Firehose → Structure`). Touches nothing else:
+    /// selection, depth and follow are unaffected.
+    pub fn cycle_pane(&mut self, fwd: bool) {
+        self.pane = self.pane.cycled(fwd);
+    }
+
+    /// Lines `pane` is held above its live tail (`0` = pinned to the newest
+    /// line). The structure pane windows itself and always answers `0`.
+    pub fn scroll_offset(&self, pane: Pane) -> usize {
+        match pane {
+            Pane::Structure => 0,
+            Pane::Stream => self.stream_scroll,
+            Pane::Firehose => self.firehose_scroll,
+        }
+    }
+
+    /// Bound `pane`'s offset to `max_offset` — the most lines the renderer
+    /// can actually scroll back given the buffer it just drew (typically
+    /// `total_lines - visible_rows`, `0` for an empty or short buffer). Call
+    /// once per frame so an offset never runs past the real scrollback, and a
+    /// pane whose buffer shrank snaps back instead of drawing blank. A no-op
+    /// for the structure pane.
+    pub fn clamp_scroll(&mut self, pane: Pane, max_offset: usize) {
+        match pane {
+            Pane::Structure => {}
+            Pane::Stream => self.stream_scroll = self.stream_scroll.min(max_offset),
+            Pane::Firehose => self.firehose_scroll = self.firehose_scroll.min(max_offset),
+        }
+    }
+
+    /// Everything that decides which transcript the stream pane shows: the
+    /// drill depth, the three cursors and the unit filter (a filter change
+    /// can swap the unit under an unchanged cursor index).
+    fn selection_key(&self) -> (Depth, usize, usize, usize, UnitFilter) {
+        (
+            self.depth,
+            self.step_idx,
+            self.unit_idx,
+            self.sub_idx,
+            self.filter,
+        )
+    }
+
+    /// Scroll the focused pane `lines` toward older output (`older`) or the
+    /// live tail. Saturates at the tail; the far end is the renderer's
+    /// [`NavState::clamp_scroll`]. A no-op with the structure pane focused.
+    fn scroll_focused(&mut self, older: bool, lines: usize) {
+        let offset = match self.pane {
+            Pane::Structure => return,
+            Pane::Stream => &mut self.stream_scroll,
+            Pane::Firehose => &mut self.firehose_scroll,
+        };
+        *offset = if older {
+            offset.saturating_add(lines)
+        } else {
+            offset.saturating_sub(lines)
+        };
+    }
+
     /// The step under the cursor (valid at every depth).
     pub fn selected_step<'a>(&self, view: &'a RunView) -> Option<&'a StepView> {
         view.steps.get(clamp_idx(self.step_idx, view.steps.len()))
+    }
+
+    /// The step the operator has *chosen*, if any. While the view is
+    /// following the newest activity at `Run` depth the step cursor is just
+    /// parked on step 0 — that is not a selection, so nothing is chosen. Once
+    /// the operator has moved the cursor or drilled in, the cursor step is
+    /// the choice. While following, a parked run's first gate stands in for a
+    /// choice ([`NavState::gate_step`]), so what `a` / `r` would act on is
+    /// the thing marked. The one predicate behind every selection marker.
+    pub fn chosen_step<'a>(&self, view: &'a RunView) -> Option<&'a StepView> {
+        let chosen = !self.follow || self.depth != Depth::Run;
+        self.selected_step(view)
+            .filter(|_| chosen)
+            .or_else(|| self.gate_step(view))
     }
 
     /// The unit under the cursor within the selected step's *filtered* list.
@@ -152,14 +289,44 @@ impl NavState {
     }
 
     /// The sub-agent under the cursor.
-    fn selected_sub_agent<'a>(&self, view: &'a RunView) -> Option<&'a DispatchView> {
+    pub fn selected_sub_agent<'a>(&self, view: &'a RunView) -> Option<&'a DispatchView> {
         let subs = self.sub_list(view);
         subs.get(clamp_idx(self.sub_idx, subs.len())).copied()
     }
 
+    /// The parked-gate step an approve / reject would act on, if any. The ONE
+    /// predicate behind both the footer legend (`a approve · r reject · …`) and
+    /// the key dispatch, so the two can never disagree.
+    ///
+    /// Only an `AwaitingApproval` run has one, and only a step with an entry in
+    /// the run's awaiting set (`view.gates`) is actionable — a step that merely
+    /// looks parked is not. Once the operator has chosen a step (moved the
+    /// cursor or drilled in) the gate is that step, if it is parked. While
+    /// following the newest activity nothing is chosen, so the first parked
+    /// gate in step order is focused automatically — a parked run must not
+    /// need navigation before its keys appear.
+    pub fn gate_step<'a>(&self, view: &'a RunView) -> Option<&'a StepView> {
+        if view.status != RunStatus::AwaitingApproval {
+            return None;
+        }
+        let parked = |s: &&StepView| view.gates.iter().any(|g| g.step_id == s.step_id);
+        let chosen = !self.follow || self.depth != Depth::Run;
+        if chosen {
+            self.selected_step(view).filter(parked)
+        } else {
+            view.steps.iter().find(parked)
+        }
+    }
+
+    /// The gate behind [`NavState::gate_step`]: what `a` / `r` / `v` act on.
+    pub fn focused_gate<'a>(&self, view: &'a RunView) -> Option<&'a GateView> {
+        let step = self.gate_step(view)?;
+        view.gates.iter().find(|g| g.step_id == step.step_id)
+    }
+
     /// The unit under the cursor within `step`'s *filtered* list. Same answer
     /// as [`NavState::selected_unit`] when `step` is the selected step; for
-    /// renderers that hold only the step (`layout::fanout_block`).
+    /// renderers that hold only the step (the structure pane's fan-out block).
     pub fn selected_unit_in<'a>(&self, step: &'a StepView) -> Option<&'a UnitView> {
         let units = self.filtered_units(step);
         units.get(clamp_idx(self.unit_idx, units.len())).copied()
@@ -233,25 +400,56 @@ impl NavState {
     /// The pure transition. Returns [`NavAction::Quit`] / [`NavAction::Pause`]
     /// for the two keys the caller must act on; everything else is
     /// [`NavAction::None`] after mutating `self`.
+    ///
+    /// Focus routing: `Quit` / `Pause` / `Follow` and the pane-cycle keys work
+    /// from any pane. The drill / move / filter keys act only with the
+    /// structure pane focused; with the stream or firehose focused `Up` /
+    /// `Down` scroll that pane a line and `ScrollUp` / `ScrollDown` a page, and
+    /// `In` / `Out` / `Filter` do nothing.
     pub fn apply(&mut self, key: NavKey, view: &RunView) -> NavAction {
         self.settle(view);
+        let structure = self.pane == Pane::Structure;
+        // What the stream pane is showing: any change to it invalidates the
+        // stream's scroll offset (it indexed into the previous transcript).
+        let shown = self.selection_key();
         let action = match key {
             NavKey::Quit => NavAction::Quit,
             NavKey::Pause => NavAction::Pause,
-            NavKey::Up => {
-                self.move_cursor(false, view);
+            NavKey::PaneNext => {
+                self.cycle_pane(true);
                 NavAction::None
             }
-            NavKey::Down => {
-                self.move_cursor(true, view);
+            NavKey::PanePrev => {
+                self.cycle_pane(false);
+                NavAction::None
+            }
+            NavKey::ScrollUp => {
+                self.scroll_focused(true, SCROLL_PAGE);
+                NavAction::None
+            }
+            NavKey::ScrollDown => {
+                self.scroll_focused(false, SCROLL_PAGE);
+                NavAction::None
+            }
+            NavKey::Up | NavKey::Down => {
+                let down = key == NavKey::Down;
+                if structure {
+                    self.move_cursor(down, view);
+                } else {
+                    self.scroll_focused(!down, SCROLL_LINE);
+                }
                 NavAction::None
             }
             NavKey::In => {
-                self.drill_in(view);
+                if structure {
+                    self.drill_in(view);
+                }
                 NavAction::None
             }
             NavKey::Out => {
-                self.drill_out();
+                if structure {
+                    self.drill_out();
+                }
                 NavAction::None
             }
             NavKey::Follow => {
@@ -260,18 +458,26 @@ impl NavState {
                 self.step_idx = 0;
                 self.unit_idx = 0;
                 self.sub_idx = 0;
+                // Following means "back to live" everywhere.
+                self.stream_scroll = 0;
+                self.firehose_scroll = 0;
                 NavAction::None
             }
             NavKey::Filter => {
-                self.filter = self.filter.next();
-                // The filtered list was rebuilt; start from its top.
-                self.unit_idx = 0;
-                self.sub_idx = 0;
+                if structure {
+                    self.filter = self.filter.next();
+                    // The filtered list was rebuilt; start from its top.
+                    self.unit_idx = 0;
+                    self.sub_idx = 0;
+                }
                 NavAction::None
             }
         };
         // A filter change can empty the list the depth points into.
         self.settle(view);
+        if self.selection_key() != shown {
+            self.stream_scroll = 0;
+        }
         action
     }
 
@@ -368,7 +574,7 @@ mod tests {
     use super::*;
     use crate::output::run_model::RunView;
     use rupu_orchestrator::executor::Event;
-    use rupu_orchestrator::runs::StepKind;
+    use rupu_orchestrator::runs::{RunStatus, StepKind};
 
     fn fanout_view() -> RunView {
         let mut v = RunView::default();
@@ -730,7 +936,8 @@ mod tests {
 
     #[test]
     fn step_scoped_accessors_agree_with_the_view_scoped_ones() {
-        // `fanout_block` only holds the step, so nav must answer from it.
+        // The structure pane's fan-out block only holds the step, so nav must
+        // answer from it.
         let mut v = fanout_view();
         complete_unit(&mut v, "hunt", 0, true); // svc-0 Done
         complete_unit(&mut v, "hunt", 1, false); // svc-1 Failed; svc-2 Running
@@ -793,5 +1000,495 @@ mod tests {
         nav.apply(NavKey::In, &f);
         nav.sync(&f);
         assert_eq!(nav.depth(), Depth::Step);
+    }
+
+    // ── gate focus (Plan 3, I1) ─────────────────────────────────────────
+
+    /// `build` done, `gate_a` / `gate_b` parked, `deploy` pending; both
+    /// gates are in `view.gates` (run.json's awaiting set) when `parked`.
+    fn parked_view(two_gates: bool) -> RunView {
+        use crate::output::run_model::{GateView, StepState};
+        let mut v = RunView::default();
+        v.status = RunStatus::AwaitingApproval;
+        start_step(&mut v, "build", StepKind::Linear);
+        v.step_mut("build").state = StepState::Complete;
+        let mut gates = vec!["gate_a"];
+        if two_gates {
+            gates.push("gate_b");
+        }
+        for id in &gates {
+            let s = v.step_mut(id);
+            s.kind = StepKind::ApprovalGate;
+            s.state = StepState::AwaitingApproval;
+        }
+        v.step_mut("deploy");
+        v.gates = gates
+            .into_iter()
+            .map(|id| GateView {
+                step_id: id.into(),
+                prompt: Some("publish?".into()),
+                since: chrono::Utc::now(),
+                expires_at: None,
+            })
+            .collect();
+        v
+    }
+
+    fn gate_id(nav: &NavState, v: &RunView) -> Option<String> {
+        nav.focused_gate(v).map(|g| g.step_id.clone())
+    }
+
+    #[test]
+    fn a_parked_gate_is_auto_focused_while_following() {
+        let v = parked_view(true);
+        let nav = NavState::default();
+        assert!(nav.is_following());
+        // No manual selection: the FIRST parked gate (step order) is focused.
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+        assert_eq!(
+            nav.gate_step(&v).map(|s| s.step_id.as_str()),
+            Some("gate_a")
+        );
+    }
+
+    #[test]
+    fn a_manual_selection_decides_the_focused_gate() {
+        let v = parked_view(true);
+        // Down x1 -> `gate_a`, x2 -> `gate_b`; x0..: following parks on step 0.
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v); // step 1 = gate_a (a move stops following)
+        assert!(!nav.is_following());
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_b"));
+
+        // Selecting a step that is NOT a parked gate: nothing is focused —
+        // the navigation keys apply, not approve/reject.
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(
+            nav.selected_step(&v).map(|s| s.step_id.as_str()),
+            Some("deploy")
+        );
+        assert_eq!(gate_id(&nav, &v), None);
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::Up, &v);
+        assert_eq!(
+            nav.selected_step(&v).map(|s| s.step_id.as_str()),
+            Some("build")
+        );
+        assert_eq!(gate_id(&nav, &v), None);
+
+        // `a` (Follow) drops the manual selection and re-focuses the first gate.
+        nav.apply(NavKey::Follow, &v);
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+    }
+
+    #[test]
+    fn chosen_step_is_only_a_real_choice_or_the_parked_gate() {
+        let chosen = |nav: &NavState, v: &RunView| nav.chosen_step(v).map(|s| s.step_id.clone());
+
+        // Following with nothing parked: the cursor idles on step 0 — that is
+        // not a choice.
+        let mut v = parked_view(true);
+        v.status = RunStatus::Running;
+        v.gates.clear();
+        assert_eq!(chosen(&NavState::default(), &v), None);
+
+        // Following a parked run: the first gate stands in for a choice.
+        let v = parked_view(true);
+        assert_eq!(chosen(&NavState::default(), &v).as_deref(), Some("gate_a"));
+
+        // A manual move chooses the cursor step, parked or not.
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Up, &v); // stops following, cursor stays on `build`
+        assert_eq!(chosen(&nav, &v).as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn a_drilled_gate_stays_focused_without_following() {
+        let v = parked_view(false);
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v); // gate_a
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+    }
+
+    #[test]
+    fn no_gate_is_focused_unless_the_run_is_awaiting_and_the_gate_is_actionable() {
+        // The run is not awaiting approval (e.g. a pause left a stale record):
+        let mut v = parked_view(true);
+        v.status = RunStatus::Running;
+        assert_eq!(gate_id(&NavState::default(), &v), None);
+
+        // A step that merely LOOKS parked but has no entry in run.json's
+        // awaiting set is not actionable: no approve/reject advertised.
+        let mut v = parked_view(true);
+        v.gates.clear();
+        assert_eq!(gate_id(&NavState::default(), &v), None);
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(gate_id(&nav, &v), None);
+
+        // A decided gate drops out of the set: the other one takes the focus.
+        let mut v = parked_view(true);
+        v.gates.retain(|g| g.step_id != "gate_a");
+        assert_eq!(gate_id(&NavState::default(), &v).as_deref(), Some("gate_b"));
+    }
+
+    // ── pane focus + per-pane scroll (dashboard Task 6) ─────────────────
+
+    fn three_steps() -> RunView {
+        let mut v = RunView::default();
+        for id in ["a", "b", "c"] {
+            start_step(&mut v, id, StepKind::Linear);
+        }
+        v
+    }
+
+    /// A fresh `NavState` with `pane` focused.
+    fn focused(pane: Pane) -> NavState {
+        NavState {
+            pane,
+            ..NavState::default()
+        }
+    }
+
+    fn sel(nav: &NavState, v: &RunView) -> Option<String> {
+        nav.selected_step(v).map(|s| s.step_id.clone())
+    }
+
+    #[test]
+    fn tab_cycles_structure_stream_firehose_and_back() {
+        let v = fanout_view();
+        let mut nav = NavState::default();
+        assert_eq!(nav.pane(), Pane::Structure);
+
+        for want in [Pane::Stream, Pane::Firehose, Pane::Structure] {
+            assert_eq!(nav.apply(NavKey::PaneNext, &v), NavAction::None);
+            assert_eq!(nav.pane(), want);
+        }
+        // Reverse walks the same ring the other way.
+        for want in [Pane::Firehose, Pane::Stream, Pane::Structure] {
+            assert_eq!(nav.apply(NavKey::PanePrev, &v), NavAction::None);
+            assert_eq!(nav.pane(), want);
+        }
+
+        // The direct accessor agrees with the keys.
+        nav.cycle_pane(true);
+        assert_eq!(nav.pane(), Pane::Stream);
+        nav.cycle_pane(false);
+        assert_eq!(nav.pane(), Pane::Structure);
+    }
+
+    #[test]
+    fn pane_focus_does_not_touch_selection_follow_or_depth() {
+        let v = three_steps();
+        let mut nav = NavState::default();
+        assert!(nav.is_following());
+        nav.apply(NavKey::PaneNext, &v);
+        nav.apply(NavKey::PaneNext, &v);
+        nav.apply(NavKey::PanePrev, &v);
+        assert!(nav.is_following());
+        assert_eq!(nav.depth(), Depth::Run);
+        assert_eq!(sel(&nav, &v).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn structure_keys_move_and_drill_only_in_structure_focus() {
+        let v = three_steps();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(sel(&nav, &v).as_deref(), Some("b"));
+
+        for pane in [Pane::Stream, Pane::Firehose] {
+            nav.pane = pane;
+            let before = nav;
+            for key in [
+                NavKey::Down,
+                NavKey::Up,
+                NavKey::In,
+                NavKey::Out,
+                NavKey::Filter,
+            ] {
+                nav.apply(key, &v);
+                assert_eq!(sel(&nav, &v).as_deref(), Some("b"), "{key:?} in {pane:?}");
+                assert_eq!(nav.depth(), before.depth(), "{key:?} in {pane:?}");
+                assert_eq!(nav.filter(), before.filter(), "{key:?} in {pane:?}");
+            }
+        }
+
+        // Back in Structure focus the same keys act again.
+        nav.pane = Pane::Structure;
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(sel(&nav, &v).as_deref(), Some("c"));
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+        nav.apply(NavKey::Filter, &v);
+        assert_ne!(nav.filter(), UnitFilter::All);
+    }
+
+    #[test]
+    fn out_ascends_only_with_the_structure_pane_focused() {
+        // `Out` at `Run` is a no-op anyway, so the gate must be proven at a
+        // depth where `Out` really ascends: drill to `Unit`, then move focus
+        // off the structure pane. Removing the `structure` gate on `Out`
+        // makes this fail (the depth would drop to `Step`).
+        let v = fanout_view();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &v);
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Unit);
+
+        for pane in [Pane::Stream, Pane::Firehose] {
+            nav.pane = pane;
+            assert_eq!(nav.apply(NavKey::Out, &v), NavAction::None);
+            assert_eq!(nav.depth(), Depth::Unit, "Out in {pane:?} must not ascend");
+            assert_eq!(nav.breadcrumb(&v), vec!["mint-tundra", "hunt", "otter#1"]);
+        }
+
+        // Back on the structure pane the same key ascends.
+        nav.pane = Pane::Structure;
+        nav.apply(NavKey::Out, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+    }
+
+    #[test]
+    fn a_move_key_outside_structure_focus_does_not_stop_following() {
+        // `move_cursor` clears `follow`; an arrow that only scrolls the
+        // stream must not, or the run view would stop tracking the frontier.
+        let v = three_steps();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::PaneNext, &v);
+        nav.apply(NavKey::Down, &v);
+        nav.apply(NavKey::Up, &v);
+        assert!(nav.is_following());
+    }
+
+    #[test]
+    fn arrows_scroll_the_focused_pane_and_stop_at_the_live_tail() {
+        let v = three_steps();
+        let mut nav = NavState::default();
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        assert_eq!(nav.scroll_offset(Pane::Firehose), 0);
+
+        nav.apply(NavKey::PaneNext, &v); // Stream
+        nav.apply(NavKey::Up, &v); // toward older lines
+        nav.apply(NavKey::Up, &v);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 2);
+        assert_eq!(nav.scroll_offset(Pane::Firehose), 0);
+        nav.apply(NavKey::Down, &v); // toward the tail
+        assert_eq!(nav.scroll_offset(Pane::Stream), 1);
+        nav.apply(NavKey::Down, &v);
+        nav.apply(NavKey::Down, &v); // already at the tail: stays put
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+
+        // Firehose keeps its own offset, and offsets survive a focus change.
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::PaneNext, &v); // Firehose
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::Up, &v);
+        assert_eq!(nav.scroll_offset(Pane::Firehose), 3);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 1);
+        // Structure has no scroll offset of its own.
+        assert_eq!(nav.scroll_offset(Pane::Structure), 0);
+    }
+
+    #[test]
+    fn scroll_keys_scroll_only_the_focused_pane() {
+        let v = three_steps();
+        let mut nav = NavState::default();
+
+        // Structure focus: its windowing is its own, so scroll keys are inert.
+        nav.apply(NavKey::ScrollUp, &v);
+        nav.apply(NavKey::ScrollDown, &v);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        assert_eq!(nav.scroll_offset(Pane::Firehose), 0);
+        assert_eq!(sel(&nav, &v).as_deref(), Some("a"));
+        assert!(nav.is_following());
+
+        nav.apply(NavKey::PaneNext, &v); // Stream
+        nav.apply(NavKey::ScrollUp, &v);
+        let up = nav.scroll_offset(Pane::Stream);
+        assert!(up > 0, "ScrollUp raises the stream offset");
+        assert_eq!(nav.scroll_offset(Pane::Firehose), 0);
+        nav.apply(NavKey::ScrollUp, &v);
+        assert!(nav.scroll_offset(Pane::Stream) > up);
+        nav.apply(NavKey::ScrollDown, &v);
+        assert_eq!(nav.scroll_offset(Pane::Stream), up);
+        // ScrollDown saturates at the tail.
+        for _ in 0..4 {
+            nav.apply(NavKey::ScrollDown, &v);
+        }
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+
+        nav.apply(NavKey::PaneNext, &v); // Firehose
+        nav.apply(NavKey::ScrollUp, &v);
+        assert!(nav.scroll_offset(Pane::Firehose) > 0);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        // Scrolling never moves the structure selection.
+        assert_eq!(sel(&nav, &v).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn clamp_scroll_bounds_the_offset_to_the_real_buffer() {
+        let v = three_steps();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::PaneNext, &v);
+        for _ in 0..50 {
+            nav.apply(NavKey::ScrollUp, &v);
+        }
+        nav.clamp_scroll(Pane::Stream, 7);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 7);
+        // Already within bounds: untouched. Other panes: untouched.
+        nav.clamp_scroll(Pane::Stream, 100);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 7);
+        nav.clamp_scroll(Pane::Firehose, 0);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 7);
+        // An emptied buffer snaps back to the tail.
+        nav.clamp_scroll(Pane::Stream, 0);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        // Structure never carries an offset.
+        nav.clamp_scroll(Pane::Structure, 5);
+        assert_eq!(nav.scroll_offset(Pane::Structure), 0);
+    }
+
+    #[test]
+    fn changing_the_selection_returns_the_stream_to_the_tail() {
+        // The stream pane follows the structure selection, so an offset into
+        // one transcript means nothing against another.
+        let v = three_steps();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::PaneNext, &v); // Stream
+        nav.apply(NavKey::ScrollUp, &v);
+        nav.apply(NavKey::ScrollUp, &v);
+        assert!(nav.scroll_offset(Pane::Stream) > 0);
+        nav.apply(NavKey::PanePrev, &v); // Structure
+        assert!(nav.scroll_offset(Pane::Stream) > 0, "focus alone keeps it");
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+
+        // A move that stops at the end of the list changes nothing, so the
+        // operator's scroll position is kept.
+        nav.apply(NavKey::Down, &v); // c
+        nav.apply(NavKey::PaneNext, &v);
+        nav.apply(NavKey::ScrollUp, &v);
+        let held = nav.scroll_offset(Pane::Stream);
+        nav.apply(NavKey::PanePrev, &v);
+        nav.apply(NavKey::Down, &v); // already on c
+        assert_eq!(nav.scroll_offset(Pane::Stream), held);
+    }
+
+    #[test]
+    fn drilling_or_filtering_also_returns_the_stream_to_the_tail() {
+        // Neither changes a cursor index on a one-step run, but both change
+        // which transcript the stream pane is showing.
+        let v = fanout_view();
+        let mut nav = NavState::default();
+        let scrolled = |nav: &mut NavState| {
+            nav.apply(NavKey::PaneNext, &v);
+            nav.apply(NavKey::ScrollUp, &v);
+            nav.apply(NavKey::PanePrev, &v);
+            assert!(nav.scroll_offset(Pane::Stream) > 0);
+        };
+        scrolled(&mut nav);
+        nav.apply(NavKey::In, &v); // Run -> Step: cursors unchanged
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        scrolled(&mut nav);
+        nav.apply(NavKey::Filter, &v);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        scrolled(&mut nav);
+        nav.apply(NavKey::Out, &v);
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+    }
+
+    #[test]
+    fn selection_still_drives_the_stream_from_any_focus() {
+        let v = fanout_view();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &v);
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Unit);
+        let unit = |nav: &NavState| nav.selected_unit(&v).map(|u| u.unit_key.clone());
+        assert_eq!(unit(&nav).as_deref(), Some("svc-0"));
+
+        // Focus the stream: the unit it would show is unchanged, and arrows
+        // scroll rather than walk to svc-1.
+        nav.apply(NavKey::PaneNext, &v);
+        nav.apply(NavKey::Down, &v);
+        nav.apply(NavKey::Up, &v);
+        assert_eq!(unit(&nav).as_deref(), Some("svc-0"));
+        assert_eq!(nav.depth(), Depth::Unit);
+        assert_eq!(nav.breadcrumb(&v), vec!["mint-tundra", "hunt", "otter#1"]);
+
+        // Return to Structure: drilling and moving work as before (the unit
+        // cursor walks units at Step depth).
+        nav.apply(NavKey::PanePrev, &v);
+        nav.apply(NavKey::Out, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(unit(&nav).as_deref(), Some("svc-1"));
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Unit);
+    }
+
+    #[test]
+    fn follow_returns_every_pane_to_the_tail_without_changing_focus() {
+        let v = three_steps();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::PaneNext, &v); // Stream
+        nav.apply(NavKey::ScrollUp, &v);
+        nav.apply(NavKey::PaneNext, &v); // Firehose
+        nav.apply(NavKey::ScrollUp, &v);
+        assert!(nav.scroll_offset(Pane::Stream) > 0);
+        assert!(nav.scroll_offset(Pane::Firehose) > 0);
+
+        nav.apply(NavKey::Follow, &v);
+        assert!(nav.is_following());
+        assert_eq!(nav.scroll_offset(Pane::Stream), 0);
+        assert_eq!(nav.scroll_offset(Pane::Firehose), 0);
+        assert_eq!(nav.pane(), Pane::Firehose);
+    }
+
+    #[test]
+    fn quit_and_pause_work_from_every_pane() {
+        let v = three_steps();
+        for pane in [Pane::Structure, Pane::Stream, Pane::Firehose] {
+            let mut nav = focused(pane);
+            assert_eq!(nav.apply(NavKey::Quit, &v), NavAction::Quit);
+            assert_eq!(nav.apply(NavKey::Pause, &v), NavAction::Pause);
+        }
+    }
+
+    #[test]
+    fn every_key_in_every_pane_is_panic_free_on_empty_and_shrunken_views() {
+        let keys = [
+            NavKey::Up,
+            NavKey::Down,
+            NavKey::In,
+            NavKey::Out,
+            NavKey::Follow,
+            NavKey::Filter,
+            NavKey::Quit,
+            NavKey::Pause,
+            NavKey::PaneNext,
+            NavKey::PanePrev,
+            NavKey::ScrollUp,
+            NavKey::ScrollDown,
+        ];
+        let views = [RunView::default(), three_steps(), fanout_view()];
+        for view in &views {
+            for pane in [Pane::Structure, Pane::Stream, Pane::Firehose] {
+                for key in keys {
+                    let mut nav = focused(pane);
+                    nav.apply(key, view);
+                    // Drive it on a different view afterwards.
+                    nav.apply(key, &RunView::default());
+                    nav.sync(&RunView::default());
+                }
+            }
+        }
     }
 }
