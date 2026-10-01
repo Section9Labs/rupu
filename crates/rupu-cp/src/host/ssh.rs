@@ -1082,6 +1082,11 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
         "kex_exchange_identification",
         "permission denied (publickey",
         "host key verification failed",
+        // Mid-session drops (the connection came up, then died):
+        "closed by remote host", // "Connection to <host> closed by remote host."
+        "not responding",        // "Timeout, server <host> not responding."
+        "broken pipe",           // "client_loop: send disconnect: Broken pipe"
+        "received disconnect",   // "Received disconnect from <ip> port 22:…"
     ];
     let lower = stderr.to_ascii_lowercase();
     MARKERS.iter().any(|m| lower.contains(m))
@@ -2128,6 +2133,13 @@ impl HostConnector for SshHostConnector {
     ///
     /// `stream_run_events` still reads the mirror, deliberately: tailing a
     /// known path on a live run is a different problem from enumerating.
+    ///
+    /// Errors split on WHO failed. An ssh transport failure (host down,
+    /// connection dropped; see [`is_ssh_transport_failure`]) passes through
+    /// as [`HostConnectorError::Unreachable`], which the web renders as
+    /// offline. A failure in the remote rupu itself (an old rupu with no
+    /// `run list`) maps to [`HostConnectorError::Unsupported`] ("needs a
+    /// newer rupu").
     async fn list_runs(
         &self,
         params: RunListQuery,
@@ -2754,9 +2766,13 @@ impl HostConnector for SshHostConnector {
     /// ControlMaster multiplexing), so this deliberately stays coarse — no
     /// per-panel round-trips.
     ///
-    /// An old remote rupu without `run list` yields
-    /// [`HostConnectorError::Unsupported`], never zeroed data: a host that
-    /// cannot report is not a host with no runs.
+    /// Errors split on WHO failed. An ssh transport failure (host down,
+    /// connection dropped; see [`is_ssh_transport_failure`]) passes through
+    /// as [`HostConnectorError::Unreachable`], rendered as offline. A failure
+    /// in the remote rupu itself (an old rupu without `run list`) yields
+    /// [`HostConnectorError::Unsupported`] ("needs a newer rupu"). Neither
+    /// ever produces zeroed data: a host that cannot report is not a host
+    /// with no runs.
     async fn dashboard_summary(
         &self,
         range: crate::host::dashboard_summary::DashboardRange,
@@ -3658,16 +3674,42 @@ mod tests {
         assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
     }
 
+    #[tokio::test]
+    async fn dashboard_summary_still_reports_an_old_remote_rupu_as_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
+    }
+
     #[test]
     fn ssh_transport_failures_are_told_apart_from_remote_cli_failures() {
+        // Each marker is hit by at least one case that matches no OTHER
+        // marker, so dropping any single marker fails this test.
         for stderr in [
-            "ssh: connect to host host-a port 22: Connection refused",
+            // `ssh: ` prefix
             "ssh: Could not resolve hostname host-a: nodename nor servname provided, or not known",
-            "user@host-a: Permission denied (publickey).",
-            "kex_exchange_identification: read: Connection reset by peer",
+            // `ssh spawn failed` (the real inner message of a spawn error)
+            "ssh spawn failed: No such file or directory",
+            "connect to host host-a port 22: Connection refused",
+            "connect to host host-a port 22: Connection timed out",
+            "connect to host host-a port 22: Operation timed out",
+            "connect to host host-a port 22: No route to host",
             "Connection closed by 10.0.0.9 port 22",
+            "Connection reset by 10.0.0.9 port 22",
+            "kex_exchange_identification: banner line contains invalid characters",
+            "user@host-a: Permission denied (publickey).",
             "Host key verification failed.",
-            "host unreachable: ssh spawn failed: No such file or directory",
+            // Mid-session drops.
+            "Connection to host-a closed by remote host.",
+            "Timeout, server host-a not responding.",
+            "client_loop: send disconnect: Broken pipe",
+            "Received disconnect from 10.0.0.9 port 22:2: Too many authentication failures",
+            // The real shape ssh prints for the common case.
+            "ssh: connect to host host-a port 22: Connection refused",
         ] {
             assert!(is_ssh_transport_failure(stderr), "{stderr}");
         }
