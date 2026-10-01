@@ -9,6 +9,11 @@ use std::time::Duration;
 /// shuts down) and on SIGTERM (the handler thread, before the re-raise).
 pub const CREDENTIAL_WRITE_DRAIN: Duration = Duration::from_secs(10);
 
+/// How long the SIGTERM handler thread waits for its own `SIGTERM received`
+/// line to reach stderr before it moves on ([`say_detached`]): a stderr
+/// nobody reads delays the re-raise by at most this.
+pub const SIGTERM_STDERR_GRACE: Duration = Duration::from_millis(250);
+
 /// Wait (at most `timeout`) for OAuth token refreshes still being persisted
 /// ([`rupu_providers::credential_writes`]).
 ///
@@ -38,29 +43,59 @@ pub async fn drain_credential_writes(timeout: Duration) -> bool {
 /// thread with no runtime, so it blocks on
 /// [`rupu_providers::credential_writes::wait_blocking`]. The bound is this
 /// thread's own clock — a runtime that makes no progress cannot stretch
-/// it. Returns `true` when nothing is left in flight.
+/// it — and its messages go out through [`say_detached`] without a wait,
+/// so a stderr nobody reads cannot stretch it either. Returns `true` when
+/// nothing is left in flight.
 pub fn drain_credential_writes_blocking(timeout: Duration) -> bool {
     let pending = rupu_providers::credential_writes::pending();
     if pending == 0 {
         return true;
     }
-    eprintln!("rupu: waiting for {pending} credential write(s) to finish…");
+    say_detached(
+        move || eprintln!("rupu: waiting for {pending} credential write(s) to finish…"),
+        None,
+    );
     let drained = rupu_providers::credential_writes::wait_blocking(timeout);
     if !drained {
-        eprintln!(
-            "rupu: gave up waiting for credential writes after {}s",
-            timeout.as_secs()
+        let secs = timeout.as_secs();
+        say_detached(
+            move || eprintln!("rupu: gave up waiting for credential writes after {secs}s"),
+            None,
         );
     }
     drained
 }
 
+/// Run `say` (a stderr write, or a log line that may go to stderr) on a
+/// detached thread, so a stderr nobody reads — a full pipe — blocks that
+/// thread and never the caller: the handler thread's drain and re-raise
+/// never depend on stderr being writable. The caller waits at most `grace`
+/// for the write to land (`None`: not at all) and never joins the thread.
+/// If no thread can be spawned, the message is simply not written.
+fn say_detached(say: impl FnOnce() + Send + 'static, grace: Option<Duration>) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("rupu-sigterm-say".into())
+        .spawn(move || {
+            say();
+            let _ = done_tx.send(());
+        });
+    if spawned.is_err() {
+        return;
+    }
+    if let Some(grace) = grace {
+        let _ = done_rx.recv_timeout(grace);
+    }
+}
+
 /// Set by `main` once it has finished its own drain and is about to exit
-/// with the command's code ([`exit_by_signal_if_terminating`]). From then
-/// on a SIGTERM ends the process by the signal right inside the signal
-/// handler ([`register_signal_actions`]): there is no window left in which
-/// a signal delivered after `main`'s last check could let the process
-/// exit by its code instead.
+/// with the command's code ([`exit_by_signal_if_terminating`]) — and by
+/// [`install_sigterm_handler`] when the handler thread could not be set
+/// up. From then on a SIGTERM ends the process by the signal right inside
+/// the signal handler ([`register_signal_actions`]): there is no window
+/// left in which a signal delivered after `main`'s last check could let
+/// the process exit by its code instead, and no state in which a signal
+/// is swallowed.
 fn exit_committed() -> &'static Arc<AtomicBool> {
     static COMMITTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     COMMITTED.get_or_init(Default::default)
@@ -71,49 +106,102 @@ fn exit_committed() -> &'static Arc<AtomicBool> {
 /// signal handler itself, async-signal-safely, the instant the signal is
 /// delivered ([`register_signal_actions`]): the process is marked
 /// terminating (every runner then refuses to start an LLM call or a tool
-/// dispatch), and — only once `main` has committed to exit — the default
+/// dispatch), and — only once the exit is committed — the default
 /// disposition is restored and the signal re-raised, so a late signal
 /// still ends the process by SIGTERM. Otherwise the thread takes over: it
 /// marks termination again (harmless; it is what the order below rests
-/// on), logs that the signal arrived (INFO), waits — at most
-/// [`CREDENTIAL_WRITE_DRAIN`], on its own clock — for credential writes
-/// still being persisted, and then restores SIGTERM's default disposition
-/// and re-raises it: the process dies by the signal, exactly as an
-/// unhandled one would, so a cancel, the shell and `systemctl stop` all see
-/// a signal death and not an exit code. With nothing pending that happens
-/// at once. The run itself is never waited for.
+/// on), logs that the signal arrived (INFO, written off-thread — see
+/// [`say_detached`]), waits — at most [`CREDENTIAL_WRITE_DRAIN`], on its
+/// own clock — for credential writes still being persisted, and then
+/// restores SIGTERM's default disposition and re-raises it: the process
+/// dies by the signal, exactly as an unhandled one would, so a cancel, the
+/// shell and `systemctl stop` all see a signal death and not an exit code.
+/// With nothing pending that happens at once. The run itself is never
+/// waited for.
+///
+/// If the thread cannot be set up (its signal socket pair or the thread
+/// itself — EMFILE/ENFILE/EAGAIN), the in-handler actions stay and the
+/// exit is committed at once, so a SIGTERM ends the process by the signal
+/// immediately, with no drain — never swallowed (signal-hook never runs
+/// the default disposition a signal had before its handler); the failure
+/// is printed on stderr, since it happens before logging is set up. If
+/// even the actions cannot be registered, nothing is installed and SIGTERM
+/// keeps its default disposition.
 ///
 /// Commands that shut down gracefully on SIGTERM themselves (`autoflow
 /// serve`) don't install it.
 #[cfg(unix)]
 pub fn install_sigterm_handler() {
-    use signal_hook::consts::SIGTERM;
-    if let Err(e) = register_signal_actions() {
-        tracing::warn!(error = %e, "could not install the SIGTERM handler");
-        return;
-    }
-    let mut signals = match signal_hook::iterator::Signals::new([SIGTERM]) {
-        Ok(signals) => signals,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not install the SIGTERM handler");
-            return;
-        }
-    };
-    let spawned = std::thread::Builder::new()
-        .name("rupu-sigterm".into())
-        .spawn(move || {
-            if signals.forever().next().is_some() {
-                on_sigterm();
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "could not start the SIGTERM handler thread");
-    }
+    install_sigterm_handler_at(None)
 }
 
 /// No-op off unix: there is no SIGTERM.
 #[cfg(not(unix))]
 pub fn install_sigterm_handler() {}
+
+/// Where [`install_sigterm_handler_at`] is made to fail — the tests of the
+/// failure branches (`child_role_entry`) inject these; production passes
+/// `None`.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallFailure {
+    /// `Signals::new` fails (EMFILE/ENFILE at its socket pair).
+    Signals,
+    /// The handler thread cannot be spawned (EAGAIN).
+    Spawn,
+}
+
+#[cfg(unix)]
+fn install_sigterm_handler_at(fail: Option<InstallFailure>) {
+    use signal_hook::consts::SIGTERM;
+    if let Err(e) = register_signal_actions() {
+        // Nothing is installed: SIGTERM keeps its default disposition.
+        eprintln!(
+            "rupu: could not install the SIGTERM handler ({e}); a SIGTERM ends the process at \
+             once, with no wait for credential writes"
+        );
+        return;
+    }
+    let signals = match fail {
+        Some(InstallFailure::Signals) => {
+            Err(std::io::Error::other("injected failure: Signals::new"))
+        }
+        _ => signal_hook::iterator::Signals::new([SIGTERM]),
+    };
+    let mut signals = match signals {
+        Ok(signals) => signals,
+        Err(e) => return without_handler_thread(&e),
+    };
+    let spawned = match fail {
+        Some(InstallFailure::Spawn) => Err(std::io::Error::other("injected failure: thread spawn")),
+        _ => std::thread::Builder::new()
+            .name("rupu-sigterm".into())
+            .spawn(move || {
+                if signals.forever().next().is_some() {
+                    on_sigterm();
+                }
+            })
+            .map(drop),
+    };
+    if let Err(e) = spawned {
+        without_handler_thread(&e);
+    }
+}
+
+/// The in-handler actions are installed but no thread will drain and
+/// re-raise. Left like that, a SIGTERM would only set the flag and the
+/// process would ignore `systemctl stop` until SIGKILL. Committing the exit
+/// makes the conditional-default action end the process by SIGTERM at once
+/// instead — what an uninstalled handler would do, minus the drain.
+#[cfg(unix)]
+fn without_handler_thread(e: &std::io::Error) {
+    exit_committed().store(true, Ordering::SeqCst);
+    eprintln!(
+        "rupu: could not install the SIGTERM handler ({e}); a SIGTERM ends the process at once, \
+         with no wait for credential writes"
+    );
+}
 
 /// The actions that run inside the SIGTERM signal handler itself, in this
 /// order (signal-hook runs them in registration order):
@@ -122,7 +210,7 @@ pub fn install_sigterm_handler() {}
 ///    atomic store) — so [`exit_by_signal_if_terminating`] sees a signal
 ///    that was delivered before its check, whether or not the handler
 ///    thread has woken yet;
-/// 2. if `main` has committed to exit ([`exit_committed`]), the default
+/// 2. if the exit is committed ([`exit_committed`]), the default
 ///    disposition is restored and the signal re-raised
 ///    (`register_conditional_default`): the process dies by SIGTERM here
 ///    and now.
@@ -134,26 +222,40 @@ pub fn install_sigterm_handler() {}
 /// delivered after it finds the commit and kills the process itself. The
 /// handler thread stays responsible for the bounded drain and the
 /// re-raise in the ordinary case.
+///
+/// All or nothing: if the second action cannot be registered, the first is
+/// removed again, so a failure leaves SIGTERM's default disposition rather
+/// than a flag-only handler that would swallow the signal.
 #[cfg(unix)]
 fn register_signal_actions() -> std::io::Result<()> {
     use signal_hook::consts::SIGTERM;
-    signal_hook::flag::register(
+    let flag = signal_hook::flag::register(
         SIGTERM,
         rupu_providers::credential_writes::terminating_flag(),
     )?;
-    signal_hook::flag::register_conditional_default(SIGTERM, exit_committed().clone())?;
+    if let Err(e) =
+        signal_hook::flag::register_conditional_default(SIGTERM, exit_committed().clone())
+    {
+        signal_hook::low_level::unregister(flag);
+        return Err(e);
+    }
     Ok(())
 }
 
 /// What SIGTERM does, on the handler thread. Termination is marked before
-/// anything that could block (the log line goes to stderr, which may be a
-/// stalled pipe), so a runner's next check refuses new work no matter
-/// what the log does.
+/// anything else; the log line is written off-thread and waited for at
+/// most [`SIGTERM_STDERR_GRACE`], so a blocked stderr can delay neither the
+/// mark nor the drain nor the re-raise beyond that.
 #[cfg(unix)]
 fn on_sigterm() -> ! {
     rupu_providers::credential_writes::request_termination();
-    tracing::info!(
-        "SIGTERM received; terminating by it once pending credential writes are drained"
+    say_detached(
+        || {
+            tracing::info!(
+                "SIGTERM received; terminating by it once pending credential writes are drained"
+            )
+        },
+        Some(SIGTERM_STDERR_GRACE),
     );
     drain_credential_writes_blocking(CREDENTIAL_WRITE_DRAIN);
     die_by_sigterm()
@@ -307,12 +409,36 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(200));
     }
 
+    /// A message whose writer blocks (here: forever) costs the caller at
+    /// most the grace, and nothing without one.
+    #[test]
+    fn say_detached_never_blocks_the_caller_beyond_the_grace() {
+        let started = Instant::now();
+        say_detached(
+            || std::thread::sleep(Duration::from_secs(30)),
+            Some(Duration::from_millis(100)),
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_secs(2),
+            "bounded by the grace: {waited:?}"
+        );
+        let started = Instant::now();
+        say_detached(|| std::thread::sleep(Duration::from_secs(30)), None);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "no grace: no wait ({:?})",
+            started.elapsed()
+        );
+    }
+
     // ---- the signal-handler-side actions, in a child process ---------------
     //
     // The closest seam to "the flag is set and the committed exit is killed
-    // inside the signal handler, with no help from the handler thread":
-    // this test binary re-runs itself with only `register_signal_actions`
-    // installed (no thread), driven by `RUPU_EXIT_SEAM_ROLE`.
+    // inside the signal handler, with no help from the handler thread", and
+    // to the install's failure branches: this test binary re-runs itself,
+    // driven by `RUPU_EXIT_SEAM_ROLE`, with exactly the parts under test
+    // installed.
 
     /// The child side. A no-op unless this process was spawned as a role.
     #[cfg(unix)]
@@ -321,19 +447,22 @@ mod tests {
         let Ok(role) = std::env::var("RUPU_EXIT_SEAM_ROLE") else {
             return;
         };
-        register_signal_actions().expect("register the signal actions");
         match role.as_str() {
-            // `main`'s last step done: committed, no signal yet. Then the
-            // SIGTERM must end the process by itself.
+            // Only the in-handler actions, no thread; `main`'s last step
+            // done: committed, no signal yet. Then the SIGTERM must end the
+            // process by itself.
             "committed" => {
+                register_signal_actions().expect("register the signal actions");
                 exit_by_signal_if_terminating();
                 eprintln!("seam: committed");
                 std::thread::sleep(Duration::from_secs(10));
                 std::process::exit(0)
             }
-            // Not committed: the signal only sets the flag, which this
-            // process reports by its exit code (7 = set, 8 = never set).
+            // Only the in-handler actions, not committed: the signal only
+            // sets the flag, which this process reports by its exit code
+            // (7 = set, 8 = never set).
             "flag-only" => {
+                register_signal_actions().expect("register the signal actions");
                 eprintln!("seam: ready");
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while Instant::now() < deadline {
@@ -344,14 +473,71 @@ mod tests {
                 }
                 std::process::exit(8)
             }
+            // The install with its signal socket pair, or its thread,
+            // failing: a SIGTERM must still end the process by the signal.
+            "signals-fail" | "spawn-fail" => {
+                let failure = if role == "signals-fail" {
+                    InstallFailure::Signals
+                } else {
+                    InstallFailure::Spawn
+                };
+                install_sigterm_handler_at(Some(failure));
+                eprintln!("seam: installed");
+                std::thread::sleep(Duration::from_secs(10));
+                std::process::exit(0)
+            }
+            // The real handler, a credential write pending for 1.5s, and a
+            // stderr nobody reads that is already full (a thread fills it
+            // and blocks, holding stderr's lock): the handler thread must
+            // still re-raise once the write lands. Progress is reported on
+            // stdout, the only readable side.
+            "stderr-blocked" => {
+                use std::io::Write;
+                // As the real binary under `RUPU_LOG=info`: the handler's
+                // INFO line is a stderr write.
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::stderr)
+                    .with_max_level(tracing::Level::INFO)
+                    .init();
+                println!("seam: ready");
+                let _ = std::io::stdout().flush();
+                std::thread::spawn(|| {
+                    let filler = vec![b'x'; 4 << 20];
+                    let mut err = std::io::stderr().lock();
+                    let _ = err.write_all(&filler);
+                });
+                let rt = tokio::runtime::Runtime::new().expect("runtime");
+                rt.block_on(async {
+                    drop(rupu_providers::credential_writes::spawn(
+                        tokio::time::sleep(Duration::from_millis(1500)),
+                    ));
+                    install_sigterm_handler();
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+                std::process::exit(0)
+            }
             other => panic!("unknown role {other:?}"),
         }
     }
 
-    /// Spawn this test binary as `role`, wait for its `seam: <marker>`
-    /// line, send it SIGTERM and return how it ended.
+    /// Which pipe of the child carries its `seam: <marker>` line.
     #[cfg(unix)]
-    fn run_role(role: &str, marker: &str) -> std::process::ExitStatus {
+    #[derive(Clone, Copy)]
+    enum MarkerOn {
+        Stderr,
+        Stdout,
+    }
+
+    /// Spawn this test binary as `role`, wait for its `seam: <marker>`
+    /// line on `marker_on` (the other pipe is never read), wait `settle`,
+    /// send it SIGTERM and return how it ended and how long that took.
+    #[cfg(unix)]
+    fn run_role(
+        role: &str,
+        marker: &str,
+        marker_on: MarkerOn,
+        settle: Duration,
+    ) -> (std::process::ExitStatus, Duration) {
         use std::io::BufRead;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -362,14 +548,17 @@ mod tests {
             ])
             .env("RUPU_EXIT_SEAM_ROLE", role)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the child role");
-        let stderr = child.stderr.take().unwrap();
+        let reader: Box<dyn std::io::Read + Send> = match marker_on {
+            MarkerOn::Stderr => Box::new(child.stderr.take().unwrap()),
+            MarkerOn::Stdout => Box::new(child.stdout.take().unwrap()),
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stderr)
+            for line in std::io::BufReader::new(reader)
                 .lines()
                 .map_while(Result::ok)
             {
@@ -387,15 +576,17 @@ mod tests {
                 }
             }
         }
+        std::thread::sleep(settle);
         let killed = std::process::Command::new("kill")
             .args(["-TERM", &child.id().to_string()])
             .status()
             .unwrap();
         assert!(killed.success());
+        let signalled_at = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
-                return status;
+                return (status, signalled_at.elapsed());
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -411,7 +602,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_signal_handler_itself_sets_the_terminating_flag() {
-        let status = run_role("flag-only", "ready");
+        let (status, _) = run_role("flag-only", "ready", MarkerOn::Stderr, Duration::ZERO);
         assert_eq!(
             status.code(),
             Some(7),
@@ -426,13 +617,59 @@ mod tests {
     #[test]
     fn a_sigterm_after_the_committed_exit_kills_by_the_signal_in_the_handler() {
         use std::os::unix::process::ExitStatusExt;
-        let status = run_role("committed", "committed");
+        let (status, _) = run_role("committed", "committed", MarkerOn::Stderr, Duration::ZERO);
         assert_eq!(
             status.signal(),
             Some(libc_sigterm()),
             "died by SIGTERM inside the handler, not by the exit code: {status:?}"
         );
         assert_eq!(status.code(), None);
+    }
+
+    /// A handler whose thread could not be set up (the signal socket pair,
+    /// or the thread itself) never swallows SIGTERM: the process still dies
+    /// by the signal, at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_handler_install_still_dies_by_sigterm() {
+        use std::os::unix::process::ExitStatusExt;
+        for role in ["signals-fail", "spawn-fail"] {
+            let (status, took) = run_role(role, "installed", MarkerOn::Stderr, Duration::ZERO);
+            assert_eq!(
+                status.signal(),
+                Some(libc_sigterm()),
+                "{role}: died by SIGTERM, not swallowed and not by the exit code: {status:?}"
+            );
+            assert!(
+                took < Duration::from_secs(5),
+                "{role}: at once, with no drain ({took:?})"
+            );
+        }
+    }
+
+    /// A stderr nobody reads, already full, with a credential write pending:
+    /// the handler thread still waits for the write and re-raises — its
+    /// own output never blocks the drain or the re-raise.
+    #[cfg(unix)]
+    #[test]
+    fn a_blocked_stderr_does_not_stall_the_re_raise() {
+        use std::os::unix::process::ExitStatusExt;
+        // 500ms for the filler thread to fill the pipe and block on it.
+        let (status, took) = run_role(
+            "stderr-blocked",
+            "ready",
+            MarkerOn::Stdout,
+            Duration::from_millis(500),
+        );
+        assert_eq!(
+            status.signal(),
+            Some(libc_sigterm()),
+            "died by SIGTERM once the write landed: {status:?}"
+        );
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(12),
+            "held by the pending write, then re-raised within the bound ({took:?})"
+        );
     }
 
     #[cfg(unix)]
