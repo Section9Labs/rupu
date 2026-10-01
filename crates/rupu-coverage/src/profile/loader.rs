@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub enum LoadError {
     #[error("profile include cycle at {0:?}")]
     IncludeCycle(String),
-    #[error("profile {0:?} includes unknown profile")]
+    #[error("unknown engagement profile {0:?} referenced as an include")]
     MissingInclude(String),
     #[error(transparent)]
     Profile(#[from] ProfileError),
@@ -53,12 +53,15 @@ fn dedup(p: &mut EngagementProfile) {
     // asset_kinds keep insertion order; drop later duplicates by id.
     let mut seen = std::collections::HashSet::new();
     p.asset_kinds.retain(|k| seen.insert(k.id.clone()));
-    p.completeness.sort_by(|a, b| a.id.cmp(&b.id));
-    p.completeness.dedup_by(|a, b| a.id == b.id);
-    p.coverage.enumerates.sort();
-    p.coverage.enumerates.dedup();
-    p.coverage.depth_ladder.sort();
-    p.coverage.depth_ladder.dedup();
+    // completeness keep insertion order; drop later duplicates by id.
+    let mut seen_completeness = std::collections::HashSet::new();
+    p.completeness.retain(|c| seen_completeness.insert(c.id.clone()));
+    // enumerates keep insertion order; drop later duplicates.
+    let mut seen_enumerates = std::collections::HashSet::new();
+    p.coverage.enumerates.retain(|e| seen_enumerates.insert(e.clone()));
+    // depth_ladder keep insertion order; drop later duplicates.
+    let mut seen_ladder = std::collections::HashSet::new();
+    p.coverage.depth_ladder.retain(|d| seen_ladder.insert(d.clone()));
 }
 
 /// Discover `*.toml` profiles across dirs; later dirs override earlier by id.
@@ -115,5 +118,17 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("x".into(), prof("x", &["missing"], "kx"));
         assert!(matches!(expand_includes(&m, "x"), Err(LoadError::MissingInclude(_))));
+    }
+
+    #[test]
+    fn preserves_ladder_order() {
+        let p = crate::profile::parse_profile(
+            "id=\"ordered\"\nname=\"ordered\"\n[[asset_kinds]]\nid=\"test\"\nlabel=\"l\"\n[coverage]\ndepth_ladder=[\"located\",\"disassembled\",\"analyzed\"]\n[bundle]\n"
+        ).unwrap();
+        let mut all = BTreeMap::new();
+        all.insert("ordered".into(), p);
+
+        let result = expand_includes(&all, "ordered").unwrap();
+        assert_eq!(result.coverage.depth_ladder, vec!["located", "disassembled", "analyzed"]);
     }
 }
