@@ -93,6 +93,24 @@ To force a specific mode, set `auth: api-key` or `auth: sso` in the agent's YAML
 
 SSO access tokens expire (typically 1 hour). The resolver pre-emptively refreshes when `expires_at - now < 60s` on a `get()` call, using the stored refresh token. On refresh failure: an actionable error naming the account and the mode that needs re-authenticating (`refresh failed for '<account>': HTTP <code>. Re-authenticate this account (mode: sso) to continue.`). There is no automatic fall-back to API-key — the user explicitly chose SSO.
 
+### Credential refresh and locking
+
+Every credential lives in one file, `~/.rupu/auth.json`, and rupu keeps a lock file beside it, `auth.json.lock`. `rupu auth login`, `rupu auth logout` and every SSO token refresh hold that lock while they change the file, so several rupu processes (a `cp serve`, a workflow, a second terminal) can share one login safely.
+
+- **One refresh at a time.** A process that finds an SSO token near expiry takes the lock, re-reads the stored credential, and asks the provider for a new token only if one is still needed (a refresh forced by a 401 always asks, from the latest stored token); if another process already refreshed it, this one uses that result. New tokens are written to a temporary file and renamed into place, so a reader never sees a half-written file. A refresh the provider doesn't answer gives up after 30 seconds and releases the lock.
+- **A stuck lock is reported, not waited on forever.** Waiting for the lock is bounded at 30 seconds. After that the command fails with `credential store is locked by another process (<path>/auth.json.lock); retry, or find and stop the process holding it`, and writes nothing. A stopped process or a hung network-filesystem lock daemon can cause it.
+- **A token that was refreshed but couldn't be saved is not lost.** Providers rotate the refresh token when they issue a new access token. If the write then fails (a read-only directory, a full disk), the process keeps using the new credential, holds it in memory, and prints to stderr:
+
+  ```
+  rupu: the '<account>' token was refreshed but could not be written to <path>: <error>. This process keeps using the new token and retries the write on its next write of the credential file or refresh of this account; if the next rupu command cannot authenticate, run: rupu auth login --account <account> --mode sso
+  ```
+
+  Until a write succeeds the file still holds the old, now dead, refresh token, so fix the cause and run again, or log in again as the message says. Nothing retries on its own: the retry happens the next time that process writes the file or refreshes that account. If another process logs the account in or out, or refreshes it, in the meantime, the in-memory copy is discarded and the file wins.
+- **Exit waits for writes in flight.** Before it exits, rupu waits up to 10 seconds for a token write still in progress (`rupu: waiting for N credential write(s) to finish…`, then `rupu: gave up waiting for credential writes after 10s` if it doesn't land).
+- **SIGTERM.** A rupu process that receives SIGTERM (a cancelled run, `systemctl stop`) starts no new model call, summariser call or tool, so a run stops as aborted or cancelled at its next step instead of finishing. It waits at most 10 seconds for a credential write already in flight (not at all when there is none), then dies by the signal, so a shell or supervisor sees a signal death rather than an exit code. `rupu autoflow serve` does its own graceful SIGTERM shutdown and then waits for writes as it exits.
+
+SIGKILL, or a refresh still running after the 10-second wait, can still lose a rotated token; `rupu auth login` recovers.
+
 ### Logout
 
 ```sh
