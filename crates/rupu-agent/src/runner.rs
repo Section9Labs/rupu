@@ -83,6 +83,8 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
         | E::Preflight(_)
         | E::LongContextUnavailable { .. }
         | E::Other(_) => false,
+        // The process is exiting: nothing started now would finish.
+        E::Terminating => false,
     }
 }
 
@@ -555,6 +557,13 @@ self-contained.";
         disable_prompt_cache: true,
     };
 
+    // The summariser is an LLM call: none once SIGTERM has arrived. Checked
+    // here, in the library, so every caller is covered — the agent loop
+    // (which also refuses earlier, closing its transcript as aborted),
+    // `rupu session compact` and the session worker's compaction turn.
+    if rupu_providers::credential_writes::terminating() {
+        return Err(rupu_providers::ProviderError::Terminating);
+    }
     let summary_resp = provider.send(&summary_req).await?;
 
     // Extract summary text from the response.

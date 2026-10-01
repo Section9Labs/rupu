@@ -62,6 +62,11 @@ pub enum ProviderError {
     #[error("transient error: {0}")]
     Transient(#[source] anyhow::Error),
 
+    /// SIGTERM has arrived (`credential_writes::terminating()`) and the
+    /// request was not sent: nothing started now would finish.
+    #[error("the process is terminating (SIGTERM); the request was not sent")]
+    Terminating,
+
     #[error("provider error: {0}")]
     Other(#[source] anyhow::Error),
 
