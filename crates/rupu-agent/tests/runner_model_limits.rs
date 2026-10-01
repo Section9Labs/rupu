@@ -782,6 +782,11 @@ async fn long_context_unavailable_clamps_to_200k_and_retries_once() {
 const LONG_CONTEXT_HINT: &str =
     "remove `[1m]` from the model / `contextWindow: 1m` from the agent to skip this";
 
+/// A session keeps the model and window it started with, so editing the
+/// agent doesn't help its later turns.
+const SESSION_HINT: &str =
+    "an existing session keeps the model and window it started with — start a new session";
+
 /// A session's later turns already carry the clamped 200K input limit (it
 /// was persisted), so their notice has no "input X → Y" part — but every
 /// run still sends one refused request, and the notice must still say how
@@ -813,6 +818,38 @@ async fn long_context_unavailable_notice_keeps_its_hint_when_already_clamped() {
         clamped[0]
     );
     assert!(clamped[0].contains(LONG_CONTEXT_HINT), "{}", clamped[0]);
+    assert!(
+        !clamped[0].contains(SESSION_HINT),
+        "not a session: {}",
+        clamped[0]
+    );
+}
+
+/// In a session the hint must also say that the session itself won't pick
+/// up the change — it keeps the model and window it started with.
+#[tokio::test]
+async fn long_context_unavailable_notice_tells_a_session_to_start_anew() {
+    let inner = CapturingMockProvider::new(vec![final_text_turn(usage(300, 6, 0))]);
+    let provider = FailFirst {
+        err: Some(long_context_unavailable()),
+        inner,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    let mut limits = live_1m_limits();
+    limits.input = Limit::new(200_000, LimitSource::Observed);
+    opts.limits = limits;
+    opts.surface_tag = Some("session".into());
+    opts.turn_index_offset = 3;
+    run_agent(opts).await.expect("the retry succeeds");
+    let n = notices(&transcript);
+    assert!(
+        n.iter().any(|(k, m)| k == "model_limits_clamped"
+            && m.contains(LONG_CONTEXT_HINT)
+            && m.contains(SESSION_HINT)),
+        "{n:?}"
+    );
 }
 
 /// If the retried turn (now without the beta) still overflows the 200K

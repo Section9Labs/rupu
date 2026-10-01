@@ -1548,9 +1548,11 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                 // The hint matters most on a session's later
                                 // turns: the clamp is already persisted (no
                                 // "input X → Y"), yet every run still sends
-                                // one refused request first.
+                                // one refused request first — and a session
+                                // keeps the model and window it started with,
+                                // so editing the agent won't reach it.
                                 message: format!(
-                                    "this account has no extra-usage entitlement for 1M context — using the {} window (1M beta disabled){} — remove `[1m]` from the model / `contextWindow: 1m` from the agent to skip this refused request each run",
+                                    "this account has no extra-usage entitlement for 1M context — using the {} window (1M beta disabled){} — remove `[1m]` from the model / `contextWindow: 1m` from the agent to skip this refused request each run{}",
                                     group_thousands(u64::from(STANDARD_CONTEXT_WINDOW)),
                                     if clamped {
                                         format!(
@@ -1562,6 +1564,11 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                         )
                                     } else {
                                         String::new()
+                                    },
+                                    if opts.surface_tag.as_deref() == Some("session") {
+                                        " (an existing session keeps the model and window it started with — start a new session to apply the change)"
+                                    } else {
+                                        ""
                                     }
                                 ),
                             })?;
