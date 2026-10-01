@@ -1,9 +1,11 @@
+pub mod asset_mark;
 pub mod coverage_concerns_detail;
 pub mod coverage_concerns_search;
 pub mod coverage_mark;
 pub mod coverage_remaining;
 pub mod coverage_status;
 pub mod report_finding;
+pub use asset_mark::{asset_mark, AssetMarkError, AssetMarkInput, AssetMarkOutput};
 pub use coverage_concerns_detail::{
     coverage_concerns_detail, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
 };

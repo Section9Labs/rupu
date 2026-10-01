@@ -1,4 +1,4 @@
-use crate::asset::{append_asset, read_asset_graph, Asset, AssetId, Coordinate, Locator};
+use crate::asset::{default_label, upsert_asset, Asset, AssetId, Coordinate, Locator};
 use crate::catalog::types::Severity;
 use crate::ledger::events::{
     AssetRef, Attribution, FindingEvidence, FindingRecord, FindingScope, ScopeLocator,
@@ -219,7 +219,7 @@ pub fn report_finding(
                 id: asset.id.0.clone(),
                 kind: asset.kind.clone(),
             };
-            upsert_asset(paths, asset, label_given, &attribution)?;
+            upsert_asset(paths, asset, label_given, None, &attribution)?;
             Some(asset_ref)
         }
         None => None,
@@ -358,18 +358,8 @@ fn engage<'a>(engagement: &'a ActiveSet, input: &ReportFindingInput) -> Engaged<
     let named = input.asset.is_some() || input.file_path.is_some();
     let asset = (named && profile.is_some()).then(|| {
         let label_given = label.is_some();
-        let label = label.unwrap_or_else(|| {
-            kind_def
-                .and_then(|d| locator.render_label(&d.label))
-                .unwrap_or_else(|| {
-                    let described = locator.describe();
-                    if described.is_empty() {
-                        kind.clone()
-                    } else {
-                        described
-                    }
-                })
-        });
+        let label = label
+            .unwrap_or_else(|| default_label(&kind, kind_def.map(|d| d.label.as_str()), &locator));
         let mut asset = Asset::new(kind.clone(), locator.clone(), label);
         asset.parent = parent.map(AssetId);
         EngagedAsset { asset, label_given }
@@ -425,37 +415,6 @@ fn profile_problems(
         }),
     }
     problems
-}
-
-/// Register `asset` in the append-only asset store.
-///
-/// The store folds last-write-wins on the WHOLE record, so a bare
-/// `Asset::new` would erase what an earlier pass recorded (a coverage `depth`,
-/// attributes, an agent-given label). The new record is therefore merged over
-/// the existing one first, and nothing is appended when that changes nothing,
-/// so a hundred findings on one function leave one line, not a hundred.
-fn upsert_asset(
-    paths: &CoveragePaths,
-    mut asset: Asset,
-    label_given: bool,
-    attribution: &Attribution,
-) -> std::io::Result<()> {
-    let graph = read_asset_graph(paths);
-    let existing = graph.get(&asset.id);
-    if let Some(old) = existing {
-        if !label_given {
-            asset.label = old.label.clone();
-        }
-        if asset.parent.is_none() {
-            asset.parent = old.parent.clone();
-        }
-        asset.depth = old.depth.clone();
-        asset.attributes = old.attributes.clone();
-    }
-    if existing == Some(&asset) {
-        return Ok(());
-    }
-    append_asset(paths, &asset, attribution)
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a

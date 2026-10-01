@@ -7,4 +7,5 @@ pub mod types;
 pub use coordinate::{Coordinate, Locator, Proto};
 pub use graph::AssetGraph;
 pub use store::{append_asset, read_asset_graph};
+pub(crate) use store::{default_label, upsert_asset};
 pub use types::{Asset, AssetId};

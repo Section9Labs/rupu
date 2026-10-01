@@ -75,6 +75,63 @@ pub fn read_asset_graph(paths: &crate::ledger::CoveragePaths) -> AssetGraph {
     graph
 }
 
+/// The label an asset gets when its agent names none: the kind's label
+/// template rendered over the locator, else a plain description of the
+/// locator, else the kind id itself.
+pub(crate) fn default_label(
+    kind: &str,
+    template: Option<&str>,
+    locator: &crate::asset::Locator,
+) -> String {
+    template
+        .and_then(|t| locator.render_label(t))
+        .unwrap_or_else(|| {
+            let described = locator.describe();
+            if described.is_empty() {
+                kind.to_string()
+            } else {
+                described
+            }
+        })
+}
+
+/// Register `asset` in the append-only asset store.
+///
+/// The store folds last-write-wins on the WHOLE record, so a bare
+/// `Asset::new` would erase what an earlier pass recorded (a coverage `depth`,
+/// attributes, an agent-given label). The new record is therefore merged over
+/// the existing one first, and nothing is appended when that changes nothing,
+/// so a hundred findings on one function leave one line, not a hundred.
+///
+/// `depth` is the one field a caller may SET: `Some(d)` records `d`, `None`
+/// keeps whatever depth the asset already has (a finding must never reset it).
+pub(crate) fn upsert_asset(
+    paths: &crate::ledger::CoveragePaths,
+    mut asset: Asset,
+    label_given: bool,
+    depth: Option<String>,
+    attribution: &Attribution,
+) -> std::io::Result<()> {
+    let graph = read_asset_graph(paths);
+    let existing = graph.get(&asset.id);
+    if let Some(old) = existing {
+        if !label_given {
+            asset.label = old.label.clone();
+        }
+        if asset.parent.is_none() {
+            asset.parent = old.parent.clone();
+        }
+        asset.depth = depth.or_else(|| old.depth.clone());
+        asset.attributes = old.attributes.clone();
+    } else {
+        asset.depth = depth;
+    }
+    if existing == Some(&asset) {
+        return Ok(());
+    }
+    append_asset(paths, &asset, attribution)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
