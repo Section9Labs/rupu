@@ -286,6 +286,9 @@ impl Panes<'_> {
             Pane::Stream => self.stream_rows(rows, w),
             Pane::Firehose => self.firehose_rows(rows, w),
         });
+        // Keep the `≤ body_h` guarantee local here rather than relying on
+        // `structure_pane` to clip itself to `rows`.
+        out.truncate(plan.body_h);
         out
     }
 

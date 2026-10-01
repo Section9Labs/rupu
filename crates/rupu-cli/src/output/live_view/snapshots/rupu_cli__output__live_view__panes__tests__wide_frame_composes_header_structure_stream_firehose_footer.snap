@@ -1,5 +1,6 @@
 ---
 source: crates/rupu-cli/src/output/live_view/panes.rs
+assertion_line: 633
 expression: s
 ---
 assess-services  ● mint-tundra  ◐ running · 4m 12s
@@ -29,4 +30,4 @@ step 1/3  ████████░░░░░░░░░░░░░░░�
                                         │
                                         │
                                         │
-↑↓ move · enter drill · ← back · / filter · Esc pause · q quit
+↑↓ move · enter drill · ← back · / filter · tab pane · Esc pause · q quit

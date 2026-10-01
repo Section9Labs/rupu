@@ -4,8 +4,9 @@
 //! [`run_live_view`] drives, every 100 ms: the run model ([`RunView`], folded
 //! from `events.jsonl` plus the few things only `run.json` knows), the drill
 //! navigation ([`NavState`]), the bounded transcript firehose
-//! ([`TranscriptMux`]), the adaptive layout ([`live_layout`]) and the diff
-//! renderer ([`LiveRenderer`]). Keys are decoded in one place
+//! ([`TranscriptMux`]), the three-pane dashboard frame
+//! ([`dashboard_frame`]) and the diff renderer ([`LiveRenderer`]). Keys are
+//! decoded in one place
 //! ([`decode_key`]) and an approval gate is *modal*: while one is focused
 //! (`NavState::focused_gate` — the same predicate the footer legend uses)
 //! `a` approves, `r` rejects and `v` shows what the run found.
@@ -33,9 +34,10 @@ use tokio::task::JoinHandle;
 
 use crate::output::jsonl_reader::WfEventTailer;
 use crate::output::live_view::gate::{gate_detail_lines, GateFinding};
-use crate::output::live_view::layout::{live_layout, printable};
+use crate::output::live_view::layout::printable;
 use crate::output::live_view::mux::TranscriptMux;
-use crate::output::live_view::nav::{Depth, NavAction, NavKey, NavState};
+use crate::output::live_view::nav::{Depth, NavAction, NavKey, NavState, Pane};
+use crate::output::live_view::panes::{dashboard_frame, scroll_rows};
 use crate::output::live_view::render::{AltScreen, LiveRenderer};
 use crate::output::live_view::row::Line;
 use crate::output::run_model::{GateView, RunView};
@@ -77,10 +79,12 @@ enum KeyAction {
 ///
 /// A gate is modal: `a` approves, `r` rejects, `v` / `enter` show details.
 /// With none focused, `a` is auto-follow, `enter` drills in, and `r` / `v` do
-/// nothing. `q` and Ctrl-C quit (raw mode turns the tty's SIGINT off, so
-/// Ctrl-C arrives as a key and must be handled here); only `Esc` pauses. A
-/// control- or alt-modified letter is never a plain command — Ctrl-A must not
-/// approve a gate.
+/// nothing. `tab` / shift-`tab` cycle the pane focus and `PgUp` / `PgDn` page
+/// the focused scrolling pane (both from any focus, gate included). `q` and
+/// Ctrl-C quit (raw mode turns the tty's SIGINT off, so Ctrl-C arrives as a
+/// key and must be handled here); only `Esc` pauses. A control- or
+/// alt-modified letter is never a plain command — Ctrl-A must not approve a
+/// gate.
 fn decode_key(code: KeyCode, mods: KeyModifiers, gate_focused: bool) -> Option<KeyAction> {
     if mods.contains(KeyModifiers::CONTROL) {
         return (code == KeyCode::Char('c')).then_some(KeyAction::Nav(NavKey::Quit));
@@ -93,8 +97,12 @@ fn decode_key(code: KeyCode, mods: KeyModifiers, gate_focused: bool) -> Option<K
         KeyCode::Char('a') if gate_focused => Some(KeyAction::Approve),
         KeyCode::Char('r') if gate_focused => Some(KeyAction::Reject),
         KeyCode::Char('v') | KeyCode::Enter if gate_focused => Some(KeyAction::ToggleDetails),
-        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => nav(NavKey::Up),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => nav(NavKey::Down),
+        KeyCode::Tab => nav(NavKey::PaneNext),
+        KeyCode::BackTab => nav(NavKey::PanePrev),
+        KeyCode::PageUp => nav(NavKey::ScrollUp),
+        KeyCode::PageDown => nav(NavKey::ScrollDown),
+        KeyCode::Up | KeyCode::Char('k') => nav(NavKey::Up),
+        KeyCode::Down | KeyCode::Char('j') => nav(NavKey::Down),
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => nav(NavKey::In),
         KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => nav(NavKey::Out),
         KeyCode::Char('a') => nav(NavKey::Follow),
@@ -155,6 +163,9 @@ enum Exit {
 /// be canonicalised).
 #[derive(Debug, Default)]
 struct TranscriptIndex {
+    /// A leaf step's own transcript (a linear / `run:` step), keyed by step id.
+    /// A fan-out step has none of its own — its units do.
+    steps: HashMap<String, PathBuf>,
     units: HashMap<(String, usize), PathBuf>,
     dispatches: HashMap<String, PathBuf>,
 }
@@ -207,18 +218,41 @@ impl TranscriptIndex {
             WfEvent::DispatchStarted { sub_run_id, .. } => {
                 self.dispatches.insert(sub_run_id.clone(), path.clone());
             }
+            // A step's own transcript: the agent of a non-fan-out step
+            // (`unit_index` is `None`), or the path `StepWorking` carries.
+            WfEvent::AgentStarted {
+                step_id,
+                unit_index: None,
+                ..
+            }
+            | WfEvent::StepWorking { step_id, .. } => {
+                self.steps.insert(step_id.clone(), path.clone());
+            }
             _ => {}
         }
         Some((path.clone(), codename))
     }
 }
 
-/// The transcript to pin: the drilled unit's (`Unit` depth) or sub-agent's
-/// (`SubAgent` depth). At `Run` / `Step` depth nothing is pinned and the feed
-/// is the merged firehose.
+/// The transcript the stream pane pins — the ONE stream-target predicate,
+/// kept in lockstep with what the stream title names (`panes::selection_label`
+/// reads the SAME nav selection), so the title can never name a transcript the
+/// stream is not showing (Task 5 review, Minor 7):
+///
+/// * `SubAgent` / `Unit` depth: the drilled sub-agent / unit's transcript —
+///   the breadcrumb leaf the title shows.
+/// * `Run` / `Step` depth: the *chosen* step's own transcript — a manual
+///   selection, or (while following a parked run) its gate. A fan-out step has
+///   no transcript of its own, so the pin is `None` there and the stream waits
+///   until the operator drills into a unit.
+/// * Following at `Run` depth with nothing chosen: `None` — the stream is idle
+///   and its title is the neutral `run`.
 fn pinned_path(view: &RunView, nav: &NavState, index: &TranscriptIndex) -> Option<PathBuf> {
     match nav.depth() {
-        Depth::Run | Depth::Step => None,
+        Depth::SubAgent => {
+            let sub = nav.selected_sub_agent(view)?;
+            index.dispatches.get(&sub.sub_run_id).cloned()
+        }
         Depth::Unit => {
             let step = nav.selected_step(view)?;
             let unit = nav.selected_unit(view)?;
@@ -227,9 +261,9 @@ fn pinned_path(view: &RunView, nav: &NavState, index: &TranscriptIndex) -> Optio
                 .get(&(step.step_id.clone(), unit.index))
                 .cloned()
         }
-        Depth::SubAgent => {
-            let sub = nav.selected_sub_agent(view)?;
-            index.dispatches.get(&sub.sub_run_id).cloned()
+        Depth::Run | Depth::Step => {
+            let step = nav.chosen_step(view)?;
+            index.steps.get(&step.step_id).cloned()
         }
     }
 }
@@ -822,12 +856,13 @@ impl Live {
         }));
     }
 
-    /// The feed region: a focused gate's details when `v` is on; else the
-    /// pinned stream (drilled into a unit / sub-agent) or the merged firehose;
-    /// plus the notice, last.
+    /// The stream pane's content: a focused gate's details when `v` is on,
+    /// else the pinned (drilled / chosen) transcript — empty when nothing is
+    /// pinned, since the firehose now has its own pane. The transient notice
+    /// rides last. Pins + drains the mux, so it is called once per frame.
     fn build_feed(&mut self) -> Vec<Line> {
         let pinned = pinned_path(&self.view, &self.nav, &self.paths);
-        self.mux.pin(pinned.clone());
+        self.mux.pin(pinned);
         self.mux.drain();
         let details = self
             .nav
@@ -835,8 +870,7 @@ impl Live {
             .filter(|_| self.show_details);
         let mut feed = match details {
             Some(gate) => gate_detail_lines(gate, &self.gate_findings, Utc::now()),
-            None if pinned.is_some() => self.mux.pinned_lines(),
-            None => self.mux.firehose_lines(),
+            None => self.mux.pinned_lines(),
         };
         let notice = self
             .notice
@@ -847,18 +881,37 @@ impl Live {
         feed
     }
 
+    /// Compose one frame at `size` (`(cols, rows)`): the three-pane dashboard
+    /// built from the run model, the pinned stream and the merged firehose.
+    /// Clamps each scrolling pane's offset against the real buffer first
+    /// (nav windows but never clamps), using [`scroll_rows`] so the clamp and
+    /// the frame measure the body the same way.
+    fn frame(&mut self, size: (u16, u16)) -> Vec<Line> {
+        let stream = self.build_feed();
+        let firehose = self.mux.firehose_lines();
+        let w = usize::from(size.0).saturating_sub(EDGE_GUARD).max(1);
+        let h = usize::from(size.1);
+        let now = Utc::now();
+        let rows = scroll_rows(&self.view, &self.nav, now, w, h);
+        self.nav
+            .clamp_scroll(Pane::Stream, stream.len().saturating_sub(rows.stream));
+        self.nav
+            .clamp_scroll(Pane::Firehose, firehose.len().saturating_sub(rows.firehose));
+        dashboard_frame(
+            &self.view,
+            &self.workflow,
+            &self.nav,
+            &stream,
+            &firehose,
+            now,
+            w,
+            h,
+        )
+    }
+
     /// Compose and paint one frame at `size` (`(cols, rows)`).
     fn draw(&mut self, out: &mut impl Write, size: (u16, u16)) {
-        let feed = self.build_feed();
-        let cols = usize::from(size.0).saturating_sub(EDGE_GUARD).max(1);
-        let frame = live_layout(
-            &self.view,
-            &self.nav,
-            &feed,
-            Utc::now(),
-            cols,
-            usize::from(size.1),
-        );
+        let frame = self.frame(size);
         // A failed write leaves the screen in an unknown state: forget what
         // was drawn so the next frame repaints in full.
         if self.renderer.draw(out, &frame).is_err() {
@@ -901,7 +954,7 @@ impl Live {
 /// [`RunView`]; reconcile [`NavState`]; decode keys (`q` / Ctrl-C quit and
 /// leave the run running, `Esc` pauses, an approval gate is modal); pin the
 /// drilled transcript and drain the [`TranscriptMux`]; refresh the usage fold
-/// at most once a second; and diff-render [`live_layout`]'s frame. A terminal
+/// at most once a second; and diff-render [`dashboard_frame`]'s frame. A terminal
 /// resize repaints in full. [`AltScreen`] restores the terminal on every exit
 /// path, a panic included.
 ///
@@ -976,10 +1029,13 @@ mod tests {
         for (code, want) in [
             (KeyCode::Up, nav(NavKey::Up)),
             (KeyCode::Char('k'), nav(NavKey::Up)),
-            (KeyCode::BackTab, nav(NavKey::Up)),
             (KeyCode::Down, nav(NavKey::Down)),
             (KeyCode::Char('j'), nav(NavKey::Down)),
-            (KeyCode::Tab, nav(NavKey::Down)),
+            // Tab / shift-Tab cycle the pane focus; PgUp/PgDn page a feed.
+            (KeyCode::Tab, nav(NavKey::PaneNext)),
+            (KeyCode::BackTab, nav(NavKey::PanePrev)),
+            (KeyCode::PageUp, nav(NavKey::ScrollUp)),
+            (KeyCode::PageDown, nav(NavKey::ScrollDown)),
             (KeyCode::Enter, nav(NavKey::In)),
             (KeyCode::Right, nav(NavKey::In)),
             (KeyCode::Char('l'), nav(NavKey::In)),
@@ -1687,7 +1743,7 @@ mod tests {
 
     #[test]
     fn a_parked_run_replayed_from_disk_shows_the_gate_keys_and_they_act() {
-        use crate::output::live_view::layout::live_layout;
+        use crate::output::live_view::layout::footer_line;
         use crate::output::live_view::row::render_plain;
         use std::io::Write as _;
 
@@ -1733,8 +1789,7 @@ mod tests {
         let view = RunView::from_run_dir(&store, "run_P", &rupu_config::PricingConfig::default());
         assert_eq!(view.status, RunStatus::AwaitingApproval);
         let at = |nav: &NavState| -> (String, bool) {
-            let frame = live_layout(&view, nav, &[], Utc::now(), 80, 24);
-            let footer = render_plain(&frame[frame.len() - 1..]);
+            let footer = render_plain(std::slice::from_ref(&footer_line(&view, nav, 80)));
             let acts = decode_key(KeyCode::Char('a'), NONE, nav.focused_gate(&view).is_some())
                 == Some(KeyAction::Approve);
             (footer, acts)
@@ -1989,5 +2044,31 @@ mod tests {
         live.draw(&mut third, (60, 20));
         let third = String::from_utf8_lossy(&third).to_string();
         assert!(third.contains("gate_a"), "{third:?}");
+    }
+
+    #[test]
+    fn the_loops_frame_composes_three_panes_and_the_gate_footer() {
+        use crate::output::live_view::row::render_plain;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut live, _store) = parked_live(tmp.path());
+        live.ingest();
+        // Drive the exact path the draw loop uses, at a wide size.
+        let frame = live.frame((100, 28));
+        let s = render_plain(&frame);
+
+        // The three panes compose: a structure column, a stream pane, and the
+        // firehose rule under it.
+        assert!(s.contains("─ structure"), "{s}");
+        assert!(s.contains("─ stream · "), "{s}");
+        assert!(s.contains("├─ live · "), "{s}");
+        // The parked gate is on screen in the structure column.
+        assert!(s.contains("gate_a"), "{s}");
+        // Following a parked run auto-focuses its gate, so the footer is the
+        // modal approve / reject legend.
+        assert_eq!(
+            render_plain(&frame[frame.len() - 1..]),
+            "a approve · r reject · v findings · Esc pause · q quit",
+            "{s}"
+        );
     }
 }
