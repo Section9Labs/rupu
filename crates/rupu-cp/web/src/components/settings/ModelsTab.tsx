@@ -30,7 +30,12 @@ const COLUMNS: Column<CatalogModel>[] = [
 
 export function ModelsTab() {
   const [catalog, setCatalog] = useState<CatalogProvider[] | null>(null);
+  // A catalog LOAD failure (first load, or a reload after a refetch). Retry re-runs it.
   const [loadError, setLoadError] = useState<string | null>(null);
+  // A thrown Refetch all (the refresh itself failed): a load Retry would not
+  // redo it, so it gets a plain banner with no Retry.
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -49,8 +54,18 @@ export function ModelsTab() {
     void load();
   }, [load]);
 
+  const retry = async () => {
+    setRetrying(true);
+    try {
+      await load();
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   const refetch = async (provider?: string) => {
     setBusy(provider ?? '*');
+    setRefreshError(null);
     try {
       const outcomes = await api.refreshModels(provider);
       setErrors((prev) => {
@@ -67,28 +82,30 @@ export function ModelsTab() {
       // network) lands inline under that provider (spec §8.3); only a thrown
       // Refetch all falls back to the page-level banner.
       if (provider) setErrors((prev) => ({ ...prev, [provider]: apiErrorMessage(e) }));
-      else setLoadError(apiErrorMessage(e));
+      else setRefreshError(apiErrorMessage(e));
     } finally {
       setBusy(null);
     }
   };
 
   if (unavailable) return <EmptyTabState text="The model catalog requires `rupu cp serve`." />;
+  // The load-failure banner, with a Retry that is blocked while its own load is
+  // in flight so a second click can't stack requests.
+  const loadErrorBanner = loadError ? (
+    <ErrorBanner>
+      <div className="flex items-center justify-between gap-3">
+        <span>{loadError}</span>
+        <Button variant="secondary" size="sm" disabled={retrying} aria-busy={retrying} onClick={() => void retry()}>
+          Retry
+        </Button>
+      </div>
+    </ErrorBanner>
+  ) : null;
+
   if (!catalog) {
     // First load failed (non-501): nothing to show yet, so give the operator a
     // way back in without leaving the Settings page.
-    return loadError ? (
-      <ErrorBanner>
-        <div className="flex items-center justify-between gap-3">
-          <span>{loadError}</span>
-          <Button variant="secondary" size="sm" onClick={() => void load()}>
-            Retry
-          </Button>
-        </div>
-      </ErrorBanner>
-    ) : (
-      <Spinner label="Loading models…" />
-    );
+    return loadErrorBanner ?? <Spinner label="Loading models…" />;
   }
 
   return (
@@ -103,7 +120,8 @@ export function ModelsTab() {
           Refetch all
         </Button>
       </div>
-      {loadError && <ErrorBanner>{loadError}</ErrorBanner>}
+      {loadErrorBanner}
+      {refreshError && <ErrorBanner>{refreshError}</ErrorBanner>}
       {catalog.map((p) => {
         // A provider is refreshing during its own Refetch and during Refetch all.
         const refreshing = busy === '*' || busy === p.provider;

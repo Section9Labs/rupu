@@ -83,6 +83,75 @@ describe('ModelsTab', () => {
     expect(screen.queryByText('catalog exploded')).not.toBeInTheDocument();
   });
 
+  it('disables Retry and marks it aria-busy while its own load is in flight', async () => {
+    let resolveRetry: (c: CatalogProvider[]) => void = () => {};
+    const list = vi
+      .spyOn(api, 'getModelCatalog')
+      .mockRejectedValueOnce(new ApiError(500, 'boom', '{"error":"catalog exploded"}'))
+      .mockReturnValueOnce(
+        new Promise<CatalogProvider[]>((resolve) => {
+          resolveRetry = resolve;
+        }),
+      );
+    render(<ModelsTab />);
+    const retry = await screen.findByRole('button', { name: 'Retry' });
+    expect(retry).toBeEnabled();
+    expect(retry).toHaveAttribute('aria-busy', 'false');
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled());
+    expect(screen.getByRole('button', { name: 'Retry' })).toHaveAttribute('aria-busy', 'true');
+    expect(list).toHaveBeenCalledTimes(2);
+
+    // A second click while the first retry is pending does not load again.
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(list).toHaveBeenCalledTimes(2);
+
+    resolveRetry(CATALOG);
+    expect(await screen.findByText('claude-demo-1')).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it('offers Retry on the reload-failure banner and clears it when the reload recovers', async () => {
+    const updated: CatalogProvider[] = [
+      {
+        ...CATALOG[0],
+        models: [{ id: 'claude-demo-2', input_tokens: 200_000, output_tokens: 64_000, source: 'live' }],
+      },
+      CATALOG[1],
+    ];
+    const list = vi
+      .spyOn(api, 'getModelCatalog')
+      .mockResolvedValueOnce(CATALOG)
+      .mockRejectedValueOnce(new ApiError(500, 'boom', '{"error":"catalog exploded"}'))
+      .mockResolvedValueOnce(updated);
+    vi.spyOn(api, 'refreshModels').mockResolvedValue([{ provider: 'anthropic', ok: true, count: 1 }]);
+    render(<ModelsTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Refetch anthropic' }));
+    expect(await screen.findByText('catalog exploded')).toBeInTheDocument();
+    // The previously loaded table is still on screen alongside the banner.
+    expect(screen.getByText('claude-demo-1')).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('claude-demo-2')).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(screen.queryByText('catalog exploded')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+    expect(screen.queryByText('claude-demo-1')).not.toBeInTheDocument();
+  });
+
+  it('does not offer a catalog-reload Retry on a failed Refetch all banner', async () => {
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    vi.spyOn(api, 'refreshModels').mockRejectedValue(new ApiError(500, 'boom', '{"error":"refresh exploded"}'));
+    render(<ModelsTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Refetch all' }));
+    expect(await screen.findByText('refresh exploded')).toBeInTheDocument();
+    // Reloading the catalog would not redo the failed refresh (and would
+    // silently clear the banner), so this banner has no Retry.
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
+
   it('renders the stale badge only for a stale provider', async () => {
     vi.spyOn(api, 'getModelCatalog').mockResolvedValue([
       { ...CATALOG[0], stale: true },
