@@ -292,3 +292,198 @@ async fn the_event_poller_refreshes_an_expired_token_before_polling() {
     token.assert_hits(1);
     events.assert_hits(1);
 }
+
+/// The repo connector and the event poller each hold their own copy of one
+/// stored credential. Whichever refreshes second adopts the first's
+/// rotation from the store instead of spending the rotated-out refresh
+/// token: one token request between them.
+#[tokio::test]
+#[serial]
+async fn the_repo_connector_and_the_event_poller_refresh_once_between_them() {
+    let home = tempfile::tempdir().unwrap();
+    let server = MockServer::start_async().await;
+    let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
+
+    let resolver = KeychainResolver::new();
+    resolver
+        .store_named(
+            "gl-work",
+            AuthMode::Sso,
+            &sso(&server, "a1", "r1", -chrono::Duration::minutes(1)),
+        )
+        .await
+        .unwrap();
+    let token = token_endpoint(&server);
+    let project = project_endpoint(&server);
+    let events = server.mock(|when, then| {
+        when.method(GET)
+            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .header("authorization", "Bearer a2");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+
+    let registry = Registry::discover(
+        &resolver,
+        &config_for("gl-work", &server),
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await;
+    registry
+        .repo_by_account(&AccountId::new("gl-work"))
+        .unwrap()
+        .get_repo(&mirror())
+        .await
+        .unwrap();
+    let (_, poller) = registry
+        .events_for_source(
+            &EventSourceRef::Repo { repo: mirror() },
+            None,
+            Some(&AccountId::new("gl-work")),
+        )
+        .unwrap();
+    let since = format!(
+        "since:{}",
+        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+    );
+    poller
+        .poll_events(&EventSourceRef::Repo { repo: mirror() }, Some(&since), 50)
+        .await
+        .unwrap();
+
+    token.assert_hits(1);
+    project.assert_hits(1);
+    events.assert_hits(1);
+}
+
+/// A token can be refused before it expires — revoked, or replaced by a
+/// `rupu auth login` the error told the user to run. A running connector
+/// (`cp serve`, `mcp serve`) takes the stored replacement on that 401 and
+/// retries, instead of failing until its copy's expiry.
+#[tokio::test]
+#[serial]
+async fn a_re_login_reaches_a_running_connector_on_its_next_401() {
+    let home = tempfile::tempdir().unwrap();
+    let server = MockServer::start_async().await;
+    let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
+
+    let resolver = KeychainResolver::new();
+    resolver
+        .store_named(
+            "gitlab",
+            AuthMode::Sso,
+            &sso(&server, "a1", "r1", chrono::Duration::hours(2)),
+        )
+        .await
+        .unwrap();
+    let registry = Registry::discover(
+        &resolver,
+        &config_for("gitlab", &server),
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await;
+    // The re-login, after the connector was built.
+    resolver
+        .store_named(
+            "gitlab",
+            AuthMode::Sso,
+            &sso(&server, "a-new", "r-new", chrono::Duration::hours(2)),
+        )
+        .await
+        .unwrap();
+    let token = token_endpoint(&server);
+    let refused = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v4/projects/section9labs%2Frupu-mirror")
+            .header("authorization", "Bearer a1");
+        then.status(401)
+            .header("content-type", "application/json")
+            .body(r#"{"message":"401 Unauthorized"}"#);
+    });
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/project_get_happy.json").unwrap();
+    let accepted = server.mock(move |when, then| {
+        when.method(GET)
+            .path("/api/v4/projects/section9labs%2Frupu-mirror")
+            .header("authorization", "Bearer a-new");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(body);
+    });
+
+    registry
+        .repo_by_account(&AccountId::new("gitlab"))
+        .unwrap()
+        .get_repo(&mirror())
+        .await
+        .expect("retried with the stored replacement");
+
+    refused.assert_hits(1);
+    accepted.assert_hits(1);
+    token.assert_hits(0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_re_login_reaches_a_running_event_poller_on_its_next_401() {
+    let home = tempfile::tempdir().unwrap();
+    let server = MockServer::start_async().await;
+    let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
+
+    let resolver = KeychainResolver::new();
+    resolver
+        .store_named(
+            "gl-work",
+            AuthMode::Sso,
+            &sso(&server, "a1", "r1", chrono::Duration::hours(2)),
+        )
+        .await
+        .unwrap();
+    let registry = Registry::discover(
+        &resolver,
+        &config_for("gl-work", &server),
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await;
+    resolver
+        .store_named(
+            "gl-work",
+            AuthMode::Sso,
+            &sso(&server, "a-new", "r-new", chrono::Duration::hours(2)),
+        )
+        .await
+        .unwrap();
+    let refused = server.mock(|when, then| {
+        when.method(GET)
+            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .header("authorization", "Bearer a1");
+        then.status(401).body(r#"{"message":"401 Unauthorized"}"#);
+    });
+    let accepted = server.mock(|when, then| {
+        when.method(GET)
+            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .header("authorization", "Bearer a-new");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+
+    let (_, poller) = registry
+        .events_for_source(
+            &EventSourceRef::Repo { repo: mirror() },
+            None,
+            Some(&AccountId::new("gl-work")),
+        )
+        .unwrap();
+    let since = format!(
+        "since:{}",
+        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+    );
+    poller
+        .poll_events(&EventSourceRef::Repo { repo: mirror() }, Some(&since), 50)
+        .await
+        .expect("retried with the stored replacement");
+
+    refused.assert_hits(1);
+    accepted.assert_hits(1);
+}

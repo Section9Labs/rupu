@@ -71,6 +71,41 @@ impl GitlabEventConnector {
     }
 }
 
+impl GitlabEventConnector {
+    /// GET `url` with the current token. A 401 for an OAuth token is
+    /// retried once with its replacement from the store — a
+    /// `rupu auth login` or another process's refresh since this poller
+    /// last read it.
+    async fn get_authed(&self, url: &str) -> Result<reqwest::Response, ScmError> {
+        let token = self.token.token().await?;
+        let resp = self.get_with(url, &token).await?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        match self.token.replacement_for(&token).await? {
+            Some(fresh) => self.get_with(url, &fresh).await,
+            None => Ok(resp),
+        }
+    }
+
+    async fn get_with(&self, url: &str, token: &str) -> Result<reqwest::Response, ScmError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("rupu/0"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| ScmError::Transient(anyhow::anyhow!("invalid token: {e}")))?,
+        );
+        self.http
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ScmError::Network(anyhow::anyhow!("gitlab events GET {url}: {e}")))
+    }
+}
+
 #[async_trait]
 impl EventConnector for GitlabEventConnector {
     async fn poll_events(
@@ -116,23 +151,7 @@ impl EventConnector for GitlabEventConnector {
             after_date,
         );
 
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("rupu/0"));
-        let token = self.token.token().await?;
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|e| ScmError::Transient(anyhow::anyhow!("invalid token: {e}")))?,
-        );
-
-        let resp = self
-            .http
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| ScmError::Network(anyhow::anyhow!("gitlab events GET {url}: {e}")))?;
+        let resp = self.get_authed(&url).await?;
 
         let status = resp.status();
         if !status.is_success() {

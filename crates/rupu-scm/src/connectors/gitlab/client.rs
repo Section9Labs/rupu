@@ -118,8 +118,48 @@ impl GitlabClient {
     /// The token to send now (refreshed first if it is an expiring OAuth
     /// token). Read by every request here and by `clone_to`, which puts it
     /// in the clone URL.
-    pub async fn access_token(&self) -> Result<String, ScmError> {
+    pub(crate) async fn access_token(&self) -> Result<String, ScmError> {
         self.token.token().await
+    }
+
+    /// Send the request `build` makes, with the current token as
+    /// `Authorization: Bearer` (the one header GitLab accepts for OAuth
+    /// tokens and access tokens alike; `PRIVATE-TOKEN` rejects OAuth
+    /// tokens). A 401 for an OAuth token is retried once with its
+    /// replacement from the store — a `rupu auth login` or another
+    /// process's refresh since this connector last read it.
+    async fn send_authed(
+        &self,
+        build: impl Fn() -> reqwest_middleware::RequestBuilder,
+    ) -> Result<reqwest::Response, ScmError> {
+        let token = self.access_token().await?;
+        let resp = build().bearer_auth(&token).send().await;
+        let resp = resp.map_err(transport_error)?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        match self.token.replacement_for(&token).await? {
+            Some(fresh) => build()
+                .bearer_auth(&fresh)
+                .send()
+                .await
+                .map_err(transport_error),
+            None => Ok(resp),
+        }
+    }
+
+    /// The API host when it isn't gitlab.com (a self-managed instance, or a
+    /// `base_url` that doesn't parse), for `clone_to`, whose URLs only know
+    /// gitlab.com.
+    pub(crate) fn self_managed_host(&self) -> Option<String> {
+        let host = url::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        match host.as_deref() {
+            Some("gitlab.com") => None,
+            Some(other) => Some(other.to_string()),
+            None => Some(self.base_url.clone()),
+        }
     }
 
     /// The configured clone protocol, read by `GitlabRepoConnector::clone_to`.
@@ -191,28 +231,24 @@ impl GitlabClient {
         }
     }
 
-    /// Issue a JSON GET against `<base_url><path>` with the token as
-    /// `Authorization: Bearer` (the one header GitLab accepts for OAuth
-    /// tokens and access tokens alike; `PRIVATE-TOKEN` rejects OAuth
-    /// tokens), honoring the LRU ETag cache and classifying error
-    /// responses via `classify_scm_error(Platform::Gitlab, ...)`.
+    /// Issue an authenticated JSON GET against `<base_url><path>`
+    /// ([`Self::send_authed`]), honoring the LRU ETag cache and
+    /// classifying error responses via
+    /// `classify_scm_error(Platform::Gitlab, ...)`.
     pub async fn get_json(&self, path: &str) -> Result<serde_json::Value, ScmError> {
         let url = format!("{}{}", self.base_url, path);
         let cache_key = url.clone();
         let cached = self.cache_get(&cache_key);
 
-        let token = self.access_token().await?;
-        let mut req = self.http.get(&url).bearer_auth(token);
-        if let Some((etag, _)) = &cached {
-            req = req.header("If-None-Match", etag);
-        }
-        let resp = req.send().await.map_err(|e| {
-            if e.is_timeout() || e.is_connect() {
-                ScmError::Network(anyhow::anyhow!("gitlab transport: {e}"))
-            } else {
-                ScmError::Transient(anyhow::anyhow!("gitlab: {e}"))
-            }
-        })?;
+        let resp = self
+            .send_authed(|| {
+                let req = self.http.get(&url);
+                match &cached {
+                    Some((etag, _)) => req.header("If-None-Match", etag),
+                    None => req,
+                }
+            })
+            .await?;
 
         let status = resp.status().as_u16();
         let etag = resp
@@ -261,21 +297,9 @@ impl GitlabClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ScmError> {
         let url = format!("{}{}", self.base_url, path);
-        let token = self.access_token().await?;
         let resp = self
-            .http
-            .request(method, &url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
-                    ScmError::Network(anyhow::anyhow!("gitlab transport: {e}"))
-                } else {
-                    ScmError::Transient(anyhow::anyhow!("gitlab: {e}"))
-                }
-            })?;
+            .send_authed(|| self.http.request(method.clone(), &url).json(&body))
+            .await?;
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
         if !(200..300).contains(&status) {
@@ -294,20 +318,7 @@ impl GitlabClient {
     /// Fetch a non-JSON text body (e.g. the raw-diff endpoint).
     pub async fn get_text(&self, path: &str) -> Result<String, ScmError> {
         let url = format!("{}{}", self.base_url, path);
-        let token = self.access_token().await?;
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
-                    ScmError::Network(anyhow::anyhow!("gitlab transport: {e}"))
-                } else {
-                    ScmError::Transient(anyhow::anyhow!("gitlab: {e}"))
-                }
-            })?;
+        let resp = self.send_authed(|| self.http.get(&url)).await?;
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
         if !(200..300).contains(&status) {
@@ -322,6 +333,14 @@ impl GitlabClient {
         resp.text()
             .await
             .map_err(|e| ScmError::Transient(anyhow::anyhow!("gitlab text: {e}")))
+    }
+}
+
+fn transport_error(e: reqwest_middleware::Error) -> ScmError {
+    if e.is_timeout() || e.is_connect() {
+        ScmError::Network(anyhow::anyhow!("gitlab transport: {e}"))
+    } else {
+        ScmError::Transient(anyhow::anyhow!("gitlab: {e}"))
     }
 }
 
