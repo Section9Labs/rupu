@@ -434,10 +434,52 @@ mod tests {
     fn cwe_and_explicit_classifications_fold_together() {
         let mut v = fixture();
         v["cwe"] = serde_json::json!(["CWE-306"]);
-        v["classifications"] = serde_json::json!([{"system":"CVE","id":"CVE-2026-0001","vector":"AV:N"}]);
+        v["classifications"] = serde_json::json!([
+            {"system":"CVE","id":"CVE-2026-0001","vector":"AV:N"},
+            {"system":"CWE","id":"CWE-306"}
+        ]);
+        v["rating"]["cvss_v3"] = serde_json::json!("7.5");
         let r: FindingReport = serde_json::from_value(v).unwrap();
         let all = r.all_classifications();
+
+        // CWE from cwe field appears
         assert!(all.iter().any(|c| c.system == "CWE" && c.id == "CWE-306"));
-        assert!(all.iter().any(|c| c.system == "CVE" && c.vector.as_deref() == Some("AV:N")));
+
+        // CVE from explicit classifications appears
+        assert!(all.iter().any(|c| c.system == "CVE" && c.id == "CVE-2026-0001" && c.vector.as_deref() == Some("AV:N")));
+
+        // CVSS from rating.cvss_v3 appears
+        assert!(all.iter().any(|c| c.system == "CVSS" && c.id == "7.5"));
+
+        // Dedup: CWE-306 in both cwe and classifications appears once
+        let cwe_count = all.iter().filter(|c| c.system == "CWE" && c.id == "CWE-306").count();
+        assert_eq!(cwe_count, 1, "CWE-306 should appear exactly once, not duplicated");
+
+        // Should have 3 total: CVE, CWE-306 (deduplicated), CVSS
+        assert_eq!(all.len(), 3, "Expected 3 classifications after dedup");
+    }
+
+    #[test]
+    fn cvss_unknown_or_empty_yields_no_entry() {
+        // Test "Unknown"
+        let mut v = fixture();
+        v["cwe"] = serde_json::json!([]);
+        v["classifications"] = serde_json::json!([]);
+        v["rating"]["cvss_v3"] = serde_json::json!("Unknown");
+        let r: FindingReport = serde_json::from_value(v.clone()).unwrap();
+        let all = r.all_classifications();
+        assert!(!all.iter().any(|c| c.system == "CVSS"), "Unknown CVSS should not yield an entry");
+
+        // Test empty cvss_v3
+        v["rating"]["cvss_v3"] = serde_json::json!("");
+        let r: FindingReport = serde_json::from_value(v.clone()).unwrap();
+        let all = r.all_classifications();
+        assert!(!all.iter().any(|c| c.system == "CVSS"), "Empty CVSS should not yield an entry");
+
+        // Test whitespace-only cvss_v3
+        v["rating"]["cvss_v3"] = serde_json::json!("   ");
+        let r: FindingReport = serde_json::from_value(v).unwrap();
+        let all = r.all_classifications();
+        assert!(!all.iter().any(|c| c.system == "CVSS"), "Whitespace-only CVSS should not yield an entry");
     }
 }
