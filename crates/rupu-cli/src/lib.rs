@@ -264,6 +264,19 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         }
     }
 
+    // SIGTERM — what a workflow-run cancel sends the run's `runner_pid` —
+    // would otherwise kill the process before `main` drains an OAuth token
+    // refresh still being persisted. `autoflow serve` shuts down gracefully
+    // on SIGTERM itself (and `main` drains after it returns).
+    if !matches!(
+        cli.command,
+        Cmd::Autoflow {
+            action: cmd::autoflow::Action::Serve { .. }
+        }
+    ) {
+        exit::install_sigterm_drain();
+    }
+
     // Run / Workflow Run / Watch / Session Attach own a live stdout view.
     // Tracing on stderr would bleed through and corrupt that output.
     // Route logs to the rupu log file for those commands; everything
