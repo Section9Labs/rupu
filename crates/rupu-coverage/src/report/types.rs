@@ -204,6 +204,8 @@ pub struct EvidenceClaim {
     /// Path of an entry in `artifacts` this claim is proven by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<EvidenceBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +379,66 @@ impl FindingReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisasmLine {
+    pub addr: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "block", rename_all = "snake_case")]
+pub enum EvidenceBlock {
+    Text { text: String },
+    CodeSlice {
+        excerpt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+    },
+    Diff { diff: String },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Image {
+        artifact: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    Hexdump {
+        base: u64,
+        artifact: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rendered: Option<String>,
+    },
+    Disasm {
+        arch: String,
+        listing: Vec<DisasmLine>,
+    },
+    Decompile { lang: String, listing: String },
+    HttpExchange { request: String, response: String },
+    ScanOutput { tool: String, output: String },
+    PcapRef { artifact: String, summary: String },
+}
+
+impl EvidenceBlock {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EvidenceBlock::Text { .. } => "text",
+            EvidenceBlock::CodeSlice { .. } => "code_slice",
+            EvidenceBlock::Diff { .. } => "diff",
+            EvidenceBlock::Table { .. } => "table",
+            EvidenceBlock::Image { .. } => "image",
+            EvidenceBlock::Hexdump { .. } => "hexdump",
+            EvidenceBlock::Disasm { .. } => "disasm",
+            EvidenceBlock::Decompile { .. } => "decompile",
+            EvidenceBlock::HttpExchange { .. } => "http_exchange",
+            EvidenceBlock::ScanOutput { .. } => "scan_output",
+            EvidenceBlock::PcapRef { .. } => "pcap_ref",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +454,20 @@ mod tests {
         serde_path_to_error::deserialize::<_, FindingReport>(v)
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn claim_carries_typed_blocks_with_kind_tags() {
+        let b = EvidenceBlock::Disasm {
+            arch: "x86_64".into(),
+            listing: vec![DisasmLine {
+                addr: "0x401000".into(),
+                text: "mov eax, edi".into(),
+            }],
+        };
+        assert_eq!(b.kind(), "disasm");
+        let j = serde_json::to_value(&b).unwrap();
+        assert_eq!(serde_json::from_value::<EvidenceBlock>(j).unwrap(), b);
     }
 
     #[test]
