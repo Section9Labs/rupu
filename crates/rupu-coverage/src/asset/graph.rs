@@ -55,8 +55,16 @@ mod tests {
 
     #[test]
     fn builds_tree_and_updates_depth() {
-        let root = Asset::new("binary:binary", Locator(vec![Coordinate::Sha256("ab".into())]), "blob");
-        let mut child = Asset::new("binary:function", Locator(vec![Coordinate::Address(0x1000)]), "f");
+        let root = Asset::new(
+            "binary:binary",
+            Locator(vec![Coordinate::Sha256("ab".into())]),
+            "blob",
+        );
+        let mut child = Asset::new(
+            "binary:function",
+            Locator(vec![Coordinate::Address(0x1000)]),
+            "f",
+        );
         child.parent = Some(root.id.clone());
         let (rid, cid) = (root.id.clone(), child.id.clone());
 

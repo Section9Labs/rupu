@@ -558,4 +558,68 @@ mod tests {
         let all = r.all_classifications();
         assert!(!all.iter().any(|c| c.system == "CVSS"), "Whitespace-only CVSS should not yield an entry");
     }
+
+    /// One value per `EvidenceBlock` variant. Later plans (profile
+    /// `evidence_blocks` validation, renderers) rely on `kind()` equalling the
+    /// serialized `"block"` discriminant.
+    fn one_block_of_each() -> Vec<EvidenceBlock> {
+        vec![
+            EvidenceBlock::Text { text: "t".into() },
+            EvidenceBlock::CodeSlice {
+                excerpt: "x".into(),
+                lang: Some("rust".into()),
+            },
+            EvidenceBlock::Diff { diff: "-a\n+b".into() },
+            EvidenceBlock::Table {
+                headers: vec!["h".into()],
+                rows: vec![vec!["r".into()]],
+            },
+            EvidenceBlock::Image {
+                artifact: "a".repeat(64),
+                caption: None,
+            },
+            EvidenceBlock::Hexdump {
+                base: 0x1000,
+                artifact: "a".repeat(64),
+                rendered: None,
+            },
+            EvidenceBlock::Disasm {
+                arch: "x86_64".into(),
+                listing: vec![DisasmLine {
+                    addr: "0x401000".into(),
+                    text: "ret".into(),
+                }],
+            },
+            EvidenceBlock::Decompile {
+                lang: "c".into(),
+                listing: "int f(void);".into(),
+            },
+            EvidenceBlock::HttpExchange {
+                request: "GET / HTTP/1.1".into(),
+                response: "HTTP/1.1 200 OK".into(),
+            },
+            EvidenceBlock::ScanOutput {
+                tool: "nmap".into(),
+                output: "open".into(),
+            },
+            EvidenceBlock::PcapRef {
+                artifact: "a".repeat(64),
+                summary: "s".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn kind_equals_the_serialized_block_tag_for_every_variant() {
+        let all = one_block_of_each();
+        assert_eq!(all.len(), 11, "one value per EvidenceBlock variant");
+        for b in &all {
+            let j = serde_json::to_value(b).unwrap();
+            assert_eq!(
+                j["block"].as_str(),
+                Some(b.kind()),
+                "serde tag drifted from kind() for {b:?}"
+            );
+        }
+    }
 }

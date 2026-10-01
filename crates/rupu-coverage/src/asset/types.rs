@@ -55,12 +55,20 @@ mod tests {
 
     #[test]
     fn id_is_stable_and_namespace_parses() {
-        let loc = Locator(vec![Coordinate::Address(0x401000), Coordinate::Symbol("main".into())]);
+        let loc = Locator(vec![
+            Coordinate::Address(0x401000),
+            Coordinate::Symbol("main".into()),
+        ]);
         let a = Asset::new("binary:function", loc.clone(), "main @ 0x401000");
         let b = Asset::new("binary:function", loc, "main @ 0x401000");
         assert_eq!(a.id, b.id, "same kind+locator ⇒ same id");
         assert_ne!(
-            Asset::new("binary:function", Locator(vec![Coordinate::Address(0x2000)]), "g").id,
+            Asset::new(
+                "binary:function",
+                Locator(vec![Coordinate::Address(0x2000)]),
+                "g"
+            )
+            .id,
             a.id,
             "different locator ⇒ different id"
         );

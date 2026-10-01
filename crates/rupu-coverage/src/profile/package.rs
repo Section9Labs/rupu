@@ -65,7 +65,10 @@ pub fn parse_profile(src: &str) -> Result<EngagementProfile, ProfileError> {
     for k in &p.asset_kinds {
         for tag in &k.coordinates {
             if !Coordinate::known_tag(tag) {
-                return Err(ProfileError::UnknownCoordinate { kind: k.id.clone(), tag: tag.clone() });
+                return Err(ProfileError::UnknownCoordinate {
+                    kind: k.id.clone(),
+                    tag: tag.clone(),
+                });
             }
         }
     }
@@ -82,9 +85,14 @@ mod tests {
     fn parses_the_builtin_binary_profile() {
         let p = parse_profile(BINARY).unwrap();
         assert_eq!(p.id, "binary");
-        assert!(p.asset_kinds.iter().any(|k| k.id == "function"
-            && k.coordinates.contains(&"address".to_string())));
-        assert_eq!(p.coverage.depth_ladder.first().map(String::as_str), Some("located"));
+        assert!(p
+            .asset_kinds
+            .iter()
+            .any(|k| k.id == "function" && k.coordinates.contains(&"address".to_string())));
+        assert_eq!(
+            p.coverage.depth_ladder.first().map(String::as_str),
+            Some("located")
+        );
     }
 
     #[test]
@@ -101,6 +109,9 @@ enumerates = ["k"]
 depth_ladder = ["a"]
 [bundle]
 "#;
-        assert!(matches!(parse_profile(bad), Err(ProfileError::UnknownCoordinate { .. })));
+        assert!(matches!(
+            parse_profile(bad),
+            Err(ProfileError::UnknownCoordinate { .. })
+        ));
     }
 }

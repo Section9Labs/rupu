@@ -39,7 +39,10 @@ impl ProfileRegistry {
     pub fn active_set(&self, ids: &[String]) -> Result<ActiveSet, RegistryError> {
         let mut chosen = Vec::new();
         for id in ids {
-            let p = self.profiles.get(id).ok_or_else(|| RegistryError::UnknownProfile(id.clone()))?;
+            let p = self
+                .profiles
+                .get(id)
+                .ok_or_else(|| RegistryError::UnknownProfile(id.clone()))?;
             chosen.push(p.clone());
         }
         // Fail-closed on a namespaced-kind collision across the active set.
@@ -99,18 +102,27 @@ mod tests {
         let reg = ProfileRegistry::from_profiles(all).unwrap();
 
         let set = reg.active_set(&["network".into(), "web".into()]).unwrap();
-        assert_eq!(set.profile_for_kind("network:service").unwrap().id, "network");
+        assert_eq!(
+            set.profile_for_kind("network:service").unwrap().id,
+            "network"
+        );
         assert_eq!(set.profile_for_kind("web:route").unwrap().id, "web");
         assert!(set.profile_for_kind("cloud:bucket").is_none());
 
         let narrowed = set.narrow(&["network".into()]).unwrap();
         assert!(narrowed.profile_for_kind("web:route").is_none());
-        assert!(matches!(set.narrow(&["cloud".into()]), Err(RegistryError::WidenNotAllowed(_))));
+        assert!(matches!(
+            set.narrow(&["cloud".into()]),
+            Err(RegistryError::WidenNotAllowed(_))
+        ));
     }
 
     #[test]
     fn unknown_profile_errors() {
         let reg = ProfileRegistry::from_profiles(BTreeMap::new()).unwrap();
-        assert!(matches!(reg.active_set(&["ghost".into()]), Err(RegistryError::UnknownProfile(_))));
+        assert!(matches!(
+            reg.active_set(&["ghost".into()]),
+            Err(RegistryError::UnknownProfile(_))
+        ));
     }
 }

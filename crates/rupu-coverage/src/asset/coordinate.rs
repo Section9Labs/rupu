@@ -55,8 +55,18 @@ impl Coordinate {
     pub fn known_tag(tag: &str) -> bool {
         matches!(
             tag,
-            "path" | "line_range" | "symbol" | "commit" | "sha256" | "offset"
-                | "address" | "host" | "port" | "url" | "http_route" | "param"
+            "path"
+                | "line_range"
+                | "symbol"
+                | "commit"
+                | "sha256"
+                | "offset"
+                | "address"
+                | "host"
+                | "port"
+                | "url"
+                | "http_route"
+                | "param"
                 | "resource_id"
         )
     }
@@ -88,5 +98,52 @@ mod tests {
         assert_eq!(Coordinate::Address(0x401000).tag(), "address");
         let j = serde_json::to_string(&loc).unwrap();
         assert_eq!(serde_json::from_str::<Locator>(&j).unwrap(), loc);
+    }
+
+    /// One value per `Coordinate` variant. If you add a variant, add it here —
+    /// the exhaustive match in `tag()` forces the other half of the contract.
+    fn one_of_each() -> Vec<Coordinate> {
+        vec![
+            Coordinate::Path("src/lib.rs".into()),
+            Coordinate::LineRange { start: 1, end: 9 },
+            Coordinate::Symbol("main".into()),
+            Coordinate::Commit("deadbeef".into()),
+            Coordinate::Sha256("00".repeat(32)),
+            Coordinate::Offset(16),
+            Coordinate::Address(0x401000),
+            Coordinate::Host("10.0.0.1".into()),
+            Coordinate::Port {
+                number: 443,
+                proto: Proto::Tcp,
+            },
+            Coordinate::Url("https://example.test/".into()),
+            Coordinate::HttpRoute {
+                method: "GET".into(),
+                path: "/v1/things".into(),
+            },
+            Coordinate::Param("q".into()),
+            Coordinate::ResourceId {
+                scheme: "arn".into(),
+                id: "aws:s3:::bucket".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn tag_known_tag_and_serde_key_agree_for_every_variant() {
+        let all = one_of_each();
+        assert_eq!(all.len(), 13, "one value per Coordinate variant");
+        for c in &all {
+            assert!(
+                Coordinate::known_tag(c.tag()),
+                "known_tag rejects tag() {:?} of {c:?}",
+                c.tag()
+            );
+            let v = serde_json::to_value(c).unwrap();
+            let obj = v.as_object().expect("externally tagged => object");
+            assert_eq!(obj.len(), 1, "{c:?} => {v}");
+            let key = obj.keys().next().unwrap();
+            assert_eq!(key, c.tag(), "serde key drifted from tag() for {c:?}");
+        }
     }
 }
