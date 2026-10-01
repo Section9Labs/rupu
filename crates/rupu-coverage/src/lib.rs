@@ -3,10 +3,12 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+pub mod asset;
 pub mod audit;
 pub mod catalog;
 pub mod diff;
 pub mod ledger;
+pub mod profile;
 pub mod report;
 pub mod rerun;
 pub mod tool_mappings;
@@ -14,6 +16,9 @@ pub mod tools;
 
 #[cfg(feature = "gen")]
 pub mod cwe_gen;
+
+pub use asset::{Coordinate, Locator, Proto};
+pub use asset::{Asset, AssetGraph, AssetId};
 
 pub use tools::{
     coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,

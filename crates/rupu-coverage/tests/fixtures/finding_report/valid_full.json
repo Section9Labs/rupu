@@ -17,6 +17,9 @@
   "category": "Authorization Bypass Through User-Controlled Key",
   "attack_vector": "Authenticated HTTP request with another user's note id",
   "cwe": ["CWE-639", "CWE-862"],
+  "classifications": [
+    {"system": "CVE", "id": "CVE-2026-0001", "vector": "AV:N/AU:S/C:H/I:N/A:N"}
+  ],
   "description": "The `get_note` handler loads a note by the `id` path parameter and returns it without checking that the note belongs to the signed-in user.",
   "impact": "Any signed-in user can read every other user's notes by iterating ids.",
   "location": {

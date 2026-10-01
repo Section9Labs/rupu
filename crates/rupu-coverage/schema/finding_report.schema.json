@@ -55,6 +55,20 @@
     "category": { "type": "string", "minLength": 1 },
     "attack_vector": { "type": "string", "minLength": 1, "description": "How the surface is reached, including authentication or user interaction required, or 'Unknown'." },
     "cwe": { "type": "array", "items": { "type": "string", "pattern": "^CWE-[0-9]+$" }, "description": "CWE ids, e.g. ['CWE-306']. May be empty." },
+    "classifications": {
+      "type": "array",
+      "description": "Multi-system classification (CWE, CVE, CVSS, etc.). May be empty.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["system", "id"],
+        "properties": {
+          "system": { "type": "string", "minLength": 1, "description": "Classification system: CWE, CVE, CVSS, etc." },
+          "id": { "type": "string", "minLength": 1, "description": "Identifier within the system (e.g. CVE-2026-0001, 7.5)." },
+          "vector": { "type": "string", "description": "Optional vector string (e.g. CVSS vector like 'AV:N/AU:N')." }
+        }
+      }
+    },
     "description": { "type": "string", "minLength": 1, "description": "Markdown. What the issue is, where it occurs, why it is a weakness." },
     "impact": { "type": "string", "minLength": 1, "description": "Markdown. What an attacker could achieve and why it matters." },
     "location": {
@@ -107,7 +121,19 @@
           "excerpt": { "type": "string", "description": "Only the lines that matter." },
           "lang": { "type": "string", "description": "Language for highlighting, e.g. 'c', 'sh'." },
           "sha256": { "type": "string", "description": "Set by rupu; omit." },
-          "artifact": { "type": "string", "description": "Path of an entry in artifacts that proves this claim." }
+          "artifact": { "type": "string", "description": "Path of an entry in artifacts that proves this claim." },
+          "blocks": {
+            "type": "array",
+            "description": "Typed evidence blocks (text, code, diff, table, image, hexdump, disasm, decompile, http_exchange, scan_output, pcap_ref).",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["block"],
+              "properties": {
+                "block": { "type": "string", "description": "Block discriminator tag." }
+              }
+            }
+          }
         }
       }
     },

@@ -204,6 +204,8 @@ pub struct EvidenceClaim {
     /// Path of an entry in `artifacts` this claim is proven by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<EvidenceBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +310,15 @@ pub struct Verification {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Classification {
+    pub system: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FindingReport {
     pub title: String,
     pub ownership: Ownership,
@@ -318,6 +329,8 @@ pub struct FindingReport {
     pub attack_vector: String,
     #[serde(default)]
     pub cwe: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classifications: Vec<Classification>,
     pub description: String,
     pub impact: String,
     pub location: ReportLocation,
@@ -338,6 +351,94 @@ pub struct FindingReport {
     pub verification: Option<Verification>,
 }
 
+impl FindingReport {
+    pub fn all_classifications(&self) -> Vec<Classification> {
+        let mut out = self.classifications.clone();
+        for id in &self.cwe {
+            let c = Classification {
+                system: "CWE".into(),
+                id: id.clone(),
+                vector: None,
+            };
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        let cvss = self.rating.cvss_v3.trim();
+        if !cvss.is_empty() && !cvss.eq_ignore_ascii_case("unknown") {
+            let c = Classification {
+                system: "CVSS".into(),
+                id: cvss.to_string(),
+                vector: None,
+            };
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisasmLine {
+    pub addr: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "block", rename_all = "snake_case")]
+pub enum EvidenceBlock {
+    Text { text: String },
+    CodeSlice {
+        excerpt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+    },
+    Diff { diff: String },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Image {
+        artifact: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    Hexdump {
+        base: u64,
+        artifact: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rendered: Option<String>,
+    },
+    Disasm {
+        arch: String,
+        listing: Vec<DisasmLine>,
+    },
+    Decompile { lang: String, listing: String },
+    HttpExchange { request: String, response: String },
+    ScanOutput { tool: String, output: String },
+    PcapRef { artifact: String, summary: String },
+}
+
+impl EvidenceBlock {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EvidenceBlock::Text { .. } => "text",
+            EvidenceBlock::CodeSlice { .. } => "code_slice",
+            EvidenceBlock::Diff { .. } => "diff",
+            EvidenceBlock::Table { .. } => "table",
+            EvidenceBlock::Image { .. } => "image",
+            EvidenceBlock::Hexdump { .. } => "hexdump",
+            EvidenceBlock::Disasm { .. } => "disasm",
+            EvidenceBlock::Decompile { .. } => "decompile",
+            EvidenceBlock::HttpExchange { .. } => "http_exchange",
+            EvidenceBlock::ScanOutput { .. } => "scan_output",
+            EvidenceBlock::PcapRef { .. } => "pcap_ref",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +454,20 @@ mod tests {
         serde_path_to_error::deserialize::<_, FindingReport>(v)
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn claim_carries_typed_blocks_with_kind_tags() {
+        let b = EvidenceBlock::Disasm {
+            arch: "x86_64".into(),
+            listing: vec![DisasmLine {
+                addr: "0x401000".into(),
+                text: "mov eax, edi".into(),
+            }],
+        };
+        assert_eq!(b.kind(), "disasm");
+        let j = serde_json::to_value(&b).unwrap();
+        assert_eq!(serde_json::from_value::<EvidenceBlock>(j).unwrap(), b);
     }
 
     #[test]
@@ -389,5 +504,122 @@ mod tests {
             err.to_string().contains("invalid type: boolean `true`"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn cwe_and_explicit_classifications_fold_together() {
+        let mut v = fixture();
+        v["cwe"] = serde_json::json!(["CWE-306"]);
+        v["classifications"] = serde_json::json!([
+            {"system":"CVE","id":"CVE-2026-0001","vector":"AV:N"},
+            {"system":"CWE","id":"CWE-306"}
+        ]);
+        v["rating"]["cvss_v3"] = serde_json::json!("7.5");
+        let r: FindingReport = serde_json::from_value(v).unwrap();
+        let all = r.all_classifications();
+
+        // CWE from cwe field appears
+        assert!(all.iter().any(|c| c.system == "CWE" && c.id == "CWE-306"));
+
+        // CVE from explicit classifications appears
+        assert!(all.iter().any(|c| c.system == "CVE" && c.id == "CVE-2026-0001" && c.vector.as_deref() == Some("AV:N")));
+
+        // CVSS from rating.cvss_v3 appears
+        assert!(all.iter().any(|c| c.system == "CVSS" && c.id == "7.5"));
+
+        // Dedup: CWE-306 in both cwe and classifications appears once
+        let cwe_count = all.iter().filter(|c| c.system == "CWE" && c.id == "CWE-306").count();
+        assert_eq!(cwe_count, 1, "CWE-306 should appear exactly once, not duplicated");
+
+        // Should have 3 total: CVE, CWE-306 (deduplicated), CVSS
+        assert_eq!(all.len(), 3, "Expected 3 classifications after dedup");
+    }
+
+    #[test]
+    fn cvss_unknown_or_empty_yields_no_entry() {
+        // Test "Unknown"
+        let mut v = fixture();
+        v["cwe"] = serde_json::json!([]);
+        v["classifications"] = serde_json::json!([]);
+        v["rating"]["cvss_v3"] = serde_json::json!("Unknown");
+        let r: FindingReport = serde_json::from_value(v.clone()).unwrap();
+        let all = r.all_classifications();
+        assert!(!all.iter().any(|c| c.system == "CVSS"), "Unknown CVSS should not yield an entry");
+
+        // Test empty cvss_v3
+        v["rating"]["cvss_v3"] = serde_json::json!("");
+        let r: FindingReport = serde_json::from_value(v.clone()).unwrap();
+        let all = r.all_classifications();
+        assert!(!all.iter().any(|c| c.system == "CVSS"), "Empty CVSS should not yield an entry");
+
+        // Test whitespace-only cvss_v3
+        v["rating"]["cvss_v3"] = serde_json::json!("   ");
+        let r: FindingReport = serde_json::from_value(v).unwrap();
+        let all = r.all_classifications();
+        assert!(!all.iter().any(|c| c.system == "CVSS"), "Whitespace-only CVSS should not yield an entry");
+    }
+
+    /// One value per `EvidenceBlock` variant. Later plans (profile
+    /// `evidence_blocks` validation, renderers) rely on `kind()` equalling the
+    /// serialized `"block"` discriminant.
+    fn one_block_of_each() -> Vec<EvidenceBlock> {
+        vec![
+            EvidenceBlock::Text { text: "t".into() },
+            EvidenceBlock::CodeSlice {
+                excerpt: "x".into(),
+                lang: Some("rust".into()),
+            },
+            EvidenceBlock::Diff { diff: "-a\n+b".into() },
+            EvidenceBlock::Table {
+                headers: vec!["h".into()],
+                rows: vec![vec!["r".into()]],
+            },
+            EvidenceBlock::Image {
+                artifact: "a".repeat(64),
+                caption: None,
+            },
+            EvidenceBlock::Hexdump {
+                base: 0x1000,
+                artifact: "a".repeat(64),
+                rendered: None,
+            },
+            EvidenceBlock::Disasm {
+                arch: "x86_64".into(),
+                listing: vec![DisasmLine {
+                    addr: "0x401000".into(),
+                    text: "ret".into(),
+                }],
+            },
+            EvidenceBlock::Decompile {
+                lang: "c".into(),
+                listing: "int f(void);".into(),
+            },
+            EvidenceBlock::HttpExchange {
+                request: "GET / HTTP/1.1".into(),
+                response: "HTTP/1.1 200 OK".into(),
+            },
+            EvidenceBlock::ScanOutput {
+                tool: "nmap".into(),
+                output: "open".into(),
+            },
+            EvidenceBlock::PcapRef {
+                artifact: "a".repeat(64),
+                summary: "s".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn kind_equals_the_serialized_block_tag_for_every_variant() {
+        let all = one_block_of_each();
+        assert_eq!(all.len(), 11, "one value per EvidenceBlock variant");
+        for b in &all {
+            let j = serde_json::to_value(b).unwrap();
+            assert_eq!(
+                j["block"].as_str(),
+                Some(b.kind()),
+                "serde tag drifted from kind() for {b:?}"
+            );
+        }
     }
 }
