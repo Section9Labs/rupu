@@ -526,10 +526,13 @@ async fn run_follow_up(
             via,
             approver,
         } => {
-            let (opts, _chain_len) =
-                crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, None)
-                    .await
-                    .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
+            let global = crate::paths::global_dir()
+                .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
+            let (opts, _chain_len) = crate::resume::build_reject_cleanup_opts(
+                &store, &global, run_id, &step_id, &reason, None,
+            )
+            .await
+            .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
             rupu_orchestrator::runner::run_reject_cleanup(
                 opts,
                 &step_id,
