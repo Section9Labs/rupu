@@ -1230,6 +1230,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         tmp: false,
         run_id: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),

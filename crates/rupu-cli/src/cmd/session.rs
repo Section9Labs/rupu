@@ -158,6 +158,18 @@ pub struct StartArgs {
     /// Live renderer mode when auto-attaching.
     #[arg(long, value_enum)]
     pub view: Option<LiveViewMode>,
+    /// Engagement profile(s) for every turn of this session
+    /// (`--engagement-profile binary`, repeatable, or
+    /// `--engagement-profiles binary,web`), overriding the agent's
+    /// `engagementProfiles`. Snapshotted at start. Omitted or `code` keeps the
+    /// native code-review path.
+    #[arg(
+        long = "engagement-profiles",
+        alias = "engagement-profile",
+        value_name = "ID",
+        value_delimiter = ','
+    )]
+    pub engagement_profiles: Vec<String>,
 }
 
 #[derive(ClapArgs, Debug, Clone, Default)]
@@ -388,6 +400,12 @@ struct SessionRecord {
     /// `full`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// The engagement profile ids this session runs under: `session start
+    /// --engagement-profile(s)`, else the agent's `engagementProfiles`,
+    /// snapshotted at creation. Empty ⇒ the native `code` path (and the field
+    /// is omitted from the record).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    engagement_profiles: Vec<String>,
     workspace_id: String,
     workspace_path: PathBuf,
     #[serde(default)]
@@ -1574,6 +1592,22 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     }
     .to_string();
 
+    // Snapshot the engagement selection like the other agent-spec fields:
+    // the flag wins, else the agent's frontmatter. Left empty for the native
+    // `code` path. Validated now (unknown id / bad profile file) so a typo
+    // fails `session start`, not every later turn.
+    let engagement_profiles = if args.engagement_profiles.is_empty() {
+        spec.engagement_profiles.clone()
+    } else {
+        args.engagement_profiles.clone()
+    };
+    crate::engagement_opts::active_set(
+        &global,
+        project_root.as_deref(),
+        &engagement_profiles,
+        &[],
+    )?;
+
     let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
     let issue_ref = standalone_issue_ref(run_target.as_ref());
     let workspace_strategy =
@@ -1611,6 +1645,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         anthropic_speed: spec.anthropic_speed,
         dispatchable_agents: spec.dispatchable_agents.clone(),
         findings_profile: spec.findings_profile,
+        engagement_profiles,
         workspace_id: ws.id,
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root,
@@ -7629,11 +7664,24 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let codename = session.codename.clone().unwrap_or_else(|| {
             rupu_codename::derive_legacy(&session.session_id, Some(&session.agent_name))
         });
+        // Rebuilt every turn from the session's snapshotted selection (the
+        // worker is long-lived, and a profile file may change between turns).
+        // `None` for the native `code` path.
+        let engagement = crate::engagement_opts::active_set(
+            &global,
+            session.project_root.as_deref(),
+            &session.engagement_profiles,
+            &[],
+        )?;
         let tool_context = ToolContext {
             findings: Some(
-                crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
-                    rupu_coverage::FindingProfile::resolve(None, None, session.findings_profile),
-                ),
+                crate::findings_opts::base_options(&global, &cfg.findings)
+                    .with_engagement(engagement)
+                    .with_profile(rupu_coverage::FindingProfile::resolve(
+                        None,
+                        None,
+                        session.findings_profile,
+                    )),
             ),
             workspace_path: session.workspace_path.clone(),
             bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
@@ -10002,6 +10050,51 @@ mod tests {
         assert!(rec.codename.is_none());
     }
 
+    #[test]
+    fn engagement_profiles_snapshot_is_omitted_when_empty_and_round_trips() {
+        // The native `code` path leaves the record byte-identical.
+        let plain = serde_json::to_value(test_session_record()).unwrap();
+        assert!(plain.get("engagement_profiles").is_none());
+        let rec: SessionRecord = serde_json::from_value(plain).unwrap();
+        assert!(rec.engagement_profiles.is_empty());
+
+        let mut with = test_session_record();
+        with.engagement_profiles = vec!["binary".into(), "web".into()];
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            v["engagement_profiles"],
+            serde_json::json!(["binary", "web"])
+        );
+        let back: SessionRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.engagement_profiles, vec!["binary", "web"]);
+    }
+
+    #[test]
+    fn start_args_parse_engagement_profiles() {
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            start: StartArgs,
+        }
+        use clap::Parser;
+        let w = Wrap::try_parse_from([
+            "x",
+            "sec",
+            "--engagement-profile",
+            "binary",
+            "--engagement-profiles",
+            "web,network",
+        ])
+        .unwrap();
+        assert_eq!(w.start.agent, "sec");
+        assert_eq!(
+            w.start.engagement_profiles,
+            vec!["binary", "web", "network"]
+        );
+        let none = Wrap::try_parse_from(["x", "sec"]).unwrap();
+        assert!(none.start.engagement_profiles.is_empty());
+    }
+
     fn test_session_record() -> SessionRecord {
         SessionRecord {
             version: SessionRecord::VERSION,
@@ -10028,6 +10121,7 @@ mod tests {
             anthropic_speed: None,
             dispatchable_agents: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             workspace_id: "ws_test".into(),
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/repo")),

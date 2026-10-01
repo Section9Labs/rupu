@@ -65,6 +65,17 @@ pub struct Args {
     /// passes its step's resolved profile this way.
     #[arg(long, value_name = "PROFILE", value_parser = parse_findings_profile)]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Engagement profile(s) for this run (`--engagement-profile binary`,
+    /// repeatable, or `--engagement-profiles binary,web`), overriding the
+    /// agent's `engagementProfiles`. Omitted or `code` keeps the native
+    /// code-review path.
+    #[arg(
+        long = "engagement-profiles",
+        alias = "engagement-profile",
+        value_name = "ID",
+        value_delimiter = ','
+    )]
+    pub engagement_profiles: Vec<String>,
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -524,6 +535,17 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
 
+    // Engagement profiles: `--engagement-profile(s)` → the agent's
+    // `engagementProfiles` → the `code` default. Resolved before any setup so a
+    // typo'd id fails fast. `None` for the native `code` path (byte-identical
+    // to a run with no engagement support).
+    let engagement = crate::engagement_opts::active_set(
+        &global,
+        project_root.as_deref(),
+        &args.engagement_profiles,
+        &spec.engagement_profiles,
+    )?;
+
     // Resolve config (global + project).
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
@@ -811,7 +833,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // through — bare `rupu run` uses the `LineStreamPrinter`, which
         // renders dispatch children post-hoc from the parent transcript's
         // tool_call/tool_result entries rather than tailing `events.jsonl`.
-        let findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
+        // The engagement (resolved up front) rides on the findings options, so
+        // dispatched sub-agents inherit it through `findings_base`.
+        let findings_base =
+            crate::findings_opts::base_options(&global, &cfg.findings).with_engagement(engagement);
         let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
             global.clone(),
             project_root.clone(),
@@ -1489,6 +1514,29 @@ mod tests {
         assert_eq!(args.findings_profile, Some(Full));
         assert_eq!(args.agent, "sec");
         assert_eq!(launch_args(&["sec"]).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn engagement_profiles_flag_takes_a_list_or_repeats() {
+        let args = launch_args(&["sec", "--engagement-profiles", "binary,web"]).unwrap();
+        assert_eq!(args.engagement_profiles, vec!["binary", "web"]);
+        let args = launch_args(&[
+            "--engagement-profile",
+            "binary",
+            "sec",
+            "--engagement-profile",
+            "web",
+            "--prompt",
+            "p",
+        ])
+        .unwrap();
+        assert_eq!(args.engagement_profiles, vec!["binary", "web"]);
+        assert_eq!(args.agent, "sec");
+        assert_eq!(args.prompt_flag.as_deref(), Some("p"));
+        assert!(launch_args(&["sec"])
+            .unwrap()
+            .engagement_profiles
+            .is_empty());
     }
 
     #[test]
