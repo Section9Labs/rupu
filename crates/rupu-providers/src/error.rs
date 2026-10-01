@@ -120,6 +120,96 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     v.parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// First `max` characters of a response body, for log lines. Char-based so a
+/// multi-byte boundary can never panic.
+fn body_preview(body: &str, max: usize) -> String {
+    body.chars().take(max).collect()
+}
+
+/// Parse a model-listing response body as JSON.
+///
+/// The server answered — so a body that is not the expected JSON is a decode
+/// failure ([`ProviderError::Json`]), not a transport failure
+/// ([`ProviderError::Http`]); callers (and the operator reading the error)
+/// must be able to tell "unreachable" from "reachable but sent garbage". A
+/// short preview of the body is logged so the garbage is visible.
+pub(crate) fn parse_listing_json<T: serde::de::DeserializeOwned>(
+    provider: &str,
+    body: &str,
+) -> Result<T, ProviderError> {
+    serde_json::from_str(body).map_err(|e| {
+        tracing::warn!(
+            provider,
+            error = %e,
+            body_preview = %body_preview(body, 200),
+            "model listing body is not the expected JSON"
+        );
+        ProviderError::Json(format!("{provider} model listing: {e}"))
+    })
+}
+
+/// The error for a model listing that parsed as JSON but has none of the
+/// shapes the provider documents (e.g. no `data` array). Never an empty
+/// catalog: "the server told us it has no models" and "the server told us
+/// something we don't understand" must not look the same. The top-level keys
+/// are logged so a changed wire format is diagnosable.
+pub(crate) fn listing_shape_error(
+    provider: &str,
+    expected: &str,
+    body: &serde_json::Value,
+) -> ProviderError {
+    let keys: Vec<&str> = body
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    tracing::warn!(
+        provider,
+        expected,
+        top_level_keys = ?keys,
+        "model listing has an unexpected shape"
+    );
+    ProviderError::Json(format!(
+        "{provider} model listing has an unexpected shape (expected {expected})"
+    ))
+}
+
+#[cfg(test)]
+mod listing_helper_tests {
+    use super::*;
+
+    #[test]
+    fn parse_listing_json_maps_garbage_to_json_not_http() {
+        let err = parse_listing_json::<serde_json::Value>("acme", "not json").unwrap_err();
+        match err {
+            ProviderError::Json(m) => assert!(m.contains("acme"), "{m}"),
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_listing_json_accepts_valid_json() {
+        let v = parse_listing_json::<serde_json::Value>("acme", r#"{"data":[]}"#).unwrap();
+        assert!(v["data"].is_array());
+    }
+
+    #[test]
+    fn listing_shape_error_is_json_and_names_the_provider_and_expectation() {
+        let err = listing_shape_error("acme", "a `data` array", &serde_json::json!({"weird": 1}));
+        match err {
+            ProviderError::Json(m) => {
+                assert!(m.contains("acme") && m.contains("`data` array"), "{m}")
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_preview_is_char_safe() {
+        let s = "é".repeat(300);
+        assert_eq!(body_preview(&s, 200).chars().count(), 200);
+    }
+}
+
 #[cfg(test)]
 mod structured_variants_tests {
     use super::*;

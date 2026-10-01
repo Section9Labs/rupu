@@ -338,6 +338,10 @@ fn apply_cache_breakpoints(body: &mut serde_json::Value) {
 
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Page size for the `GET /v1/models` catalog listing (spec 2026-09-30 §3).
+/// The API's maximum, so the whole catalog is normally one request.
+const MODELS_PAGE_LIMIT: u32 = 1000;
 // ─────────────────────────────────────────────────────────────────────
 // Claude Code OAuth wire-shape pins
 //
@@ -1393,12 +1397,15 @@ impl Drop for FlowCompletionGuard {
 }
 
 impl AnthropicClient {
-    /// Build and send the authenticated `GET /v1/models` request.
+    /// Build and send the authenticated `GET /v1/models` request, asking for
+    /// `limit` entries per page (`after_id` continues a listing).
     ///
-    /// Shared by [`LlmProvider::list_models`] (which swallows failures into an
-    /// empty vec) and [`LlmProvider::probe`] (which propagates them). Kept as
-    /// one function so the two can never drift apart in auth handling — a
-    /// probe that authenticated differently from the real call would be
+    /// Shared by the catalog listing ([`LlmProvider::list_models`] /
+    /// [`LlmProvider::fetch_models`], via `fetch_all_models`, `limit` =
+    /// [`MODELS_PAGE_LIMIT`]) and [`LlmProvider::probe`] (`limit` = 1: the
+    /// status is the whole answer, so it must not download the catalog).
+    /// Kept as one function so the two can never drift apart in auth handling
+    /// — a probe that authenticated differently from the real call would be
     /// testing the wrong thing.
     ///
     /// Deliberately does NOT go through `apply_auth_headers`: that injects
@@ -1407,6 +1414,7 @@ impl AnthropicClient {
     async fn models_request(
         &self,
         after_id: Option<&str>,
+        limit: u32,
     ) -> Result<reqwest::Response, ProviderError> {
         // Strip the `/v1/messages` (and optional `?beta=true`) suffix off
         // `api_url` to get the API root, then append `/v1/models`.
@@ -1418,7 +1426,8 @@ impl AnthropicClient {
             .trim_end_matches("/v1/messages")
             .trim_end_matches('/');
         let url = format!("{base}/v1/models");
-        let mut query: Vec<(&str, &str)> = vec![("limit", "1000")];
+        let limit = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("limit", limit.as_str())];
         if let Some(a) = after_id {
             query.push(("after_id", a));
         }
@@ -2339,9 +2348,15 @@ impl AnthropicClient {
         }
         let mut out = Vec::new();
         let mut after: Option<String> = None;
-        // Bounded: a server that repeats `last_id` must not loop forever.
+        // Every cursor already requested: a server that cycles (A -> B -> A)
+        // would otherwise re-collect the same models until the page cap.
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Bounded as well: a server that never repeats a cursor must not loop
+        // forever either.
         for page_num in 0..50 {
-            let resp = self.models_request(after.as_deref()).await?;
+            let resp = self
+                .models_request(after.as_deref(), MODELS_PAGE_LIMIT)
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 let message: String = resp
@@ -2356,10 +2371,11 @@ impl AnthropicClient {
                     message,
                 });
             }
-            let page: Page = resp
-                .json()
+            let body = resp
+                .text()
                 .await
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let page: Page = crate::error::parse_listing_json("anthropic", &body)?;
             out.extend(page.data.into_iter().map(|e| crate::model_pool::ModelInfo {
                 id: e.id,
                 provider: ProviderId::Anthropic,
@@ -2381,13 +2397,15 @@ impl AnthropicClient {
                     break;
                 }
                 (true, Some(ref new_last)) => {
-                    // Check for repeated cursor (edge case a)
-                    if after.as_ref() == Some(new_last) {
+                    // Check for a repeated cursor (edge case a): the one just
+                    // requested, or any earlier one (a cycle).
+                    if !seen_cursors.insert(new_last.clone()) {
                         warn!(
-                            "anthropic models pagination stopped: cursor repeated (last_id={:?}); \
-                             returning {} models collected so far",
-                            new_last,
-                            out.len()
+                            provider = "anthropic",
+                            cursor = %new_last,
+                            collected = out.len(),
+                            "models pagination stopped: cursor already seen; \
+                             returning the models collected so far"
                         );
                         break;
                     }
@@ -2637,7 +2655,7 @@ impl crate::provider::LlmProvider for AnthropicClient {
     /// makes — but here the status IS the answer, so nothing is swallowed. A
     /// 2xx means the credential works, even if the account lists no models.
     async fn probe(&self) -> Result<(), ProviderError> {
-        let resp = self.models_request(None).await?;
+        let resp = self.models_request(None, 1).await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -5480,10 +5498,42 @@ mod tests {
             .await
             .expect_err("a 401 must never be reported as healthy");
 
-        assert!(
-            matches!(err, ProviderError::Api { status: 401, .. }),
-            "expected Api{{status:401}}, got {err:?}"
+        match err {
+            ProviderError::Api {
+                status: 401,
+                message,
+            } => assert!(
+                message.contains("authentication_error"),
+                "the response body must land in the message, got {message:?}"
+            ),
+            other => panic!("expected Api{{status:401}}, got {other:?}"),
+        }
+    }
+
+    /// `probe` only needs the status, so it must not download the whole
+    /// catalog: it asks for a single model.
+    #[tokio::test]
+    async fn probe_requests_a_single_model() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("limit", "1")
+                .matches(no_after_id);
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [], "has_more": false }));
+        });
+        let client = AnthropicClient::with_url(
+            "good-key".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         );
+
+        <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
+            .await
+            .expect("probe must succeed against a limit=1 listing");
+        m.assert_hits(1);
     }
 
     /// A 2xx means the credential works — even when the account lists no
@@ -5669,6 +5719,74 @@ mod tests {
         assert_eq!(models.len(), 2); // Two models: one from page1, one from page2
         assert_eq!(models[0].id, "model-1");
         assert_eq!(models[1].id, "model-2");
+    }
+
+    /// An A -> B -> A cursor cycle (not just an immediate repeat) must stop
+    /// before re-requesting a page — otherwise the same models are collected
+    /// again until the 50-page cap.
+    #[tokio::test]
+    async fn fetch_models_stops_on_an_a_b_a_cursor_cycle() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET).path("/v1/models").matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "max_input_tokens": 100, "max_tokens": 10 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "cursor-a");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-2", "max_input_tokens": 200, "max_tokens": 20 }],
+                "has_more": true, "last_id": "cursor-b"
+            }));
+        });
+        let page3 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "cursor-b");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-3", "max_input_tokens": 300, "max_tokens": 30 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert_hits(1);
+        page2.assert_hits(1);
+        page3.assert_hits(1);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["model-1", "model-2", "model-3"], "no duplicates");
+    }
+
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure: it must surface as `Json`, not `Http`.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200).body("not json");
+        });
+        let mut client = AnthropicClient::with_url(
+            "k".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
     }
 
     // ── Reasoning capture (Task 2) ───────────────────────────────────
