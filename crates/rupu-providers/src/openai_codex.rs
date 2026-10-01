@@ -851,9 +851,11 @@ impl OpenAiCodexClient {
                 message,
             });
         }
-        resp.json()
+        let body = resp
+            .text()
             .await
-            .map_err(|e| ProviderError::Http(e.to_string()))
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        crate::error::parse_listing_json("openai_codex", &body)
     }
 }
 
@@ -1001,22 +1003,26 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
                 "{}?client_version=0.50.0",
                 self.api_url.replace("/responses", "/models")
             );
-            return Ok(models_from_listing(
-                &self.get_models_json(&url).await?,
-                false,
-                pid,
-            ));
+            return models_from_listing(&self.get_models_json(&url).await?, false, pid);
         }
         // API key: Codex metadata is only on the ChatGPT backend. Try it
         // first, then fall back to ids-only `/v1/models`.
         let backend = self.chatgpt_models_url.clone();
         match self.get_models_json(&backend).await {
-            Ok(v) => {
-                let models = models_from_listing(&v, true, pid);
-                if !models.is_empty() {
-                    return Ok(models);
-                }
-            }
+            Ok(v) => match models_from_listing(&v, true, pid) {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                // A 200 whose every entry is `supported_in_api: false`
+                // (or that lists nothing): nothing usable with an API key.
+                Ok(_) => tracing::debug!(
+                    "codex model catalog has no API-usable models with an API key; \
+                     falling back to /v1/models"
+                ),
+                Err(e) => tracing::debug!(
+                    error = %e,
+                    "codex model catalog has an unrecognized shape with an API key; \
+                     falling back to /v1/models"
+                ),
+            },
             Err(e) => {
                 tracing::debug!(error = %e, "codex model catalog unavailable with an API key; falling back to /v1/models")
             }
@@ -1026,7 +1032,7 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
             .trim_end_matches("/v1/responses")
             .trim_end_matches('/');
         let v = self.get_models_json(&format!("{base}/v1/models")).await?;
-        Ok(models_from_listing(&v, false, pid))
+        models_from_listing(&v, false, pid)
     }
 }
 
@@ -1052,25 +1058,8 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
 /// Free function so the unit tests below can exercise it directly
 /// without spinning up an HTTP mock.
 pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
-    fn id_from_object(v: &serde_json::Value) -> Option<String> {
-        for key in ["id", "slug", "display_name", "name"] {
-            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
-            }
-        }
-        None
-    }
-
     fn entries_from_array(arr: &[serde_json::Value]) -> Vec<String> {
-        arr.iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Object(_) => id_from_object(v),
-                _ => None,
-            })
-            .collect()
+        arr.iter().filter_map(listing_entry_id).collect()
     }
 
     if let serde_json::Value::Array(arr) = parsed {
@@ -1086,6 +1075,21 @@ pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
         return entries_from_array(arr);
     }
     Vec::new()
+}
+
+/// The model id of one listing entry: a plain string is the id itself; an
+/// object probes `id`, `slug`, `display_name`, then `name` (first non-empty).
+/// The one order every listing path uses, so `list_models` and
+/// `fetch_models` can never name the same model differently.
+fn listing_entry_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(_) => ["id", "slug", "display_name", "name"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 /// A Codex `/codex/models` entry's usable input limit (spec §3):
@@ -1106,36 +1110,49 @@ pub(crate) fn codex_input_limit(entry: &serde_json::Value) -> u32 {
     u32::try_from(window.saturating_mul(pct) / 100).unwrap_or(u32::MAX)
 }
 
-/// Model listing → `ModelInfo`s. The Codex `models` array carries limits;
-/// the public `/v1/models` `data` array carries ids only (limits 0). In
+/// Model listing → `ModelInfo`s. The Codex `models` array carries limits
+/// (`codex_input_limit`); the public `/v1/models` `data` array, a bare
+/// top-level array, and plain string entries carry ids only (limits 0). In
 /// API-key mode, entries with `supported_in_api: false` are dropped.
+///
+/// A body with none of those arrays is an `Err` — never an empty catalog:
+/// "the server listed no models" (`{"models": []}`) and "the server sent
+/// something this parser does not understand" must not look alike. Of the
+/// recognized arrays the first non-empty one wins (top-level, `models`,
+/// `data`); if all are empty the catalog is genuinely empty.
 pub(crate) fn models_from_listing(
     parsed: &serde_json::Value,
     api_key_mode: bool,
     provider: crate::provider_id::ProviderId,
-) -> Vec<crate::model_pool::ModelInfo> {
-    if let Some(arr) = parsed.get("models").and_then(|v| v.as_array()) {
-        return arr
-            .iter()
-            .filter(|e| {
-                !(api_key_mode
-                    && e.get("supported_in_api").and_then(|v| v.as_bool()) == Some(false))
-            })
-            .filter_map(|e| {
-                let id = ["slug", "id", "display_name", "name"]
-                    .iter()
-                    .find_map(|k| e.get(*k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))?
-                    .to_string();
-                let mut mi = make_model_info(id, provider);
-                mi.context_window = codex_input_limit(e);
-                Some(mi)
-            })
-            .collect();
-    }
-    extract_model_ids(parsed)
-        .into_iter()
-        .map(|id| make_model_info(id, provider))
-        .collect()
+) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+    let candidates = [
+        parsed.as_array(),
+        parsed.get("models").and_then(|v| v.as_array()),
+        parsed.get("data").and_then(|v| v.as_array()),
+    ];
+    let Some(arr) = candidates
+        .iter()
+        .flatten()
+        .find(|a| !a.is_empty())
+        .or_else(|| candidates.iter().flatten().next())
+    else {
+        return Err(crate::error::listing_shape_error(
+            "openai_codex",
+            "a `models` array, a `data` array, or a top-level array",
+            parsed,
+        ));
+    };
+    Ok(arr
+        .iter()
+        .filter(|e| {
+            !(api_key_mode && e.get("supported_in_api").and_then(|v| v.as_bool()) == Some(false))
+        })
+        .filter_map(|e| {
+            let mut mi = make_model_info(listing_entry_id(e)?, provider);
+            mi.context_window = codex_input_limit(e);
+            Some(mi)
+        })
+        .collect())
 }
 
 // ── model_pool helper ────────────────────────────────────────────────
@@ -2915,6 +2932,30 @@ mod reasoning_capture_tests {
         );
     }
 
+    /// The `gpt-5` gate: those models reject `max_output_tokens`, so even an
+    /// explicit pin must not reach the wire.
+    #[test]
+    fn gpt5_omits_max_output_tokens_even_when_a_cap_is_pinned() {
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        for model in ["gpt-5", "gpt-5.4", "gpt-5-mini"] {
+            let mut r = request_with(vec![Message::user("hi")]);
+            r.model = model.into();
+            r.max_tokens = Some(900);
+            assert!(
+                client
+                    .build_request_body(&r, false)
+                    .get("max_output_tokens")
+                    .is_none(),
+                "{model} must not send max_output_tokens"
+            );
+        }
+    }
+
     #[test]
     fn assistant_turn_replays_stored_output_items_verbatim() {
         let request = request_with(vec![
@@ -3300,8 +3341,8 @@ mod fetch_models_tests {
             { "slug": "m-api", "context_window": 1000, "supported_in_api": true },
             { "slug": "m-app", "context_window": 1000, "supported_in_api": false }
         ]});
-        let ids = |ms: Vec<crate::model_pool::ModelInfo>| {
-            ms.into_iter().map(|m| m.id).collect::<Vec<_>>()
+        let ids = |ms: Result<Vec<crate::model_pool::ModelInfo>, ProviderError>| {
+            ms.unwrap().into_iter().map(|m| m.id).collect::<Vec<_>>()
         };
         assert_eq!(
             ids(models_from_listing(&v, true, ProviderId::OpenaiCodex)),
@@ -3419,10 +3460,308 @@ mod fetch_models_tests {
         .unwrap();
         client.api_url = format!("{}/v1/responses", server.url(""));
         client.chatgpt_models_url = server.url("/backend-api/codex/models");
+        let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        // The public `/v1/models` failure is the one reported.
         assert!(
-            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
-                .await
-                .is_err()
+            matches!(err, ProviderError::Api { status: 500, .. }),
+            "{err:?}"
         );
+    }
+
+    // ── review fixes: shapes, decode errors, fallback, production URL ─────
+
+    /// The query string the production catalog URL carries — tests build
+    /// their mock URLs from it so they track the real constant.
+    fn prod_catalog_query() -> &'static str {
+        CODEX_MODELS_URL
+            .split_once('?')
+            .expect("the production catalog URL carries a query")
+            .1
+    }
+
+    fn oauth_backend_client(server: &httpmock::MockServer) -> OpenAiCodexClient {
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "t".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        client.account_id = "acct-1".into();
+        client
+    }
+
+    fn api_key_client(server: &httpmock::MockServer) -> OpenAiCodexClient {
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = format!(
+            "{}?{}",
+            server.url("/backend-api/codex/models"),
+            prod_catalog_query()
+        );
+        client
+    }
+
+    #[test]
+    fn production_catalog_url_and_default_carry_client_version() {
+        assert_eq!(
+            CODEX_MODELS_URL,
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0"
+        );
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert_eq!(client.chatgpt_models_url, CODEX_MODELS_URL);
+    }
+
+    #[tokio::test]
+    async fn catalog_requests_carry_client_version_on_both_paths() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        // ChatGPT OAuth path: URL derived from `api_url`.
+        let oauth = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .query_param("client_version", "0.50.0");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [{ "slug": "gpt-q", "context_window": 1000 }] }),
+            );
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        oauth.assert_hits(1);
+        assert_eq!(models[0].id, "gpt-q");
+
+        // API-key path: the `chatgpt_models_url` built from the production
+        // constant's query.
+        let server = MockServer::start();
+        let backend = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .query_param("client_version", "0.50.0");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [{ "slug": "gpt-r", "context_window": 1000 }] }),
+            );
+        });
+        let mut client = api_key_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        backend.assert_hits(1);
+        assert_eq!(models[0].id, "gpt-r");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_models_array_of_strings_yields_ids_with_zero_limits() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "models": ["gpt-s-1", "gpt-s-2"] }));
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-s-1", "gpt-s-2"]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.context_window == 0 && m.max_output_tokens == 0));
+    }
+
+    /// A 200 that is valid JSON but has no model list at all must be an
+    /// error — never `Ok(vec![])`, which reads as "this account has no
+    /// models".
+    #[tokio::test]
+    async fn fetch_models_unrecognized_shape_is_an_error_not_an_empty_catalog() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "weird": 1 }));
+        });
+        let mut client = oauth_backend_client(&server);
+        let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// A genuinely empty listing is still an empty catalog (the server said
+    /// so), distinct from the unrecognized shape above.
+    #[tokio::test]
+    async fn fetch_models_empty_models_array_is_an_empty_catalog() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "models": [] }));
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert!(models.is_empty());
+    }
+
+    /// `id` wins over `slug` — the same order `extract_model_ids` uses.
+    #[tokio::test]
+    async fn fetch_models_probes_id_before_slug() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "id": "the-id", "slug": "the-slug", "context_window": 1000 }
+            ]}));
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "the-id");
+        assert_eq!(models[0].context_window, 950);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200).body("not json");
+        });
+        let mut client = oauth_backend_client(&server);
+        let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// The catalog answers 200 but every entry is `supported_in_api: false`:
+    /// nothing usable with an API key, so fall back to the public listing.
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_when_every_catalog_entry_is_filtered() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let backend = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "slug": "app-only-1", "context_window": 1000, "supported_in_api": false },
+                { "slug": "app-only-2", "context_window": 1000, "supported_in_api": false }
+            ]}));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = api_key_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        backend.assert_hits(1);
+        public.assert_hits(1);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-plain"]
+        );
+        assert_eq!(models[0].context_window, 0);
+    }
+
+    /// An unrecognized catalog shape with an API key also falls back (the
+    /// error is logged at debug), rather than surfacing or returning empty.
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_when_the_catalog_shape_is_unrecognized() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "weird": 1 }));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = api_key_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        public.assert_hits(1);
+        assert_eq!(models[0].id, "gpt-plain");
+    }
+
+    #[test]
+    fn listing_shapes_pure() {
+        let pid = ProviderId::OpenaiCodex;
+        let ids = |v: serde_json::Value, api: bool| {
+            models_from_listing(&v, api, pid).map(|ms| {
+                ms.into_iter()
+                    .map(|m| (m.id, m.context_window))
+                    .collect::<Vec<_>>()
+            })
+        };
+        // models: strings, limits 0
+        assert_eq!(
+            ids(serde_json::json!({ "models": ["a", "b"] }), false).unwrap(),
+            [("a".to_string(), 0), ("b".to_string(), 0)]
+        );
+        // bare top-level array of strings and of objects
+        assert_eq!(
+            ids(serde_json::json!(["a"]), false).unwrap(),
+            [("a".to_string(), 0)]
+        );
+        assert_eq!(
+            ids(
+                serde_json::json!([{ "id": "o", "context_window": 1000 }]),
+                false
+            )
+            .unwrap(),
+            [("o".to_string(), 950)]
+        );
+        // public listing: ids only
+        assert_eq!(
+            ids(serde_json::json!({ "data": [{ "id": "p" }] }), true).unwrap(),
+            [("p".to_string(), 0)]
+        );
+        // empty-but-recognized is an empty catalog; unrecognized is an error
+        assert!(ids(serde_json::json!({ "models": [] }), false)
+            .unwrap()
+            .is_empty());
+        assert!(ids(serde_json::json!({ "data": [] }), false)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            ids(serde_json::json!({ "weird": 1 }), false),
+            Err(ProviderError::Json(_))
+        ));
+        assert!(matches!(
+            ids(serde_json::json!("a string"), false),
+            Err(ProviderError::Json(_))
+        ));
+        assert!(matches!(
+            ids(serde_json::json!({ "models": "nope", "data": 3 }), false),
+            Err(ProviderError::Json(_))
+        ));
     }
 }
