@@ -1,3929 +1,1964 @@
-//! Live workflow run view — pure state + renderers.
+//! The live `workflow run` view — the tick loop behind the in-place terminal
+//! surface (spec 2026-09-30).
 //!
-//! `LiveRunState` accumulates step / unit / panel status, run totals,
-//! and the active agent's rolling activity feed from two event streams:
-//!   - workflow step events ([`rupu_orchestrator::executor::Event`],
-//!     applied via [`LiveRunState::apply`]) drive the dashboard + graph,
-//!   - the active step's transcript events (pushed via
-//!     [`LiveRunState::push_activity`]) drive the focus feed.
+//! [`run_live_view`] drives, every 100 ms: the run model ([`RunView`], folded
+//! from `events.jsonl` plus the few things only `run.json` knows), the drill
+//! navigation ([`NavState`]), the bounded transcript firehose
+//! ([`TranscriptMux`]), the adaptive layout ([`live_layout`]) and the diff
+//! renderer ([`LiveRenderer`]). Keys are decoded in one place
+//! ([`decode_key`]) and an approval gate is *modal*: while one is focused
+//! (`NavState::focused_gate` — the same predicate the footer legend uses)
+//! `a` approves, `r` rejects and `v` shows what the run found.
 //!
-//! The three zone renderers ([`render_dashboard`], [`render_graph`],
-//! [`render_focus`]) and the combined [`render_view`] are PURE — they
-//! take a state + dimensions and return ANSI-colored `Vec<String>`. They
-//! are the unit-tested core. The live loop (cursor control, the render
-//! tick) lives in `cmd/workflow.rs` and is validated by running it.
+//! The terminal loop itself is validated by running it. Everything it
+//! decides — key decoding, gate focus, which transcript to pin, when to leave,
+//! what a gate decision does to the run store — lives in small pure functions
+//! below, and is unit-tested.
+
+use std::collections::HashMap;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use rupu_app_canvas::NodeStatus;
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
 use rupu_orchestrator::executor::Event as WfEvent;
-use rupu_orchestrator::{RunStatus, StepKind, Workflow};
+use rupu_orchestrator::{
+    ApprovalDecision, ApprovalError, RunRecord, RunStatus, RunStore, Step, StepKind,
+    StepResultRecord, TimeoutAction, Workflow,
+};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 
-use crate::output::fmt::{format_cost_compact, format_token_compact};
-use crate::output::palette::{self, BRAND, COMPLETE, DIM, FAILED, RUNNING};
-use crate::output::printer::visible_len;
+use crate::output::jsonl_reader::WfEventTailer;
+use crate::output::live_view::gate::{gate_detail_lines, GateFinding};
+use crate::output::live_view::layout::{live_layout, printable};
+use crate::output::live_view::mux::TranscriptMux;
+use crate::output::live_view::nav::{Depth, NavAction, NavKey, NavState};
+use crate::output::live_view::render::{AltScreen, LiveRenderer};
+use crate::output::live_view::row::Line;
+use crate::output::run_model::{GateView, RunView};
 
-/// Braille spinner frames cycled by the render tick.
-const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Repaint cadence.
+const TICK: Duration = Duration::from_millis(100);
+/// How often the slow, file-reading parts of the view (usage fold,
+/// `step_results.jsonl`) are re-read.
+const SLOW_REFRESH_EVERY: Duration = Duration::from_secs(1);
+/// How long a one-line notice (pause requested, gate decided, …) stays up.
+const NOTICE_TTL: Duration = Duration::from_secs(8);
+/// Columns left unwritten at the right edge. A row that fills the last column
+/// leaves the terminal in its deferred-wrap state, and the renderer's
+/// clear-to-end-of-line then erases that last glyph on common emulators.
+const EDGE_GUARD: usize = 1;
+/// Tails the mux gets when the fd budget cannot be read.
+const DEFAULT_TAILS: usize = 16;
+/// Reason recorded when the operator rejects a gate from the view (the CLI's
+/// `workflow reject` default).
+const REJECT_REASON: &str = "rejected by operator";
 
-/// Cap on the number of activity lines retained for the focus feed.
-/// The renderer windows to the available height; this just bounds memory.
-const ACTIVITY_CAP: usize = 200;
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
 
-/// Return the spinner glyph for `tick`, cycling the braille frames.
-pub fn spinner_frame(tick: u64) -> char {
-    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
-}
-
-/// Map a [`NodeStatus`] to its live-view glyph. Distinct from the
-/// canvas `NodeStatus::glyph` so pending/never-reached uses `◌`.
-fn node_glyph(status: NodeStatus) -> char {
-    match status {
-        NodeStatus::Waiting => '○',
-        NodeStatus::Active | NodeStatus::Working => '◐',
-        NodeStatus::Complete => '✓',
-        NodeStatus::Failed => '✗',
-        NodeStatus::SoftFailed => '✗',
-        NodeStatus::Awaiting => '⏸',
-        NodeStatus::Retrying => '↻',
-        NodeStatus::Skipped => '◌',
-    }
-}
-
-fn node_color(status: NodeStatus) -> owo_colors::Rgb {
-    match status {
-        NodeStatus::Waiting | NodeStatus::Skipped => DIM,
-        NodeStatus::Active | NodeStatus::Working => RUNNING,
-        NodeStatus::Complete => COMPLETE,
-        NodeStatus::Failed | NodeStatus::SoftFailed => FAILED,
-        NodeStatus::Awaiting => palette::AWAITING,
-        NodeStatus::Retrying => palette::RETRYING,
-    }
-}
-
-/// One unit (a `for_each` item or `parallel` sub-step) of a fan-out step.
-#[derive(Debug, Clone)]
-pub struct UnitState {
-    pub key: String,
-    pub status: NodeStatus,
-    pub tokens: u64,
-    pub elapsed_secs: u64,
-    /// Transcript path set by this unit's `UnitStarted` event. Lets a
-    /// pinned selection (Task 2) resolve a fan-out unit's transcript
-    /// directly from `LiveRunState` rather than the live loop's
-    /// `active.active_unit_transcript`, which only ever tracks the
-    /// most-recently-started unit (auto-follow). `None` until the unit
-    /// has started.
-    pub transcript_path: Option<std::path::PathBuf>,
-    /// Correlation key for a dispatched sub-agent child (Part B, Task 2):
-    /// `Some(sub_run_id)` from `DispatchStarted`/`DispatchCompleted`.
-    /// `for_each`/`parallel` units are index-keyed and always leave this
-    /// `None` — only `apply`'s `Dispatch*` arms set it, to find the right
-    /// slot on `DispatchCompleted` without relying on index/order.
-    pub sub_run_id: Option<String>,
-    /// Codename leaf source (`crew/role#n`) from `UnitStarted` /
-    /// `DispatchStarted` / `AgentStarted`. `None` on legacy event logs.
-    pub codename: Option<String>,
-    /// Provider / model from `AgentStarted` / `DispatchStarted`.
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    /// The fan-out unit's own index (`UnitStarted`/`UnitCompleted.index`,
-    /// the ledger's `unit_index`) — its identity. `None` for a
-    /// dispatch-child slot. Dispatch children are appended to the same
-    /// vec, so a unit's vec position is NOT its index: every lookup by
-    /// unit index goes through this field ([`fanout_unit_mut`]).
-    pub index: Option<usize>,
-}
-
-/// One line in the active agent's rolling activity feed.
-#[derive(Debug, Clone)]
-pub struct ActivityLine {
-    pub ts: DateTime<Utc>,
-    pub kind: ActivityKind,
-    pub text: String,
-}
-
-/// The visual class of an activity line — picks the leading glyph.
+/// What a keypress asks the loop to do. Navigation goes through
+/// [`NavState::apply`]; the other three are the modal gate keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityKind {
-    ToolCall,
-    Finding,
-    Coverage,
-    Text,
-    /// A `tool_audit` line recording a DENIED catalog call (step
-    /// `actions:` narrowing or the run's permission mode). Without this,
-    /// `workflow run`'s live focus feed was the only one of the 6
-    /// tool_audit-consuming surfaces that never showed a blocked call —
-    /// `map_transcript_event` returned `None` for every `ToolAudit` event.
-    Blocked,
+enum KeyAction {
+    Nav(NavKey),
+    Approve,
+    Reject,
+    ToggleDetails,
 }
 
-impl ActivityKind {
-    fn glyph(self) -> char {
-        match self {
-            ActivityKind::ToolCall => '▸',
-            ActivityKind::Finding => '⚑',
-            ActivityKind::Coverage => '✓',
-            ActivityKind::Text => '·',
-            ActivityKind::Blocked => '✕',
-        }
+/// Decode one key press. `gate_focused` is `NavState::focused_gate(..)
+/// .is_some()` — the SAME predicate the footer legend uses, so the keys the
+/// legend advertises are exactly the keys that act.
+///
+/// A gate is modal: `a` approves, `r` rejects, `v` / `enter` show details.
+/// With none focused, `a` is auto-follow, `enter` drills in, and `r` / `v` do
+/// nothing. `q` and Ctrl-C quit (raw mode turns the tty's SIGINT off, so
+/// Ctrl-C arrives as a key and must be handled here); only `Esc` pauses. A
+/// control- or alt-modified letter is never a plain command — Ctrl-A must not
+/// approve a gate.
+fn decode_key(code: KeyCode, mods: KeyModifiers, gate_focused: bool) -> Option<KeyAction> {
+    if mods.contains(KeyModifiers::CONTROL) {
+        return (code == KeyCode::Char('c')).then_some(KeyAction::Nav(NavKey::Quit));
     }
-
-    fn color(self) -> owo_colors::Rgb {
-        match self {
-            ActivityKind::ToolCall => palette::TOOL_ARROW,
-            ActivityKind::Finding => palette::SEV_HIGH,
-            ActivityKind::Coverage => COMPLETE,
-            ActivityKind::Text => DIM,
-            ActivityKind::Blocked => palette::FAILED,
-        }
+    if mods.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char(_)) {
+        return None;
     }
-}
-
-/// Per-step accumulated state.
-#[derive(Debug, Clone)]
-pub struct StepState {
-    pub id: String,
-    pub kind: StepKind,
-    pub agent: Option<String>,
-    pub status: NodeStatus,
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub elapsed_secs: u64,
-    /// Fan-out (`for_each` / `parallel`) units. Empty for linear/panel.
-    pub units: Vec<UnitState>,
-    /// `for_each`/`parallel` completed-unit count summary (done, total).
-    pub fanout_total: Option<usize>,
-    /// Panel iteration counters: (current_iteration, max_iterations).
-    pub panel_iter: Option<(u32, u32)>,
-    /// Panel findings observed so far.
-    pub panel_findings: usize,
-    /// Codename of the step's singleton member (`StepStarted` / `AgentStarted`).
-    pub codename: Option<String>,
-    /// Provider / model from `AgentStarted`.
-    pub provider: Option<String>,
-    pub model: Option<String>,
-}
-
-impl StepState {
-    /// The rows the `done/total` summary counts. A real fan-out's rows are
-    /// its indexed units — dispatch-child slots appended to the same vec are
-    /// not units (`fanout_total` counts indexed rows only). A step with no
-    /// indexed rows at all — a `parallel` step, which emits no unit events,
-    /// or a plain step whose agent dispatches — counts every row.
-    fn counted_units(&self) -> impl Iterator<Item = &UnitState> {
-        let indexed = self.units.iter().any(|u| u.index.is_some());
-        self.units
-            .iter()
-            .filter(move |u| !indexed || u.index.is_some())
-    }
-
-    fn done_units(&self) -> usize {
-        self.counted_units()
-            .filter(|u| matches!(u.status, NodeStatus::Complete | NodeStatus::Failed))
-            .count()
-    }
-
-    fn total_units(&self) -> usize {
-        self.fanout_total
-            .unwrap_or_else(|| self.counted_units().count())
+    let nav = |key: NavKey| Some(KeyAction::Nav(key));
+    match code {
+        KeyCode::Char('a') if gate_focused => Some(KeyAction::Approve),
+        KeyCode::Char('r') if gate_focused => Some(KeyAction::Reject),
+        KeyCode::Char('v') | KeyCode::Enter if gate_focused => Some(KeyAction::ToggleDetails),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => nav(NavKey::Up),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => nav(NavKey::Down),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => nav(NavKey::In),
+        KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => nav(NavKey::Out),
+        KeyCode::Char('a') => nav(NavKey::Follow),
+        KeyCode::Char('/') => nav(NavKey::Filter),
+        KeyCode::Char('q') => nav(NavKey::Quit),
+        KeyCode::Esc => nav(NavKey::Pause),
+        _ => None,
     }
 }
 
-/// The currently-active focus: which step + (optional) unit is running,
-/// plus the rolling transcript feed and the last-event timestamp used by
-/// the heartbeat.
-#[derive(Debug, Clone, Default)]
-pub struct ActiveFocus {
-    pub step_id: Option<String>,
-    pub unit_key: Option<String>,
-    pub agent: Option<String>,
-    pub codename: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    /// Transcript of the active fan-out UNIT (set by `UnitStarted`). The
-    /// live loop tails this in preference to `run.json`'s active-step
-    /// transcript, which is null during a fan-out. `None` for linear
-    /// steps (the loop falls back to the active-step transcript).
-    pub active_unit_transcript: Option<std::path::PathBuf>,
-    pub feed: Vec<ActivityLine>,
-    pub last_event_at: Option<DateTime<Utc>>,
+// ---------------------------------------------------------------------------
+// Leaving
+// ---------------------------------------------------------------------------
+
+/// A run is finished for the view's purposes when it is terminal or
+/// cooperatively paused (a paused run is resumable, so `is_terminal()` alone
+/// would spin forever on it: the process driving the view stops with it).
+fn finished(status: RunStatus) -> bool {
+    status.is_terminal() || status == RunStatus::Paused
 }
 
-/// A navigable node in the live view's node-selection scope (Q1): the
-/// currently active step, or one of that step's fan-out units, keyed by
-/// index. The active step id is implicit — carried on
-/// [`ActiveFocus::step_id`] rather than duplicated here — so `NodeRef`
-/// only distinguishes "the step itself" from "one of its children".
-/// Becomes stale the instant the active step changes, which is why
-/// `apply` clears `selected` on every `StepStarted` (Q4).
+/// The generation whose terminal / paused status was already in the log when
+/// the view attached — a *previous* generation's outcome, replayed. `None`
+/// for a run that had not finished (every fresh run).
+fn stale_terminal_gen(replayed: &RunView) -> Option<u64> {
+    finished(replayed.status).then_some(replayed.generation)
+}
+
+/// Whether the loop should leave on this tick. `events.jsonl` is append-only
+/// across resumes, so on attach the model replays the previous generation's
+/// `RunFailed` / `RunPaused` before the resumed run's `RunStarted` is written;
+/// exiting on that would tear the view down the instant it opened. Each
+/// `RunStarted` bumps `generation`, so a finished status only counts once it
+/// belongs to a generation other than the stale one.
+fn should_exit(status: RunStatus, generation: u64, stale: Option<u64>) -> bool {
+    finished(status) && stale != Some(generation)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeRef {
-    /// The active step itself (the whole linear step, or the fan-out
-    /// step's own row rather than one of its units).
-    Step,
-    /// One fan-out unit of the active step, by index into `StepState::units`.
-    Unit { index: usize },
+enum Exit {
+    /// `q` / Ctrl-C: leave the viewer; the run keeps going.
+    Quit,
+    /// The run finished (current generation).
+    RunFinished,
 }
 
-/// Pure, accumulating state for the live run view.
-#[derive(Debug, Clone)]
-pub struct LiveRunState {
-    pub workflow_name: String,
-    pub run_id: String,
-    pub status: RunStatus,
-    pub started_at: Option<DateTime<Utc>>,
-    pub finished_at: Option<DateTime<Utc>>,
-    /// Steps in declared order; index aligns with the workflow's steps.
-    pub steps: Vec<StepState>,
-    /// Run totals.
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub cost: Option<f64>,
-    pub findings_count: Option<usize>,
-    pub coverage_pct: Option<u8>,
-    pub active: ActiveFocus,
-    /// Operator-driven node selection within the active step's navigable
-    /// set (Task 1: state + nav only — Task 2 wires this to focus/render).
-    /// `None` means auto-follow (today's default behavior, unchanged).
-    pub selected: Option<NodeRef>,
-    /// Run crew name (`jade-reef`) for the dashboard title; `None` until known.
-    pub codename: Option<String>,
+// ---------------------------------------------------------------------------
+// Transcripts
+// ---------------------------------------------------------------------------
+
+/// Where each unit / sub-agent's transcript lives, learned from the events
+/// that announce them. `UnitView` / `DispatchView` carry no path, so this is
+/// how a drilled selection resolves to a file to pin.
+///
+/// A path is stored in the exact spelling its event used and handed to the
+/// mux in that same spelling, so `observe` and `pin` can never disagree
+/// (canonicalising would not do: a transcript that does not exist yet cannot
+/// be canonicalised).
+#[derive(Debug, Default)]
+struct TranscriptIndex {
+    units: HashMap<(String, usize), PathBuf>,
+    dispatches: HashMap<String, PathBuf>,
 }
 
-impl LiveRunState {
-    /// Build the initial state from the parsed workflow + a run id. Every
-    /// step starts `Waiting`; the first `StepStarted` event activates one.
-    pub fn from_workflow(workflow: &Workflow, run_id: impl Into<String>) -> Self {
-        let steps = workflow
-            .steps
-            .iter()
-            .map(|step| {
-                let kind = step_kind(step);
-                StepState {
-                    id: step.id.clone(),
-                    kind,
-                    agent: step.agent.clone(),
-                    status: NodeStatus::Waiting,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    elapsed_secs: 0,
-                    units: Vec::new(),
-                    fanout_total: None,
-                    panel_iter: step
-                        .panel
-                        .as_ref()
-                        .and_then(|p| p.gate.as_ref().map(|g| (0, g.max_iterations))),
-                    panel_findings: 0,
-                    codename: None,
-                    provider: None,
-                    model: None,
-                }
-            })
-            .collect();
-        Self {
-            workflow_name: workflow.name.clone(),
-            run_id: run_id.into(),
-            status: RunStatus::Running,
-            started_at: None,
-            finished_at: None,
-            steps,
-            tokens_in: 0,
-            tokens_out: 0,
-            cost: None,
-            findings_count: None,
-            coverage_pct: None,
-            active: ActiveFocus::default(),
-            selected: None,
-            codename: None,
-        }
-    }
-
-    fn step_mut(&mut self, step_id: &str) -> Option<&mut StepState> {
-        self.steps.iter_mut().find(|s| s.id == step_id)
-    }
-
-    /// Number of completed steps (for the progress bar).
-    pub fn completed_steps(&self) -> usize {
-        self.steps
-            .iter()
-            .filter(|s| matches!(s.status, NodeStatus::Complete | NodeStatus::Skipped))
-            .count()
-    }
-
-    /// Status lookup for the graph renderer, keyed by step id.
-    pub fn status_for(&self, step_id: &str) -> NodeStatus {
-        self.steps
-            .iter()
-            .find(|s| s.id == step_id)
-            .map(|s| s.status)
-            .unwrap_or(NodeStatus::Waiting)
-    }
-
-    /// The ordered set of nodes the operator can navigate between (Q1
-    /// scope): the active step itself, followed by that step's fan-out
-    /// units in index order. Empty when no step is active yet. Only the
-    /// active step's own children are navigable — completed steps and
-    /// other steps' units are out of scope for this task.
-    fn navigable_nodes(&self) -> Vec<NodeRef> {
-        let Some(step_id) = self.active.step_id.as_deref() else {
-            return Vec::new();
-        };
-        let mut nodes = vec![NodeRef::Step];
-        if let Some(step) = self.steps.iter().find(|s| s.id == step_id) {
-            nodes.extend((0..step.units.len()).map(|index| NodeRef::Unit { index }));
-        }
-        nodes
-    }
-
-    /// Move the selection forward over [`Self::navigable_nodes`], wrapping
-    /// past the last node to the first (Q2). From `None`, the first press
-    /// seeds the selection to the first node rather than advancing past
-    /// it. A no-op when there is nothing to navigate (no active step).
-    pub fn select_next(&mut self) {
-        let nodes = self.navigable_nodes();
-        if nodes.is_empty() {
-            return;
-        }
-        self.selected = Some(match self.selected {
-            None => nodes[0],
-            Some(current) => {
-                let pos = nodes.iter().position(|n| *n == current).unwrap_or(0);
-                nodes[(pos + 1) % nodes.len()]
-            }
-        });
-    }
-
-    /// Move the selection backward over [`Self::navigable_nodes`],
-    /// wrapping before the first node to the last (Q2). Seeds from `None`
-    /// exactly like [`Self::select_next`].
-    pub fn select_prev(&mut self) {
-        let nodes = self.navigable_nodes();
-        if nodes.is_empty() {
-            return;
-        }
-        self.selected = Some(match self.selected {
-            None => nodes[0],
-            Some(current) => {
-                let pos = nodes.iter().position(|n| *n == current).unwrap_or(0);
-                let prev = if pos == 0 { nodes.len() - 1 } else { pos - 1 };
-                nodes[prev]
-            }
-        });
-    }
-
-    /// Release the operator's selection back to auto-follow (the
-    /// pre-selection default: the view tracks whichever unit most
-    /// recently started, per `UnitStarted`'s auto-focus assignment).
-    pub fn clear_selection(&mut self) {
-        self.selected = None;
-    }
-
-    /// Resolve the transcript path that should drive the focus feed this
-    /// tick.
-    ///
-    /// When the operator has pinned a node (`selected` is `Some`), that
-    /// node's own transcript wins over auto-follow: a [`NodeRef::Unit`]
-    /// resolves to that unit's `transcript_path` (set by its
-    /// `UnitStarted`); a [`NodeRef::Step`] resolves to
-    /// `active_step_transcript_path` (the caller's `run.json` read — the
-    /// same source linear-step auto-follow uses). A unit's
-    /// `transcript_path` is never cleared once set (`UnitCompleted`
-    /// doesn't touch it), so a pin on a unit that finishes keeps
-    /// resolving to the same path — the pin doesn't get yanked away mid-
-    /// review. Only a nav key (`select_next`/`select_prev`) or releasing
-    /// the pin (`clear_selection`, or the auto-clear on `StepStarted`)
-    /// changes the target.
-    ///
-    /// `selected: None` reproduces today's auto-follow precedence
-    /// exactly: the active fan-out unit's transcript
-    /// (`active.active_unit_transcript`, from the most recently started
-    /// `UnitStarted`) wins, falling back to `active_step_transcript_path`
-    /// for a linear step.
-    pub fn focused_transcript(
-        &self,
-        active_step_transcript_path: Option<std::path::PathBuf>,
-    ) -> Option<std::path::PathBuf> {
-        match self.selected {
-            Some(NodeRef::Unit { index }) => self
-                .active
-                .step_id
-                .as_deref()
-                .and_then(|step_id| self.steps.iter().find(|s| s.id == step_id))
-                .and_then(|step| step.units.get(index))
-                .and_then(|unit| unit.transcript_path.clone()),
-            Some(NodeRef::Step) => active_step_transcript_path,
-            None => self
-                .active
-                .active_unit_transcript
-                .clone()
-                .or(active_step_transcript_path),
-        }
-    }
-
-    /// Apply a workflow step event, mutating step / run status.
-    pub fn apply(&mut self, event: &WfEvent) {
-        match event {
-            WfEvent::RunStarted { started_at, .. } => {
-                self.started_at = Some(*started_at);
-                self.status = RunStatus::Running;
-            }
-            WfEvent::StepStarted {
-                step_id,
-                agent,
-                codename,
-                ..
-            } => {
-                self.active.step_id = Some(step_id.clone());
-                self.active.unit_key = None;
-                self.active.agent = agent.clone();
-                self.active.codename = codename.clone();
-                self.active.provider = None;
-                self.active.model = None;
-                self.active.feed.clear();
-                self.active.last_event_at = None;
-                // A new active step means the old concurrency context (and
-                // any selection scoped to it) is gone (Q4). Auto-follow
-                // resumes; `UnitStarted`'s auto-focus assignment below is
-                // unaffected — it only applies when `selected` is `None`.
-                self.clear_selection();
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = NodeStatus::Active;
-                    if agent.is_some() {
-                        step.agent = agent.clone();
-                    }
-                    if codename.is_some() {
-                        step.codename = codename.clone();
-                    }
-                }
-            }
-            WfEvent::StepWorking { step_id, .. } => {
-                if let Some(step) = self.step_mut(step_id) {
-                    if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
-                        step.status = NodeStatus::Working;
-                    }
-                }
-            }
-            WfEvent::AgentStarted {
-                step_id,
-                unit_index,
-                codename,
-                agent,
-                provider,
-                model,
-                ..
-            } => {
-                let on_active_step = self.active.step_id.as_deref() == Some(step_id.as_str());
-                let active_unit_key = self.active.unit_key.clone();
-                let mut unit_is_focused = false;
-                if let Some(step) = self.step_mut(step_id) {
-                    match unit_index {
-                        Some(index) => {
-                            let unit = fanout_unit_mut(&mut step.units, *index);
-                            unit.codename = codename.clone();
-                            unit.provider = provider.clone();
-                            unit.model = model.clone();
-                            unit_is_focused = !unit.key.is_empty()
-                                && active_unit_key.as_deref() == Some(unit.key.as_str());
-                        }
-                        None => {
-                            step.codename = codename.clone().or(step.codename.take());
-                            step.provider = provider.clone();
-                            step.model = model.clone();
-                            if step.agent.is_none() {
-                                step.agent = Some(agent.clone());
-                            }
-                        }
-                    }
-                }
-                // Focus follows the agent only when it belongs to what is
-                // already in focus: the step itself, or the focused unit
-                // (a unit-scoped event that lands before its `UnitStarted`
-                // is reconciled when that event re-focuses).
-                if on_active_step
-                    && ((unit_index.is_none() && self.active.unit_key.is_none()) || unit_is_focused)
-                {
-                    self.active.codename = codename.clone();
-                    self.active.provider = provider.clone();
-                    self.active.model = model.clone();
-                }
-            }
-            WfEvent::StepAwaitingApproval { step_id, .. } => {
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = NodeStatus::Awaiting;
-                }
-            }
-            WfEvent::StepCompleted {
-                step_id,
-                success,
-                duration_ms,
-                ..
-            } => {
-                let secs = duration_ms / 1000;
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = if *success {
-                        NodeStatus::Complete
-                    } else {
-                        NodeStatus::Failed
-                    };
-                    step.elapsed_secs = secs;
-                }
-            }
-            WfEvent::StepFailed { step_id, .. } => {
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = NodeStatus::Failed;
-                }
-            }
-            WfEvent::StepSkipped { step_id, .. } => {
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = NodeStatus::Skipped;
-                }
-            }
+impl TranscriptIndex {
+    /// Remember the transcript `ev` announces (if any) and return the
+    /// `(path, codename)` to register with the mux. Call after
+    /// `view.apply(ev)`: a `StepWorking` path has no codename of its own, it
+    /// takes its step's, which `StepStarted` set.
+    fn note(&mut self, view: &RunView, ev: &WfEvent) -> Option<(PathBuf, Option<String>)> {
+        let (path, codename) = match ev {
             WfEvent::UnitStarted {
-                step_id,
-                index,
-                unit_key,
-                agent,
                 transcript_path,
                 codename,
                 ..
-            } => {
-                // Re-focus on this unit: its transcript drives the feed.
-                self.active.step_id = Some(step_id.clone());
-                self.active.unit_key = Some(unit_key.clone());
-                if agent.is_some() {
-                    self.active.agent = agent.clone();
-                }
-                self.active.active_unit_transcript = Some(transcript_path.clone());
-                self.active.codename = codename.clone();
-                self.active.provider = None;
-                self.active.model = None;
-                self.active.feed.clear();
-                self.active.last_event_at = None;
-                let mut focus_meta = None;
-                if let Some(step) = self.step_mut(step_id) {
-                    if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
-                        step.status = NodeStatus::Working;
-                    }
-                    let unit = fanout_unit_mut(&mut step.units, *index);
-                    unit.key = unit_key.clone();
-                    unit.status = NodeStatus::Working;
-                    unit.transcript_path = Some(transcript_path.clone());
-                    if codename.is_some() {
-                        unit.codename = codename.clone();
-                    }
-                    // `AgentStarted` may have landed first (it carries
-                    // provider/model); keep whatever it recorded.
-                    focus_meta = Some((
-                        unit.codename.clone(),
-                        unit.provider.clone(),
-                        unit.model.clone(),
-                    ));
-                }
-                if let Some((c, p, m)) = focus_meta {
-                    self.active.codename = c.or_else(|| codename.clone());
-                    self.active.provider = p;
-                    self.active.model = m;
-                }
             }
-            WfEvent::UnitCompleted {
-                step_id,
-                index,
-                unit_key,
-                success,
-                tokens_in,
-                tokens_out,
-                ..
-            } => {
-                if let Some(step) = self.step_mut(step_id) {
-                    let unit = fanout_unit_mut(&mut step.units, *index);
-                    if unit.key.is_empty() {
-                        unit.key = unit_key.clone();
-                    }
-                    unit.status = if *success {
-                        NodeStatus::Complete
-                    } else {
-                        NodeStatus::Failed
-                    };
-                    // The unit's honest total (spec §3.4). Step and run
-                    // totals come from the usage fold alone
-                    // (`apply_run_usage`), which already counts this unit's
-                    // ledger rows; `max` keeps this from stacking on the
-                    // fold's own value for the unit. A remote unit has no
-                    // ledger rows, so this is its only per-unit figure.
-                    unit.tokens = unit.tokens.max(tokens_in + tokens_out);
-                    // Keep the collapsed `done/total` summary coherent: at
-                    // minimum the step has as many units as the highest
-                    // index seen so far (dispatch-child slots aside).
-                    let seen = step.units.iter().filter(|u| u.index.is_some()).count();
-                    step.fanout_total = Some(step.fanout_total.unwrap_or(0).max(seen));
-                }
-            }
-            WfEvent::RunCompleted {
-                status,
-                finished_at,
-                ..
-            } => {
-                self.status = *status;
-                self.finished_at = Some(*finished_at);
-                self.active.step_id = None;
-            }
-            WfEvent::RunFailed { finished_at, .. } => {
-                self.status = RunStatus::Failed;
-                self.finished_at = Some(*finished_at);
-            }
-            WfEvent::RunPaused { .. } => {
-                self.status = RunStatus::Paused;
-            }
-            WfEvent::RunResumed { .. } => {
-                self.status = RunStatus::Running;
-            }
-            WfEvent::StepPaused { step_id, .. } => {
-                // No dedicated `NodeStatus::Paused` glyph yet (tracked for
-                // the CP web Paused-node work); reuse `Awaiting`'s pause
-                // glyph (`⏸`, see `node_glyph`) as the closest visual match
-                // until that lands.
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = NodeStatus::Awaiting;
-                }
-            }
-            WfEvent::StepResumed { step_id, .. } => {
-                if let Some(step) = self.step_mut(step_id) {
-                    step.status = NodeStatus::Working;
-                }
-            }
-            // PanelRound drives the web Control Plane's live round
-            // counter; the CLI live view does not render it, so no
-            // per-step state change is needed here.
-            WfEvent::PanelRound { .. } => {}
-            WfEvent::DispatchStarted {
-                sub_run_id,
-                agent,
+            | WfEvent::AgentStarted {
                 transcript_path,
                 codename,
-                provider,
-                model,
+                ..
+            }
+            | WfEvent::DispatchStarted {
+                transcript_path,
+                codename,
+                ..
+            } => (transcript_path, codename.clone()),
+            WfEvent::StepWorking {
+                step_id,
+                transcript_path: Some(path),
                 ..
             } => {
-                // Dispatch carries no `step_id` (it fires from inside the
-                // active step's tool loop, not a step boundary) — attach
-                // the child to whichever step is currently active. Nothing
-                // to attach to (no active step yet) is a no-op.
-                let Some(step_id) = self.active.step_id.clone() else {
-                    return;
-                };
-                // Re-focus on this child: its transcript drives the feed,
-                // same as `UnitStarted`'s auto-focus assignment, so
-                // auto-follow (no operator selection) still tracks the
-                // newest dispatched child by default.
-                let key = agent.clone().unwrap_or_else(|| sub_run_id.clone());
-                self.active.unit_key = Some(key.clone());
-                if agent.is_some() {
-                    self.active.agent = agent.clone();
-                }
-                self.active.active_unit_transcript = Some(transcript_path.clone());
-                self.active.codename = codename.clone();
-                self.active.provider = provider.clone();
-                self.active.model = model.clone();
-                self.active.feed.clear();
-                self.active.last_event_at = None;
-                if let Some(step) = self.step_mut(&step_id) {
-                    if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
-                        step.status = NodeStatus::Working;
-                    }
-                    // Find-or-append by `sub_run_id` so a redelivered
-                    // `DispatchStarted` doesn't create a duplicate slot.
-                    let existing = step
-                        .units
-                        .iter_mut()
-                        .find(|u| u.sub_run_id.as_deref() == Some(sub_run_id.as_str()));
-                    match existing {
-                        Some(unit) => {
-                            unit.key = key;
-                            unit.status = NodeStatus::Working;
-                            unit.transcript_path = Some(transcript_path.clone());
-                            unit.codename = codename.clone();
-                            unit.provider = provider.clone();
-                            unit.model = model.clone();
-                        }
-                        None => {
-                            step.units.push(UnitState {
-                                key,
-                                status: NodeStatus::Working,
-                                tokens: 0,
-                                elapsed_secs: 0,
-                                transcript_path: Some(transcript_path.clone()),
-                                sub_run_id: Some(sub_run_id.clone()),
-                                codename: codename.clone(),
-                                provider: provider.clone(),
-                                model: model.clone(),
-                                index: None,
-                            });
-                        }
-                    }
-                }
+                let codename = view
+                    .steps
+                    .iter()
+                    .find(|s| &s.step_id == step_id)
+                    .and_then(|s| s.codename.clone());
+                (path, codename)
             }
-            WfEvent::DispatchCompleted {
-                sub_run_id,
-                success,
-                tokens_in,
-                tokens_out,
-                ..
-            } => {
-                let Some(step_id) = self.active.step_id.clone() else {
-                    return;
-                };
-                if let Some(step) = self.step_mut(&step_id) {
-                    if let Some(unit) = step
-                        .units
-                        .iter_mut()
-                        .find(|u| u.sub_run_id.as_deref() == Some(sub_run_id.as_str()))
-                    {
-                        unit.status = if *success {
-                            NodeStatus::Complete
-                        } else {
-                            NodeStatus::Failed
-                        };
-                        // Display only: the child's own row. Its spend is
-                        // already in the fold's step and run totals (its
-                        // ledger rows attribute to its ancestor's step), so
-                        // it is never added to those here.
-                        unit.tokens = unit.tokens.max(tokens_in + tokens_out);
-                    }
-                    // No matching unit (e.g. `DispatchStarted` was missed)
-                    // — nothing to complete; graceful no-op.
-                }
+            _ => return None,
+        };
+        // A remote unit whose transcript is not mirrored yet can announce an
+        // empty path; there is nothing to tail.
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        match ev {
+            WfEvent::UnitStarted { step_id, index, .. } => {
+                self.units.insert((step_id.clone(), *index), path.clone());
             }
-        }
-    }
-
-    /// Append a line to the active agent's rolling feed and bump the
-    /// heartbeat timestamp. Caps the feed at [`ACTIVITY_CAP`].
-    pub fn push_activity(
-        &mut self,
-        ts: DateTime<Utc>,
-        kind: ActivityKind,
-        text: impl Into<String>,
-    ) {
-        self.active.last_event_at = Some(ts);
-        self.active.feed.push(ActivityLine {
-            ts,
-            kind,
-            text: text.into(),
-        });
-        if self.active.feed.len() > ACTIVITY_CAP {
-            let overflow = self.active.feed.len() - ACTIVITY_CAP;
-            self.active.feed.drain(0..overflow);
-        }
-    }
-
-    /// Set the run, step and unit token totals and the run cost from the
-    /// run's usage fold (`rupu_cp::usage::run_usage`: ledger rows plus a
-    /// fold of every known transcript without them). Replaces rather than
-    /// accumulates, so applying the same fold twice is a no-op — tokens
-    /// cover every unit and dispatched child, never double-count a
-    /// dispatch, and never re-count when the focus moves.
-    ///
-    /// A step with no fold rows reads zero. Units are set only where the
-    /// fold has a figure for `(step_id, unit_index)` (the ledger's own
-    /// units); a unit it can't see — a remote unit, a dispatch child's
-    /// slot — keeps the figure its completion event reported. `cost` is
-    /// the priced rows' sum, `None` when no row is priced (never a made-up
-    /// `$0`).
-    pub fn apply_run_usage(
-        &mut self,
-        u: &rupu_cp::usage_index::RunUsage,
-        pricing: &rupu_config::PricingConfig,
-    ) {
-        let summary = rupu_cp::usage::summarize(&u.rows, pricing);
-        self.tokens_in = summary.input_tokens;
-        self.tokens_out = summary.output_tokens;
-        self.cost = summary.cost_usd;
-        for step in &mut self.steps {
-            let (tokens_in, tokens_out) = u.by_step.get(&step.id).map_or((0, 0), |rows| {
-                rows.iter().fold((0, 0), |(i, o), r| {
-                    (i + r.input_tokens, o + r.output_tokens)
-                })
-            });
-            step.tokens_in = tokens_in;
-            step.tokens_out = tokens_out;
-        }
-        // Matched by unit identity, never vec position: a dispatch-child
-        // slot (`index: None`) never receives a unit's figure — a
-        // `parallel` step's rows are ALL child slots, while the ledger
-        // tags its sub-steps `(step, idx)`.
-        for ((step_id, index), t) in &u.by_unit {
-            if let Some(unit) = self.step_mut(step_id).and_then(|step| {
-                step.units
-                    .iter_mut()
-                    .find(|unit| unit.index == Some(*index))
-            }) {
-                unit.tokens = t.input + t.output;
+            WfEvent::DispatchStarted { sub_run_id, .. } => {
+                self.dispatches.insert(sub_run_id.clone(), path.clone());
             }
+            _ => {}
         }
+        Some((path.clone(), codename))
     }
+}
 
-    /// Seconds since the run started, given a `now`.
-    pub fn elapsed_secs(&self, now: DateTime<Utc>) -> i64 {
-        self.started_at
-            .map(|s| (now - s).num_seconds().max(0))
-            .unwrap_or(0)
-    }
-
-    fn status_label(&self) -> (&'static str, owo_colors::Rgb) {
-        match self.status {
-            RunStatus::Running => ("running", RUNNING),
-            RunStatus::Completed => ("completed", COMPLETE),
-            RunStatus::Failed => ("failed", FAILED),
-            RunStatus::AwaitingApproval => ("awaiting", palette::AWAITING),
-            RunStatus::Rejected => ("rejected", FAILED),
-            RunStatus::Cancelled => ("cancelled", FAILED),
-            RunStatus::Pending => ("pending", DIM),
-            RunStatus::Paused => ("paused", palette::AWAITING),
+/// The transcript to pin: the drilled unit's (`Unit` depth) or sub-agent's
+/// (`SubAgent` depth). At `Run` / `Step` depth nothing is pinned and the feed
+/// is the merged firehose.
+fn pinned_path(view: &RunView, nav: &NavState, index: &TranscriptIndex) -> Option<PathBuf> {
+    match nav.depth() {
+        Depth::Run | Depth::Step => None,
+        Depth::Unit => {
+            let step = nav.selected_step(view)?;
+            let unit = nav.selected_unit(view)?;
+            index
+                .units
+                .get(&(step.step_id.clone(), unit.index))
+                .cloned()
+        }
+        Depth::SubAgent => {
+            let sub = nav.selected_sub_agent(view)?;
+            index.dispatches.get(&sub.sub_run_id).cloned()
         }
     }
 }
 
-/// The row of fan-out unit `index`, found by its identity
-/// ([`UnitState::index`]) — never by vec position, which dispatch-child
-/// slots appended to the same vec shift. When absent, the step grows
-/// `Waiting` placeholder rows for every unit index up to `index` not yet
-/// seen: fan-out events arrive per-unit (in real start/finish order under
-/// concurrency), so the unit rows fill in sparsely, but the indices present
-/// are always contiguous from 0.
-fn fanout_unit_mut(units: &mut Vec<UnitState>, index: usize) -> &mut UnitState {
-    let next = units
-        .iter()
-        .filter_map(|u| u.index)
-        .max()
-        .map_or(0, |max| max + 1);
-    for missing in next..=index {
-        units.push(UnitState {
-            key: String::new(),
-            status: NodeStatus::Waiting,
-            tokens: 0,
-            elapsed_secs: 0,
-            transcript_path: None,
-            sub_run_id: None,
-            codename: None,
-            provider: None,
-            model: None,
-            index: Some(missing),
-        });
+/// Concurrent tails the mux may use, from `(open descriptors, limit)`: a
+/// quarter of the headroom past a reserve. The mux clamps the result to its
+/// own floor / ceiling.
+fn tail_budget(usage: Option<(u64, u64)>) -> usize {
+    match usage {
+        Some((open, limit)) => {
+            let spare = limit.saturating_sub(open).saturating_sub(16) / 4;
+            usize::try_from(spare).unwrap_or(usize::MAX)
+        }
+        None => DEFAULT_TAILS,
     }
-    units
-        .iter_mut()
-        .find(|u| u.index == Some(index))
-        .expect("indices 0..=index are present after the growth above")
 }
 
-/// Overall run progress in `[0, 1]`, blending completed whole steps with
-/// the currently-active step's intra-step progress so the bar advances
-/// during a long fan-out / panel step rather than freezing between
-/// `StepCompleted` events.
-///
-/// `progress = (completed_steps + active_step_fraction) / total`, where
-/// `active_step_fraction` is:
-///   - fan-out (`for_each` / `parallel`): `done_units / total_units`
-///     (counted units in `Complete`/`Failed` over `fanout_total` or the
-///     counted-unit count — see `StepState::counted_units`),
-///   - panel: `iteration / max_iterations`,
-///   - linear / unknown: `0.0`.
-///
-/// The active step is the one in `Active`/`Working` status (it is NOT
-/// counted in `completed_steps`). Clamped to `[0, 1]`.
-fn overall_progress_fraction(state: &LiveRunState) -> f64 {
-    let total = state.steps.len().max(1) as f64;
-    let completed = state.completed_steps() as f64;
+// ---------------------------------------------------------------------------
+// The model: seeding + the parts only run.json knows
+// ---------------------------------------------------------------------------
 
-    let active_fraction = state
-        .steps
-        .iter()
-        .find(|s| matches!(s.status, NodeStatus::Active | NodeStatus::Working))
-        .map(|step| match step.kind {
-            StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
-                let total_units = step.total_units();
-                if total_units == 0 {
-                    0.0
-                } else {
-                    (step.done_units() as f64 / total_units as f64).clamp(0.0, 1.0)
-                }
-            }
-            StepKind::Panel => match step.panel_iter {
-                Some((iter, max)) if max > 0 => (iter as f64 / max as f64).clamp(0.0, 1.0),
-                _ => 0.0,
-            },
-            StepKind::Linear => 0.0,
-            StepKind::Branch => 0.0,
-            StepKind::Split => 0.0,
-            StepKind::Join => 0.0,
-            StepKind::Loop => 0.0,
-            StepKind::Action => 0.0,
-            StepKind::ApprovalGate => 0.0,
-            // I-39: an unrecognized future kind — same "linear / unknown:
-            // 0.0" fallback the doc comment above already anticipates.
-            StepKind::Unknown => 0.0,
-        })
-        .unwrap_or(0.0);
-
-    ((completed + active_fraction) / total).clamp(0.0, 1.0)
-}
-
-fn step_kind(step: &rupu_orchestrator::Step) -> StepKind {
-    if step.panel.is_some() {
+/// The kind a not-yet-started step is shown as. Mirrors the orchestrator's
+/// step classification (`step_kind_for_run_record`, crate-private there); it
+/// only labels a *pending* row, since `StepStarted` carries the real kind.
+fn seed_kind(step: &Step) -> StepKind {
+    if rupu_orchestrator::is_approval_gate(step) {
+        StepKind::ApprovalGate
+    } else if step.run.is_some() {
+        StepKind::Run
+    } else if step.branch.is_some() {
+        StepKind::Branch
+    } else if step.split.is_some() {
+        StepKind::Split
+    } else if step.join.is_some() {
+        StepKind::Join
+    } else if step.panel.is_some() {
         StepKind::Panel
     } else if step.parallel.is_some() {
         StepKind::Parallel
     } else if step.for_each.is_some() {
         StepKind::ForEach
+    } else if step.action.is_some() {
+        StepKind::Action
     } else {
         StepKind::Linear
     }
 }
 
-/// Format an `Ns` / `Nm Ss` elapsed string.
-fn fmt_elapsed(secs: i64) -> String {
-    let secs = secs.max(0);
-    if secs < 60 {
-        format!("{secs}s")
+/// The view before any event: every workflow step pending, in declaration
+/// order, so the graph shows the whole run up front and the layout can fold
+/// what has not started.
+fn seed_view(workflow: &Workflow, run_id: &str) -> RunView {
+    let mut view = RunView::default();
+    view.run_id = run_id.to_string();
+    view.workflow_name = workflow.name.clone();
+    for step in &workflow.steps {
+        let seeded = view.step_mut(&step.id);
+        seeded.kind = seed_kind(step);
+        seeded.agent = step.agent.clone();
+    }
+    view
+}
+
+/// Fold what only `run.json` knows into the view: the crew, the parked-gate
+/// set, and the *parked* status. A gate park emits no run-level event (the
+/// runner just stops), so without this a parked run would read `running`
+/// forever. Applied every tick.
+///
+/// Gates are taken only while the record is `AwaitingApproval`: a cooperative
+/// pause also fills the awaiting fields (`RunStore::pause` records the active
+/// step there), and that is not a gate anyone can approve. Only the parked
+/// status is overlaid — terminal and paused stay event-derived, so the
+/// resume-generation guard keeps its meaning.
+fn overlay_record(view: &mut RunView, rec: &RunRecord) {
+    if view.workflow_name.is_empty() {
+        view.workflow_name.clone_from(&rec.workflow_name);
+    }
+    if let Some(crew) = &rec.codename {
+        view.crew = Some(crew.clone());
+    }
+    view.gates = if rec.status == RunStatus::AwaitingApproval {
+        rec.awaiting_gates()
+            .into_iter()
+            .map(|g| GateView {
+                step_id: g.step_id,
+                prompt: g.prompt,
+                since: g.since,
+                expires_at: g.expires_at,
+            })
+            .collect()
     } else {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Zone 1 — Dashboard
-// ---------------------------------------------------------------------------
-
-/// Render Zone 1: title + status + elapsed, a rule, the `step N/M`
-/// progress bar, and the adaptive meters row.
-pub fn render_dashboard(state: &LiveRunState, now: DateTime<Utc>, width: usize) -> Vec<String> {
-    let mut rows = Vec::new();
-    let (label, color) = state.status_label();
-    let elapsed = fmt_elapsed(state.elapsed_secs(now));
-
-    // Title line: brand name left, `status · elapsed` right.
-    let right = format!("{label} · {elapsed}");
-    let mut title = String::new();
-    let _ = palette::write_bold_colored(&mut title, &state.workflow_name, BRAND);
-    if let Some(c) = state.codename.as_deref() {
-        title.push_str("  ");
-        super::codename::write_crew(&mut title, c.split('/').next().unwrap_or(c));
-    }
-    let used = visible_len(&title) + visible_len(&right);
-    let pad = width.saturating_sub(used);
-    title.push_str(&" ".repeat(pad));
-    let _ = palette::write_colored(&mut title, &right, color);
-    rows.push(title);
-
-    // Horizontal rule.
-    let mut rule = String::new();
-    let _ = palette::write_colored(&mut rule, &"─".repeat(width), palette::SEPARATOR);
-    rows.push(rule);
-
-    // Progress bar: `step N/M  [bar]  active_step`.
-    let total = state.steps.len().max(1);
-    let done = state.completed_steps();
-    let active_name = state
-        .active
-        .step_id
-        .as_deref()
-        .or_else(|| {
-            state
-                .steps
-                .iter()
-                .find(|s| matches!(s.status, NodeStatus::Active | NodeStatus::Working))
-                .map(|s| s.id.as_str())
-        })
-        .unwrap_or("");
-    let bar_w = 24usize;
-    // Blend completed steps with the active step's intra-step progress so
-    // the bar visibly advances during a long fan-out / panel step instead
-    // of freezing between `StepCompleted` events.
-    let filled = ((overall_progress_fraction(state) * bar_w as f64).round() as usize).min(bar_w);
-    let mut prog = String::new();
-    let _ = palette::write_colored(&mut prog, &format!("step {done}/{total}   "), DIM);
-    let _ = palette::write_colored(&mut prog, &"█".repeat(filled), RUNNING);
-    let _ = palette::write_colored(&mut prog, &"░".repeat(bar_w - filled), DIM);
-    if !active_name.is_empty() {
-        prog.push_str("   ");
-        let _ = palette::write_bold_colored(&mut prog, active_name, BRAND);
-    }
-    rows.push(prog);
-
-    // Meters row, adaptive.
-    let mut meters = String::new();
-    let _ = palette::write_colored(
-        &mut meters,
-        &format!("⇡ {}   ", format_token_compact(state.tokens_in)),
-        DIM,
-    );
-    let _ = palette::write_colored(
-        &mut meters,
-        &format!("⇣ {}   ", format_token_compact(state.tokens_out)),
-        DIM,
-    );
-    let cost = state.cost.unwrap_or(0.0);
-    let _ = palette::write_colored(&mut meters, &format_cost_compact(cost), COMPLETE);
-    if let Some(findings) = state.findings_count.filter(|n| *n > 0) {
-        let _ = palette::write_colored(&mut meters, "          ", DIM);
-        let _ = palette::write_colored(
-            &mut meters,
-            &format!("findings {findings}"),
-            palette::SEV_HIGH,
-        );
-    }
-    if let Some(pct) = state.coverage_pct {
-        let _ = palette::write_colored(&mut meters, "          ", DIM);
-        let _ = palette::write_colored(&mut meters, "coverage ", DIM);
-        let cov_w = 8usize;
-        let cov_filled = (pct as usize * cov_w) / 100;
-        let _ = palette::write_colored(&mut meters, &"█".repeat(cov_filled), COMPLETE);
-        let _ = palette::write_colored(&mut meters, &"░".repeat(cov_w - cov_filled), DIM);
-        let _ = palette::write_colored(&mut meters, &format!(" {pct}%"), DIM);
-    }
-    rows.push(meters);
-
-    // Keymap hint: only when the active step actually has more than one
-    // navigable node (the step itself plus at least one fan-out unit) —
-    // a single-step/no-selection run has nothing to select, so omit the
-    // hint rather than clutter the dashboard.
-    if state.navigable_nodes().len() > 1 {
-        let mut hint = String::new();
-        let _ = palette::write_colored(&mut hint, "↑↓/Tab select · a auto", DIM);
-        rows.push(hint);
-    }
-
-    rows
-}
-
-// ---------------------------------------------------------------------------
-// Zone 2 — Git-graph spine
-// ---------------------------------------------------------------------------
-
-/// A dotted-leader right-aligned line: `<glyph> <label> ····· <status>`.
-fn leader_line(
-    prefix: &str,
-    prefix_status: NodeStatus,
-    label: &str,
-    label_color: owo_colors::Rgb,
-    right: &str,
-    right_color: owo_colors::Rgb,
-    width: usize,
-) -> String {
-    // Compose the plain (uncolored) skeleton first to measure widths.
-    let left_plain = format!("{prefix} {label} ");
-    let right_plain = format!(" {right}");
-    let dots = width
-        .saturating_sub(visible_len(&left_plain) + visible_len(&right_plain))
-        .max(1);
-
-    let mut buf = String::new();
-    let _ = palette::write_bold_colored(&mut buf, prefix, node_color(prefix_status));
-    buf.push(' ');
-    let _ = palette::write_colored(&mut buf, label, label_color);
-    buf.push(' ');
-    let _ = palette::write_colored(&mut buf, &"·".repeat(dots), DIM);
-    buf.push(' ');
-    let _ = palette::write_colored(&mut buf, right, right_color);
-    buf
-}
-
-/// Cursor glyph rendered before a spine row's label when that row is the
-/// operator's pinned node ([`LiveRunState::selected`]). Applied to
-/// exactly one row per frame — the row matching `selected` — everything
-/// else renders unmarked, unchanged from before Task 2.
-const SELECTION_MARKER: &str = "▸ ";
-
-/// Prefix `label` with [`SELECTION_MARKER`] when `selected` is true for
-/// this row; otherwise return it unchanged.
-fn mark_selected(label: &str, selected: bool) -> String {
-    if selected {
-        format!("{SELECTION_MARKER}{label}")
-    } else {
-        label.to_string()
-    }
-}
-
-/// Render Zone 2: the heavy-edged git-graph spine. Walks the workflow
-/// steps and the live `LiveRunState`. The active fan-out step expands
-/// its units as branch rows; inactive fan-outs collapse to `done/total`.
-/// When [`LiveRunState::selected`] pins a node of the active step, that
-/// row (and only that row) is marked with [`SELECTION_MARKER`].
-pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) -> Vec<String> {
-    let mut rows: Vec<String> = Vec::new();
-    let total = state.steps.len();
-
-    for (i, step) in state.steps.iter().enumerate() {
-        // Spine connector before each step (except the first).
-        if i > 0 {
-            let mut pipe = String::new();
-            let _ = palette::write_colored(&mut pipe, "┃", DIM);
-            rows.push(pipe);
-        }
-
-        let glyph = node_glyph(step.status).to_string();
-        let agent = step.agent.clone().unwrap_or_default();
-        // Only the active step carries a navigable selection (Q1 scope);
-        // `selected` is stale/meaningless for any other step.
-        let is_active_step = state.active.step_id.as_deref() == Some(step.id.as_str());
-        let step_selected = is_active_step && matches!(state.selected, Some(NodeRef::Step));
-
-        match step.kind {
-            StepKind::Panel => {
-                let (iter, max) = step.panel_iter.unwrap_or((0, 0));
-                let right = if matches!(step.status, NodeStatus::Active | NodeStatus::Working) {
-                    format!("⟲ iter {iter}/{max} · {} found", step.panel_findings)
-                } else {
-                    status_word(step.status)
-                };
-                let label = mark_selected(&format!("{} · panel", step.id), step_selected);
-                rows.push(leader_line(
-                    &glyph,
-                    step.status,
-                    &label,
-                    BRAND,
-                    &right,
-                    node_color(step.status),
-                    width,
-                ));
-            }
-            StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
-                let is_active = matches!(step.status, NodeStatus::Active | NodeStatus::Working);
-                let total_units = step.total_units();
-                let done = step.done_units();
-                let kind_word = match step.kind {
-                    StepKind::ForEach => "for_each",
-                    StepKind::Run => "run",
-                    _ => "parallel",
-                };
-                let label = mark_selected(&format!("{} · {kind_word}", step.id), step_selected);
-
-                if is_active && !step.units.is_empty() {
-                    // Header line with the summary + total tokens.
-                    let right = format!(
-                        "{}/{} ⇡{}",
-                        done,
-                        total_units,
-                        format_token_compact(step.tokens_in)
-                    );
-                    rows.push(leader_line(
-                        &glyph,
-                        step.status,
-                        &label,
-                        BRAND,
-                        &right,
-                        node_color(step.status),
-                        width,
-                    ));
-                    // One branch row per unit.
-                    let last = step.units.len() - 1;
-                    for (ui, unit) in step.units.iter().enumerate() {
-                        let branch = if ui == last { "┗━" } else { "┣━" };
-                        let uglyph = node_glyph(unit.status);
-                        let prefix = format!("{branch}{uglyph}");
-                        let right = unit_right(unit);
-                        let unit_selected = is_active_step
-                            && matches!(state.selected, Some(NodeRef::Unit { index }) if index == ui);
-                        let unit_text = match unit.codename.as_deref() {
-                            Some(c) => {
-                                let label = super::codename::member_label(
-                                    Some(c),
-                                    &unit.key,
-                                    unit.provider.as_deref(),
-                                    unit.model.as_deref(),
-                                );
-                                match super::codename::badge_glyph(c) {
-                                    Some(g) => format!("{g} {label}"),
-                                    None => label,
-                                }
-                            }
-                            None => unit.key.clone(),
-                        };
-                        let unit_label = mark_selected(&unit_text, unit_selected);
-                        rows.push(leader_line(
-                            &prefix,
-                            unit.status,
-                            &unit_label,
-                            node_color(unit.status),
-                            &right,
-                            node_color(unit.status),
-                            width,
-                        ));
-                    }
-                } else {
-                    // Collapsed one-line summary.
-                    let right = if total_units > 0 {
-                        format!("{done}/{total_units}")
-                    } else {
-                        status_word(step.status)
-                    };
-                    rows.push(leader_line(
-                        &glyph,
-                        step.status,
-                        &label,
-                        BRAND,
-                        &right,
-                        node_color(step.status),
-                        width,
-                    ));
-                }
-            }
-            StepKind::Linear
-            | StepKind::Branch
-            | StepKind::Split
-            | StepKind::Join
-            | StepKind::Loop
-            | StepKind::Action
-            | StepKind::ApprovalGate
-            // I-39: an unrecognized future kind falls back to the same
-            // generic linear rendering as every other non-fanout kind.
-            | StepKind::Unknown => {
-                let right = if matches!(step.status, NodeStatus::Complete) {
-                    format!(
-                        "{} {} ⇡{}",
-                        node_glyph(step.status),
-                        fmt_elapsed(step.elapsed_secs as i64),
-                        format_token_compact(step.tokens_in)
-                    )
-                } else {
-                    status_word(step.status)
-                };
-                let label = if agent.is_empty() {
-                    step.id.clone()
-                } else if step.codename.is_some() || step.provider.is_some() {
-                    format!(
-                        "{} · {}",
-                        step.id,
-                        super::codename::member_label(
-                            step.codename.as_deref(),
-                            &agent,
-                            step.provider.as_deref(),
-                            step.model.as_deref(),
-                        )
-                    )
-                } else {
-                    format!("{} · {agent}", step.id)
-                };
-                let label = mark_selected(&label, step_selected);
-                rows.push(leader_line(
-                    &glyph,
-                    step.status,
-                    &label,
-                    BRAND,
-                    &right,
-                    node_color(step.status),
-                    width,
-                ));
-            }
-        }
-        let _ = total;
-    }
-    rows
-}
-
-fn unit_right(unit: &UnitState) -> String {
-    match unit.status {
-        NodeStatus::Complete => format!("✓  ⇡{}", format_token_compact(unit.tokens)),
-        NodeStatus::Failed => format!("✗  ⇡{}", format_token_compact(unit.tokens)),
-        NodeStatus::Active | NodeStatus::Working => {
-            format!("working ⇡{}", format_token_compact(unit.tokens))
-        }
-        _ => status_word(unit.status),
-    }
-}
-
-fn status_word(status: NodeStatus) -> String {
-    match status {
-        NodeStatus::Waiting => "queued".into(),
-        NodeStatus::Active => "active".into(),
-        NodeStatus::Working => "working".into(),
-        NodeStatus::Complete => "done".into(),
-        NodeStatus::Failed => "failed".into(),
-        NodeStatus::SoftFailed => "soft-failed".into(),
-        NodeStatus::Awaiting => "awaiting".into(),
-        NodeStatus::Retrying => "retrying".into(),
-        NodeStatus::Skipped => "pending".into(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Zone 3 — Focus feed
-// ---------------------------------------------------------------------------
-
-/// Render Zone 3: a bordered panel for the active agent. Header shows
-/// `unit · agent  ⇡tokens  ◐ active Ns ago`; body is the rolling feed,
-/// windowed to `height` rows (including the two border rows). On a
-/// failed run, the last body line is the `↳ rupu workflow resume` hint.
-pub fn render_focus(
-    state: &LiveRunState,
-    now: DateTime<Utc>,
-    width: usize,
-    height: usize,
-) -> Vec<String> {
-    let inner = width.saturating_sub(4); // borders + padding
-    let mut rows = Vec::new();
-
-    // Header text.
-    let agent = state
-        .active
-        .agent
-        .clone()
-        .unwrap_or_else(|| "—".to_string());
-    let unit = state
-        .active
-        .unit_key
-        .clone()
-        .or_else(|| state.active.step_id.clone())
-        .unwrap_or_else(|| "—".to_string());
-    let header_left = if state.active.codename.is_some() || state.active.provider.is_some() {
-        let label = super::codename::member_label(
-            state.active.codename.as_deref(),
-            &agent,
-            state.active.provider.as_deref(),
-            state.active.model.as_deref(),
-        );
-        // A dispatched sub-agent's unit key IS its agent name; repeating it
-        // as a prefix would print `agent · leaf · agent`.
-        if unit == agent {
-            label
-        } else {
-            format!("{unit} · {label}")
-        }
-    } else {
-        format!("{unit} · {agent}")
+        Vec::new()
     };
-
-    let heartbeat = match state.active.last_event_at {
-        Some(ts) => {
-            let secs = (now - ts).num_seconds().max(0);
-            format!("◐ active {secs}s ago")
-        }
-        None => "◐ idle".to_string(),
-    };
-
-    // Top border: ╭ header_left ... heartbeat ╮
-    let mut top = String::new();
-    let _ = palette::write_colored(&mut top, "╭ ", palette::SEPARATOR);
-    let _ = palette::write_bold_colored(&mut top, &header_left, BRAND);
-    let mid_used = visible_len(&header_left) + visible_len(&heartbeat) + 4;
-    let fill = width.saturating_sub(mid_used).max(1);
-    let _ = palette::write_colored(&mut top, &" ".repeat(fill), palette::SEPARATOR);
-    let _ = palette::write_colored(&mut top, &heartbeat, RUNNING);
-    let _ = palette::write_colored(&mut top, " ╮", palette::SEPARATOR);
-    rows.push(top);
-
-    // Body window. Reserve 2 rows for borders.
-    let body_rows = height.saturating_sub(2).max(1);
-    let failed = matches!(state.status, RunStatus::Failed | RunStatus::Rejected);
-    let resume_hint = if state.status == RunStatus::Paused {
-        // Cooperatively paused (operator pressed Esc, or `rupu workflow
-        // pause`/`rupu run pause` from another terminal) — offer the
-        // resume path right in the focus panel, same spot the failed-run
-        // hint uses below.
-        Some(format!(
-            "↳ paused — resume with: rupu workflow resume {}",
-            state.run_id
-        ))
-    } else {
-        failed.then(|| format!("↳ rupu workflow resume {}", state.run_id))
-    };
-    let reserve = if resume_hint.is_some() { 1 } else { 0 };
-    let feed_rows = body_rows.saturating_sub(reserve);
-
-    let feed = &state.active.feed;
-    let start = feed.len().saturating_sub(feed_rows);
-    for line in &feed[start..] {
-        rows.push(border_body_line(&format_activity(line, inner), width));
-    }
-    // Pad with blank body rows so the panel keeps a fixed height.
-    let used = feed[start..].len() + reserve;
-    for _ in used..body_rows {
-        rows.push(border_body_line("", width));
-    }
-    if let Some(hint) = resume_hint {
-        let mut buf = String::new();
-        let _ = palette::write_colored(&mut buf, &hint, FAILED);
-        rows.push(border_body_line_colored(buf, &hint, width));
-    }
-
-    // Bottom border.
-    let mut bottom = String::new();
-    let _ = palette::write_colored(
-        &mut bottom,
-        &format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
-        palette::SEPARATOR,
-    );
-    rows.push(bottom);
-
-    rows
-}
-
-/// Format one activity line as `HH:MM:SS  <glyph> <text>` (uncolored
-/// content sized to `inner`), returning the colored string.
-fn format_activity(line: &ActivityLine, inner: usize) -> String {
-    let ts = line.ts.format("%H:%M:%S").to_string();
-    let glyph = line.kind.glyph();
-    let mut buf = String::new();
-    let _ = palette::write_colored(&mut buf, &ts, DIM);
-    buf.push_str("  ");
-    let _ = palette::write_colored(&mut buf, &glyph.to_string(), line.kind.color());
-    buf.push(' ');
-    let body = truncate_plain(&line.text, inner.saturating_sub(visible_len(&ts) + 4));
-    let _ = palette::write_colored(&mut buf, &body, DIM);
-    buf
-}
-
-/// Wrap a pre-colored content string in `│ … │` borders, padding to width.
-fn border_body_line_colored(content_colored: String, content_plain: &str, width: usize) -> String {
-    let inner = width.saturating_sub(4);
-    let pad = inner.saturating_sub(visible_len(content_plain));
-    let mut buf = String::new();
-    let _ = palette::write_colored(&mut buf, "│ ", palette::SEPARATOR);
-    buf.push_str(&content_colored);
-    buf.push_str(&" ".repeat(pad));
-    let _ = palette::write_colored(&mut buf, " │", palette::SEPARATOR);
-    buf
-}
-
-/// Wrap an already-colored body string in borders. The body is measured
-/// by stripping ANSI to compute padding.
-fn border_body_line(content_colored: &str, width: usize) -> String {
-    let inner = width.saturating_sub(4);
-    let pad = inner.saturating_sub(visible_len(content_colored));
-    let mut buf = String::new();
-    let _ = palette::write_colored(&mut buf, "│ ", palette::SEPARATOR);
-    buf.push_str(content_colored);
-    buf.push_str(&" ".repeat(pad));
-    let _ = palette::write_colored(&mut buf, " │", palette::SEPARATOR);
-    buf
-}
-
-fn truncate_plain(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max <= 1 {
-        "…".to_string()
-    } else {
-        let mut out: String = s.chars().take(max - 1).collect();
-        out.push('…');
-        out
-    }
-}
-
-/// ANSI-aware single-row truncation to at most `width` *visible* columns.
-///
-/// Counts visible columns via [`visible_len`] (ANSI SGR runs are
-/// zero-width) so color codes are neither counted nor split mid-escape.
-/// A row that already fits is returned unchanged. A row that overflows is
-/// cut to the first `width` visible columns (reusing [`wrap_with_ansi`]'s
-/// SGR-preserving split), with the final visible column replaced by `…`
-/// so the truncation reads cleanly and never wraps onto a second line.
-fn truncate_to_width(row: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if visible_len(row) <= width {
-        return row.to_string();
-    }
-    // First wrap piece is exactly `width` visible columns wide, with the
-    // active SGR state preserved and a trailing reset. Replace its last
-    // visible char with `…`.
-    let head = crate::output::printer::wrap_with_ansi(row, width)
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-
-    // Walk `head` and drop the last visible char, inserting `…` in its
-    // place while keeping all SGR runs intact.
-    let total_visible = visible_len(&head);
-    let mut out = String::with_capacity(head.len() + 3);
-    let mut seen = 0usize;
-    let mut chars = head.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            out.push(c);
-            for inner in chars.by_ref() {
-                out.push(inner);
-                if inner == 'm' {
-                    break;
-                }
-            }
-            continue;
-        }
-        seen += 1;
-        if seen == total_visible {
-            out.push('…');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Combined view
-// ---------------------------------------------------------------------------
-
-/// Stack the three zones into a single block that is HARD-bounded to the
-/// viewport: at most `term_height` rows, and every row at most
-/// `term_width` visible columns. The alt-screen loop owns the terminal,
-/// so a frame that overflows either dimension would scroll/wrap and
-/// corrupt the display — hence the clamp lives here, not in the loop.
-///
-/// Budget (top-down, fixed zones win): dashboard (~5 rows) + a blank +
-/// graph + a blank + focus feed. The focus feed takes whatever rows
-/// remain after the dashboard and graph. If the dashboard + graph alone
-/// exceed the height, the graph is clipped with a trailing `… (+N more)`
-/// row so the dashboard always survives. Each emitted row is then
-/// truncated to `term_width` visible columns (ANSI-aware), so no row ever
-/// wraps onto a second physical line.
-pub fn render_view(
-    state: &LiveRunState,
-    workflow: &Workflow,
-    now: DateTime<Utc>,
-    term_width: usize,
-    term_height: usize,
-) -> Vec<String> {
-    let width = term_width.max(20);
-    let height = term_height.max(1);
-
-    let dashboard = render_dashboard(state, now, width);
-    let graph = render_graph(state, workflow, width);
-
-    let mut out: Vec<String> = Vec::new();
-
-    // Zone 1 — dashboard always wins; if even it overflows, clip it.
-    out.extend(dashboard);
-    if out.len() > height {
-        out.truncate(height);
-        return clamp_rows_width(out, width);
-    }
-
-    // Separator + Zone 2 — graph. Reserve at least one row for the graph
-    // (or its "+N more" marker) when there's room; clip with a marker if
-    // dashboard + separator + graph would overflow.
-    if out.len() < height {
-        out.push(String::new());
-    }
-    let remaining_for_graph = height.saturating_sub(out.len());
-    if remaining_for_graph == 0 {
-        out.truncate(height);
-        return clamp_rows_width(out, width);
-    }
-    if graph.len() > remaining_for_graph {
-        // Keep what fits, minus one row for the truncation marker.
-        let keep = remaining_for_graph.saturating_sub(1);
-        let hidden = graph.len() - keep;
-        out.extend(graph.into_iter().take(keep));
-        let mut marker = String::new();
-        let _ = palette::write_colored(&mut marker, &format!("… (+{hidden} more)"), DIM);
-        out.push(marker);
-        out.truncate(height);
-        return clamp_rows_width(out, width);
-    }
-    out.extend(graph);
-
-    // Separator + Zone 3 — focus feed fills whatever rows remain.
-    if out.len() < height {
-        out.push(String::new());
-    }
-    let focus_height = height.saturating_sub(out.len());
-    if focus_height > 0 {
-        out.extend(render_focus(state, now, width, focus_height));
-    }
-
-    // Final guards: never exceed the height, never exceed the width.
-    out.truncate(height);
-    clamp_rows_width(out, width)
-}
-
-/// Truncate every row to at most `width` visible columns (ANSI-aware).
-fn clamp_rows_width(rows: Vec<String>, width: usize) -> Vec<String> {
-    rows.into_iter()
-        .map(|r| truncate_to_width(&r, width))
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Live loop (best-effort; cursor control validated by running it)
-// ---------------------------------------------------------------------------
-
-/// RAII guard that owns the alternate screen (+ raw mode) for the live
-/// view. On entry it enables raw mode, switches to the alt screen, and
-/// hides the cursor; on `Drop` it restores the normal terminal — on
-/// EVERY exit path (normal return, early return, panic, Ctrl-C). Mirrors
-/// `session.rs`'s `SessionScreenGuard` / `RawModeGuard`.
-///
-/// Raw mode is required for [`run_live_view`]'s Esc-to-pause handling:
-/// without it, keystrokes are line-buffered by the terminal driver and
-/// Esc would not reach `crossterm::event::read` until Enter was pressed.
-struct AltScreenGuard;
-
-impl AltScreenGuard {
-    fn enter() -> std::io::Result<Self> {
-        use crossterm::cursor::Hide;
-        use crossterm::execute;
-        use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
-        enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
-        Ok(Self)
-    }
-}
-
-impl Drop for AltScreenGuard {
-    fn drop(&mut self) {
-        use crossterm::cursor::Show;
-        use crossterm::execute;
-        use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
-        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-    }
-}
-
-/// Pure keypress handler for the live-run view's alt-screen loop.
-///
-/// `Esc` requests a cooperative pause of the run being tailed via the
-/// exact primitive `rupu workflow pause <run_id>` uses
-/// ([`crate::cmd::workflow::pause_with_store`]: `RunStore::pause` + the
-/// pause marker a detached runner process polls) — NOT a copy of the
-/// logic, the same function, so there is exactly one pause code path.
-/// `pause_with_store` writes straight to the run store rather than
-/// stdout, so it is safe to call while the alt screen owns the
-/// terminal (unlike `crate::cmd::workflow::pause`, which `println!`s a
-/// confirmation that would corrupt the frame).
-///
-/// On success, an immediate feed line gives the operator feedback ahead
-/// of the round-trip `RunPaused` event (emitted once the run actually
-/// stops at a safe boundary, which flips [`LiveRunState::status`] via
-/// [`LiveRunState::apply`]). A failed request (already paused, or the
-/// run just reached a terminal state) is swallowed — the state already
-/// reflects reality, so no user-facing action is needed.
-///
-/// `Down`/`j`/`Tab` and `Up`/`k`/`BackTab` (Shift-Tab) move the node
-/// selection over the active step's navigable set ([`LiveRunState::select_next`]
-/// / [`LiveRunState::select_prev`]); `a` releases the selection back to
-/// auto-follow ([`LiveRunState::clear_selection`]). These are state-only
-/// in this task — Task 2 wires the selection into the focus zone's
-/// rendering. Any other key, or a non-Press event (key-repeat/release
-/// under kitty-protocol terminals), is a no-op.
-fn handle_live_run_keypress(
-    key: crossterm::event::KeyEvent,
-    store: &rupu_orchestrator::RunStore,
-    run_id: &str,
-    state: &mut LiveRunState,
-) {
-    use crossterm::event::{KeyCode, KeyEventKind};
-    if key.kind != KeyEventKind::Press {
-        return;
-    }
-    match key.code {
-        KeyCode::Esc if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() => {
-            state.push_activity(
-                Utc::now(),
-                ActivityKind::Text,
-                format!(
-                    "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
-                ),
-            );
-        }
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => state.select_next(),
-        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => state.select_prev(),
-        KeyCode::Char('a') => state.clear_selection(),
+    match (rec.status, view.status) {
+        (RunStatus::AwaitingApproval, _) => view.status = RunStatus::AwaitingApproval,
+        // The gate was decided (here or elsewhere): follow the record out.
+        (settled, RunStatus::AwaitingApproval) => view.status = settled,
         _ => {}
     }
 }
 
-/// How often the live view re-reads the run's usage fold.
-const USAGE_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Pull `run_id`'s usage from the shared fold ([`rupu_cp::usage::run_usage`])
-/// into `state` ([`LiveRunState::apply_run_usage`]).
-fn refresh_run_usage(
-    state: &mut LiveRunState,
-    store: &rupu_orchestrator::RunStore,
-    run_id: &str,
-    pricing: &rupu_config::PricingConfig,
-) {
-    let usage = rupu_cp::usage::run_usage(store, run_id);
-    state.apply_run_usage(&usage, pricing);
+/// Fold `step_results.jsonl` into the view: loop iteration + host onto the
+/// steps that exist, and the findings-by-severity tally. Idempotent — the
+/// tally is recounted from scratch, so re-reading every second never stacks.
+/// A result for a step the view does not know (a loop super-node) is counted
+/// for findings but never invents a row.
+fn overlay_step_results(view: &mut RunView, records: &[StepResultRecord]) {
+    view.findings_by_severity.clear();
+    for r in records {
+        if let Some(step) = view.steps.iter_mut().find(|s| s.step_id == r.step_id) {
+            if r.loop_iteration.is_some() {
+                step.loop_iteration = r.loop_iteration;
+            }
+            if r.host.is_some() {
+                step.host.clone_from(&r.host);
+            }
+        }
+        for f in &r.findings {
+            *view
+                .findings_by_severity
+                .entry(f.severity.to_lowercase())
+                .or_insert(0) += 1;
+        }
+    }
 }
 
-/// Drive the live three-zone view on the alternate screen until the run
-/// reaches a terminal state. Tails `events.jsonl` for step status, reads
-/// `run.json` for the active step's transcript path, and tails that
-/// transcript for the focus feed. Tokens and cost come from the run's usage
-/// fold, re-read once a second ([`refresh_run_usage`]). Repaints on a
-/// ~100ms tick and immediately after each event batch.
-///
-/// The view fully owns the terminal via [`AltScreenGuard`]: every tick
-/// re-queries the terminal size (resize-aware), rebuilds a frame bounded
-/// to the viewport by [`render_view`], homes the cursor and clears, then
-/// repaints. No `MoveToPreviousLine`/`prev_lines` bookkeeping — the frame
-/// can never overflow or wrap, so it can never stack. The guard restores
-/// the normal screen on every exit path. No summary is printed here: the
-/// caller prints the shared completion summary once the screen is restored.
-///
-/// Best-effort: any I/O hiccup degrades to the next tick. The caller
-/// guards entry behind a tty check; non-tty falls back to the existing
-/// line printer.
-pub async fn run_live_view(
+/// The findings the run has recorded so far, for the gate-details panel.
+fn gate_findings(records: &[StepResultRecord]) -> Vec<GateFinding> {
+    records
+        .iter()
+        .flat_map(|r| r.findings.iter())
+        .map(|f| GateFinding {
+            severity: f.severity.clone(),
+            title: f.title.clone(),
+            who: f.codename.clone().or_else(|| Some(f.source.clone())),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Gate decisions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateVerb {
+    Approve,
+    Reject,
+}
+
+/// What a decided gate asks the loop to run next. The decision itself (the
+/// run store flip) is already recorded when one of these is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateFollowUp {
+    /// Approved: re-enter the run from this gate (`crate::resume::resume_run`,
+    /// exactly what `rupu workflow approve` runs after recording).
+    Resume {
+        step_id: String,
+        approver: String,
+        via_timeout: bool,
+    },
+    /// Rejected (or auto-rejected by the gate's own timeout policy): run the
+    /// gate's `on_reject` cleanup chain, exactly what `rupu workflow reject`
+    /// runs after recording.
+    Cleanup {
+        step_id: String,
+        reason: String,
+        via: &'static str,
+        approver: String,
+    },
+}
+
+/// What the gate's own `on_timeout` policy had already decided, when the gate
+/// is overdue. Lets an approve / reject that lands on an overdue gate be
+/// attributed to the policy (`via: "timeout"`), as the CLI does.
+fn overdue_policy(
+    workflow: &Workflow,
+    gate: &GateView,
+    now: DateTime<Utc>,
+) -> Option<TimeoutAction> {
+    let overdue = gate.expires_at.is_some_and(|exp| now > exp);
+    overdue
+        .then(|| rupu_orchestrator::gate_timeout_action(workflow, &gate.step_id))
+        .flatten()
+}
+
+/// Record an operator's decision on `gate` (phase 1 of `workflow approve` /
+/// `reject`: the same `RunStore` calls, none of the CLI's `println!`s, which
+/// would corrupt the alternate screen). `Err` carries a one-line message for
+/// the notice row; nothing was recorded.
+fn decide_gate(
+    store: &RunStore,
+    workflow: &Workflow,
+    run_id: &str,
+    gate: &GateView,
+    verb: GateVerb,
+    approver: &str,
+    now: DateTime<Utc>,
+) -> Result<GateFollowUp, String> {
+    let policy = overdue_policy(workflow, gate, now);
+    match verb {
+        GateVerb::Approve => match store.approve_gate(run_id, approver, now, Some(&gate.step_id)) {
+            Ok(ApprovalDecision::Approved { step_id, .. }) => Ok(GateFollowUp::Resume {
+                step_id,
+                approver: approver.to_string(),
+                via_timeout: policy == Some(TimeoutAction::Approve),
+            }),
+            // The gate's own `on_timeout: reject` fired before this approve
+            // landed; the store already finalized the run `Rejected`.
+            Err(ApprovalError::ExpiredRejected { step_id, reason }) => Ok(GateFollowUp::Cleanup {
+                step_id,
+                reason,
+                via: "timeout",
+                approver: approver.to_string(),
+            }),
+            Err(e) => Err(format!("approve failed: {e}")),
+            Ok(other) => Err(format!("approve: unexpected decision {other:?}")),
+        },
+        GateVerb::Reject => {
+            match store.reject_gate(run_id, approver, REJECT_REASON, now, Some(&gate.step_id)) {
+                Ok(ApprovalDecision::Rejected {
+                    step_id, reason, ..
+                }) => Ok(GateFollowUp::Cleanup {
+                    step_id,
+                    reason,
+                    via: if policy == Some(TimeoutAction::Reject) {
+                        "timeout"
+                    } else {
+                        "human"
+                    },
+                    approver: approver.to_string(),
+                }),
+                Err(e) => Err(format!("reject failed: {e}")),
+                Ok(other) => Err(format!("reject: unexpected decision {other:?}")),
+            }
+        }
+    }
+}
+
+/// Run a decided gate's follow-up in this process: the resume for an approve,
+/// the `on_reject` chain for a reject. `Err` is the message for the notice
+/// row.
+async fn run_follow_up(
+    runs_dir: &Path,
+    run_id: &str,
+    follow_up: GateFollowUp,
+) -> Result<(), String> {
+    let store = RunStore::new(runs_dir.to_path_buf());
+    match follow_up {
+        GateFollowUp::Resume {
+            step_id,
+            approver,
+            via_timeout,
+        } => crate::resume::resume_run(&store, run_id, &step_id, None, &approver, via_timeout)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("resume failed: {e:#}")),
+        GateFollowUp::Cleanup {
+            step_id,
+            reason,
+            via,
+            approver,
+        } => {
+            let (opts, _chain_len) =
+                crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, None)
+                    .await
+                    .map_err(|e| format!("on_reject cleanup unavailable: {e:#}"))?;
+            rupu_orchestrator::runner::run_reject_cleanup(
+                opts,
+                &step_id,
+                &reason,
+                via,
+                Some(&approver),
+            )
+            .await
+            .map_err(|e| format!("on_reject cleanup failed: {e}"))?;
+            // The chain just ran synchronously: clear the pending marker so
+            // `cp serve`'s gate sweep does not run it a second time.
+            // Best-effort — a failure to clear must not hide a success.
+            let _ = store.clear_reject_cleanup(run_id);
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The loop
+// ---------------------------------------------------------------------------
+
+/// A one-line message under the feed (pause requested, gate decided, a
+/// failure). Replaced by the next one and gone after [`NOTICE_TTL`].
+struct Notice {
+    line: Line,
+    until: Instant,
+    /// A "run parked at a gate" pointer: dropped as soon as it is acted on.
+    pointer: bool,
+}
+
+fn notice_line(text: &str, bad: bool) -> Line {
+    let text = printable(text);
+    let line = Line::new().dim("» ");
+    if bad {
+        line.danger(text)
+    } else {
+        line.plain(text)
+    }
+}
+
+/// Everything the loop owns between ticks.
+struct Live {
     workflow: Workflow,
-    runs_dir: std::path::PathBuf,
+    store: RunStore,
+    runs_dir: PathBuf,
     run_id: String,
     pricing: rupu_config::PricingConfig,
-) -> std::io::Result<()> {
-    use crossterm::cursor::MoveTo;
-    use crossterm::queue;
-    use crossterm::style::Print;
-    use crossterm::terminal::{self, Clear, ClearType};
-    use std::io::Write;
-
-    let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
-    let events_path = runs_dir.join(&run_id).join("events.jsonl");
-    let mut events_tailer = crate::output::jsonl_reader::WfEventTailer::new(&events_path);
-    let mut state = LiveRunState::from_workflow(&workflow, &run_id);
-
-    let mut transcript_tailer: Option<(std::path::PathBuf, crate::output::TranscriptTailer)> = None;
-    let mut last_usage_refresh: Option<std::time::Instant> = None;
-    let mut tick: u64 = 0;
-    let mut stdout = std::io::stdout();
-    // Take the alternate screen. The guard restores the normal screen
-    // (and cursor) on every exit path via Drop.
-    let _screen = AltScreenGuard::enter()?;
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    loop {
-        interval.tick().await;
-        tick += 1;
-
-        // Non-blocking keypress check: `Esc` requests a cooperative
-        // pause (see `handle_live_run_keypress`). Drains every pending
-        // key event this tick so a held/repeated Esc doesn't queue up
-        // stale reads for the next iteration.
-        while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                handle_live_run_keypress(key, &store, &run_id, &mut state);
-            }
-        }
-
-        // Drain workflow events. `UnitStarted` may re-point the focus to
-        // a fan-out unit's transcript (see below).
-        for ev in events_tailer.drain_events() {
-            state.apply(&ev);
-        }
-
-        // Decide which transcript drives the focus feed. During a
-        // fan-out the active UNIT's transcript (from the most recent
-        // `UnitStarted`) wins; `run.json`'s active_step_transcript_path
-        // is null then. For a linear step, fall back to that path.
-        if let Ok(record) = store.load(&run_id) {
-            if state.codename.is_none() {
-                state.codename = Some(crate::output::codename::display_codename(
-                    record.codename.as_deref(),
-                    &run_id,
-                    None,
-                ));
-            }
-            if let Some(step_id) = record.active_step_id.clone() {
-                // Don't clobber a fan-out unit focus set by UnitStarted.
-                if state.active.active_unit_transcript.is_none() {
-                    state.active.step_id = Some(step_id.clone());
-                    if record.active_step_agent.is_some() {
-                        state.active.agent = record.active_step_agent.clone();
-                    }
-                }
-            }
-        }
-        // `focused_transcript` folds in the operator's pinned selection
-        // (Task 2): `None` reproduces the precedence above verbatim,
-        // `Some(node)` resolves that node's own transcript instead.
-        let active_step_transcript_path = store
-            .load(&run_id)
-            .ok()
-            .and_then(|r| r.active_step_transcript_path);
-        let desired_transcript = state.focused_transcript(active_step_transcript_path);
-        if let Some(path) = desired_transcript {
-            let need_new = transcript_tailer
-                .as_ref()
-                .map(|(p, _)| p != &path)
-                .unwrap_or(true);
-            if need_new {
-                transcript_tailer =
-                    Some((path.clone(), crate::output::TranscriptTailer::new(path)));
-                // `apply(UnitStarted)` already cleared the feed; clearing
-                // again here is harmless and covers the linear re-point.
-                state.active.feed.clear();
-            }
-        }
-        // The focused transcript feeds the activity feed only. Tokens and
-        // cost come from the run's usage fold below — tailing one focused
-        // transcript saw neither the other units nor dispatch children,
-        // and re-read (re-counted) a transcript whenever focus returned.
-        if let Some((_, tailer)) = transcript_tailer.as_mut() {
-            for ev in tailer.drain() {
-                let now = Utc::now();
-                if let Some((kind, text)) = map_transcript_event(&ev, now) {
-                    state.push_activity(now, kind, text);
-                }
-            }
-        }
-
-        // Tokens + cost from the shared fold, once a second. `run_usage`
-        // is incremental (reads only bytes appended since the last call),
-        // so this stays cheap on a long run.
-        if last_usage_refresh.is_none_or(|at| at.elapsed() >= USAGE_REFRESH_EVERY) {
-            refresh_run_usage(&mut state, &store, &run_id, &pricing);
-            last_usage_refresh = Some(std::time::Instant::now());
-        }
-
-        // Repaint. Re-query the size every tick so a mid-run terminal
-        // resize is reflected immediately. `render_view` hard-bounds the
-        // frame to `(cols, rows)` so it can never overflow or wrap.
-        let now = Utc::now();
-        let (cols, rows) = terminal::size().unwrap_or((100, 30));
-        let _ = tick; // spinner advance is handled via heartbeat / glyphs
-        let frame = render_view(&state, &workflow, now, cols as usize, rows as usize);
-
-        let _ = queue!(stdout, MoveTo(0, 0), Clear(ClearType::All));
-        for line in &frame {
-            let _ = queue!(stdout, Print(line), Print("\r\n"));
-        }
-        let _ = stdout.flush();
-
-        // `Paused` is deliberately NOT in `RunStatus::is_terminal()` (a
-        // paused run is fully resumable, unlike Completed/Failed/
-        // Rejected/Cancelled) — but the process driving THIS view exits
-        // once its `run_workflow` future returns from the cooperative
-        // pause, so the loop must stop here too or it would spin forever
-        // waiting for a status that will only change in a *different*
-        // (resumed) process/run.
-        if state.status.is_terminal() || state.status == RunStatus::Paused {
-            break;
-        }
-    }
-
-    // Render one final frame reflecting the terminal state, then drop the
-    // guard to restore the normal screen. The caller prints the shared
-    // completion summary there (see `cmd::workflow`), so this view emits no
-    // trailing line of its own. Refresh the fold first so the final frame
-    // carries the final spend, not up-to-a-second-stale figures.
-    refresh_run_usage(&mut state, &store, &run_id, &pricing);
-    let now = Utc::now();
-    let (cols, rows) = terminal::size().unwrap_or((100, 30));
-    let frame = render_view(&state, &workflow, now, cols as usize, rows as usize);
-    let _ = queue!(stdout, MoveTo(0, 0), Clear(ClearType::All));
-    for line in &frame {
-        let _ = queue!(stdout, Print(line), Print("\r\n"));
-    }
-    let _ = stdout.flush();
-
-    drop(_screen);
-    Ok(())
+    approver: String,
+    view: RunView,
+    nav: NavState,
+    mux: TranscriptMux,
+    renderer: LiveRenderer,
+    tailer: WfEventTailer,
+    paths: TranscriptIndex,
+    /// The previous generation's finished outcome, replayed on attach.
+    stale_gen: Option<u64>,
+    /// `v` / `enter` at a focused gate: show its details instead of the feed.
+    show_details: bool,
+    gate_findings: Vec<GateFinding>,
+    notice: Option<Notice>,
+    /// The gate the "run parked" notice was last shown for, so it fires once
+    /// per park rather than every tick.
+    parked_hint: Option<String>,
+    /// Follow-ups of in-view gate decisions (resume / on_reject cleanup).
+    /// Joined on exit so leaving the view never kills the run it resumed.
+    background: Vec<JoinHandle<()>>,
+    msgs_tx: UnboundedSender<String>,
+    msgs_rx: UnboundedReceiver<String>,
+    last_slow: Option<Instant>,
 }
 
-// ---------------------------------------------------------------------------
-// Transcript-event → activity mapping
-// ---------------------------------------------------------------------------
+impl Live {
+    /// Seed the view from the workflow, replay `events.jsonl` and read
+    /// `run.json`, so the first frame is already true. The slow files (usage
+    /// fold, step results) are read after it is painted.
+    fn new(
+        workflow: Workflow,
+        runs_dir: PathBuf,
+        run_id: String,
+        pricing: rupu_config::PricingConfig,
+    ) -> Self {
+        let store = RunStore::new(runs_dir.clone());
+        let (msgs_tx, msgs_rx) = unbounded_channel();
+        let mut live = Self {
+            view: seed_view(&workflow, &run_id),
+            nav: NavState::default(),
+            mux: TranscriptMux::new(tail_budget(rupu_agent::fd_budget::fd_usage())),
+            renderer: LiveRenderer::new(),
+            tailer: WfEventTailer::new(runs_dir.join(&run_id).join("events.jsonl")),
+            paths: TranscriptIndex::default(),
+            stale_gen: None,
+            show_details: false,
+            gate_findings: Vec::new(),
+            notice: None,
+            parked_hint: None,
+            background: Vec::new(),
+            msgs_tx,
+            msgs_rx,
+            last_slow: None,
+            approver: whoami::username(),
+            workflow,
+            store,
+            runs_dir,
+            run_id,
+            pricing,
+        };
+        live.drain_events();
+        live.stale_gen = stale_terminal_gen(&live.view);
+        live.overlay();
+        live
+    }
 
-/// Map a transcript event to a focus-feed activity line, if it should
-/// surface. Returns `None` for events that don't add signal (turn
-/// boundaries, run start/stop, deltas). Pure + unit-tested.
-pub fn map_transcript_event(
-    ev: &rupu_transcript::Event,
-    now: DateTime<Utc>,
-) -> Option<(ActivityKind, String)> {
-    use rupu_transcript::Event as Tx;
-    let _ = now;
-    match ev {
-        Tx::ToolCall { tool, input, .. } => {
-            let arg = tool_key_arg(tool, input);
-            let text = if arg.is_empty() {
-                tool.clone()
-            } else {
-                format!("{tool}  {arg}")
+    /// Fold newly appended events into the model and register their
+    /// transcripts with the mux.
+    fn drain_events(&mut self) {
+        for ev in self.tailer.drain_events() {
+            self.view.apply(&ev);
+            if let Some((path, codename)) = self.paths.note(&self.view, &ev) {
+                self.mux.observe(path, codename);
+            }
+        }
+    }
+
+    /// Re-read `run.json` into the view (crew, gates, parked status).
+    fn overlay(&mut self) {
+        if let Ok(rec) = self.store.load(&self.run_id) {
+            overlay_record(&mut self.view, &rec);
+        }
+    }
+
+    /// The per-tick intake: events, `run.json`, follow-up results, and a nav
+    /// reconcile against the (possibly grown / replaced) view.
+    fn ingest(&mut self) {
+        self.drain_events();
+        self.overlay();
+        while let Ok(msg) = self.msgs_rx.try_recv() {
+            self.set_notice(&msg, true);
+        }
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|n| Instant::now() >= n.until)
+        {
+            self.notice = None;
+        }
+        self.nav.sync(&self.view);
+        let gate_focused = self.nav.focused_gate(&self.view).is_some();
+        if !gate_focused {
+            self.show_details = false;
+        }
+        self.hint_parked_gate(gate_focused);
+    }
+
+    /// A run that parks while the operator is looking elsewhere (drilled into
+    /// a unit, say) keeps their selection — the gate keys only apply once it
+    /// is focused — so say once that it is waiting and how to reach it.
+    fn hint_parked_gate(&mut self, gate_focused: bool) {
+        // The pointer has done its job once the gate is focused.
+        if gate_focused && self.notice.as_ref().is_some_and(|n| n.pointer) {
+            self.notice = None;
+        }
+        let parked = if self.view.status == RunStatus::AwaitingApproval {
+            self.view.gates.first().map(|g| g.step_id.clone())
+        } else {
+            None
+        };
+        match (parked, gate_focused) {
+            (Some(step), false) if self.parked_hint.as_ref() != Some(&step) => {
+                self.set_notice(
+                    &format!(
+                        "run parked at gate {step} — press a to jump to it, then a approve / r reject"
+                    ),
+                    false,
+                );
+                if let Some(n) = self.notice.as_mut() {
+                    n.pointer = true;
+                }
+                self.parked_hint = Some(step);
+            }
+            (None, _) => self.parked_hint = None,
+            _ => {}
+        }
+    }
+
+    /// The slow, file-reading parts, at most once a second (`force` skips the
+    /// rate limit): the usage fold (incremental, cheap on a long run) and
+    /// `step_results.jsonl` (findings, loop iteration, host).
+    fn refresh_slow(&mut self, force: bool) {
+        if !force
+            && self
+                .last_slow
+                .is_some_and(|t| t.elapsed() < SLOW_REFRESH_EVERY)
+        {
+            return;
+        }
+        self.last_slow = Some(Instant::now());
+        self.view.usage = Some(rupu_cp::usage::summarize_run(
+            &self.store,
+            &self.run_id,
+            &self.pricing,
+        ));
+        if let Ok(records) = self.store.read_step_results(&self.run_id) {
+            overlay_step_results(&mut self.view, &records);
+            self.gate_findings = gate_findings(&records);
+        }
+    }
+
+    fn set_notice(&mut self, text: &str, bad: bool) {
+        self.notice = Some(Notice {
+            line: notice_line(text, bad),
+            until: Instant::now() + NOTICE_TTL,
+            pointer: false,
+        });
+    }
+
+    /// Drain pending key presses. `Some` when one asks to leave.
+    fn poll_keys(&mut self) -> Option<Exit> {
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let key = match event::read() {
+                Ok(TermEvent::Key(key)) => key,
+                Ok(_) => continue,
+                Err(_) => break,
             };
-            Some((ActivityKind::ToolCall, text))
-        }
-        Tx::ActionEmitted { kind, payload, .. } => {
-            // `report_finding` actions surface as findings; coverage
-            // marks surface as coverage; others are skipped.
-            if kind.contains("finding") {
-                let sev = payload
-                    .get("severity")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_uppercase();
-                let title = payload
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(kind);
-                let text = if sev.is_empty() {
-                    title.to_string()
-                } else {
-                    format!("{sev}  {title}")
-                };
-                Some((ActivityKind::Finding, text))
-            } else if kind.contains("coverage") {
-                let id = payload
-                    .get("id")
-                    .or_else(|| payload.get("control_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(kind);
-                Some((ActivityKind::Coverage, id.to_string()))
-            } else {
-                None
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // Re-derived per key: an approve in this very drain may have
+            // just retired the gate.
+            let gate_focused = self.nav.focused_gate(&self.view).is_some();
+            let Some(action) = decode_key(key.code, key.modifiers, gate_focused) else {
+                continue;
+            };
+            if let Some(exit) = self.apply_action(action) {
+                return Some(exit);
             }
         }
-        // A denied catalog call (step `actions:` narrowing or the run's
-        // permission mode) — the ONE tool_audit outcome operators must
-        // never miss. Allowed calls stay silent here (the paired
-        // `ToolCall` line above already surfaced the attempt); we're not
-        // duplicating the whole audit trail into the focus feed, just
-        // making sure a denial is never invisible.
-        Tx::ToolAudit { tool, blocked, .. } if *blocked => {
-            Some((ActivityKind::Blocked, format!("{tool}  blocked")))
+        None
+    }
+
+    fn apply_action(&mut self, action: KeyAction) -> Option<Exit> {
+        match action {
+            KeyAction::Nav(key) => match self.nav.apply(key, &self.view) {
+                NavAction::Quit => return Some(Exit::Quit),
+                NavAction::Pause => self.request_pause(),
+                NavAction::None => {}
+            },
+            KeyAction::Approve => self.decide(GateVerb::Approve),
+            KeyAction::Reject => self.decide(GateVerb::Reject),
+            KeyAction::ToggleDetails => self.show_details = !self.show_details,
         }
-        _ => None,
+        None
+    }
+
+    /// `Esc`: ask the run to pause cooperatively — the exact primitive
+    /// `rupu workflow pause` uses, which writes to the store rather than
+    /// stdout so it is safe on the alternate screen. The view stays up until
+    /// the run actually stops (`RunPaused`), so the operator watches it land.
+    fn request_pause(&mut self) {
+        // A run resumed from this view runs without a pause channel
+        // (`resume_run` wires none); flipping its record to `Paused` would
+        // claim a pause nothing will honor.
+        if self.background.iter().any(|h| !h.is_finished()) {
+            self.set_notice(
+                "pause is not available for a run resumed from this view \
+                 (q leaves it running; rupu workflow cancel stops it)",
+                true,
+            );
+            return;
+        }
+        match crate::cmd::workflow::pause_with_store(&self.store, &self.run_id) {
+            Ok(()) => {
+                let msg = format!(
+                    "pause requested — will stop at next safe boundary \
+                     (resume: rupu workflow resume {})",
+                    self.run_id
+                );
+                self.set_notice(&msg, false);
+            }
+            Err(e) => self.set_notice(&format!("{e:#}"), true),
+        }
+    }
+
+    /// `a` / `r` at the focused gate: record the decision, then run its
+    /// follow-up in the background while the view keeps following the run.
+    fn decide(&mut self, verb: GateVerb) {
+        let Some(gate) = self.nav.focused_gate(&self.view).cloned() else {
+            return;
+        };
+        match decide_gate(
+            &self.store,
+            &self.workflow,
+            &self.run_id,
+            &gate,
+            verb,
+            &self.approver,
+            Utc::now(),
+        ) {
+            Ok(follow_up) => {
+                let (what, step) = match verb {
+                    GateVerb::Approve => ("approved", "resuming the run"),
+                    GateVerb::Reject => ("rejected", "running its on_reject cleanup"),
+                };
+                self.set_notice(&format!("{what} {} — {step}", gate.step_id), false);
+                self.spawn_follow_up(follow_up);
+            }
+            Err(msg) => self.set_notice(&msg, true),
+        }
+        // The decision rewrote run.json: reflect it now, so the gate stops
+        // being focusable (and advertised) before the next key.
+        self.overlay();
+        self.nav.sync(&self.view);
+    }
+
+    fn spawn_follow_up(&mut self, follow_up: GateFollowUp) {
+        let runs_dir = self.runs_dir.clone();
+        let run_id = self.run_id.clone();
+        let tx = self.msgs_tx.clone();
+        self.background.push(tokio::spawn(async move {
+            if let Err(msg) = run_follow_up(&runs_dir, &run_id, follow_up).await {
+                let _ = tx.send(msg);
+            }
+        }));
+    }
+
+    /// The feed region: a focused gate's details when `v` is on; else the
+    /// pinned stream (drilled into a unit / sub-agent) or the merged firehose;
+    /// plus the notice, last.
+    fn build_feed(&mut self) -> Vec<Line> {
+        let pinned = pinned_path(&self.view, &self.nav, &self.paths);
+        self.mux.pin(pinned.clone());
+        self.mux.drain();
+        let details = self
+            .nav
+            .focused_gate(&self.view)
+            .filter(|_| self.show_details);
+        let mut feed = match details {
+            Some(gate) => gate_detail_lines(gate, &self.gate_findings, Utc::now()),
+            None if pinned.is_some() => self.mux.pinned_lines(),
+            None => self.mux.firehose_lines(),
+        };
+        let notice = self
+            .notice
+            .as_ref()
+            .filter(|n| Instant::now() < n.until)
+            .map(|n| n.line.clone());
+        feed.extend(notice);
+        feed
+    }
+
+    /// Compose and paint one frame at `size` (`(cols, rows)`).
+    fn draw(&mut self, out: &mut impl Write, size: (u16, u16)) {
+        let feed = self.build_feed();
+        let cols = usize::from(size.0).saturating_sub(EDGE_GUARD).max(1);
+        let frame = live_layout(
+            &self.view,
+            &self.nav,
+            &feed,
+            Utc::now(),
+            cols,
+            usize::from(size.1),
+        );
+        // A failed write leaves the screen in an unknown state: forget what
+        // was drawn so the next frame repaints in full.
+        if self.renderer.draw(out, &frame).is_err() {
+            self.renderer.invalidate();
+        }
+    }
+
+    fn run_finished(&self) -> bool {
+        should_exit(self.view.status, self.view.generation, self.stale_gen)
+    }
+
+    /// Wait for the follow-ups of in-view gate decisions. They run in this
+    /// process, so leaving before they finish would kill the run they
+    /// resumed. Called with the terminal already restored.
+    async fn join_background(&mut self) {
+        let pending: Vec<JoinHandle<()>> = self
+            .background
+            .drain(..)
+            .filter(|h| !h.is_finished())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        eprintln!(
+            "rupu: finishing run {} before exit (Ctrl-C aborts)",
+            self.run_id
+        );
+        for handle in pending {
+            let _ = handle.await;
+        }
     }
 }
 
-/// Extract the single most informative argument for a tool call.
-fn tool_key_arg(tool: &str, input: &serde_json::Value) -> String {
-    let candidate = match tool {
-        "read_file" | "write_file" | "edit_file" => input.get("path"),
-        "grep" => input.get("pattern"),
-        "bash" => input.get("command"),
-        _ => None,
+/// Drive the live view on the alternate screen until the run finishes (this
+/// generation's terminal / paused outcome) or the operator leaves. Returns
+/// with the normal screen restored; the caller prints the shared completion
+/// summary there.
+///
+/// Every [`TICK`]: fold new `events.jsonl` lines + `run.json` into the
+/// [`RunView`]; reconcile [`NavState`]; decode keys (`q` / Ctrl-C quit and
+/// leave the run running, `Esc` pauses, an approval gate is modal); pin the
+/// drilled transcript and drain the [`TranscriptMux`]; refresh the usage fold
+/// at most once a second; and diff-render [`live_layout`]'s frame. A terminal
+/// resize repaints in full. [`AltScreen`] restores the terminal on every exit
+/// path, a panic included.
+///
+/// A parked approval gate does not end the view: `a` / `r` record the decision
+/// through the run store and run its follow-up (resume / `on_reject`
+/// cleanup) in this process, the same code `rupu workflow approve` / `reject`
+/// run. The follow-up is joined before returning.
+///
+/// Best-effort: an I/O hiccup degrades to the next tick. The caller guards
+/// entry behind a tty check; non-tty falls back to the line printer.
+pub async fn run_live_view(
+    workflow: Workflow,
+    runs_dir: PathBuf,
+    run_id: String,
+    pricing: rupu_config::PricingConfig,
+) -> io::Result<()> {
+    let mut live = Live::new(workflow, runs_dir, run_id, pricing);
+    let screen = AltScreen::enter()?;
+    // The renderer flushes once per frame; buffering turns a frame's many
+    // small queued writes into one syscall (a bare stdout lock flashes).
+    let mut out = BufWriter::new(io::stdout());
+
+    let mut interval = tokio::time::interval(TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_size: Option<(u16, u16)> = None;
+    let mut size = (100, 30);
+    let exit = loop {
+        interval.tick().await;
+        size = terminal::size().unwrap_or(size);
+        if last_size.replace(size) != Some(size) {
+            // A resize can reflow or drop rows behind the renderer's back.
+            live.renderer.invalidate();
+        }
+        live.ingest();
+        if let Some(exit) = live.poll_keys() {
+            break exit;
+        }
+        live.draw(&mut out, size);
+        live.refresh_slow(false);
+        if live.run_finished() {
+            break Exit::RunFinished;
+        }
     };
-    candidate
-        .or_else(|| input.get("path"))
-        .or_else(|| input.get("query"))
-        .and_then(|v| v.as_str())
-        .map(|s| truncate_plain(s, 48))
-        .unwrap_or_default()
+
+    if exit == Exit::RunFinished {
+        // One last frame carrying the final spend, not up-to-a-second-stale
+        // figures.
+        live.ingest();
+        live.refresh_slow(true);
+        live.draw(&mut out, size);
+    }
+    drop(out);
+    drop(screen);
+    live.join_background().await;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use rupu_orchestrator::executor::Event;
 
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for inner in chars.by_ref() {
-                    if inner == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
+    const NONE: KeyModifiers = KeyModifiers::NONE;
 
-    fn ts(sec: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 6, 17, 17, 42, sec).unwrap()
-    }
-
-    fn fanout_state(active: bool) -> LiveRunState {
-        let units = vec![
-            UnitState {
-                codename: None,
-                provider: None,
-                model: None,
-                key: "conf-manager".into(),
-                status: NodeStatus::Complete,
-                tokens: 210_000,
-                elapsed_secs: 12,
-                transcript_path: Some(std::path::PathBuf::from("/runs/conf-manager.jsonl")),
-                sub_run_id: None,
-                index: Some(0),
-            },
-            UnitState {
-                codename: None,
-                provider: None,
-                model: None,
-                key: "tlb-agent".into(),
-                status: NodeStatus::Complete,
-                tokens: 180_000,
-                elapsed_secs: 11,
-                transcript_path: Some(std::path::PathBuf::from("/runs/tlb-agent.jsonl")),
-                sub_run_id: None,
-                index: Some(1),
-            },
-            UnitState {
-                codename: None,
-                provider: None,
-                model: None,
-                key: "app-gw".into(),
-                status: NodeStatus::Working,
-                tokens: 120_000,
-                elapsed_secs: 8,
-                transcript_path: Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
-                sub_run_id: None,
-                index: Some(2),
-            },
-            UnitState {
-                codename: None,
-                provider: None,
-                model: None,
-                key: "rtc".into(),
-                status: NodeStatus::Waiting,
-                tokens: 0,
-                elapsed_secs: 0,
-                transcript_path: None,
-                sub_run_id: None,
-                index: Some(3),
-            },
-            UnitState {
-                codename: None,
-                provider: None,
-                model: None,
-                key: "auth".into(),
-                status: NodeStatus::Waiting,
-                tokens: 0,
-                elapsed_secs: 0,
-                transcript_path: None,
-                sub_run_id: None,
-                index: Some(4),
-            },
-        ];
-        let assess = StepState {
-            codename: None,
-            provider: None,
-            model: None,
-            id: "assess".into(),
-            kind: StepKind::ForEach,
-            agent: Some("for_each".into()),
-            status: if active {
-                NodeStatus::Working
-            } else {
-                NodeStatus::Complete
-            },
-            tokens_in: 890_000,
-            tokens_out: 0,
-            elapsed_secs: 0,
-            units,
-            fanout_total: Some(5),
-            panel_iter: None,
-            panel_findings: 0,
-        };
-        LiveRunState {
-            codename: None,
-            workflow_name: "oracle-assessor-workflow".into(),
-            run_id: "run_01ABC".into(),
-            status: RunStatus::Running,
-            started_at: Some(ts(0)),
-            finished_at: None,
-            steps: vec![
-                StepState {
-                    codename: None,
-                    provider: None,
-                    model: None,
-                    id: "understand".into(),
-                    kind: StepKind::Linear,
-                    agent: Some("oracle-recon".into()),
-                    status: NodeStatus::Complete,
-                    tokens_in: 102_000,
-                    tokens_out: 0,
-                    elapsed_secs: 18,
-                    units: Vec::new(),
-                    fanout_total: None,
-                    panel_iter: None,
-                    panel_findings: 0,
-                },
-                assess,
-                StepState {
-                    codename: None,
-                    provider: None,
-                    model: None,
-                    id: "sweep".into(),
-                    kind: StepKind::Panel,
-                    agent: None,
-                    status: NodeStatus::Working,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    elapsed_secs: 0,
-                    units: Vec::new(),
-                    fanout_total: None,
-                    panel_iter: Some((2, 10)),
-                    panel_findings: 2,
-                },
-                StepState {
-                    codename: None,
-                    provider: None,
-                    model: None,
-                    id: "report".into(),
-                    kind: StepKind::Linear,
-                    agent: None,
-                    status: NodeStatus::Waiting,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    elapsed_secs: 0,
-                    units: Vec::new(),
-                    fanout_total: None,
-                    panel_iter: None,
-                    panel_findings: 0,
-                },
-            ],
-            tokens_in: 1_200_000,
-            tokens_out: 45_000,
-            cost: Some(3.40),
-            findings_count: Some(12),
-            coverage_pct: Some(78),
-            active: ActiveFocus {
-                codename: None,
-                provider: None,
-                model: None,
-                step_id: Some("assess".into()),
-                unit_key: Some("app-gw".into()),
-                agent: Some("oracle-assessor".into()),
-                active_unit_transcript: None,
-                feed: Vec::new(),
-                last_event_at: Some(ts(31)),
-            },
-            selected: None,
-        }
-    }
-
-    fn empty_workflow() -> Workflow {
-        // The graph renderer drives off LiveRunState.steps, not the
-        // workflow itself, so an empty workflow is sufficient.
-        serde_yaml::from_str("name: w\nsteps: []\n").unwrap()
-    }
-
-    fn stripped(rows: Vec<String>) -> Vec<String> {
-        rows.iter().map(|r| strip_ansi(r)).collect()
+    fn nav(k: NavKey) -> Option<KeyAction> {
+        Some(KeyAction::Nav(k))
     }
 
     #[test]
-    fn spinner_cycles() {
-        assert_eq!(spinner_frame(0), '⠋');
-        assert_eq!(spinner_frame(1), '⠙');
-        assert_eq!(spinner_frame(10), '⠋');
-        assert_eq!(spinner_frame(19), '⠏');
-    }
-
-    #[test]
-    fn dashboard_progress_bar_blends_active_step_units() {
-        // 1 of 4 steps complete (understand), plus the active fan-out
-        // `assess` step is 2/5 units done. The bar is unit-aware:
-        // (1 + 0.4) / 4 = 0.35 → 0.35 * 24 = 8.4 → round = 8 filled.
-        let state = fanout_state(true);
-        let rows = stripped(render_dashboard(&state, ts(31), 79));
-        let prog = rows.iter().find(|r| r.contains("step ")).unwrap();
-        assert!(prog.contains("step 1/4"), "got {prog:?}");
-        assert_eq!(prog.matches('█').count(), 8, "got {prog:?}");
-        assert_eq!(prog.matches('░').count(), 16, "got {prog:?}");
-    }
-
-    #[test]
-    fn dashboard_meters_always_show_tokens_and_cost() {
-        let state = fanout_state(true);
-        let rows = stripped(render_dashboard(&state, ts(31), 79));
-        let meters = rows.iter().find(|r| r.contains("⇡")).unwrap();
-        assert!(meters.contains("⇡ 1.2M"), "got {meters:?}");
-        assert!(meters.contains("⇣ 45K"), "got {meters:?}");
-        assert!(meters.contains("$3.40"), "got {meters:?}");
-    }
-
-    #[test]
-    fn dashboard_findings_and_coverage_shown_when_present() {
-        let state = fanout_state(true);
-        let rows = stripped(render_dashboard(&state, ts(31), 79));
-        let meters = rows.iter().find(|r| r.contains("⇡")).unwrap();
-        assert!(meters.contains("findings 12"), "got {meters:?}");
-        assert!(meters.contains("78%"), "got {meters:?}");
-    }
-
-    #[test]
-    fn dashboard_findings_and_coverage_hidden_when_absent() {
-        let mut state = fanout_state(true);
-        state.findings_count = None;
-        state.coverage_pct = None;
-        state.findings_count = Some(0); // zero also hides findings
-        let rows = stripped(render_dashboard(&state, ts(31), 79));
-        let meters = rows.iter().find(|r| r.contains("⇡")).unwrap();
-        assert!(!meters.contains("findings"), "got {meters:?}");
-        assert!(!meters.contains("coverage"), "got {meters:?}");
-    }
-
-    #[test]
-    fn graph_active_fanout_expands_units() {
-        let state = fanout_state(true);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        // Active assess expands all 5 units.
-        assert!(rows.iter().any(|r| r.contains("conf-manager")), "{rows:#?}");
-        assert!(rows.iter().any(|r| r.contains("tlb-agent")));
-        assert!(rows.iter().any(|r| r.contains("app-gw")));
-        assert!(rows.iter().any(|r| r.contains("rtc")));
-        assert!(rows.iter().any(|r| r.contains("auth")));
-        // Mid branches use ┣━, last uses ┗━.
-        assert!(rows.iter().any(|r| r.starts_with("┣━")), "{rows:#?}");
-        assert!(rows.iter().any(|r| r.starts_with("┗━")), "{rows:#?}");
-        // Completed units carry ✓; working unit reads "working".
-        let app_gw = rows.iter().find(|r| r.contains("app-gw")).unwrap();
-        assert!(app_gw.contains("working"), "{app_gw:?}");
-        let queued = rows.iter().find(|r| r.contains("rtc")).unwrap();
-        assert!(queued.contains("queued"), "{queued:?}");
-    }
-
-    #[test]
-    fn graph_inactive_fanout_collapses_to_done_over_total() {
-        let state = fanout_state(false);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        // assess is complete (not active) → collapsed, no unit rows.
-        assert!(
-            !rows.iter().any(|r| r.contains("conf-manager")),
-            "{rows:#?}"
-        );
-        let assess = rows.iter().find(|r| r.contains("assess")).unwrap();
-        // done_units counts Complete+Failed: conf-manager + tlb-agent = 2 of 5.
-        assert!(assess.contains("2/5"), "{assess:?}");
-    }
-
-    #[test]
-    fn graph_panel_shows_iteration() {
-        let state = fanout_state(true);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        let panel = rows.iter().find(|r| r.contains("sweep")).unwrap();
-        assert!(panel.contains("⟲ iter 2/10"), "{panel:?}");
-        assert!(panel.contains("2 found"), "{panel:?}");
-    }
-
-    #[test]
-    fn graph_failed_unit_shows_cross() {
-        let mut state = fanout_state(true);
-        state.steps[1].units[2].status = NodeStatus::Failed;
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        let app_gw = rows.iter().find(|r| r.contains("app-gw")).unwrap();
-        assert!(app_gw.contains('✗'), "{app_gw:?}");
-    }
-
-    #[test]
-    fn graph_uses_heavy_spine() {
-        let state = fanout_state(true);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        assert!(rows.iter().any(|r| r == "┃"), "{rows:#?}");
-    }
-
-    #[test]
-    fn focus_heartbeat_formats_seconds_ago() {
-        let mut state = fanout_state(true);
-        state.active.last_event_at = Some(ts(31));
-        let rows = stripped(render_focus(&state, ts(33), 79, 8));
-        let header = &rows[0];
-        assert!(header.contains("active 2s ago"), "{header:?}");
-        assert!(header.contains("app-gw · oracle-assessor"), "{header:?}");
-    }
-
-    #[test]
-    fn focus_feed_respects_height_cap() {
-        let mut state = fanout_state(true);
-        for i in 0..50u32 {
-            state.push_activity(ts(i % 60), ActivityKind::ToolCall, format!("event {i}"));
-        }
-        // height 8 → 6 body rows.
-        let rows = render_focus(&state, ts(59), 79, 8);
-        assert_eq!(rows.len(), 8, "1 top + 6 body + 1 bottom");
-        let stripped_rows = stripped(rows);
-        // Most recent event (49) is shown; an old one (10) is not.
-        assert!(stripped_rows.iter().any(|r| r.contains("event 49")));
-        assert!(!stripped_rows.iter().any(|r| r.contains("event 10")));
-    }
-
-    #[test]
-    fn focus_failed_run_shows_resume_hint() {
-        let mut state = fanout_state(true);
-        state.status = RunStatus::Failed;
-        let rows = stripped(render_focus(&state, ts(33), 79, 8));
-        assert!(
-            rows.iter()
-                .any(|r| r.contains("↳ rupu workflow resume run_01ABC")),
-            "{rows:#?}"
-        );
-    }
-
-    #[test]
-    fn agent_started_shows_name_provider_model_in_focus_and_graph() {
-        let mut state = fanout_state(true);
-        state.apply(&WfEvent::StepStarted {
-            run_id: "run_01ABC".into(),
-            step_id: "report".into(),
-            kind: StepKind::Linear,
-            agent: Some("reporter".into()),
-            host: None,
-            codename: Some("jade-reef/heron".into()),
-        });
-        state.apply(&WfEvent::AgentStarted {
-            run_id: "run_01ABC".into(),
-            step_id: "report".into(),
-            unit_index: None,
-            codename: Some("jade-reef/heron".into()),
-            agent: "reporter".into(),
-            provider: Some("anthropic".into()),
-            model: Some("claude-opus-5-5".into()),
-            agent_run_id: "run_x".into(),
-            transcript_path: std::path::PathBuf::from("/tmp/x.jsonl"),
-        });
-        let focus = stripped(render_focus(&state, ts(33), 100, 6));
-        assert!(
-            focus
-                .iter()
-                .any(|r| r.contains("heron · reporter · anthropic/claude-opus-5-5")),
-            "{focus:#?}"
-        );
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.provider.as_deref(), Some("anthropic"));
-    }
-
-    #[test]
-    fn dispatched_subagent_focus_header_does_not_repeat_agent() {
-        let mut state = fanout_state(true);
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_1".into(),
-            agent: Some("lynx-helper".into()),
-            transcript_path: std::path::PathBuf::from("/tmp/d.jsonl"),
-            codename: Some("jade-reef/heron#1>lynx#1".into()),
-            provider: Some("anthropic".into()),
-            model: Some("claude-opus-5-5".into()),
-        });
-        let focus = stripped(render_focus(&state, ts(33), 120, 6));
-        let head = &focus[0];
-        assert!(
-            head.contains("lynx#1 · lynx-helper · anthropic/claude-opus-5-5"),
-            "{head}"
-        );
-        assert_eq!(head.matches("lynx-helper").count(), 1, "{head}");
-    }
-
-    #[test]
-    fn unit_started_then_agent_started_labels_unit_row() {
-        let mut state = fanout_state(true);
-        let step_id = state
-            .steps
-            .iter()
-            .find(|s| matches!(s.kind, StepKind::ForEach | StepKind::Parallel))
-            .map(|s| s.id.clone())
-            .unwrap();
-        state.apply(&WfEvent::UnitStarted {
-            run_id: "run_01ABC".into(),
-            step_id: step_id.clone(),
-            index: 0,
-            unit_key: "src/a.rs".into(),
-            agent: Some("reviewer".into()),
-            transcript_path: std::path::PathBuf::from("/tmp/u.jsonl"),
-            host: None,
-            codename: Some("jade-reef/lynx#1".into()),
-        });
-        state.apply(&WfEvent::AgentStarted {
-            run_id: "run_01ABC".into(),
-            step_id: step_id.clone(),
-            unit_index: Some(0),
-            codename: Some("jade-reef/lynx#1".into()),
-            agent: "reviewer".into(),
-            provider: Some("openai".into()),
-            model: Some("gpt-5".into()),
-            agent_run_id: "run_y".into(),
-            transcript_path: std::path::PathBuf::from("/tmp/u.jsonl"),
-        });
-        let unit = &state.steps.iter().find(|s| s.id == step_id).unwrap().units[0];
-        assert_eq!(unit.codename.as_deref(), Some("jade-reef/lynx#1"));
-        assert_eq!(state.active.model.as_deref(), Some("gpt-5"));
-        let focus = stripped(render_focus(&state, ts(33), 100, 6));
-        assert!(
-            focus
-                .iter()
-                .any(|r| r.contains("src/a.rs · lynx#1 · reviewer · openai/gpt-5")),
-            "{focus:#?}"
-        );
-    }
-
-    #[test]
-    fn apply_step_started_activates_and_resets_feed() {
-        let mut state = fanout_state(true);
-        state.push_activity(ts(1), ActivityKind::Text, "stale");
-        state.apply(&WfEvent::StepStarted {
-            run_id: "run_01ABC".into(),
-            step_id: "report".into(),
-            kind: StepKind::Linear,
-            agent: Some("reporter".into()),
-            host: None,
-            codename: None,
-        });
-        assert_eq!(state.active.step_id.as_deref(), Some("report"));
-        assert_eq!(state.active.agent.as_deref(), Some("reporter"));
-        assert!(state.active.feed.is_empty());
-        assert_eq!(state.status_for("report"), NodeStatus::Active);
-    }
-
-    #[test]
-    fn apply_step_completed_sets_status_and_elapsed() {
-        let mut state = fanout_state(true);
-        state.apply(&WfEvent::StepCompleted {
-            run_id: "run_01ABC".into(),
-            step_id: "understand".into(),
-            success: true,
-            duration_ms: 18_000,
-            host: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "understand").unwrap();
-        assert_eq!(step.status, NodeStatus::Complete);
-        assert_eq!(step.elapsed_secs, 18);
-    }
-
-    #[test]
-    fn map_transcript_tool_call_surfaces_key_arg() {
-        let ev = rupu_transcript::Event::ToolCall {
-            call_id: "c1".into(),
-            tool: "read_file".into(),
-            input: serde_json::json!({"path": "services/app-gw/handler.go"}),
-        };
-        let (kind, text) = map_transcript_event(&ev, ts(0)).unwrap();
-        assert_eq!(kind, ActivityKind::ToolCall);
-        assert!(text.contains("read_file"), "{text:?}");
-        assert!(text.contains("services/app-gw/handler.go"), "{text:?}");
-    }
-
-    #[test]
-    fn map_transcript_finding_action_surfaces_severity() {
-        let ev = rupu_transcript::Event::ActionEmitted {
-            kind: "report_finding".into(),
-            payload: serde_json::json!({"severity": "high", "title": "path traversal"}),
-            allowed: true,
-            applied: true,
-            reason: None,
-        };
-        let (kind, text) = map_transcript_event(&ev, ts(0)).unwrap();
-        assert_eq!(kind, ActivityKind::Finding);
-        assert!(text.starts_with("HIGH"), "{text:?}");
-        assert!(text.contains("path traversal"), "{text:?}");
-    }
-
-    #[test]
-    fn map_transcript_blocked_tool_audit_surfaces_as_blocked() {
-        // Regression (minor fix, tool_audit review): `workflow run`'s live
-        // focus feed used to return `None` for EVERY `ToolAudit` event, so
-        // it was the only one of the 6 tool_audit-consuming surfaces that
-        // never showed a blocked call. A denial must now surface.
-        let ev = rupu_transcript::Event::ToolAudit {
-            tool: "issues.create".into(),
-            declared: true,
-            granted: true,
-            blocked: true,
-            restricted: true,
-        };
-        let (kind, text) = map_transcript_event(&ev, ts(0)).unwrap();
-        assert_eq!(kind, ActivityKind::Blocked);
-        assert!(text.contains("issues.create"), "{text:?}");
-        assert!(text.contains("blocked"), "{text:?}");
-    }
-
-    #[test]
-    fn map_transcript_allowed_tool_audit_stays_silent() {
-        // An allowed call's `tool_audit` line adds no signal beyond the
-        // `ToolCall` line already shown — must not duplicate the feed.
-        let ev = rupu_transcript::Event::ToolAudit {
-            tool: "issues.list".into(),
-            declared: false,
-            granted: true,
-            blocked: false,
-            restricted: false,
-        };
-        assert!(map_transcript_event(&ev, ts(0)).is_none());
-    }
-
-    #[test]
-    fn apply_unit_started_marks_unit_working_and_sets_active_transcript() {
-        let mut state = fanout_state(true);
-        // Pre-seed stale feed to prove the unit switch resets it.
-        state.push_activity(ts(1), ActivityKind::Text, "stale");
-        let path = std::path::PathBuf::from("/runs/run_unit2.jsonl");
-        state.apply(&WfEvent::UnitStarted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 2,
-            unit_key: "app-gw".into(),
-            agent: Some("oracle-assessor".into()),
-            transcript_path: path.clone(),
-            host: None,
-            codename: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.units[2].status, NodeStatus::Working);
-        assert_eq!(step.units[2].key, "app-gw");
-        assert_eq!(state.active.step_id.as_deref(), Some("assess"));
-        assert_eq!(state.active.unit_key.as_deref(), Some("app-gw"));
-        assert_eq!(state.active.active_unit_transcript.as_ref(), Some(&path));
-        assert!(state.active.feed.is_empty(), "feed reset on unit switch");
-    }
-
-    #[test]
-    fn apply_unit_completed_marks_done_without_touching_fold_totals() {
-        let mut state = fanout_state(true);
-        let step_before = (state.steps[1].tokens_in, state.steps[1].tokens_out);
-        let run_before = (state.tokens_in, state.tokens_out);
-        // Unit 3 starts Waiting in the fixture; complete it.
-        state.apply(&WfEvent::UnitCompleted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 3,
-            unit_key: "rtc".into(),
-            success: true,
-            tokens_in: 1000,
-            tokens_out: 250,
-            host: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.units[3].status, NodeStatus::Complete);
-        // The unit shows its own honest total (the only source for a remote
-        // unit, which has no ledger rows) ...
-        assert_eq!(step.units[3].tokens, 1250);
-        // ... but step and run totals are the fold's alone: adding here
-        // would stack on top of the ledger rows the fold already counted.
-        assert_eq!((step.tokens_in, step.tokens_out), step_before);
-        assert_eq!((state.tokens_in, state.tokens_out), run_before);
-        // done_units now counts conf-manager + tlb-agent + rtc = 3.
-        assert_eq!(step.done_units(), 3);
-    }
-
-    #[test]
-    fn apply_unit_completed_never_stacks_on_a_fold_value() {
-        // app-gw (index 2) already carries 120K from the fold; its
-        // UnitCompleted reports the same honest total. It must not double.
-        let mut state = fanout_state(true);
-        state.apply(&WfEvent::UnitCompleted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 2,
-            unit_key: "app-gw".into(),
-            success: true,
-            tokens_in: 100_000,
-            tokens_out: 20_000,
-            host: None,
-        });
-        assert_eq!(state.steps[1].units[2].tokens, 120_000);
-    }
-
-    #[test]
-    fn apply_unit_completed_failure_marks_failed() {
-        let mut state = fanout_state(true);
-        state.apply(&WfEvent::UnitCompleted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 2,
-            unit_key: "app-gw".into(),
-            success: false,
-            tokens_in: 0,
-            tokens_out: 0,
-            host: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.units[2].status, NodeStatus::Failed);
-    }
-
-    #[test]
-    fn apply_unit_started_grows_units_for_fresh_fanout() {
-        // A fresh fan-out step (no pre-seeded units) should grow its
-        // unit vector to address the started index, filling gaps with
-        // Waiting placeholders.
-        let mut state = fanout_state(true);
-        state.steps[1].units.clear();
-        state.apply(&WfEvent::UnitStarted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 3,
-            unit_key: "rtc".into(),
-            agent: Some("oracle-assessor".into()),
-            transcript_path: std::path::PathBuf::from("/runs/u3.jsonl"),
-            host: None,
-            codename: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.units.len(), 4);
-        assert_eq!(step.units[3].status, NodeStatus::Working);
-        assert_eq!(step.units[0].status, NodeStatus::Waiting);
-    }
-
-    /// A fixture with the active focus redirected onto the linear
-    /// `report` step (empty `units`, `Waiting`) so dispatch children land
-    /// in a clean unit list distinct from `assess`'s pre-seeded fan-out
-    /// units — dispatch has no `for_each`/`parallel` index of its own, so
-    /// this exercises the plain "step whose agent dispatches sub-agents"
-    /// shape the feature targets.
-    fn dispatch_state() -> LiveRunState {
-        let mut state = fanout_state(true);
-        state.active.step_id = Some("report".into());
-        state.active.unit_key = None;
-        state.active.agent = None;
-        state.active.active_unit_transcript = None;
-        state
-    }
-
-    /// `fanout_state` with `assess` reset to a single-unit `for_each`
-    /// (no rows yet) whose agent dispatches two children, both completed.
-    fn one_unit_fanout_with_dispatch_children() -> LiveRunState {
-        let mut state = fanout_state(true);
-        let assess = state.steps.iter_mut().find(|s| s.id == "assess").unwrap();
-        assess.units.clear();
-        assess.fanout_total = None;
-        state.apply(&WfEvent::UnitStarted {
-            codename: None,
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 0,
-            unit_key: "only-unit".into(),
-            agent: Some("fanner".into()),
-            transcript_path: std::path::PathBuf::from("/runs/only-unit.jsonl"),
-            host: None,
-        });
-        for child in ["sub_kid_a", "sub_kid_b"] {
-            state.apply(&WfEvent::DispatchStarted {
-                provider: None,
-                model: None,
-                codename: None,
-                run_id: "run_01ABC".into(),
-                sub_run_id: child.into(),
-                agent: Some("helper".into()),
-                transcript_path: std::path::PathBuf::from(format!("/runs/{child}.jsonl")),
-            });
-            state.apply(&WfEvent::DispatchCompleted {
-                run_id: "run_01ABC".into(),
-                sub_run_id: child.into(),
-                success: true,
-                tokens_in: 3,
-                tokens_out: 1,
-            });
-        }
-        state
-    }
-
-    #[test]
-    fn fanout_done_count_ignores_dispatch_child_rows() {
-        let mut state = one_unit_fanout_with_dispatch_children();
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.units.len(), 3, "1 unit + 2 dispatch-child rows");
-        assert_eq!(step.done_units(), 0, "the one unit is still working");
-        assert_eq!(step.total_units(), 1);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        assert!(
-            rows.iter().any(|r| r.contains("0/1")),
-            "header shows 0/1, never 2/3: {rows:#?}"
-        );
-
-        state.apply(&WfEvent::UnitCompleted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 0,
-            unit_key: "only-unit".into(),
-            success: true,
-            tokens_in: 10,
-            tokens_out: 2,
-            host: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.done_units(), 1);
-        assert_eq!(step.total_units(), 1);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
-        assert!(
-            rows.iter().any(|r| r.contains("1/1")) && !rows.iter().any(|r| r.contains("3/1")),
-            "{rows:#?}"
-        );
-    }
-
-    #[test]
-    fn a_step_with_only_dispatch_children_still_counts_them() {
-        // A `parallel` step emits no unit events, so its rows are all
-        // dispatch children: they stay the done/total population.
-        let mut state = dispatch_state();
-        let report = state.steps.iter_mut().find(|s| s.id == "report").unwrap();
-        report.kind = StepKind::Parallel;
-        for (child, done) in [("sub_p1", true), ("sub_p2", false)] {
-            state.apply(&WfEvent::DispatchStarted {
-                provider: None,
-                model: None,
-                codename: None,
-                run_id: "run_01ABC".into(),
-                sub_run_id: child.into(),
-                agent: Some("helper".into()),
-                transcript_path: std::path::PathBuf::from(format!("/runs/{child}.jsonl")),
-            });
-            if done {
-                state.apply(&WfEvent::DispatchCompleted {
-                    run_id: "run_01ABC".into(),
-                    sub_run_id: child.into(),
-                    success: true,
-                    tokens_in: 1,
-                    tokens_out: 1,
-                });
-            }
-        }
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.done_units(), 1);
-        assert_eq!(step.total_units(), 2);
-    }
-
-    #[test]
-    fn apply_dispatch_started_adds_child_node_to_active_step() {
-        let mut state = dispatch_state();
-        let path = std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl");
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: path.clone(),
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.units.len(), 1);
-        let unit = &step.units[0];
-        assert_eq!(unit.status, NodeStatus::Working);
-        assert_eq!(unit.transcript_path.as_ref(), Some(&path));
-        assert_eq!(unit.sub_run_id.as_deref(), Some("sub_child"));
-        assert_eq!(unit.key, "security-reviewer");
-        assert_eq!(step.status, NodeStatus::Working);
-        assert_eq!(state.active.active_unit_transcript.as_ref(), Some(&path));
-
-        // A redelivered `DispatchStarted` for the same `sub_run_id` is
-        // idempotent — it finds the existing slot instead of appending a
-        // duplicate, refreshing its transcript path.
-        let path2 = std::path::PathBuf::from("/runs/run_01ABC/sub_child_retry.jsonl");
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: path2.clone(),
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.units.len(), 1, "no duplicate slot on redelivery");
-        assert_eq!(step.units[0].transcript_path.as_ref(), Some(&path2));
-    }
-
-    #[test]
-    fn apply_dispatch_completed_marks_child_done_by_sub_run_id() {
-        let mut state = dispatch_state();
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            success: true,
-            tokens_in: 500,
-            tokens_out: 120,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        let unit = &step.units[0];
-        assert_eq!(unit.status, NodeStatus::Complete);
-        // The child's own row shows its own spend (display only).
-        assert_eq!(unit.tokens, 620);
-
-        // Failure path marks Failed rather than Complete.
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_fail".into(),
-            agent: Some("other-agent".into()),
-            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_fail.jsonl"),
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_fail".into(),
-            success: false,
-            tokens_in: 0,
-            tokens_out: 0,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        let failed_unit = step
-            .units
-            .iter()
-            .find(|u| u.sub_run_id.as_deref() == Some("sub_fail"))
-            .unwrap();
-        assert_eq!(failed_unit.status, NodeStatus::Failed);
-    }
-
-    #[test]
-    fn apply_dispatch_completed_with_no_matching_unit_is_graceful() {
-        // `DispatchCompleted` with no prior `DispatchStarted` (e.g. the
-        // Started event was dropped/missed) must not panic and must
-        // leave the step's units untouched.
-        let mut state = dispatch_state();
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_orphan".into(),
-            success: true,
-            tokens_in: 10,
-            tokens_out: 5,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert!(step.units.is_empty());
-    }
-
-    #[test]
-    fn dispatch_child_is_navigable_and_selectable() {
-        let mut state = dispatch_state();
-        let path = std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl");
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: path.clone(),
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        assert_eq!(
-            state.navigable_nodes(),
-            vec![NodeRef::Step, NodeRef::Unit { index: 0 }]
-        );
-        // Pin the dispatch child (Part A's selection primitive) and
-        // confirm its transcript resolves — the Part A/B integration
-        // this task is meant to get "for free".
-        state.selected = Some(NodeRef::Unit { index: 0 });
-        assert_eq!(state.focused_transcript(None), Some(path));
-    }
-
-    #[test]
-    fn two_parallel_dispatch_children_get_distinct_slots() {
-        let mut state = dispatch_state();
-        let path_a = std::path::PathBuf::from("/runs/run_01ABC/sub_a.jsonl");
-        let path_b = std::path::PathBuf::from("/runs/run_01ABC/sub_b.jsonl");
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_a".into(),
-            agent: Some("agent-a".into()),
-            transcript_path: path_a,
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        state.apply(&WfEvent::DispatchStarted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_b".into(),
-            agent: Some("agent-b".into()),
-            transcript_path: path_b,
-            codename: None,
-            model: None,
-            provider: None,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.units.len(), 2);
-        assert_eq!(step.units[0].sub_run_id.as_deref(), Some("sub_a"));
-        assert_eq!(step.units[1].sub_run_id.as_deref(), Some("sub_b"));
-
-        // Complete the SECOND dispatched child first — matching must be
-        // by `sub_run_id`, not "the most recently touched index".
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_b".into(),
-            success: true,
-            tokens_in: 10,
-            tokens_out: 5,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.units[0].status, NodeStatus::Working, "sub_a untouched");
-        assert_eq!(step.units[1].status, NodeStatus::Complete);
-
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_a".into(),
-            success: false,
-            tokens_in: 0,
-            tokens_out: 0,
-        });
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.units[0].status, NodeStatus::Failed);
-        assert_eq!(
-            step.units[1].status,
-            NodeStatus::Complete,
-            "sub_b unaffected"
-        );
-    }
-
-    #[test]
-    fn overall_progress_fraction_blends_active_fanout() {
-        // 4 steps, step 2 (`assess`) active with 2 of 5 units done.
-        // (1 completed + 2/5) / 4 = 1.4 / 4 = 0.35.
-        let state = fanout_state(true);
-        let frac = overall_progress_fraction(&state);
-        assert!((frac - 0.35).abs() < 1e-9, "got {frac}");
-    }
-
-    #[test]
-    fn overall_progress_fraction_panel_uses_iteration() {
-        // Make the panel the only active step: clear the fan-out's
-        // active status so only `sweep` (panel iter 2/10) is active.
-        let mut state = fanout_state(true);
-        state.steps[1].status = NodeStatus::Complete; // assess no longer active
-                                                      // completed = understand + assess = 2; active = sweep panel 2/10.
-                                                      // (2 + 0.2) / 4 = 0.55.
-        let frac = overall_progress_fraction(&state);
-        assert!((frac - 0.55).abs() < 1e-9, "got {frac}");
-    }
-
-    #[test]
-    fn overall_progress_fraction_spec_example() {
-        // Spec example: 4 steps, step 2 active at 3/5 units ⇒
-        // (1 + 0.6) / 4 = 0.4.
-        let mut state = fanout_state(true);
-        // Mark a third unit complete so done_units = 3 of 5.
-        state.steps[1].units[3].status = NodeStatus::Complete;
-        let frac = overall_progress_fraction(&state);
-        assert!((frac - 0.4).abs() < 1e-9, "got {frac}");
-    }
-
-    #[test]
-    fn overall_progress_fraction_clamped_to_unit_interval() {
-        let mut state = fanout_state(true);
-        // All steps complete → fraction is 1.0 (no active step).
-        for step in &mut state.steps {
-            step.status = NodeStatus::Complete;
-        }
-        let frac = overall_progress_fraction(&state);
-        assert!((frac - 1.0).abs() < 1e-9, "got {frac}");
-    }
-
-    fn row(provider: &str, model: &str, input: u64, output: u64) -> rupu_transcript::UsageRow {
-        rupu_transcript::UsageRow {
-            provider: provider.into(),
-            model: model.into(),
-            agent: "oracle-assessor".into(),
-            input_tokens: input,
-            output_tokens: output,
-            runs: 1,
-            ..Default::default()
-        }
-    }
-
-    fn tok(input: u64, output: u64) -> rupu_cp::usage_index::Tokens {
-        rupu_cp::usage_index::Tokens {
-            input,
-            output,
-            cached: 0,
-            cache_write: 0,
+    fn decode_key_truth_table_without_a_gate() {
+        let d = |c: KeyCode| decode_key(c, NONE, false);
+        for (code, want) in [
+            (KeyCode::Up, nav(NavKey::Up)),
+            (KeyCode::Char('k'), nav(NavKey::Up)),
+            (KeyCode::BackTab, nav(NavKey::Up)),
+            (KeyCode::Down, nav(NavKey::Down)),
+            (KeyCode::Char('j'), nav(NavKey::Down)),
+            (KeyCode::Tab, nav(NavKey::Down)),
+            (KeyCode::Enter, nav(NavKey::In)),
+            (KeyCode::Right, nav(NavKey::In)),
+            (KeyCode::Char('l'), nav(NavKey::In)),
+            (KeyCode::Left, nav(NavKey::Out)),
+            (KeyCode::Backspace, nav(NavKey::Out)),
+            (KeyCode::Char('h'), nav(NavKey::Out)),
+            (KeyCode::Char('a'), nav(NavKey::Follow)),
+            (KeyCode::Char('/'), nav(NavKey::Filter)),
+            (KeyCode::Char('q'), nav(NavKey::Quit)),
+            (KeyCode::Esc, nav(NavKey::Pause)),
+            // The gate keys do nothing without a focused gate.
+            (KeyCode::Char('r'), None),
+            (KeyCode::Char('v'), None),
+            (KeyCode::Char('x'), None),
+            (KeyCode::F(5), None),
+        ] {
+            assert_eq!(d(code), want, "{code:?}");
         }
     }
 
     #[test]
-    fn apply_run_usage_sets_all_units_not_just_focused() {
-        // The fixture focuses app-gw (index 2); the fold covers every unit.
-        let mut state = fanout_state(true);
-        let mut u = rupu_cp::usage_index::RunUsage::default();
-        u.by_unit.insert(("assess".into(), 0), tok(100, 10));
-        u.by_unit.insert(("assess".into(), 2), tok(300, 30));
-        u.by_step
-            .insert("assess".into(), vec![row("anthropic", "claude-x", 400, 40)]);
-        u.rows = vec![row("anthropic", "claude-x", 400, 40)];
-        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
-        assert_eq!(state.steps[1].id, "assess");
-        assert_eq!(state.steps[1].units[0].tokens, 110);
-        assert_eq!(state.steps[1].units[2].tokens, 330);
-        assert_eq!(state.tokens_in, 400);
-        assert_eq!(state.tokens_out, 40);
+    fn a_focused_gate_makes_a_r_v_enter_modal_and_leaves_the_rest_alone() {
+        let d = |c: KeyCode| decode_key(c, NONE, true);
+        assert_eq!(d(KeyCode::Char('a')), Some(KeyAction::Approve));
+        assert_eq!(d(KeyCode::Char('r')), Some(KeyAction::Reject));
+        assert_eq!(d(KeyCode::Char('v')), Some(KeyAction::ToggleDetails));
+        assert_eq!(d(KeyCode::Enter), Some(KeyAction::ToggleDetails));
+        // Movement, quitting and pausing are unchanged at a gate.
+        assert_eq!(d(KeyCode::Down), nav(NavKey::Down));
+        assert_eq!(d(KeyCode::Char('j')), nav(NavKey::Down));
+        assert_eq!(d(KeyCode::Char('q')), nav(NavKey::Quit));
+        assert_eq!(d(KeyCode::Esc), nav(NavKey::Pause));
+        assert_eq!(d(KeyCode::Right), nav(NavKey::In));
     }
 
     #[test]
-    fn apply_run_usage_replaces_idempotently_and_prices_the_rows() {
-        let mut state = fanout_state(true);
-        let model = "claude-sonnet-4-6"; // built-in: $3 in / $15 out per Mtok
-        let mut u = rupu_cp::usage_index::RunUsage::default();
-        u.by_step.insert(
-            "understand".into(),
-            vec![row("anthropic", model, 1_000_000, 0)],
-        );
-        u.by_step
-            .insert("assess".into(), vec![row("anthropic", model, 0, 1_000_000)]);
-        u.rows = vec![row("anthropic", model, 1_000_000, 1_000_000)];
-        let pricing = rupu_config::PricingConfig::default();
-
-        // Applying the same fold twice (a refresh with nothing new) must
-        // not stack: the values are replaced, not accumulated.
-        state.apply_run_usage(&u, &pricing);
-        state.apply_run_usage(&u, &pricing);
-
-        assert_eq!((state.tokens_in, state.tokens_out), (1_000_000, 1_000_000));
-        assert_eq!(state.steps[0].tokens_in, 1_000_000);
-        // `assess` had a stale 890K input in the fixture — replaced.
-        assert_eq!(
-            (state.steps[1].tokens_in, state.steps[1].tokens_out),
-            (0, 1_000_000)
-        );
-        // A step the fold has no rows for reads zero.
-        assert_eq!(
-            (state.steps[2].tokens_in, state.steps[2].tokens_out),
-            (0, 0)
-        );
-        assert_eq!(state.cost, Some(18.0));
-    }
-
-    #[test]
-    fn apply_run_usage_unpriced_rows_leave_cost_none() {
-        let mut state = fanout_state(true);
-        let u = rupu_cp::usage_index::RunUsage {
-            rows: vec![row("nonesuch-provider", "nonesuch-model", 1_000, 1_000)],
-            ..Default::default()
-        };
-        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
-        assert_eq!(state.cost, None, "no price → the `—` placeholder, never $0");
-        assert_eq!(state.tokens_in, 1_000);
-    }
-
-    #[test]
-    fn dispatch_completed_no_longer_adds_tokens() {
-        let mut state = dispatch_state();
-        state.apply(&WfEvent::DispatchStarted {
-            provider: None,
-            model: None,
-            codename: None,
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
-        });
-        let before = (state.tokens_in, state.tokens_out);
-        let report = |s: &LiveRunState| {
-            let step = s.steps.iter().find(|st| st.id == "report").unwrap();
-            (step.tokens_in, step.tokens_out)
-        };
-        let step_before = report(&state);
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            success: true,
-            tokens_in: 999,
-            tokens_out: 999,
-        });
-        // The child's ledger rows are already in the fold (under its
-        // ancestor's step); adding them here was the double count.
-        assert_eq!((state.tokens_in, state.tokens_out), before);
-        assert_eq!(report(&state), step_before);
-    }
-
-    #[test]
-    fn apply_run_usage_never_writes_onto_a_dispatch_child_row() {
-        // A `parallel` step emits no `UnitStarted`, so its only rows are
-        // dispatch-child slots — while the ledger tags each sub-step with
-        // `unit_index: Some(idx)`, and a sub-step's children attribute to
-        // its `(step, idx)`. Sub-step 0's total must not land on child 0.
-        let mut state = dispatch_state();
-        state.steps[3].kind = StepKind::Parallel;
-        state.apply(&WfEvent::DispatchStarted {
-            provider: None,
-            model: None,
-            codename: None,
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
-        });
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            success: true,
-            tokens_in: 500,
-            tokens_out: 120,
-        });
-        let mut u = rupu_cp::usage_index::RunUsage::default();
-        u.by_unit.insert(("report".into(), 0), tok(5_000, 500));
-        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
-
-        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
-        assert_eq!(step.units.len(), 1);
-        assert_eq!(step.units[0].sub_run_id.as_deref(), Some("sub_child"));
-        assert_eq!(step.units[0].tokens, 620, "the child keeps its own figure");
-    }
-
-    #[test]
-    fn fanout_units_keep_their_rows_and_values_with_an_interleaved_dispatch_child() {
-        // Unit 0 starts and dispatches a sub-agent (its slot lands at vec
-        // position 1) before unit 1 starts: unit 1 must get its own row,
-        // not the child's, and the fold's per-unit figures must land on
-        // the rows of the units they belong to.
-        let mut state = fanout_state(true);
-        state.steps[1].units.clear();
-        let unit_started = |index: usize, key: &str| WfEvent::UnitStarted {
-            codename: None,
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index,
-            unit_key: key.into(),
-            agent: Some("oracle-assessor".into()),
-            transcript_path: std::path::PathBuf::from(format!("/runs/{key}.jsonl")),
-            host: None,
-        };
-        state.apply(&unit_started(0, "u0"));
-        state.apply(&WfEvent::DispatchStarted {
-            provider: None,
-            model: None,
-            codename: None,
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            agent: Some("security-reviewer".into()),
-            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
-        });
-        state.apply(&unit_started(1, "u1"));
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_01ABC".into(),
-            sub_run_id: "sub_child".into(),
-            success: true,
-            tokens_in: 500,
-            tokens_out: 120,
-        });
-        let mut u = rupu_cp::usage_index::RunUsage::default();
-        u.by_unit.insert(("assess".into(), 0), tok(100, 10));
-        u.by_unit.insert(("assess".into(), 1), tok(300, 30));
-        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
-
-        let units = &state.steps[1].units;
-        assert_eq!(units.len(), 3, "{units:?}");
-        let row = |key: &str| units.iter().find(|u| u.key == key).unwrap();
-        assert_eq!(row("u0").tokens, 110);
-        assert_eq!(row("u1").tokens, 330);
-        assert_eq!(
-            row("u1").sub_run_id,
-            None,
-            "u1 did not take over the child's slot"
-        );
-        let child = row("security-reviewer");
-        assert_eq!(child.sub_run_id.as_deref(), Some("sub_child"));
-        assert_eq!(child.status, NodeStatus::Complete);
-        assert_eq!(child.tokens, 620);
-    }
-
-    /// One ledger row for the run-store round trip below.
-    fn ledger_row(
-        id: &str,
-        step: Option<&str>,
-        unit: Option<usize>,
-        agent_run: &str,
-        parent: Option<&str>,
-        input: u64,
-        output: u64,
-    ) -> rupu_orchestrator::usage_ledger::LedgerRow {
-        rupu_orchestrator::usage_ledger::LedgerRow {
-            v: rupu_orchestrator::usage_ledger::LEDGER_VERSION,
-            id: id.into(),
-            at: Utc::now(),
-            kind: rupu_orchestrator::usage_ledger::LedgerKind::Turn,
-            step_id: step.map(str::to_string),
-            unit_index: unit,
-            unit_key: None,
-            agent_run_id: agent_run.into(),
-            parent_agent_run_id: parent.map(str::to_string),
-            transcript: std::path::PathBuf::from(format!("/nowhere/{agent_run}.jsonl")),
-            agent: "oracle-assessor".into(),
-            provider: "nonesuch-provider".into(),
-            model: "nonesuch-model".into(),
-            input_tokens: input,
-            output_tokens: output,
-            cached_tokens: 0,
-            cache_write_tokens: 0,
-        }
-    }
-
-    #[test]
-    fn refresh_run_usage_reads_every_unit_and_dispatch_child_from_the_ledger() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
-        store
-            .create(
-                minimal_run_record("run_LEDGER", RunStatus::Running),
-                "name: sample\nsteps: []\n",
-            )
-            .unwrap();
-        let ledger = rupu_orchestrator::usage_ledger::UsageLedger::for_run(&store, "run_LEDGER");
-        ledger.append(&ledger_row(
-            "r1",
-            Some("assess"),
-            Some(0),
-            "ag_u0",
-            None,
-            100,
-            10,
-        ));
-        ledger.append(&ledger_row(
-            "r2",
-            Some("assess"),
-            Some(2),
-            "ag_u2",
-            None,
-            300,
-            30,
-        ));
-        // A sub-agent unit 2 dispatched: untagged, attributed via its parent.
-        ledger.append(&ledger_row(
-            "r3",
-            None,
-            None,
-            "ag_child",
-            Some("ag_u2"),
-            50,
-            5,
-        ));
-
-        let mut state = fanout_state(true);
-        let pricing = rupu_config::PricingConfig::default();
-        refresh_run_usage(&mut state, &store, "run_LEDGER", &pricing);
-        assert_eq!(state.steps[1].units[0].tokens, 110);
-        assert_eq!(state.steps[1].units[2].tokens, 385, "own 330 + child 55");
-        assert_eq!((state.tokens_in, state.tokens_out), (450, 45));
-
-        // The child finishing, a refocus, and a second refresh with no new
-        // rows all leave the totals exactly where the ledger puts them.
-        state.apply(&WfEvent::DispatchCompleted {
-            run_id: "run_LEDGER".into(),
-            sub_run_id: "sub_child".into(),
-            success: true,
-            tokens_in: 50,
-            tokens_out: 5,
-        });
-        state.active.unit_key = Some("conf-manager".into());
-        refresh_run_usage(&mut state, &store, "run_LEDGER", &pricing);
-        assert_eq!((state.tokens_in, state.tokens_out), (450, 45));
-        assert_eq!(state.steps[1].units[2].tokens, 385);
-    }
-
-    #[test]
-    fn map_transcript_delta_is_ignored() {
-        let ev = rupu_transcript::Event::AssistantDelta {
-            content: "thinking...".into(),
-        };
-        assert!(map_transcript_event(&ev, ts(0)).is_none());
-    }
-
-    #[test]
-    fn render_view_stacks_zones_and_fills_height() {
-        let state = fanout_state(true);
-        let rows = render_view(&state, &empty_workflow(), ts(31), 79, 30);
-        // The view should be at most term_height rows.
-        assert!(rows.len() <= 30, "got {}", rows.len());
-        let plain = stripped(rows);
-        // Sanity: dashboard title + graph + focus border all present.
-        assert!(plain.iter().any(|r| r.contains("oracle-assessor-workflow")));
-        assert!(plain.iter().any(|r| r.contains("understand")));
-        assert!(plain.iter().any(|r| r.starts_with("╭ ")));
-        assert!(plain.iter().any(|r| r.starts_with("╰")));
-    }
-
-    /// A state with many steps, each a fan-out with many units, so the
-    /// graph alone is far taller than any small viewport — forces the
-    /// height-truncation (graph clip) path.
-    fn many_steps_state() -> LiveRunState {
-        let mut base = fanout_state(true);
-        let mut steps = Vec::new();
-        for i in 0..40 {
-            let mut units = Vec::new();
-            for u in 0..6 {
-                units.push(UnitState {
-                    codename: None,
-                    provider: None,
-                    model: None,
-                    key: format!("very-long-unit-name-that-overflows-{i}-{u}"),
-                    status: NodeStatus::Working,
-                    tokens: 120_000,
-                    elapsed_secs: 8,
-                    transcript_path: None,
-                    sub_run_id: None,
-                    index: Some(u),
-                });
-            }
-            steps.push(StepState {
-                codename: None,
-                provider: None,
-                model: None,
-                id: format!("step-with-a-deliberately-long-identifier-{i}"),
-                kind: StepKind::ForEach,
-                agent: Some("for_each".into()),
-                status: NodeStatus::Working,
-                tokens_in: 500_000,
-                tokens_out: 0,
-                elapsed_secs: 0,
-                units,
-                fanout_total: Some(6),
-                panel_iter: None,
-                panel_findings: 0,
-            });
-        }
-        base.steps = steps;
-        base
-    }
-
-    #[test]
-    fn render_view_bounds_height_and_width() {
-        let state = many_steps_state();
-        for (w, h) in [(40usize, 10usize), (20, 6), (60, 15), (30, 3)] {
-            let rows = render_view(&state, &empty_workflow(), ts(31), w, h);
-            assert!(
-                rows.len() <= h,
-                "({w},{h}) produced {} rows (> {h})",
-                rows.len()
+    fn ctrl_c_always_quits_and_other_chords_never_act() {
+        for gate in [false, true] {
+            assert_eq!(
+                decode_key(KeyCode::Char('c'), KeyModifiers::CONTROL, gate),
+                nav(NavKey::Quit),
+                "gate={gate}"
             );
-            for (i, r) in rows.iter().enumerate() {
-                assert!(
-                    visible_len(r) <= w,
-                    "({w},{h}) row {i} visible_len {} > {w}: {r:?}",
-                    visible_len(r)
+            // Ctrl-A / Ctrl-R / Ctrl-Q are not plain commands: Ctrl-A must
+            // never approve a gate.
+            for c in ['a', 'r', 'v', 'q', 'j'] {
+                assert_eq!(
+                    decode_key(KeyCode::Char(c), KeyModifiers::CONTROL, gate),
+                    None,
+                    "ctrl-{c} gate={gate}"
+                );
+                assert_eq!(
+                    decode_key(KeyCode::Char(c), KeyModifiers::ALT, gate),
+                    None,
+                    "alt-{c} gate={gate}"
                 );
             }
+            // Uppercase is a different key: `A` is not approve.
+            assert_eq!(
+                decode_key(KeyCode::Char('A'), KeyModifiers::SHIFT, gate),
+                None
+            );
         }
     }
 
-    #[test]
-    fn render_view_emits_more_marker_when_graph_clipped() {
-        let state = many_steps_state();
-        // Dashboard (~5) + separator + graph (huge) into a 12-row viewport
-        // must clip the graph and surface the "+N more" marker.
-        let rows = render_view(&state, &empty_workflow(), ts(31), 80, 12);
-        assert!(rows.len() <= 12);
-        let plain = stripped(rows);
-        assert!(
-            plain.iter().any(|r| r.contains("more)")),
-            "expected a truncation marker, got: {plain:?}"
-        );
-    }
-
-    #[test]
-    fn truncate_to_width_is_ansi_aware() {
-        // Plain string longer than width gets an ellipsis at the width.
-        let t = truncate_to_width("abcdefgh", 4);
-        assert_eq!(visible_len(&t), 4);
-        assert!(t.ends_with('…'));
-
-        // A colored string: ANSI must not be counted and the visible
-        // width must respect the bound.
-        //
-        // The escape sequence is written literally rather than produced by
-        // `palette::write_colored`. The subject here is `truncate_to_width`'s
-        // ANSI-awareness, not the color *decision* — and routing through
-        // `write_colored` made this test depend on process-global color state
-        // that a concurrently-running test can flip.
-        let colored = "\x1b[38;2;124;58;237mabcdefghij\x1b[39m".to_string();
-        let t = truncate_to_width(&colored, 5);
-        assert_eq!(visible_len(&t), 5, "colored truncation: {t:?}");
-        assert!(t.contains('\x1b'), "color codes preserved");
-
-        // A string that already fits is returned unchanged.
-        assert_eq!(truncate_to_width("hi", 10), "hi");
-    }
-
-    // -----------------------------------------------------------------------
-    // Task 7 — RunPaused/RunResumed apply(), paused resume hint, Esc handling
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn apply_run_paused_sets_status() {
-        let mut state = fanout_state(true);
-        assert_eq!(state.status, RunStatus::Running);
-        state.apply(&WfEvent::RunPaused {
-            run_id: "run_01ABC".into(),
-        });
-        assert_eq!(state.status, RunStatus::Paused);
-    }
-
-    #[test]
-    fn apply_run_resumed_sets_status_running() {
-        let mut state = fanout_state(true);
-        state.status = RunStatus::Paused;
-        state.apply(&WfEvent::RunResumed {
-            run_id: "run_01ABC".into(),
-        });
-        assert_eq!(state.status, RunStatus::Running);
-    }
-
-    #[test]
-    fn focus_paused_run_shows_resume_hint() {
-        let mut state = fanout_state(true);
-        state.status = RunStatus::Paused;
-        let rows = stripped(render_focus(&state, ts(33), 79, 8));
-        assert!(
-            rows.iter()
-                .any(|r| r.contains("paused") && r.contains("rupu workflow resume run_01ABC")),
-            "{rows:#?}"
-        );
-    }
-
-    #[test]
-    fn focus_failed_hint_unchanged_by_paused_addition() {
-        // Regression guard: the pre-existing Failed/Rejected hint text
-        // must be untouched by the new Paused branch.
-        let mut state = fanout_state(true);
-        state.status = RunStatus::Rejected;
-        let rows = stripped(render_focus(&state, ts(33), 79, 8));
-        assert!(
-            rows.iter()
-                .any(|r| r.contains("↳ rupu workflow resume run_01ABC")),
-            "{rows:#?}"
-        );
-        assert!(!rows.iter().any(|r| r.contains("paused")), "{rows:#?}");
-    }
-
-    /// Minimal persisted `RunRecord` for the run-store round-trip in
-    /// [`esc_keypress_requests_pause_and_pushes_activity_line`] — field
-    /// set mirrors `cmd::workflow::tests::sample_run_record`.
-    fn minimal_run_record(id: &str, status: RunStatus) -> rupu_orchestrator::RunRecord {
-        rupu_orchestrator::RunRecord {
-            id: id.to_string(),
-            workflow_name: "sample".into(),
-            status,
-            inputs: std::collections::BTreeMap::new(),
-            event: None,
-            workspace_id: "ws_test".into(),
-            workspace_path: std::path::PathBuf::from("/tmp/workspace"),
-            transcript_dir: std::path::PathBuf::from("/tmp/transcripts"),
+    fn started() -> Event {
+        Event::RunStarted {
+            event_version: 1,
+            run_id: "r".into(),
+            workflow_path: "wf".into(),
             started_at: Utc::now(),
-            finished_at: None,
-            error_message: None,
-            awaiting: Vec::new(),
-            awaiting_step_id: None,
-            approval_prompt: None,
-            awaiting_since: None,
-            expires_at: None,
-            resume_requested_at: None,
-            resume_claimed_at: None,
-            resume_claimed_by: None,
-            resume_mode: None,
-            resume_gate_id: None,
-            resume_approver: None,
-            reject_cleanup_pending: None,
-            permission_mode: None,
-            issue_ref: None,
-            issue: None,
-            parent_run_id: None,
-            backend_id: None,
-            worker_id: None,
-            artifact_manifest_path: None,
-            runner_pid: None,
-            source_wake_id: None,
-            active_step_id: None,
-            active_step_kind: None,
-            active_step_agent: None,
-            active_step_transcript_path: None,
-            final_output: None,
-            loop_progress: Default::default(),
-            codename: None,
+        }
+    }
+
+    fn failed() -> Event {
+        Event::RunFailed {
+            run_id: "r".into(),
+            error: "boom".into(),
+            finished_at: Utc::now(),
+        }
+    }
+
+    fn completed() -> Event {
+        Event::RunCompleted {
+            run_id: "r".into(),
+            status: RunStatus::Completed,
+            finished_at: Utc::now(),
         }
     }
 
     #[test]
-    fn esc_keypress_requests_pause_and_pushes_activity_line() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
-        store
-            .create(
-                minimal_run_record("run_01ABC", RunStatus::Running),
-                "name: sample\nsteps: []\n",
-            )
-            .unwrap();
+    fn should_exit_waits_for_a_finished_status_of_a_fresh_generation() {
+        // Live statuses never exit.
+        for s in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+        ] {
+            assert!(!should_exit(s, 1, None), "{s:?}");
+        }
+        // Terminal / paused with nothing stale: exit.
+        for s in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Rejected,
+            RunStatus::Cancelled,
+            RunStatus::Paused,
+        ] {
+            assert!(should_exit(s, 1, None), "{s:?}");
+        }
+        // The stale generation's outcome does not count; a later one does.
+        assert!(!should_exit(RunStatus::Failed, 1, Some(1)));
+        assert!(!should_exit(RunStatus::Paused, 3, Some(3)));
+        assert!(should_exit(RunStatus::Completed, 2, Some(1)));
+    }
 
-        let mut state = fanout_state(true);
-        assert!(state.active.feed.is_empty());
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
-
+    #[test]
+    fn a_resumed_runs_replayed_terminal_event_does_not_close_the_view() {
+        // events.jsonl of a run that failed and is now being resumed: the
+        // previous generation's RunFailed is replayed on attach.
+        let mut view = RunView::default();
+        view.apply(&started());
+        view.apply(&failed());
+        let stale = stale_terminal_gen(&view);
+        assert_eq!(stale, Some(1));
+        assert!(finished(view.status));
         assert!(
-            state
-                .active
-                .feed
-                .iter()
-                .any(|line| line.text.contains("pause requested")),
-            "{:#?}",
-            state.active.feed
+            !should_exit(view.status, view.generation, stale),
+            "must not exit on the replayed RunFailed"
         );
-        let persisted = store.load("run_01ABC").unwrap();
-        assert_eq!(persisted.status, RunStatus::Paused);
-        assert!(store.pause_marker_exists("run_01ABC"));
+
+        // The resumed run starts: a new generation, no longer finished.
+        view.apply(&started());
+        assert_eq!(view.generation, 2);
+        assert!(!should_exit(view.status, view.generation, stale));
+
+        // ...and finishing it IS honored.
+        view.apply(&completed());
+        assert!(should_exit(view.status, view.generation, stale));
+
+        // A fresh run (nothing finished at attach) exits on its first outcome.
+        let mut fresh = RunView::default();
+        fresh.apply(&started());
+        assert_eq!(stale_terminal_gen(&fresh), None);
+        fresh.apply(&completed());
+        assert!(should_exit(
+            fresh.status,
+            fresh.generation,
+            stale_terminal_gen(&RunView::default())
+        ));
     }
 
-    #[test]
-    fn esc_keypress_noop_on_already_terminal_run() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
-        store
-            .create(
-                minimal_run_record("run_01ABC", RunStatus::Completed),
-                "name: sample\nsteps: []\n",
-            )
-            .unwrap();
+    // ── transcripts ─────────────────────────────────────────────────────
 
-        let mut state = fanout_state(true);
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
-
-        assert!(
-            state.active.feed.is_empty(),
-            "a rejected pause request must not push a feed line: {:#?}",
-            state.active.feed
-        );
-    }
-
-    #[test]
-    fn non_esc_keypress_is_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
-        store
-            .create(
-                minimal_run_record("run_01ABC", RunStatus::Running),
-                "name: sample\nsteps: []\n",
-            )
-            .unwrap();
-
-        let mut state = fanout_state(true);
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('q'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
-
-        assert!(state.active.feed.is_empty());
-        assert_eq!(store.load("run_01ABC").unwrap().status, RunStatus::Running);
-    }
-
-    // -----------------------------------------------------------------
-    // Node-selection state + keyboard navigation (Task 1)
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn nav_down_selects_first_concurrent_unit_then_next() {
-        // `fanout_state(true)` has the active "assess" step with 5 units
-        // (index 0..=4). The navigable set is [Step, Unit0, Unit1, ...].
-        let mut state = fanout_state(true);
-        assert_eq!(state.selected, None);
-
-        state.select_next();
-        assert_eq!(
-            state.selected,
-            Some(NodeRef::Step),
-            "first press seeds the selection to the first node (the step itself)"
-        );
-
-        state.select_next();
-        assert_eq!(state.selected, Some(NodeRef::Unit { index: 0 }));
-
-        state.select_next();
-        assert_eq!(state.selected, Some(NodeRef::Unit { index: 1 }));
-    }
-
-    #[test]
-    fn nav_wraps_at_ends() {
-        let mut state = fanout_state(true);
-        // 5 units on "assess" -> navigable set is [Step, Unit0..Unit4].
-        state.selected = Some(NodeRef::Unit { index: 4 });
-        state.select_next();
-        assert_eq!(
-            state.selected,
-            Some(NodeRef::Step),
-            "select_next past the last node wraps to the first"
-        );
-
-        state.selected = Some(NodeRef::Step);
-        state.select_prev();
-        assert_eq!(
-            state.selected,
-            Some(NodeRef::Unit { index: 4 }),
-            "select_prev before the first node wraps to the last"
-        );
-    }
-
-    #[test]
-    fn release_key_clears_selection_to_auto_follow() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
-        store
-            .create(
-                minimal_run_record("run_01ABC", RunStatus::Running),
-                "name: sample\nsteps: []\n",
-            )
-            .unwrap();
-
-        let mut state = fanout_state(true);
-        state.selected = Some(NodeRef::Unit { index: 2 });
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
-
-        assert_eq!(state.selected, None);
-    }
-
-    #[test]
-    fn step_change_releases_selection() {
-        let mut state = fanout_state(true);
-        state.selected = Some(NodeRef::Unit { index: 1 });
-
-        state.apply(&WfEvent::StepStarted {
-            run_id: "run_01ABC".into(),
-            step_id: "report".into(),
-            kind: StepKind::Linear,
-            agent: Some("reporter".into()),
+    fn step_started(step: &str, kind: StepKind, codename: Option<&str>) -> Event {
+        Event::StepStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            kind,
+            agent: None,
             host: None,
-            codename: None,
-        });
+            codename: codename.map(str::to_string),
+        }
+    }
 
-        assert_eq!(
-            state.selected, None,
-            "a new active step clears a selection scoped to the old step's concurrency context"
-        );
+    fn unit_started(step: &str, index: usize, path: &str, codename: &str) -> Event {
+        Event::UnitStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            unit_key: format!("svc-{index}"),
+            agent: Some("breaker".into()),
+            transcript_path: path.into(),
+            host: None,
+            codename: Some(codename.into()),
+        }
+    }
+
+    fn dispatch_started(sub: &str, path: &str, codename: &str) -> Event {
+        Event::DispatchStarted {
+            run_id: "r".into(),
+            sub_run_id: sub.into(),
+            agent: Some("scout".into()),
+            transcript_path: path.into(),
+            codename: Some(codename.into()),
+            provider: None,
+            model: None,
+        }
+    }
+
+    /// Fold `events` the way the loop does: apply, then note.
+    fn fold(events: &[Event]) -> (RunView, TranscriptIndex, Vec<(PathBuf, Option<String>)>) {
+        let mut view = RunView::default();
+        let mut index = TranscriptIndex::default();
+        let mut observed = Vec::new();
+        for ev in events {
+            view.apply(ev);
+            observed.extend(index.note(&view, ev));
+        }
+        (view, index, observed)
     }
 
     #[test]
-    fn esc_still_pauses_with_selection_active() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
-        store
-            .create(
-                minimal_run_record("run_01ABC", RunStatus::Running),
-                "name: sample\nsteps: []\n",
-            )
-            .unwrap();
-
-        let mut state = fanout_state(true);
-        state.selected = Some(NodeRef::Unit { index: 3 });
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
-
-        assert!(
-            state
-                .active
-                .feed
-                .iter()
-                .any(|line| line.text.contains("pause requested")),
-            "{:#?}",
-            state.active.feed
-        );
-        assert_eq!(
-            state.selected,
-            Some(NodeRef::Unit { index: 3 }),
-            "Esc must not touch an active selection"
-        );
-        let persisted = store.load("run_01ABC").unwrap();
-        assert_eq!(persisted.status, RunStatus::Paused);
-    }
-
-    #[test]
-    fn nav_ignored_when_no_concurrent_nodes() {
-        // A single linear step, active, with no fan-out units at all. The
-        // navigable set is just `[Step]` (len 1): nav selects the lone
-        // step on first press, and further presses are idempotent rather
-        // than a special-cased no-op — same algorithm, no branching.
-        let mut state = LiveRunState {
-            codename: None,
-            workflow_name: "w".into(),
-            run_id: "run_1".into(),
-            status: RunStatus::Running,
-            started_at: Some(ts(0)),
-            finished_at: None,
-            steps: vec![StepState {
-                codename: None,
+    fn events_that_name_a_transcript_register_it_with_its_codename() {
+        let (_, index, observed) = fold(&[
+            step_started("hunt", StepKind::ForEach, None),
+            unit_started("hunt", 0, "/t/u0.jsonl", "otter#1"),
+            Event::AgentStarted {
+                run_id: "r".into(),
+                step_id: "hunt".into(),
+                unit_index: Some(0),
+                codename: Some("otter#1".into()),
+                agent: "breaker".into(),
                 provider: None,
                 model: None,
-                id: "only".into(),
-                kind: StepKind::Linear,
-                agent: Some("solo-agent".into()),
-                status: NodeStatus::Working,
-                tokens_in: 0,
-                tokens_out: 0,
-                elapsed_secs: 0,
-                units: Vec::new(),
-                fanout_total: None,
-                panel_iter: None,
-                panel_findings: 0,
-            }],
-            tokens_in: 0,
-            tokens_out: 0,
-            cost: None,
-            findings_count: None,
-            coverage_pct: None,
-            active: ActiveFocus {
-                codename: None,
-                provider: None,
-                model: None,
-                step_id: Some("only".into()),
-                unit_key: None,
-                agent: Some("solo-agent".into()),
-                active_unit_transcript: None,
-                feed: Vec::new(),
-                last_event_at: None,
+                agent_run_id: "a0".into(),
+                transcript_path: "/t/u0.jsonl".into(),
             },
-            selected: None,
+            dispatch_started("sub1", "/t/sub1.jsonl", "wren#1"),
+            step_started("report", StepKind::Linear, Some("heron#1")),
+            Event::StepWorking {
+                run_id: "r".into(),
+                step_id: "report".into(),
+                note: None,
+                transcript_path: Some("/t/report.jsonl".into()),
+            },
+            // No path: nothing to register.
+            Event::StepWorking {
+                run_id: "r".into(),
+                step_id: "report".into(),
+                note: Some("tool call".into()),
+                transcript_path: None,
+            },
+            // A remote unit whose transcript is not mirrored yet: empty path.
+            unit_started("hunt", 1, "", "otter#2"),
+        ]);
+        let got: Vec<(String, Option<String>)> = observed
+            .iter()
+            .map(|(p, c)| (p.display().to_string(), c.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/t/u0.jsonl".to_string(), Some("otter#1".to_string())),
+                ("/t/u0.jsonl".to_string(), Some("otter#1".to_string())),
+                ("/t/sub1.jsonl".to_string(), Some("wren#1".to_string())),
+                // A step's own transcript takes the step's codename.
+                ("/t/report.jsonl".to_string(), Some("heron#1".to_string())),
+            ]
+        );
+        assert_eq!(
+            index.units.get(&("hunt".to_string(), 0)),
+            Some(&PathBuf::from("/t/u0.jsonl"))
+        );
+        // The empty-path unit is not indexed (nothing to pin).
+        assert!(!index.units.contains_key(&("hunt".to_string(), 1)));
+        assert_eq!(
+            index.dispatches.get("sub1"),
+            Some(&PathBuf::from("/t/sub1.jsonl"))
+        );
+    }
+
+    #[test]
+    fn a_drilled_selection_resolves_to_the_exact_path_the_mux_was_given() {
+        let (view, index, observed) = fold(&[
+            step_started("hunt", StepKind::ForEach, None),
+            unit_started("hunt", 0, "/t/u0.jsonl", "otter#1"),
+            unit_started("hunt", 1, "/t/u1.jsonl", "otter#2"),
+            dispatch_started("sub1", "/t/sub1.jsonl", "wren#1"),
+        ]);
+        let mut nav = NavState::default();
+        // Run and Step depth pin nothing: the feed is the firehose.
+        assert_eq!(pinned_path(&view, &nav, &index), None);
+        nav.apply(NavKey::In, &view);
+        assert_eq!(nav.depth(), Depth::Step);
+        assert_eq!(pinned_path(&view, &nav, &index), None);
+        // Unit depth pins the selected unit...
+        nav.apply(NavKey::In, &view);
+        assert_eq!(nav.depth(), Depth::Unit);
+        assert_eq!(
+            pinned_path(&view, &nav, &index),
+            Some(PathBuf::from("/t/u0.jsonl"))
+        );
+        // The unit cursor moves at Step depth: back out, step down, drill in.
+        nav.apply(NavKey::Out, &view);
+        nav.apply(NavKey::Down, &view);
+        nav.apply(NavKey::In, &view);
+        assert_eq!(nav.depth(), Depth::Unit);
+        assert_eq!(
+            pinned_path(&view, &nav, &index),
+            Some(PathBuf::from("/t/u1.jsonl"))
+        );
+        // ...and the pin is spelled exactly like an observed path, so the
+        // mux's pin lands on an entry it already knows.
+        assert!(observed
+            .iter()
+            .any(|(p, _)| Some(p) == pinned_path(&view, &nav, &index).as_ref()));
+        // Sub-agent depth pins the dispatched child.
+        nav.apply(NavKey::In, &view);
+        assert_eq!(nav.depth(), Depth::SubAgent);
+        assert_eq!(
+            pinned_path(&view, &nav, &index),
+            Some(PathBuf::from("/t/sub1.jsonl"))
+        );
+        // Popping back out unpins.
+        nav.apply(NavKey::Out, &view);
+        nav.apply(NavKey::Out, &view);
+        assert_eq!(pinned_path(&view, &nav, &index), None);
+    }
+
+    #[test]
+    fn the_tail_budget_is_a_quarter_of_the_spare_descriptors() {
+        assert_eq!(tail_budget(Some((100, 10_240))), (10_240 - 100 - 16) / 4);
+        // No headroom: zero, which the mux lifts to its own floor.
+        assert_eq!(tail_budget(Some((10_240, 10_240))), 0);
+        assert_eq!(tail_budget(Some((300, 256))), 0);
+        assert_eq!(tail_budget(Some((250, 256))), 0);
+        // Unreadable: a modest default.
+        assert_eq!(tail_budget(None), DEFAULT_TAILS);
+    }
+
+    // ── the model ───────────────────────────────────────────────────────
+
+    const GATES_YAML: &str =
+        "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
+
+    fn parse(yaml: &str) -> Workflow {
+        Workflow::parse(yaml).unwrap_or_else(|e| panic!("fixture workflow: {e}"))
+    }
+
+    /// A run record in `status`, with `gates` parked when awaiting approval.
+    fn record(id: &str, status: &str, gates: &[(&str, Option<DateTime<Utc>>)]) -> RunRecord {
+        let awaiting: Vec<serde_json::Value> = gates
+            .iter()
+            .map(|(step, expires)| {
+                serde_json::json!({
+                    "step_id": step,
+                    "prompt": format!("approve {step}?"),
+                    "since": "2026-09-30T11:00:00Z",
+                    "expires_at": expires,
+                })
+            })
+            .collect();
+        let mut rec: RunRecord = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "workflow_name": "g",
+            "status": status,
+            "inputs": {},
+            "workspace_id": "ws",
+            "workspace_path": "/tmp/ws",
+            "transcript_dir": "/tmp/tr",
+            "started_at": "2026-09-30T10:00:00Z",
+            "codename": "mint-tundra",
+            "awaiting": awaiting,
+        }))
+        .unwrap();
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn the_seeded_view_lists_every_step_pending_in_order() {
+        let wf = parse(
+            "name: seeded\nsteps:\n  \
+             - id: plan\n    agent: planner\n    prompt: go\n  \
+             - id: hunt\n    agent: breaker\n    for_each: \"{{ inputs.items }}\"\n    prompt: x\n  \
+             - id: ship\n    approval: {}\n",
+        );
+        let view = seed_view(&wf, "run_1");
+        assert_eq!(view.run_id, "run_1");
+        assert_eq!(view.workflow_name, "seeded");
+        let got: Vec<(&str, StepKind, bool)> = view
+            .steps
+            .iter()
+            .map(|s| {
+                (
+                    s.step_id.as_str(),
+                    s.kind,
+                    s.state == crate::output::run_model::StepState::Pending,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("plan", StepKind::Linear, true),
+                ("hunt", StepKind::ForEach, true),
+                ("ship", StepKind::ApprovalGate, true),
+            ]
+        );
+        assert_eq!(view.steps[0].agent.as_deref(), Some("planner"));
+        // Events then update the seeded rows in place rather than adding new.
+        let mut view = view;
+        view.apply(&step_started("hunt", StepKind::ForEach, Some("heron#1")));
+        assert_eq!(view.steps.len(), 3);
+        assert_eq!(
+            view.steps[1].state,
+            crate::output::run_model::StepState::Running
+        );
+    }
+
+    #[test]
+    fn overlay_record_takes_gates_only_while_awaiting_and_follows_the_record_out() {
+        let mut view = seed_view(&parse(GATES_YAML), "r");
+        // Events alone never say "parked": a gate park emits no run-level event.
+        view.apply(&started());
+        assert_eq!(view.status, RunStatus::Running);
+
+        let parked = record(
+            "r",
+            "awaiting_approval",
+            &[("gate_a", None), ("gate_b", None)],
+        );
+        overlay_record(&mut view, &parked);
+        assert_eq!(view.status, RunStatus::AwaitingApproval);
+        assert_eq!(view.crew.as_deref(), Some("mint-tundra"));
+        let ids: Vec<&str> = view.gates.iter().map(|g| g.step_id.as_str()).collect();
+        assert_eq!(ids, vec!["gate_a", "gate_b"]);
+        assert_eq!(view.gates[0].prompt.as_deref(), Some("approve gate_a?"));
+
+        // One gate decided: it leaves the set, the run stays parked.
+        let one_left = record("r", "awaiting_approval", &[("gate_b", None)]);
+        overlay_record(&mut view, &one_left);
+        assert_eq!(view.status, RunStatus::AwaitingApproval);
+        assert_eq!(view.gates.len(), 1);
+
+        // The last gate decided and the run resumed: no gates, status follows.
+        overlay_record(&mut view, &record("r", "running", &[]));
+        assert_eq!(view.status, RunStatus::Running);
+        assert!(view.gates.is_empty());
+    }
+
+    #[test]
+    fn a_manual_pause_record_is_not_a_gate_and_never_overwrites_event_status() {
+        let mut view = seed_view(&parse(GATES_YAML), "r");
+        view.apply(&started());
+        // `RunStore::pause` stores the active step in the awaiting fields.
+        let mut paused = record("r", "paused", &[]);
+        paused.awaiting_step_id = Some("gate_a".into());
+        overlay_record(&mut view, &paused);
+        assert!(view.gates.is_empty(), "a pause is not an approvable gate");
+        // Terminal / paused stay event-derived (the generation guard's input).
+        assert_eq!(view.status, RunStatus::Running);
+        overlay_record(&mut view, &record("r", "failed", &[]));
+        assert_eq!(view.status, RunStatus::Running);
+    }
+
+    fn step_result(step: &str, findings: &[&str]) -> StepResultRecord {
+        let mut r: StepResultRecord = serde_json::from_value(serde_json::json!({
+            "step_id": step,
+            "run_id": "r",
+            "transcript_path": "/t/x.jsonl",
+            "output": "",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "",
+            "finished_at": "2026-09-30T11:00:00Z",
+        }))
+        .unwrap();
+        r.findings = findings
+            .iter()
+            .map(|sev| rupu_orchestrator::FindingRecord {
+                source: "panel".into(),
+                severity: (*sev).into(),
+                title: format!("{sev} thing"),
+                body: String::new(),
+                codename: None,
+            })
+            .collect();
+        r
+    }
+
+    #[test]
+    fn step_results_overlay_is_idempotent_and_never_invents_a_step() {
+        let mut view = seed_view(&parse(GATES_YAML), "r");
+        let mut a = step_result("gate_a", &["High", "high", "low"]);
+        a.loop_iteration = Some(2);
+        a.host = Some("kuki".into());
+        // A loop super-node result: findings count, but no row is invented.
+        let phantom = step_result("loop:fix", &["low"]);
+        let records = vec![a, phantom];
+
+        overlay_step_results(&mut view, &records);
+        overlay_step_results(&mut view, &records);
+        assert_eq!(view.findings_by_severity.get("high"), Some(&2));
+        assert_eq!(view.findings_by_severity.get("low"), Some(&2));
+        assert_eq!(view.steps.len(), 2, "no phantom `loop:fix` row");
+        assert_eq!(view.steps[0].loop_iteration, Some(2));
+        assert_eq!(view.steps[0].host.as_deref(), Some("kuki"));
+
+        let listed = gate_findings(&records);
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[0].who.as_deref(), Some("panel"));
+    }
+
+    // ── gate decisions ──────────────────────────────────────────────────
+
+    fn gate_view(step: &str, expires_at: Option<DateTime<Utc>>) -> GateView {
+        GateView {
+            step_id: step.into(),
+            prompt: None,
+            since: Utc::now(),
+            expires_at,
+        }
+    }
+
+    fn parked_store(tmp: &Path, yaml: &str, gates: &[(&str, Option<DateTime<Utc>>)]) -> RunStore {
+        let store = RunStore::new(tmp.join("runs"));
+        store
+            .create(record("run_t", "awaiting_approval", gates), yaml)
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn approving_one_gate_records_it_and_asks_for_a_resume_of_that_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parked_store(
+            tmp.path(),
+            GATES_YAML,
+            &[("gate_a", None), ("gate_b", None)],
+        );
+        let wf = parse(GATES_YAML);
+
+        let out = decide_gate(
+            &store,
+            &wf,
+            "run_t",
+            &gate_view("gate_b", None),
+            GateVerb::Approve,
+            "op",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            GateFollowUp::Resume {
+                step_id: "gate_b".into(),
+                approver: "op".into(),
+                via_timeout: false,
+            }
+        );
+        // Only gate_b left the set; the run stays parked on gate_a.
+        let rec = store.load("run_t").unwrap();
+        assert_eq!(rec.status, RunStatus::AwaitingApproval);
+        let left: Vec<String> = rec
+            .awaiting_gates()
+            .into_iter()
+            .map(|g| g.step_id)
+            .collect();
+        assert_eq!(left, vec!["gate_a".to_string()]);
+    }
+
+    #[test]
+    fn rejecting_a_gate_records_it_and_asks_for_the_on_reject_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parked_store(
+            tmp.path(),
+            GATES_YAML,
+            &[("gate_a", None), ("gate_b", None)],
+        );
+        let wf = parse(GATES_YAML);
+
+        let out = decide_gate(
+            &store,
+            &wf,
+            "run_t",
+            &gate_view("gate_a", None),
+            GateVerb::Reject,
+            "op",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            GateFollowUp::Cleanup {
+                step_id: "gate_a".into(),
+                reason: REJECT_REASON.into(),
+                via: "human",
+                approver: "op".into(),
+            }
+        );
+        let left: Vec<String> = store
+            .load("run_t")
+            .unwrap()
+            .awaiting_gates()
+            .into_iter()
+            .map(|g| g.step_id)
+            .collect();
+        assert_eq!(left, vec!["gate_b".to_string()]);
+    }
+
+    #[test]
+    fn a_decision_that_cannot_be_recorded_is_a_one_line_message_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parked_store(
+            tmp.path(),
+            GATES_YAML,
+            &[("gate_a", None), ("gate_b", None)],
+        );
+        let wf = parse(GATES_YAML);
+        let try_it = |step: &str, verb| {
+            decide_gate(
+                &store,
+                &wf,
+                "run_t",
+                &gate_view(step, None),
+                verb,
+                "op",
+                Utc::now(),
+            )
         };
 
-        state.select_next();
-        assert_eq!(
-            state.selected,
-            Some(NodeRef::Step),
-            "with no fan-out units, the lone step is the only navigable node"
+        let err = try_it("no_such_gate", GateVerb::Approve).unwrap_err();
+        assert!(
+            err.starts_with("approve failed:") && err.contains("no_such_gate"),
+            "{err}"
         );
+        let err = try_it("no_such_gate", GateVerb::Reject).unwrap_err();
+        assert!(err.starts_with("reject failed:"), "{err}");
+        assert!(!err.contains('\n'), "one line: {err:?}");
+        assert_eq!(store.load("run_t").unwrap().awaiting_gates().len(), 2);
 
-        state.select_next();
-        assert_eq!(
-            state.selected,
-            Some(NodeRef::Step),
-            "a single-node set is idempotent under further nav"
-        );
-
-        state.select_prev();
-        assert_eq!(state.selected, Some(NodeRef::Step));
+        // A second approve of an already-decided gate is refused, not applied.
+        try_it("gate_a", GateVerb::Approve).unwrap();
+        let err = try_it("gate_a", GateVerb::Approve).unwrap_err();
+        assert!(err.starts_with("approve failed:"), "{err}");
     }
 
-    // -----------------------------------------------------------------
-    // Focus resolution + spine highlight + keymap hint (Task 2)
-    // -----------------------------------------------------------------
+    const TIMED_YAML: &str = "name: g\nsteps:\n  - id: gate_a\n    approval:\n      \
+         timeout_seconds: 60\n      on_timeout: approve\n  - id: gate_b\n    approval:\n      \
+         timeout_seconds: 60\n      on_timeout: reject\n";
 
-    /// A single active linear step with no fan-out units — mirrors
-    /// `nav_ignored_when_no_concurrent_nodes`'s fixture (navigable set of
-    /// length 1: `[Step]` only).
-    fn solo_step_state() -> LiveRunState {
-        LiveRunState {
-            codename: None,
-            workflow_name: "w".into(),
-            run_id: "run_1".into(),
-            status: RunStatus::Running,
-            started_at: Some(ts(0)),
-            finished_at: None,
-            steps: vec![StepState {
-                codename: None,
-                provider: None,
-                model: None,
-                id: "only".into(),
-                kind: StepKind::Linear,
-                agent: Some("solo-agent".into()),
-                status: NodeStatus::Working,
-                tokens_in: 0,
-                tokens_out: 0,
-                elapsed_secs: 0,
-                units: Vec::new(),
-                fanout_total: None,
-                panel_iter: None,
-                panel_findings: 0,
-            }],
-            tokens_in: 0,
-            tokens_out: 0,
-            cost: None,
-            findings_count: None,
-            coverage_pct: None,
-            active: ActiveFocus {
-                codename: None,
-                provider: None,
-                model: None,
-                step_id: Some("only".into()),
-                unit_key: None,
-                agent: Some("solo-agent".into()),
-                active_unit_transcript: None,
-                feed: Vec::new(),
-                last_event_at: None,
-            },
-            selected: None,
+    #[test]
+    fn a_decision_on_an_overdue_gate_is_attributed_to_its_timeout_policy() {
+        let wf = parse(TIMED_YAML);
+        let now = Utc::now();
+        let past = now - chrono::Duration::seconds(5);
+        let future = now + chrono::Duration::seconds(50);
+
+        assert_eq!(
+            overdue_policy(&wf, &gate_view("gate_a", Some(past)), now),
+            Some(TimeoutAction::Approve)
+        );
+        assert_eq!(
+            overdue_policy(&wf, &gate_view("gate_b", Some(past)), now),
+            Some(TimeoutAction::Reject)
+        );
+        // Not overdue, no deadline, or not a gate: no policy has fired.
+        assert_eq!(
+            overdue_policy(&wf, &gate_view("gate_a", Some(future)), now),
+            None
+        );
+        assert_eq!(overdue_policy(&wf, &gate_view("gate_a", None), now), None);
+        assert_eq!(
+            overdue_policy(&wf, &gate_view("nope", Some(past)), now),
+            None
+        );
+
+        // Approving the overdue `on_timeout: approve` gate resumes it as a
+        // timeout decision (`via: "timeout"`), as the CLI records it.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parked_store(tmp.path(), TIMED_YAML, &[("gate_a", Some(past))]);
+        let out = decide_gate(
+            &store,
+            &wf,
+            "run_t",
+            &gate_view("gate_a", Some(past)),
+            GateVerb::Approve,
+            "op",
+            now,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &out,
+                GateFollowUp::Resume {
+                    via_timeout: true,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+
+        // Rejecting the overdue `on_timeout: reject` gate is the policy's call.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parked_store(tmp.path(), TIMED_YAML, &[("gate_b", Some(past))]);
+        let out = decide_gate(
+            &store,
+            &wf,
+            "run_t",
+            &gate_view("gate_b", Some(past)),
+            GateVerb::Reject,
+            "op",
+            now,
+        )
+        .unwrap();
+        assert!(
+            matches!(&out, GateFollowUp::Cleanup { via: "timeout", .. }),
+            "{out:?}"
+        );
+    }
+
+    // ── the footer and the keys agree ───────────────────────────────────
+
+    #[test]
+    fn a_parked_run_replayed_from_disk_shows_the_gate_keys_and_they_act() {
+        use crate::output::live_view::layout::live_layout;
+        use crate::output::live_view::row::render_plain;
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path().join("runs");
+        let run_dir = runs.join("run_P");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::json!({
+                "id": "run_P",
+                "workflow_name": "publish",
+                "status": "awaiting_approval",
+                "inputs": {},
+                "workspace_id": "ws",
+                "workspace_path": tmp.path(),
+                "transcript_dir": tmp.path(),
+                "started_at": "2026-09-30T10:00:00Z",
+                "codename": "mint-tundra",
+                "awaiting": [{
+                    "step_id": "approve",
+                    "prompt": "publish the report?",
+                    "since": "2026-09-30T11:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut f = std::fs::File::create(run_dir.join("events.jsonl")).unwrap();
+        for line in [
+            r#"{"type":"run_started","event_version":1,"run_id":"run_P","workflow_path":"wf","started_at":"2026-09-30T10:00:00Z"}"#,
+            r#"{"type":"step_started","run_id":"run_P","step_id":"build","kind":"run","agent":null}"#,
+            r#"{"type":"step_completed","run_id":"run_P","step_id":"build","success":true,"duration_ms":18000}"#,
+            r#"{"type":"step_started","run_id":"run_P","step_id":"approve","kind":"approval_gate","agent":null}"#,
+            r#"{"type":"step_awaiting_approval","run_id":"run_P","step_id":"approve","reason":"publish?"}"#,
+            r#"{"type":"step_started","run_id":"run_P","step_id":"deploy","kind":"run","agent":null}"#,
+        ] {
+            writeln!(f, "{line}").unwrap();
         }
+        drop(f);
+
+        let store = RunStore::new(runs);
+        let view = RunView::from_run_dir(&store, "run_P", &rupu_config::PricingConfig::default());
+        assert_eq!(view.status, RunStatus::AwaitingApproval);
+        let at = |nav: &NavState| -> (String, bool) {
+            let frame = live_layout(&view, nav, &[], Utc::now(), 80, 24);
+            let footer = render_plain(&frame[frame.len() - 1..]);
+            let acts = decode_key(KeyCode::Char('a'), NONE, nav.focused_gate(&view).is_some())
+                == Some(KeyAction::Approve);
+            (footer, acts)
+        };
+
+        // Following a parked run: the gate is focused with no navigation,
+        // the footer advertises approve, and `a` really approves.
+        let (footer, acts) = at(&NavState::default());
+        assert!(footer.starts_with("a approve · r reject"), "{footer}");
+        assert!(acts);
+
+        // Select a step that is not the gate: the legend is the navigation
+        // set and `a` is auto-follow — the two can never disagree.
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Up, &view); // step 0 = `build`, chosen by hand
+        let (footer, acts) = at(&nav);
+        assert!(footer.starts_with("↑↓ move"), "{footer}");
+        assert!(!acts);
+        // `a` there is Follow, which returns to the auto-focused gate.
+        assert_eq!(
+            decode_key(KeyCode::Char('a'), NONE, false),
+            nav_key(NavKey::Follow)
+        );
+        nav.apply(NavKey::Follow, &view);
+        assert!(at(&nav).1);
+    }
+
+    fn nav_key(k: NavKey) -> Option<KeyAction> {
+        Some(KeyAction::Nav(k))
     }
 
     #[test]
-    fn desired_transcript_follows_selection_when_pinned() {
-        // Pin unit 0 ("conf-manager") while auto-follow's own signals
-        // (the active-unit transcript AND the caller's active-step path)
-        // both point elsewhere — the pin must win over both.
-        let mut state = fanout_state(true);
-        state.active.active_unit_transcript = Some(std::path::PathBuf::from("/runs/app-gw.jsonl"));
-        state.selected = Some(NodeRef::Unit { index: 0 });
-
-        let resolved =
-            state.focused_transcript(Some(std::path::PathBuf::from("/runs/active_step.jsonl")));
-
-        assert_eq!(
-            resolved,
-            Some(std::path::PathBuf::from("/runs/conf-manager.jsonl"))
-        );
-    }
-
-    #[test]
-    fn desired_transcript_auto_follows_when_selection_none() {
-        // `selected: None` must reproduce today's precedence exactly:
-        // the active unit's transcript wins when present...
-        let mut state = fanout_state(true);
-        state.active.active_unit_transcript = Some(std::path::PathBuf::from("/runs/app-gw.jsonl"));
-        assert_eq!(state.selected, None);
-        assert_eq!(
-            state.focused_transcript(Some(std::path::PathBuf::from("/runs/active_step.jsonl"))),
-            Some(std::path::PathBuf::from("/runs/app-gw.jsonl"))
-        );
-
-        // ...falling back to the caller-supplied active-step path when
-        // there is no active-unit transcript (the linear-step case).
-        state.active.active_unit_transcript = None;
-        assert_eq!(
-            state.focused_transcript(Some(std::path::PathBuf::from("/runs/active_step.jsonl"))),
-            Some(std::path::PathBuf::from("/runs/active_step.jsonl"))
-        );
-    }
-
-    #[test]
-    fn pinned_completed_node_stays_focused() {
-        // Pin the in-flight "app-gw" unit (index 2)...
-        let mut state = fanout_state(true);
-        state.selected = Some(NodeRef::Unit { index: 2 });
-        assert_eq!(
-            state.focused_transcript(None),
-            Some(std::path::PathBuf::from("/runs/app-gw.jsonl"))
-        );
-
-        // ...then complete it. The pin must not auto-jump away: the same
-        // transcript stays the focus target until the operator moves the
-        // selection or releases it (`a`).
-        state.apply(&WfEvent::UnitCompleted {
-            run_id: "run_01ABC".into(),
-            step_id: "assess".into(),
-            index: 2,
-            unit_key: "app-gw".into(),
-            success: true,
-            tokens_in: 10,
-            tokens_out: 5,
-            host: None,
-        });
-
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        assert_eq!(step.units[2].status, NodeStatus::Complete);
-        assert_eq!(
-            state.focused_transcript(None),
-            Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
-            "a pinned node's transcript must not change when it completes"
-        );
-    }
-
-    #[test]
-    fn render_graph_highlights_selected_node() {
-        // Selecting the active step itself marks only that step's row.
-        let mut state = fanout_state(true);
-        state.selected = Some(NodeRef::Step);
-        let rows = stripped(render_graph(&state, &empty_workflow(), 100));
-        let marked: Vec<&String> = rows
-            .iter()
-            .filter(|r| r.contains(SELECTION_MARKER))
-            .collect();
-        assert_eq!(marked.len(), 1, "{rows:#?}");
-        assert!(marked[0].contains("assess"), "{rows:#?}");
-
-        // Selecting a fan-out unit marks only that unit's row, and no
-        // other row (including the step header) carries the marker.
-        state.selected = Some(NodeRef::Unit { index: 1 });
-        let rows = stripped(render_graph(&state, &empty_workflow(), 100));
-        let marked: Vec<&String> = rows
-            .iter()
-            .filter(|r| r.contains(SELECTION_MARKER))
-            .collect();
-        assert_eq!(marked.len(), 1, "{rows:#?}");
-        assert!(marked[0].contains("tlb-agent"), "{rows:#?}");
-    }
-
-    #[test]
-    fn dashboard_shows_selection_keymap_hint() {
-        // The active "assess" step has 5 fan-out units -> navigable set
-        // of 6 nodes, so the hint should render.
-        let with_units = fanout_state(true);
-        assert!(with_units.navigable_nodes().len() > 1);
-        let rows = stripped(render_dashboard(&with_units, ts(0), 100));
+    fn notices_are_single_scrubbed_rows() {
+        use crate::output::live_view::row::render_plain;
+        let line = notice_line("pause\u{1b}[2J requested\nnow", false);
+        let plain = render_plain(&[line]);
+        assert!(plain.starts_with("» pause"), "{plain:?}");
         assert!(
-            rows.iter()
-                .any(|r| r.contains("select") && r.contains("auto")),
-            "{rows:#?}"
+            !plain.contains('\u{1b}') && !plain.contains('\n'),
+            "{plain:?}"
+        );
+    }
+
+    // ── the loop's state, driven without a terminal ─────────────────────
+
+    const RUN_AND_GATES_YAML: &str = "name: g\nsteps:\n  - id: build\n    run:\n      \
+         cmd: echo\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
+
+    /// A `Live` over a run parked at `gate_a` + `gate_b` (after a `build`
+    /// step), plus its store. No terminal is touched.
+    fn parked_live(tmp: &Path) -> (Live, RunStore) {
+        let store = parked_store(
+            tmp,
+            RUN_AND_GATES_YAML,
+            &[("gate_a", None), ("gate_b", None)],
+        );
+        let live = Live::new(
+            parse(RUN_AND_GATES_YAML),
+            tmp.join("runs"),
+            "run_t".into(),
+            rupu_config::PricingConfig::default(),
+        );
+        (live, store)
+    }
+
+    fn notice_text(live: &Live) -> Option<String> {
+        use crate::output::live_view::row::render_plain;
+        live.notice
+            .as_ref()
+            .map(|n| render_plain(std::slice::from_ref(&n.line)))
+    }
+
+    #[test]
+    fn a_parked_run_focuses_its_first_gate_and_a_wandering_operator_is_told_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut live, store) = parked_live(tmp.path());
+        live.ingest();
+        assert_eq!(live.view.status, RunStatus::AwaitingApproval);
+        assert_eq!(
+            live.nav
+                .focused_gate(&live.view)
+                .map(|g| g.step_id.as_str()),
+            Some("gate_a")
+        );
+        // Following a parked run needs no hint: the gate is already focused.
+        assert!(notice_text(&live).is_none());
+
+        // The operator moves off the gates (onto `build`): they keep their
+        // selection, and are told once that the run is waiting.
+        live.apply_action(KeyAction::Nav(NavKey::Up));
+        live.ingest();
+        assert_eq!(live.nav.focused_gate(&live.view).map(|_| ()), None);
+        let hint = notice_text(&live).expect("a parked-run notice");
+        assert!(
+            hint.contains("gate_a") && hint.contains("press a"),
+            "{hint}"
+        );
+        // Once per park: clearing it and ticking again does not re-announce.
+        live.notice = None;
+        live.ingest();
+        assert!(notice_text(&live).is_none());
+
+        // `a` (follow) brings the gate back into focus, and the pointer
+        // that said how to get there goes away.
+        live.ingest();
+        live.notice = None;
+        live.parked_hint = None;
+        live.ingest();
+        assert!(notice_text(&live).is_some());
+        live.apply_action(KeyAction::Nav(NavKey::Follow));
+        live.ingest();
+        assert!(live.nav.focused_gate(&live.view).is_some());
+        assert!(notice_text(&live).is_none());
+
+        // Both gates decided elsewhere: the run is no longer parked and the
+        // next park would be announced afresh.
+        store
+            .approve_gate("run_t", "op", Utc::now(), Some("gate_a"))
+            .unwrap();
+        store
+            .approve_gate("run_t", "op", Utc::now(), Some("gate_b"))
+            .unwrap();
+        live.ingest();
+        assert_ne!(live.view.status, RunStatus::AwaitingApproval);
+        assert!(live.view.gates.is_empty());
+        assert_eq!(live.parked_hint, None);
+    }
+
+    #[test]
+    fn quit_leaves_pause_only_asks_and_a_stale_gate_key_is_a_notice_not_an_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut live, store) = parked_live(tmp.path());
+        live.ingest();
+
+        // `q` / Ctrl-C leave; neither touches the run.
+        assert_eq!(
+            live.apply_action(KeyAction::Nav(NavKey::Quit)),
+            Some(Exit::Quit)
+        );
+        assert_eq!(
+            store.load("run_t").unwrap().status,
+            RunStatus::AwaitingApproval
         );
 
-        // A lone active step with no units has nothing to select -> the
-        // hint must be omitted to avoid cluttering single-step runs.
-        let solo = solo_step_state();
-        assert_eq!(solo.navigable_nodes().len(), 1);
-        let rows = stripped(render_dashboard(&solo, ts(0), 100));
-        assert!(
-            !rows
-                .iter()
-                .any(|r| r.contains("select") && r.contains("auto")),
-            "{rows:#?}"
+        // `Esc` on a parked run cannot pause it: a one-line notice says why,
+        // and the record is untouched.
+        assert_eq!(live.apply_action(KeyAction::Nav(NavKey::Pause)), None);
+        let note = notice_text(&live).expect("a notice");
+        assert!(note.contains("only a running run can be paused"), "{note}");
+        assert_eq!(
+            store.load("run_t").unwrap().status,
+            RunStatus::AwaitingApproval
         );
+
+        // Someone else decides `gate_a` first; this view still shows it. The
+        // approve is refused (nothing spawned) and the gate leaves the view.
+        store
+            .approve_gate("run_t", "other", Utc::now(), Some("gate_a"))
+            .unwrap();
+        live.apply_action(KeyAction::Approve);
+        let note = notice_text(&live).expect("a notice");
+        assert!(note.starts_with("» approve failed:"), "{note}");
+        assert!(
+            live.background.is_empty(),
+            "a refused decision spawns nothing"
+        );
+        assert_eq!(
+            live.nav
+                .focused_gate(&live.view)
+                .map(|g| g.step_id.as_str()),
+            Some("gate_b"),
+            "the view dropped the decided gate and focuses the next"
+        );
+    }
+
+    #[test]
+    fn the_gate_panel_replaces_the_feed_while_v_is_on_and_the_notice_stays_last() {
+        use crate::output::live_view::row::render_plain;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut live, _store) = parked_live(tmp.path());
+        live.ingest();
+        let plain = |lines: &[Line]| render_plain(lines);
+
+        assert!(plain(&live.build_feed()).is_empty());
+        live.apply_action(KeyAction::ToggleDetails);
+        live.set_notice("approved nothing", false);
+        let feed = plain(&live.build_feed());
+        assert!(feed.contains("⏸ gate_a · parked"), "{feed}");
+        assert!(feed.contains("approve gate_a?"), "{feed}");
+        assert!(feed.ends_with("» approved nothing"), "{feed}");
+
+        // Toggling off — or losing the gate's focus — restores the feed.
+        live.apply_action(KeyAction::ToggleDetails);
+        assert!(!plain(&live.build_feed()).contains("gate_a"));
+        live.apply_action(KeyAction::ToggleDetails);
+        live.apply_action(KeyAction::Nav(NavKey::Up)); // off the gates
+        live.ingest();
+        assert!(!live.show_details);
+    }
+
+    #[test]
+    fn a_frame_is_painted_in_full_then_only_what_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut live, _store) = parked_live(tmp.path());
+        live.ingest();
+        let mut first: Vec<u8> = Vec::new();
+        live.draw(&mut first, (80, 24));
+        let first = String::from_utf8_lossy(&first).to_string();
+        assert!(first.contains("approve"), "{first:?}");
+        assert!(first.contains("gate_a"), "{first:?}");
+
+        // Nothing but the clock can have changed: the unchanged rows (the
+        // gate's, the footer's) are not written again.
+        let mut second: Vec<u8> = Vec::new();
+        live.draw(&mut second, (80, 24));
+        let second = String::from_utf8_lossy(&second).to_string();
+        assert!(!second.contains("gate_a"), "{second:?}");
+        assert!(!second.contains("approve"), "{second:?}");
+
+        // A resize invalidates the renderer: the next frame clears and
+        // repaints everything.
+        live.renderer.invalidate();
+        let mut third: Vec<u8> = Vec::new();
+        live.draw(&mut third, (60, 20));
+        let third = String::from_utf8_lossy(&third).to_string();
+        assert!(third.contains("gate_a"), "{third:?}");
     }
 }

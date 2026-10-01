@@ -218,11 +218,14 @@ fn focused_step_id<'a>(view: &'a RunView, nav: &NavState) -> Option<&'a str> {
 }
 
 /// The step the operator has chosen (see [`focused_step_id`]) — what the
-/// graph marks `▸`, what the layout never collapses, and whose state picks the
-/// footer legend.
+/// graph marks `▸` and what the layout never collapses. While following, a
+/// parked run's first gate stands in for a choice ([`NavState::gate_step`]),
+/// so the marker shows which gate `a` / `r` would act on.
 fn chosen_step<'a>(view: &'a RunView, nav: &NavState) -> Option<&'a StepView> {
     let chosen = !nav.is_following() || nav.depth() != Depth::Run;
-    nav.selected_step(view).filter(|_| chosen)
+    nav.selected_step(view)
+        .filter(|_| chosen)
+        .or_else(|| nav.gate_step(view))
 }
 
 fn step_row(step: &StepView, marked: bool) -> Line {
@@ -643,7 +646,7 @@ fn join_dot(mut line: Line, parts: Vec<Line>, lead: bool) -> Line {
 
 /// Wire text for a single-line row: control characters (ESC, newlines, …)
 /// become U+FFFD so they can neither reach the terminal nor break the row.
-pub(super) fn printable(s: &str) -> String {
+pub(crate) fn printable(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
@@ -1159,7 +1162,9 @@ fn footer_line(view: &RunView, nav: &NavState, w: usize) -> Line {
         ("v findings", 3),
         ("q quit", 0),
     ];
-    let at_gate = chosen_step(view, nav).is_some_and(|s| s.state == StepState::AwaitingApproval);
+    // The same predicate the key dispatch uses, so the legend never
+    // advertises a key that would do nothing (or hides one that would act).
+    let at_gate = nav.focused_gate(view).is_some();
     let mut hints = if at_gate { AT_GATE } else { NAVIGATE }.to_vec();
     while legend(&hints).width() > w && hints.len() > 1 {
         let Some(least) = hints
@@ -1195,7 +1200,7 @@ mod tests {
     use super::*;
     use crate::output::live_view::nav::{NavKey, UnitFilter};
     use crate::output::live_view::row::{render_plain, Style};
-    use crate::output::run_model::{RunView, UnitView};
+    use crate::output::run_model::{GateView, RunView, UnitView};
     use chrono::{Duration, TimeZone, Utc};
     use rupu_orchestrator::executor::Event;
     use rupu_orchestrator::runs::{RunStatus, StepKind};
@@ -2269,28 +2274,79 @@ mod tests {
         gate.kind = StepKind::ApprovalGate;
         gate.state = StepState::AwaitingApproval;
         v.step_mut("deploy");
-
-        let footer = |nav: &NavState, w: usize| {
-            let out = live_layout(&v, nav, &feed(6), now(), w, 24);
+        // A step that merely LOOKS parked (no entry in run.json's awaiting
+        // set) is not actionable: the footer must not advertise a/r on it.
+        let footer_of = |v: &RunView, nav: &NavState, w: usize| {
+            let out = live_layout(v, nav, &feed(6), now(), w, 24);
             render_plain(&out[out.len() - 1..])
         };
         let normal = "↑↓ move · enter drill · ← back · / filter · q quit";
         let at_gate = "a approve · r reject · v findings · q quit";
-        // Not selecting anything, or selecting another step: navigation keys.
-        assert_eq!(footer(&NavState::default(), W), normal);
+        assert_eq!(footer_of(&v, &NavState::default(), W), normal);
+        assert_eq!(footer_of(&v, &nav_at(&v, 1), W), normal);
+
+        v.gates = vec![GateView {
+            step_id: "gate".into(),
+            prompt: None,
+            since: now(),
+            expires_at: None,
+        }];
+        let footer = |nav: &NavState, w: usize| footer_of(&v, nav, w);
+        // Following with the run parked: the gate is auto-focused, so its
+        // keys show without any navigation (Plan 2's I1 gap).
+        assert_eq!(footer(&NavState::default(), W), at_gate);
+        // The operator selects another step: navigation keys. (`nav_at(_, 0)`
+        // is just the default, still following; stepping down then back up
+        // selects step 0 by hand.)
+        let mut at_build = nav_at(&v, 1);
+        at_build.apply(NavKey::Up, &v);
+        assert!(!at_build.is_following());
+        assert_eq!(footer(&at_build, W), normal);
         assert_eq!(footer(&nav_at(&v, 2), W), normal);
         // Selecting the parked gate: the modal approve/reject set.
         assert_eq!(footer(&nav_at(&v, 1), W), at_gate);
         assert_eq!(footer(&drilled_at(&v, 1, 0), W), at_gate);
 
         // A narrow terminal drops the least important hints; `q quit` stays.
-        assert_eq!(
-            footer(&NavState::default(), 30),
-            "↑↓ move · enter drill · q quit"
-        );
+        assert_eq!(footer(&nav_at(&v, 2), 30), "↑↓ move · enter drill · q quit");
         assert_eq!(footer(&nav_at(&v, 1), 30), "a approve · r reject · q quit");
         assert_eq!(footer(&nav_at(&v, 1), 24), "a approve · q quit");
-        assert_eq!(footer(&NavState::default(), 6), "q quit");
+        assert_eq!(footer(&nav_at(&v, 2), 6), "q quit");
+    }
+
+    #[test]
+    fn the_auto_focused_gate_is_marked_so_a_and_r_have_a_visible_target() {
+        let mut v = RunView::default();
+        v.status = RunStatus::AwaitingApproval;
+        complete(&mut v, "build");
+        for id in ["gate_a", "gate_b"] {
+            let g = v.step_mut(id);
+            g.kind = StepKind::ApprovalGate;
+            g.state = StepState::AwaitingApproval;
+            v.gates.push(GateView {
+                step_id: id.into(),
+                prompt: None,
+                since: now(),
+                expires_at: None,
+            });
+        }
+        let marked = |v: &RunView, nav: &NavState| -> Vec<String> {
+            lines_of(&graph(v, nav))
+                .into_iter()
+                .filter(|l| l.starts_with('▸'))
+                .collect()
+        };
+        // Following: exactly the first parked gate carries the marker.
+        let auto = marked(&v, &NavState::default());
+        assert_eq!(auto.len(), 1, "{auto:?}");
+        assert!(auto[0].contains("gate_a"), "{auto:?}");
+        // Choosing the second gate moves it there.
+        let second = marked(&v, &nav_at(&v, 2));
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(second[0].contains("gate_b"), "{second:?}");
+        // A run that is not parked marks nothing while following.
+        v.status = RunStatus::Running;
+        assert!(marked(&v, &NavState::default()).is_empty());
     }
 
     #[test]

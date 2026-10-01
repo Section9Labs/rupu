@@ -9,7 +9,8 @@
 //! dispatches between ticks, so every call re-clamps the cursors to the lists
 //! that exist *now* and never indexes out of range.
 
-use crate::output::run_model::{DispatchView, RunView, StepView, UnitStatus, UnitView};
+use crate::output::run_model::{DispatchView, GateView, RunView, StepView, UnitStatus, UnitView};
+use rupu_orchestrator::runs::RunStatus;
 
 /// A navigation input, already decoded from the terminal by Plan 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,9 +153,39 @@ impl NavState {
     }
 
     /// The sub-agent under the cursor.
-    fn selected_sub_agent<'a>(&self, view: &'a RunView) -> Option<&'a DispatchView> {
+    pub fn selected_sub_agent<'a>(&self, view: &'a RunView) -> Option<&'a DispatchView> {
         let subs = self.sub_list(view);
         subs.get(clamp_idx(self.sub_idx, subs.len())).copied()
+    }
+
+    /// The parked-gate step an approve / reject would act on, if any. The ONE
+    /// predicate behind both the footer legend (`a approve · r reject · …`) and
+    /// the key dispatch, so the two can never disagree.
+    ///
+    /// Only an `AwaitingApproval` run has one, and only a step with an entry in
+    /// the run's awaiting set (`view.gates`) is actionable — a step that merely
+    /// looks parked is not. Once the operator has chosen a step (moved the
+    /// cursor or drilled in) the gate is that step, if it is parked. While
+    /// following the newest activity nothing is chosen, so the first parked
+    /// gate in step order is focused automatically — a parked run must not
+    /// need navigation before its keys appear.
+    pub fn gate_step<'a>(&self, view: &'a RunView) -> Option<&'a StepView> {
+        if view.status != RunStatus::AwaitingApproval {
+            return None;
+        }
+        let parked = |s: &&StepView| view.gates.iter().any(|g| g.step_id == s.step_id);
+        let chosen = !self.follow || self.depth != Depth::Run;
+        if chosen {
+            self.selected_step(view).filter(parked)
+        } else {
+            view.steps.iter().find(parked)
+        }
+    }
+
+    /// The gate behind [`NavState::gate_step`]: what `a` / `r` / `v` act on.
+    pub fn focused_gate<'a>(&self, view: &'a RunView) -> Option<&'a GateView> {
+        let step = self.gate_step(view)?;
+        view.gates.iter().find(|g| g.step_id == step.step_id)
     }
 
     /// The unit under the cursor within `step`'s *filtered* list. Same answer
@@ -368,7 +399,7 @@ mod tests {
     use super::*;
     use crate::output::run_model::RunView;
     use rupu_orchestrator::executor::Event;
-    use rupu_orchestrator::runs::StepKind;
+    use rupu_orchestrator::runs::{RunStatus, StepKind};
 
     fn fanout_view() -> RunView {
         let mut v = RunView::default();
@@ -793,5 +824,119 @@ mod tests {
         nav.apply(NavKey::In, &f);
         nav.sync(&f);
         assert_eq!(nav.depth(), Depth::Step);
+    }
+
+    // ── gate focus (Plan 3, I1) ─────────────────────────────────────────
+
+    /// `build` done, `gate_a` / `gate_b` parked, `deploy` pending; both
+    /// gates are in `view.gates` (run.json's awaiting set) when `parked`.
+    fn parked_view(two_gates: bool) -> RunView {
+        use crate::output::run_model::{GateView, StepState};
+        let mut v = RunView::default();
+        v.status = RunStatus::AwaitingApproval;
+        start_step(&mut v, "build", StepKind::Linear);
+        v.step_mut("build").state = StepState::Complete;
+        let mut gates = vec!["gate_a"];
+        if two_gates {
+            gates.push("gate_b");
+        }
+        for id in &gates {
+            let s = v.step_mut(id);
+            s.kind = StepKind::ApprovalGate;
+            s.state = StepState::AwaitingApproval;
+        }
+        v.step_mut("deploy");
+        v.gates = gates
+            .into_iter()
+            .map(|id| GateView {
+                step_id: id.into(),
+                prompt: Some("publish?".into()),
+                since: chrono::Utc::now(),
+                expires_at: None,
+            })
+            .collect();
+        v
+    }
+
+    fn gate_id(nav: &NavState, v: &RunView) -> Option<String> {
+        nav.focused_gate(v).map(|g| g.step_id.clone())
+    }
+
+    #[test]
+    fn a_parked_gate_is_auto_focused_while_following() {
+        let v = parked_view(true);
+        let nav = NavState::default();
+        assert!(nav.is_following());
+        // No manual selection: the FIRST parked gate (step order) is focused.
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+        assert_eq!(
+            nav.gate_step(&v).map(|s| s.step_id.as_str()),
+            Some("gate_a")
+        );
+    }
+
+    #[test]
+    fn a_manual_selection_decides_the_focused_gate() {
+        let v = parked_view(true);
+        // Down x1 -> `gate_a`, x2 -> `gate_b`; x0..: following parks on step 0.
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v); // step 1 = gate_a (a move stops following)
+        assert!(!nav.is_following());
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_b"));
+
+        // Selecting a step that is NOT a parked gate: nothing is focused —
+        // the navigation keys apply, not approve/reject.
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(
+            nav.selected_step(&v).map(|s| s.step_id.as_str()),
+            Some("deploy")
+        );
+        assert_eq!(gate_id(&nav, &v), None);
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::Up, &v);
+        nav.apply(NavKey::Up, &v);
+        assert_eq!(
+            nav.selected_step(&v).map(|s| s.step_id.as_str()),
+            Some("build")
+        );
+        assert_eq!(gate_id(&nav, &v), None);
+
+        // `a` (Follow) drops the manual selection and re-focuses the first gate.
+        nav.apply(NavKey::Follow, &v);
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+    }
+
+    #[test]
+    fn a_drilled_gate_stays_focused_without_following() {
+        let v = parked_view(false);
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v); // gate_a
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+        assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+    }
+
+    #[test]
+    fn no_gate_is_focused_unless_the_run_is_awaiting_and_the_gate_is_actionable() {
+        // The run is not awaiting approval (e.g. a pause left a stale record):
+        let mut v = parked_view(true);
+        v.status = RunStatus::Running;
+        assert_eq!(gate_id(&NavState::default(), &v), None);
+
+        // A step that merely LOOKS parked but has no entry in run.json's
+        // awaiting set is not actionable: no approve/reject advertised.
+        let mut v = parked_view(true);
+        v.gates.clear();
+        assert_eq!(gate_id(&NavState::default(), &v), None);
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(gate_id(&nav, &v), None);
+
+        // A decided gate drops out of the set: the other one takes the focus.
+        let mut v = parked_view(true);
+        v.gates.retain(|g| g.step_id != "gate_a");
+        assert_eq!(gate_id(&NavState::default(), &v).as_deref(), Some("gate_b"));
     }
 }
