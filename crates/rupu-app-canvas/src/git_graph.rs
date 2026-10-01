@@ -20,6 +20,7 @@
 //! ```
 
 use crate::node_status::NodeStatus;
+use rupu_orchestrator::workflow::{Join, JoinWait, JoinWaitKeyword};
 use rupu_orchestrator::{is_approval_gate, Workflow};
 use serde::{Deserialize, Serialize};
 
@@ -120,6 +121,10 @@ where
             emit_panel_step(&mut rows, &step.id, &panel.panelists, &status_lookup);
         } else if let Some(subs) = &step.parallel {
             emit_parallel_step(&mut rows, &step.id, subs, &status_lookup);
+        } else if let Some(targets) = &step.split {
+            emit_split_step(&mut rows, &step.id, targets, &status_lookup);
+        } else if let Some(join) = &step.join {
+            emit_join_step(&mut rows, &step.id, join, &status_lookup);
         } else if step.for_each.is_some() {
             emit_for_each_step(&mut rows, &step.id, &status_lookup);
         } else {
@@ -199,6 +204,81 @@ fn emit_parallel_step<F: Fn(&str) -> NodeStatus>(
             GraphCell::Branch(BranchGlyph::Bot, step_status),
         ],
         anchor: None,
+    });
+}
+
+/// Emit a `split:` orchestration node: a bulleted node row carrying a
+/// `split` meta, then one fork lane per target id.
+///
+/// The first lane opens with `╭─`, the last closes with `╰─`, and any
+/// in between use `├─` (a lone target gets the closing `╰─`). Lanes are
+/// coloured by the *target's* status. They deliberately carry no anchor:
+/// every target is itself a top-level step that renders — and anchors —
+/// on its own row, so anchoring the lane too would register the same
+/// step id twice.
+fn emit_split_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step_id: &str,
+    targets: &[String],
+    status_lookup: &F,
+) {
+    let status = status_lookup(step_id);
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Bullet(status),
+            GraphCell::Space(2),
+            GraphCell::Label(step_id.to_string()),
+            GraphCell::Space(2),
+            GraphCell::Meta("split".into()),
+        ],
+        anchor: Some((step_id.to_string(), status)),
+    });
+    let last = targets.len().saturating_sub(1);
+    for (i, target) in targets.iter().enumerate() {
+        let glyph = if i == last {
+            BranchGlyph::Bot
+        } else if i == 0 {
+            BranchGlyph::Top
+        } else {
+            BranchGlyph::Mid
+        };
+        rows.push(GraphRow {
+            cells: vec![
+                GraphCell::Branch(glyph, status_lookup(target)),
+                GraphCell::Space(1),
+                GraphCell::Label(target.clone()),
+            ],
+            anchor: None,
+        });
+    }
+}
+
+/// Emit a `join:` (barrier) orchestration node: `●◄─ <step_id>  join · wait:<policy>`.
+///
+/// The merge glyph marks the convergence point; `wait:` is `all`, `any`,
+/// or the required inbound count.
+fn emit_join_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step_id: &str,
+    join: &Join,
+    status_lookup: &F,
+) {
+    let status = status_lookup(step_id);
+    let wait = match &join.wait {
+        JoinWait::Keyword(JoinWaitKeyword::All) => "all".to_string(),
+        JoinWait::Keyword(JoinWaitKeyword::Any) => "any".to_string(),
+        JoinWait::Count { count } => count.to_string(),
+    };
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Bullet(status),
+            GraphCell::Branch(BranchGlyph::Merge, status),
+            GraphCell::Space(1),
+            GraphCell::Label(step_id.to_string()),
+            GraphCell::Space(2),
+            GraphCell::Meta(format!("join · wait:{wait}")),
+        ],
+        anchor: Some((step_id.to_string(), status)),
     });
 }
 
@@ -714,5 +794,223 @@ steps:
                 .any(|r| r.anchor.as_ref().map(|(id, _)| id.as_str()) == Some("score")),
             "the run node must anchor so live status can paint it"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_join_rows_tests {
+    use super::*;
+    use rupu_orchestrator::Workflow;
+
+    /// a -> fan (split [b, c, d]) -> gather (join) with the given wait
+    /// policy YAML (`all`, `any`, or `{ count: 2 }`).
+    fn fanout_yaml(wait: &str) -> String {
+        format!(
+            r#"
+name: t
+steps:
+  - id: a
+    agent: x
+    prompt: p
+    next: [fan]
+  - id: fan
+    split: [b, c, d]
+  - id: b
+    agent: x
+    prompt: p
+    next: [gather]
+  - id: c
+    agent: x
+    prompt: p
+    next: [gather]
+  - id: d
+    agent: x
+    prompt: p
+    next: [gather]
+  - id: gather
+    join: {{ wait: {wait} }}
+"#
+        )
+    }
+
+    fn rows_with<F: Fn(&str) -> NodeStatus>(yaml: &str, lookup: F) -> Vec<GraphRow> {
+        let wf = Workflow::parse(yaml).expect("workflow parses");
+        render_rows(&wf, lookup)
+    }
+
+    fn rows_for(yaml: &str) -> Vec<GraphRow> {
+        rows_with(yaml, |_| NodeStatus::Waiting)
+    }
+
+    fn metas(rows: &[GraphRow]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| r.cells.iter())
+            .filter_map(|c| match c {
+                GraphCell::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn label_of(row: &GraphRow) -> Option<&str> {
+        row.cells.iter().find_map(|c| match c {
+            GraphCell::Label(l) => Some(l.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The fork-lane rows: a leading `Branch` cell and no anchor (the
+    /// targets are real top-level steps that anchor on their own rows).
+    fn lane_rows(rows: &[GraphRow]) -> Vec<(BranchGlyph, NodeStatus, String)> {
+        rows.iter()
+            .filter(|r| r.anchor.is_none())
+            .filter_map(|r| match (r.cells.first(), label_of(r)) {
+                (Some(GraphCell::Branch(g, s)), Some(l)) => Some((*g, *s, l.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_renders_one_fork_lane_per_target() {
+        let rows = rows_for(&fanout_yaml("all"));
+        let lanes = lane_rows(&rows);
+        assert_eq!(
+            lanes,
+            vec![
+                (BranchGlyph::Top, NodeStatus::Waiting, "b".to_string()),
+                (BranchGlyph::Mid, NodeStatus::Waiting, "c".to_string()),
+                (BranchGlyph::Bot, NodeStatus::Waiting, "d".to_string()),
+            ],
+            "split targets must render as Top/Mid/Bot lanes in declared order: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn split_node_row_carries_split_meta_and_anchors() {
+        let rows = rows_for(&fanout_yaml("all"));
+        let node = rows
+            .iter()
+            .find(|r| r.anchor_step_id() == Some("fan"))
+            .expect("the split node must anchor so the CLI can select + paint it");
+        assert_eq!(label_of(node), Some("fan"));
+        assert!(
+            node.cells
+                .iter()
+                .any(|c| matches!(c, GraphCell::Meta(m) if m == "split")),
+            "split node row must carry a `split` meta: {node:#?}"
+        );
+        assert!(
+            matches!(node.cells.first(), Some(GraphCell::Bullet(_))),
+            "split node is a bulleted node row"
+        );
+    }
+
+    #[test]
+    fn split_lanes_are_coloured_by_their_target_status() {
+        let rows = rows_with(&fanout_yaml("all"), |id| match id {
+            "fan" => NodeStatus::Active,
+            "b" => NodeStatus::Complete,
+            _ => NodeStatus::Waiting,
+        });
+        let lanes = lane_rows(&rows);
+        assert_eq!(lanes[0].1, NodeStatus::Complete, "lane b");
+        assert_eq!(lanes[1].1, NodeStatus::Waiting, "lane c");
+        let node = rows
+            .iter()
+            .find(|r| r.anchor_step_id() == Some("fan"))
+            .unwrap();
+        assert_eq!(node.anchor_status(), Some(NodeStatus::Active));
+    }
+
+    #[test]
+    fn a_single_target_split_ends_its_lane_instead_of_opening_it() {
+        let rows = rows_for(
+            r#"
+name: t
+steps:
+  - id: fan
+    split: [b]
+  - id: b
+    agent: x
+    prompt: p
+"#,
+        );
+        let lanes = lane_rows(&rows);
+        assert_eq!(
+            lanes,
+            vec![(BranchGlyph::Bot, NodeStatus::Waiting, "b".to_string())]
+        );
+    }
+
+    #[test]
+    fn join_renders_a_merge_node_with_its_wait_policy() {
+        for (wait, expected) in [
+            ("all", "join · wait:all"),
+            ("any", "join · wait:any"),
+            ("{ count: 2 }", "join · wait:2"),
+        ] {
+            let rows = rows_for(&fanout_yaml(wait));
+            assert!(
+                metas(&rows).iter().any(|m| m == expected),
+                "wait `{wait}` must render `{expected}`, got {:?}",
+                metas(&rows)
+            );
+            let node = rows
+                .iter()
+                .find(|r| r.anchor_step_id() == Some("gather"))
+                .expect("the join node must anchor so the CLI can select + paint it");
+            assert!(
+                node.cells
+                    .iter()
+                    .any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Merge, _))),
+                "join node row must carry the merge glyph: {node:#?}"
+            );
+            assert_eq!(label_of(node), Some("gather"));
+        }
+    }
+
+    #[test]
+    fn join_with_no_wait_key_defaults_to_all() {
+        let rows = rows_for(
+            r#"
+name: t
+steps:
+  - id: a
+    agent: x
+    prompt: p
+    next: [j]
+  - id: j
+    join: {}
+"#,
+        );
+        assert!(metas(&rows).iter().any(|m| m == "join · wait:all"));
+    }
+
+    #[test]
+    fn join_merge_glyph_takes_the_join_status() {
+        let rows = rows_with(&fanout_yaml("all"), |id| match id {
+            "gather" => NodeStatus::Failed,
+            _ => NodeStatus::Waiting,
+        });
+        let node = rows
+            .iter()
+            .find(|r| r.anchor_step_id() == Some("gather"))
+            .unwrap();
+        assert_eq!(node.anchor_status(), Some(NodeStatus::Failed));
+        assert!(node
+            .cells
+            .iter()
+            .any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Merge, NodeStatus::Failed))));
+    }
+
+    #[test]
+    fn split_and_join_do_not_fall_through_to_the_linear_renderer() {
+        // Regression guard: before the split/join arms existed these
+        // steps rendered as a bare `● id` row with no meta at all.
+        let rows = rows_for(&fanout_yaml("all"));
+        let ms = metas(&rows);
+        assert!(ms.iter().any(|m| m == "split"), "{ms:?}");
+        assert!(ms.iter().any(|m| m.starts_with("join")), "{ms:?}");
     }
 }
