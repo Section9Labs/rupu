@@ -833,6 +833,11 @@ struct Block<'a> {
     /// Row the unit cursor sits on (an expanded fan-out only); trimming keeps
     /// it in view.
     cursor: Option<usize>,
+    /// A fan-out shown collapsed (header + density + movers + hint). Its
+    /// density row already carries the exact unit counts, so trimming it
+    /// drops everything past the head rather than leave a `⋮ +N below` whose
+    /// N counts hidden rows, not units.
+    collapsed_fan_out: bool,
 }
 
 fn make_block<'a>(
@@ -843,7 +848,8 @@ fn make_block<'a>(
 ) -> Block<'a> {
     let chosen = focus == Some(step.step_id.as_str());
     let fan_out = is_fan_out(step);
-    let cursor = (fan_out && chosen && nav.depth() != Depth::Run)
+    let expanded = fan_out && chosen && nav.depth() != Depth::Run;
+    let cursor = expanded
         .then(|| {
             let cur = nav.selected_unit_in(step)?;
             let pos = nav
@@ -859,6 +865,7 @@ fn make_block<'a>(
         class: classify(step.state, chosen),
         head: if fan_out { FANOUT_HEAD } else { 1 },
         cursor,
+        collapsed_fan_out: fan_out && !expanded,
     }
 }
 
@@ -942,13 +949,14 @@ fn fit_graph(view: &RunView, nav: &NavState, avail: usize) -> Vec<Line> {
     }
     // 3. Then the biggest surviving block gives up rows, one at a time. A
     //    target of `head + 1` has no room for a unit and the marker, so it
-    //    goes straight to `head`.
+    //    goes straight to `head`. A collapsed fan-out has no window to keep: it
+    //    goes straight to its head (header + exact-count density row).
     while !fits(&collapsed, &trim) {
         let biggest = (0..n)
             .filter(|&i| !collapsed[i] && trim[i] > blocks[i].head)
             .max_by_key(|&i| trim[i] - blocks[i].head);
         let Some(i) = biggest else { break };
-        trim[i] = if trim[i] == blocks[i].head + 2 {
+        trim[i] = if blocks[i].collapsed_fan_out || trim[i] == blocks[i].head + 2 {
             blocks[i].head
         } else {
             trim[i] - 1
@@ -979,14 +987,16 @@ fn fit_graph(view: &RunView, nav: &NavState, avail: usize) -> Vec<Line> {
 /// `block`'s rows cut to `target`: the head rows, a window of the rest centred
 /// on the unit cursor, and a last `⋮ +N above · +M below` row for what was
 /// dropped. A target with no room for a window plus that marker keeps just the
-/// head.
+/// head. A *collapsed* fan-out keeps just the head whenever it is cut at all:
+/// its density row says exactly how many units are in each state, whereas a
+/// `⋮ +N below` over its movers would count rows and read as a unit count.
 fn trim_block(block: &Block, target: usize) -> Vec<Line> {
     let rows = &block.rows;
     let head = block.head.min(rows.len());
     if target >= rows.len() {
         return rows.clone();
     }
-    if target < head + 2 {
+    if block.collapsed_fan_out || target < head + 2 {
         return rows[..head].to_vec();
     }
     let body = &rows[head..];
@@ -2414,6 +2424,38 @@ mod tests {
         // With room, the drilled list shows its cursor unit as well.
         let s = render_plain(&live_layout(&v, &nav, &feed(8), now(), W, 26));
         assert!(s.contains("▸ ┣━ ✓") && s.contains("svc-0 "), "{s}");
+    }
+
+    #[test]
+    fn collapsed_fanout_trim_keeps_density_not_misleading_row_count() {
+        // `big_run`'s 86-unit `hunt` is the running frontier, collapsed (Run
+        // depth, no unit cursor). At h=17 its whole block (header, density, 4
+        // movers, hint) fits; below that it must trim. A trimmed collapsed
+        // block keeps only its header + density row — the density row already
+        // carries the exact unit counts — and must NOT emit a `⋮ +N below`
+        // whose N counts hidden ROWS (a handful) while ~85 units are hidden.
+        let v = big_run();
+        let nav = NavState::default();
+        let full = render_plain(&live_layout(&v, &nav, &feed(12), now(), W, 17));
+        assert!(full.contains("+82 more · [enter] expand"), "{full}");
+        assert!(!full.contains('⋮'), "{full}");
+
+        let floor = dashboard(&v, now()).len() + 1 + 4 + 1;
+        // 12 is the least that holds summary + header + density + summary.
+        for h in 12..17 {
+            let out = live_layout(&v, &nav, &feed(12), now(), W, h);
+            let s = render_plain(&out);
+            assert!(h >= floor && out.len() <= h, "h={h}\n{s}");
+            // Frontier header + the truthful density row stay on screen.
+            assert_eq!(hunt_headers(&out), 1, "h={h}\n{s}");
+            assert!(s.contains("52/86 ✓52 ◐6 ✗2 ○26"), "h={h}\n{s}");
+            // No row-count marker, and no half-shown mover list.
+            assert!(!s.contains('⋮'), "h={h}\n{s}");
+            assert!(!s.contains("┣━") && !s.contains("┗━"), "h={h}\n{s}");
+            // The frontier-and-feed invariant still holds.
+            assert!(feed_rows(&out).len() >= 4, "h={h}\n{s}");
+            assert!(lines_of(&out).last().unwrap().starts_with("↑↓ move"), "{s}");
+        }
     }
 
     #[test]
