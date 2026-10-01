@@ -718,3 +718,102 @@ async fn a_symlinked_auth_file_is_written_through_to_its_target() {
         matches!(creds, rupu_providers::auth::AuthCredentials::ApiKey { key } if key == "sk-through-link")
     );
 }
+
+// ---- bounded lock wait --------------------------------------------------------
+
+/// A lock holder that never lets go (a SIGSTOPped process, a hung NFS
+/// lockd, a co-tenant flocking the file) fails the operation after the
+/// lock timeout with an error naming the lock file — it never hangs the
+/// refresh, login or logout, and it writes nothing. Both a plain write and
+/// a refresh are bounded the same way.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_held_lock_fails_the_operation_after_the_lock_timeout() {
+    use fs2::FileExt;
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .json_body(serde_json::json!({ "access_token": "mine" }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new().with_lock_timeout(std::time::Duration::from_millis(200));
+    store_near_expiry_sso(&r).await;
+    let before = std::fs::read_to_string(&auth_path).unwrap();
+
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(sidecar(&auth_path))
+        .unwrap();
+    holder.lock_exclusive().unwrap();
+
+    // A write.
+    let started = std::time::Instant::now();
+    let err = r
+        .store(
+            ProviderId::Openai,
+            AuthMode::ApiKey,
+            &StoredCredential::api_key("sk-mine"),
+        )
+        .await
+        .expect_err("a held lock fails the store");
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(200)
+            && waited < std::time::Duration::from_secs(2),
+        "bounded by the lock timeout: {waited:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("locked by another process") && msg.contains("auth.json.lock"),
+        "{msg}"
+    );
+
+    // A refresh (near-expiry `get`): same bound, no token request.
+    let started = std::time::Instant::now();
+    let err = r
+        .get("anthropic", Some(AuthMode::Sso))
+        .await
+        .expect_err("a held lock fails the refresh");
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(200)
+            && waited < std::time::Duration::from_secs(2),
+        "bounded by the lock timeout: {waited:?}"
+    );
+    assert!(
+        err.to_string().contains("locked by another process"),
+        "{err}"
+    );
+    token.assert_hits(0);
+    assert_eq!(
+        std::fs::read_to_string(&auth_path).unwrap(),
+        before,
+        "nothing was written while the lock was held"
+    );
+
+    // Released: the same resolver works again.
+    holder.unlock().unwrap();
+    r.store(
+        ProviderId::Openai,
+        AuthMode::ApiKey,
+        &StoredCredential::api_key("sk-mine"),
+    )
+    .await
+    .expect("store after release");
+}
+
+/// Production waits at most 30s for the lock.
+#[test]
+fn the_lock_timeout_defaults_to_30s() {
+    assert_eq!(
+        rupu_auth::resolver::LOCK_TIMEOUT,
+        std::time::Duration::from_secs(30)
+    );
+}

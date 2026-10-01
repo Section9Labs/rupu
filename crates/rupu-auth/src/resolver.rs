@@ -15,6 +15,13 @@ pub const EXPIRY_REFRESH_BUFFER_SECS: i64 = 60;
 /// rather than block every later `get` for that account.
 pub const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bound on waiting for the auth file's lock (`auth.json.lock`). A holder
+/// that never lets go — a SIGSTOPped process, a hung NFS lockd, a co-tenant
+/// flocking the file — must fail the operation with a clear error, not hang
+/// every refresh, login and logout (and, through them, the runtime's
+/// shutdown).
+pub const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[async_trait]
 pub trait CredentialResolver: Send + Sync {
     /// Resolve credentials for `provider`. `hint` may force a specific
@@ -71,6 +78,8 @@ pub struct KeychainResolver {
     accounts: Vec<crate::account::AccountSpec>,
     /// [`REFRESH_TIMEOUT`]; tests shorten it.
     refresh_timeout: std::time::Duration,
+    /// [`LOCK_TIMEOUT`]; tests shorten it.
+    lock_timeout: std::time::Duration,
 }
 
 /// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
@@ -115,6 +124,7 @@ impl KeychainResolver {
             path,
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         }
     }
 
@@ -122,6 +132,13 @@ impl KeychainResolver {
     /// [`REFRESH_TIMEOUT`].
     pub fn with_refresh_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.refresh_timeout = timeout;
+        self
+    }
+
+    /// Bound each wait for the auth file's lock by `timeout` instead of
+    /// [`LOCK_TIMEOUT`].
+    pub fn with_lock_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.lock_timeout = timeout;
         self
     }
 
@@ -182,8 +199,9 @@ impl KeychainResolver {
         F: FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
     {
         let path = self.auth_file();
+        let lock_timeout = self.lock_timeout;
         tokio::task::spawn_blocking(move || {
-            let _lock = AuthFileLock::acquire(&path)?;
+            let _lock = AuthFileLock::acquire(&path, lock_timeout)?;
             f(&path)
         })
         .await
@@ -341,6 +359,7 @@ impl KeychainResolver {
         kind: ProviderId,
         mode: AuthMode,
         timeout: std::time::Duration,
+        lock_timeout: std::time::Duration,
         when: RefreshWhen,
     ) -> Result<StoredCredential> {
         let legacy = Self::legacy_base(&account).map(str::to_string);
@@ -349,7 +368,7 @@ impl KeychainResolver {
             let _local = local.lock().await;
             let _file = {
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || AuthFileLock::acquire(&path))
+                tokio::task::spawn_blocking(move || AuthFileLock::acquire(&path, lock_timeout))
                     .await
                     .map_err(|e| anyhow::anyhow!("auth file lock task failed: {e}"))??
             };
@@ -379,6 +398,7 @@ impl KeychainResolver {
             kind,
             mode,
             self.refresh_timeout,
+            self.lock_timeout,
             when,
         )
         .await
@@ -678,8 +698,10 @@ impl AuthFileLock {
         s.into()
     }
 
-    /// Blocks until the lock is held.
-    fn acquire(auth_file: &std::path::Path) -> Result<Self> {
+    /// Blocks (the calling thread) until the lock is held, for at most
+    /// `timeout`: a non-blocking `flock` polled with a short backoff, so a
+    /// holder that never lets go yields an error instead of a hang.
+    fn acquire(auth_file: &std::path::Path, timeout: std::time::Duration) -> Result<Self> {
         use fs2::FileExt;
         let path = Self::path_for(auth_file);
         if let Some(parent) = path.parent() {
@@ -688,9 +710,30 @@ impl AuthFileLock {
         }
         let file = crate::private_file::open_private_for_lock(&path)
             .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-        file.lock_exclusive()
-            .map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))?;
-        Ok(Self { _file: file })
+        let deadline = std::time::Instant::now() + timeout;
+        let contended = fs2::lock_contended_error();
+        let mut backoff = std::time::Duration::from_millis(5);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e)
+                    if e.kind() == contended.kind()
+                        && e.raw_os_error() == contended.raw_os_error() =>
+                {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        anyhow::bail!(
+                            "credential store is locked by another process ({}); retry, or \
+                             find and stop the process holding it",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(backoff.min(deadline - now));
+                    backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+                }
+                Err(e) => anyhow::bail!("lock {}: {e}", path.display()),
+            }
+        }
     }
 }
 
@@ -738,6 +781,7 @@ struct KeychainRefresher {
     account: String,
     kind: ProviderId,
     timeout: std::time::Duration,
+    lock_timeout: std::time::Duration,
 }
 
 #[async_trait]
@@ -756,6 +800,7 @@ impl rupu_providers::credential_writes::OAuthRefresher for KeychainRefresher {
             self.kind,
             AuthMode::Sso,
             self.timeout,
+            self.lock_timeout,
             RefreshWhen::RotatedFrom(stale_refresh),
         )
         .await
@@ -856,6 +901,7 @@ impl CredentialResolver for KeychainResolver {
             account: provider.to_string(),
             kind,
             timeout: self.refresh_timeout,
+            lock_timeout: self.lock_timeout,
         }))
     }
 }
@@ -1096,6 +1142,7 @@ mod tests {
                 crate::account::AccountSpec::new("anthropic-personal", "anthropic"),
             ],
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         resolver
@@ -1136,6 +1183,7 @@ mod tests {
                 "anthropic",
             )],
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         resolver
@@ -1182,6 +1230,7 @@ mod tests {
             path: path.clone(),
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
         resolver
             .store(
@@ -1211,6 +1260,7 @@ mod tests {
             path: path.clone(),
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
@@ -1226,6 +1276,7 @@ mod tests {
             path: dir.path().join("auth.json"),
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
         let err = resolver.get("anthropic-typo", None).await.unwrap_err();
         assert!(
@@ -1248,6 +1299,7 @@ mod tests {
             // Deliberately NOT declared, so `get` routes into `get_named`.
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         let sso = StoredCredential {
