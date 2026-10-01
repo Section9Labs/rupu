@@ -1398,7 +1398,24 @@ fn pause_triggered(pause: &Option<CancellationToken>) -> bool {
 /// is a cheap no-op for every call site until [`run_scheduler`] is handed
 /// a real token.
 fn cancel_requested(cancel: Option<&CancellationToken>) -> bool {
-    cancel.is_some_and(|t| t.is_cancelled())
+    // A process that has received SIGTERM (and is only still alive to drain
+    // pending credential writes) launches no new node either: the run
+    // stops as cancelled at the same boundaries a whole-run cancel does.
+    cancel.is_some_and(|t| t.is_cancelled()) || rupu_providers::credential_writes::terminating()
+}
+
+/// [`UnitDispatcher::dispatch_unit`], unless the process is terminating
+/// (SIGTERM, with credential writes still draining): then the unit is not
+/// started at all — it would be killed mid-way on its host anyway.
+async fn dispatch_unit_unless_terminating(
+    dispatcher: &dyn UnitDispatcher,
+    unit: UnitDispatch,
+    host: &str,
+) -> Result<UnitOutcome, RunError> {
+    if rupu_providers::credential_writes::terminating() {
+        return Err(RunError::Terminating);
+    }
+    dispatcher.dispatch_unit(unit, host).await
 }
 
 /// True when any step in the workflow resolves to `workspace: sync`. Used to
@@ -4285,6 +4302,14 @@ async fn run_steps_over(
             continue;
         }
 
+        // Step-boundary stop once SIGTERM has arrived: no further step is
+        // started (the scheduler path does the same through
+        // `cancel_requested`); the run ends as cancelled.
+        if rupu_providers::credential_writes::terminating() {
+            info!(step = %step.id, "the process is terminating; not starting this step");
+            return Err(RunWorkflowError::RunCancelled { aborted: 0 });
+        }
+
         // Step-boundary pause: if a cooperative pause was requested, stop
         // before dispatching the next step. Every step shape pauses cleanly
         // here (fan-out / panel / parallel steps run to completion, then pause
@@ -6220,7 +6245,7 @@ async fn dispatch_placed_step(
         run_id,
         transcript_path.to_path_buf(),
     );
-    match dispatcher.dispatch_unit(unit, host).await {
+    match dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await {
         Ok(outcome) if outcome.success => {
             let output = outcome.output;
             let ws_delta = outcome.workspace_delta;
@@ -7079,7 +7104,13 @@ async fn run_fanout_step(
                                     &run_id_clone,
                                     transcript_clone.clone(),
                                 );
-                                match dispatcher.dispatch_unit(unit, &host).await {
+                                match dispatch_unit_unless_terminating(
+                                    dispatcher.as_ref(),
+                                    unit,
+                                    &host,
+                                )
+                                .await
+                                {
                                     Ok(outcome) => {
                                         // Important fix: when the agent ran but failed
                                         // (success=false), synthesize a raw_error so
@@ -7188,7 +7219,12 @@ async fn run_fanout_step(
                                             &retry_run_id,
                                             transcript_path.clone(),
                                         );
-                                        match dispatcher.dispatch_unit(retry_unit, retry_host).await
+                                        match dispatch_unit_unless_terminating(
+                                            dispatcher.as_ref(),
+                                            retry_unit,
+                                            retry_host,
+                                        )
+                                        .await
                                         {
                                             Ok(outcome) => {
                                                 // Same fix as primary path: synthesize

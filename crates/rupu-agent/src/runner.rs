@@ -738,6 +738,12 @@ pub enum RunError {
     NonTtyAskAbort,
     #[error("operator stopped run at turn {turn}")]
     OperatorStop { turn: u32 },
+    /// SIGTERM has arrived (`rupu_providers::credential_writes::terminating`)
+    /// and the loop refused to start another LLM call or tool dispatch: the
+    /// process is exiting as soon as its pending credential writes are
+    /// drained, and nothing started now would finish.
+    #[error("run aborted: the process is terminating (SIGTERM)")]
+    Terminating,
     #[error("coverage setup: {0}")]
     Coverage(String),
     /// The agent loop returned `Ok` — no transport/provider failure — but the
@@ -747,6 +753,30 @@ pub enum RunError {
     /// [`RunResult::terminal_error`], never returned by [`run_agent`] itself.
     #[error("agent run ended in status {status:?} ({detail})")]
     TerminalStatus { status: RunStatus, detail: String },
+}
+
+/// The run's exit once SIGTERM has arrived: close the transcript as
+/// `Aborted` (saying why) and hand back [`RunError::Terminating`] — or the
+/// transcript error, if even that could not be written.
+fn terminated(
+    writer: &mut JsonlWriter,
+    run_id: &str,
+    total_tokens: u64,
+    started: Instant,
+) -> RunError {
+    let closed = writer
+        .write(&Event::RunComplete {
+            run_id: run_id.to_string(),
+            status: RunStatus::Aborted,
+            total_tokens,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error: Some("terminating (SIGTERM)".into()),
+        })
+        .and_then(|_| writer.flush());
+    match closed {
+        Ok(()) => RunError::Terminating,
+        Err(e) => RunError::Transcript(e),
+    }
 }
 
 /// Pluggable permission decider. Three production impls + a `Bypass`
@@ -1434,6 +1464,15 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             let mut long_context_fallback = false;
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
+                // No new LLM call once SIGTERM has arrived (nor a retry).
+                if rupu_providers::credential_writes::terminating() {
+                    return Err(terminated(
+                        &mut writer,
+                        &opts.run_id,
+                        total_in + total_out,
+                        started,
+                    ));
+                }
                 let step: CallStep = if opts.no_stream {
                     // `no_stream` only changes DISPLAY: the request still
                     // streams on the wire, so a long response cannot hit the
@@ -1921,6 +1960,15 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 // `blocked: true`). `blocked` is derived from the actual
                 // outcome below. Exactly one callback invocation per call,
                 // same as before.
+                // No new tool dispatch once SIGTERM has arrived.
+                if rupu_providers::credential_writes::terminating() {
+                    return Err(terminated(
+                        &mut writer,
+                        &opts.run_id,
+                        total_in + total_out,
+                        started,
+                    ));
+                }
                 let started_tool = Instant::now();
                 let invoke_result = tool.invoke(input.clone(), &opts.tool_context).await;
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
@@ -2186,12 +2234,13 @@ mod on_tool_call_tests {
     async fn on_tool_call_fires_once_per_tool_invocation() {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push(format!("{step_id}:{tool_name}:{blocked}"));
-        });
+        let cb: OnToolCallCallback =
+            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+                calls_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("{step_id}:{tool_name}:{blocked}"));
+            });
 
         // Two-turn script: turn 0 → tool use (read_file), turn 1 → final text.
         // The read_file tool needs a `path` input; we point it at a real
@@ -2292,12 +2341,14 @@ mod on_tool_call_tests {
         // hard run failure).
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((step_id.to_string(), tool_name.to_string(), blocked));
-        });
+        let cb: OnToolCallCallback =
+            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+                calls_clone.lock().unwrap().push((
+                    step_id.to_string(),
+                    tool_name.to_string(),
+                    blocked,
+                ));
+            });
 
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test_denied.jsonl");
@@ -2371,7 +2422,11 @@ mod on_tool_call_tests {
         assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
 
         let log = calls.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected exactly one on_tool_call, got {log:?}"
+        );
         assert_eq!(log[0], ("s1".to_string(), "bash".to_string(), true));
 
         // The model got a tool error back, not a hard failure.
@@ -2385,7 +2440,10 @@ mod on_tool_call_tests {
                 Event::ToolResult { error: Some(msg), .. } if msg.contains("unknown tool: bash")
             )
         });
-        assert!(saw_tool_error, "expected a tool-error ToolResult for the denied call; got {events:?}");
+        assert!(
+            saw_tool_error,
+            "expected a tool-error ToolResult for the denied call; got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -2402,12 +2460,14 @@ mod on_tool_call_tests {
         // exactly this case. It must now report `blocked: true`.
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((step_id.to_string(), tool_name.to_string(), blocked));
-        });
+        let cb: OnToolCallCallback =
+            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+                calls_clone.lock().unwrap().push((
+                    step_id.to_string(),
+                    tool_name.to_string(),
+                    blocked,
+                ));
+            });
 
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test_readonly_denied.jsonl");
@@ -2485,7 +2545,11 @@ mod on_tool_call_tests {
         assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
 
         let log = calls.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected exactly one on_tool_call, got {log:?}"
+        );
         assert_eq!(
             log[0],
             ("s1".to_string(), "issues.create".to_string(), true),
@@ -3327,7 +3391,9 @@ impl LlmProvider for MockProvider {
             rupu_providers::ProviderError::Other(anyhow::anyhow!("mock script exhausted"))
         })?;
         match turn {
-            ScriptedTurn::ProviderError(e) => Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e))),
+            ScriptedTurn::ProviderError(e) => {
+                Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
+            }
             ScriptedTurn::AssistantText {
                 text,
                 stop,

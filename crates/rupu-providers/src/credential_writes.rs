@@ -12,9 +12,9 @@
 //! for the outstanding ones, bounded, before it exits.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -93,6 +93,45 @@ pub async fn wait(timeout: Duration) -> bool {
     tokio::time::timeout(timeout, drained).await.is_ok()
 }
 
+/// [`wait`] for a plain OS thread with no runtime (the SIGTERM handler
+/// thread): blocks the calling thread until no tracked write is running,
+/// for at most `timeout`. The bound holds on this thread's own clock — it
+/// does not need the runtime to make progress, so a wedged runtime still
+/// lets the caller move on at the deadline. Returns `true` when none is
+/// left.
+pub fn wait_blocking(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pending() == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
+}
+
+/// Set once SIGTERM has arrived and the process is on its way out (the
+/// handler holds the exit only for credential writes still draining).
+static TERMINATING: AtomicBool = AtomicBool::new(false);
+
+/// Mark the process as terminating. Called by the SIGTERM handler before it
+/// waits for pending writes; never cleared.
+pub fn request_termination() {
+    TERMINATING.store(true, Ordering::SeqCst);
+}
+
+/// Whether SIGTERM has arrived. Every runner checks this before starting an
+/// LLM call or a tool dispatch and, if set, stops its run as aborted
+/// without starting that work — the process is exiting as soon as the
+/// pending credential writes are done, and nothing started now would
+/// finish.
+pub fn terminating() -> bool {
+    TERMINATING.load(Ordering::SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +159,38 @@ mod tests {
     async fn the_wait_is_bounded() {
         let handle = spawn(tokio::time::sleep(Duration::from_secs(2)));
         assert!(!wait(Duration::from_millis(50)).await);
+        handle.abort();
+    }
+
+    /// The thread-side wait sees a write complete (the runtime runs it on
+    /// another thread) and is bounded by its own clock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_blocking_wait_completes_and_is_bounded() {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        drop(spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            flag.store(true, Ordering::SeqCst);
+        }));
+        let started = Instant::now();
+        let drained = tokio::task::spawn_blocking(|| wait_blocking(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(drained, "the write finished within the bound");
+        assert!(done.load(Ordering::SeqCst));
+        assert!(started.elapsed() >= Duration::from_millis(150));
+
+        let handle = spawn(tokio::time::sleep(Duration::from_secs(5)));
+        let started = Instant::now();
+        let drained = tokio::task::spawn_blocking(|| wait_blocking(Duration::from_millis(100)))
+            .await
+            .unwrap();
+        assert!(!drained, "a write outlasting the bound is reported");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and the bound held: {:?}",
+            started.elapsed()
+        );
         handle.abort();
     }
 }
