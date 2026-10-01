@@ -13,8 +13,10 @@ pub struct AssetLine {
 
 /// Append a single asset to the assets.jsonl store.
 ///
-/// Creates parent directory if needed. Opens `paths.assets` in append mode,
-/// writes one JSON line + newline. This is safe for parallel writers.
+/// Creates parent directory if needed. Serializes the entire line first,
+/// then opens `paths.assets` in append mode and writes in a single `write_all` call.
+/// A single write under O_APPEND is atomic on local filesystems,
+/// making this safe for parallel writers.
 pub fn append_asset(
     paths: &crate::ledger::CoveragePaths,
     asset: &Asset,
@@ -27,17 +29,17 @@ pub fn append_asset(
         declared_by: declared_by.clone(),
     };
 
+    // Serialize before opening the file to avoid leaving an empty file on error.
+    let mut buf = serde_json::to_vec(&line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    buf.push(b'\n');
+
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&paths.assets)?;
 
-    let json = serde_json::to_string(&line).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
-
-    file.write_all(json.as_bytes())?;
-    file.write_all(b"\n")?;
+    file.write_all(&buf)?;
 
     Ok(())
 }
@@ -46,21 +48,27 @@ pub fn append_asset(
 ///
 /// Missing file returns an empty graph. Each line is folded via `AssetGraph::insert`,
 /// applying last-write-wins semantics (order-independent, safe for parallel writers).
+/// Unparseable lines are skipped with a tracing warning.
 pub fn read_asset_graph(paths: &crate::ledger::CoveragePaths) -> AssetGraph {
     let mut graph = AssetGraph::default();
 
     let content = match std::fs::read_to_string(&paths.assets) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return graph,
-        Err(_) => return graph,
+        Err(e) => {
+            tracing::warn!("failed to read assets.jsonl: {}", e);
+            return graph;
+        }
     };
 
     for line in content.lines() {
-        if line.trim().is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if let Ok(asset_line) = serde_json::from_str::<AssetLine>(line) {
-            graph.insert(asset_line.asset);
+        match serde_json::from_str::<AssetLine>(trimmed) {
+            Ok(asset_line) => graph.insert(asset_line.asset),
+            Err(e) => tracing::warn!("failed to parse asset line: {}", e),
         }
     }
 
@@ -112,8 +120,7 @@ mod tests {
         // Re-insert child with new depth
         let mut child_updated = child.clone();
         child_updated.depth = Some("analyzed".to_string());
-        append_asset(&paths, &child_updated, &attribution)
-            .expect("reinsert append should succeed");
+        append_asset(&paths, &child_updated, &attribution).expect("reinsert append should succeed");
 
         // Read and verify
         let graph = read_asset_graph(&paths);
@@ -144,5 +151,58 @@ mod tests {
 
         let graph = read_asset_graph(&paths);
         assert_eq!(graph.roots().len(), 0, "empty graph should have no roots");
+    }
+
+    #[test]
+    fn iter_and_from_assets_preserve_order_and_no_duplicate_on_reinsert() {
+        // Create three assets
+        let a1 = Asset::new(
+            "binary:binary",
+            Locator(vec![Coordinate::Sha256("aaa".into())]),
+            "a1",
+        );
+        let a2 = Asset::new(
+            "binary:function",
+            Locator(vec![Coordinate::Address(0x1000)]),
+            "a2",
+        );
+        let a3 = Asset::new(
+            "binary:function",
+            Locator(vec![Coordinate::Address(0x2000)]),
+            "a3",
+        );
+
+        let ids = (a1.id.clone(), a2.id.clone(), a3.id.clone());
+
+        // Insert in order
+        let graph = crate::asset::AssetGraph::from_assets(vec![a1, a2, a3]);
+
+        // Verify iteration preserves insertion order
+        let iter_ids: Vec<_> = graph.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(iter_ids.len(), 3);
+        assert_eq!(&iter_ids[0], &ids.0);
+        assert_eq!(&iter_ids[1], &ids.1);
+        assert_eq!(&iter_ids[2], &ids.2);
+
+        // Re-insert middle asset with new label
+        let mut graph = graph;
+        let a2_updated = Asset::new(
+            "binary:function",
+            Locator(vec![Coordinate::Address(0x1000)]),
+            "a2_updated",
+        );
+        graph.insert(a2_updated);
+
+        // Verify no duplication: still 3 items
+        let iter_ids: Vec<_> = graph.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(
+            iter_ids.len(),
+            3,
+            "re-inserted asset should not create duplicate"
+        );
+        assert_eq!(
+            &iter_ids[1], &ids.1,
+            "re-inserted item stays in original position"
+        );
     }
 }

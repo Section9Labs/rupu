@@ -48,9 +48,7 @@ impl AssetGraph {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Asset> {
-        self.order
-            .iter()
-            .filter_map(|k| self.nodes.get(k))
+        self.order.iter().filter_map(|k| self.nodes.get(k))
     }
 
     pub fn from_assets(it: impl IntoIterator<Item = Asset>) -> Self {
