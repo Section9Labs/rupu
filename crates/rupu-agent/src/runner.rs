@@ -79,10 +79,12 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
     }
 }
 
-/// Default per-request output-token budget when an agent doesn't set
-/// `maxTokens`. 4096 was too low for output-heavy agents (it truncated
-/// responses before a tool call could be emitted, especially with extended
-/// thinking, which draws from the same budget).
+/// The output budget an Anthropic request falls back to when `maxTokens` is
+/// neither pinned nor discovered (Anthropic requires the field). Same value as
+/// `rupu_providers::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS`, which is the
+/// constant the provider applies; this name stays because the agent DTOs and
+/// docs still cite it. A run no longer sends it itself: an unknown output
+/// limit goes on the wire as `max_tokens: None`.
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Callback invoked by `run_agent` immediately before each tool
@@ -182,12 +184,88 @@ fn trim_oldest_exchange(messages: &mut Vec<Message>) -> usize {
     0
 }
 
-/// Return true when the provider error string signals a context-window overflow.
-fn is_context_overflow(err: &str) -> bool {
+/// A provider context-overflow error, with the numbers when the message
+/// carries them (spec 2026-09-30 §7; formats are observed, not documented).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Overflow {
+    pub tokens: Option<u32>,
+    pub max: Option<u32>,
+}
+
+pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
     let e = err.to_ascii_lowercase();
-    e.contains("prompt is too long")
+    let after = |needle: &str| e.find(needle).map(|i| &e[i + needle.len()..]);
+    // Anthropic: "prompt is too long: N tokens > M maximum"
+    if let Some(rest) = after("prompt is too long:") {
+        let n = numbers(rest);
+        return Some(Overflow {
+            tokens: n.first().copied(),
+            max: n.get(1).copied(),
+        });
+    }
+    // OpenAI / Copilot: "maximum context length is M tokens … resulted in N tokens"
+    if let Some(rest) = after("maximum context length is") {
+        let n = numbers(rest);
+        return Some(Overflow {
+            max: n.first().copied(),
+            tokens: n.get(1).copied(),
+        });
+    }
+    // vLLM: "Input length (N) exceeds model's maximum context length (M)"
+    if e.contains("exceeds model's maximum context length") {
+        if let Some(rest) = after("input length") {
+            let n = numbers(rest);
+            return Some(Overflow {
+                tokens: n.first().copied(),
+                max: n.get(1).copied(),
+            });
+        }
+    }
+    // Gemini: "input token count (N) exceeds the maximum number of tokens allowed (M)"
+    if let Some(rest) = after("input token count") {
+        let n = numbers(rest);
+        return Some(Overflow {
+            tokens: n.first().copied(),
+            max: n.get(1).copied(),
+        });
+    }
+    if e.contains("prompt is too long")
         || e.contains("too many tokens")
         || e.contains("context window")
+    {
+        return Some(Overflow {
+            tokens: None,
+            max: None,
+        });
+    }
+    None
+}
+
+/// Every integer in `s`, in order. A `,` or `_` between digits is a thousands separator.
+fn numbers(s: &str) -> Vec<u32> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut cur: Option<u64> = None;
+    for (i, &c) in b.iter().enumerate() {
+        if c.is_ascii_digit() {
+            cur = Some(
+                cur.unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(c - b'0')),
+            );
+        } else if (c == b',' || c == b'_')
+            && cur.is_some()
+            && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+        {
+            // thousands separator
+        } else if let Some(n) = cur.take() {
+            out.push(n.min(u64::from(u32::MAX)) as u32);
+        }
+    }
+    if let Some(n) = cur {
+        out.push(n.min(u64::from(u32::MAX)) as u32);
+    }
+    out
 }
 
 /// Estimate token count for a slice of messages using chars/4 approximation.
@@ -465,7 +543,7 @@ async fn compact_context(
     writer: &mut JsonlWriter,
     last_input_tokens: u32,
 ) -> bool {
-    let context_window_tokens = match opts.context_window_tokens {
+    let context_window_tokens = match opts.limits.input.tokens {
         Some(w) => w,
         None => return false,
     };
@@ -499,7 +577,7 @@ async fn compact_context(
         opts.provider.as_mut(),
         &opts.model,
         context_window_tokens,
-        opts.compact_at_percent,
+        Some(opts.limits.compact_at_percent),
         last_input_tokens,
     )
     .await
@@ -780,12 +858,12 @@ pub struct AgentRunOpts {
     /// the catalog to the system prompt. `None` (default) disables all
     /// coverage harness machinery.
     pub concerns: Option<rupu_coverage::ConcernsBlock>,
-    /// Per-request output-token budget (`max_tokens`). See `DEFAULT_MAX_TOKENS`.
-    pub max_tokens: u32,
-    /// Model context-window size in tokens for compaction. `None` = compaction disabled.
-    pub context_window_tokens: Option<u32>,
-    /// Threshold percentage for compaction. Defaults to 80, clamped to [10, 95].
-    pub compact_at_percent: Option<u8>,
+    /// Resolved model limits (spec 2026-09-30 §5): the request `max_tokens`
+    /// (`output`), the compaction threshold (`compact_threshold()`), and the
+    /// run-start notice. Launch sites build this with
+    /// `rupu_runtime::model_limits::resolve`; tests use `ModelLimits::unknown()`
+    /// / `fixed(..)`.
+    pub limits: rupu_providers::model_limits::ModelLimits,
     /// Override the `scope_name` used when deriving the coverage `target_id`.
     /// When `None` (default, standalone agent runs), falls back to `agent_name`.
     /// Workflow runs set this to the workflow name so all steps accumulate
@@ -843,6 +921,9 @@ pub struct RunResult {
     /// finished — badly. Callers must not read `Result::is_ok()` as "the
     /// agent did its job"; see [`RunResult::terminal_error`].
     pub error: Option<String>,
+    /// `opts.limits` as the run ended, including any limit learned from an
+    /// overflow error (spec §7). Sessions persist this.
+    pub final_limits: rupu_providers::model_limits::ModelLimits,
 }
 
 impl RunResult {
@@ -1036,6 +1117,12 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         system_prompt: Some(opts.agent_system_prompt.clone()),
         codename: opts.codename.clone(),
     })?;
+    // One notice per run, before the first turn: what the run resolved, and
+    // where each number came from (spec 2026-09-30 §6.6).
+    writer.write(&Event::Notice {
+        kind: "model_limits".into(),
+        message: opts.limits.describe(&opts.provider_name, Utc::now()),
+    })?;
     writer.flush()?;
 
     // Wire coverage into tool context.
@@ -1214,6 +1301,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // -----------------------------------------------------------------------
     let inner_result: Result<RunResult, RunError> = async {
         let mut compaction_seq = 0u32;
+        // Input tokens the provider billed on the most recent completed turn;
+        // calibrates an overflow-triggered compaction whose error message
+        // carried no token count (spec §7).
+        let mut last_turn_input_tokens: u32 = 0;
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
                 break 'turns LoopOutcome::Status(
@@ -1226,7 +1317,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
                 messages: messages.clone(),
-                max_tokens: Some(opts.max_tokens),
+                max_tokens: opts.limits.output.tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
                 trace_id: None,
@@ -1241,6 +1332,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 disable_prompt_cache: false,
             };
             let mut trim_attempts = 0u32;
+            // Compact-on-overflow runs at most once per turn (spec §7); a
+            // repeat overflow falls through to the trim loop.
+            let mut overflow_compacted = false;
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
                 let step: CallStep = if opts.no_stream {
@@ -1327,8 +1421,52 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     CallStep::Paused => break CallOutcome::Paused,
                     CallStep::Err(e) => {
                         let e_str = e.to_string();
-                        if is_context_overflow(&e_str) && trim_attempts <= 64 {
-                            if trim_oldest_exchange(&mut req.messages) > 0 {
+                        if let Some(overflow) = parse_context_overflow(&e_str) {
+                            // Learn the real limit, then compact once per turn
+                            // (spec §7).
+                            if !overflow_compacted {
+                                overflow_compacted = true;
+                                if let Some(max) = overflow.max.filter(|m| *m > 0) {
+                                    let before = opts.limits.input.tokens;
+                                    if opts.limits.clamp_input(max) {
+                                        writer.write(&Event::Notice {
+                                            kind: "model_limits_clamped".into(),
+                                            message: format!(
+                                                "input {} → {} (provider error); if this recurs, pin contextWindowTokens on the agent",
+                                                before.map_or("unknown".to_string(), |b| {
+                                                    rupu_providers::model_limits::group_thousands(
+                                                        u64::from(b),
+                                                    )
+                                                }),
+                                                rupu_providers::model_limits::group_thousands(
+                                                    u64::from(max)
+                                                ),
+                                            ),
+                                        })?;
+                                        writer.flush()?;
+                                    }
+                                }
+                                compaction_seq += 1;
+                                let run_id_clone = opts.run_id.clone();
+                                let calibration =
+                                    overflow.tokens.unwrap_or(last_turn_input_tokens).max(1);
+                                if compact_context(
+                                    &mut messages,
+                                    &mut opts,
+                                    &run_id_clone,
+                                    compaction_seq,
+                                    &mut writer,
+                                    calibration,
+                                )
+                                .await
+                                {
+                                    req.messages = messages.clone();
+                                    continue;
+                                }
+                            }
+                            // Last resort: the delete-oldest trim loop (no max
+                            // parsed, compaction failed, or still overflowing).
+                            if trim_attempts <= 64 && trim_oldest_exchange(&mut req.messages) > 0 {
                                 trim_attempts += 1;
                                 writer.write(&Event::Notice {
                                     kind: "context_trim".into(),
@@ -1459,13 +1597,12 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 purpose: None,
             })?;
             total_cached += resp.usage.cached_tokens as u64;
+            last_turn_input_tokens = resp.usage.input_tokens;
 
             // Proactive context compaction: if the previous turn's input exceeded
             // the configured threshold, summarise older turns before building the
             // next request. Must run after usage accounting.
-            if let Some(threshold) =
-                effective_compact_threshold(opts.context_window_tokens, opts.compact_at_percent)
-            {
+            if let Some(threshold) = opts.limits.compact_threshold() {
                 if resp.usage.input_tokens as u64 > threshold {
                     compaction_seq += 1;
                     let run_id_clone = opts.run_id.clone();
@@ -1773,6 +1910,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             final_messages: messages,
             paused,
             error: terminal_error,
+            final_limits: opts.limits.clone(),
         })
     }
     .await;
@@ -1935,11 +2073,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2037,11 +2173,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2153,11 +2287,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2227,11 +2359,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
         };
         let result = run_agent(opts).await.unwrap();
@@ -2327,11 +2457,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2405,11 +2533,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2505,11 +2631,9 @@ mod on_tool_call_tests {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             };
@@ -2668,7 +2792,7 @@ mod retry_tests {
 
 #[cfg(test)]
 mod context_trim_tests {
-    use super::{is_context_overflow, trim_oldest_exchange};
+    use super::{parse_context_overflow, trim_oldest_exchange, Overflow};
     use rupu_providers::types::{ContentBlock, Message, Role};
 
     fn user_msg(text: &str) -> Message {
@@ -2752,18 +2876,58 @@ mod context_trim_tests {
     }
 
     #[test]
-    fn is_context_overflow_matches_known_phrases() {
-        assert!(is_context_overflow("prompt is too long for the model"));
-        assert!(is_context_overflow("too many tokens in request"));
-        assert!(is_context_overflow("exceeds context window limit"));
-        assert!(is_context_overflow("PROMPT IS TOO LONG")); // case-insensitive
+    fn overflow_formats_parse_tokens_and_max() {
+        let cases = [
+            (
+                r#"bad request: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 maximum"}}"#,
+                Some(215_000),
+                Some(200_000),
+            ),
+            (
+                "API error 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130500 tokens.",
+                Some(130_500),
+                Some(128_000),
+            ),
+            (
+                "API error 400: Input length (140000) exceeds model's maximum context length (131072).",
+                Some(140_000),
+                Some(131_072),
+            ),
+            (
+                "bad request: The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).",
+                Some(1_100_000),
+                Some(1_048_576),
+            ),
+            ("prompt is too long for the model", None, None),
+            ("too many tokens in request", None, None),
+            ("exceeds context window limit", None, None),
+            ("PROMPT IS TOO LONG", None, None), // case-insensitive
+        ];
+        for (msg, tokens, max) in cases {
+            assert_eq!(
+                parse_context_overflow(msg),
+                Some(Overflow { tokens, max }),
+                "{msg}"
+            );
+        }
     }
 
     #[test]
-    fn is_context_overflow_does_not_match_unrelated_errors() {
-        assert!(!is_context_overflow("network error"));
-        assert!(!is_context_overflow("invalid api key"));
-        assert!(!is_context_overflow("rate limited"));
+    fn overflow_ignores_unrelated_errors() {
+        for msg in ["network error", "invalid api key", "rate limited"] {
+            assert_eq!(parse_context_overflow(msg), None);
+        }
+    }
+
+    #[test]
+    fn overflow_numbers_accept_thousands_separators() {
+        assert_eq!(
+            parse_context_overflow("prompt is too long: 215,000 tokens > 200,000 maximum"),
+            Some(Overflow {
+                tokens: Some(215_000),
+                max: Some(200_000)
+            })
+        );
     }
 }
 
@@ -3317,11 +3481,11 @@ mod compaction_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown()
+                .with_input(1_000_000)
+                .with_percent(75),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: Some(1_000_000),
-            compact_at_percent: Some(75),
             pause: None,
             codename: None,
         };
@@ -3621,11 +3785,9 @@ mod pause_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause,
             codename: None,
         }
@@ -3961,11 +4123,9 @@ mod reasoning_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         }
@@ -4100,15 +4260,20 @@ mod reasoning_tests {
             }
             other => panic!("first event must be run_start, got {other:?}"),
         }
+        // Every run announces its resolved model limits right after RunStart.
         assert!(matches!(
             &events[1],
+            rupu_transcript::Event::Notice { kind, .. } if kind == "model_limits"
+        ));
+        assert!(matches!(
+            &events[2],
             rupu_transcript::Event::Seed {
                 message_count: 2,
                 ..
             }
         ));
         assert!(matches!(
-            &events[2],
+            &events[3],
             rupu_transcript::Event::UserMessage { .. }
         ));
     }

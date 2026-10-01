@@ -487,9 +487,11 @@ impl StepFactory for DefaultStepFactory {
             // When the workflow declares `concerns:`, every step uses it —
             // the agent frontmatter's `concerns:` is ignored for this run.
             concerns: resolve_step_concerns(self.workflow.concerns.clone(), spec.concerns),
-            max_tokens: spec
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            limits: rupu_providers::model_limits::ModelLimits::from_pins(
+                spec.context_window_tokens,
+                spec.max_tokens,
+                spec.compact_at_percent,
+            ),
             // All steps of a workflow share the same target_id (keyed on the
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.
@@ -498,8 +500,6 @@ impl StepFactory for DefaultStepFactory {
             // FileTouchEvents are correctly attributed; the runner defaults
             // to "agent" when this is None.
             surface_tag: Some("workflow".to_string()),
-            context_window_tokens: spec.context_window_tokens,
-            compact_at_percent: spec.compact_at_percent,
             pause: None,
             codename: None,
         }

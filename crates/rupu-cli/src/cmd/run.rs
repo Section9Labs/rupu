@@ -951,13 +951,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             on_stream_event: None,
             on_usage: None,
             concerns: spec.concerns.clone(),
-            max_tokens: spec
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            limits: rupu_providers::model_limits::ModelLimits::from_pins(
+                spec.context_window_tokens,
+                spec.max_tokens,
+                spec.compact_at_percent,
+            ),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: spec.context_window_tokens,
-            compact_at_percent: spec.compact_at_percent,
             pause: None,
             codename: Some(codename.to_string()),
         };

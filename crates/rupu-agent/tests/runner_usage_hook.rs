@@ -4,6 +4,7 @@
 
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, UsageKind, UsageTurn};
+use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::{ContentBlock, Message, Role, StopReason, Usage};
 use rupu_tools::ToolContext;
 use rupu_transcript::{Event, JsonlReader};
@@ -88,11 +89,9 @@ fn build_opts(
         on_stream_event: None,
         on_usage: None,
         concerns: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: ModelLimits::unknown(),
         scope_name: None,
         surface_tag: None,
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
     }
 }
@@ -221,8 +220,7 @@ async fn compaction_call_emits_usage_with_purpose_and_hook_kind() {
         dense_msg(Role::User, "user 0"),
         dense_msg(Role::Assistant, "assistant 1"),
     ];
-    opts.context_window_tokens = Some(1000);
-    opts.compact_at_percent = Some(50);
+    opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
     opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
         seen2.lock().unwrap().push(u.clone());
     }));
@@ -311,8 +309,7 @@ async fn cache_write_tokens_reach_the_hook_and_transcript_for_turns_and_compacti
         dense_msg(Role::User, "user 0"),
         dense_msg(Role::Assistant, "assistant 1"),
     ];
-    opts.context_window_tokens = Some(1000);
-    opts.compact_at_percent = Some(50);
+    opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
     opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
         seen2.lock().unwrap().push(u.clone());
     }));

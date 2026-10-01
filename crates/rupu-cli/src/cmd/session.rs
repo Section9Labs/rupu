@@ -7735,11 +7735,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             on_stream_event: Some(on_stream_event),
             on_usage: None,
             concerns: session.concerns.clone(),
-            max_tokens: session
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
-            context_window_tokens: session.context_window_tokens,
-            compact_at_percent: session.compact_at_percent,
+            limits: rupu_providers::model_limits::ModelLimits::from_pins(
+                session.context_window_tokens,
+                session.max_tokens,
+                session.compact_at_percent,
+            ),
             // Sessions key their coverage ledger off the session_id so multiple
             // sessions against the same workspace stay distinct, and target_id
             // matches the spec's per-session derivation.
