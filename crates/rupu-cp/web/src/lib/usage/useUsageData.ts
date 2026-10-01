@@ -19,12 +19,19 @@
 // still in flight alone (restarting it would mean a host slower than the poll
 // never answers); a user window change and the tick supersede it on purpose.
 //
+// Every request is bounded at the list engine's FETCH_TIMEOUT_MS: a host that
+// has not answered by then is aborted and recorded as failed ("no answer after
+// 45s"), so the in-flight skip above can never leave a host loading forever.
+//
 // A host that answered for window A and then fails its refetch for window B
-// keeps its old answer (stale-on-error) but is EXCLUDED from B's headline. With
-// no request left in flight it counts as failed for B: shown `offline` in the
-// strip, labelled `(stale)` in `excluded`, and counted toward `error` -
-// otherwise a page whose every host ended up that way would read `loading`
-// forever. While its refetch IS in flight it is `loading`.
+// keeps its old answer (stale-on-error) but is EXCLUDED from B's headline. The
+// failure is recorded against the window it failed FOR (`failedKey`); with no
+// request left in flight, a host whose `failedKey` is the current window counts
+// as failed for it: shown `offline` in the strip, labelled `(stale)` in
+// `excluded`, and counted toward `error` - otherwise a page whose every host
+// ended up that way would read `loading` forever. A failure for some other
+// window says nothing about this one, and while its refetch IS in flight a host
+// is `loading`.
 //
 // Abandoned requests are aborted: a host's newer request aborts its previous
 // one, and unmount aborts everything still in flight. A hung remote would
@@ -35,6 +42,7 @@ import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { api, apiErrorMessage, type UsageResponse, type UsageWindow } from '../api';
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSeed } from '../perHost/types';
+import { FETCH_TIMEOUT_MS } from '../perHost/engine';
 import { classifyFailure } from '../perHost/status';
 import { mergeUsage, type MergedUsage } from './mergeUsage';
 
@@ -48,6 +56,8 @@ interface HostUsage {
   response: UsageResponse | null;
   /** The window key `response` was fetched for. */
   windowKey: string | null;
+  /** The window key of the request that last failed; cleared by a success. */
+  failedKey: string | null;
   reason: string | null;
   receivedAt: number | null;
 }
@@ -65,6 +75,7 @@ const seedOf = (h: HostSeed): HostUsage => ({
   state: 'loading',
   response: null,
   windowKey: null,
+  failedKey: null,
   reason: null,
   receivedAt: null,
 });
@@ -103,18 +114,33 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     const key = keyRef.current;
     const update = (f: (h: HostUsage) => HostUsage) =>
       setHosts((prev) => prev.map((h) => (h.hostId === hostId ? f(h) : h)));
+    // Bound the request, as the list engine does: the timeout error is rejected first, so the
+    // AbortError the fetch answers with afterwards loses the race. Raced (rather than relying on
+    // the abort alone) so a request that never rejects on abort still fails at the deadline. Any
+    // abort (this timeout, a newer request, unmount) clears the timer; settling clears it too.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`no answer after ${FETCH_TIMEOUT_MS / 1000}s`));
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
+    });
+    controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     const settled = () => {
+      clearTimeout(timer);
       if (controllersRef.current.get(hostId) === controller) controllersRef.current.delete(hostId);
     };
-    api.getUsage(windowRef.current, 'model', hostId, controller.signal).then(
+    Promise.race([api.getUsage(windowRef.current, 'model', hostId, controller.signal), timeout]).then(
       (resp) => {
         if (disposedRef.current || seqRef.current.get(hostId) !== seq) return;
         settled();
         const wire = resp.hosts.find((h) => h.host_id === hostId);
         update((h) => {
-          if (!wire) return { ...h, state: 'unavailable', response: null, reason: 'host missing from response' };
-          if (wire.state !== 'ok') return { ...h, state: wire.state, response: null, reason: wire.reason };
-          return { ...h, state: 'ok', response: resp, windowKey: key, reason: null, receivedAt: Date.now() };
+          if (!wire) {
+            return { ...h, state: 'unavailable', response: null, failedKey: null, reason: 'host missing from response' };
+          }
+          if (wire.state !== 'ok') return { ...h, state: wire.state, response: null, failedKey: null, reason: wire.reason };
+          return { ...h, state: 'ok', response: resp, windowKey: key, failedKey: null, reason: null, receivedAt: Date.now() };
         });
       },
       (e: unknown) => {
@@ -130,8 +156,8 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
         }
         update((h) =>
           h.response
-            ? { ...h, reason: f.reason } // stale-on-error: keep last good
-            : { ...h, state: f.kind === 'unavailable' ? 'unavailable' : 'offline', reason: f.reason },
+            ? { ...h, failedKey: key, reason: f.reason } // stale-on-error: keep last good
+            : { ...h, state: f.kind === 'unavailable' ? 'unavailable' : 'offline', failedKey: key, reason: f.reason },
         );
       },
     );
@@ -213,11 +239,12 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
 
   const current = (h: HostUsage) => h.state === 'ok' && h.response !== null && h.windowKey === windowKey;
   /**
-   * Answered for another window, then failed its refetch for this one, with nothing left in
-   * flight: it has failed for the current window, whatever stale data it still holds.
+   * Answered for another window, then failed its request for THIS one, with nothing left in
+   * flight: it has failed for the current window, whatever stale data it still holds. Keyed on
+   * the failing window, so a failure for some other window is never read as this one's.
    */
   const staleFailed = (h: HostUsage) =>
-    h.state === 'ok' && h.windowKey !== windowKey && h.reason != null && !controllersRef.current.has(h.hostId);
+    h.state === 'ok' && h.windowKey !== windowKey && h.failedKey === windowKey && !controllersRef.current.has(h.hostId);
 
   const data = useMemo(() => {
     const ok = hosts.filter(current);

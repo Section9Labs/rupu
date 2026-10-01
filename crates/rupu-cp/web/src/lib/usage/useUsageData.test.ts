@@ -3,7 +3,8 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, getConfig, renderHook, waitFor } from '@testing-library/react';
 import { ApiError, api, type UsageResponse, type UsageWindow } from '../api';
-import { USAGE_REMOTE_POLL_MS, useUsageData } from './useUsageData';
+import { USAGE_REMOTE_POLL_MS, useUsageData, type UseUsageDataResult } from './useUsageData';
+import { FETCH_TIMEOUT_MS } from '../perHost/engine';
 import { REG_LOCAL, REG_PROD, callsFor, deferred, flush } from '../perHost/testUtils';
 
 const WIN: UsageWindow = { since: '2026-09-01T00:00:00.000Z', until: '2026-09-30T00:00:00.000Z' };
@@ -291,5 +292,134 @@ describe('useUsageData', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(usageCallsFor('host_prod')).toHaveLength(1);
     expect(remoteSignals[0]?.aborted).toBe(false);
+  });
+
+  describe('a request that never answers', () => {
+    /** Let promise callbacks run under the faked setTimeout (the real one is not available to wait on). */
+    const settle = () => act(() => vi.advanceTimersByTimeAsync(0));
+
+    it('is aborted and recorded as failed at FETCH_TIMEOUT_MS; settled requests keep their signal', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      const signals: Record<string, AbortSignal | undefined> = {};
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host, signal) => {
+        signals[host ?? 'local'] = signal;
+        // The remote never settles, not even when aborted.
+        return host === 'local' ? Promise.resolve(resp('local', 1)) : new Promise(() => {});
+      });
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+      await settle();
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'loading']);
+
+      await act(() => vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS - 1));
+      expect(signals.host_prod?.aborted).toBe(false);
+      expect(result.current.hosts[1]?.state).toBe('loading');
+
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(signals.host_prod?.aborted).toBe(true);
+      expect(result.current.hosts[1]?.state).toBe('offline');
+      expect(result.current.hosts[1]?.reason).toBe('no answer after 45s');
+      expect(result.current.data?.excluded).toEqual(['prod (offline)']);
+      expect(result.current.error).toBeNull();
+      // Local answered long ago: its timer was cleared with it, so its request is never aborted.
+      expect(signals.local?.aborted).toBe(false);
+    });
+
+    it('keeps the last answer on a timeout (stale-on-error) and reads failed for the current window', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      let remoteHangs = false;
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>
+        host !== 'local' && remoteHangs ? new Promise(() => {}) : Promise.resolve(resp(host ?? 'local', host === 'local' ? 1 : 10)),
+      );
+      const { result, rerender } = renderHook(({ key }) => useUsageData(WIN, key, 'user'), {
+        initialProps: { key: 'preset:30d' },
+      });
+      await settle();
+      expect(result.current.data?.summary.runs).toBe(11);
+
+      remoteHangs = true;
+      rerender({ key: 'preset:7d' });
+      await settle();
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'loading']);
+
+      await act(() => vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS));
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'offline']);
+      expect(result.current.hosts[1]?.reason).toBe('no answer after 45s');
+      expect(result.current.data?.summary.runs).toBe(1);
+      expect(result.current.data?.excluded).toEqual(['prod (stale)']);
+    });
+  });
+
+  describe('a failure is remembered against the window it failed for', () => {
+    const answer = (host: string) => Promise.resolve(resp(host, host === 'local' ? 1 : 10));
+    const down = () => Promise.reject(new Error('down'));
+
+    /** Every result a render produced, in order (a transient misreading would show up in one). */
+    function mount(mode: { current: (host: string) => Promise<UsageResponse> }) {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) => mode.current(host ?? 'local'));
+      const renders: UseUsageDataResult[] = [];
+      const hook = renderHook(
+        ({ key }) => {
+          const r = useUsageData(WIN, key, 'user');
+          renders.push(r);
+          return r;
+        },
+        { initialProps: { key: 'preset:30d' } },
+      );
+      return { ...hook, renders };
+    }
+    const neverFailed = (renders: UseUsageDataResult[]) => {
+      for (const r of renders) {
+        expect(r.error).toBeNull();
+        expect(r.hosts.map((h) => h.state)).not.toContain('offline');
+      }
+    };
+
+    it("a failure for the old window is not read as the new window's, not even for one render", async () => {
+      const mode = { current: answer };
+      const { result, rerender, renders } = mount(mode);
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      // A focus refetch fails for the CURRENT window (30d): both hosts keep their answer + a reason.
+      vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+      mode.current = down;
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      await waitFor(() => expect(result.current.hosts.map((h) => h.reason)).toEqual(['down', 'down']));
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'ok']); // still current: stale-on-error
+
+      // Move the window; nothing has answered yet. No render may say a host failed for it.
+      mode.current = () => new Promise(() => {});
+      const before = renders.length;
+      rerender({ key: 'preset:7d' });
+      await flush();
+      expect(renders.length).toBeGreaterThan(before);
+      neverFailed(renders.slice(before));
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['loading', 'loading']);
+    });
+
+    it('a success clears the failure, so an older failing window is not read back as current', async () => {
+      const mode = { current: answer };
+      const { result, rerender, renders } = mount(mode);
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      mode.current = down; // fails FOR 7d
+      rerender({ key: 'preset:7d' });
+      await waitFor(() => expect(result.current.error).not.toBeNull());
+
+      mode.current = answer; // answers 90d: clears the 7d failure
+      rerender({ key: 'preset:90d' });
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      mode.current = () => new Promise(() => {});
+      const before = renders.length;
+      rerender({ key: 'preset:7d' }); // back to the window that once failed
+      await flush();
+      neverFailed(renders.slice(before));
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['loading', 'loading']);
+    });
   });
 });
