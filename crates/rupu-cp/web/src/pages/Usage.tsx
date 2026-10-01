@@ -21,9 +21,13 @@
 // re-runs the memoized `buildTimeline` synchronously — no refetch, so pulling
 // a real ~1000x-cost outlier out of the graph is instant and the axis
 // rescales live. `getUsageRuns` itself is pivot/filter-independent (fetched
-// once per `usageWindow`); `getUsage`/`getUsageOutliers` are unchanged from before
-// and still drive the headline number, `UnpricedBanner`, and
-// `HostFreshnessStrip` — those stay fleet-wide and are labeled as such.
+// once per `usageWindow`); the headline number, `UnpricedBanner` and
+// `HostFreshnessStrip` come from `useUsageData`, which loads `/api/usage` PER
+// HOST (each host answers on its own and the figures are merged client-side;
+// hosts that have not answered yet are named in the headline, not waited
+// for) — those stay fleet-wide and are labeled as such. The hook pins
+// `group_by=model`, so a pivot change never refetches the headline.
+// `getUsageOutliers` is unchanged.
 //
 // TABLE/GRAPH SHARED SOURCE (bugfix): the breakdown table below is built
 // from `aggregateRuns(runs, pivot)` over the SAME flat run rows the graph's
@@ -43,19 +47,19 @@
 // stay OWNED here (not inside `UsageTimeline`) because this page shares all
 // three with the breakdown table and outlier panel below.
 
-import { useCallback, useEffect, useMemo, useState, useTransition } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   api,
   presetWindow,
   windowFromDayRange,
   type DashboardRange,
   type OutlierRun,
-  type UsageResponse,
   type UsageRunRow,
   type UsageWindow,
 } from '../lib/api';
 import { formatCost, formatTokens } from '../lib/usage';
 import { aggregateRuns, type TimelineFilter } from '../lib/usage/buildTimeline';
+import { useUsageData } from '../lib/usage/useUsageData';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../components/usage/PivotPicker';
 import { UnpricedBanner } from '../components/usage/UnpricedBanner';
 import { OutlierPanel } from '../components/usage/OutlierPanel';
@@ -96,6 +100,21 @@ export default function Usage() {
   // the last good data on failure and shows no "updating" cue; a user change
   // keeps both. Always set in the same batch as `setUsageWindow`.
   const [windowSource, setWindowSource] = useState<'user' | 'tick'>('user');
+  // The fleet headline, loaded per host (spec 2026-10-01 §6.5). A preset's
+  // identity is the preset (its `until` ticks every 30s without changing what
+  // the operator is looking at); a custom window's is its exact bounds.
+  const windowKey = isCustomWindow ? `${usageWindow.since}|${usageWindow.until}` : `preset:${range}`;
+  const { data: current, hosts, error } = useUsageData(usageWindow, windowKey, windowSource);
+  // `current` is null from a user window change until the first host answers for
+  // the NEW window (the hook never mixes an old window's figures into a new
+  // one). Keep the last good headline on screen meanwhile, as the page did when
+  // it held a single `/api/usage` response: the graph's "updating" cue and the
+  // host strip's `loading` entries say it is refreshing, and the page does not
+  // collapse to its full-page spinner (which would unmount `UsageTimeline` and
+  // delay its run-rows fetch until the headline lands).
+  const lastGood = useRef(current);
+  if (current) lastGood.current = current;
+  const data = current ?? lastGood.current;
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   // Task loading-ux: pivot switches and filter-exclusion toggles trigger a
@@ -130,9 +149,7 @@ export default function Usage() {
     setWindowSource('user');
   }, [range]);
 
-  const [data, setData] = useState<UsageResponse | null>(null);
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
-  const [error, setError] = useState<Error | null>(null);
   // The flat per-run rows `UsageTimeline` fetches for the graph (Task U1),
   // handed back via `onRunsLoaded` so the breakdown table below can be built
   // from the SAME rows instead of `data.breakdown` (fleet-wide, from
@@ -155,34 +172,12 @@ export default function Usage() {
     setExcludedKeys(new Set());
   }, [pivot]);
 
-  // `/api/usage`: summary + the pivoted breakdown + the unpriced gap + host
-  // freshness. Re-fetches whenever the window OR the pivot changes. Depends
-  // on `usageWindow.since`/`usageWindow.until` (primitives), not the
+  // `/api/usage/outliers`: local-only, re-fetches on window. Depends on
+  // `usageWindow.since`/`usageWindow.until` (primitives), not the
   // `usageWindow` object itself — `handleSelectRange` (and `presetWindow`)
   // build a fresh window object each call, and keying off the object would
   // risk a spurious refetch loop if that ever stopped being referentially
   // stable (same primitive-deps pattern as `UsageTimeline`'s own effect).
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getUsage(usageWindow, pivot)
-      .then((resp) => {
-        if (cancelled) return;
-        setData(resp);
-        setError(null);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e : new Error(String(e)));
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment above.
-  }, [usageWindow.since, usageWindow.until, pivot]);
-
-  // `/api/usage/outliers`: local-only, re-fetches on window (primitives —
-  // see the comment on the effect above).
   useEffect(() => {
     let cancelled = false;
     api
@@ -197,17 +192,18 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment on the effect above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment above.
   }, [usageWindow.since, usageWindow.until]);
 
   // Live refresh: a preset window ends at "now", so its `until` goes stale the
   // moment it is built — new runs (and a still-running run's growing usage)
   // land after it. While a preset is active, re-derive the window every 30s;
-  // the new `until` re-fires the three fetches above (and `UsageTimeline`'s
-  // own run-rows fetch) through their normal primitive-keyed effects. A
-  // drag-selected custom window is a fixed historical span and never ticks.
-  // Hidden tabs skip the tick (the next visible one catches up), and the timer
-  // is cleared on unmount / range change.
+  // the new `until` re-fires the outliers fetch above, `useUsageData`'s local
+  // refetch and `UsageTimeline`'s own run-rows fetch through their normal
+  // primitive-keyed effects. A drag-selected custom window is a fixed
+  // historical span and never ticks. Hidden tabs skip the tick (the next
+  // visible one catches up), and the timer is cleared on unmount / range
+  // change.
   useEffect(() => {
     if (isCustomWindow) return;
     const t = window.setInterval(() => {
@@ -252,9 +248,9 @@ export default function Usage() {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-semibold text-ink">Usage</h1>
-          {data && (
+          {hosts.length > 0 && (
             <div className="mt-1">
-              <HostFreshnessStrip hosts={data.hosts} />
+              <HostFreshnessStrip hosts={hosts} />
             </div>
           )}
         </div>
@@ -298,11 +294,11 @@ export default function Usage() {
         <>
           <UnpricedBanner unpriced={data.unpriced} />
 
-          {/* The headline here is fleet-wide (`/api/usage`, fans out across
-              hosts) — deliberately NOT derived from the local-only run rows
-              `UsageTimeline` fetches for the graph itself, which is why it's
-              passed in rather than computed inside that component (see its
-              doc comment). */}
+          {/* The headline here is fleet-wide (`/api/usage`, loaded per host by
+              `useUsageData` and merged) — deliberately NOT derived from the
+              local-only run rows `UsageTimeline` fetches for the graph itself,
+              which is why it's passed in rather than computed inside that
+              component (see its doc comment). */}
           <UsageTimeline
             usageWindow={usageWindow}
             pivot={pivot}
@@ -315,12 +311,12 @@ export default function Usage() {
             onSelectRange={handleSelectRange}
             pending={isPending}
             background={windowSource === 'tick'}
-            hosts={data.hosts}
+            hosts={hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),
               subLabel: `${formatTokens(data.summary.total_tokens)} tokens · ${data.summary.runs} runs${
                 !data.summary.priced ? ' · partial (see banner above)' : ''
-              }`,
+              }${data.excluded.length ? ` · excludes ${data.excluded.join(', ')}` : ''}`,
             }}
           />
 
@@ -331,7 +327,7 @@ export default function Usage() {
             <ModelBreakdownTable
               rows={breakdown}
               pivot={pivot}
-              hosts={data.hosts}
+              hosts={hosts}
               selectable
               excludedKeys={excludedKeys}
               onToggleKey={toggleKey}

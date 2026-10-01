@@ -20,7 +20,7 @@
 // transform is exported for unit testing.
 
 import { formatCost, formatTokens, type UsageBreakdownRow } from '../../lib/usage';
-import type { HostFreshness, Pivot } from '../../lib/api';
+import type { Pivot } from '../../lib/api';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { assignModelColors, pivotLabel, OTHER_COLOR } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
@@ -166,11 +166,11 @@ export default function ModelBreakdownTable({
 }: {
   rows: UsageBreakdownRow[];
   pivot?: Pivot;
-  /** `data.hosts` from `/api/usage`, for mapping a `host` pivot's raw
+  /** Per-host name refs (from `useUsageData`), for mapping a `host` pivot's raw
    *  `host_id` rows to their friendly `name` for display. Optional — callers
    *  that don't pivot by host (or don't have the host list handy) can omit
    *  it, and rows fall back to the raw id. */
-  hosts?: HostFreshness[];
+  hosts?: { host_id: string; name: string }[];
   /** Task U3's interactive `/usage` page: turns every row into a checkbox
    *  wired to `excludedKeys`/`onToggleKey`, and shows every row (no top-6
    *  rollup) in a scrollable body. Default `false` leaves the dashboard's

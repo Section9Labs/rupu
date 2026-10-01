@@ -5,6 +5,7 @@ import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-li
 import { MemoryRouter } from 'react-router-dom';
 import Usage from './Usage';
 import { api, presetWindow, type UsageResponse, type OutlierRun, type UsageRunRow } from '../lib/api';
+import { REG_LOCAL } from '../lib/perHost/testUtils';
 
 // Fixed clock so `presetWindow(...)` computed here (for assertions) and
 // inside `Usage` (driving the actual fetch) agree on `until` exactly.
@@ -50,9 +51,7 @@ function usageResponse(overrides: Partial<UsageResponse> = {}): UsageResponse {
       },
     ],
     unpriced: { models: [], rows: 0 },
-    hosts: [
-      { host_id: 'local', name: 'local', transport_kind: 'local', state: 'ok', captured_at: new Date().toISOString(), reason: null },
-    ],
+    hosts: [{ host_id: 'local', name: 'Local', transport_kind: 'local', state: 'ok', captured_at: '2026-09-30T00:00:00Z', reason: null }],
     ...overrides,
   };
 }
@@ -90,6 +89,7 @@ function mockAll(opts: {
   runs?: UsageRunRow[];
   outliers?: OutlierRun[];
 } = {}) {
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
   vi.spyOn(api, 'getUsage').mockResolvedValue(opts.usage ?? usageResponse());
   vi.spyOn(api, 'getUsageRuns').mockResolvedValue(opts.runs ?? [runRow()]);
   vi.spyOn(api, 'getUsageOutliers').mockResolvedValue(opts.outliers ?? []);
@@ -101,7 +101,7 @@ describe('Usage page', () => {
 
     renderUsage();
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
     await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW)));
     // Both the headline and the breakdown table's total render "$4.50" —
     // assert on presence, not a single unique match.
@@ -121,16 +121,41 @@ describe('Usage page', () => {
     expect(screen.queryByText(/No usage recorded yet/)).not.toBeInTheDocument();
   });
 
-  it('re-fetches with the new pivot when the pivot picker changes', async () => {
+  it('re-labels the breakdown when the pivot picker changes', async () => {
     mockAll();
 
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
 
     fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'workflow'));
     expect(await screen.findByText('Breakdown by Workflow')).toBeInTheDocument();
+  });
+
+  it('a pivot change does not refetch the headline', async () => {
+    mockAll();
+    renderUsage();
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: /provider/i }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.getUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the last good headline on screen while a user-changed window loads', async () => {
+    mockAll();
+    renderUsage();
+    await waitFor(() => expect(screen.getByText(/3 runs/)).toBeInTheDocument());
+
+    // The 7d window's headline never answers: no host is current for it, but the page
+    // must not collapse to its full-page spinner (that would unmount the graph).
+    vi.mocked(api.getUsage).mockImplementation(() => new Promise(() => {}));
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await waitFor(() =>
+      expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('7d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)),
+    );
+
+    expect(screen.getByText(/3 runs/)).toBeInTheDocument();
+    expect(screen.getByText('Spend over time')).toBeInTheDocument();
   });
 
   it('does not refetch getUsageRuns when the pivot changes — buildTimeline just re-stacks in memory', async () => {
@@ -140,7 +165,6 @@ describe('Usage page', () => {
     await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledTimes(1));
 
     fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'workflow'));
 
     // Give any stray effect a tick, then assert the runs fetch was never repeated.
     await waitFor(() => expect(screen.getByText('Breakdown by Workflow')).toBeInTheDocument());
@@ -187,16 +211,17 @@ describe('Usage page', () => {
     mockAll();
 
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
 
     fireEvent.click(screen.getByRole('button', { name: '7d' }));
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
     await waitFor(() => expect(api.getUsageOutliers).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW)));
     await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW)));
   });
 
   it('shows an error state without a prior successful load', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
     vi.spyOn(api, 'getUsage').mockRejectedValue(new Error('boom'));
     vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
     vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
@@ -208,21 +233,34 @@ describe('Usage page', () => {
 
   it('labels the local-only timeline graph and outliers panel, and maps the host pivot to friendly names, on a multi-host fleet', async () => {
     mockAll({
-      usage: usageResponse({
-        hosts: [
-          { host_id: 'local', name: 'local', transport_kind: 'local', state: 'ok', captured_at: new Date().toISOString(), reason: null },
-          { host_id: 'host_01KWREMOTE', name: 'staging-box', transport_kind: 'http_cp', state: 'ok', captured_at: new Date().toISOString(), reason: null },
-        ],
-      }),
       // The breakdown table is now built from these same run rows (Fix 1),
-      // not from `data.breakdown` above — the run needs the host id under
+      // not from `data.breakdown` — the run needs the host id under
       // test for the table's host-pivot mapping to have anything to map.
       runs: [runRow({ host_id: 'host_01KWREMOTE' })],
     });
 
+    // Each host answers for itself (the per-host headline): the registered
+    // list drives the fan-out and every response carries its own host's entry.
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([
+      REG_LOCAL,
+      { id: 'host_01KWREMOTE', name: 'staging-box', transport_kind: 'http_cp' },
+    ]);
+    vi.mocked(api.getUsage).mockImplementation((_win, _pivot, host) =>
+      Promise.resolve(
+        usageResponse({
+          hosts: [
+            host === 'host_01KWREMOTE'
+              ? { host_id: 'host_01KWREMOTE', name: 'staging-box', transport_kind: 'http_cp', state: 'ok', captured_at: '2026-09-30T00:00:00Z', reason: null }
+              : { host_id: 'local', name: 'Local', transport_kind: 'local', state: 'ok', captured_at: '2026-09-30T00:00:00Z', reason: null },
+          ],
+        }),
+      ),
+    );
+
     renderUsage();
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'host_01KWREMOTE', expect.any(AbortSignal)));
 
     // The timeline graph (local-only, no host fan-out) is labeled, distinct
     // from the fleet-wide headline number above it.
@@ -231,7 +269,6 @@ describe('Usage page', () => {
     expect(screen.getByText(/this host only/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'host' }));
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'host'));
 
     // The host-pivot breakdown row shows the friendly host name, not the raw
     // id — scoped to the breakdown table since the freshness strip above
@@ -368,7 +405,6 @@ describe('Usage page', () => {
 
       fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
 
-      await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'workflow'));
       await waitFor(() => expect(screen.getAllByText('nightly-scan').length).toBeGreaterThan(0));
       expect(screen.getAllByText('pr-review').length).toBeGreaterThan(0);
       expect(api.getUsageRuns).toHaveBeenCalledTimes(1);

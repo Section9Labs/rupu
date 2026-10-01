@@ -22,6 +22,7 @@ import {
   type UsageResponse,
   type UsageRunRow,
 } from '../lib/api';
+import { REG_LOCAL } from '../lib/perHost/testUtils';
 
 // The chart stub exposes a drag-select trigger and how many day buckets the
 // page fed it (0 = the graph was blanked).
@@ -42,6 +43,7 @@ const TICK = 30_000;
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
   vi.setSystemTime(FIXED_NOW);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
   vi.spyOn(api, 'getUsage').mockResolvedValue(usageResponse());
   vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
   vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
@@ -58,7 +60,7 @@ function usageResponse(): UsageResponse {
     summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: 0, priced: true, runs: 0 },
     breakdown: [],
     unpriced: { models: [], rows: 0 },
-    hosts: [],
+    hosts: [{ host_id: 'local', name: 'Local', transport_kind: 'local', state: 'ok', captured_at: '2026-09-30T00:00:00Z', reason: null }],
   };
 }
 
@@ -118,7 +120,7 @@ describe('Usage page — 30s live refresh', () => {
     renderUsage();
     await flush();
     expect(api.getUsage).toHaveBeenCalledTimes(1);
-    expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('30d', FIXED_NOW), 'model');
+    expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal));
 
     await advance(TICK);
     await flush();
@@ -127,7 +129,7 @@ describe('Usage page — 30s live refresh', () => {
     // the same span and never see anything newer.
     const next = presetWindow('30d', FIXED_NOW + TICK);
     expect(api.getUsage).toHaveBeenCalledTimes(2);
-    expect(api.getUsage).toHaveBeenLastCalledWith(next, 'model');
+    expect(api.getUsage).toHaveBeenLastCalledWith(next, 'model', 'local', expect.any(AbortSignal));
     expect(api.getUsageOutliers).toHaveBeenLastCalledWith(next);
     expect(api.getUsageRuns).toHaveBeenLastCalledWith(next);
 
@@ -143,7 +145,7 @@ describe('Usage page — 30s live refresh', () => {
     fireEvent.click(screen.getByText('trigger-select'));
     await flush();
     const custom = windowFromDayRange('2026-07-10', '2026-07-12');
-    expect(api.getUsage).toHaveBeenLastCalledWith(custom, 'model');
+    expect(api.getUsage).toHaveBeenLastCalledWith(custom, 'model', 'local', expect.any(AbortSignal));
     const calls = vi.mocked(api.getUsage).mock.calls.length;
 
     await advance(TICK * 3);

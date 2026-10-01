@@ -20,7 +20,7 @@
 // breakdown table (Task U4) without a second, duplicate fetch.
 
 import { useEffect, useMemo, useState } from 'react';
-import { api, type HostFreshness, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
+import { api, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { buildTimeline, type TimelineFilter } from '../../lib/usage/buildTimeline';
 import UsageTimelineStacked, { type UsageMetric } from '../dashboard/UsageTimelineStacked';
 import { Spinner } from '../ui/Spinner';
@@ -58,7 +58,7 @@ export default function UsageTimeline({
   filter: TimelineFilter;
   excludedCount: number;
   onReset: () => void;
-  hosts?: HostFreshness[];
+  hosts?: { host_id: string; name: string }[];
   headline: { costLabel: string; subLabel: string };
   onRunsLoaded?: (rows: UsageRunRow[]) => void;
   /**
