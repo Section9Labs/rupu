@@ -38,7 +38,7 @@ Non-goals:
 | GitHub Copilot | live `GET {api}/models` (new; the built-in list becomes an offline fallback with limits of 0) | `capabilities.limits.max_prompt_tokens`; if absent, `max_context_window_tokens` | `capabilities.limits.max_output_tokens` |
 | Gemini AI Studio (api-key) | `GET /v1beta/models`, following `nextPageToken` (new); strip the `models/` prefix from `name` | `inputTokenLimit` | `outputTokenLimit` |
 | Gemini CLI / Antigravity (OAuth) | none; Code Assist has no listing method | 0 | 0 |
-| OpenAI-compatible (vLLM) | live `GET {base}/v1/models` fills in fields config didn't set | `max_model_len`; a LoRA entry with null falls back to its `parent` | 0; the server caps output to fit |
+| OpenAI-compatible (vLLM) | live `GET {base}/v1/models` fills in fields config didn't set | `max_model_len`; a LoRA entry with null falls back to its `parent` | 0; unset, so no cap is sent and the server's own default applies (§6.3) |
 
 Notes:
 - **Why `max_prompt_tokens` for Copilot.** It's often much smaller than the window (for example 128K vs 400K). VS Code Copilot uses it for the same reason.
