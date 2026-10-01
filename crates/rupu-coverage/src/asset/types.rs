@@ -59,6 +59,11 @@ mod tests {
         let a = Asset::new("binary:function", loc.clone(), "main @ 0x401000");
         let b = Asset::new("binary:function", loc, "main @ 0x401000");
         assert_eq!(a.id, b.id, "same kind+locator ⇒ same id");
+        assert_ne!(
+            Asset::new("binary:function", Locator(vec![Coordinate::Address(0x2000)]), "g").id,
+            a.id,
+            "different locator ⇒ different id"
+        );
         assert_eq!(profile_of("binary:function"), "binary");
         assert_eq!(profile_of("code"), "code");
     }

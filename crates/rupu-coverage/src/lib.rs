@@ -18,6 +18,7 @@ pub mod cwe_gen;
 
 pub use asset::{Coordinate, Locator, Proto};
 // Task 2/3: pub use asset::{Asset, AssetGraph, AssetId};
+pub use asset::{Asset, AssetId};
 
 pub use tools::{
     coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
