@@ -18,15 +18,24 @@ use crate::sse::SseParser;
 use crate::types::{ContentBlock, LlmRequest, LlmResponse, StreamEvent};
 
 /// vLLM-style `GET /v1/models` → `ModelInfo`s (spec §3). `max_model_len` is the
-/// input limit; a LoRA entry with a null value inherits its `parent`'s.
-pub(crate) fn vllm_models_from_listing(v: &serde_json::Value) -> Vec<ModelInfo> {
-    let entries: Vec<&serde_json::Value> = v
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
+/// input limit; a LoRA entry with a null value inherits its `parent`'s (a
+/// parent absent from the listing leaves the limit unknown, 0).
+///
+/// A body without a `data` array is an `Err` — never an empty catalog, which
+/// would read as "this server serves no models".
+pub(crate) fn vllm_models_from_listing(
+    v: &serde_json::Value,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let Some(data) = v.get("data").and_then(|d| d.as_array()) else {
+        return Err(crate::error::listing_shape_error(
+            "openai_compatible",
+            "a `data` array",
+            v,
+        ));
+    };
+    let entries: Vec<&serde_json::Value> = data.iter().collect();
     let own = |e: &serde_json::Value| e.get("max_model_len").and_then(|x| x.as_u64());
-    entries
+    Ok(entries
         .iter()
         .filter_map(|e| {
             let id = e.get("id")?.as_str()?.to_string();
@@ -47,7 +56,7 @@ pub(crate) fn vllm_models_from_listing(v: &serde_json::Value) -> Vec<ModelInfo> 
                 status: crate::model_pool::ModelStatus::default(),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// A model offered by an OpenAI-compatible endpoint, declared in config.
@@ -323,11 +332,24 @@ impl LlmProvider for OpenAiCompatibleClient {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message: String = resp.text().await.unwrap_or_default().chars().take(500).collect();
-            return Err(ProviderError::Api { status: status.as_u16(), message });
+            let message: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message,
+            });
         }
-        let v: serde_json::Value = resp.json().await.map_err(|e| ProviderError::Http(e.to_string()))?;
-        Ok(vllm_models_from_listing(&v))
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let v: serde_json::Value = crate::error::parse_listing_json("openai_compatible", &body)?;
+        vllm_models_from_listing(&v)
     }
 }
 
@@ -540,7 +562,7 @@ mod tests {
             { "id": "my-lora", "object": "model", "max_model_len": null, "parent": "base-model" },
             { "id": "mystery", "object": "model" }
         ]});
-        let ms = vllm_models_from_listing(&v);
+        let ms = vllm_models_from_listing(&v).unwrap();
         let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap().context_window;
         assert_eq!(get("base-model"), 131_072);
         assert_eq!(get("my-lora"), 131_072);
@@ -560,6 +582,97 @@ mod tests {
         m.assert();
         assert_eq!(ms[0].context_window, 4096);
         assert_eq!(ms[0].provider, crate::provider_id::ProviderId::OpenaiCompatible);
+    }
+
+    #[test]
+    fn vllm_listing_edge_cases() {
+        let v = serde_json::json!({ "object": "list", "data": [
+            { "id": "base-model", "object": "model", "max_model_len": 8192, "parent": null },
+            // Parent is not in the listing: nothing to inherit.
+            { "id": "orphan-lora", "object": "model", "max_model_len": null, "parent": "missing-base" },
+            // Own value wins over the parent's.
+            { "id": "tuned-lora", "object": "model", "max_model_len": 4096, "parent": "base-model" },
+            // Beyond u32: clamps rather than wrapping.
+            { "id": "huge", "object": "model", "max_model_len": 99999999999u64 },
+            // Not an object with an id: skipped.
+            { "object": "model", "max_model_len": 1 }
+        ]});
+        let ms = vllm_models_from_listing(&v).unwrap();
+        assert_eq!(ms.len(), 4);
+        let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(get("base-model").context_window, 8192);
+        assert_eq!(get("orphan-lora").context_window, 0);
+        assert_eq!(get("tuned-lora").context_window, 4096);
+        assert_eq!(get("huge").context_window, u32::MAX);
+        // /v1/models never reports an output cap.
+        assert!(ms.iter().all(|m| m.max_output_tokens == 0));
+    }
+
+    /// No `data` array: an error, not an empty catalog ("this server has no
+    /// models"). An empty `data` array is genuinely empty.
+    #[test]
+    fn vllm_listing_without_data_is_a_shape_error() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({ "object": "list" }),
+            serde_json::json!({ "data": "nope" }),
+            serde_json::json!([{ "id": "x" }]),
+        ] {
+            assert!(
+                matches!(vllm_models_from_listing(&v), Err(ProviderError::Json(_))),
+                "{v}"
+            );
+        }
+        assert!(vllm_models_from_listing(&serde_json::json!({ "data": [] }))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_models_without_a_data_array_is_an_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "object": "list" }));
+        });
+        let mut c = OpenAiCompatibleClient::new(
+            &format!("{}/v1", server.url("")),
+            "k",
+            "base-model",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200).body("not json");
+        });
+        let mut c = OpenAiCompatibleClient::new(
+            &format!("{}/v1", server.url("")),
+            "k",
+            "base-model",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
     }
 
     #[tokio::test]
