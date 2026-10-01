@@ -90,7 +90,7 @@ pub struct RunListQuery {
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// Errors produced by a `HostConnector` method.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum HostConnectorError {
     /// The target host could not be reached (network failure, DNS, timeout).
     #[error("host unreachable: {0}")]
