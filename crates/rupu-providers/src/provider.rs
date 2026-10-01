@@ -144,6 +144,26 @@ mod tests {
         );
     }
 
+    /// A provider that overrides neither `fetch_models` nor
+    /// `output_shares_context` gets the trait defaults: "no model listing" (an
+    /// `Err`, never an empty `Ok` that would read as "this provider has no
+    /// models") and "output shares the input window".
+    #[tokio::test]
+    async fn fetch_models_and_output_shares_context_defaults() {
+        let mut p = MockProvider {
+            response: mock_response(),
+        };
+        let err = p
+            .fetch_models()
+            .await
+            .expect_err("the default must not report an empty catalog");
+        assert!(
+            matches!(&err, ProviderError::NotImplemented { provider } if provider == "anthropic"),
+            "expected NotImplemented for anthropic, got {err:?}"
+        );
+        assert!(p.output_shares_context());
+    }
+
     fn mock_response() -> LlmResponse {
         LlmResponse {
             id: "msg_mock".into(),

@@ -173,7 +173,7 @@ impl ModelLimits {
             (Some(t), _) => format!(
                 "compact at {} ({}%)",
                 group_thousands(t),
-                self.compact_at_percent
+                self.compact_at_percent.clamp(10, 95)
             ),
             (None, _) => "compaction off".to_string(),
         };
@@ -390,5 +390,51 @@ mod tests {
         let s = serde_json::to_string(&l).unwrap();
         let back: ModelLimits = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn serde_round_trips_a_live_limit() {
+        let mut l = ModelLimits::unknown();
+        l.input = Limit::new(
+            1_000_000,
+            LimitSource::Live {
+                fetched_at: at(12, 0),
+                stale: true,
+            },
+        );
+        l.output = Limit::new(
+            128_000,
+            LimitSource::Live {
+                fetched_at: at(12, 5),
+                stale: false,
+            },
+        );
+        let s = serde_json::to_string(&l).unwrap();
+        let back: ModelLimits = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, l);
+        // The wire form is the tagged shape other readers (session store) see.
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["input"]["source"]["kind"], "live");
+        assert_eq!(v["input"]["source"]["stale"], true);
+    }
+
+    #[test]
+    fn describe_prints_the_clamped_percent_for_a_deserialized_out_of_range_value() {
+        // `with_percent` clamps, but a stored/deserialized value bypasses it.
+        // The threshold uses the clamped 95; the notice must say 95, not 99.
+        let mut v = serde_json::to_value(ModelLimits::unknown().with_input(1000)).unwrap();
+        v["compact_at_percent"] = serde_json::json!(99);
+        let l: ModelLimits = serde_json::from_value(v).unwrap();
+        assert_eq!(l.compact_at_percent, 99, "the raw field is stored as-is");
+        assert_eq!(l.compact_threshold(), Some(950));
+        let text = l.describe("anthropic", at(12, 0));
+        assert!(text.contains("compact at 950 (95%)"), "{text}");
+        assert!(!text.contains("99%"), "{text}");
+
+        let mut v = serde_json::to_value(ModelLimits::unknown().with_input(1000)).unwrap();
+        v["compact_at_percent"] = serde_json::json!(3);
+        let l: ModelLimits = serde_json::from_value(v).unwrap();
+        let text = l.describe("anthropic", at(12, 0));
+        assert!(text.contains("compact at 100 (10%)"), "{text}");
     }
 }
