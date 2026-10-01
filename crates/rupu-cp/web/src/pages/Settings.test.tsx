@@ -529,4 +529,17 @@ describe('Settings page', () => {
     expect(screen.getByText('general')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: /^permission_mode$/i })).toBeInTheDocument();
   });
+
+  it('Models tab loads the model catalog', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue([]);
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Models' }));
+    expect(await screen.findByRole('button', { name: 'Refetch all' })).toBeInTheDocument();
+  });
 });
