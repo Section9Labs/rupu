@@ -308,6 +308,15 @@ pub struct Verification {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Classification {
+    pub system: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FindingReport {
     pub title: String,
     pub ownership: Ownership,
@@ -318,6 +327,8 @@ pub struct FindingReport {
     pub attack_vector: String,
     #[serde(default)]
     pub cwe: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classifications: Vec<Classification>,
     pub description: String,
     pub impact: String,
     pub location: ReportLocation,
@@ -336,6 +347,34 @@ pub struct FindingReport {
     pub artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+}
+
+impl FindingReport {
+    pub fn all_classifications(&self) -> Vec<Classification> {
+        let mut out = self.classifications.clone();
+        for id in &self.cwe {
+            let c = Classification {
+                system: "CWE".into(),
+                id: id.clone(),
+                vector: None,
+            };
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        let cvss = self.rating.cvss_v3.trim();
+        if !cvss.is_empty() && !cvss.eq_ignore_ascii_case("unknown") {
+            let c = Classification {
+                system: "CVSS".into(),
+                id: cvss.to_string(),
+                vector: None,
+            };
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -389,5 +428,16 @@ mod tests {
             err.to_string().contains("invalid type: boolean `true`"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn cwe_and_explicit_classifications_fold_together() {
+        let mut v = fixture();
+        v["cwe"] = serde_json::json!(["CWE-306"]);
+        v["classifications"] = serde_json::json!([{"system":"CVE","id":"CVE-2026-0001","vector":"AV:N"}]);
+        let r: FindingReport = serde_json::from_value(v).unwrap();
+        let all = r.all_classifications();
+        assert!(all.iter().any(|c| c.system == "CWE" && c.id == "CWE-306"));
+        assert!(all.iter().any(|c| c.system == "CVE" && c.vector.as_deref() == Some("AV:N")));
     }
 }
