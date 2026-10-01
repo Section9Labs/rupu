@@ -3005,8 +3005,10 @@ async fn approve(
             // (`run_reject_cleanup` itself already handles a zero-length
             // chain fine; `chain_len` is only used below to decide whether
             // to print "cleanup: N step(s) executed").
-            match crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, mode)
-                .await
+            match crate::resume::build_reject_cleanup_opts(
+                &store, &global, run_id, &step_id, &reason, mode,
+            )
+            .await
             {
                 Ok((opts, chain_len)) => {
                     match rupu_orchestrator::runner::run_reject_cleanup(
@@ -3770,6 +3772,7 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
     // a reason to skip recording that the gate WAS rejected.
     match crate::resume::build_reject_cleanup_opts(
         &store,
+        &global,
         run_id,
         &rejected_step_id,
         &rejected_reason,
