@@ -658,11 +658,12 @@ impl Live {
         if gate_focused && self.notice.as_ref().is_some_and(|n| n.pointer) {
             self.notice = None;
         }
-        let parked = if self.view.status == RunStatus::AwaitingApproval {
-            self.view.gates.first().map(|g| g.step_id.clone())
-        } else {
-            None
-        };
+        // The gate `a` (follow) will land on: a default nav is following, so
+        // `gate_step` yields the first parked gate in step order — the same
+        // one the key focuses, not merely the first in run.json's set.
+        let parked = NavState::default()
+            .gate_step(&self.view)
+            .map(|s| s.step_id.clone());
         match (parked, gate_focused) {
             (Some(step), false) if self.parked_hint.as_ref() != Some(&step) => {
                 self.set_notice(
@@ -1860,6 +1861,34 @@ mod tests {
         assert_ne!(live.view.status, RunStatus::AwaitingApproval);
         assert!(live.view.gates.is_empty());
         assert_eq!(live.parked_hint, None);
+    }
+
+    #[test]
+    fn the_parked_hint_names_the_gate_the_follow_key_lands_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut live, _store) = parked_live(tmp.path());
+        live.ingest();
+        // The operator wanders off the gates (onto `build`).
+        live.apply_action(KeyAction::Nav(NavKey::Up));
+        // run.json's awaiting set lists `gate_b` first, but step order — what
+        // `a` (follow) focuses — puts `gate_a` first: the hint must agree
+        // with the key, not with the set's order.
+        live.view.gates.reverse();
+        live.notice = None;
+        live.parked_hint = None;
+        live.hint_parked_gate(false);
+        let hint = notice_text(&live).expect("a parked-run notice");
+        assert!(
+            hint.contains("gate_a") && !hint.contains("gate_b"),
+            "{hint}"
+        );
+        live.apply_action(KeyAction::Nav(NavKey::Follow));
+        assert_eq!(
+            live.nav
+                .focused_gate(&live.view)
+                .map(|g| g.step_id.as_str()),
+            Some("gate_a")
+        );
     }
 
     #[test]

@@ -2644,4 +2644,220 @@ mod tests {
         let s = render_plain(&live_layout(&grown, &nav, &feed(6), now(), W, 24));
         assert!(s.contains("▸ ✓ stage-03 "), "{s}");
     }
+
+    // ---- whole-frame regression snapshots --------------------------------
+    //
+    // The three shapes the operator actually sees, composed by the real
+    // `live_layout` from a `RunView` built through `apply` / public fields:
+    // parked at an approval gate, a wide fan-out mid-flight, and finished.
+
+    /// A realistic firehose row: `<codename> ▸ <tool> <arg>`.
+    fn firehose(codename: &str, tool: &str, arg: &str) -> Line {
+        Line::new()
+            .plain(format!("{codename} "))
+            .dim("▸ ")
+            .strong(tool)
+            .dim(format!(" {arg}"))
+    }
+
+    /// A run that fanned out, finished `inventory`, and parked at the
+    /// `approve-deploy` gate with `deploy` / `smoke` still to come.
+    fn gate_parked_view() -> RunView {
+        let mut v = RunView::default();
+        v.workflow_name = "release-train".into();
+        v.crew = Some("mint-tundra".into());
+        v.started_at = Some(now() - Duration::seconds(7 * 60 + 41));
+        v.status = RunStatus::AwaitingApproval;
+        start_as(
+            &mut v,
+            "build",
+            StepKind::Linear,
+            Some("builder"),
+            Some("heron#1"),
+        );
+        agent_started(&mut v, "build", "builder", "anthropic", "claude-opus-5-5");
+        v.apply(&Event::StepCompleted {
+            run_id: "r".into(),
+            step_id: "build".into(),
+            success: true,
+            duration_ms: 96_000,
+            host: None,
+        });
+        start_as(
+            &mut v,
+            "review",
+            StepKind::Linear,
+            Some("reviewer"),
+            Some("lynx#2"),
+        );
+        agent_started(&mut v, "review", "reviewer", "anthropic", "claude-opus-5-5");
+        v.apply(&Event::StepCompleted {
+            run_id: "r".into(),
+            step_id: "review".into(),
+            success: true,
+            duration_ms: 142_000,
+            host: None,
+        });
+        start_as(&mut v, "approve-deploy", StepKind::ApprovalGate, None, None);
+        v.apply(&Event::StepAwaitingApproval {
+            run_id: "r".into(),
+            step_id: "approve-deploy".into(),
+            reason: "awaiting approval".into(),
+        });
+        v.step_mut("deploy");
+        v.step_mut("smoke");
+        v.gates = vec![GateView {
+            step_id: "approve-deploy".into(),
+            prompt: Some("Deploy release 4.2.0 to production?".into()),
+            since: now() - Duration::seconds(95),
+            expires_at: None,
+        }];
+        v.usage = Some(rupu_cp::usage::UsageSummary {
+            input_tokens: 1_240_000,
+            output_tokens: 86_000,
+            total_tokens: 1_326_000,
+            cost_usd: Some(4.12),
+            priced: true,
+            ..Default::default()
+        });
+        v.findings_by_severity.insert("medium".into(), 1);
+        v
+    }
+
+    #[test]
+    fn whole_frame_gate_parked_shows_the_gate_and_its_keys() {
+        let v = gate_parked_view();
+        let feed = vec![
+            firehose("lynx#2", "read_file", "src/release.rs"),
+            firehose("lynx#2", "grep", "unwrap"),
+            firehose("heron#1", "bash", "cargo build"),
+        ];
+        // Following, no navigation: the parked gate is auto-focused.
+        let out = live_layout(&v, &NavState::default(), &feed, now(), 80, 16);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        // 3 dashboard rows + 5 steps + 3 feed rows + the footer.
+        assert_eq!(out.len(), 12, "{s}");
+        let lines = lines_of(&out);
+        // The gate row is the marked one, and says it is parked.
+        let gate_row = lines
+            .iter()
+            .find(|l| l.contains("approve-deploy · gate"))
+            .unwrap_or_else(|| panic!("gate row missing:\n{s}"));
+        assert!(
+            gate_row.starts_with("▸ ⏸ approve-deploy") && gate_row.contains("awaiting approval"),
+            "{s}"
+        );
+        assert_eq!(
+            s.matches('▸').count() - feed.len(),
+            1,
+            "one gate marked:\n{s}"
+        );
+        // The footer advertises the modal gate keys, not navigation.
+        assert_eq!(
+            lines.last().unwrap(),
+            "a approve · r reject · v findings · q quit",
+            "{s}"
+        );
+        assert!(!s.contains("↑↓ move"), "{s}");
+        // The dashboard reflects the parked run.
+        assert!(s.contains("awaiting_approval"), "{s}");
+        assert!(s.contains("⏸ approve-deploy"), "{s}");
+        // The feed rows are intact beneath the graph.
+        assert_eq!(lines.iter().filter(|l| l.contains(" ▸ ")).count(), 3, "{s}");
+    }
+
+    #[test]
+    fn whole_frame_86_unit_fan_out_at_24_rows_keeps_density_and_feed() {
+        let v = big_run();
+        let feed = vec![
+            firehose("otter#57", "read_file", "services/billing/src/lib.rs"),
+            firehose("otter#58", "grep", "TODO"),
+            firehose("otter#59", "bash", "cargo test -p billing"),
+            firehose("otter#56", "write_file", "findings/svc-56.md"),
+            firehose("otter#57", "bash", "git diff --stat"),
+            firehose("otter#58", "read_file", "services/auth/src/token.rs"),
+        ];
+        let out = live_layout(&v, &NavState::default(), &feed, now(), 100, 24);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        assert_eq!(out.len(), 24, "{s}");
+        // Settled steps collapsed to one summary row; the running frontier
+        // and its density block stay.
+        assert!(
+            s.contains("✓ stage-00 … stage-29  (+28 done · 2 skipped)"),
+            "{s}"
+        );
+        assert!(s.contains("◐ hunt · for_each · 86 units"), "{s}");
+        assert!(s.contains("52/86 ✓52 ◐6 ✗2 ○26"), "{s}");
+        assert!(s.contains("+82 more · [enter] expand"), "{s}");
+        // The feed keeps its newest rows, in order, above the footer.
+        let lines = lines_of(&out);
+        let fed: Vec<&String> = lines.iter().filter(|l| l.contains(" ▸ ")).collect();
+        assert!(fed.len() >= 4, "{s}");
+        assert!(
+            fed.last().unwrap().contains("services/auth/src/token.rs"),
+            "{s}"
+        );
+        assert!(lines.last().unwrap().starts_with("↑↓ move"), "{s}");
+    }
+
+    #[test]
+    fn whole_frame_completed_run_shows_a_full_bar_and_no_active_step() {
+        let mut v = RunView::default();
+        v.workflow_name = "release-train".into();
+        v.crew = Some("mint-tundra".into());
+        v.started_at = Some(now() - Duration::seconds(12 * 60 + 5));
+        v.status = RunStatus::Running;
+        for id in ["build", "review", "deploy", "smoke"] {
+            start_as(&mut v, id, StepKind::Linear, Some("builder"), None);
+            agent_started(&mut v, id, "builder", "anthropic", "claude-opus-5-5");
+            v.apply(&Event::StepCompleted {
+                run_id: "r".into(),
+                step_id: id.into(),
+                success: true,
+                duration_ms: 61_000,
+                host: None,
+            });
+        }
+        v.apply(&Event::RunCompleted {
+            run_id: "r".into(),
+            status: RunStatus::Completed,
+            finished_at: now() - Duration::seconds(30),
+        });
+        v.usage = Some(rupu_cp::usage::UsageSummary {
+            input_tokens: 2_400_000,
+            output_tokens: 150_000,
+            total_tokens: 2_550_000,
+            cost_usd: Some(7.85),
+            priced: true,
+            ..Default::default()
+        });
+        v.findings_by_severity.insert("high".into(), 1);
+        v.findings_by_severity.insert("low".into(), 2);
+        let feed = vec![
+            firehose("heron#1", "bash", "make smoke"),
+            firehose("heron#1", "write_file", "reports/release-4.2.0.md"),
+        ];
+        let out = live_layout(&v, &NavState::default(), &feed, now(), 80, 14);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        let lines = lines_of(&out);
+        // Elapsed freezes at the finish time, not at `now`.
+        assert!(lines[0].contains("completed · 11m 35s"), "{s}");
+        assert!(lines[1].starts_with("step 4/4"), "{s}");
+        assert_eq!(s.matches('█').count(), 24, "{s}");
+        assert!(!s.contains('░'), "{s}");
+        for step_row in &lines[3..7] {
+            assert!(step_row.starts_with("  ✓ "), "every step done:\n{s}");
+        }
+        assert!(
+            !s.contains('◐') && !s.contains('⏸'),
+            "nothing in flight:\n{s}"
+        );
+        assert!(lines.last().unwrap().starts_with("↑↓ move"), "{s}");
+    }
 }

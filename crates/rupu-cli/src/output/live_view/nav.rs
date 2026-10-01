@@ -3,8 +3,8 @@
 //!
 //! Depth axis: run → step → unit → sub-agent. The cursor at each depth moves
 //! over the in-view list for that depth (steps at `Run`, the filtered units
-//! at `Step`, sub-agents at `Unit`/`SubAgent`). No terminal I/O: Plan 3 maps
-//! crossterm key events onto [`NavKey`] and feeds them to [`NavState::apply`]
+//! at `Step`, sub-agents at `Unit`/`SubAgent`). No terminal I/O: `output::live_run`
+//! maps crossterm key events onto [`NavKey`] and feeds them to [`NavState::apply`]
 //! together with the current [`RunView`]. A run grows steps / units /
 //! dispatches between ticks, so every call re-clamps the cursors to the lists
 //! that exist *now* and never indexes out of range.
