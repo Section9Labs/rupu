@@ -281,6 +281,7 @@ mod tests {
             timeout_ms: Some(7_000),
             max_concurrency: Some(3),
             clone_protocol: Some("ssh".into()),
+            oauth_client_id: None,
         };
         let o = ScmClientOptions::from_platform_config(Some(&cfg));
         assert_eq!(

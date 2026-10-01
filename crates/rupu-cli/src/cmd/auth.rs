@@ -478,7 +478,8 @@ async fn login(
                 .ok_or_else(|| anyhow::anyhow!("vendor {kind} has no SSO flow"))?;
             let stored = match oauth.flow {
                 rupu_auth::oauth::providers::OAuthFlow::Callback => {
-                    rupu_auth::oauth::callback::run(pid).await?
+                    let app = sso_client(&cfg, account, pid)?;
+                    rupu_auth::oauth::callback::run_with_client(pid, app).await?
                 }
                 rupu_auth::oauth::providers::OAuthFlow::Device => {
                     rupu_auth::oauth::device::run(pid).await?
@@ -489,6 +490,28 @@ async fn login(
         }
     }
     Ok(())
+}
+
+/// The OAuth application an SSO login for `account` (vendor `pid`) uses
+/// when config chooses it: a GitLab account's `[scm.<account>]` `base_url`
+/// (its instance) and `oauth_client_id` (see
+/// [`rupu_auth::oauth::gitlab::oauth_client`]). `None` — every other
+/// vendor — logs in as the built-in application.
+fn sso_client(
+    cfg: &rupu_config::Config,
+    account: &str,
+    pid: ProviderId,
+) -> anyhow::Result<Option<rupu_auth::oauth::providers::OAuthClient>> {
+    if pid != ProviderId::Gitlab {
+        return Ok(None);
+    }
+    let scm = cfg.scm.platforms.get(account);
+    rupu_auth::oauth::gitlab::oauth_client(
+        scm.and_then(|p| p.base_url.as_deref()),
+        scm.and_then(|p| p.oauth_client_id.as_deref()),
+        account,
+    )
+    .map(Some)
 }
 
 /// Read a secret from `--key` or stdin, rejecting empty input.
@@ -1473,6 +1496,71 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("collide"));
         assert!(!msg.contains("some-config.toml"));
+    }
+
+    fn gitlab_account(base_url: Option<&str>, client_id: Option<&str>) -> rupu_config::Config {
+        let mut cfg = rupu_config::Config::default();
+        cfg.scm.platforms.insert(
+            "gl-corp".into(),
+            rupu_config::ScmPlatformConfig {
+                kind: Some("gitlab".into()),
+                base_url: base_url.map(Into::into),
+                oauth_client_id: client_id.map(Into::into),
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn a_gitlab_sso_login_uses_the_account_s_instance_and_application() {
+        let cfg = gitlab_account(Some("https://gitlab.example.com/api/v4"), Some("corp-app"));
+        let app = sso_client(&cfg, "gl-corp", ProviderId::Gitlab)
+            .unwrap()
+            .expect("a GitLab login chooses its application");
+        assert_eq!(app.client_id, "corp-app");
+        assert_eq!(app.token_url, "https://gitlab.example.com/oauth/token");
+    }
+
+    #[test]
+    fn a_gitlab_sso_login_with_nothing_configured_uses_glab_s_on_gitlab_com() {
+        let app = sso_client(
+            &rupu_config::Config::default(),
+            "gitlab",
+            ProviderId::Gitlab,
+        )
+        .unwrap()
+        .expect("a GitLab login chooses its application");
+        assert_eq!(
+            app.client_id,
+            rupu_auth::oauth::gitlab::GITLAB_COM_CLIENT_ID
+        );
+        assert_eq!(app.token_url, "https://gitlab.com/oauth/token");
+    }
+
+    #[test]
+    fn a_self_managed_gitlab_sso_login_without_an_application_is_refused() {
+        let cfg = gitlab_account(Some("https://gitlab.example.com/api/v4"), None);
+        let err = sso_client(&cfg, "gl-corp", ProviderId::Gitlab).unwrap_err();
+        assert!(
+            err.to_string().contains("[scm.gl-corp] oauth_client_id"),
+            "{err}"
+        );
+    }
+
+    /// Every other vendor logs in as its built-in application.
+    #[test]
+    fn other_vendors_log_in_as_their_built_in_application() {
+        for pid in [
+            ProviderId::Anthropic,
+            ProviderId::Openai,
+            ProviderId::Gemini,
+        ] {
+            assert_eq!(
+                sso_client(&rupu_config::Config::default(), pid.as_str(), pid).unwrap(),
+                None
+            );
+        }
     }
 }
 
