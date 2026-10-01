@@ -4,4 +4,5 @@
 pub mod layout;
 pub mod mux;
 pub mod nav;
+pub mod render;
 pub mod row;
