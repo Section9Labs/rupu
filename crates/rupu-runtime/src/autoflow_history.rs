@@ -333,7 +333,7 @@ impl AutoflowHistoryStore {
             (self.event_day_dirs()?, &mut report.event_days),
         ] {
             for day in dirs {
-                if !day_of(&day).is_some_and(|date| date < cutoff) {
+                if day_of(&day).is_none_or(|date| date >= cutoff) {
                     continue;
                 }
                 match std::fs::remove_dir_all(&day) {
