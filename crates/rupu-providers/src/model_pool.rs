@@ -147,9 +147,16 @@ impl ModelPool {
                 .iter_mut()
                 .find(|m| m.provider == provider && m.id == new_model.id)
             {
-                // Update capabilities and cost from discovery, keep status
-                existing.context_window = new_model.context_window;
-                existing.max_output_tokens = new_model.max_output_tokens;
+                // Update limits, capabilities and cost from discovery, keep
+                // status. A discovered 0 means "the listing did not say"
+                // (id-only listings, null caps) — never overwrite a known
+                // limit with it.
+                if new_model.context_window > 0 {
+                    existing.context_window = new_model.context_window;
+                }
+                if new_model.max_output_tokens > 0 {
+                    existing.max_output_tokens = new_model.max_output_tokens;
+                }
                 if !new_model.capabilities.is_empty() {
                     existing.capabilities = new_model.capabilities;
                 }
@@ -516,6 +523,41 @@ mod tests {
         let model = pool.get(ProviderId::Anthropic, "sonnet").expect("exists");
         assert_eq!(model.context_window, 1_000_000);
         assert_eq!(model.capabilities.len(), 2);
+    }
+
+    /// A discovered 0 means "this listing did not say" (Anthropic's null
+    /// `max_tokens`, Codex's missing output cap, ...). It must never overwrite
+    /// a limit the pool already knows.
+    #[test]
+    fn test_merge_discovered_keeps_known_limits_when_discovery_reports_zero() {
+        let mut known = make_model("sonnet", ProviderId::Anthropic, vec![]);
+        known.context_window = 200_000;
+        known.max_output_tokens = 64_000;
+        let pool = ModelPool::from_models(vec![known]);
+
+        let mut ids_only = make_model("sonnet", ProviderId::Anthropic, vec![]);
+        ids_only.context_window = 0;
+        ids_only.max_output_tokens = 0;
+        pool.merge_discovered(ProviderId::Anthropic, vec![ids_only]);
+        let m = pool.get(ProviderId::Anthropic, "sonnet").expect("exists");
+        assert_eq!((m.context_window, m.max_output_tokens), (200_000, 64_000));
+
+        // Each field is judged on its own: a real input limit with an unknown
+        // output cap updates only the input.
+        let mut partial = make_model("sonnet", ProviderId::Anthropic, vec![]);
+        partial.context_window = 1_000_000;
+        partial.max_output_tokens = 0;
+        pool.merge_discovered(ProviderId::Anthropic, vec![partial]);
+        let m = pool.get(ProviderId::Anthropic, "sonnet").expect("exists");
+        assert_eq!((m.context_window, m.max_output_tokens), (1_000_000, 64_000));
+
+        // And a real discovered value still wins over the known one.
+        let mut fresh = make_model("sonnet", ProviderId::Anthropic, vec![]);
+        fresh.context_window = 500_000;
+        fresh.max_output_tokens = 32_000;
+        pool.merge_discovered(ProviderId::Anthropic, vec![fresh]);
+        let m = pool.get(ProviderId::Anthropic, "sonnet").expect("exists");
+        assert_eq!((m.context_window, m.max_output_tokens), (500_000, 32_000));
     }
 
     #[test]
