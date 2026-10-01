@@ -1,18 +1,35 @@
-//! Live smoke tests. Skipped silently unless RUPU_LIVE_TESTS=1 AND
-//! per-provider credentials are present in the env.
+//! Live smoke tests. Skipped (reported as passing) unless RUPU_LIVE_TESTS=1
+//! AND the per-provider credential is set to a non-empty value.
 //!
-//! Run via: `RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... cargo test -p rupu-providers --test it live_smoke::`
+//! Run via: `RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... cargo test -p rupu-providers --test it live_smoke:: -- --nocapture`
 //!
-//! These tests are NOT run in the regular `cargo test` flow. They live
-//! behind an env gate so the per-PR CI workflow stays offline; the
-//! nightly workflow at `.github/workflows/nightly-live-tests.yml` runs
-//! them with secrets.
+//! These tests are NOT run in the regular `cargo test` flow, and no CI
+//! workflow runs them: they are a local, opt-in check against the real
+//! APIs. `--nocapture` shows which ones skipped for a missing credential.
 
 use rupu_providers::auth::AuthCredentials;
 use rupu_providers::types::{ContentBlock, LlmRequest, Message, Role, ToolDefinition, Usage};
 
 fn live_enabled() -> bool {
     std::env::var("RUPU_LIVE_TESTS").as_deref() == Ok("1")
+}
+
+/// The credential in `var`, or `None` (skip) when the live gate is off or
+/// `var` is unset or blank. A blank value is absent, not a key to send: an
+/// exported-but-empty variable otherwise reaches the API as an empty key
+/// and fails with a 401 that says nothing about the provider.
+fn live_credential(var: &str) -> Option<String> {
+    if !live_enabled() {
+        eprintln!("SKIPPED: RUPU_LIVE_TESTS != 1");
+        return None;
+    }
+    match std::env::var(var) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => {
+            eprintln!("SKIPPED: {var} not set");
+            None
+        }
+    }
 }
 
 fn minimal_request(model: &str) -> LlmRequest {
@@ -38,12 +55,8 @@ fn minimal_request(model: &str) -> LlmRequest {
 
 #[tokio::test]
 async fn anthropic_live_round_trip() {
-    if !live_enabled() {
+    let Some(key) = live_credential("RUPU_LIVE_ANTHROPIC_KEY") else {
         return;
-    }
-    let key = match std::env::var("RUPU_LIVE_ANTHROPIC_KEY") {
-        Ok(k) => k,
-        Err(_) => return,
     };
     let mut client =
         rupu_providers::AnthropicClient::new(key, std::sync::Arc::new(rupu_netflow::NullSink));
@@ -57,12 +70,8 @@ async fn anthropic_live_round_trip() {
 
 #[tokio::test]
 async fn openai_live_round_trip() {
-    if !live_enabled() {
+    let Some(key) = live_credential("RUPU_LIVE_OPENAI_KEY") else {
         return;
-    }
-    let key = match std::env::var("RUPU_LIVE_OPENAI_KEY") {
-        Ok(k) => k,
-        Err(_) => return,
     };
     let creds = AuthCredentials::ApiKey { key };
     let mut client = rupu_providers::OpenAiCodexClient::new(
@@ -80,12 +89,8 @@ async fn openai_live_round_trip() {
 
 #[tokio::test]
 async fn copilot_live_round_trip() {
-    if !live_enabled() {
+    let Some(token) = live_credential("RUPU_LIVE_COPILOT_TOKEN") else {
         return;
-    }
-    let token = match std::env::var("RUPU_LIVE_COPILOT_TOKEN") {
-        Ok(t) => t,
-        Err(_) => return,
     };
     let creds = AuthCredentials::ApiKey { key: token };
     let mut client = rupu_providers::GithubCopilotClient::new(
@@ -105,7 +110,7 @@ async fn copilot_live_round_trip() {
 // Anthropic prompt-cache live checks (Plan 3, Task 5).
 //
 // Both tests are `#[ignore]`d on top of the usual env gate, so a plain
-// `cargo test` (or even the nightly run without `--ignored`) never spends
+// `cargo test` (or even a live run without `--ignored`) never spends
 // money. Run them only after the user has explicitly approved the spend:
 //
 //   RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... \
@@ -114,8 +119,8 @@ async fn copilot_live_round_trip() {
 //     cargo test -p rupu-providers --test it -- --ignored --nocapture empty_tool_result
 //
 // `--nocapture` matters: the usage numbers are printed with `eprintln!`, and a
-// missing env var skips (returns early, reported as "ok") rather than fails —
-// the same behaviour as the round-trip tests above.
+// missing or blank env var skips (returns early, reported as "ok") rather than
+// fails — the same behaviour as the round-trip tests above.
 
 /// Model for the prompt-cache checks. `claude-haiku-4-5` (used by the plain
 /// round-trip test) needs a 4096-token prefix to cache at all, which the ~3k
@@ -153,14 +158,7 @@ fn cacheable_system_prompt() -> String {
 /// Builds a caching-ON (default) client from the live env pattern, or `None`
 /// (skip) when the env gate / key is absent.
 fn live_anthropic_client() -> Option<rupu_providers::AnthropicClient> {
-    if !live_enabled() {
-        eprintln!("SKIPPED: RUPU_LIVE_TESTS != 1");
-        return None;
-    }
-    let Ok(key) = std::env::var("RUPU_LIVE_ANTHROPIC_KEY") else {
-        eprintln!("SKIPPED: RUPU_LIVE_ANTHROPIC_KEY not set");
-        return None;
-    };
+    let key = live_credential("RUPU_LIVE_ANTHROPIC_KEY")?;
     // `AnthropicClient::new` leaves prompt caching at its default: ON.
     Some(rupu_providers::AnthropicClient::new(
         key,

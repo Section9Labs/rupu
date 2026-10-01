@@ -203,15 +203,6 @@ Set under repo Settings → Secrets and variables → Actions.
 Deploy keys rather than PATs throughout, deliberately: each writes to exactly
 one repository, none expire, and revoking one touches no other account.
 
-**Nightly live-API tests (`nightly-live-tests.yml`):**
-
-- `RUPU_LIVE_ANTHROPIC_KEY`
-- `RUPU_LIVE_OPENAI_KEY`
-- `RUPU_LIVE_GEMINI_KEY`
-- `RUPU_LIVE_COPILOT_TOKEN`
-- `RUPU_LIVE_GITHUB_TOKEN` — PAT, scopes: repo + read:user + read:org
-- `RUPU_LIVE_GITLAB_TOKEN` — PAT, scopes: api + read_user + read_repository
-
 ## Smoking a release
 
 Assets are bare binaries (`rupu-darwin-arm64`, `rupu-linux-x64`,

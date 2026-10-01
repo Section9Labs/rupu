@@ -1,6 +1,11 @@
-//! Live smoke tests against the real GitHub API. Skipped silently
-//! unless `RUPU_LIVE_TESTS=1` AND `RUPU_LIVE_GITHUB_TOKEN` are set.
-//! Wired into the existing nightly-live-tests workflow in Plan 3.
+//! Live smoke tests against the real GitHub and GitLab APIs. Skipped
+//! (reported as passing) unless `RUPU_LIVE_TESTS=1` AND the platform's token
+//! (`RUPU_LIVE_GITHUB_TOKEN` / `RUPU_LIVE_GITLAB_TOKEN`) is set to a
+//! non-empty value. Read-only: nothing here writes to either platform.
+//!
+//! Run via: `RUPU_LIVE_TESTS=1 RUPU_LIVE_GITHUB_TOKEN=... cargo test -p rupu-scm --test it live_smoke::`
+//!
+//! No CI workflow runs these; they are a local, opt-in check.
 
 use rupu_scm::{IssueConnector, IssueFilter, Platform, RepoConnector, RepoRef};
 
@@ -8,8 +13,14 @@ fn live_enabled() -> bool {
     std::env::var("RUPU_LIVE_TESTS").as_deref() == Ok("1")
 }
 
+/// The token in `var`, or `None` (skip) when it is unset or blank — an
+/// exported-but-empty variable is absent, not a token to send.
+fn live_token(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|t| !t.trim().is_empty())
+}
+
 fn token() -> Option<String> {
-    std::env::var("RUPU_LIVE_GITHUB_TOKEN").ok()
+    live_token("RUPU_LIVE_GITHUB_TOKEN")
 }
 
 fn build_connectors() -> Option<(
@@ -17,6 +28,7 @@ fn build_connectors() -> Option<(
     std::sync::Arc<dyn IssueConnector>,
 )> {
     let token = token()?;
+    rupu_scm::install_default_crypto_provider();
     use rupu_scm::connectors::github::GithubClient;
     let client = GithubClient::new(
         token,
@@ -79,7 +91,7 @@ async fn github_list_issues_for_known_target() {
 }
 
 fn gitlab_token() -> Option<String> {
-    std::env::var("RUPU_LIVE_GITLAB_TOKEN").ok()
+    live_token("RUPU_LIVE_GITLAB_TOKEN")
 }
 
 fn build_gitlab_connectors() -> Option<(
@@ -87,6 +99,7 @@ fn build_gitlab_connectors() -> Option<(
     std::sync::Arc<dyn IssueConnector>,
 )> {
     let token = gitlab_token()?;
+    rupu_scm::install_default_crypto_provider();
     use rupu_scm::connectors::gitlab::GitlabClient;
     let client = GitlabClient::new(
         token,
