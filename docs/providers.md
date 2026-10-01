@@ -245,7 +245,7 @@ See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 
 `rupu models list` (and the control plane's Models tab) build their catalog of known models from three sources, in order:
 1. **Custom** — `[[providers.<name>.models]]` entries from `~/.rupu/config.toml`.
-2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap; a file with any other schema is ignored and refetched). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches. A listing that returns no models counts as a failed refresh and never overwrites the cache.
+2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap; a file with any other schema is ignored and refetched). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing (unless a refetch failed in the last 5 minutes, see [When a refresh fails](#when-a-refresh-fails)). `rupu models list` only reads the cache — it never fetches. A listing that returns no models counts as a failed refresh and never overwrites the cache.
 3. **Baked-in** — Copilot and Gemini ship a small built-in id list (limits unknown). Baked-in entries are merged beneath the live and custom rows and only fill ids the live list doesn't contain, so `rupu models list` can still show a few `baked-in` rows after a successful fetch; they never supply limits.
 
 That three-source order is the catalog view only. The limits a **run** uses for its `model:` follow a different precedence — the agent's frontmatter, then the config entry, then the live list, then unknown — and baked-in rows never supply a limit; see [Model limits](#model-limits).
@@ -289,7 +289,11 @@ Every run also needs the model's real **input limit** (used for proactive compac
 3. the provider's live model list, from the cache above;
 4. unknown.
 
-Each run writes a `model_limits` notice to its transcript with the values and where each came from, and says so explicitly when a limit is unknown. If the input limit is unknown, compaction is off; if the output cap is unknown, Anthropic requests carry `8192` and every other provider gets no cap (the model's max). Details: [agent-format.md](agent-format.md#contextwindowtokens-and-compactatpercent).
+A value of `0` counts as unset at every level. An agent's `contextWindowTokens: 0` or `maxTokens: 0` is ignored (it would compact every turn, or send `max_tokens: 0`) and the notice says `ignored contextWindowTokens: 0`; a `0` in a `[[providers.<name>.models]]` entry is skipped the same way.
+
+Each run writes a `model_limits` notice to its transcript with the values and where each came from, and says so explicitly when a limit is unknown. If the input limit is unknown, compaction is off; if the output cap is unknown, Anthropic requests carry `8192` and every other provider gets no cap (the model's max). The one exception is an OpenAI-compatible account with `stream = false`, which carries `8192` because it cannot stream. `--no-stream` changes none of this: it only changes how output is displayed, and requests still stream on the wire. Details: [agent-format.md](agent-format.md#contextwindowtokens-and-compactatpercent).
+
+When a limit is unknown or an input was set aside, the notice also says why: the provider has no listing endpoint; the refresh failed, timed out, returned no models, or is paused (see [When a refresh fails](#when-a-refresh-fails)); the model isn't in the provider's list (`model '<id>' is not in <provider>'s model list`, shown unless your config actually supplies a limit for it); the provider lists the model without any limits (`<provider> lists '<id>' without limits; set contextWindowTokens/maxTokens or [[providers.<name>.models]]`); or the cache couldn't be written.
 
 Where each provider's limits come from:
 
@@ -305,12 +309,40 @@ Where each provider's limits come from:
 
 - **OpenAI with an API key** also sends the key, as a Bearer token, to `chatgpt.com/backend-api/codex/models` — the only endpoint beyond `api.openai.com` — to read the Codex catalog's limits; if that call fails or lists nothing it falls back to the ids-only `GET /v1/models`.
 - **Gemini CLI / Code Assist login** exposes no model limits. Declare them yourself with `[[providers.gemini.models]]` (or pin `contextWindowTokens` / `maxTokens` on the agent); with that login, `rupu models refresh --provider gemini` reports that there is no listing rather than pretending to fetch one.
-- **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit. Its built-in ids only fill gaps beneath the live list and carry no limits.
-- **OpenAI-compatible** limits are unknown unless config or the server provides them — there are no made-up defaults.
+- **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit, and a limit the listing reports as `0` counts as absent, so it falls through to the window size. Its built-in ids only fill gaps beneath the live list and carry no limits.
+- **OpenAI-compatible** limits are unknown unless config or the server provides them — there are no made-up defaults. A LoRA entry with no `max_model_len` of its own takes its parent's.
+- **A listing rupu can't make sense of is an error, never an empty catalog**: a body that isn't JSON, or — for Anthropic, Codex, Copilot and OpenAI-compatible servers — one with none of the arrays the provider documents (for example a vLLM server whose `/v1/models` has no `data`). `rupu models refresh` reports it, and the existing cache is kept. A listing that parses but holds no models at all is a failed refresh too, never a cached empty list.
+- **Paged listings** (Anthropic, Gemini AI Studio) are fetched 1000 models per page; a server that repeats a page cursor, or lists a model id twice, is cut off rather than looped on or double-listed.
 
-A provider's "prompt too long" error that reports the real maximum lowers the input limit for the rest of the run (a `model_limits_clamped` notice) and triggers compaction; the observed value is never written to the model cache, because it reflects the account rather than the model. A session resolves its limits on its first turn and keeps them (a first turn that found no limit at all is resolved again on the next turn).
+**In the control plane:** Settings → Models lists every provider's cached models with input limit, output cap, source and fetch age, with a **Refetch** button per provider and a **Refetch all** button. It is backed by `GET /api/models` and `POST /api/models/refresh` (body `{}` for all providers, or `{"provider": "<name>"}` for one) and refreshes the control-plane machine's cache only — remote hosts keep their own caches and refresh them when a run launches there. A refetch always tries, even inside the 5-minute pause below; a job that outlives its 10-second wait is reported as `timed out after 10s` and keeps running in the background.
 
-**In the control plane:** Settings → Models lists every provider's cached models with input limit, output cap, source and fetch age, with a **Refetch** button per provider and a **Refetch all** button. It is backed by `GET /api/models` and `POST /api/models/refresh` (body `{}` for all providers, or `{"provider": "<name>"}` for one) and refreshes the control-plane machine's cache only — remote hosts keep their own caches and refresh them when a run launches there.
+### When a refresh fails
+
+A run that finds a model's cache stale or missing refetches it through its own client, bounded by the same 10 seconds. A refetch that fails, times out, or returns no models is remembered for 5 minutes in `~/.rupu/cache/models/<provider>.failed`. Until then runs skip the refetch — otherwise each launch would pay the timeout again while a provider is down — and use the stale entry if there is one, else unknown. The `model_limits` notice says so: `model list refresh failed 3m ago (<error>); retrying after 5m`.
+
+A successful refetch removes the marker. `rupu models refresh` and the control plane's **Refetch** ignore it: they always try, and clear it on success. A provider that simply has no listing endpoint (a Gemini CLI login) is not a failure and is not remembered. A session resolves its limits on its first turn and keeps them for later turns, a lowered limit included — even when the turn that learned it failed. Only a stored value with no known limit at all (a first turn that hit a transient failure) is resolved again on the next turn, under the same 5-minute pause.
+
+### When the provider rejects a request
+
+Each run learns from the provider's own rejection. rupu recognizes these formats in the error text (providers don't document them, so each is pinned by a test):
+
+| Provider | Error text | What it carries |
+| --- | --- | --- |
+| Anthropic | `prompt is too long: N tokens > M maximum` | the input limit M |
+| OpenAI, Copilot | `maximum context length is M tokens … resulted in N tokens` | M |
+| Copilot | `prompt token count of N exceeds the limit of M` | M |
+| vLLM | `Input length (N) exceeds model's maximum context length (M)` | M |
+| Gemini | `input token count (N) exceeds the maximum number of tokens allowed (M)` (a bare token count without `exceeds` is not an overflow) | M |
+| any | `prompt is too long`, `too many tokens`, `context window` | no number |
+
+When the error carries the real maximum and it is below the run's input limit (or that limit is unknown), rupu lowers the input limit to it for the rest of the run, writes a `model_limits_clamped` notice, compacts with a summary, and retries. With no usable number but a known input limit it still compacts once per turn; deleting the oldest exchanges is the last resort. The observed value is never written to the model cache, because it reflects the account rather than the model. A session keeps it for later turns.
+
+Two Anthropic cases are not input overflows and are handled differently:
+
+- **`input length and `max_tokens` exceed context limit: A + B > C`** (older Claude models; reachable because rupu now sends the model's real output cap). The input fits and the output reservation does not, so the input limit is left alone. rupu retries the turn once with `max_tokens` lowered to `C − A − 1000` and writes a `model_limits_clamped` notice saying the output cap was lowered for this request. If that leaves less than 1,024 tokens, or the retry fails the same way, it compacts like an input overflow.
+- **429 `Extra usage is required for long context requests`.** The account has no extra-usage billing and the request carried the 1M-context beta (`contextWindow: 1m` with an API key, a `[1m]` model suffix with SSO). It is neither a rate limit nor a size problem, so it is never retried with the beta: rupu stops sending the beta for the rest of that client's life, clamps the input limit to 200,000, says so in a `model_limits_clamped` notice, and retries the turn once. If the input is still over 200K, the normal "prompt too long" handling compacts. Each run builds a new client and so pays one refused request; remove `[1m]` (or `contextWindow: 1m` from the agent) to skip it. A session keeps the model and window it started with, so apply that change in a new session.
+
+The `[1m]` suffix is only a client-side marker for the 1M beta: it is stripped from the model id sent to Anthropic and from the lookup in the model list.
 
 ## Troubleshooting
 
