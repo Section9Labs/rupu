@@ -1982,8 +1982,11 @@ impl AnthropicClient {
         //   * `thinking.type: "adaptive"` — server picks the budget
         //     (Opus/Sonnet 4 OAuth path).
         //   * `thinking.type: "enabled"` + `budget_tokens: <n>` — fixed
-        //     budget. Must be >= 1024 (API minimum); we silently skip
-        //     thinking when the clamped budget falls below that.
+        //     budget. Must be >= 1024 (API minimum) and < max_tokens
+        //     (thinking counts toward the cap; platform.claude.com/docs/en/
+        //     build-with-claude/extended-thinking, "Budget rules"). Clamped
+        //     to leave 1024 for the visible answer; thinking is skipped when
+        //     the clamped budget falls below the minimum.
         //   * `display: "summarized"` — opt in to readable thinking text.
         //     Only ever set alongside "adaptive": `display` accepts exactly
         //     "summarized" | "omitted" (there is no raw/full — the raw chain of
@@ -2008,7 +2011,7 @@ impl AnthropicClient {
                         ThinkingLevel::Auto => unreachable!(),
                     };
                     if raw_budget > 0 {
-                        let clamped = raw_budget.min(max_tokens);
+                        let clamped = raw_budget.min(max_tokens.saturating_sub(1024));
                         if clamped >= 1024 {
                             body["thinking"] = serde_json::json!({
                                 "type": "enabled",
@@ -3689,8 +3692,8 @@ mod tests {
         let body = client.build_request_body(&request, false);
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
         assert!(
-            budget <= 4096,
-            "budget {budget} should be <= max_tokens 4096"
+            budget < 4096,
+            "budget {budget} must be < max_tokens 4096 (an API requirement)"
         );
         assert!(budget >= 1024, "budget {budget} should be >= minimum 1024");
     }
@@ -3712,10 +3715,35 @@ mod tests {
         assert_eq!(body["thinking"]["budget_tokens"], fallback - 2000);
         assert_eq!(body["thinking"]["budget_tokens"], 8192 - 2000);
 
-        // High asks for 10_000, more than the effective cap: clamped to it.
+        // High asks for 10_000, more than the effective cap allows: clamped
+        // to leave 1024 for the answer (`budget_tokens < max_tokens`).
         request.thinking = Some(crate::model_tier::ThinkingLevel::High);
         let body = client.build_request_body(&request, false);
-        assert_eq!(body["thinking"]["budget_tokens"], fallback);
+        assert_eq!(body["thinking"]["budget_tokens"], fallback - 1024);
+    }
+
+    /// The API requires `budget_tokens < max_tokens` ("Less than
+    /// `max_tokens`" — platform.claude.com/docs/en/build-with-claude/
+    /// extended-thinking, Budget rules): thinking counts toward the cap, so
+    /// the budget must leave room for the answer. The clamp keeps 1024 for
+    /// it, and drops thinking when what is left is under the 1024 minimum.
+    #[test]
+    fn thinking_budget_stays_below_the_output_cap() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let budget = |level, cap| {
+            let mut request = make_request(None);
+            request.max_tokens = Some(cap);
+            request.thinking = Some(level);
+            client.build_request_body(&request, false)["thinking"].clone()
+        };
+        use crate::model_tier::ThinkingLevel::{High, Low, Max};
+        assert_eq!(budget(High, 8192)["budget_tokens"], 7168);
+        assert_eq!(budget(Max, 8192)["budget_tokens"], 6192);
+        assert!(
+            budget(Low, 1500).is_null(),
+            "1500 − 1024 leaves less than the 1024 minimum: no thinking"
+        );
+        assert!(budget(High, 1500).is_null());
     }
 
     #[test]

@@ -140,6 +140,8 @@ Safety of the Anthropic max, verified against the API docs:
 - `max_tokens` doesn't count toward output rate limits (OTPM), which count only generated tokens.
 - On Claude 4.5+, input + `max_tokens` larger than the window is accepted.
 
+A fixed thinking budget (`thinking.type: "enabled"` with `budget_tokens`, for models without adaptive thinking) is clamped to `max_tokens − 1024`, because the API requires `budget_tokens < max_tokens` (thinking counts toward the cap) and the visible answer needs room. Thinking is dropped when that leaves less than the 1,024-token minimum. Adaptive thinking is unaffected.
+
 ### 6.4 Compaction threshold
 
 The threshold is based on `input` and `compact_at_percent`:
