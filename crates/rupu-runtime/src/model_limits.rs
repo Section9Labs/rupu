@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rupu_providers::model_limits::{
-    fmt_age, Limit, LimitSource, ModelLimits, ANTHROPIC_FALLBACK_MAX_TOKENS,
+    clamp_compact_percent, fmt_age, Limit, LimitSource, ModelLimits, ANTHROPIC_FALLBACK_MAX_TOKENS,
     DEFAULT_COMPACT_AT_PERCENT,
 };
 use rupu_providers::model_registry::match_model_id;
@@ -304,10 +304,11 @@ pub async fn resolve(
     ModelLimits {
         input,
         output,
-        compact_at_percent: overrides
-            .compact_at_percent
-            .unwrap_or(DEFAULT_COMPACT_AT_PERCENT)
-            .clamp(10, 95),
+        compact_at_percent: clamp_compact_percent(
+            overrides
+                .compact_at_percent
+                .unwrap_or(DEFAULT_COMPACT_AT_PERCENT),
+        ),
         output_shares_context: provider.output_shares_context(),
         output_fallback: (provider.provider_id() == ProviderId::Anthropic)
             .then_some(ANTHROPIC_FALLBACK_MAX_TOKENS),
