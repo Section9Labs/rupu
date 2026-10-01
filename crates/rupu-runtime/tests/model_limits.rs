@@ -1256,6 +1256,15 @@ async fn a_listed_model_without_limits_says_so() {
             "anthropic lists 'claude-a' without limits; set contextWindowTokens/maxTokens or [[providers.anthropic.models]]"
         )
     );
+
+    // Both limits pinned: the listing's gap leaves nothing unknown, so no note.
+    let pinned = LimitOverrides {
+        context_window_tokens: Some(100_000),
+        max_tokens: Some(8_000),
+        compact_at_percent: None,
+    };
+    let l = resolve(pinned, "anthropic", "claude-a", &mut p, &ctx(&tmp)).await;
+    assert_eq!(l.note, None);
 }
 
 /// A config entry with no limits of its own is no reason to hide that the

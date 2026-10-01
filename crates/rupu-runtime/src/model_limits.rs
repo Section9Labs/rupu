@@ -270,15 +270,6 @@ pub async fn resolve(
     // Config answers for the model only when it supplies a value; a bare
     // entry is no reason to hide that the provider doesn't list it.
     let config_answers = config_input.is_some() || config_output.is_some();
-    match &live {
-        None if fetched_at.is_some() && !config_answers => notes.push(format!(
-            "model '{model}' is not in {provider_name}'s model list"
-        )),
-        Some(m) if m.context_window == 0 && m.max_output_tokens == 0 => notes.push(format!(
-            "{provider_name} lists '{model}' without limits; set contextWindowTokens/maxTokens or [[providers.{provider_name}.models]]"
-        )),
-        _ => {}
-    }
     let pick = |pin: Option<u32>, cfg: Option<u32>, live: Option<u32>| -> Limit {
         if let Some(n) = pin {
             return Limit::new(n, LimitSource::Agent);
@@ -301,6 +292,20 @@ pub async fn resolve(
         config_output,
         live.as_ref().map(|m| m.max_output_tokens),
     );
+    let still_unknown =
+        input.source == LimitSource::Unknown || output.source == LimitSource::Unknown;
+    match &live {
+        None if fetched_at.is_some() && !config_answers => notes.push(format!(
+            "model '{model}' is not in {provider_name}'s model list"
+        )),
+        // Listed, but with neither limit: say so when it leaves a gap.
+        Some(m) if m.context_window == 0 && m.max_output_tokens == 0 && still_unknown => {
+            notes.push(format!(
+                "{provider_name} lists '{model}' without limits; set contextWindowTokens/maxTokens or [[providers.{provider_name}.models]]"
+            ))
+        }
+        _ => {}
+    }
     ModelLimits {
         input,
         output,
