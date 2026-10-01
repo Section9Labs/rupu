@@ -837,6 +837,10 @@ pub enum RunStoreError {
     AlreadyExists(String),
     #[error("run `{0}` is not in a terminal state (cancel it first)")]
     NotTerminal(String),
+    /// A [`RunStore::blocking`] task did not complete: it panicked, or the
+    /// runtime cancelled it at shutdown.
+    #[error("run store task failed: {0}")]
+    TaskFailed(String),
 }
 
 /// A transcript some part of a run wrote to (live usage ledger discovery,
@@ -1606,16 +1610,22 @@ impl RunStore {
 
     /// Run `f` with a handle to this store on the blocking pool — for the
     /// async callers of the methods that take the run lock, whose bounded
-    /// wait would otherwise stall a runtime worker thread.
-    pub async fn blocking<T, F>(&self, f: F) -> T
+    /// wait would otherwise stall a runtime worker thread. A task that did
+    /// not complete (it panicked, or the runtime cancelled it at shutdown)
+    /// comes back as the closure's own error type, through
+    /// [`RunStoreError::TaskFailed`] — never as a panic on the caller's
+    /// thread.
+    pub async fn blocking<U, E, F>(&self, f: F) -> Result<U, E>
     where
-        T: Send + 'static,
-        F: FnOnce(RunStore) -> T + Send + 'static,
+        U: Send + 'static,
+        E: From<RunStoreError> + Send + 'static,
+        F: FnOnce(RunStore) -> Result<U, E> + Send + 'static,
     {
         let store = RunStore::new(self.root.clone());
-        tokio::task::spawn_blocking(move || f(store))
-            .await
-            .expect("run store task panicked")
+        match tokio::task::spawn_blocking(move || f(store)).await {
+            Ok(result) => result,
+            Err(join) => Err(E::from(RunStoreError::TaskFailed(join.to_string()))),
+        }
     }
 
     /// Append one completed step's record to `step_results.jsonl`.
@@ -2302,6 +2312,18 @@ pub enum CancelError {
     NotFound(String),
     #[error("store: {0}")]
     Store(String),
+}
+
+/// A store failure inside a locked cancel (including a
+/// [`RunStore::blocking`] task that did not complete) is reported as this
+/// error, a missing run as `NotFound`.
+impl From<RunStoreError> for CancelError {
+    fn from(e: RunStoreError) -> Self {
+        match e {
+            RunStoreError::NotFound(id) => CancelError::NotFound(id),
+            other => CancelError::Store(other.to_string()),
+        }
+    }
 }
 
 impl RunStore {
@@ -3294,6 +3316,18 @@ pub enum PauseError {
     NotFound(String),
     #[error("store: {0}")]
     Store(String),
+}
+
+/// A store failure inside a locked pause (including a
+/// [`RunStore::blocking`] task that did not complete) is reported as this
+/// error, a missing run as `NotFound`.
+impl From<RunStoreError> for PauseError {
+    fn from(e: RunStoreError) -> Self {
+        match e {
+            RunStoreError::NotFound(id) => PauseError::NotFound(id),
+            other => PauseError::Store(other.to_string()),
+        }
+    }
 }
 
 /// True when `pid` names a live process on this machine.
@@ -6014,6 +6048,25 @@ mod tests {
             RunStatus::Cancelled,
             "the caller's copy follows the disk"
         );
+    }
+
+    /// A blocking-pool task that did not complete — it panicked, or the
+    /// runtime cancelled it at shutdown — is an error to the caller, never
+    /// a panic on the runtime thread.
+    #[tokio::test]
+    async fn blocking_maps_a_task_that_did_not_complete_to_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let out: Result<(), RunStoreError> = store
+            .blocking(|_| -> Result<(), RunStoreError> { panic!("boom") })
+            .await;
+        match out {
+            Err(e) => assert!(
+                e.to_string().contains("run store task failed") && e.to_string().contains("panic"),
+                "says what happened: {e}"
+            ),
+            Ok(()) => panic!("the task never completed; expected an error"),
+        }
     }
 
     /// The resume's flip is a compare-and-swap: it writes only while the

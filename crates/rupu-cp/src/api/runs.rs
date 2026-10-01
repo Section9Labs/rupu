@@ -1448,7 +1448,7 @@ pub(crate) fn validate_id(id: &str) -> Result<(), ApiError> {
 /// Map a [`RunStoreError`] to an [`ApiError`]:
 /// - `NotFound` → 404
 /// - `NotTerminal` / `AlreadyExists` → 409
-/// - `Io` / `Json` → 500
+/// - `Io` / `Json` / `TaskFailed` → 500
 fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
     match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
@@ -1460,6 +1460,7 @@ fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
         }
         RunStoreError::Io(err) => ApiError::internal(err.to_string()),
         RunStoreError::Json(err) => ApiError::internal(err.to_string()),
+        RunStoreError::TaskFailed(msg) => ApiError::internal(msg),
     }
 }
 

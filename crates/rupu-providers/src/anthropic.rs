@@ -883,7 +883,20 @@ async fn refresh_and_persist_anthropic_token(
 /// ([`crate::private_file::write_private_atomic`]): 0600 from the moment
 /// it exists.
 pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), ProviderError> {
-    let _lock = crate::private_file::SidecarLock::acquire(path, crate::private_file::LOCK_TIMEOUT)
+    save_auth_json_with_lock_timeout(path, crate::private_file::LOCK_TIMEOUT, auth_method)
+}
+
+/// [`save_auth_json`] with the wait for the sidecar lock bounded by
+/// `lock_timeout` instead of [`crate::private_file::LOCK_TIMEOUT`]; a held
+/// lock fails the write after that long (`credential store is locked by
+/// another process (…)`) with nothing written. Tests exercise the bound
+/// through it.
+pub fn save_auth_json_with_lock_timeout(
+    path: &Path,
+    lock_timeout: std::time::Duration,
+    auth_method: &AuthMethod,
+) -> Result<(), ProviderError> {
+    let _lock = crate::private_file::SidecarLock::acquire(path, lock_timeout)
         .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
 
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());

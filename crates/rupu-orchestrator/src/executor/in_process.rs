@@ -195,8 +195,15 @@ impl WorkflowExecutor for InProcessExecutor {
 
         // 8. Spawn the runner task.
         let join: JoinHandle<()> = tokio::spawn(async move {
-            if let Err(e) = run_workflow(orchestrator_opts).await {
-                tracing::error!(error = %e, "InProcessExecutor: run_workflow failed");
+            match run_workflow(orchestrator_opts).await {
+                Ok(_) => {}
+                // A cancel is the outcome that was asked for, not a failure.
+                Err(e @ crate::runner::RunWorkflowError::RunCancelled { .. }) => {
+                    tracing::info!(reason = %e, "InProcessExecutor: run cancelled");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "InProcessExecutor: run_workflow failed");
+                }
             }
         });
         *state.join.lock().unwrap() = Some(join);

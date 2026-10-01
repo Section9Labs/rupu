@@ -1,7 +1,9 @@
 pub mod credential_store;
 pub mod discovery;
 
-pub use credential_store::{resolve_provider_auth, save_provider_auth};
+pub use credential_store::{
+    resolve_provider_auth, save_provider_auth, save_provider_auth_with_lock_timeout,
+};
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +12,10 @@ use serde::{Deserialize, Serialize};
 
 // Re-export Anthropic-specific auth for backward compatibility.
 // Consumers use rupu_providers::auth::resolve_anthropic_auth etc.
-pub use crate::anthropic::{refresh_anthropic_token, resolve_anthropic_auth, save_auth_json};
+pub use crate::anthropic::{
+    refresh_anthropic_token, resolve_anthropic_auth, save_auth_json,
+    save_auth_json_with_lock_timeout,
+};
 
 /// The OAuth beta header required for Anthropic OAuth requests.
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
@@ -493,6 +498,58 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(stray.is_empty(), "{stray:?}");
+
+        // A held lock bounds the write instead of hanging it: with the
+        // sidecar held by another holder, each writer fails after its lock
+        // timeout (short here) naming the lock file, writes nothing, and
+        // leaves the sidecar for the holder.
+        let held =
+            crate::private_file::SidecarLock::acquire(&path, std::time::Duration::from_millis(100))
+                .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bounded = |started: std::time::Instant| {
+            let waited = started.elapsed();
+            assert!(
+                waited >= std::time::Duration::from_millis(100)
+                    && waited < std::time::Duration::from_secs(2),
+                "bounded by the lock timeout: {waited:?}"
+            );
+        };
+        let started = std::time::Instant::now();
+        let err = save_provider_auth_with_lock_timeout(
+            &path,
+            std::time::Duration::from_millis(100),
+            ProviderId::Anthropic,
+            &AuthCredentials::ApiKey {
+                key: "sk-blocked".into(),
+            },
+        )
+        .unwrap_err();
+        bounded(started);
+        assert!(
+            err.to_string().contains("locked by another process")
+                && err.to_string().contains("auth.json.lock"),
+            "{err}"
+        );
+        let started = std::time::Instant::now();
+        let err = save_auth_json_with_lock_timeout(
+            &path,
+            std::time::Duration::from_millis(100),
+            &AuthMethod::ApiKey("sk-blocked".into()),
+        )
+        .unwrap_err();
+        bounded(started);
+        assert!(
+            err.to_string().contains("locked by another process"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing was written while the lock was held"
+        );
+        assert!(lock.exists(), "the sidecar stays for the holder");
+        drop(held);
     }
 
     #[cfg(unix)]

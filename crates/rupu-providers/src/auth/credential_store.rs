@@ -146,10 +146,23 @@ pub fn save_provider_auth(
     provider: ProviderId,
     creds: &AuthCredentials,
 ) -> Result<(), ProviderError> {
+    save_provider_auth_with_lock_timeout(path, LOCK_TIMEOUT, provider, creds)
+}
+
+/// [`save_provider_auth`] with the wait for the sidecar lock bounded by
+/// `lock_timeout` instead of [`LOCK_TIMEOUT`]; a held lock fails the write
+/// after that long (`credential store is locked by another process (…)`)
+/// with nothing written. Tests exercise the bound through it.
+pub fn save_provider_auth_with_lock_timeout(
+    path: &Path,
+    lock_timeout: std::time::Duration,
+    provider: ProviderId,
+    creds: &AuthCredentials,
+) -> Result<(), ProviderError> {
     let mut creds = creds.clone();
     creds.sanitize_extra();
 
-    let _lock = SidecarLock::acquire(path, LOCK_TIMEOUT)
+    let _lock = SidecarLock::acquire(path, lock_timeout)
         .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
 
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
