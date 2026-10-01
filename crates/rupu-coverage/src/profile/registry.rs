@@ -203,11 +203,13 @@ mod tests {
         ));
     }
 
-    /// A profile with one kind and one required completeness check whose id
-    /// names the profile, so a test can tell whose checks it got back.
+    /// A profile with one kind, one required completeness check, one taxonomy
+    /// and one evidence block, all named after the profile, so a test can tell
+    /// whose rules it got back (and that nothing was unioned in).
     fn pc(id: &str, kind: &str) -> crate::profile::EngagementProfile {
         parse_profile(&format!(
             "id=\"{id}\"\nname=\"{id}\"\nclassification_systems=[\"{id}-taxonomy\"]\n\
+             evidence_blocks=[\"{id}-block\"]\n\
              [[asset_kinds]]\nid=\"{kind}\"\nlabel=\"l\"\n\
              [[completeness]]\nid=\"{id}_check\"\nlabel=\"l\"\nrequired=true\n\
              satisfied_when = {{ has_field = \"root_cause\" }}\n\
@@ -252,14 +254,18 @@ mod tests {
         assert_eq!(net.id, "network");
         assert_eq!(check_ids(net), vec!["network_check"]);
         assert_eq!(net.classification_systems, vec!["network-taxonomy"]);
+        assert_eq!(net.evidence_blocks, vec!["network-block"]);
         let web = set.profile_for_kind("web:route").unwrap();
         assert_eq!(web.id, "web");
         assert_eq!(check_ids(web), vec!["web_check"]);
         assert_eq!(web.classification_systems, vec!["web-taxonomy"]);
+        assert_eq!(web.evidence_blocks, vec!["web-block"]);
         // The composite's own kind routes to the composite's OWN definition.
         let own = set.profile_for_kind("pentest:scope").unwrap();
         assert_eq!(own.id, "pentest");
         assert_eq!(check_ids(own), vec!["pentest_check"]);
+        assert_eq!(own.classification_systems, vec!["pentest-taxonomy"]);
+        assert_eq!(own.evidence_blocks, vec!["pentest-block"]);
         assert!(own.includes.is_empty());
         // Kinds the composite does not reach are still unowned.
         assert!(set.profile_for_kind("cloud:bucket").is_none());

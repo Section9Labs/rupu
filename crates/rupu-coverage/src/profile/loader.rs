@@ -13,6 +13,13 @@ pub enum LoadError {
 }
 
 /// Recursively merge `id`'s `includes` into one flattened profile.
+///
+/// This is the MERGED view: kinds, completeness checks, evidence blocks and
+/// taxonomies from every included profile are unioned (and same-id kinds from
+/// different origins are collapsed) with the origin lost. It is NOT for
+/// routing or validating a finding — a finding must be checked against the
+/// profile that owns its kind, never a composite's union. Use
+/// [`crate::profile::ProfileRegistry`] / `ActiveSet::profile_for_kind` for that.
 pub fn expand_includes(
     all: &BTreeMap<String, EngagementProfile>,
     id: &str,
@@ -119,24 +126,46 @@ pub(crate) fn dedup(p: &mut EngagementProfile) {
 
 /// Discover `*.toml` profiles across dirs; later dirs override earlier by id.
 ///
-/// Returns the parsed profiles plus one `(path, error)` entry for every `.toml`
-/// file that failed to parse — a malformed profile is surfaced to the caller,
-/// never silently dropped. Non-`.toml` files and unreadable dirs/files are not
-/// profiles and are skipped.
+/// Returns the parsed profiles plus one `(path, error)` entry for every
+/// problem that kept a profile from loading: a `.toml` that failed to parse,
+/// a `.toml` that could not be read (permission denied, not UTF-8, ...), or a
+/// directory that exists but could not be listed. None of these is silently
+/// dropped — the caller (`registry_with_overlay`) fails closed on them.
+///
+/// Only genuinely-absent things are skipped quietly: a directory that does not
+/// exist, a file that vanished between listing and reading, non-`.toml` files,
+/// and sub-directories (not profiles).
 pub fn discover(dirs: &[PathBuf]) -> (BTreeMap<String, EngagementProfile>, Vec<(PathBuf, String)>) {
     let mut out = BTreeMap::new();
     let mut errors = Vec::new();
     for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let path: PathBuf = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errors.push((dir.clone(), e.to_string()));
                 continue;
             }
-            let Ok(src) = std::fs::read_to_string(&path) else {
+        };
+        for entry in rd {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push((dir.clone(), e.to_string()));
+                    continue;
+                }
+            };
+            let path: PathBuf = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") || path.is_dir() {
                 continue;
+            }
+            let src = match std::fs::read_to_string(&path) {
+                Ok(src) => src,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    errors.push((path, e.to_string()));
+                    continue;
+                }
             };
             match parse_profile(&src) {
                 Ok(p) => {
@@ -248,6 +277,46 @@ mod tests {
             result.coverage.depth_ladder,
             vec!["located", "disassembled", "analyzed"]
         );
+    }
+
+    #[test]
+    fn discover_surfaces_an_unreadable_toml_and_keeps_valid_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("good.toml"),
+            "id=\"good\"\nname=\"good\"\n[[asset_kinds]]\nid=\"k\"\nlabel=\"l\"\n[coverage]\n[bundle]\n",
+        )
+        .unwrap();
+        // Not valid UTF-8 (e.g. a UTF-16 file): `read_to_string` fails. This
+        // must surface as an error, never be skipped as if it were absent.
+        let unreadable = dir.path().join("utf16.toml");
+        std::fs::write(&unreadable, [0xFF, 0xFE]).unwrap();
+        // A sub-directory named like a profile is not a profile: no error.
+        std::fs::create_dir(dir.path().join("dir.toml")).unwrap();
+
+        let (profiles, errors) = discover(&[dir.path().to_path_buf()]);
+
+        assert_eq!(profiles.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, unreadable);
+        assert!(!errors[0].1.is_empty());
+    }
+
+    #[test]
+    fn discover_skips_absent_dirs_but_surfaces_an_unlistable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Genuinely absent: skipped quietly.
+        let (profiles, errors) = discover(&[dir.path().join("nope")]);
+        assert!(profiles.is_empty() && errors.is_empty(), "{errors:?}");
+
+        // Exists but is not a directory: `read_dir` fails with something other
+        // than NotFound, which must be reported.
+        let file = dir.path().join("profiles");
+        std::fs::write(&file, "x").unwrap();
+        let (profiles, errors) = discover(std::slice::from_ref(&file));
+        assert!(profiles.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, file);
     }
 
     #[test]

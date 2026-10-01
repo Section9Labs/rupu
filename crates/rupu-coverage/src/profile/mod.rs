@@ -251,6 +251,22 @@ mod resolve_and_overlay_tests {
     }
 
     #[test]
+    fn overlay_fails_closed_on_an_unreadable_profile_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (g, p) = (tmp.path().join("global"), tmp.path().join("project"));
+        write(&g, "network.toml", &toml("network", "service", &[]));
+        // Not valid UTF-8: unreadable as text. Must not be skipped as absent.
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("utf16.toml"), [0xFF, 0xFE]).unwrap();
+
+        let err = registry_with_overlay(&g, &p)
+            .err()
+            .expect("must fail closed");
+        assert!(matches!(err, RegistryError::InvalidProfiles(ref v) if v.len() == 1));
+        assert!(err.to_string().contains("utf16.toml"), "{err}");
+    }
+
+    #[test]
     fn overlay_surfaces_include_errors_from_discovered_files() {
         let tmp = tempfile::tempdir().unwrap();
         write(
