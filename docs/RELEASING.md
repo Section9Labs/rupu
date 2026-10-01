@@ -24,12 +24,43 @@ Two scheduled workflows do nothing but decide which tag to push:
 
 | Workflow | Schedule | What it does |
 | --- | --- | --- |
-| `release-beta.yml` | daily, 07:37 UTC | pushes `v<base>-beta.N` for today's `main` |
+| `release-beta.yml` | daily, 07:37 UTC | runs the full CI suite on `main`'s HEAD, then pushes `v<base>-beta.N` if it passed |
 | `release-stable.yml` | Sundays, 09:17 UTC | re-tags a soaked beta's commit as `v<X.Y.Z>`, then bumps `main`'s base version |
 
-So the normal flow is: merge a PR → tomorrow morning a beta ships → after it
-has soaked two days, a Sunday promotes exactly that build to stable →
-Homebrew/AUR/Nix follow within the same run.
+So the normal flow is: merge PRs (no CI) → a beta cut runs CI once over the
+whole batch and ships it → after it has soaked two days, a Sunday promotes
+exactly that build to stable → Homebrew/AUR/Nix follow within the same run.
+To ship now instead of tomorrow morning: `gh workflow run release-beta.yml`.
+
+## CI is a release gate, not a merge gate
+
+The full suite (`ci.yml`: musl build ×2, test, clippy, the darwin build, the
+packaging and script checks) runs **once per release**, inside
+`release-beta.yml`, against the exact commit that gets tagged. It does not run
+on pull requests and there is no run on push to `main`. Before this, every
+change paid ~11 minutes of PR CI plus ~12 minutes of the same suite again on
+`main` before a beta could be cut; now a batch of PRs pays one run, and only
+when it is being released. (Design:
+`docs/superpowers/specs/2026-10-01-rupu-release-gated-ci-design.md`.)
+
+- **Merging** needs a PR and nothing else — no required checks
+  (`.github/rulesets/`). Verify locally before merging, as always.
+- **PRs that touch CI itself** still run on the PR: `.github/workflows/`,
+  `docker/`, `rust-toolchain.toml` and `.cargo/` run the full suite;
+  `packaging/`/`flake.nix`, `scripts/` and the published keyring run just
+  their own check. A broken CI file would otherwise only surface when a
+  release tries to use it.
+- **Any branch can opt in** to the full suite: `gh workflow run ci.yml --ref
+  <branch>`. The result lands on the branch's head commit, so it shows on the
+  PR.
+- **A red release** pushes no tag and the `release-beta` run goes red (not a
+  silent skip). The test step runs `--no-fail-fast`, so it names every failing
+  test binary at once. Fix forward with a PR to `main` and dispatch again;
+  `git log <last beta tag>..main` is the batch under suspicion.
+- `main` can be red between releases. That is the trade: fixes go forward, and
+  the release is what refuses to ship it.
+- The release gate's run is on `main`, so it is also what writes the Rust
+  caches `release.yml`'s tag build restores minutes later.
 
 ## Why both schedulers push over SSH
 
@@ -57,20 +88,26 @@ workspace version and `N` is derived from the existing tag list by
 the maximum). The tag is **annotated** — `release-stable.yml`'s soak window
 reads the tag's own creation date, which a lightweight tag does not have.
 
-It skips — logging which condition fired and exiting **0**, because a skipped
-day is a normal day — when any of:
+It runs three jobs: **decide**, **full CI** (`ci.yml` called as a reusable
+workflow), and **push the tag** — the last only if every CI job passed. All
+three work on the run's own commit (`github.sha`), so what CI tested is what
+gets tagged even if `main` moves during the run.
 
-1. **`main` has not moved** since the last beta of this base. Bypassable with
-   the `force` input, for re-cutting after a botched upload.
+Decide skips — logging which condition fired on the run page and exiting
+**0**, because a skipped day is a normal day — when either of:
+
+1. **Nothing shipped changed** since the nearest beta tag in `main`'s
+   history: either `main` has not moved, or every changed path is
+   documentation (`docs/` other than `docs/pages/`, and root-level `*.md` —
+   `scripts/shipped-paths.sh`). Bypassable with the `force` input, for
+   re-cutting after a botched upload.
 2. **`Cargo.toml`'s version is not newer than the newest stable tag.** A
    `v0.71.0-beta.N` sorts below the shipped `v0.71.0` and would walk
    `rupu update` backwards on the beta channel. Not bypassable; the cure is
    the version bump, which `release-stable.yml` owns.
-3. **`ci.yml` has not passed for this exact HEAD commit.** The check is by
-   head SHA, not "the newest run on `main`" — `ci.yml` uses
-   `cancel-in-progress`, so the newest run on the branch is frequently
-   `cancelled` and can belong to an older commit. An unanswerable query
-   (permissions, rate limit) counts as not-green. Not bypassable.
+
+A **red CI run is not a skip**: the run fails and no tag is pushed. Not
+bypassable by `force`.
 
 ## The weekly stable promotion
 
@@ -114,9 +151,19 @@ published again.
 All of these are `gh workflow run`; none of them build anything locally.
 
 ```bash
-# Cut a beta right now, even if main has not moved.
-# (Conditions 2 and 3 — version stall and red CI — still apply.)
+# Cut a beta right now (runs the full CI suite first; ~30 min to published).
+gh workflow run release-beta.yml
+
+# ...even if nothing shipped has changed. The version stall still applies,
+# and CI must still pass.
 gh workflow run release-beta.yml -f force=true
+
+# Exercise the whole release gate on a branch — decide + full CI — without
+# pushing a tag. The only mode allowed off main.
+gh workflow run release-beta.yml --ref <branch> -f dry_run=true -f force=true
+
+# Run the full CI suite on any branch (e.g. before merging a risky PR).
+gh workflow run ci.yml --ref <branch>
 
 # Promote the newest soaked beta right now, off-schedule.
 gh workflow run release-stable.yml
@@ -144,9 +191,9 @@ gh workflow run release-app.yml -f tag=v0.72.0 -f app_dry_run=true
 A bad value for `tag` or `soak_days` is operator error and fails the run
 loudly — unlike the scheduled skip conditions, which exit 0.
 
-To ship a hotfix as stable the same day: merge the fix, wait for `ci.yml`,
-`gh workflow run release-beta.yml -f force=true`, then once that beta has
-published, `gh workflow run release-stable.yml -f tag=<that beta>`.
+To ship a hotfix as stable the same day: merge the fix,
+`gh workflow run release-beta.yml` (it runs CI itself), then once that beta
+has published, `gh workflow run release-stable.yml -f tag=<that beta>`.
 
 ## Bumping the version by hand
 
@@ -161,12 +208,13 @@ so this only matters for local testing.
 
 ## The helper scripts
 
-`scripts/next-beta-version.sh` and `scripts/pick-promotable-beta.sh` are pure:
-they never call `git` or `gh`, they read their tag list on stdin, and `now` is
-a parameter. That is what makes them testable without a repository.
-`scripts/tests/release-cadence-tests.sh` runs on every PR via `ci.yml`'s
-`release-scripts` job — these scripts decide what gets published unattended,
-so a counter regression must not reach `main`.
+`scripts/next-beta-version.sh`, `scripts/pick-promotable-beta.sh` and
+`scripts/shipped-paths.sh` are pure: they never call `git` or `gh`, they read
+their input on stdin, and `now` is a parameter. That is what makes them
+testable without a repository. `scripts/tests/release-cadence-tests.sh` runs
+via `ci.yml`'s `release-scripts` job on every PR that touches `scripts/` (and
+in every release gate) — these scripts decide what gets published
+unattended, so a regression must not reach `main`.
 
 ## Secrets
 

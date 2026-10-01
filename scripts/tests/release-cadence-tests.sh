@@ -176,5 +176,46 @@ assert_out "newer unterminated line at EOF is correctly picked" "v0.71.0-beta.10
   sh -c "printf 'v0.71.0-beta.9\t%d\nv0.71.0-beta.10\t%d' \
     \$(( $NOW - 5 * $DAY )) \$(( $NOW - 4 * $DAY )) | '$PICK' 2 $NOW"
 
+echo
+echo "shipped-paths.sh"
+SHIP="$ROOT/scripts/shipped-paths.sh"
+
+# The case this script exists for: a batch of plans and specs is not a
+# release. Empty output is release-beta.yml's "nothing to ship" skip.
+assert_out "plans and specs ship nothing" "" \
+  sh -c "printf 'docs/superpowers/plans/x.md\ndocs/superpowers/specs/y.md\n' | '$SHIP'"
+
+assert_out "root-level markdown ships nothing" "" \
+  sh -c "printf 'CLAUDE.md\nTODO.md\nREADME.md\n' | '$SHIP'"
+
+assert_out "source ships" "crates/rupu-cli/src/main.rs" \
+  sh -c "printf 'crates/rupu-cli/src/main.rs\n' | '$SHIP'"
+
+# Markdown under crates/ is compiled in (include_str! of the agent
+# templates), so the .md suffix alone must never mark a path as docs.
+assert_out "markdown compiled into the binary ships" "crates/rupu-cli/templates/agents/fix-bug.md" \
+  sh -c "printf 'crates/rupu-cli/templates/agents/fix-bug.md\n' | '$SHIP'"
+
+# docs/pages is the published site and keyring, guarded by CI's keyring
+# check — it is not "just docs".
+assert_out "docs/pages ships" "docs/pages/rupu-archive-keyring.asc" \
+  sh -c "printf 'docs/pages/rupu-archive-keyring.asc\n' | '$SHIP'"
+
+assert_out "a lookalike of docs/ ships" "docsite/index.md" \
+  sh -c "printf 'docsite/index.md\n' | '$SHIP'"
+
+assert_out "mixed batch keeps only the shipped paths, in order" "Cargo.lock
+crates/rupu-cp/src/lib.rs" \
+  sh -c "printf 'docs/a.md\nCargo.lock\nTODO.md\ncrates/rupu-cp/src/lib.rs\n' | '$SHIP'"
+
+# `git diff --name-only` output always ends in a newline, but a final
+# unterminated line must not be dropped: dropping it would turn a real
+# change into a "nothing to ship" skip.
+assert_out "unterminated final line is still read" "Cargo.toml" \
+  sh -c "printf 'docs/a.md\nCargo.toml' | '$SHIP'"
+
+assert_out "empty input ships nothing" "" \
+  sh -c "printf '' | '$SHIP'"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

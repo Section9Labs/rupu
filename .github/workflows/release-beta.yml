@@ -1,7 +1,16 @@
 name: release-beta
 
-# Cuts a beta every day that `main` actually moved. Publishing itself is
-# `release.yml`'s job — this workflow only decides on a tag and pushes it.
+# Cuts a beta when `main` has something worth shipping. Three jobs:
+#
+#   decide  — is there anything to release (and what is the next tag)?
+#   ci      — the FULL ci.yml suite, run here against the exact commit that
+#             will be tagged. This is CI's only run on `main`: pull requests
+#             no longer run it and there is no push trigger, so a batch of
+#             PRs is tested once, at release (see ci.yml's header and
+#             docs/superpowers/specs/2026-10-01-rupu-release-gated-ci-design.md).
+#   tag     — push the annotated tag, only if every ci job passed.
+#
+# Publishing itself is release.yml's job, triggered by that tag.
 on:
   schedule:
     # 07:37 UTC. Off the :00 mark (every scheduled workflow on GitHub piles
@@ -10,41 +19,66 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Release even if main has not moved since the last beta"
+        description: "Release even if nothing shipped has changed since the last beta"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Decide and run the full CI suite, but push no tag (the only mode allowed off main)"
         type: boolean
         default: false
 
 concurrency:
-  group: release-beta
   # Two beta cuts racing would compute the same counter and one would fail to
-  # push. Queue instead of cancelling.
+  # push. Queue instead of cancelling. Per ref, so a dry run on a branch
+  # never queues behind (or ahead of) a real cut on main.
+  group: release-beta-${{ github.ref }}
   cancel-in-progress: false
 
+# The tag is pushed with the MAIN_PUSH_KEY deploy key, never the token, so
+# nothing here needs write access.
 permissions:
-  contents: write
-  # Explicitly listing any scope forces every unlisted one to `none`, so
-  # the Actions API read that the CI-green check needs must be named here
-  # or `gh run list` 403s.
-  actions: read
+  contents: read
 
 jobs:
-  cut:
+  decide:
+    name: decide whether to cut a beta
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+      tag: ${{ steps.decide.outputs.tag }}
     steps:
+      # Everything below works on `github.sha`, and the called ci.yml checks
+      # out that same commit, so what is tested is what is tagged even if
+      # main moves during the ~15 minute CI run. Dispatched from a branch,
+      # that commit is the branch's — only a dry run may do that.
+      - name: Only main is released
+        if: github.ref != 'refs/heads/main' && inputs.dry_run != true
+        run: |
+          echo "::error::release-beta cuts tags from main only (got ${{ github.ref }}). Use -f dry_run=true to exercise it on a branch."
+          exit 1
+
       - uses: actions/checkout@v5
         with:
-          ref: main
-          # Full history + tags: the counter is derived from the tag list.
+          # Full history + tags: the counter is derived from the tag list,
+          # and the shipped-changes check diffs against the last beta.
           fetch-depth: 0
 
       - name: Decide whether to cut a beta
         id: decide
         env:
-          GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
+
+          # A skip is a normal outcome (exit 0), but it must be visible on
+          # the run page rather than buried in a log line.
+          skip() {
+            echo "::notice::$1"
+            echo "No beta cut: $1" >> "$GITHUB_STEP_SUMMARY"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
 
           base=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml \
             | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')
@@ -75,52 +109,40 @@ jobs:
           if [ -n "$latest_stable" ]; then
             highest=$(printf '%s\nv%s\n' "$latest_stable" "$base" | sort -V | tail -n1)
             if [ "$highest" = "$latest_stable" ]; then
-              echo "::notice::base $base is not newer than the shipped stable $latest_stable — waiting for the version bump; skipping"
-              echo "go=false" >> "$GITHUB_OUTPUT"
-              exit 0
+              skip "base $base is not newer than the shipped stable $latest_stable — waiting for the version bump"
             fi
           fi
 
-          # -- Condition 3: main must be green. ---------------------------
-          # Without this a red main ships a broken beta every morning.
-          # Deliberately NOT bypassable by `force`.
+          # -- Condition 1: something shipped must have changed. ---------
+          # Bypassable with `force`: re-releasing is a legitimate manual act
+          # (a botched upload, a signing fix).
           #
-          # The query is by HEAD SHA, not "the newest run on main". ci.yml
-          # sets `cancel-in-progress: true`, so the most recent run on the
-          # branch is very often `cancelled` — and, worse, it can belong to an
-          # OLDER commit than the one about to be tagged, green-lighting an
-          # untested HEAD. Asking "has THIS tree ever passed ci.yml" is the
-          # property the tag actually depends on.
+          # `prev` is the nearest beta tag in this commit's history,
+          # whatever its base — after a stable promotion bumps the base, the
+          # bump commit itself is the change. Then: if the only paths that
+          # changed since `prev` are documentation (scripts/shipped-paths.sh),
+          # a release would rebuild an identical binary, so skip it rather
+          # than spend a full CI run on it.
           #
-          # A failed query (permissions, rate limit, transient API error) must not
-          # abort the step under `set -euo pipefail`. Degrade to "unknown", which
-          # is then treated as not-green: never publish on an answer we don't have.
+          # (Green CI used to be condition 3, checked by querying ci.yml runs
+          # for this SHA. It is now the `ci` job below.)
           head_sha=$(git rev-parse HEAD)
-          green=$(gh run list --branch main --workflow ci.yml --limit 50 \
-            --json headSha,conclusion \
-            --jq "[.[] | select(.headSha == \"$head_sha\" and .conclusion == \"success\")] | length" \
-            2>/dev/null || echo "unknown")
-          case "$green" in
-            ''|*[!0-9]*)
-              echo "::notice::could not determine ci.yml status for $head_sha (query returned '$green') — skipping"
-              echo "go=false" >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-            0)
-              echo "::notice::no successful ci.yml run for HEAD $head_sha — skipping"
-              echo "go=false" >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-          esac
-          echo "ci.yml is green for $head_sha ($green successful run(s))"
-
-          # -- Condition 1: main must have moved. -------------------------
-          # This one IS bypassable: re-releasing an unchanged main is a
-          # legitimate manual act (a botched upload, a signing fix).
-          prev=$(git tag -l "v$base-beta" "v$base-beta.*" | sort -V | tail -n1 || true)
-          if [ -n "$prev" ] && [ "$FORCE" != "true" ]; then
-            if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$prev^{commit}")" ]; then
-              echo "::notice::main is unchanged since $prev — skipping"
-              echo "go=false" >> "$GITHUB_OUTPUT"
-              exit 0
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*-beta*' HEAD 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            if [ "$FORCE" = "true" ]; then
+              echo "::notice::force: releasing whatever changed since $prev"
+            elif [ "$(git rev-parse "$prev^{commit}")" = "$head_sha" ]; then
+              skip "main is unchanged since $prev"
+            else
+              shipped=$(git diff --name-only "$prev" HEAD | scripts/shipped-paths.sh)
+              if [ -z "$shipped" ]; then
+                skip "only documentation changed since $prev"
+              fi
+              # A here-string, not `printf | head`: under pipefail, head
+              # closing the pipe early SIGPIPEs printf and aborts the step
+              # on any batch of more than 50 paths.
+              echo "$(wc -l <<< "$shipped" | tr -d ' ') shipped path(s) changed since $prev:"
+              head -n 50 <<< "$shipped"
             fi
           fi
 
@@ -129,12 +151,34 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "go=true"  >> "$GITHUB_OUTPUT"
 
+  ci:
+    name: full CI
+    needs: decide
+    if: needs.decide.outputs.go == 'true'
+    # A called workflow may only narrow the caller's token, so everything
+    # ci.yml's jobs declare must be granted here. `pull-requests: read` is
+    # for its `scope` job, which only uses it on pull_request events.
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+
+  tag:
+    name: push the tag
+    # `needs: ci` with the implicit success() — a failed, cancelled or
+    # skipped ci job means no tag.
+    needs: [decide, ci]
+    if: needs.decide.outputs.go == 'true' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
       - name: Push the tag
-        if: steps.decide.outputs.go == 'true'
         env:
           MAIN_PUSH_KEY: ${{ secrets.MAIN_PUSH_KEY }}
           REPO: ${{ github.repository }}
-          TAG: ${{ steps.decide.outputs.tag }}
+          TAG: ${{ needs.decide.outputs.tag }}
         run: |
           set -euo pipefail
           # THE TAG MUST BE PUSHED OVER SSH WITH A DEPLOY KEY. Do not
@@ -176,9 +220,12 @@ jobs:
           # identity, hence the git config below.
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "$TAG"
+          # On `github.sha` explicitly: the commit decide examined and ci
+          # tested, not whatever main's HEAD has become since.
+          git tag -a "$TAG" -m "$TAG" "$GITHUB_SHA"
           git push origin "$TAG"
           echo "::notice::pushed $TAG — release.yml takes it from here"
+          echo "Pushed **$TAG** on \`$GITHUB_SHA\` — release.yml publishes it." >> "$GITHUB_STEP_SUMMARY"
 
       # Same reasoning as release.yml's paired cleanup: harmless on a hosted
       # runner whose VM is destroyed, a leak on a self-hosted one.
