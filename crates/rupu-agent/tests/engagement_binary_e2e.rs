@@ -364,6 +364,40 @@ async fn asset_mark_sets_depth_and_a_later_finding_does_not_reset_it() {
 }
 
 #[tokio::test]
+async fn a_shallower_asset_mark_is_clamped_and_the_tool_reports_the_deeper_depth() {
+    let ws = tempfile::TempDir::new().unwrap();
+    // Depth is monotonic: `located` after `analyzed` must not walk it back.
+    let transcript = run(
+        ws.path(),
+        FindingWriteOptions::default().with_engagement(binary_engagement()),
+        None,
+        vec![
+            asset_mark_call("t1", "analyzed"),
+            asset_mark_call("t2", "located"),
+            done(),
+        ],
+    )
+    .await;
+
+    let graph = read_asset_graph(&paths(ws.path()));
+    let assets: Vec<_> = graph.iter().collect();
+    assert_eq!(assets.len(), 1);
+    assert_eq!(
+        assets[0].depth.as_deref(),
+        Some("analyzed"),
+        "the stored depth stays at the furthest rung"
+    );
+    // Both tool results report `analyzed`: the second shows the clamp instead
+    // of pretending `located` was set.
+    assert_eq!(
+        transcript.matches("depth: analyzed").count(),
+        2,
+        "the clamped call returns the effective depth: {transcript}"
+    );
+    assert!(!transcript.contains("depth: located"), "{transcript}");
+}
+
+#[tokio::test]
 async fn an_unknown_depth_rung_is_refused() {
     let ws = tempfile::TempDir::new().unwrap();
     let transcript = run(

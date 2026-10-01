@@ -627,8 +627,10 @@ engagement profile`. It takes `kind`, `locator` and `depth` (plus optional
 `parent` and `label`), and `depth` must be a rung of the owning profile's
 `depth_ladder`; the real ladder for `binary` is `located` → `disassembled` →
 `analyzed`. An unknown kind or an unknown rung is rejected, naming what is
-declared. Re-marking an asset updates its depth, and the last write wins: it
-is not monotonic, so marking `analyzed` and later `located` leaves `located`.
+declared. Depth is monotonic: re-marking an asset advances it along the ladder
+and never regresses it. A mark shallower than the asset's current depth is
+clamped (marking `analyzed` and later `located` leaves `analyzed`), and the tool
+returns the effective, deeper depth so the clamp is visible rather than silent.
 
 ```yaml
 ---
@@ -858,8 +860,9 @@ select a composite together with one of its own members (see
 - **Numeric coordinates in workflows.** `address`, `offset`, `port.number` and
   `line_range` cannot be filled from `{{ ... }}` templates in a `findings.record`
   `with:`; use literals.
-- **Depth.** Depth is last-write-wins, not monotonic (see
-  [Assets and depth](#assets-and-depth)).
+- **Depth.** Depth is monotonic: it advances along the ladder and never
+  regresses; a shallower `asset_mark` is clamped and the tool returns the
+  effective (deeper) depth (see [Assets and depth](#assets-and-depth)).
 - **Unused declarations.** `[coverage].enumerates` and `[bundle]` are parsed and
   kept but nothing in the run path acts on them yet.
 

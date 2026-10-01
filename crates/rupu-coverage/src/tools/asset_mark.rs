@@ -1,4 +1,4 @@
-use crate::asset::{default_label, upsert_asset, Asset, AssetId, Locator};
+use crate::asset::{default_label, read_asset_graph, upsert_asset, Asset, AssetId, Locator};
 use crate::ledger::events::Attribution;
 use crate::ledger::paths::CoveragePaths;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,9 @@ pub struct AssetMarkInput {
 pub struct AssetMarkOutput {
     pub id: String,
     pub kind: String,
+    /// The EFFECTIVE depth now stored: the requested rung, or, when that is
+    /// shallower than what the asset already had, the deeper rung that was
+    /// kept (depth is monotonic, so a shallower mark is clamped, not applied).
     pub depth: String,
 }
 
@@ -49,7 +52,7 @@ pub enum AssetMarkError {
     EmptyLocator,
 }
 
-/// Register an asset and set its coverage depth.
+/// Register an asset and advance its coverage depth.
 ///
 /// Fail-closed on the engagement: `kind` must be owned by an active profile
 /// AND declared by it (`ActiveSet::profile_for_kind` routes by namespace
@@ -60,6 +63,14 @@ pub enum AssetMarkError {
 /// marks an asset it only knows by locator must not erase the parent, label or
 /// attributes an earlier pass recorded. Only `depth` is set, and a parent or
 /// label named here overrides.
+///
+/// Depth is MONOTONIC: it advances along the owning profile's ladder and never
+/// regresses. When the requested rung is shallower than the one the asset
+/// already has, the deeper existing rung is kept (the request is clamped) and
+/// the returned [`AssetMarkOutput::depth`] reports that EFFECTIVE rung, so the
+/// caller can see the clamp rather than believe it walked the asset backward.
+/// An existing depth that is no longer on the ladder (a profile edited between
+/// runs) cannot be ordered, so the requested rung wins, with a warning.
 pub fn asset_mark(
     paths: &CoveragePaths,
     attribution: Attribution,
@@ -109,13 +120,54 @@ pub fn asset_mark(
         .unwrap_or_else(|| default_label(&input.kind, Some(&kind_def.label), &input.locator));
     let mut asset = Asset::new(input.kind, input.locator, label);
     asset.parent = input.parent.map(AssetId);
+    let depth = {
+        let graph = read_asset_graph(paths);
+        let existing = graph.get(&asset.id).and_then(|a| a.depth.as_deref());
+        monotonic_depth(
+            &profile.coverage.depth_ladder,
+            existing,
+            input.depth,
+            &asset,
+        )
+    };
     let out = AssetMarkOutput {
         id: asset.id.0.clone(),
         kind: asset.kind.clone(),
-        depth: input.depth.clone(),
+        depth: depth.clone(),
     };
-    upsert_asset(paths, asset, label_given, Some(input.depth), &attribution)?;
+    upsert_asset(paths, asset, label_given, Some(depth), &attribution)?;
     Ok(out)
+}
+
+/// The depth to store: the deeper of `existing` and `requested` by their
+/// position in `ladder` (shallowest to deepest). `requested` is already known
+/// to be on the ladder; an `existing` that is not cannot be compared, so
+/// `requested` wins and the override is logged rather than silent.
+fn monotonic_depth(
+    ladder: &[String],
+    existing: Option<&str>,
+    requested: String,
+    asset: &Asset,
+) -> String {
+    let Some(existing) = existing else {
+        return requested;
+    };
+    let rung = |d: &str| ladder.iter().position(|r| r == d);
+    let Some(existing_rung) = rung(existing) else {
+        tracing::warn!(
+            asset = %asset.id.0,
+            kind = %asset.kind,
+            existing_depth = existing,
+            requested_depth = %requested,
+            "asset's existing depth is not on its profile's depth ladder; the requested depth wins"
+        );
+        return requested;
+    };
+    // `requested` was validated against this ladder, so it always has a rung.
+    match rung(&requested) {
+        Some(requested_rung) if requested_rung < existing_rung => existing.to_string(),
+        _ => requested,
+    }
 }
 
 #[cfg(test)]
@@ -295,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn re_marking_sets_the_new_depth_and_keeps_the_other_fields() {
+    fn re_marking_advances_the_depth_and_keeps_the_other_fields() {
         let ws = tempfile::TempDir::new().unwrap();
         let paths = paths(&ws);
         let opts = opts(&["binary"]);
@@ -317,36 +369,42 @@ mod tests {
 
         // Re-marking names neither parent nor label: both survive, so does the
         // attribute, and the depth moves up the ladder.
-        asset_mark(
-            &paths,
-            attribution(),
-            input("binary:function", "analyzed"),
-            &opts,
-        )
-        .unwrap();
-        let graph = read_asset_graph(&paths);
-        assert_eq!(graph.iter().count(), 1);
-        let a = graph.get(&existing.id).unwrap();
-        assert_eq!(a.depth.as_deref(), Some("analyzed"));
-        assert_eq!(a.parent.as_ref(), Some(&parent.id));
-        assert_eq!(a.label, "entry point");
-        assert_eq!(a.attributes["calling_convention"], "sysv");
-
-        // A different depth again keeps them all.
-        asset_mark(
+        let out = asset_mark(
             &paths,
             attribution(),
             input("binary:function", "disassembled"),
             &opts,
         )
         .unwrap();
+        assert_eq!(
+            out.depth, "disassembled",
+            "a forward mark is applied as asked"
+        );
         let graph = read_asset_graph(&paths);
+        assert_eq!(graph.iter().count(), 1);
         let a = graph.get(&existing.id).unwrap();
         assert_eq!(a.depth.as_deref(), Some("disassembled"));
         assert_eq!(a.parent.as_ref(), Some(&parent.id));
+        assert_eq!(a.label, "entry point");
         assert_eq!(a.attributes["calling_convention"], "sysv");
 
-        // An explicit label and parent DO override.
+        // Advancing again keeps them all.
+        let out = asset_mark(
+            &paths,
+            attribution(),
+            input("binary:function", "analyzed"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(out.depth, "analyzed");
+        let graph = read_asset_graph(&paths);
+        let a = graph.get(&existing.id).unwrap();
+        assert_eq!(a.depth.as_deref(), Some("analyzed"));
+        assert_eq!(a.parent.as_ref(), Some(&parent.id));
+        assert_eq!(a.attributes["calling_convention"], "sysv");
+
+        // An explicit label and parent DO override, even when the depth part
+        // of the same mark is a (clamped) no-op.
         let other_parent = Asset::new(
             "binary:binary",
             Locator(vec![Coordinate::Sha256("cd".repeat(32))]),
@@ -355,12 +413,83 @@ mod tests {
         let mut i = input("binary:function", "disassembled");
         i.label = Some("renamed".into());
         i.parent = Some(other_parent.id.0.clone());
-        asset_mark(&paths, attribution(), i, &opts).unwrap();
+        let out = asset_mark(&paths, attribution(), i, &opts).unwrap();
+        assert_eq!(out.depth, "analyzed", "the clamp does not block the rest");
         let graph = read_asset_graph(&paths);
         let a = graph.get(&existing.id).unwrap();
         assert_eq!(a.label, "renamed");
         assert_eq!(a.parent.as_ref(), Some(&other_parent.id));
-        assert_eq!(a.depth.as_deref(), Some("disassembled"));
+        assert_eq!(a.depth.as_deref(), Some("analyzed"));
+    }
+
+    #[test]
+    fn a_shallower_mark_is_clamped_and_the_output_reports_the_deeper_depth() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = paths(&ws);
+        let opts = opts(&["binary"]);
+
+        let first = asset_mark(
+            &paths,
+            attribution(),
+            input("binary:function", "analyzed"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(first.depth, "analyzed");
+
+        // `located` is the shallowest rung of binary's ladder: depth never
+        // regresses, so the stored rung stays `analyzed` and the tool SAYS so.
+        let second = asset_mark(
+            &paths,
+            attribution(),
+            input("binary:function", "located"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(
+            second.depth, "analyzed",
+            "the output reports the effective (retained) depth, not the request"
+        );
+        let graph = read_asset_graph(&paths);
+        assert_eq!(graph.iter().count(), 1);
+        assert_eq!(
+            graph.iter().next().unwrap().depth.as_deref(),
+            Some("analyzed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.assets)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a fully clamped re-mark changes nothing, so appends nothing"
+        );
+    }
+
+    #[test]
+    fn an_existing_depth_off_the_ladder_yields_to_the_requested_one() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = paths(&ws);
+        // A record whose depth is not a rung of the current ladder (say the
+        // profile was edited since): it cannot be ordered against the request.
+        let mut existing = Asset::new("binary:function", locator(), "entry point");
+        existing.depth = Some("retired-rung".into());
+        crate::asset::append_asset(&paths, &existing, &attribution()).unwrap();
+
+        let out = asset_mark(
+            &paths,
+            attribution(),
+            input("binary:function", "located"),
+            &opts(&["binary"]),
+        )
+        .unwrap();
+        assert_eq!(out.depth, "located", "the requested depth wins");
+        let graph = read_asset_graph(&paths);
+        assert_eq!(
+            graph.get(&existing.id).unwrap().depth.as_deref(),
+            Some("located")
+        );
     }
 
     #[test]

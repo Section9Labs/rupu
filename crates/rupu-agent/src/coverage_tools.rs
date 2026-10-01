@@ -479,8 +479,10 @@ impl Tool for AssetMarkTool {
     fn description(&self) -> &'static str {
         "Register an asset (a function, a host, a route, ...) and record how deeply you \
          have covered it. `kind` must be an asset kind an active engagement profile \
-         declares and `depth` a rung of that profile's depth ladder. Re-marking an asset \
-         updates its depth. Returns the asset id (usable as another asset's `parent`)."
+         declares and `depth` a rung of that profile's depth ladder. Depth only advances \
+         along the ladder: re-marking an asset with a shallower rung keeps the deeper one. \
+         Returns the asset id (usable as another asset's `parent`) and the EFFECTIVE \
+         depth now recorded, which is the deeper rung when your request was shallower."
     }
 
     fn input_schema(&self) -> Value {
