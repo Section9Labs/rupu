@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api';
-import { PerHostListEngine, type PerHostFetchParams } from './engine';
+import { FETCH_TIMEOUT_MS, PerHostListEngine, type PerHostFetchParams } from './engine';
 import { rowAccess, type HostSlice } from './types';
 import { watermarkMerge } from './watermarkMerge';
 import { deferred, flush } from './testUtils';
@@ -27,7 +27,13 @@ function harness(script: Script) {
 /** Serve `all` (newest first) by offset/limit, like a real host. */
 const pager = (all: Row[]) => (p: PerHostFetchParams) => Promise.resolve(all.slice(p.offset, p.offset + p.limit));
 
-afterEach(() => vi.restoreAllMocks());
+/** Like `pager`, but re-reads the server's rows on every call (the list changes under paging). */
+const pager0 = (all: () => Row[]) => (p: PerHostFetchParams) => pager(all())(p);
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe('PerHostListEngine', () => {
   it('paints local while a remote hangs, then merges the remote in', async () => {
@@ -81,24 +87,29 @@ describe('PerHostListEngine', () => {
   });
 
   it('a late host catches up instead of shrinking the visible list', async () => {
-    const local = rows('local', 60, 1);
-    const remote = rows('remote', 200, 0.1); // busy: 10 rows a minute
+    const local = rows('local', 120, 1);
+    const remote = rows('remote', 400, 0.1); // busy: 10 rows a minute
     const remoteGate = deferred<void>();
-    const { engine, history } = harness(async (p) => {
+    const { engine, fetch, history } = harness(async (p) => {
       if (p.host === 'remote') await remoteGate.promise;
       return pager(p.host === 'local' ? local : remote)(p);
     });
     engine.start([LOCAL, REMOTE]);
     await flush();
+    await engine.loadMore();
+    await engine.loadMore();
     const before = watermarkMerge(engine.current, access).visible.length;
-    expect(before).toBe(20);
+    expect(before).toBe(60); // three local pages are on screen when the remote finally answers
 
     remoteGate.resolve();
     for (let i = 0; i < 10; i++) await flush();
     const counts = history.map((h) => watermarkMerge(h, access).visible.length);
-    const afterArrival = counts.slice(counts.findIndex((_, i) => history[i].some((s) => s.hostId === 'remote' && s.state === 'ok')));
-    for (const n of afterArrival) expect(n).toBeGreaterThanOrEqual(before);
+    const arrival = history.findIndex((h) => h.some((s) => s.hostId === 'remote' && s.state === 'ok'));
+    expect(arrival).toBeGreaterThanOrEqual(0);
+    for (const n of counts.slice(arrival)) expect(n).toBeGreaterThanOrEqual(before);
     expect(engine.current.find((s) => s.hostId === 'remote')?.catchingUp).toBe(false);
+    // Catch-up is a real batch: more rows than one ordinary next page (PAGE + OVERLAP = 25).
+    expect(fetch.mock.calls.some((c) => c[0].host === 'remote' && c[0].limit > 25)).toBe(true);
   });
 
   it('never has more than one request in flight per host, and coalesces refreshes', async () => {
@@ -149,13 +160,16 @@ describe('PerHostListEngine', () => {
 
   it('ignores answers after dispose', async () => {
     const d = deferred<Row[]>();
-    const { engine, history } = harness(() => d.promise);
+    const { engine, fetch, history } = harness(() => d.promise);
     engine.start([LOCAL]);
+    await flush(); // the request is really in flight now
+    expect(fetch).toHaveBeenCalledTimes(1);
     const n = history.length;
     engine.dispose();
     d.resolve(rows('local', 1, 1));
     await flush();
     expect(history.length).toBe(n);
+    expect(engine.current[0].state).toBe('loading');
   });
 
   it('pollLocal refreshes only local; pollRemote skips unavailable hosts', async () => {
@@ -186,5 +200,196 @@ describe('PerHostListEngine', () => {
     await engine.scheduleHead('local');
     expect(engine.current[0].hasMore).toBe(true);
     expect(engine.current[0].rows.map((r) => r.id)).toEqual(answer.map((r) => r.id));
+  });
+
+  it('a page of nothing new after rows land on top re-anchors instead of ending the host', async () => {
+    let server = rows('local', 40, 1); // two pages' worth
+    const { engine } = harness(pager0(() => server));
+    engine.start([LOCAL]);
+    await flush();
+    await engine.loadMore();
+    expect(engine.current[0].rows).toHaveLength(40);
+
+    // 50 runs land on top: the next offsets now point at rows this slice already holds.
+    server = [...rows('new', 50, 1, -200), ...server];
+    await engine.loadMore();
+    await engine.loadMore();
+    const s = engine.current[0];
+    expect(s.pagingFailed).toBe(false);
+    expect(s.hasMore).toBe(true);
+    expect(s.rows.some((r) => r.id === 'new-0')).toBe(true);
+
+    for (let i = 0; i < 20 && watermarkMerge(engine.current, access).hasMore; i++) await engine.loadMore();
+    const done = engine.current[0];
+    expect(done.hasMore).toBe(false);
+    expect(done.rows.map((r) => r.id).sort()).toEqual(server.map((r) => r.id).sort());
+  });
+
+  it('a page that keeps adding nothing is a paging failure, not a silent end', async () => {
+    const local = rows('local', 40, 1);
+    let stuck = false;
+    const { engine, fetch } = harness((p) => {
+      // Stuck: every later page is a FULL page of rows the slice already holds.
+      if (stuck && p.offset > 0) return Promise.resolve(rows('local', p.limit, 1));
+      return pager(local)(p);
+    });
+    engine.start([LOCAL]);
+    await flush();
+    await engine.loadMore();
+    expect(engine.current[0].rows).toHaveLength(40);
+    stuck = true;
+    fetch.mockClear();
+    await engine.loadMore();
+    // page (nothing new) -> re-anchor head -> page again (still nothing new) -> give up.
+    expect(fetch.mock.calls.map((c) => c[0].offset)).toEqual([35, 0, 35]);
+    expect(engine.current[0]).toMatchObject({ pagingFailed: true, hasMore: true, reason: 'list shifted while paging' });
+  });
+
+  it('retryPaging is a no-op unless the host failed paging', async () => {
+    const { engine, fetch } = harness(pager0(() => rows('local', 60, 1)));
+    engine.start([LOCAL]);
+    await flush();
+    fetch.mockClear();
+    await engine.retryPaging('local');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('retryPaging re-anchors page 0 before it resumes', async () => {
+    let server = rows('local', 60, 1);
+    let failNext = true;
+    const { engine, fetch } = harness((p) => {
+      if (p.offset > 0 && failNext) return Promise.reject(new ApiError(502, 'x', '{"error":"down"}'));
+      return pager(server)(p);
+    });
+    engine.start([LOCAL]);
+    await flush();
+    await engine.loadMore();
+    expect(engine.current[0].pagingFailed).toBe(true);
+    failNext = false;
+    server = [...rows('new', 2, 1, -10), ...server];
+    fetch.mockClear();
+    await engine.retryPaging('local');
+    expect(fetch.mock.calls[0][0]).toMatchObject({ host: 'local', offset: 0 });
+    expect(engine.current[0].rows.some((r) => r.id === 'new-0')).toBe(true);
+    expect(engine.current[0]).toMatchObject({ pagingFailed: false, reason: null, catchingUp: false });
+  });
+
+  it('a refresh queued behind an in-flight page splices against the post-page rows', async () => {
+    let server = rows('local', 60, 1);
+    const gate = deferred<void>();
+    const log: string[] = [];
+    const { engine } = harness(async (p) => {
+      log.push(`start:${p.offset}`);
+      const page = server.slice(p.offset, p.offset + p.limit); // what the host said when asked
+      if (p.offset > 0) await gate.promise;
+      log.push(`end:${p.offset}`);
+      return page;
+    });
+    engine.start([LOCAL]);
+    await flush();
+    const more = engine.loadMore();
+    await flush(); // the page request is in flight
+    server = [...rows('new', 2, 1, -5), ...server];
+    void engine.scheduleHead('local'); // queued behind the page
+    gate.resolve();
+    await more;
+    for (let i = 0; i < 3; i++) await flush();
+
+    expect(log.join()).toBe('start:0,end:0,start:15,end:15,start:0,end:0');
+    const ids = engine.current[0].rows.map((r) => r.id);
+    expect(ids).toEqual(['new-0', 'new-1', ...Array.from({ length: 40 }, (_, i) => `local-${i}`)]);
+  });
+
+  it('a fetch that never answers times out: offline, and other hosts are unaffected', async () => {
+    expect(FETCH_TIMEOUT_MS).toBe(45_000);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const local = rows('local', 60, 1);
+    const { engine, visible } = harness((p) => (p.host === 'hang' ? new Promise<Row[]>(() => {}) : pager(local)(p)));
+    engine.start([LOCAL, { ...REMOTE, id: 'hang' }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.current.find((s) => s.hostId === 'hang')?.state).toBe('loading');
+    expect(visible()).toHaveLength(20);
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(engine.current.find((s) => s.hostId === 'hang')).toMatchObject({ state: 'offline', reason: 'no answer after 45s' });
+    expect(visible()).toHaveLength(20);
+    await engine.loadMore(); // not held up by the dead host
+    expect(visible()).toHaveLength(40);
+  });
+
+  it('a hung page times out as a paging failure instead of freezing loadMore', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const local = rows('local', 60, 1);
+    const { engine } = harness((p) => (p.offset > 0 ? new Promise<Row[]>(() => {}) : pager(local)(p)));
+    engine.start([LOCAL]);
+    await vi.advanceTimersByTimeAsync(0);
+    const more = engine.loadMore();
+    await vi.advanceTimersByTimeAsync(45_000);
+    await more;
+    expect(engine.current[0]).toMatchObject({ state: 'ok', pagingFailed: true, reason: 'no answer after 45s' });
+    expect(watermarkMerge(engine.current, access).hasMore).toBe(false);
+  });
+
+  it('a hung refresh keeps last-good rows and records why', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let hang = false;
+    const { engine, visible } = harness(() => (hang ? new Promise<Row[]>(() => {}) : Promise.resolve(rows('local', 3, 1))));
+    engine.start([LOCAL]);
+    await vi.advanceTimersByTimeAsync(0);
+    hang = true;
+    const refresh = engine.scheduleHead('local');
+    await vi.advanceTimersByTimeAsync(45_000);
+    await refresh;
+    expect(visible()).toHaveLength(3);
+    expect(engine.current[0]).toMatchObject({ state: 'ok', reason: 'no answer after 45s' });
+  });
+
+  it('an unexpected job error is logged and cannot leave a host catching up forever', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let boom = false;
+    const throwing = {
+      ...access,
+      keyOf: (r: Row, h: string) => {
+        if (boom) throw new Error('boom');
+        return access.keyOf(r, h);
+      },
+    };
+    const local = rows('local', 60, 1);
+    const remote = rows('remote', 200, 0.1);
+    const remoteGate = deferred<void>();
+    const pageGate = deferred<void>();
+    const fetch = vi.fn(async (p: PerHostFetchParams) => {
+      if (p.host === 'remote') {
+        await remoteGate.promise;
+        if (p.offset > 0) await pageGate.promise;
+      }
+      return pager(p.host === 'local' ? local : remote)(p);
+    });
+    const engine = new PerHostListEngine<Row>(fetch, throwing, () => {}, true);
+    engine.start([LOCAL, REMOTE]);
+    await flush();
+    remoteGate.resolve();
+    for (let i = 0; i < 5; i++) await flush();
+    // The remote answered and is catching up: its next page is in flight.
+    expect(engine.current.find((s) => s.hostId === 'remote')?.catchingUp).toBe(true);
+    expect(fetch.mock.calls.some((c) => c[0].host === 'remote' && c[0].offset > 0)).toBe(true);
+
+    boom = true;
+    pageGate.resolve();
+    for (let i = 0; i < 5; i++) await flush();
+    expect(err).toHaveBeenCalled();
+    expect(engine.current.find((s) => s.hostId === 'remote')?.catchingUp).toBe(false);
+  });
+
+  it('reconcile keeps rows and state but takes the new name and transport', async () => {
+    const { engine } = harness((p) => Promise.resolve(rows(p.host, 3, 1)));
+    engine.start([LOCAL, REMOTE, { ...REMOTE, id: 'gone' }]);
+    await flush();
+    engine.reconcile([LOCAL, { ...REMOTE, name: 'renamed', transport_kind: 'http_cp' }, { ...REMOTE, id: 'added' }]);
+    const by = (id: string) => engine.current.find((s) => s.hostId === id);
+    expect(by('gone')).toBeUndefined();
+    expect(by('added')?.state).toBe('loading');
+    expect(by('remote')).toMatchObject({ name: 'renamed', transportKind: 'http_cp', state: 'ok' });
+    expect(by('remote')?.rows).toHaveLength(3);
   });
 });

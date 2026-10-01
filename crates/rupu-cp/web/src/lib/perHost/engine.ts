@@ -4,7 +4,12 @@
 //   a refresh that comes due while one is in flight coalesced behind it.
 // - A host that answers late (first page, or recovering) JOINS by catching
 //   up to the floor before it gates, so the visible list never gets shorter.
-// - Splices refreshes with spliceHead and pages with a 5-row overlap.
+// - Splices refreshes with spliceHead and pages with a 5-row overlap. A full
+//   page that adds nothing means rows landed on top and shifted every offset:
+//   the host re-anchors on a fresh page 0 and retries once, never silently
+//   ending its list.
+// - Bounds every fetch (FETCH_TIMEOUT_MS), so one host that never answers
+//   cannot hold its own queue, or loadMore's scroll lock, forever.
 //
 // The React hook (usePerHostPagedList.ts) owns one engine per filter
 // generation and disposes it on change. A disposed engine ignores every
@@ -19,6 +24,8 @@ import { classifyFailure } from './status';
 export const PAGE = 20;
 export const OVERLAP = 5;
 export const MAX_LIMIT = 200;
+/** A host that has not answered by then is treated as failed (offline / paging failure). */
+export const FETCH_TIMEOUT_MS = 45_000;
 
 export interface PerHostFetchParams {
   host: string;
@@ -57,7 +64,12 @@ export class PerHostListEngine<T extends HostTagged> {
   /** Manual Refresh: add new hosts, drop removed ones, refresh every host (unavailable ones included). */
   reconcile(hosts: readonly HostSeed[]): void {
     const byId = new Map(this.slices.map((s) => [s.hostId, s]));
-    this.commit(hosts.map((h) => byId.get(h.id) ?? emptySlice<T>(h)));
+    this.commit(
+      hosts.map((h) => {
+        const kept = byId.get(h.id);
+        return kept ? { ...kept, name: h.name, transportKind: h.transport_kind } : emptySlice<T>(h);
+      }),
+    );
     for (const h of hosts) void this.scheduleHead(h.id);
   }
 
@@ -88,8 +100,18 @@ export class PerHostListEngine<T extends HostTagged> {
     ).then(() => undefined);
   }
 
+  /**
+   * Resume a host whose paging failed: re-anchor on a fresh page 0 (the list
+   * may have shifted since), then catch up again. A no-op for any other host.
+   */
   retryPaging(id: string): Promise<void> {
-    return this.enqueue(id, () => this.join(id, { pagingFailed: false, reason: null }));
+    if (!this.find(id)?.pagingFailed) return Promise.resolve();
+    return this.enqueue(id, async () => {
+      if (!this.find(id)?.pagingFailed) return;
+      this.patch(id, (s) => ({ ...s, pagingFailed: false, reason: null }));
+      await this.head(id);
+      await this.join(id);
+    });
   }
 
   /** A row action (archive/restore/delete) took this row out of the list. */
@@ -125,16 +147,34 @@ export class PerHostListEngine<T extends HostTagged> {
 
   private enqueue(id: string, job: () => Promise<void>): Promise<void> {
     const prev = this.queues.get(id) ?? Promise.resolve();
-    const next = prev.then(() => (this.disposed ? undefined : job())).catch(() => undefined);
+    const next = prev
+      .then(() => (this.disposed ? undefined : job()))
+      .catch((e) => {
+        // Fetch failures are handled inside the jobs; this is a bug. Keep the queue alive, but say so.
+        console.error('PerHostListEngine: unexpected job error', e);
+      });
     this.queues.set(id, next);
     return next;
   }
 
+  /** One fetch, bounded: rejects with a plain Error if the host has not answered in FETCH_TIMEOUT_MS. */
+  private async fetchBounded(p: PerHostFetchParams): Promise<T[]> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no answer after ${FETCH_TIMEOUT_MS / 1000}s`)), FETCH_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([this.fetchPage(p), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async head(id: string): Promise<void> {
-    if (!this.find(id)) return;
+    if (this.disposed || !this.find(id)) return;
     let page: T[];
     try {
-      page = withHost(await this.fetchPage({ host: id, offset: 0, limit: PAGE }), id);
+      page = withHost(await this.fetchBounded({ host: id, offset: 0, limit: PAGE }), id);
     } catch (e) {
       this.fail(id, e);
       return;
@@ -173,39 +213,50 @@ export class PerHostListEngine<T extends HostTagged> {
    * stopping early once it reaches the floor or runs out of rows. Then it
    * gates.
    */
-  private async join(id: string, prePatch: Partial<HostSlice<T>> = {}): Promise<void> {
+  private async join(id: string): Promise<void> {
     const start = this.find(id);
     if (!start) return;
-    this.patch(id, (s) => ({ ...s, ...prePatch, catchingUp: s.hasMore }));
     const others = () => this.slices.filter((o) => o.hostId !== id);
-    const budget = displacedCount(
-      watermarkMerge(others(), this.access).visible,
-      coveredOf({ ...start, ...prePatch } as HostSlice<T>, this.access.timeOf),
-      this.access.timeOf,
-    );
-    let added = 0;
-    for (;;) {
-      const s = this.find(id);
-      if (this.disposed || !s) return;
-      const floor = floorOf(others(), this.access.timeOf);
-      if (!s.hasMore || coveredOf(s, this.access.timeOf) <= floor || added >= budget) break;
-      const got = await this.next(id, Math.min(MAX_LIMIT - OVERLAP, Math.max(PAGE, budget - added)));
-      if (got === null) return; // next() marked pagingFailed and cleared catchingUp
-      if (got === 0) break;
-      added += got;
+    try {
+      this.patch(id, (s) => ({ ...s, catchingUp: s.hasMore }));
+      const budget = displacedCount(
+        watermarkMerge(others(), this.access).visible,
+        coveredOf(start, this.access.timeOf),
+        this.access.timeOf,
+      );
+      let added = 0;
+      for (;;) {
+        const s = this.find(id);
+        if (this.disposed || !s) return;
+        const floor = floorOf(others(), this.access.timeOf);
+        if (!s.hasMore || coveredOf(s, this.access.timeOf) <= floor || added >= budget) break;
+        const got = await this.next(id, Math.min(MAX_LIMIT - OVERLAP, Math.max(PAGE, budget - added)));
+        if (got === null) return; // next() marked pagingFailed and cleared catchingUp
+        if (got === 0) break;
+        added += got;
+      }
+    } finally {
+      // Whatever happened (even an unexpected throw), never leave a host catching up forever.
+      if (this.find(id)?.catchingUp) this.patch(id, (s) => ({ ...s, catchingUp: false }));
     }
-    this.patch(id, (s) => ({ ...s, catchingUp: false }));
   }
 
-  /** Fetch `want` more rows (+ overlap). Returns the count of NEW rows, or null on failure. */
-  private async next(id: string, want: number): Promise<number | null> {
+  /**
+   * Fetch `want` more rows (+ overlap). Returns the count of NEW rows, or null on failure.
+   *
+   * A FULL page that adds nothing means the list shifted under us (rows landed
+   * on top, so the offset now points at rows we already hold). Re-anchor with a
+   * fresh page 0 and try once more; if that also adds nothing, fail loudly. A
+   * SHORT page that adds nothing is the real end of the list.
+   */
+  private async next(id: string, want: number, reanchored = false): Promise<number | null> {
     const cur = this.find(id);
     if (!cur) return 0;
     const limit = want + OVERLAP;
     let page: T[];
     try {
       page = withHost(
-        await this.fetchPage({ host: id, offset: Math.max(0, cur.rows.length - OVERLAP), limit }),
+        await this.fetchBounded({ host: id, offset: Math.max(0, cur.rows.length - OVERLAP), limit }),
         id,
       );
     } catch (e) {
@@ -215,14 +266,21 @@ export class PerHostListEngine<T extends HostTagged> {
       return null;
     }
     if (this.disposed) return null;
-    let added = 0;
-    this.patch(id, (s) => {
-      const rows = appendPage(s.rows, page, this.access, id);
-      added = rows.length - s.rows.length;
-      // A full page of nothing new means the offsets drifted (many rows
-      // inserted above). Stop rather than re-request the same offset forever.
-      return { ...s, rows, hasMore: page.length === limit && added > 0 };
-    });
+    const held = this.find(id);
+    if (!held) return 0;
+    const rows = appendPage(held.rows, page, this.access, id);
+    const added = rows.length - held.rows.length;
+    const full = page.length === limit;
+    if (full && added === 0) {
+      if (reanchored) {
+        this.patch(id, (s) => ({ ...s, pagingFailed: true, catchingUp: false, reason: 'list shifted while paging' }));
+        return null;
+      }
+      await this.head(id);
+      if (this.disposed) return null;
+      return this.next(id, want, true);
+    }
+    this.patch(id, (s) => ({ ...s, rows, hasMore: full && added > 0 }));
     return added;
   }
 
