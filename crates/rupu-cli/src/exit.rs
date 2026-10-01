@@ -99,10 +99,13 @@ fn say_detached(say: impl FnOnce() + Send + 'static, grace: Option<Duration>) {
 /// with the command's code ([`exit_by_signal_if_terminating`]) — and by
 /// [`install_sigterm_handler`] when the handler thread could not be set
 /// up. From then on a SIGTERM ends the process by the signal right inside
-/// the signal handler ([`register_signal_actions`]): there is no window
-/// left in which a signal delivered after `main`'s last check could let
-/// the process exit by its code instead, and no state in which a signal
-/// is swallowed.
+/// the signal handler ([`register_signal_actions_at`]'s re-raise action):
+/// there is no window left in which a signal delivered after `main`'s
+/// last check could let the process exit by its code instead. That holds
+/// as long as the re-raise action is registered; without it — and
+/// without the handler thread — a signal only marks the process
+/// terminating, the one state in which it is not acted on at once (see
+/// [`register_signal_actions_at`]).
 fn exit_committed() -> &'static Arc<AtomicBool> {
     static COMMITTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     COMMITTED.get_or_init(Default::default)
@@ -111,7 +114,7 @@ fn exit_committed() -> &'static Arc<AtomicBool> {
 /// Handle SIGTERM on a dedicated OS thread — not a tokio task, so a wedged
 /// runtime can neither delay nor swallow it. Two things happen inside the
 /// signal handler itself, async-signal-safely, the instant the signal is
-/// delivered ([`register_signal_actions`]): the process is marked
+/// delivered ([`register_signal_actions_at`]): the process is marked
 /// terminating (every runner then refuses to start an LLM call or a tool
 /// dispatch), and — only once the exit is committed — the default
 /// disposition is restored and the signal re-raised, so a late signal
