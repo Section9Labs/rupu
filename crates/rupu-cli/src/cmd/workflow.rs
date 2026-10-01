@@ -3738,7 +3738,7 @@ async fn cancel(run_id: &str) -> anyhow::Result<()> {
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
-    let outcome = cancel_with_store(&store, run_id, "cancelled by operator")?;
+    let outcome = cancel_with_store(&store, run_id, "cancelled by operator").await?;
     match outcome {
         CancelOutcome::RejectedAwaitingApproval => {
             println!("rupu: cancelled paused run {run_id}");
@@ -3763,13 +3763,17 @@ async fn cancel(run_id: &str) -> anyhow::Result<()> {
 /// AwaitingApproval → reject; terminal → error). Maps the library's
 /// [`CancelError`] onto an `anyhow::Error` with the same user-facing
 /// message shape the CLI printed before.
-fn cancel_with_store(
+/// `RunStore::cancel` on the blocking pool (it waits, bounded, for the run
+/// lock), with its errors mapped for the operator.
+async fn cancel_with_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
     reason: &str,
 ) -> anyhow::Result<CancelOutcome> {
+    let (id, reason, approver) = (run_id.to_string(), reason.to_string(), whoami::username());
     store
-        .cancel(run_id, &whoami::username(), reason, chrono::Utc::now())
+        .blocking(move |s| s.cancel(&id, &approver, &reason, chrono::Utc::now()))
+        .await
         .map_err(|e| match e {
             CancelError::AlreadyTerminal(status) => {
                 anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
@@ -5153,7 +5157,8 @@ async fn execute_workflow_invocation(
                     run_store_for_resume.as_ref(),
                     &current_run_id,
                     "cancelled by operator",
-                )?;
+                )
+                .await?;
                 // The retained view is already torn down; this early return
                 // skips the shared summary print below, so print it here.
                 if print_summary {
@@ -5717,15 +5722,16 @@ mod tests {
         handle.abort();
     }
 
-    #[test]
-    fn cancel_with_store_marks_running_run_failed() {
+    #[tokio::test]
+    async fn cancel_with_store_marks_running_run_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Running, Some(999_999));
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let outcome =
-            cancel_with_store(&store, "run_test_cancel", "cancelled by operator").unwrap();
+        let outcome = cancel_with_store(&store, "run_test_cancel", "cancelled by operator")
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             CancelOutcome::MarkedCancelled {
@@ -5789,15 +5795,16 @@ mod tests {
         assert!(store.load("run_test_cancel").is_err());
     }
 
-    #[test]
-    fn cancel_with_store_rejects_awaiting_run() {
+    #[tokio::test]
+    async fn cancel_with_store_rejects_awaiting_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::AwaitingApproval, None);
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let outcome =
-            cancel_with_store(&store, "run_test_cancel", "cancelled by operator").unwrap();
+        let outcome = cancel_with_store(&store, "run_test_cancel", "cancelled by operator")
+            .await
+            .unwrap();
         assert_eq!(outcome, CancelOutcome::RejectedAwaitingApproval);
 
         let persisted = store.load("run_test_cancel").unwrap();

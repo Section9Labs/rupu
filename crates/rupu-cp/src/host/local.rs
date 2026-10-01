@@ -284,8 +284,11 @@ impl HostConnector for LocalHostConnector {
 
     async fn cancel_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
+        // On the blocking pool: `cancel` waits (bounded) for the run lock.
+        let id = run_id.to_string();
         self.run_store
-            .cancel(run_id, "connector", "Cancelled via connector", now)
+            .blocking(move |store| store.cancel(&id, "connector", "Cancelled via connector", now))
+            .await
             .map(|_| ())
             .map_err(|e| map_cancel_err(run_id, e))
     }

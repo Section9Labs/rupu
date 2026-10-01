@@ -1022,18 +1022,29 @@ pub async fn run_workflow(
         }
     } else if let Some(store) = &opts.run_store {
         // Resume path: load the existing record so the terminal-flip
-        // block at the bottom of the function can update it.
-        match store.load(&run_id) {
-            Ok(mut rec) => {
-                rec.runner_pid = Some(std::process::id());
-                if let Err(e) = store.update(&rec) {
-                    warn!(error = %e, "failed to persist resumed runner pid");
-                }
-                Some(rec)
+        // block at the bottom of the function can update it. Under the run
+        // lock: a `Cancelled` that landed since the resume was decided is
+        // preserved, and the run does not start.
+        let claimed = {
+            let run_id = run_id.clone();
+            store
+                .blocking(move |s| {
+                    s.modify_unless_cancelled(&run_id, |rec| {
+                        rec.runner_pid = Some(std::process::id());
+                        true
+                    })
+                })
+                .await
+        };
+        match claimed {
+            Ok(Some(rec)) => Some(rec),
+            Ok(None) => {
+                info!(run_id = %run_id, "the run was cancelled on disk before it resumed; not starting it");
+                return Err(RunWorkflowError::RunCancelled { aborted: 0 });
             }
             Err(e) => {
-                warn!(error = %e, "failed to load resumed run record");
-                None
+                warn!(error = %e, "failed to persist resumed runner pid");
+                store.load(&run_id).ok()
             }
         }
     } else {
@@ -1280,8 +1291,15 @@ pub async fn run_workflow(
         }
         // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
         // `RunStore::cancel` from the CLI or `cp serve` writes `Cancelled`
-        // while this run finishes). The store re-reads under the run lock.
-        match store.update_unless_cancelled(record) {
+        // while this run finishes). The store re-reads under the run lock —
+        // on the blocking pool, since the lock wait blocks its thread.
+        let flipped = {
+            let record = record.clone();
+            store
+                .blocking(move |s| s.update_unless_cancelled(&record))
+                .await
+        };
+        match flipped {
             Ok(true) => {}
             Ok(false) => {
                 info!(run_id = %record.id, "the run was cancelled on disk while finishing; keeping that status");
@@ -2796,7 +2814,7 @@ async fn run_scheduler_scoped(
             // exactly; only WHERE the dispatch itself runs changed.
             let effective_continue_on_error =
                 step.continue_on_error.unwrap_or(workflow_default_continue);
-            persist_active_step(opts, run_id, step, None);
+            persist_active_step(opts, run_id, step, None).await;
             let step_kind = step_kind_for_run_record(step);
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
@@ -2996,7 +3014,7 @@ async fn run_scheduler_scoped(
             }
             NodeOutcome::Completed(mut result) => {
                 let done_step_id = wf.steps[i].id.clone();
-                clear_active_step(opts, run_id, &done_step_id);
+                clear_active_step(opts, run_id, &done_step_id).await;
                 if cancel_state.cancelled_by_us.remove(&i) {
                     // Lost the abort race — tokio's own docs note a task
                     // that had already finished when `.abort()` was
@@ -3306,7 +3324,7 @@ async fn run_loop_node(
         // call — a pause/cancel landing anywhere inside it (even before
         // any member has run) resumes at THIS iteration, never the
         // previous one.
-        persist_loop_progress(opts, run_id, loop_name, iteration);
+        persist_loop_progress(opts, run_id, loop_name, iteration).await;
 
         let mut loop_progress = std::collections::BTreeMap::new();
         loop_progress.insert(
@@ -3526,7 +3544,7 @@ enum LoopNodeOutcome {
 /// there's no run store or run id (in-memory harness / unit tests
 /// without persistence) — the loop still runs correctly in a single
 /// process, it just has nothing to resume FROM if the process exits.
-fn persist_loop_progress(
+async fn persist_loop_progress(
     opts: &OrchestratorRunOpts,
     run_id: &str,
     loop_name: &str,
@@ -3536,14 +3554,24 @@ fn persist_loop_progress(
     if run_id.is_empty() {
         return;
     }
-    let Ok(mut record) = store.load(run_id) else {
-        return;
-    };
-    record
-        .loop_progress
-        .insert(loop_name.to_string(), iteration);
-    if let Err(e) = store.update(&record) {
-        warn!(loop_name, iteration, error = %e, "failed to persist loop progress checkpoint");
+    let (run_id_owned, name) = (run_id.to_string(), loop_name.to_string());
+    let written = store
+        .blocking(move |s| {
+            s.modify_unless_cancelled(&run_id_owned, |record| {
+                record.loop_progress.insert(name, iteration);
+                true
+            })
+        })
+        .await;
+    match written {
+        Ok(Some(_)) => {}
+        Ok(None) => info!(
+            run_id,
+            loop_name, "the run was cancelled on disk; loop progress not recorded"
+        ),
+        Err(e) => {
+            warn!(loop_name, iteration, error = %e, "failed to persist loop progress checkpoint")
+        }
     }
 }
 
@@ -4599,7 +4627,7 @@ async fn run_steps_over(
 
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
-        persist_active_step(opts, run_id, step, None);
+        persist_active_step(opts, run_id, step, None).await;
 
         let step_kind = step_kind_for_run_record(step);
         if let Some(sink) = opts.event_sink.as_ref() {
@@ -4645,7 +4673,7 @@ async fn run_steps_over(
             }
             NodeOutcome::Completed(result) => {
                 persist_step_result(opts, run_id, &result);
-                clear_active_step(opts, run_id, &step.id);
+                clear_active_step(opts, run_id, &step.id).await;
                 step_results.push(result);
             }
         }
@@ -4728,7 +4756,7 @@ async fn run_node(
                         },
                     );
                 }
-                clear_active_step(opts, run_id, &step.id);
+                clear_active_step(opts, run_id, &step.id).await;
                 return Ok(NodeOutcome::Paused {
                     step_id,
                     seed: Vec::new(),
@@ -4796,7 +4824,7 @@ async fn run_node(
                         },
                     );
                 }
-                clear_active_step(opts, run_id, &step.id);
+                clear_active_step(opts, run_id, &step.id).await;
                 return Ok(NodeOutcome::Paused {
                     step_id,
                     seed,
@@ -6136,7 +6164,9 @@ pub async fn run_reject_cleanup(
     Ok(())
 }
 
-fn persist_active_step(
+/// Record `step` as the run's active step — under the run lock, never over
+/// an on-disk `Cancelled` (which has already cleared the active step).
+async fn persist_active_step(
     opts: &OrchestratorRunOpts,
     workflow_run_id: &str,
     step: &Step,
@@ -6146,35 +6176,57 @@ fn persist_active_step(
     if workflow_run_id.is_empty() {
         return;
     }
-    let Ok(mut record) = store.load(workflow_run_id) else {
-        return;
-    };
-    record.active_step_id = Some(step.id.clone());
-    record.active_step_kind = Some(step_kind_for_run_record(step));
-    record.active_step_agent = step.agent.clone();
-    record.active_step_transcript_path = transcript_path;
-    if let Err(e) = store.update(&record) {
-        warn!(step = %step.id, error = %e, "failed to persist active step");
+    let run_id = workflow_run_id.to_string();
+    let (step_id, kind, agent) = (
+        step.id.clone(),
+        step_kind_for_run_record(step),
+        step.agent.clone(),
+    );
+    let written = store
+        .blocking(move |s| {
+            s.modify_unless_cancelled(&run_id, |record| {
+                record.active_step_id = Some(step_id);
+                record.active_step_kind = Some(kind);
+                record.active_step_agent = agent;
+                record.active_step_transcript_path = transcript_path;
+                true
+            })
+        })
+        .await;
+    match written {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            info!(step = %step.id, "the run was cancelled on disk; active step not recorded")
+        }
+        Err(e) => warn!(step = %step.id, error = %e, "failed to persist active step"),
     }
 }
 
-fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
+/// Clear `step_id` as the run's active step if it still is — under the run
+/// lock, never over an on-disk `Cancelled`.
+async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
     let Some(store) = &opts.run_store else { return };
     if workflow_run_id.is_empty() {
         return;
     }
-    let Ok(mut record) = store.load(workflow_run_id) else {
-        return;
-    };
-    if record.active_step_id.as_deref() != Some(step_id) {
-        return;
-    }
-    record.active_step_id = None;
-    record.active_step_kind = None;
-    record.active_step_agent = None;
-    record.active_step_transcript_path = None;
-    if let Err(e) = store.update(&record) {
-        warn!(step = %step_id, error = %e, "failed to clear active step");
+    let (run_id, step) = (workflow_run_id.to_string(), step_id.to_string());
+    let written = store
+        .blocking(move |s| {
+            s.modify_unless_cancelled(&run_id, |record| {
+                if record.active_step_id.as_deref() != Some(step.as_str()) {
+                    return false;
+                }
+                record.active_step_id = None;
+                record.active_step_kind = None;
+                record.active_step_agent = None;
+                record.active_step_transcript_path = None;
+                true
+            })
+        })
+        .await;
+    match written {
+        Ok(_) => {}
+        Err(e) => warn!(step = %step_id, error = %e, "failed to clear active step"),
     }
 }
 
@@ -6348,7 +6400,7 @@ async fn run_linear_step(
         .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
         .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
     let codename = step_codename(opts, step);
-    persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
+    persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone())).await;
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
     // `StepStarted`), so the UI has no way to learn it until the step
@@ -13837,6 +13889,10 @@ steps:
   - id: ship
     agent: shipper
     prompt: "ship"
+    # After the loop (collapsed: `loop:refine -> ship`). Without the edge
+    # `ship` is a root racing the loop concurrently, and whether its result
+    # is folded in before the gate parks is an interleaving accident.
+    depends_on: [review]
 loops:
   refine:
     nodes: [work, review]

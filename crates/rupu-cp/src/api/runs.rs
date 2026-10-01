@@ -275,10 +275,14 @@ async fn cancel_run(
     let reason = body
         .and_then(|b| b.0.reason)
         .unwrap_or_else(|| "Cancelled from control plane".to_string());
-    let _outcome: CancelOutcome = s
-        .run_store
-        .cancel(&id, "web", &reason, now)
-        .map_err(|e| map_cancel_err(&id, e))?;
+    // On the blocking pool: `cancel` waits (bounded) for the run lock.
+    let _outcome: CancelOutcome = {
+        let (run_id, reason) = (id.clone(), reason.clone());
+        s.run_store
+            .blocking(move |store| store.cancel(&run_id, "web", &reason, now))
+            .await
+            .map_err(|e| map_cancel_err(&id, e))?
+    };
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)

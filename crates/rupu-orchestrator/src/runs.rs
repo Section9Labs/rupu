@@ -1488,6 +1488,12 @@ impl RunStore {
     /// than that is wedged, and the caller then proceeds unlocked (the
     /// pre-lock behavior) rather than hanging — logged. The lock is held
     /// while the returned file is alive.
+    ///
+    /// The wait blocks the calling thread (a polled non-blocking flock with
+    /// a short sleep), so the methods that take it (`cancel`,
+    /// `update_unless_cancelled`, `modify_unless_cancelled`) are called from
+    /// an async context through [`RunStore::blocking`], never directly on a
+    /// runtime worker.
     fn lock_run_json(&self, run_id: &str) -> Option<File> {
         if !self.run_dir(run_id).is_dir() {
             return None;
@@ -1542,6 +1548,44 @@ impl RunStore {
         }
         self.update(record)?;
         Ok(true)
+    }
+
+    /// Load → `modify` → write `run.json`, under the run lock, unless the run
+    /// is `Cancelled` on disk: the writers that touch the record mid-run (the
+    /// active step, loop progress, a resumed run's pid) must never turn a
+    /// cancel that landed since their last look back into `Running`.
+    /// `modify` returns whether the record is to be written. Returns the
+    /// record after `modify` (written when it asked), or `None` when the
+    /// on-disk `Cancelled` was preserved — `modify` did not run and nothing
+    /// was written.
+    pub fn modify_unless_cancelled(
+        &self,
+        run_id: &str,
+        modify: impl FnOnce(&mut RunRecord) -> bool,
+    ) -> Result<Option<RunRecord>, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if record.status == RunStatus::Cancelled {
+            return Ok(None);
+        }
+        if modify(&mut record) {
+            self.update(&record)?;
+        }
+        Ok(Some(record))
+    }
+
+    /// Run `f` with a handle to this store on the blocking pool — for the
+    /// async callers of the methods that take the run lock, whose bounded
+    /// wait would otherwise stall a runtime worker thread.
+    pub async fn blocking<T, F>(&self, f: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(RunStore) -> T + Send + 'static,
+    {
+        let store = RunStore::new(self.root.clone());
+        tokio::task::spawn_blocking(move || f(store))
+            .await
+            .expect("run store task panicked")
     }
 
     /// Append one completed step's record to `step_results.jsonl`.
@@ -5536,6 +5580,74 @@ mod tests {
         plain.status = RunStatus::Completed;
         assert!(store.update_unless_cancelled(&plain).unwrap());
         assert_eq!(store.load(&plain.id).unwrap().status, RunStatus::Completed);
+    }
+
+    /// The mid-run writers (active step, loop progress, a resumed run's
+    /// pid) load → modify → write under the run lock, and a `Cancelled`
+    /// that landed on disk is preserved: the closure never runs and
+    /// nothing is written — a cancel is not reset to `Running`.
+    #[test]
+    fn a_mid_run_modify_preserves_an_on_disk_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_modify_vs_cancel");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = None;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        // Running: the modification lands, and the written record comes back.
+        let written = store
+            .modify_unless_cancelled(&rec.id, |r| {
+                r.active_step_id = Some("step-a".into());
+                true
+            })
+            .unwrap()
+            .expect("not cancelled");
+        assert_eq!(written.active_step_id.as_deref(), Some("step-a"));
+        assert_eq!(
+            store.load(&rec.id).unwrap().active_step_id.as_deref(),
+            Some("step-a")
+        );
+
+        // The closure can decline the write (nothing changed on disk).
+        let unchanged = store
+            .modify_unless_cancelled(&rec.id, |r| {
+                r.active_step_id = None;
+                false
+            })
+            .unwrap()
+            .expect("not cancelled");
+        assert_eq!(unchanged.active_step_id, None, "the closure's view");
+        assert_eq!(
+            store.load(&rec.id).unwrap().active_step_id.as_deref(),
+            Some("step-a"),
+            "declined: not written"
+        );
+
+        // Cancelled on disk since the writer's last look: preserved.
+        store
+            .cancel(&rec.id, "matt", "stop it", Utc::now())
+            .unwrap();
+        let ran = std::cell::Cell::new(false);
+        let preserved = store
+            .modify_unless_cancelled(&rec.id, |r| {
+                ran.set(true);
+                r.status = RunStatus::Running;
+                true
+            })
+            .unwrap();
+        assert!(preserved.is_none(), "the cancel wins");
+        assert!(!ran.get(), "the closure never ran");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+        assert_eq!(reloaded.active_step_id, None, "the cancel cleared it");
+
+        // A missing run is an error, not a silent no-op.
+        assert!(matches!(
+            store.modify_unless_cancelled("run_missing", |_| true),
+            Err(RunStoreError::NotFound(_))
+        ));
     }
 
     /// The flip and a concurrent cancel serialize on `run.json.lock`: a
