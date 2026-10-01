@@ -9,9 +9,6 @@
 //! `RUPU_HOME` and the token-endpoint seam are process-wide env vars, so
 //! the tests are `#[serial]`.
 
-// Throwaway in-process mock-server client, not rupu's egress.
-#![allow(clippy::disallowed_methods)]
-
 use httpmock::prelude::*;
 use rupu_auth::resolver::{CredentialResolver, KeychainResolver};
 use rupu_auth::stored::StoredCredential;
@@ -161,4 +158,46 @@ async fn a_gitlab_credential_without_a_recorded_application_refreshes_as_glab_s(
         AuthCredentials::OAuth { access, .. } => assert_eq!(access, "a2"),
         other => panic!("expected OAuth, got {other:?}"),
     }
+}
+
+/// Only GitLab logins record an application. `extra` is free-form (and
+/// flattened into the stored JSON), so any other vendor's credential is
+/// refreshed at its built-in endpoint whatever its `extra` carries.
+#[tokio::test]
+#[serial]
+async fn only_a_gitlab_credential_s_recorded_endpoint_is_used() {
+    let home = tempfile::tempdir().unwrap();
+    let server = MockServer::start_async().await;
+    let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let built_in = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(rotated());
+    });
+    let recorded = server.mock(|when, then| {
+        when.method(POST).path("/recorded");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(rotated());
+    });
+
+    let resolver = KeychainResolver::new();
+    resolver
+        .store_named(
+            "anthropic",
+            AuthMode::Sso,
+            &expired(serde_json::json!({
+                "oauth_client_id": "someone-else",
+                "oauth_token_url": server.url("/recorded"),
+            })),
+        )
+        .await
+        .unwrap();
+
+    resolver.get("anthropic", None).await.unwrap();
+
+    built_in.assert_hits(1);
+    recorded.assert_hits(0);
 }

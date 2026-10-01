@@ -24,9 +24,11 @@
 //!   self-managed instance uses its own application, configured per
 //!   account.
 //!
-//! Vendors don't approve third-party rupu-branded clients for
+//! The LLM vendors don't approve third-party rupu-branded clients for
 //! subscriber inference, so mirroring the upstream CLI's request shape
-//! is the durable answer, not a stopgap (TODO.md's Re-MITM section).
+//! is the durable answer there, not a stopgap (TODO.md's Re-MITM
+//! section). Anyone can register a gitlab.com application; glab's is
+//! used for zero setup, as `gh`'s is for GitHub.
 
 use crate::backend::ProviderId;
 
@@ -260,8 +262,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // non-Copilot-installed orgs were silently invisible.
             // Switching to gh's classic OAuth client_id restores the
             // scope-based authorization model users expect from
-            // `gh auth login`. See TODO.md "Register rupu-specific
-            // OAuth clients" for the proper long-term cure.
+            // `gh auth login`.
             client_id: "178c6fc778ccc68e1d6a",
             client_secret: None,
             authorize_url: "",

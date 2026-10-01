@@ -659,15 +659,18 @@ impl KeychainResolver {
             }
             _ => (oauth.client_id, oauth.client_secret),
         };
-        // A credential that recorded the application it was issued to (a
-        // login with a chosen application: a GitLab account's configured
-        // one, or a self-managed instance's — `oauth::callback::
+        // A GitLab credential that recorded the application it was issued
+        // to (a login with a chosen application: the account's configured
+        // one, or its self-managed instance's — `oauth::callback::
         // run_with_client`) refreshes as that public client, at that
         // endpoint, which the built-in endpoints' test seam never
-        // redirects.
+        // redirects. Only GitLab logins record one; any other vendor's
+        // free-form `extra` is never read for an endpoint.
         let recorded = |key: &str| match &sc.credentials {
-            AuthCredentials::OAuth { extra, .. } => extra.get(key).and_then(|v| v.as_str()),
-            AuthCredentials::ApiKey { .. } => None,
+            AuthCredentials::OAuth { extra, .. } if kind == ProviderId::Gitlab => {
+                extra.get(key).and_then(|v| v.as_str())
+            }
+            _ => None,
         };
         let (client_id, client_secret) = match recorded(crate::oauth::providers::EXTRA_CLIENT_ID) {
             Some(id) => (id, None),

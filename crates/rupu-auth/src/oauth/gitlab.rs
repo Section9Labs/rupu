@@ -72,6 +72,9 @@ fn instance_root(api_base_url: &str) -> Option<String> {
     }
     url.set_query(None);
     url.set_fragment(None);
+    // Never carried into the recorded token endpoint or the authorize URL.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     let s = url.as_str().trim_end_matches('/');
     Some(s.strip_suffix("/api/v4").unwrap_or(s).to_string())
 }
@@ -157,6 +160,23 @@ mod tests {
         ] {
             assert!(err.contains(needed), "{needed:?} missing from: {err}");
         }
+    }
+
+    /// Credentials in a `base_url` never reach the recorded token endpoint
+    /// or the browser's authorize URL.
+    #[test]
+    fn userinfo_in_the_api_root_is_dropped() {
+        let c = oauth_client(
+            Some("https://user:secret@gitlab.example.com/api/v4"),
+            Some("corp-app"),
+            "gl-corp",
+        )
+        .unwrap();
+        assert_eq!(c.token_url, "https://gitlab.example.com/oauth/token");
+        assert_eq!(
+            c.authorize_url,
+            "https://gitlab.example.com/oauth/authorize"
+        );
     }
 
     #[test]
