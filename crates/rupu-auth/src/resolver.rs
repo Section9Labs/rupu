@@ -378,7 +378,9 @@ impl KeychainResolver {
                 return Ok(sc);
             }
             let new = Self::refresh_inner(&account, kind, &sc, timeout).await?;
-            Self::store_named_at(&path, &account, mode, &new)?;
+            if let Err(e) = Self::store_named_at(&path, &account, mode, &new) {
+                report_unpersisted_rotation(&path, &account, &e);
+            }
             Ok(new)
         });
         job.await
@@ -662,6 +664,27 @@ impl Default for KeychainResolver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The token endpoint has already rotated the refresh token when the write
+/// of the new credential fails (a read-only directory, a full disk): the
+/// credential in hand is the only live one. It is handed back so the run
+/// continues, and the loss is reported loudly — the next process will find
+/// the dead refresh token in the file and need `rupu auth login`.
+fn report_unpersisted_rotation(path: &std::path::Path, account: &str, error: &anyhow::Error) {
+    tracing::error!(
+        path = %path.display(),
+        account,
+        error = %error,
+        "the refreshed OAuth token could not be persisted; this process keeps using it, the \
+         next one will need `rupu auth login`"
+    );
+    eprintln!(
+        "rupu: the '{account}' token was refreshed but could not be written to {}: {error}. This \
+         process keeps using the new token; if the next rupu command cannot authenticate, run: \
+         rupu auth login --account {account} --mode sso",
+        path.display()
+    );
 }
 
 /// The process-wide lock serializing refreshes of one account's stored

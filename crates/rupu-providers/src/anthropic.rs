@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::credential_store::resolve_provider_auth;
 use crate::auth::{is_token_expired, AuthCredentials, AuthFile, AuthMethod};
@@ -857,12 +857,12 @@ async fn refresh_and_persist_anthropic_token(
             AuthMethod::ApiKey(key) => AuthCredentials::ApiKey { key: key.clone() },
         };
         if let Err(e) = store.update(crate::provider_id::ProviderId::Anthropic, creds) {
-            warn!(error = %e, "failed to persist refreshed token via credential store");
+            error!(error = %e, "the refreshed Anthropic token could not be persisted via the credential store; this process keeps using it, the next one will need to log in again");
         }
     } else if let Some(path) = &auth_json_path {
         // Legacy fallback
         if let Err(e) = save_auth_json(path, &new_auth) {
-            warn!(error = %e, "failed to save refreshed token to auth.json");
+            error!(path = %path.display(), error = %e, "the refreshed Anthropic token could not be written; this process keeps using it, the next one will need to log in again");
         }
     }
     Ok(new_auth)

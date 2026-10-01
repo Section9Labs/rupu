@@ -845,3 +845,113 @@ fn the_lock_timeout_defaults_to_30s() {
         std::time::Duration::from_secs(30)
     );
 }
+
+// ---- a rotation that cannot be persisted ------------------------------------
+
+/// Captures what a `tracing` subscriber writes.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Restores a directory's mode on drop (so the temp dir can be removed
+/// even when an assertion fails first).
+#[cfg(unix)]
+struct RestoreMode(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// The token endpoint has already rotated the refresh token when the write
+/// of the new credential fails (a read-only directory, a full disk). The
+/// credential in hand is then the only live one: the `get` still returns
+/// it, so the run continues, and the loss is reported at ERROR naming the
+/// file — never dropped silently. The file itself is untouched.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_persist_failure_after_the_token_post_still_returns_the_new_token() {
+    use httpmock::prelude::*;
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token").body_contains("refresh-1");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "expires_in": 3600
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let dir = tmp.path().join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth_path = dir.join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    store_near_expiry_sso(&r).await;
+    let before = std::fs::read_to_string(&auth_path).unwrap();
+
+    // No new file can be created in a read-only directory, so the temp +
+    // rename write fails; the lock file already exists and still opens.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestoreMode(dir.clone());
+    if std::fs::File::create(dir.join("probe")).is_ok() {
+        eprintln!("skipping: directory modes are not enforced for this user (root?)");
+        return;
+    }
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::ERROR)
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let (_, creds) = r
+        .get("anthropic", Some(AuthMode::Sso))
+        .await
+        .expect("the get still succeeds with the rotated token");
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth {
+            access, refresh, ..
+        } => assert_eq!(
+            (access.as_str(), refresh.as_str()),
+            ("access-2", "refresh-2")
+        ),
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+    token.assert_hits(1);
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("ERROR")
+            && log.contains("auth.json")
+            && log.contains("could not be persisted"),
+        "the loss is logged loudly, naming the file: {log:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&auth_path).unwrap(),
+        before,
+        "the file is untouched — nothing half-written"
+    );
+}

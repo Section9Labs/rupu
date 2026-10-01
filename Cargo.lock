@@ -4548,6 +4548,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "webbrowser",
 ]

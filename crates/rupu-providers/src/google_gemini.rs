@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
 use crate::error::ProviderError;
@@ -644,7 +644,7 @@ async fn refresh_and_persist_google_token(
             extra,
         };
         if let Err(e) = save_provider_auth(path, variant.provider_id(), &creds) {
-            warn!(error = %e, "failed to persist refreshed Google credentials");
+            error!(path = %path.display(), error = %e, "the refreshed Google token could not be written; this process keeps using it, the next one will need to log in again");
         }
     }
 
@@ -780,9 +780,7 @@ pub(crate) fn gemini_models_from_listing(
         .filter(|e| {
             e.get("supportedGenerationMethods")
                 .and_then(|m| m.as_array())
-                .is_none_or(|ms| {
-                    ms.iter().any(|x| x.as_str() == Some("generateContent"))
-                })
+                .is_none_or(|ms| ms.iter().any(|x| x.as_str() == Some("generateContent")))
         })
         .filter_map(|e| {
             let name = e.get("name")?.as_str()?;
@@ -3179,11 +3177,7 @@ mod llm_provider_impl_tests {
 
         // Verify no duplicates
         let ids: std::collections::HashSet<_> = ms.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(
-            ids.len(),
-            50,
-            "all 50 model ids should be unique"
-        );
+        assert_eq!(ids.len(), 50, "all 50 model ids should be unique");
 
         // Verify page 1 (no pageToken) was hit exactly once
         page1.assert_hits(1);

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
 use crate::error::ProviderError;
@@ -1167,13 +1167,13 @@ async fn refresh_and_persist_openai_token(
     };
     if let Some(ref store) = credential_store {
         if let Err(e) = store.update(crate::provider_id::ProviderId::OpenaiCodex, creds) {
-            warn!(error = %e, "failed to persist refreshed OpenAI credentials via store");
+            error!(error = %e, "the refreshed OpenAI token could not be persisted via the credential store; this process keeps using it, the next one will need to log in again");
         }
     } else if let Some(ref path) = auth_json_path {
         if let Err(e) =
             save_provider_auth(path, crate::provider_id::ProviderId::OpenaiCodex, &creds)
         {
-            warn!(error = %e, "failed to persist refreshed OpenAI credentials");
+            error!(path = %path.display(), error = %e, "the refreshed OpenAI token could not be written; this process keeps using it, the next one will need to log in again");
         }
     }
 
