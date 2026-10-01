@@ -479,6 +479,19 @@ impl RepoConnector for GitlabRepoConnector {
         translate_mr_to_pr(r.clone(), &resp)
     }
     async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError> {
+        // Clone URLs always name gitlab.com: for an account on another
+        // instance that would send its token to gitlab.com (HTTPS), or
+        // clone whatever gitlab.com has at the same path (SSH).
+        if let Some(instance) = self.client.self_managed_host() {
+            return Err(ScmError::BadRequest {
+                message: format!(
+                    "can't clone {}/{} from {instance}: rupu's GitLab clone URLs always \
+                     point at gitlab.com (self-managed clone hosts aren't supported yet), \
+                     which would receive this account's token; clone it with git directly",
+                    r.owner, r.repo
+                ),
+            });
+        }
         let protocol = self.client.clone_protocol();
         // GitLab token-as-password convention with username "oauth2" (HTTPS
         // only; the ssh form drops the token entirely). Taken fresh: a clone

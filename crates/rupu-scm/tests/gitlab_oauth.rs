@@ -96,3 +96,35 @@ async fn a_raw_file_read_sends_the_token_as_a_bearer_token() {
     assert_eq!(file.content, "# rupu");
     raw.assert();
 }
+
+/// Clone URLs always name gitlab.com (self-managed clone hosts are TODO.md
+/// work), so cloning for an account on another instance would hand that
+/// instance's token to gitlab.com over HTTPS — or, over SSH, silently clone
+/// whatever gitlab.com has at the same path. Refused up front instead,
+/// before any network request.
+#[tokio::test]
+async fn a_self_managed_account_s_repo_is_never_cloned_from_gitlab_com() {
+    for protocol in [rupu_scm::CloneProtocol::Https, rupu_scm::CloneProtocol::Ssh] {
+        let client = GitlabClient::with_options(
+            "glpat-fake-for-a-refusal-test".into(),
+            &rupu_scm::ScmClientOptions {
+                base_url: Some("https://gitlab.example.com/api/v4".into()),
+                clone_protocol: protocol,
+                ..Default::default()
+            },
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = GitlabRepoConnector::new(client)
+            .clone_to(&repo(), &dir.path().join("checkout"))
+            .await
+            .expect_err("refused");
+        match err {
+            rupu_scm::ScmError::BadRequest { message } => {
+                assert!(message.contains("gitlab.example.com"), "{message}");
+                assert!(message.contains("gitlab.com"), "{message}");
+            }
+            other => panic!("{protocol:?}: expected a refusal, got {other:?}"),
+        }
+    }
+}
