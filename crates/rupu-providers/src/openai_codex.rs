@@ -18,6 +18,10 @@ const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// The Codex model catalog. The only OpenAI endpoint that carries
 /// per-model limits; the public `/v1/models` has ids only (spec 2026-09-30 §3).
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0";
+/// Bound on the API-key path's first attempt (the chatgpt.com catalog), so
+/// a hanging catalog still leaves the ids-only `/v1/models` fallback time to
+/// run inside the caller's overall listing timeout (10s, spec §3).
+const CODEX_CATALOG_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Netflow-instrumented client bound to `sink`. No run context is
 /// available at construction — stamped
@@ -173,6 +177,8 @@ pub struct OpenAiCodexClient {
     /// platform API (ISSUES.md I-12).
     org_id: Option<String>,
     chatgpt_models_url: String,
+    /// [`CODEX_CATALOG_ATTEMPT_TIMEOUT`]; tests shorten it.
+    catalog_attempt_timeout: std::time::Duration,
 }
 
 /// The `OpenAI-Organization` header value for a request to `api_url`, if any.
@@ -248,6 +254,7 @@ impl OpenAiCodexClient {
                     credential_store: None,
                     org_id: None,
                     chatgpt_models_url: CODEX_MODELS_URL.to_string(),
+                    catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
@@ -262,6 +269,7 @@ impl OpenAiCodexClient {
                 credential_store: None,
                 org_id: None,
                 chatgpt_models_url: CODEX_MODELS_URL.to_string(),
+                catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
             }),
         }
     }
@@ -1008,7 +1016,16 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
         // API key: Codex metadata is only on the ChatGPT backend. Try it
         // first, then fall back to ids-only `/v1/models`.
         let backend = self.chatgpt_models_url.clone();
-        match self.get_models_json(&backend).await {
+        let attempt =
+            tokio::time::timeout(self.catalog_attempt_timeout, self.get_models_json(&backend))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ProviderError::Http(format!(
+                        "codex model catalog did not answer within {}s",
+                        self.catalog_attempt_timeout.as_secs_f32()
+                    )))
+                });
+        match attempt {
             Ok(v) => match models_from_listing(&v, true, pid) {
                 Ok(models) if !models.is_empty() => return Ok(models),
                 // A 200 whose every entry is `supported_in_api: false`
@@ -3443,6 +3460,65 @@ mod fetch_models_tests {
         public.assert();
         assert_eq!(models[0].id, "gpt-plain");
         assert_eq!(models[0].context_window, 0);
+    }
+
+    /// API-key path: the chatgpt.com catalog attempt has its own short
+    /// timeout, so a hanging catalog still leaves the ids-only `/v1/models`
+    /// fallback time to run inside the caller's overall 10s listing budget.
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_when_the_catalog_hangs() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .delay(std::time::Duration::from_secs(2))
+                .json_body(serde_json::json!({ "models": [
+                    { "slug": "gpt-api", "context_window": 200000, "supported_in_api": true }
+                ]}));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        client.catalog_attempt_timeout = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "the catalog attempt was cut off, not waited out"
+        );
+        public.assert();
+        assert_eq!(models[0].id, "gpt-plain");
+    }
+
+    #[test]
+    fn the_catalog_attempt_timeout_defaults_to_3s() {
+        assert_eq!(
+            CODEX_CATALOG_ATTEMPT_TIMEOUT,
+            std::time::Duration::from_secs(3)
+        );
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert_eq!(
+            client.catalog_attempt_timeout,
+            CODEX_CATALOG_ATTEMPT_TIMEOUT
+        );
     }
 
     #[tokio::test]
