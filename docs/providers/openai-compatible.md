@@ -112,7 +112,7 @@ Each `[[providers.<name>.models]]` entry:
 | ---------------- | ------ | :------: | ------------------------------ |
 | `id`             | string | yes      | Model id passed verbatim to the API.  |
 | `context_window` | u32    | no       | Input-token limit, used for compaction. When omitted, the server's `/v1/models` `max_model_len`; unknown if that is missing too. |
-| `max_output`     | u32    | no       | Maximum output tokens. When omitted, unknown and no cap is sent (the server caps output to fit). |
+| `max_output`     | u32    | no       | Maximum output tokens. When omitted, unknown and no cap is sent, so the server's own default applies (a `stream = false` server gets `8192`); set `max_output`, or `maxTokens` on the agent, if replies are truncated. |
 
 ## Limitations
 
@@ -124,9 +124,11 @@ Each `[[providers.<name>.models]]` entry:
 - `rupu models refresh` fetches the server's `/v1/models` (with the account's
   Bearer key) and caches it for an hour; `rupu models list` reads that cache
   plus the models declared in `[[providers.<name>.models]]`. A server without
-  a usable `/v1/models` makes refresh report an error for that account, and
-  its models are then only those declared in config. Only `max_model_len` is
-  read from the listing (as the input limit); no output cap is reported.
+  a usable `/v1/models` — or one whose reply has no `data` array — makes
+  refresh report an error for that account (and exit non-zero if it was the only
+  provider targeted), and its models are then only those declared in config.
+  Only `max_model_len` is read from the listing (as the input limit; a LoRA
+  entry without one of its own takes its parent's); no output cap is reported.
 - Cost tracking reports $0.00 for openai-compatible providers (no pricing
   tables are available). Usage token counts are still captured in JSONL
   transcripts if the server returns them.
