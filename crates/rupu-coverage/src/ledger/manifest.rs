@@ -25,6 +25,10 @@ pub struct RunManifest {
     /// (agent name for agent runs, session id for session runs, etc.).
     pub scope_name: String,
     pub workspace_path: std::path::PathBuf,
+    /// The engagement profiles selected for this run (e.g., ["code-review", "security"]).
+    /// Omitted from JSON if empty (backwards compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engagement_profiles: Vec<String>,
 }
 
 /// Append a manifest row to `runs.jsonl` (creates the file if absent).
@@ -86,6 +90,7 @@ mod tests {
             },
             scope_name: "reviewer".to_string(),
             workspace_path: std::path::PathBuf::from("/tmp/repo"),
+            engagement_profiles: vec![],
         }
     }
 
@@ -120,5 +125,47 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(tmp.path(), "tgt");
         assert!(read_manifests(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn manifest_without_engagement_profiles_field_loads_as_empty() {
+        // A manifest JSON without the engagement_profiles field should deserialize
+        // with engagement_profiles as an empty vec (backwards compatibility).
+        // Serialize a manifest without the field, then deserialize it back.
+        let m = sample("run_a");
+        let serialized = serde_json::to_string(&m).unwrap();
+        // The serialized form should not contain engagement_profiles (it's empty)
+        assert!(!serialized.contains("engagement_profiles"));
+
+        // Now manually create a JSON without the field
+        let json_obj = serde_json::from_str::<serde_json::Value>(&serialized).unwrap();
+        let manifest: RunManifest = serde_json::from_value(json_obj).unwrap();
+        assert_eq!(manifest.engagement_profiles, vec![] as Vec<String>);
+    }
+
+    #[test]
+    fn manifest_with_engagement_profiles_field_round_trips() {
+        // A manifest JSON with engagement_profiles should deserialize and serialize correctly.
+        let mut manifest = sample("run_a");
+        manifest.engagement_profiles = vec!["profile1".to_string(), "profile2".to_string()];
+
+        // Verify serialization includes engagement_profiles
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(serialized.contains("engagement_profiles"));
+
+        // Verify round-trip
+        let deserialized: RunManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.engagement_profiles, vec!["profile1".to_string(), "profile2".to_string()]);
+    }
+
+    #[test]
+    fn manifest_with_empty_engagement_profiles_skips_in_serialization() {
+        // A manifest with empty engagement_profiles should not include the field in JSON
+        // (due to skip_serializing_if).
+        let manifest = sample("run_a");
+        assert!(manifest.engagement_profiles.is_empty());
+
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(!serialized.contains("engagement_profiles"));
     }
 }

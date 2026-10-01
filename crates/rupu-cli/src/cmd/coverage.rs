@@ -1492,6 +1492,7 @@ mod tests {
             },
             scope_name: "ses_1".to_string(),
             workspace_path: tmp.path().to_path_buf(),
+            engagement_profiles: vec![],
         };
         append_manifest(&paths, &m).unwrap();
         let loaded = find_manifest(&paths, "run_sess").unwrap().unwrap();
@@ -1729,6 +1730,7 @@ mod tests {
             },
             scope_name: "a".to_string(),
             workspace_path: tmp.path().to_path_buf(),
+            engagement_profiles: vec![],
         };
         append_manifest(&paths, &m).unwrap();
 

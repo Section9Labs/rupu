@@ -12,6 +12,7 @@ pub struct RerunInvocation {
     pub user_prompt: String,
     pub permission_mode: String,
     pub workspace_path: std::path::PathBuf,
+    pub engagement_profiles: Vec<String>,
 }
 
 /// Why a run can't be replayed.
@@ -39,6 +40,7 @@ pub fn plan_rerun(manifest: &RunManifest) -> Result<RerunInvocation, RerunError>
             user_prompt: manifest.user_prompt.clone(),
             permission_mode: manifest.permission_mode.clone(),
             workspace_path: manifest.workspace_path.clone(),
+            engagement_profiles: manifest.engagement_profiles.clone(),
         }),
         Surface::Session => Err(RerunError::UnsupportedSurface("session".to_string())),
         Surface::Workflow => Err(RerunError::UnsupportedSurface("workflow".to_string())),
@@ -72,6 +74,7 @@ mod tests {
             },
             scope_name: "reviewer".to_string(),
             workspace_path: std::path::PathBuf::from("/tmp/repo"),
+            engagement_profiles: vec![],
         }
     }
 
@@ -82,6 +85,7 @@ mod tests {
         assert_eq!(inv.user_prompt, "Review.");
         assert_eq!(inv.permission_mode, "bypass");
         assert_eq!(inv.workspace_path, std::path::PathBuf::from("/tmp/repo"));
+        assert_eq!(inv.engagement_profiles, vec![] as Vec<String>);
     }
 
     #[test]
@@ -95,5 +99,20 @@ mod tests {
     fn workflow_and_autoflow_are_unsupported() {
         assert!(plan_rerun(&manifest_with_surface(Surface::Workflow)).is_err());
         assert!(plan_rerun(&manifest_with_surface(Surface::Autoflow)).is_err());
+    }
+
+    #[test]
+    fn plan_rerun_preserves_engagement_profiles() {
+        let mut manifest = manifest_with_surface(Surface::Agent);
+        manifest.engagement_profiles = vec!["profile1".to_string(), "profile2".to_string()];
+        let inv = plan_rerun(&manifest).unwrap();
+        assert_eq!(inv.engagement_profiles, vec!["profile1".to_string(), "profile2".to_string()]);
+    }
+
+    #[test]
+    fn plan_rerun_with_empty_engagement_profiles() {
+        let manifest = manifest_with_surface(Surface::Agent);
+        let inv = plan_rerun(&manifest).unwrap();
+        assert_eq!(inv.engagement_profiles, vec![] as Vec<String>);
     }
 }

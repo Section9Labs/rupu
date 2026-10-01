@@ -982,6 +982,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 concerns: block.clone(),
                 scope_name: resolved_scope.to_string(),
                 workspace_path: opts.workspace_path.clone(),
+                engagement_profiles: vec![],
             };
             if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
                 tracing::warn!(error = %e, "failed to write coverage run manifest");
