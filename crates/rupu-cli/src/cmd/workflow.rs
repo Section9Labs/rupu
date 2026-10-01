@@ -3054,7 +3054,7 @@ async fn approve(
             // runner to apply (spec §7): prune its path, run its
             // `on_reject` chain, carry on with every other path.
             if pending_gate_decision(&store, run_id, &step_id) {
-                let result = crate::resume::resume_decided(&store, run_id, mode).await?;
+                let result = crate::resume::resume_decided(&store, &global, run_id, mode).await?;
                 report_resumed_run(&result, &format!("applied gate `{step_id}`'s rejection"));
                 return Ok(());
             }
@@ -3105,6 +3105,7 @@ async fn approve(
     // hands off instead of starting a second runner.
     let outcome = crate::resume::resume_run(
         &store,
+        &global,
         run_id,
         &awaited_step_id,
         mode,
@@ -3287,7 +3288,7 @@ pub(crate) async fn resume_run(
         RunStatus::AwaitingApproval | RunStatus::Running
     ) && !record.gate_decisions.is_empty()
     {
-        let result = crate::resume::resume_decided(&store, run_id, mode).await?;
+        let result = crate::resume::resume_decided(&store, &global, run_id, mode).await?;
         report_resumed_run(&result, "to apply its recorded gate decisions");
         return Ok(());
     }
@@ -3887,7 +3888,7 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
     // runner does that now (or hand it to the runner already executing it).
     if pending_gate_decision(&store, run_id, &rejected_step_id) {
         println!("rupu: gate `{rejected_step_id}` rejected on run {run_id}");
-        let result = crate::resume::resume_decided(&store, run_id, None).await?;
+        let result = crate::resume::resume_decided(&store, &global, run_id, None).await?;
         report_resumed_run(
             &result,
             &format!("to apply gate `{rejected_step_id}`'s rejection"),
