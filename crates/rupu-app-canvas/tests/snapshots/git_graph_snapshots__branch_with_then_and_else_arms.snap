@@ -1,0 +1,88 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+expression: rows
+---
+- cells:
+    - Bullet: complete
+    - Space: 2
+    - Label: classify
+    - Space: 2
+    - Meta: classifier
+  anchor:
+    - classify
+    - complete
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: complete
+    - Space: 2
+    - Label: route
+    - Space: 2
+    - Meta: "branch · when: {{ steps.classify.output == 'bug' }}"
+  anchor:
+    - route
+    - complete
+- cells:
+    - Branch:
+        - Top
+        - complete
+    - Space: 1
+    - Meta: ▶ then →
+    - Space: 1
+    - Label: fix
+  anchor: ~
+- cells:
+    - Branch:
+        - Bot
+        - complete
+    - Space: 1
+    - Meta: ▶ then →
+    - Space: 1
+    - Label: notify
+  anchor: ~
+- cells:
+    - Branch:
+        - Bot
+        - skipped
+    - Space: 1
+    - Meta: ⊘ else →
+    - Space: 1
+    - Label: close
+  anchor: ~
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: complete
+    - Space: 2
+    - Label: fix
+    - Space: 2
+    - Meta: fixer
+  anchor:
+    - fix
+    - complete
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: complete
+    - Space: 2
+    - Label: notify
+    - Space: 2
+    - Meta: notifier
+  anchor:
+    - notify
+    - complete
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: skipped
+    - Space: 2
+    - Label: close
+    - Space: 2
+    - Meta: closer
+  anchor:
+    - close
+    - skipped

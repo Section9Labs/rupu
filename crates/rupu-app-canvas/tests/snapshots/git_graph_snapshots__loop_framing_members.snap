@@ -1,0 +1,94 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+expression: rows
+---
+- cells:
+    - Bullet: complete
+    - Space: 2
+    - Label: seed
+    - Space: 2
+    - Meta: seeder
+  anchor:
+    - seed
+    - complete
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Branch:
+        - Mid
+        - waiting
+    - Branch:
+        - Top
+        - waiting
+    - Space: 1
+    - Label: "↻ loop:refine"
+    - Space: 2
+    - Meta: "until {{ steps.critique.output }} · max 5"
+  anchor: ~
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Bullet: complete
+    - Space: 2
+    - Label: gen
+    - Space: 2
+    - Meta: generator
+  anchor:
+    - gen
+    - complete
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Bullet: working
+    - Space: 2
+    - Label: test
+    - Space: 2
+    - Meta: tester
+  anchor:
+    - test
+    - working
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Bullet: waiting
+    - Space: 2
+    - Label: critique
+    - Space: 2
+    - Meta: critic
+  anchor:
+    - critique
+    - waiting
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Branch:
+        - Merge
+        - waiting
+    - Space: 1
+    - Label: "↺ loop:refine"
+    - Space: 2
+    - Meta: loop-back
+  anchor: ~
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: ship
+    - Space: 2
+    - Meta: shipper
+  anchor:
+    - ship
+    - waiting
