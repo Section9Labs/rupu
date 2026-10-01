@@ -6733,18 +6733,30 @@ pub async fn run_reject_cleanup(
 
     // 2. The gate's own rejected result, recorded BEFORE the chain runs
     //    (a `via`/`decision` variant of Task 3's now-generalized
-    //    `emit_gate_result`).
-    emit_gate_result(
-        &opts,
-        &run_id,
-        gate,
-        "rejected",
-        via,
-        approver,
-        Some(reason),
-        &mut step_results,
-        None,
-    );
+    //    `emit_gate_result`) — unless the prior results already hold it:
+    //    the gate sweep records the row itself ([`record_gate_decision`])
+    //    when a timed-out gate's chain cannot be built, and retries the
+    //    chain here, from the run's cleanup-pending marker, once it can.
+    //    That retry must not write the row a second time.
+    let already_recorded = step_results.iter().any(|r| {
+        r.step_id == rejected_step_id
+            && r.kind == crate::runs::StepKind::ApprovalGate
+            && serde_json::from_str::<serde_json::Value>(&r.output)
+                .is_ok_and(|o| o["decision"] == "rejected")
+    });
+    if !already_recorded {
+        emit_gate_result(
+            &opts,
+            &run_id,
+            gate,
+            "rejected",
+            via,
+            approver,
+            Some(reason),
+            &mut step_results,
+            None,
+        );
+    }
 
     // 3. Dispatch each on_reject step through the same per-step
     //    machinery `run_workflow`'s linear arm uses (StepStarted event →

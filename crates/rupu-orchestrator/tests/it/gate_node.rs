@@ -16,7 +16,8 @@ use rupu_agent::AgentRunOpts;
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
 use rupu_orchestrator::runner::{
-    run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, StepFactory,
+    record_gate_decision, run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState,
+    StepFactory,
 };
 use rupu_orchestrator::{
     ApprovalDecision, ApprovalError, RunStatus, RunStore, StepKind, StepResult, Workflow,
@@ -1076,6 +1077,124 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         Some("run_completed"),
         "events.jsonl must end with run_completed even for an empty cleanup chain; got {types:?}"
     );
+}
+
+/// `run_reject_cleanup` records the gate's rejected result once. The prior
+/// results it is handed may already hold it: the gate sweep writes the row
+/// with `record_gate_decision` when a timed-out gate's chain cannot be
+/// built, and retries the chain from the run's cleanup-pending marker once
+/// it can — that retry runs the chain against the row on disk and must not
+/// write it a second time.
+#[tokio::test]
+async fn reject_cleanup_does_not_record_the_gate_twice_on_a_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_REJECT_EMPTY).unwrap();
+
+    let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_reject_retry".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT_EMPTY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let run_id = run_workflow(opts1)
+        .await
+        .expect("phase 1 returns Ok")
+        .run_id;
+    let (rejected_step_id, reason) = match store
+        .reject(&run_id, "operator", "timed out", chrono::Utc::now())
+        .expect("reject succeeds")
+    {
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => (step_id, reason),
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+
+    // The sweep's first attempt could not build the chain: it recorded the
+    // gate's rejected row on its own.
+    record_gate_decision(
+        &store,
+        &run_id,
+        &rejected_step_id,
+        "rejected",
+        "timeout",
+        None,
+        Some(&reason),
+    )
+    .unwrap();
+    let prior: Vec<StepResult> = store
+        .read_step_results(&run_id)
+        .unwrap()
+        .iter()
+        .map(StepResult::from)
+        .collect();
+    assert_eq!(prior.len(), 1, "the row the sweep recorded");
+
+    // The retry: the chain against the results on disk, the row included.
+    let record = store.load(&run_id).unwrap();
+    let events_path = store.root.join(&run_id).join("events.jsonl");
+    let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
+    let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: record.workspace_id.clone(),
+        workspace_path: record.workspace_path.clone(),
+        transcript_dir: record.transcript_dir.clone(),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT_EMPTY.to_string()),
+        resume_from: Some(ResumeState::from_rejection(
+            run_id.clone(),
+            prior,
+            rejected_step_id.clone(),
+            reason.clone(),
+        )),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: Some(sink),
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout", None)
+        .await
+        .expect("the retry is Ok");
+
+    let records = store.read_step_results(&run_id).unwrap();
+    let gate_rows: Vec<_> = records.iter().filter(|r| r.step_id == "gate").collect();
+    assert_eq!(
+        gate_rows.len(),
+        1,
+        "the gate's rejected row is recorded once across the attempt and its retry: {records:?}"
+    );
+    let output: serde_json::Value = serde_json::from_str(&gate_rows[0].output).unwrap();
+    assert_eq!(output["decision"], "rejected");
+    assert_eq!(output["via"], "timeout");
+    // The log still ends closed.
+    let types = read_event_types(&events_path);
+    assert_eq!(types.last().map(String::as_str), Some("run_completed"));
 }
 
 // ---------------------------------------------------------------------------

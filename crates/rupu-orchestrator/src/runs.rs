@@ -324,7 +324,12 @@ pub struct RunRecord {
     /// `on_timeout: reject` auto-expiry branch inside `reject_gate` (that
     /// path is already covered — the CLI's `via: "timeout"` handling and
     /// the sweep's own proactive `expire_gate_if_overdue` arm both run the
-    /// chain synchronously without needing a marker).
+    /// chain synchronously without needing a marker) — except that the
+    /// sweep sets it itself when that chain cannot be built (a config
+    /// that does not parse), having recorded the gate's rejected row on
+    /// its own, so its `Rejected` arm retries the chain on a later tick
+    /// (`run_reject_cleanup` writes no second row for a gate result
+    /// already on disk).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_cleanup_pending: Option<RejectCleanupMarker>,
     /// The effective permission mode (`ask` / `bypass` / `readonly`) this
@@ -3248,6 +3253,47 @@ impl RunStore {
         record.resume_gate_id = gate.map(str::to_string);
         record.resume_approver = Some(approver.to_string());
         self.update(&record)
+    }
+
+    /// Ask the resume worker for a runner for a run whose recorded gate
+    /// decisions no runner is applying: the `workflow resume` a spawner
+    /// started for them died before it claimed the run (its own rebuild
+    /// failed — a config that does not parse), or a live runner crashed on
+    /// a run still parked at a sibling. The decisions are durable; the
+    /// marker a spawner consumes at its spawn is not, so nothing else
+    /// retries them. Under the run lock, on the record as it is now: when
+    /// the run is `Running` or `AwaitingApproval` with a decision recorded,
+    /// has no live runner ([`live_runner`](Self::live_runner)), no marker
+    /// and no live claim, and its newest decision is older than
+    /// [`RESUME_LEASE`](Self::RESUME_LEASE) — the time a spawned runner is
+    /// given to claim the run — the marker is set (approver `"sweep"`, no
+    /// gate and no mode: the decisions carry their own) and this is
+    /// `Ok(true)`; otherwise nothing is written and it is `Ok(false)`. A
+    /// `Paused` run is never re-requested: the operator paused it. The
+    /// wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn request_runner_for_stranded_decisions(
+        &self,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let record = self.load(run_id)?;
+        let newest_decision = record.gate_decisions.iter().map(|d| d.decided_at).max();
+        let stranded = matches!(
+            record.status,
+            RunStatus::Running | RunStatus::AwaitingApproval
+        ) && record.resume_requested_at.is_none()
+            && record
+                .resume_claimed_at
+                .is_none_or(|at| now - at > Self::RESUME_LEASE)
+            && newest_decision.is_some_and(|at| now - at > Self::RESUME_LEASE)
+            && self.live_runner(&record).is_none();
+        if !stranded {
+            return Ok(false);
+        }
+        self.mark_resume_requested(record, "sweep", None, None, now)?;
+        Ok(true)
     }
 
     /// Runs that a web/delegated gate decision OR manual-pause resume
@@ -6821,6 +6867,124 @@ mod tests {
         assert_eq!(untouched.resume_requested_at, Some(now));
         assert_eq!(untouched.resume_claimed_at, Some(now));
         assert_eq!(untouched.resume_claimed_by.as_deref(), Some("worker"));
+    }
+
+    /// A recorded decision with no runner, no marker and no live claim,
+    /// older than a runner's grace, gets the resume marker set again (the
+    /// sweep's re-request); the marker is then there for the resume worker
+    /// and a second call writes nothing. Anything that means a runner is
+    /// on its way or at work — a fresh decision, a marker, a live claim, a
+    /// live runner — or a pause leaves the record alone.
+    #[test]
+    fn request_runner_for_stranded_decisions_marks_only_a_decision_nobody_is_applying() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let stale = now - RunStore::RESUME_LEASE - chrono::Duration::seconds(1);
+        let decided = |at| GateDecision {
+            step_id: "gate".into(),
+            verdict: GateVerdict::Approved,
+            via: "human".into(),
+            approver: Some("web".into()),
+            reason: None,
+            decided_at: at,
+        };
+        let mut rec = sample_record("run_stranded");
+        rec.status = RunStatus::Running;
+        rec.gate_decisions = vec![decided(stale)];
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(store
+            .request_runner_for_stranded_decisions(&rec.id, now)
+            .unwrap());
+        let marked = store.load(&rec.id).unwrap();
+        assert_eq!(marked.resume_requested_at, Some(now));
+        assert_eq!(marked.resume_approver.as_deref(), Some("sweep"));
+        assert_eq!(marked.resume_gate_id, None);
+        assert_eq!(marked.resume_mode, None);
+        assert_eq!(marked.status, RunStatus::Running);
+        assert_eq!(marked.gate_decisions.len(), 1);
+        assert_eq!(store.list_pending_resume(now).unwrap().len(), 1);
+        // The marker is there: a second call writes nothing.
+        assert!(!store
+            .request_runner_for_stranded_decisions(&rec.id, now)
+            .unwrap());
+        assert_eq!(store.load(&rec.id).unwrap().resume_requested_at, Some(now));
+
+        // Parked at a sibling with a stranded decision: re-requested too.
+        let mut parked = awaiting_record("run_stranded_parked");
+        parked.gate_decisions = vec![decided(stale)];
+        store.create(parked.clone(), SAMPLE_YAML).unwrap();
+        assert!(store
+            .request_runner_for_stranded_decisions(&parked.id, now)
+            .unwrap());
+        assert_eq!(
+            store.load(&parked.id).unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+
+        // Left alone: a fresh decision (its runner is on its way).
+        let mut fresh = sample_record("run_fresh");
+        fresh.status = RunStatus::Running;
+        fresh.gate_decisions = vec![decided(now - chrono::Duration::seconds(5))];
+        store.create(fresh.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store
+            .request_runner_for_stranded_decisions(&fresh.id, now)
+            .unwrap());
+        // Left alone: a live claim (a spawner is mid-flight, or backing off).
+        let mut claimed = sample_record("run_claimed");
+        claimed.status = RunStatus::Running;
+        claimed.gate_decisions = vec![decided(stale)];
+        claimed.resume_claimed_at = Some(now - chrono::Duration::seconds(5));
+        claimed.resume_claimed_by = Some("worker".into());
+        store.create(claimed.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store
+            .request_runner_for_stranded_decisions(&claimed.id, now)
+            .unwrap());
+        // ... until that claim is stale.
+        assert!(store
+            .request_runner_for_stranded_decisions(
+                &claimed.id,
+                now + RunStore::RESUME_LEASE + chrono::Duration::seconds(1)
+            )
+            .unwrap());
+        // Left alone: a live runner.
+        let mut live = sample_record("run_live");
+        live.status = RunStatus::Running;
+        live.gate_decisions = vec![decided(stale)];
+        live.runner_pid = Some(std::process::id());
+        store.create(live.clone(), SAMPLE_YAML).unwrap();
+        let _guard = store.register_runner(&live.id);
+        assert!(!store
+            .request_runner_for_stranded_decisions(&live.id, now)
+            .unwrap());
+        // Left alone: no decision, a pause, a terminal run.
+        let mut none = sample_record("run_no_decision");
+        none.status = RunStatus::Running;
+        store.create(none.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store
+            .request_runner_for_stranded_decisions(&none.id, now)
+            .unwrap());
+        for (id, status) in [
+            ("run_paused_decision", RunStatus::Paused),
+            ("run_done_decision", RunStatus::Completed),
+        ] {
+            let mut rec = sample_record(id);
+            rec.status = status;
+            rec.gate_decisions = vec![decided(stale)];
+            store.create(rec.clone(), SAMPLE_YAML).unwrap();
+            assert!(
+                !store
+                    .request_runner_for_stranded_decisions(id, now)
+                    .unwrap(),
+                "{id}"
+            );
+            assert_eq!(store.load(id).unwrap().resume_requested_at, None);
+        }
+        assert!(matches!(
+            store.request_runner_for_stranded_decisions("run_missing", now),
+            Err(RunStoreError::NotFound(_))
+        ));
     }
 
     /// `modify_fields` writes its fields onto the record whatever its
