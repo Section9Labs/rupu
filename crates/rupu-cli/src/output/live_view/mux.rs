@@ -190,6 +190,8 @@ const MIN_TAILS: usize = 4;
 const MAX_TAILS: usize = 64;
 /// Merged feed ring capacity (oldest rows drop first).
 const RING_CAP: usize = 500;
+/// Pinned-stream buffer capacity (oldest rows drop first).
+const PINNED_CAP: usize = 500;
 /// Descriptors left untouched when deciding whether another tail may open.
 const FD_RESERVE: u64 = 16;
 
@@ -223,24 +225,24 @@ struct OpenTail {
     skip: usize,
 }
 
-struct RingEntry {
-    path: PathBuf,
-    feed: FeedLine,
-}
-
 /// Bounded multi-transcript tail: merges the unit / sub-agent transcripts a
 /// run produces into one arrival-ordered firehose without ever touching more
 /// than `max_tails` files per tick, and without opening any more when the
 /// process is short of file descriptors. The pinned (drilled) transcript is
-/// always tailed and never evicted. Display-only: token / usage totals live
-/// elsewhere.
+/// always tailed and never evicted, and its own stream is kept in a dedicated
+/// buffer so it stays complete however chatty the siblings are. Display-only:
+/// token / usage totals live elsewhere.
 pub struct TranscriptMux {
     /// Concurrently tailed transcripts, pinned included (clamped 4..=64).
     max_tails: usize,
     pinned: Option<PathBuf>,
     observed: HashMap<PathBuf, Observed>,
     open: HashMap<PathBuf, OpenTail>,
-    ring: VecDeque<RingEntry>,
+    /// Merged cross-unit firehose, arrival order.
+    ring: VecDeque<FeedLine>,
+    /// The pinned transcript's OWN stream (history from offset 0, then live),
+    /// independent of the shared ring so sibling chatter can't scroll it out.
+    pinned_buf: VecDeque<Line>,
     /// Monotonic stamp source for `order` / `last_active` / `served`.
     seq: u64,
     /// `(open descriptors, limit)`; injectable so tests don't depend on the
@@ -258,6 +260,7 @@ impl TranscriptMux {
             observed: HashMap::new(),
             open: HashMap::new(),
             ring: VecDeque::new(),
+            pinned_buf: VecDeque::new(),
             seq: 0,
             fd_probe: rupu_agent::fd_budget::fd_usage,
         }
@@ -273,10 +276,18 @@ impl TranscriptMux {
     }
 
     /// Pin the drilled unit's transcript (or clear the pin). A pinned path is
-    /// always tailed and exempt from eviction.
+    /// always tailed and exempt from eviction. Re-pinning the SAME path is a
+    /// no-op (callers may pin every tick); moving or clearing the pin resets
+    /// the stream buffer, and a newly pinned path is re-tailed from offset 0
+    /// on the next [`drain`](Self::drain) so its whole history fills the buffer.
     pub fn pin(&mut self, path: Option<PathBuf>) {
+        if self.pinned == path {
+            return;
+        }
+        self.pinned_buf.clear();
         if let Some(p) = &path {
             self.register(p.clone(), None);
+            self.open.remove(p);
         }
         self.pinned = path;
     }
@@ -284,7 +295,8 @@ impl TranscriptMux {
     /// Advance the open tails: the pinned one plus the most-recently-active
     /// observed paths that fit the budget. New events are projected, tagged
     /// with their path's codename, and appended to the capped ring in arrival
-    /// order. A transcript that cannot be read (not created yet, fd
+    /// order (the pinned path's rows also go to its dedicated stream buffer).
+    /// A transcript that cannot be read (not created yet, fd
     /// exhaustion) is swallowed and simply contributes nothing this tick.
     pub fn drain(&mut self) {
         self.bump_changed_closed();
@@ -308,20 +320,14 @@ impl TranscriptMux {
 
     /// The merged cross-unit ring, oldest to newest.
     pub fn firehose_lines(&self) -> Vec<Line> {
-        self.ring.iter().map(|e| e.feed.line.clone()).collect()
+        self.ring.iter().map(|f| f.line.clone()).collect()
     }
 
-    /// Only the pinned transcript's rows still in the ring (its stream);
-    /// empty when nothing is pinned.
+    /// The pinned transcript's own stream, oldest to newest: its history from
+    /// offset 0 plus live rows, kept in a dedicated buffer so it is complete
+    /// regardless of sibling activity. Empty when nothing is pinned.
     pub fn pinned_lines(&self) -> Vec<Line> {
-        let Some(pinned) = self.pinned.as_ref() else {
-            return Vec::new();
-        };
-        self.ring
-            .iter()
-            .filter(|e| e.path == *pinned)
-            .map(|e| e.feed.line.clone())
-            .collect()
+        self.pinned_buf.iter().cloned().collect()
     }
 
     fn register(&mut self, path: PathBuf, codename: Option<String>) {
@@ -387,8 +393,9 @@ impl TranscriptMux {
     }
 
     /// Open (if needed) and drain one transcript, projecting its new events
-    /// into the ring.
+    /// into the ring (and, for the pinned path, its stream buffer).
     fn drain_one(&mut self, path: &Path) {
+        let is_pinned = self.pinned.as_deref() == Some(path);
         let Some(entry) = self.observed.get_mut(path) else {
             return;
         };
@@ -407,20 +414,32 @@ impl TranscriptMux {
 
         let mut fresh = false;
         for ev in tail.tailer.drain() {
-            if tail.skip > 0 {
+            // Replayed prefix after a re-open from offset 0: already in the
+            // ring, so it never re-enters it. The pinned stream wants it
+            // anyway (that is its history); other paths skip it outright.
+            let replay = tail.skip > 0;
+            if replay {
                 tail.skip -= 1;
-                continue;
-            }
-            fresh = true;
-            entry.consumed += 1;
-            if let Some(feed) = project_event(&ev, entry.codename.as_deref()) {
-                if self.ring.len() >= RING_CAP {
-                    self.ring.pop_front();
+                if !is_pinned {
+                    continue;
                 }
-                self.ring.push_back(RingEntry {
-                    path: path.to_path_buf(),
-                    feed,
-                });
+            } else {
+                fresh = true;
+                entry.consumed += 1;
+            }
+            if let Some(feed) = project_event(&ev, entry.codename.as_deref()) {
+                if is_pinned {
+                    if self.pinned_buf.len() >= PINNED_CAP {
+                        self.pinned_buf.pop_front();
+                    }
+                    self.pinned_buf.push_back(feed.line.clone());
+                }
+                if !replay {
+                    if self.ring.len() >= RING_CAP {
+                        self.ring.pop_front();
+                    }
+                    self.ring.push_back(feed);
+                }
             }
         }
         if fresh {
@@ -1110,5 +1129,109 @@ mod tests {
         assert_eq!(lines[0], "▪ m100");
         assert_eq!(lines[499], "▪ m599");
         assert_eq!(m.pinned_lines().len(), 500);
+    }
+
+    #[test]
+    fn pinned_stream_stays_complete_while_chatty_siblings_flood_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let quiet = dir.path().join("quiet.jsonl");
+        write_events(&quiet, &[msg("q one"), msg("q two"), msg("q three")]);
+        let chatty = dir.path().join("chatty.jsonl");
+        let flood: Vec<Event> = (0..650).map(|i| msg(&format!("s{i}"))).collect();
+        write_events(&chatty, &flood);
+
+        let mut m = mux(8);
+        m.observe(quiet.clone(), Some("q#1".into()));
+        m.observe(chatty.clone(), Some("s#1".into()));
+        m.pin(Some(quiet.clone()));
+        m.drain();
+        // More sibling chatter over later ticks; the pinned unit stays quiet.
+        for tick in 0..3 {
+            for i in 0..100 {
+                append_event(&chatty, &msg(&format!("late{tick}-{i}")));
+            }
+            m.pin(Some(quiet.clone())); // re-pinning each tick must be harmless
+            m.drain();
+        }
+
+        // The pinned stream still shows the quiet unit's whole history...
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec![
+                "q#1 ▪ q one".to_string(),
+                "q#1 ▪ q two".into(),
+                "q#1 ▪ q three".into()
+            ]
+        );
+        // ...even though the shared firehose has long scrolled it out and is
+        // full of the siblings' chatter.
+        let all = plain_lines(&m.firehose_lines());
+        assert_eq!(all.len(), 500);
+        assert!(all.iter().all(|l| !l.contains("q#1")), "{all:?}");
+        assert_eq!(all[499], "s#1 ▪ late2-99");
+    }
+
+    #[test]
+    fn re_pinning_the_same_path_does_not_reset_or_duplicate_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a"]);
+        let mut m = mux(8);
+        m.pin(Some(paths[0].clone()));
+        m.drain();
+        for n in 0..3 {
+            m.pin(Some(paths[0].clone()));
+            append_event(&paths[0], &msg(&format!("a more{n}")));
+            m.drain();
+        }
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec![
+                "▪ a first".to_string(),
+                "▪ a second".into(),
+                "▪ a more0".into(),
+                "▪ a more1".into(),
+                "▪ a more2".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pinning_an_already_drained_unit_backfills_its_history_without_touching_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = seed(dir.path(), &["a", "b"]);
+        let mut m = mux(8);
+        m.observe(paths[0].clone(), Some("a#1".into()));
+        m.observe(paths[1].clone(), Some("b#1".into()));
+        m.drain();
+        let ring_before = plain_lines(&m.firehose_lines());
+        assert_eq!(ring_before.len(), 4);
+        assert!(m.pinned_lines().is_empty());
+
+        // Drill into `a`: its history (already consumed into the ring) fills
+        // the stream buffer; the ring must not see it a second time.
+        m.pin(Some(paths[0].clone()));
+        m.drain();
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec!["a#1 ▪ a first".to_string(), "a#1 ▪ a second".into()]
+        );
+        assert_eq!(plain_lines(&m.firehose_lines()), ring_before);
+
+        // Live output after the replay reaches both.
+        append_event(&paths[0], &msg("a third"));
+        m.drain();
+        assert_eq!(m.pinned_lines().len(), 3);
+        assert_eq!(m.firehose_lines().len(), 5);
+
+        // Moving the pin swaps the stream; clearing it empties it.
+        m.pin(Some(paths[1].clone()));
+        m.drain();
+        assert_eq!(
+            plain_lines(&m.pinned_lines()),
+            vec!["b#1 ▪ b first".to_string(), "b#1 ▪ b second".into()]
+        );
+        assert_eq!(m.firehose_lines().len(), 5, "no ring duplicates");
+        m.pin(None);
+        assert!(m.pinned_lines().is_empty());
     }
 }
