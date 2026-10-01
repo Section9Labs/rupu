@@ -453,9 +453,14 @@ pub(crate) fn resolve_host(
 /// - `Unsupported` / `Invalid` → 501: the host cannot serve this listing (an
 ///   old remote rupu, a transport with no such surface). The web shows the
 ///   host as *unavailable*, with this reason.
-/// - `NotFound` → 404.
-/// - everything else → 502: the host gave no usable answer. The web shows it
-///   as *offline*, with this reason.
+/// - everything else, `NotFound` included → 502: the host gave no usable
+///   answer. The web shows it as *offline*, with this reason.
+///
+/// A 404 on these paths comes only from [`resolve_host`] (an unknown host id =
+/// the host was removed from the registry), and the web treats it as exactly
+/// that. A connector `NotFound` on a LIST call cannot mean that — a reachable
+/// remote that answers a list route with HTTP 404 surfaces as `NotFound` — so
+/// it maps to 502, never 404.
 ///
 /// Was a bare 500 for all of them, which cannot tell "down" from "too old".
 pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
@@ -463,7 +468,6 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
         HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
             ApiError::not_available(e.to_string())
         }
-        HostConnectorError::NotFound(_) => ApiError::not_found(e.to_string()),
         other => ApiError::bad_gateway(other.to_string()),
     }
 }
@@ -3125,7 +3129,7 @@ pub(crate) mod tests {
             ),
             (
                 HostConnectorError::NotFound("x".into()),
-                StatusCode::NOT_FOUND,
+                StatusCode::BAD_GATEWAY,
             ),
             (
                 HostConnectorError::Unreachable("x".into()),
@@ -3205,6 +3209,25 @@ pub(crate) mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    /// The only 404 left on a single-host list path: a host id that is not in
+    /// the registry (the host was removed). Connector `NotFound` is 502.
+    #[tokio::test]
+    async fn single_remote_host_run_list_for_an_unregistered_host_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state_with_fake_host(&tmp, serde_json::json!({}));
+        let err = list_runs(
+            State(s),
+            Query(RunsListQuery {
+                offset: None,
+                limit: None,
+                host: Some("host_missing".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
