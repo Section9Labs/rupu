@@ -3092,6 +3092,34 @@ async fn approve(
 /// paused step re-runs from where its agent left off instead of from
 /// scratch. A step-boundary pause (no seed) just replays like a terminal
 /// resume.
+/// The resume's flip to `Running` found the run's status changed since it
+/// was loaded as `original`: a cancel that landed in between must not be
+/// resumed over (the run stays cancelled and does not start), and a run
+/// another process resumed meanwhile must not run twice. Either way the
+/// resume fails — a non-zero exit — naming what the run is now.
+fn resume_refused_by_status_change(
+    run_id: &str,
+    original: rupu_orchestrator::RunStatus,
+    current: &rupu_orchestrator::RunRecord,
+) -> anyhow::Error {
+    match current.status {
+        rupu_orchestrator::RunStatus::Cancelled => anyhow::anyhow!(
+            "run {run_id} was cancelled before it could resume{} (it was `{}` when loaded); not starting it",
+            current
+                .error_message
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default(),
+            original.as_str()
+        ),
+        other => anyhow::anyhow!(
+            "run {run_id} is now `{}` (it was `{}` when loaded); not resuming it",
+            other.as_str(),
+            original.as_str()
+        ),
+    }
+}
+
 pub(crate) async fn resume_run(
     run_id: &str,
     mode: Option<&str>,
@@ -3104,7 +3132,7 @@ pub(crate) async fn resume_run(
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
 
-    let mut record = store.load(run_id).map_err(|e| match e {
+    let record = store.load(run_id).map_err(|e| match e {
         rupu_orchestrator::RunStoreError::NotFound(id) => {
             anyhow::anyhow!("run not found: {id}\n  hint: list runs with `rupu workflow runs`")
         }
@@ -3229,14 +3257,35 @@ pub(crate) async fn resume_run(
 
     // Flip the persisted record back to Running and clear the prior
     // terminal markers so the runner's terminal-flip block at the end
-    // updates it coherently.
-    record.status = RunStatus::Running;
-    record.finished_at = None;
-    record.error_message = None;
-    record.runner_pid = Some(std::process::id());
-    store
-        .update(&record)
-        .map_err(|e| anyhow::anyhow!("flip run to running: {e}"))?;
+    // updates it coherently. A compare-and-swap under the run lock, on the
+    // blocking pool: it writes only while the record still has the status
+    // it was loaded with, so a cancel (or another resume) that landed
+    // since is not overwritten — and the run does not start.
+    let flipped = {
+        let run_id = run_id.to_string();
+        let pid = std::process::id();
+        store
+            .blocking(move |s| {
+                s.modify_if_status(&run_id, original_status, |record| {
+                    record.status = RunStatus::Running;
+                    record.finished_at = None;
+                    record.error_message = None;
+                    record.runner_pid = Some(pid);
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("flip run to running: {e}"))?
+    };
+    let record = match flipped {
+        Ok(record) => record,
+        Err(current) => {
+            return Err(resume_refused_by_status_change(
+                run_id,
+                original_status,
+                &current,
+            ))
+        }
+    };
 
     // Resolve project_root from the persisted workspace path so
     // agent/config discovery picks up the same `.rupu/` dir the
@@ -3803,7 +3852,7 @@ pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
-    pause_with_store(&store, run_id)?;
+    pause_with_store(&store, run_id).await?;
     println!(
         "rupu: pause requested for run {run_id} (resume with `rupu workflow resume {run_id}`)"
     );
@@ -3821,24 +3870,32 @@ pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
 /// ([`crate::output::live_run`], Task 7) can request a pause for the run
 /// it is tailing using the exact same primitive, without going through
 /// `pause`'s stdout `println!` (which would corrupt the alt-screen).
-pub(crate) fn pause_with_store(
+///
+/// The store pauses under the run lock (a cancel that lands meanwhile is
+/// refused, never overwritten), whose bounded wait blocks its thread — so
+/// the pause runs on the blocking pool.
+pub(crate) async fn pause_with_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
-    store.pause(run_id, now).map_err(|e| match e {
-        PauseError::AlreadyTerminal(status) => {
-            anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
-        }
-        PauseError::NotRunning(status) => {
-            anyhow::anyhow!(
-                "run {run_id} is `{}` — only a running run can be paused",
-                status.as_str()
-            )
-        }
-        PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
-        PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
-    })?;
+    let id = run_id.to_string();
+    store
+        .blocking(move |s| s.pause(&id, now))
+        .await
+        .map_err(|e| match e {
+            PauseError::AlreadyTerminal(status) => {
+                anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
+            }
+            PauseError::NotRunning(status) => {
+                anyhow::anyhow!(
+                    "run {run_id} is `{}` — only a running run can be paused",
+                    status.as_str()
+                )
+            }
+            PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
+            PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
+        })?;
     // Deliver the pause to the detached runner process via the marker.
     store
         .set_pause_marker(run_id)
@@ -5868,14 +5925,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pause_with_store_marks_running_run_paused_and_writes_marker() {
+    #[tokio::test]
+    async fn pause_with_store_marks_running_run_paused_and_writes_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Running, Some(999_999));
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        pause_with_store(&store, "run_test_cancel").unwrap();
+        pause_with_store(&store, "run_test_cancel").await.unwrap();
 
         let persisted = store.load("run_test_cancel").unwrap();
         assert_eq!(persisted.status, RunStatus::Paused);
@@ -5885,14 +5942,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pause_with_store_rejects_terminal_run() {
+    #[tokio::test]
+    async fn pause_with_store_rejects_terminal_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Completed, None);
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        let err = pause_with_store(&store, "run_test_cancel")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already terminal"));
         assert!(
             !store.pause_marker_exists("run_test_cancel"),
@@ -5900,15 +5959,120 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pause_with_store_rejects_already_paused_run() {
+    #[tokio::test]
+    async fn pause_with_store_rejects_already_paused_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Paused, None);
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        let err = pause_with_store(&store, "run_test_cancel")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("only a running run can be paused"));
+    }
+
+    /// The refusal names what the run is now: a cancel, with its reason,
+    /// or another status.
+    #[test]
+    fn resume_refused_by_status_change_names_the_cancel() {
+        let mut cancelled = sample_run_record(RunStatus::Cancelled, None);
+        cancelled.error_message = Some("stop it".into());
+        let err = resume_refused_by_status_change("run_x", RunStatus::Paused, &cancelled);
+        assert_eq!(
+            err.to_string(),
+            "run run_x was cancelled before it could resume: stop it (it was `paused` when loaded); not starting it"
+        );
+        let running = sample_run_record(RunStatus::Running, Some(1));
+        let err = resume_refused_by_status_change("run_x", RunStatus::Paused, &running);
+        assert_eq!(
+            err.to_string(),
+            "run run_x is now `running` (it was `paused` when loaded); not resuming it"
+        );
+    }
+
+    /// A cancel that lands between the resume's load and its flip to
+    /// `Running` wins: the flip (a compare-and-swap under the run lock)
+    /// finds `Cancelled`, the run does not start, and the resume fails
+    /// saying so. Driven exactly: the test holds `run.json.lock` while the
+    /// resume loads and passes its guards (observable: it clears the pause
+    /// marker), writes the cancel, then releases the lock the flip is
+    /// waiting on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_refuses_a_run_cancelled_since_it_was_loaded() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", tmp.path());
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let mut record = sample_run_record(RunStatus::Paused, None);
+        record.workspace_path = tmp.path().join("workspace");
+        record.transcript_dir = tmp.path().join("transcripts");
+        std::fs::create_dir_all(&record.workspace_path).unwrap();
+        store
+            .create(
+                record.clone(),
+                "name: sample\nsteps:\n  - id: only\n    agent: writer\n    prompt: hi\n",
+            )
+            .unwrap();
+        store.set_pause_marker(&record.id).unwrap();
+
+        // Another process holds the run lock — the cancel it is about to
+        // write.
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(
+                tmp.path()
+                    .join("runs")
+                    .join(&record.id)
+                    .join("run.json.lock"),
+            )
+            .unwrap();
+        rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let run_id = record.id.clone();
+        let resume = tokio::spawn(async move { resume_run(&run_id, None, true).await });
+
+        // Once the marker is gone, the resume has loaded the run as
+        // `Paused` and passed its guards; its flip is next, and waits on
+        // the lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.pause_marker_exists(&record.id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resume never got past its guards"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !resume.is_finished(),
+            "the resume is still in flight (its flip waits on the lock)"
+        );
+        let mut cancelled = record.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        store.update(&cancelled).unwrap();
+        drop(lock_file);
+
+        let err = resume
+            .await
+            .unwrap()
+            .expect_err("the resume must not start a cancelled run");
+        assert!(
+            err.to_string()
+                .contains("was cancelled before it could resume")
+                && err.to_string().contains("stop it"),
+            "{err}"
+        );
+        let reloaded = store.load(&record.id).unwrap();
+        assert_eq!(
+            reloaded.status,
+            RunStatus::Cancelled,
+            "the cancel is preserved"
+        );
+        assert_eq!(reloaded.runner_pid, None, "the run never started");
+        std::env::remove_var("RUPU_HOME");
     }
 
     // ── Task 5b-2a: CLI `--gate` wiring (approve/reject phase 1) ────────

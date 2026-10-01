@@ -1205,15 +1205,24 @@ async fn run_gate_sweep(
                 let pid_alive = rec.runner_pid.map(rupu_orchestrator::runs::pid_is_running);
                 let decision = sweep_decision(rec.status, None, false, pid_alive, is_remote);
                 match decision {
-                    SweepAction::Reap => match store.reap_if_orphaned(&mut rec, now) {
-                        Ok(true) => {
-                            tracing::warn!(run_id = %run_id, "gate sweep: reaped orphaned run (runner pid dead)");
+                    SweepAction::Reap => {
+                        // Re-decided under the run lock, on the blocking
+                        // pool (the lock wait blocks its thread): a cancel
+                        // that landed since the list was taken is preserved.
+                        let mut listed = rec.clone();
+                        let reaped = store
+                            .blocking(move |s| s.reap_if_orphaned(&mut listed, now))
+                            .await;
+                        match reaped {
+                            Ok(true) => {
+                                tracing::warn!(run_id = %run_id, "gate sweep: reaped orphaned run (runner pid dead)");
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!(run_id = %run_id, error = %e, "gate sweep: reap_if_orphaned failed");
+                            }
                         }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::warn!(run_id = %run_id, error = %e, "gate sweep: reap_if_orphaned failed");
-                        }
-                    },
+                    }
                     _ => {
                         if is_remote {
                             tracing::debug!(run_id = %run_id, "gate sweep: skipping remote-host in-flight run");

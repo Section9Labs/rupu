@@ -337,8 +337,12 @@ async fn pause_run(
     // does not re-read its own record status. Mirrors
     // `LocalHostConnector::pause_run`.
     let now = chrono::Utc::now();
+    // Under the run lock, on the blocking pool (its wait blocks the
+    // thread): a cancel that lands meanwhile is refused, never overwritten.
+    let run_id = id.clone();
     s.run_store
-        .pause(&id, now)
+        .blocking(move |store| store.pause(&run_id, now))
+        .await
         .map_err(|e| map_pause_err(&id, e))?;
     s.run_store
         .set_pause_marker(&id)
