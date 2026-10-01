@@ -461,6 +461,10 @@ pub(crate) fn rebuild_compacted(
     result
 }
 
+/// Output cap of the compaction summariser call — and so the most the summary
+/// adds to the compacted history.
+const SUMMARY_MAX_TOKENS: u32 = 8192;
+
 /// Result of compacting a conversation: the new (shorter) message list and how
 /// many middle messages were replaced by the summary.
 pub struct CompactionOutcome {
@@ -478,9 +482,13 @@ pub struct CompactionOutcome {
 /// `compact_threshold` is the input-token count compaction keeps the history
 /// under — [`ModelLimits::compact_threshold`](rupu_providers::model_limits::ModelLimits::compact_threshold),
 /// the same value that triggers proactive compaction (spec 2026-09-30 §6.4,
-/// headroom rule included). Half of it is kept verbatim as recent history, so
-/// the compacted conversation lands under the threshold instead of
-/// re-triggering compaction on the next turn.
+/// headroom rule included). The compacted conversation — the task message,
+/// the summary (up to [`SUMMARY_MAX_TOKENS`]) and the recent messages kept
+/// verbatim — is sized to about half of it: the recent budget is half the
+/// threshold NET of the task and the summary, so it lands under the
+/// threshold instead of re-triggering compaction on the next turn. The last
+/// two messages are always kept, so a task too large for any budget
+/// degrades to keeping those two rather than to a no-op.
 ///
 /// `last_input_tokens` is the provider's real input token count from the most
 /// recent turn. It is used to calibrate a char→token ratio so the recent-message
@@ -498,7 +506,11 @@ pub async fn compact_messages(
     let total_chars: usize = messages.iter().map(message_chars).sum();
     let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
 
-    let target_recent_tokens = (compact_threshold / 2) as f64;
+    // The task message and the summary survive outside the recent slice:
+    // the budget is net of both.
+    let fixed_tokens = messages.first().map_or(0, message_chars) as f64 * tokens_per_char
+        + f64::from(SUMMARY_MAX_TOKENS);
+    let target_recent_tokens = ((compact_threshold / 2) as f64 - fixed_tokens).max(0.0);
     let recent_budget_chars = (target_recent_tokens / tokens_per_char) as usize;
 
     let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget_chars)
@@ -514,12 +526,11 @@ conclusions; findings and their locations; files/areas already examined; the \
 current state; and any open threads or planned next steps. Omit chit-chat and \
 redundant tool output. This summary replaces the omitted turns, so it must be \
 self-contained.";
-    let summary_max_tokens = 8192u32;
     let summary_req = LlmRequest {
         model: model.to_string(),
         system: Some(summary_prompt.to_string()),
         messages: messages[..recent_start].to_vec(),
-        max_tokens: Some(summary_max_tokens),
+        max_tokens: Some(SUMMARY_MAX_TOKENS),
         tools: vec![],
         cell_id: None,
         trace_id: None,
@@ -3894,6 +3905,69 @@ mod compaction_tests {
             captured[0].disable_prompt_cache,
             "compaction summary request must opt out of prompt caching"
         );
+    }
+
+    /// `[task, then `n` alternating 5,000-char messages]`; the task is
+    /// `task_chars` long.
+    fn sized_history(task_chars: usize, n: usize) -> Vec<Message> {
+        let mut msgs = vec![text_msg(Role::User, &"t".repeat(task_chars))];
+        for i in 0..n {
+            let role = if i % 2 == 0 {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            msgs.push(text_msg(role, &"x".repeat(5_000)));
+        }
+        msgs
+    }
+
+    /// The task message and the summary (up to 8,192 tokens) survive
+    /// compaction outside the "recent" slice, so the recent budget is net of
+    /// them: with a 30K-token task at a 50K threshold, the compacted history
+    /// (task + summary + recent) must land under the threshold — a
+    /// `threshold / 2` recent budget alone would put it at ~63K and compact
+    /// again on the next turn.
+    #[tokio::test]
+    async fn compaction_budget_is_net_of_the_task_and_the_summary() {
+        let msgs = sized_history(30_000, 10); // 80,000 chars
+        let mut provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary.".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 10,
+            output_tokens: 2,
+        }]);
+        // 80,000 billed tokens over 80,000 chars: one token per char.
+        let outcome = compact_messages(&msgs, &mut provider, "mock-1", 50_000, 80_000)
+            .await
+            .expect("no provider error")
+            .expect("compacts");
+        let recent: usize = outcome.messages[1..].iter().map(message_chars).sum();
+        assert!(
+            30_000 + 8_192 + recent < 50_000,
+            "task 30,000 + summary 8,192 + recent {recent} must stay under 50,000"
+        );
+    }
+
+    /// A task larger than half the history used to make compaction a silent
+    /// no-op while over threshold (everything after the task fit the gross
+    /// budget, so there was no middle). With the budget net of the task it
+    /// degrades to keeping the minimum two messages — it still compacts.
+    #[tokio::test]
+    async fn a_task_larger_than_half_the_history_still_compacts() {
+        let msgs = sized_history(60_000, 4); // 80,000 chars
+        let mut provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary.".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 10,
+            output_tokens: 2,
+        }]);
+        let outcome = compact_messages(&msgs, &mut provider, "mock-1", 50_000, 80_000)
+            .await
+            .expect("no provider error")
+            .expect("a large task must not turn compaction into a no-op");
+        assert_eq!(outcome.summarized_messages, 2);
+        assert_eq!(outcome.messages.len(), 3, "task+summary, then the last two");
     }
 
     #[tokio::test]

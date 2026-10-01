@@ -156,7 +156,7 @@ The `input − output` headroom rule compacts early enough that a full-length re
 - **Haiku 4.5 (200K / 64K):** the threshold is 136K, not 160K. Without the rule, raising `max_tokens` to 64K would let a reply hit the window before the response-outcomes spec exists to handle `model_context_window_exceeded`.
 - **1M models (1M / 128K):** the percentage wins (800K). The rule never triggers.
 
-Compaction also sizes what it keeps from this threshold: half of it stays verbatim as recent history (beyond the last two messages, which are always kept), and the rest is summarised. Sizing from `input × pct` instead would keep more recent history than the headroom threshold allows, and the next turn would compact again. Manual compaction (`rupu session compact`, the session worker's compact request) uses the same threshold, built from the session's effective limits (`--window` replaces the input side only).
+Compaction also sizes what it keeps from this threshold. The compacted history is the task message, the summary (the summariser's output cap is 8,192 tokens) and the recent messages kept verbatim; the recent budget is half the threshold *net of* the task and the summary, so the result lands at about half the threshold. The last two messages are always kept, so a task too large for any budget degrades to keeping those two rather than to a no-op. Sizing from `input × pct`, or ignoring the task and summary, would leave the history above the threshold, and the next turn would compact again. Manual compaction (`rupu session compact`, the session worker's compact request) uses the same threshold, built from the session's effective limits (`--window` replaces the input side only).
 
 ### 6.5 Sessions
 

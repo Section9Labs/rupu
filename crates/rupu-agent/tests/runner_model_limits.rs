@@ -546,9 +546,11 @@ async fn run_sizing_turn(limits: ModelLimits) -> (Vec<LlmRequest>, Vec<Message>)
 /// Spec §6.4: compaction sizes the verbatim recent history from the SAME
 /// threshold that triggered it — `min(input × pct, input − output)` — not
 /// from `input × pct` alone. 200,000 input / 64,000 output → threshold
-/// 136,000, so the recent budget is 68,000 tokens (= chars here): the last
-/// seven messages (60,002 chars) stay verbatim and eight are summarised. A
-/// 160,000-based budget (80,000) would keep eight and summarise seven.
+/// 136,000: the recent budget is half of it net of the 19,998-token task and
+/// the 8,192-token summary cap, 68,000 − 28,190 = 39,810 tokens (= chars
+/// here). The last four messages (30,002 chars) stay verbatim and eleven are
+/// summarised. A 160,000-based budget (51,810 net) would keep five and
+/// summarise ten.
 #[tokio::test]
 async fn compaction_budget_follows_the_headroom_threshold() {
     let limits = discovered(
@@ -564,8 +566,8 @@ async fn compaction_budget_follows_the_headroom_threshold() {
     assert_eq!(reqs.len(), 2, "the turn, then the summariser call");
     assert_eq!(
         reqs[1].messages.len(),
-        8,
-        "task + seven messages summarised; seven recent kept verbatim"
+        11,
+        "task + ten messages summarised; four recent kept verbatim"
     );
 }
 
