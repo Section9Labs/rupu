@@ -58,6 +58,7 @@ impl ProfileRegistry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveSet {
     profiles: Vec<EngagementProfile>,
 }
@@ -124,5 +125,17 @@ mod tests {
             reg.active_set(&["ghost".into()]),
             Err(RegistryError::UnknownProfile(_))
         ));
+    }
+
+    #[test]
+    fn active_set_is_clone_and_eq() {
+        let mut all = BTreeMap::new();
+        all.insert("network".into(), p("network", "service"));
+        let reg = ProfileRegistry::from_profiles(all).unwrap();
+        let set = reg.active_set(&["network".into()]).unwrap();
+        let copy = set.clone();
+        assert_eq!(set, copy);
+        let empty = reg.active_set(&[]).unwrap();
+        assert_ne!(set, empty);
     }
 }

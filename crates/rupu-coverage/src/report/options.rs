@@ -32,6 +32,10 @@ pub struct FindingWriteOptions {
     /// Organisation-specific ticket patterns (from `[findings].ticket_patterns`),
     /// appended to the prompt guidance. Nothing org-specific ships in rupu.
     pub ticket_patterns: Vec<String>,
+    /// The engagement profiles active for this run (`None` = the native
+    /// `code` path, unchanged). Runtime-only: this struct is never
+    /// serialized, so the set is resolved per run, not persisted with it.
+    pub engagement: Option<std::sync::Arc<crate::profile::ActiveSet>>,
 }
 
 impl Default for FindingWriteOptions {
@@ -44,6 +48,7 @@ impl Default for FindingWriteOptions {
             artifact_total_max_bytes: DEFAULT_ARTIFACT_TOTAL_MAX_BYTES,
             report_max_bytes: DEFAULT_REPORT_MAX_BYTES,
             ticket_patterns: Vec::new(),
+            engagement: None,
         }
     }
 }
@@ -54,6 +59,12 @@ impl FindingWriteOptions {
         self
     }
 
+    /// Attach the active engagement set (`None` keeps the native `code` path).
+    pub fn with_engagement(mut self, e: Option<std::sync::Arc<crate::profile::ActiveSet>>) -> Self {
+        self.engagement = e;
+        self
+    }
+
     /// The artifact-ingest bounds these options carry.
     pub fn ingest_limits(&self) -> crate::report::IngestLimits {
         crate::report::IngestLimits {
@@ -61,5 +72,43 @@ impl FindingWriteOptions {
             max_files: self.artifact_max_files,
             max_total_bytes: self.artifact_total_max_bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::builtin_registry;
+    use std::sync::Arc;
+
+    fn set() -> crate::profile::ActiveSet {
+        builtin_registry()
+            .unwrap()
+            .active_set(&["code".into(), "binary".into()])
+            .unwrap()
+    }
+
+    #[test]
+    fn engagement_defaults_to_none() {
+        assert!(FindingWriteOptions::default().engagement.is_none());
+    }
+
+    #[test]
+    fn with_engagement_carries_the_active_set() {
+        let opts = FindingWriteOptions::default().with_engagement(Some(Arc::new(set())));
+        assert!(opts.engagement.is_some());
+        let cleared = opts.with_engagement(None);
+        assert!(cleared.engagement.is_none());
+    }
+
+    #[test]
+    fn options_with_equal_engagement_compare_equal() {
+        let a = FindingWriteOptions::default().with_engagement(Some(Arc::new(set())));
+        let b = a.clone();
+        assert_eq!(a, b);
+        // Equality is by value, not Arc pointer identity.
+        let c = FindingWriteOptions::default().with_engagement(Some(Arc::new(set())));
+        assert_eq!(a, c);
+        assert_ne!(a, FindingWriteOptions::default());
     }
 }
