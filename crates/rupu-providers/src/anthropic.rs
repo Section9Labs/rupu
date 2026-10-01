@@ -993,6 +993,11 @@ pub struct AnthropicClient {
     /// across a dropped call so the next call adopts it instead of starting
     /// a second refresh with the rotated-out refresh token.
     pending_refresh: Option<tokio::task::JoinHandle<Result<AuthMethod, ProviderError>>>,
+    /// The credential store's refresher (rupu-auth's `KeychainResolver`):
+    /// when set, token refreshes go through it — under the store's
+    /// cross-process lock, persisted — instead of this client's own token
+    /// request, whose rotation would otherwise live only in memory.
+    oauth_refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
 }
 
 impl AnthropicClient {
@@ -1017,6 +1022,7 @@ impl AnthropicClient {
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1062,6 +1068,16 @@ impl AnthropicClient {
             }
             None => Ok(None),
         }
+    }
+
+    /// Hand token refreshes to the credential store's refresher (see the
+    /// `oauth_refresher` field). `None` keeps the client's own refresh.
+    pub fn with_oauth_refresher(
+        mut self,
+        refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
+    ) -> Self {
+        self.oauth_refresher = refresher;
+        self
     }
 
     /// Set the OAuth account UUID. Used by the factory after reading it
@@ -1115,6 +1131,7 @@ impl AnthropicClient {
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1143,6 +1160,7 @@ impl AnthropicClient {
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1185,6 +1203,7 @@ impl AnthropicClient {
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1215,6 +1234,7 @@ impl AnthropicClient {
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1235,9 +1255,9 @@ impl AnthropicClient {
         for _ in 0..2 {
             if self.pending_refresh.is_none() {
                 let AuthMethod::OAuth {
+                    access_token,
                     refresh_token,
                     expires_ms,
-                    ..
                 } = &self.auth
                 else {
                     return Ok(());
@@ -1246,15 +1266,29 @@ impl AnthropicClient {
                     return Ok(());
                 }
                 info!("OAuth token expired, refreshing");
-                self.pending_refresh = Some(crate::credential_writes::spawn(
-                    refresh_and_persist_anthropic_token(
+                self.pending_refresh = Some(match self.oauth_refresher.clone() {
+                    Some(refresher) => {
+                        let stale = AuthCredentials::OAuth {
+                            access: access_token.clone(),
+                            refresh: refresh_token.clone(),
+                            expires: *expires_ms,
+                            extra: HashMap::new(),
+                        };
+                        crate::credential_writes::spawn(async move {
+                            refresher
+                                .refresh(stale)
+                                .await
+                                .map(AuthCredentials::into_anthropic_auth_method)
+                        })
+                    }
+                    None => crate::credential_writes::spawn(refresh_and_persist_anthropic_token(
                         self.client.clone(),
                         self.token_url.clone(),
                         refresh_token.clone(),
                         self.credential_store.clone(),
                         self.auth_json_path.clone(),
-                    ),
-                ));
+                    )),
+                });
             }
             let Some(job) = self.pending_refresh.as_mut() else {
                 return Ok(());
@@ -5715,6 +5749,64 @@ mod tests {
         assert!(
             matches!(&client.auth, AuthMethod::OAuth { access_token, .. } if access_token == "access-3"),
             "the expired adopted token was refreshed again"
+        );
+    }
+
+    /// An OAuthRefresher that records the stale refresh token it was handed
+    /// and returns a fixed fresh credential.
+    struct FakeRefresher {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credential_writes::OAuthRefresher for FakeRefresher {
+        async fn refresh(&self, stale: AuthCredentials) -> Result<AuthCredentials, ProviderError> {
+            if let AuthCredentials::OAuth { refresh, .. } = &stale {
+                self.seen.lock().unwrap().push(refresh.clone());
+            }
+            Ok(AuthCredentials::OAuth {
+                access: "access-9".into(),
+                refresh: "refresh-9".into(),
+                expires: u64::MAX / 2,
+                extra: Default::default(),
+            })
+        }
+    }
+
+    /// With a refresher (the store that owns the credential), the client
+    /// hands its refresh over — so the rotation is persisted under the
+    /// store's lock — and never calls the token endpoint itself.
+    #[tokio::test]
+    async fn a_client_with_a_refresher_hands_it_the_refresh() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let own = server.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "own" }));
+        });
+        let refresher = std::sync::Arc::new(FakeRefresher {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1,
+            },
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_oauth_refresher(Some(refresher.clone()));
+        client.token_url = server.url("/v1/oauth/token");
+        client.ensure_valid_token().await.unwrap();
+        own.assert_hits(0);
+        assert_eq!(
+            *refresher.seen.lock().unwrap(),
+            vec!["refresh-1".to_string()]
+        );
+        assert!(
+            matches!(&client.auth, AuthMethod::OAuth { access_token, .. } if access_token == "access-9")
         );
     }
 

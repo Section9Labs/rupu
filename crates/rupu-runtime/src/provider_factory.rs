@@ -415,12 +415,23 @@ pub async fn build_for_provider_with_config(
         .tuning
         .clone()
         .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(kind));
+    // An OAuth client refreshes through the store that owns the credential:
+    // under its cross-process lock, persisted. Refreshing alone it would keep
+    // the rotated refresh token in memory and leave a dead one stored.
+    let refresher = match &creds {
+        rupu_providers::auth::AuthCredentials::OAuth { .. } => resolver.oauth_refresher(name),
+        rupu_providers::auth::AuthCredentials::ApiKey { .. } => None,
+    };
     let client = match kind {
-        "anthropic" => build_anthropic(creds, model, config, &tuning, sink.clone()).await?,
-        "openai" | "openai_codex" | "codex" => {
-            build_openai(creds, model, &tuning, sink.clone()).await?
+        "anthropic" => {
+            build_anthropic(creds, model, config, &tuning, refresher, sink.clone()).await?
         }
-        "gemini" | "google_gemini" => build_gemini(creds, model, &tuning, sink.clone()).await?,
+        "openai" | "openai_codex" | "codex" => {
+            build_openai(creds, model, &tuning, refresher, sink.clone()).await?
+        }
+        "gemini" | "google_gemini" => {
+            build_gemini(creds, model, &tuning, refresher, sink.clone()).await?
+        }
         "copilot" | "github_copilot" => build_copilot(creds, model, &tuning, sink.clone()).await?,
         "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
         _ => {
@@ -552,11 +563,16 @@ fn resolve_anthropic_prompt_cache(
         .unwrap_or(true)
 }
 
+/// The credential store's refresher for an OAuth client (see
+/// `rupu_auth::CredentialResolver::oauth_refresher`).
+type OAuthRefresherHandle = std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>;
+
 async fn build_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     config: &ProviderConfig,
     tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Convert the resolved credential into an Anthropic AuthMethod so OAuth
@@ -585,7 +601,8 @@ async fn build_anthropic(
     }
     .with_tuning(tuning)
     .with_oauth_account_uuid(account_uuid)
-    .with_prompt_cache(prompt_cache);
+    .with_prompt_cache(prompt_cache)
+    .with_oauth_refresher(refresher);
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);
     }
@@ -601,11 +618,13 @@ async fn build_openai(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None, sink)
         .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?
-        .with_tuning(tuning);
+        .with_tuning(tuning)
+        .with_oauth_refresher(refresher);
     Ok(Box::new(client))
 }
 
@@ -613,6 +632,7 @@ async fn build_gemini(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Branch on credential shape:
@@ -637,7 +657,8 @@ async fn build_gemini(
     };
     let client = GoogleGeminiClient::new(creds, variant, None, sink)
         .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?
-        .with_tuning(tuning);
+        .with_tuning(tuning)
+        .with_oauth_refresher(refresher);
     Ok(Box::new(client))
 }
 

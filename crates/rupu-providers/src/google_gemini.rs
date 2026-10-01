@@ -148,6 +148,11 @@ pub struct GoogleGeminiClient {
     /// across a dropped call so the next call adopts it instead of starting
     /// a second refresh.
     pending_refresh: Option<PendingGoogleRefresh>,
+    /// The credential store's refresher (rupu-auth's `KeychainResolver`):
+    /// when set, token refreshes go through it — under the store's
+    /// cross-process lock, persisted — instead of this client's own token
+    /// request, whose result would otherwise live only in memory.
+    oauth_refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
 }
 
 /// A spawned Google token refresh: `(access_token, refresh_token, expires_ms)`.
@@ -215,6 +220,7 @@ impl GoogleGeminiClient {
                     api_base_override: None,
                     token_url: GOOGLE_TOKEN_URL.to_string(),
                     pending_refresh: None,
+                    oauth_refresher: None,
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
@@ -229,6 +235,7 @@ impl GoogleGeminiClient {
                 api_base_override: None,
                 token_url: GOOGLE_TOKEN_URL.to_string(),
                 pending_refresh: None,
+                oauth_refresher: None,
             }),
             (AuthCredentials::ApiKey { .. }, _) => Err(ProviderError::AuthConfig(
                 "Google Cloud Code Assist (gemini-cli / antigravity) requires OAuth, \
@@ -486,6 +493,16 @@ impl GoogleGeminiClient {
         })
     }
 
+    /// Hand token refreshes to the credential store's refresher (see the
+    /// `oauth_refresher` field). `None` keeps the client's own refresh.
+    pub fn with_oauth_refresher(
+        mut self,
+        refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
+    ) -> Self {
+        self.oauth_refresher = refresher;
+        self
+    }
+
     /// Cancel-safe: the refresh and its persistence run as their own task
     /// (tracked by [`crate::credential_writes`], which the binary drains
     /// before exit), so a caller dropped mid-flight (a pause, a timeout) only
@@ -505,16 +522,40 @@ impl GoogleGeminiClient {
                 if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
                     return Ok(());
                 }
-                self.pending_refresh = Some(crate::credential_writes::spawn(
-                    refresh_and_persist_google_token(
+                self.pending_refresh = Some(match self.oauth_refresher.clone() {
+                    Some(refresher) => {
+                        let stale = AuthCredentials::OAuth {
+                            access: self.access_token.clone(),
+                            refresh: self.refresh_token.clone(),
+                            expires: self.expires_ms,
+                            extra: HashMap::new(),
+                        };
+                        crate::credential_writes::spawn(async move {
+                            match refresher.refresh(stale).await? {
+                                AuthCredentials::OAuth {
+                                    access,
+                                    refresh,
+                                    expires,
+                                    ..
+                                } => Ok((access, refresh, expires)),
+                                AuthCredentials::ApiKey { .. } => {
+                                    Err(ProviderError::TokenRefreshFailed(
+                                        "the credential store returned an API key for an OAuth refresh"
+                                            .into(),
+                                    ))
+                                }
+                            }
+                        })
+                    }
+                    None => crate::credential_writes::spawn(refresh_and_persist_google_token(
                         self.client.clone(),
                         self.token_url.clone(),
                         self.variant,
                         self.refresh_token.clone(),
                         self.project_id.clone(),
                         self.auth_json_path.clone(),
-                    ),
-                ));
+                    )),
+                });
             }
             let Some(job) = self.pending_refresh.as_mut() else {
                 return Ok(());
@@ -1271,6 +1312,69 @@ mod tests {
         first.assert_hits(1);
         second.assert_hits(1);
         assert_eq!(client.access_token, "access-3");
+    }
+
+    /// An OAuthRefresher that records the stale refresh token it was handed
+    /// and returns a fixed fresh credential.
+    struct FakeRefresher {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credential_writes::OAuthRefresher for FakeRefresher {
+        async fn refresh(&self, stale: AuthCredentials) -> Result<AuthCredentials, ProviderError> {
+            if let AuthCredentials::OAuth { refresh, .. } = &stale {
+                self.seen.lock().unwrap().push(refresh.clone());
+            }
+            Ok(AuthCredentials::OAuth {
+                access: "access-9".into(),
+                refresh: "refresh-9".into(),
+                expires: u64::MAX / 2,
+                extra: Default::default(),
+            })
+        }
+    }
+
+    /// With a refresher (the store that owns the credential), the client
+    /// hands its refresh over — so the rotation is persisted under the
+    /// store's lock — and never calls the token endpoint itself.
+    #[tokio::test]
+    async fn a_client_with_a_refresher_hands_it_the_refresh() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let own = server.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "own" }));
+        });
+        let refresher = std::sync::Arc::new(FakeRefresher {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1;
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap()
+        .with_oauth_refresher(Some(refresher.clone()));
+        client.token_url = server.url("/token");
+        client.ensure_valid_token().await.unwrap();
+        own.assert_hits(0);
+        assert_eq!(
+            *refresher.seen.lock().unwrap(),
+            vec!["refresh-1".to_string()]
+        );
+        assert_eq!(client.access_token, "access-9");
+        assert_eq!(client.refresh_token, "refresh-9");
     }
 
     /// A client left behind by a dropped call adopts the refresh still in
