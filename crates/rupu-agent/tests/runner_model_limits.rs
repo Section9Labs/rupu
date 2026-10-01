@@ -3,10 +3,10 @@
 //! overflow error teaches the run the real input limit (spec 2026-09-30
 //! §6.3, §6.6, §7).
 
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
-use rupu_providers::model_limits::ModelLimits;
-use rupu_providers::types::{ContentBlock, Message, Role, StopReason, Usage};
+use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+use rupu_providers::types::{ContentBlock, LlmRequest, Message, Role, StopReason, Usage};
 use rupu_providers::LlmProvider;
 use rupu_tools::ToolContext;
 use rupu_transcript::{Event, JsonlReader};
@@ -37,6 +37,76 @@ fn dense_msg(role: Role, label: &str) -> Message {
             text: format!("{label}: {}", "x".repeat(1000)),
         }],
     }
+}
+
+/// The compaction summariser's scripted reply; the marker lets a test tell a
+/// post-compaction history from the original one.
+const SUMMARY: &str = "SUMMARY-MARKER: condensed earlier work";
+
+fn summary_turn(u: Usage) -> ScriptedTurn {
+    ScriptedTurn::AssistantTextWithUsage {
+        text: SUMMARY.into(),
+        stop: StopReason::EndTurn,
+        usage: u,
+    }
+}
+
+/// Four dense messages: enough for `partition_for_compaction` to find a
+/// middle to summarise (mirrors `runner_usage_hook.rs`).
+fn dense_seed() -> Vec<Message> {
+    vec![
+        dense_msg(Role::User, "task"),
+        dense_msg(Role::Assistant, "assistant 0"),
+        dense_msg(Role::User, "user 0"),
+        dense_msg(Role::Assistant, "assistant 1"),
+    ]
+}
+
+fn message_text(m: &Message) -> String {
+    m.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compaction_count(path: &std::path::Path) -> usize {
+    JsonlReader::iter(path)
+        .unwrap()
+        .filter(|e| matches!(e, Ok(Event::Compaction { .. })))
+        .count()
+}
+
+/// After an overflow-triggered compaction the captured requests are: the
+/// failed turn, the summariser call, the retried turn. The retry must carry
+/// the compacted history, not the original one.
+fn assert_retried_turn_carries_compacted_history(captured: &[LlmRequest]) {
+    assert_eq!(
+        captured.len(),
+        3,
+        "failed turn, summariser call, retried turn"
+    );
+    let (failed, retried) = (&captured[0], &captured[2]);
+    assert!(
+        !failed
+            .messages
+            .iter()
+            .any(|m| message_text(m).contains(SUMMARY)),
+        "the failed request predates the summary"
+    );
+    assert!(
+        retried.messages.len() < failed.messages.len(),
+        "retry has {} messages, failed request had {}",
+        retried.messages.len(),
+        failed.messages.len()
+    );
+    assert!(
+        message_text(&retried.messages[0]).contains(SUMMARY),
+        "the retried request starts from the summary-bearing task message"
+    );
 }
 
 /// `runner_usage_hook.rs`'s opts construction, parameterised on the
@@ -144,25 +214,22 @@ async fn unknown_output_cap_is_not_sent() {
 
 #[tokio::test]
 async fn overflow_error_clamps_the_limit_and_compacts_instead_of_trimming() {
-    let provider = MockProvider::new(vec![
+    let provider = CapturingMockProvider::new(vec![
         ScriptedTurn::ProviderError("prompt is too long: 1500 tokens > 1000 maximum".into()),
-        final_text_turn(usage(100, 10, 0)), // the compaction summariser's send
-        final_text_turn(usage(300, 6, 0)),  // the retried turn
+        summary_turn(usage(100, 10, 0)), // the compaction summariser's send
+        final_text_turn(usage(300, 6, 0)), // the retried turn
     ]);
+    let captured = provider.captured.clone();
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = vec![
-        dense_msg(Role::User, "task"),
-        dense_msg(Role::Assistant, "assistant 0"),
-        dense_msg(Role::User, "user 0"),
-        dense_msg(Role::Assistant, "assistant 1"),
-    ];
+    opts.initial_messages = dense_seed();
     opts.limits = ModelLimits::unknown()
         .with_input(1_000_000)
         .with_percent(50);
     let result = run_agent(opts).await.unwrap();
     assert_eq!(result.final_limits.input.tokens, Some(1000));
+    assert_eq!(result.final_limits.input.source, LimitSource::Observed);
     let n = notices(&transcript);
     assert!(
         n.iter()
@@ -173,9 +240,80 @@ async fn overflow_error_clamps_the_limit_and_compacts_instead_of_trimming() {
         !n.iter().any(|(k, _)| k == "context_trim"),
         "compaction, not trimming: {n:?}"
     );
-    let compactions = JsonlReader::iter(&transcript)
-        .unwrap()
-        .filter(|e| matches!(e, Ok(Event::Compaction { .. })))
-        .count();
-    assert_eq!(compactions, 1);
+    assert_eq!(compaction_count(&transcript), 1);
+    assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
+}
+
+/// Spec §7: with the input limit known, an overflow whose message carries no
+/// `max` still compacts with a summary (once) before the trim loop is
+/// considered. The limit is not touched, so no clamp notice either.
+///
+/// The limit is 1000 rather than 1,000,000 so the seeded history has a middle
+/// to summarise: compaction keeps roughly `threshold / 2` tokens verbatim,
+/// which at 1M would cover the whole four-message seed.
+#[tokio::test]
+async fn overflow_without_a_parsed_max_still_compacts_when_the_limit_is_known() {
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::ProviderError("too many tokens in request".into()),
+        summary_turn(usage(100, 10, 0)),
+        final_text_turn(usage(300, 6, 0)),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = dense_seed();
+    opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
+    let result = run_agent(opts).await.unwrap();
+
+    assert_eq!(compaction_count(&transcript), 1);
+    let n = notices(&transcript);
+    assert!(
+        !n.iter().any(|(k, _)| k == "context_trim"),
+        "compaction, not trimming: {n:?}"
+    );
+    assert!(
+        !n.iter().any(|(k, _)| k == "model_limits_clamped"),
+        "no max parsed, so nothing to clamp: {n:?}"
+    );
+    assert_eq!(
+        result.final_limits.input,
+        Limit::new(1000, LimitSource::Agent),
+        "the limit is unchanged"
+    );
+    assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
+}
+
+/// Same as above for a parsed `max` that is not below the current limit:
+/// `clamp_input` leaves the limit alone, and the run still compacts.
+#[tokio::test]
+async fn overflow_with_a_max_that_does_not_lower_the_limit_still_compacts() {
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::ProviderError("prompt is too long: 1500 tokens > 2000 maximum".into()),
+        summary_turn(usage(100, 10, 0)),
+        final_text_turn(usage(300, 6, 0)),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = dense_seed();
+    opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
+    let result = run_agent(opts).await.unwrap();
+
+    assert_eq!(compaction_count(&transcript), 1);
+    let n = notices(&transcript);
+    assert!(
+        !n.iter().any(|(k, _)| k == "context_trim"),
+        "compaction, not trimming: {n:?}"
+    );
+    assert!(
+        !n.iter().any(|(k, _)| k == "model_limits_clamped"),
+        "2000 is above the current 1000, so the limit is not clamped: {n:?}"
+    );
+    assert_eq!(
+        result.final_limits.input,
+        Limit::new(1000, LimitSource::Agent)
+    );
+    assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
 }

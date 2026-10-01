@@ -180,7 +180,9 @@ When `max` is parsed and is below `limits.input` (or `limits.input` is unknown):
 1. Set `limits.input = max` with source `Observed`, for the rest of the run. Sessions persist it (§6.5).
 2. Write `Notice { kind: "model_limits_clamped" }`, e.g. `input 1,000,000 → 200,000 (provider error)`.
 3. **Compact with a summary** at the recomputed threshold, then retry.
-4. The delete-oldest trim loop stays as the last resort: no `max` parsed, compaction failed, or the request still overflows.
+4. The delete-oldest trim loop stays as the last resort: compaction impossible (input limit unknown), compaction failed, or the request still overflows.
+
+When no `max` is parsed, or the parsed max doesn't lower the limit, but the input limit is known, rupu still compacts with a summary once per turn before falling back to trimming: a summary preserves more than deleting the oldest exchange.
 
 The observed value is **not** written to the model cache, because it reflects the account, not the model. If the clamp recurs, the notice suggests pinning `contextWindowTokens` on the agent.
 
