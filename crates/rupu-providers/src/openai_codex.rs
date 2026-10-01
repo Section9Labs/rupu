@@ -1077,13 +1077,14 @@ pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
     Vec::new()
 }
 
-/// The model id of one listing entry: a plain string is the id itself; an
-/// object probes `id`, `slug`, `display_name`, then `name` (first non-empty).
+/// The model id of one listing entry: a non-empty plain string is the id
+/// itself; an object probes `id`, `slug`, `display_name`, then `name` (first non-empty).
 /// The one order every listing path uses, so `list_models` and
 /// `fetch_models` can never name the same model differently.
 fn listing_entry_id(v: &serde_json::Value) -> Option<String> {
     match v {
-        serde_json::Value::String(s) => Some(s.clone()),
+        // An empty string is no more an id than an empty object field is.
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
         serde_json::Value::Object(_) => ["id", "slug", "display_name", "name"]
             .iter()
             .find_map(|k| v.get(*k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))
@@ -3448,8 +3449,12 @@ mod fetch_models_tests {
     async fn fetch_models_errors_when_both_listings_fail() {
         use httpmock::prelude::*;
         let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET);
+        let catalog = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(500);
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
             then.status(500);
         });
         let mut client = OpenAiCodexClient::new(
@@ -3463,6 +3468,9 @@ mod fetch_models_tests {
         let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
+        // Both endpoints were tried, once each.
+        catalog.assert_hits(1);
+        public.assert_hits(1);
         // The public `/v1/models` failure is the one reported.
         assert!(
             matches!(err, ProviderError::Api { status: 500, .. }),
@@ -3709,6 +3717,36 @@ mod fetch_models_tests {
             .unwrap();
         public.assert_hits(1);
         assert_eq!(models[0].id, "gpt-plain");
+    }
+
+    /// An empty-string entry is not a model id: skipped, in both the
+    /// limit-carrying `models_from_listing` and the id-only
+    /// `extract_model_ids`, for every container shape.
+    #[test]
+    fn empty_string_entries_are_not_model_ids() {
+        let pid = ProviderId::OpenaiCodex;
+        for v in [
+            serde_json::json!({ "models": ["", "gpt-x"] }),
+            serde_json::json!({ "data": ["", "gpt-x"] }),
+            serde_json::json!(["", "gpt-x"]),
+            // An object whose every id field is empty is skipped too.
+            serde_json::json!({ "models": [{ "id": "", "slug": "" }, "gpt-x"] }),
+        ] {
+            let ids: Vec<String> = models_from_listing(&v, false, pid)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(ids, ["gpt-x"], "models_from_listing on {v}");
+            assert_eq!(extract_model_ids(&v), ["gpt-x"], "extract_model_ids on {v}");
+        }
+        // A listing of nothing but empty strings is an empty catalog, with no
+        // blank-id model in it.
+        let only_blank = serde_json::json!({ "models": ["", ""] });
+        assert!(models_from_listing(&only_blank, false, pid)
+            .unwrap()
+            .is_empty());
+        assert!(extract_model_ids(&only_blank).is_empty());
     }
 
     #[test]
