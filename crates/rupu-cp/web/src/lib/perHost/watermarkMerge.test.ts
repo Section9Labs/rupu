@@ -76,4 +76,23 @@ describe('watermarkMerge', () => {
     expect(displacedCount(visible, T0 - 2.5 * 60_000, access.timeOf)).toBe(2);
     expect(displacedCount(visible, -Infinity, access.timeOf)).toBe(0);
   });
+
+  it('tie-breaks rows with the same started_at by (host_id, id)', () => {
+    const sameTime = '2026-09-30T10:00:00Z';
+    const a = slice('a', []);
+    a.rows = [{ id: 'x', started_at: sameTime, host_id: 'a' }];
+    const b = slice('b', []);
+    b.rows = [{ id: 'y', started_at: sameTime, host_id: 'b' }];
+    expect(watermarkMerge([a, b], access).visible.map((r) => r.id)).toEqual(['x', 'y']); // a < b lexicographically
+  });
+
+  it('does not collapse rows without host_id that share an id across different slices', () => {
+    const a = slice('a', []);
+    a.rows = [{ id: 'x', started_at: at(1), host_id: undefined }];
+    const b = slice('b', []);
+    b.rows = [{ id: 'x', started_at: at(2), host_id: undefined }];
+    const visible = watermarkMerge([a, b], access).visible;
+    expect(visible).toHaveLength(2);
+    expect(visible.map((r) => r.id)).toEqual(['x', 'x']);
+  });
 });

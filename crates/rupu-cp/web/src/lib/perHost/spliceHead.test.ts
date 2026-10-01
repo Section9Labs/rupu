@@ -16,8 +16,9 @@ describe('spliceHead', () => {
   it('keeps the boundary row when a new run arrives at the top (usePagedList dropped it)', () => {
     const old = seq(1, 40);
     const fresh = [r('n1', 0), ...seq(1, 19)]; // page 0 now ends at r19
-    const { rows, fullyListed } = spliceHead(old, fresh, 20, access, 'h');
+    const { rows, fullyListed, replaced } = spliceHead(old, fresh, 20, access, 'h');
     expect(fullyListed).toBe(false);
+    expect(replaced).toBe(false);
     expect(ids(rows)).toEqual(['n1', ...ids(seq(1, 40))]);
   });
 
@@ -45,7 +46,18 @@ describe('spliceHead', () => {
     const tie = { ...r('tie', 20) };
     const old = [...seq(1, 20), tie];
     const fresh = seq(1, 20); // cutoff = r20's time = tie's time
-    expect(ids(spliceHead(old, fresh, 20, access, 'h').rows)).toContain('tie');
+    const result = spliceHead(old, fresh, 20, access, 'h');
+    expect(ids(result.rows)).toContain('tie');
+    expect(ids(result.rows)[ids(result.rows).length - 1]).toBe('tie'); // 'tie' is the last (oldest) row
+  });
+
+  it('replaces the slice when fresh does not overlap old, marking replaced: true', () => {
+    const old = seq(30, 49); // 30..49 minutes ago
+    const fresh = seq(1, 20); // 1..20 minutes ago (no overlap)
+    const result = spliceHead(old, fresh, 20, access, 'h');
+    expect(ids(result.rows)).toEqual(ids(seq(1, 20)));
+    expect(result.fullyListed).toBe(false);
+    expect(result.replaced).toBe(true);
   });
 });
 
@@ -61,5 +73,15 @@ describe('appendPage / withHost', () => {
   it('fills host_id only when the server did not tag the row', () => {
     const rows = withHost<Row>([{ id: 'a', started_at: '' }, { id: 'b', started_at: '', host_id: 'x' }], 'h');
     expect(rows.map((x) => x.host_id)).toEqual(['h', 'x']);
+  });
+
+  it('deduplicates a page containing the same key twice, keeping the first copy', () => {
+    const page = [
+      r('x', 1, 'running'),
+      r('x', 2, 'completed'), // duplicate key with different time and status
+    ];
+    const result = spliceHead([], page, 20, access, 'h');
+    expect(ids(result.rows)).toEqual(['x']);
+    expect(result.rows[0].status).toBe('running'); // first copy wins
   });
 });

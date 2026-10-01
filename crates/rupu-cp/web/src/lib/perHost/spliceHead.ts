@@ -37,6 +37,8 @@ export interface SpliceResult<T> {
   rows: T[];
   /** Page 0 came back short: it is this host's whole list. */
   fullyListed: boolean;
+  /** Page 0 did not overlap the old rows and replaced them; more rows exist below it. */
+  replaced: boolean;
 }
 
 /**
@@ -44,6 +46,8 @@ export interface SpliceResult<T> {
  * the span the page covers, it is authoritative: old rows newer than its
  * oldest row that it no longer contains have left the list. Older rows are
  * kept. A row exactly at the cutoff is kept so a timestamp tie is never lost.
+ * The union is gap-free only when the old and fresh ranges overlap; if they do not,
+ * page 0 replaces the slice to avoid losing rows trapped between them.
  */
 export function spliceHead<T>(
   old: readonly T[],
@@ -52,10 +56,13 @@ export function spliceHead<T>(
   access: RowAccess<T>,
   hostId: string,
 ): SpliceResult<T> {
-  if (fresh.length < limit) return { rows: sortSlice(fresh, access, hostId), fullyListed: true };
+  if (fresh.length < limit) return { rows: sortSlice(fresh, access, hostId), fullyListed: true, replaced: false };
   let cutoff = Infinity;
   for (const r of fresh) cutoff = Math.min(cutoff, access.timeOf(r));
+  let newestOld = -Infinity;
+  for (const r of old) newestOld = Math.max(newestOld, access.timeOf(r));
+  if (old.length === 0 || newestOld < cutoff) return { rows: sortSlice(fresh, access, hostId), fullyListed: false, replaced: true };
   const freshKeys = new Set(fresh.map((r) => access.keyOf(r, hostId)));
   const kept = old.filter((o) => access.timeOf(o) <= cutoff && !freshKeys.has(access.keyOf(o, hostId)));
-  return { rows: sortSlice([...fresh, ...kept], access, hostId), fullyListed: false };
+  return { rows: sortSlice([...fresh, ...kept], access, hostId), fullyListed: false, replaced: false };
 }

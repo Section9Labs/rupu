@@ -51,7 +51,7 @@ export function rowAccess<T extends HostTagged>(
 ): RowAccess<T> {
   return {
     timeOf: (row) => instantOf(row[timeField]),
-    keyOf: (row, sliceHostId) => `${row.host_id ?? sliceHostId}\u0000${String(row[idField])}`,
+    keyOf: (row, sliceHostId) => `${row.host_id || sliceHostId}\u0000${String(row[idField])}`,
     idOf: (row) => String(row[idField]),
   };
 }
