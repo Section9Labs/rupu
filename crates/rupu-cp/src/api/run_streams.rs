@@ -854,7 +854,7 @@ async fn list_agent_runs(
         let mut rows = conn
             .list_agent_runs()
             .await
-            .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
         let lifecycle = q.lifecycle.as_deref();
         rows.retain(|r| agent_in_lifecycle(r.get("status").and_then(|v| v.as_str()), lifecycle));
         return Ok(Json(
@@ -1018,7 +1018,7 @@ async fn list_autoflow_runs(
         let rows = conn
             .list_autoflow_runs()
             .await
-            .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
         return Ok(Json(
             crate::pagination::paginate(rows, &q.page())
                 .into_iter()
@@ -1223,7 +1223,7 @@ async fn list_autoflow_events(
         let rows = conn
             .list_autoflow_events()
             .await
-            .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
         return Ok(Json(
             crate::pagination::paginate(rows, &q.page())
                 .into_iter()
@@ -2459,6 +2459,54 @@ mod tests {
         .await
         .expect("a malformed since must degrade, never error");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_remote_host_autoflow_and_agent_lists_report_unsupported_as_501() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // FakeHostConnector has no autoflow overrides (trait default:
+        // Unsupported) and no "agent_runs" key (its own Unsupported branch).
+        let s = crate::api::runs::tests::state_with_fake_host(&tmp, serde_json::json!({}));
+        let err = list_autoflow_runs(
+            State(s.clone()),
+            Query(AutoflowRunsQuery {
+                offset: None,
+                limit: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let err = list_autoflow_events(
+            State(s.clone()),
+            Query(AutoflowEventsQuery {
+                offset: None,
+                limit: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let err = list_agent_runs(
+            State(s),
+            Query(AgentRunsQuery {
+                offset: None,
+                limit: None,
+                lifecycle: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

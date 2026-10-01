@@ -446,6 +446,28 @@ pub(crate) fn resolve_host(
     })
 }
 
+/// Map a connector failure on a single-host LIST path (`?host=<remote-id>`)
+/// to the status the web's per-host loader reads (spec
+/// `2026-10-01-rupu-cp-progressive-per-host-loading-design.md` §7.1):
+///
+/// - `Unsupported` / `Invalid` → 501: the host cannot serve this listing (an
+///   old remote rupu, a transport with no such surface). The web shows the
+///   host as *unavailable*, with this reason.
+/// - `NotFound` → 404.
+/// - everything else → 502: the host gave no usable answer. The web shows it
+///   as *offline*, with this reason.
+///
+/// Was a bare 500 for all of them, which cannot tell "down" from "too old".
+pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
+            ApiError::not_available(e.to_string())
+        }
+        HostConnectorError::NotFound(_) => ApiError::not_found(e.to_string()),
+        other => ApiError::bad_gateway(other.to_string()),
+    }
+}
+
 /// Concurrently call `list_runs` on every registered host, tag each row with
 /// its `host_id`, merge, and sort newest-first. A per-host failure produces an
 /// empty contribution plus a warning — it never fails the whole merge.
@@ -714,10 +736,7 @@ async fn list_runs(
             limit: page.limit(),
             lifecycle: None,
         };
-        let rows = conn
-            .list_runs(params)
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let rows = conn.list_runs(params).await.map_err(host_list_error)?;
         let tagged: Vec<serde_json::Value> = rows
             .into_iter()
             .map(|mut v| {
@@ -851,10 +870,7 @@ async fn list_workflow_runs(
             limit: page.limit(),
             lifecycle: q.lifecycle.clone(),
         };
-        let rows = conn
-            .list_runs(params)
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let rows = conn.list_runs(params).await.map_err(host_list_error)?;
         let tagged: Vec<serde_json::Value> = rows
             .into_iter()
             .map(|mut v| {
@@ -3038,11 +3054,18 @@ pub(crate) mod tests {
         ) -> Result<String, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }
+        /// Rows come from `run_json["runs"]` when present; otherwise the
+        /// host answers as unreachable (exercises the 502 mapping).
         async fn list_runs(
             &self,
             _params: RunListQuery,
         ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-            unimplemented!("not exercised by this test")
+            match self.run_json.get("runs").and_then(|v| v.as_array()) {
+                Some(rows) => Ok(rows.clone()),
+                None => Err(HostConnectorError::Unreachable(
+                    "fake host: no runs scripted".into(),
+                )),
+            }
         }
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
             Ok(self.run_json.clone())
@@ -3086,6 +3109,102 @@ pub(crate) mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             Ok(self.run_json.clone())
         }
+    }
+
+    #[test]
+    fn host_list_error_maps_connector_failures_to_honest_statuses() {
+        use axum::http::StatusCode;
+        let cases = [
+            (
+                HostConnectorError::Unsupported("x".into()),
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                HostConnectorError::Invalid("x".into()),
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                HostConnectorError::NotFound("x".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                HostConnectorError::Unreachable("x".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (HostConnectorError::Unauthorized, StatusCode::BAD_GATEWAY),
+            (
+                HostConnectorError::Remote(500, "x".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                HostConnectorError::NotJson("x".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ];
+        for (err, want) in cases {
+            let label = err.to_string();
+            assert_eq!(host_list_error(err).0, want, "{label}");
+        }
+    }
+
+    /// An `AppState` whose registry resolves `host_fake` to a
+    /// [`FakeHostConnector`] scripted with `run_json` (same seam as
+    /// `get_run_proxies_to_host_when_resolver_says_host`: a `Local`-transport
+    /// entry under a distinct id resolves to the injected connector).
+    pub(crate) fn state_with_fake_host(
+        tmp: &tempfile::TempDir,
+        run_json: serde_json::Value,
+    ) -> AppState {
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: "host_fake".into(),
+                name: "fake".into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let fake: Arc<dyn crate::host::connector::HostConnector> =
+            Arc::new(FakeHostConnector { run_json });
+        test_state(tmp).with_hosts(Arc::new(crate::host::registry::HostRegistry::new(
+            host_store, fake,
+        )))
+    }
+
+    #[tokio::test]
+    async fn single_remote_host_run_lists_report_an_unreachable_host_as_502() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No "runs" scripted → the fake's list_runs answers Unreachable.
+        let s = state_with_fake_host(&tmp, serde_json::json!({}));
+        let err = list_runs(
+            State(s.clone()),
+            Query(RunsListQuery {
+                offset: None,
+                limit: None,
+                host: Some("host_fake".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+        let err = list_workflow_runs(
+            State(s),
+            Query(WorkflowRunsQuery {
+                offset: None,
+                limit: None,
+                lifecycle: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

@@ -425,7 +425,7 @@ async fn list_sessions(
         let rows = conn
             .list_sessions(q.scope.as_deref())
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
         let page = crate::pagination::PageQuery {
             offset: q.offset,
             limit: q.limit,
@@ -979,6 +979,26 @@ async fn delete_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn single_remote_host_session_list_reports_unsupported_as_501() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::api::runs::tests::state_with_fake_host(&tmp, serde_json::json!({}));
+        let err = list_sessions(
+            State(s),
+            Query(SessionsQuery {
+                offset: None,
+                limit: None,
+                scope: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
 
     /// SSH bodies arrive unpriced (that connector has no pricing config);
     /// the CP prices them from the reported token counts.
