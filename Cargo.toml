@@ -62,6 +62,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # POSIX syscalls; the workspace forbids `unsafe_code`, so signalling/liveness
 # and open(2) flags std doesn't expose cannot call libc directly)
 rustix = { version = "1", features = ["process", "fs"] }
+# SIGTERM on a dedicated thread, through safe wrappers: the handler drains
+# pending credential writes, then restores the default disposition and
+# re-raises so the process dies by the signal. Already in the tree via
+# crossterm.
+signal-hook = "0.3"
 
 # IDs / time
 ulid = { version = "1", features = ["serde"] }

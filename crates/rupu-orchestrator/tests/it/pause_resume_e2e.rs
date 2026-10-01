@@ -31,9 +31,7 @@
 //!     step-boundary / mid-fan-out pause tests.
 
 use async_trait::async_trait;
-use rupu_agent::runner::{
-    BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
-};
+use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_orchestrator::executor::{Event, EventSink};
 use rupu_orchestrator::runner::{
@@ -136,8 +134,9 @@ impl<P: LlmProvider> LlmProvider for CancelAfterInner<P> {
     }
 }
 
-/// Build a minimal `AgentRunOpts` around `provider`. `no_stream: true` races
-/// `provider.send` directly against the pause token — the deterministic
+/// Build a minimal `AgentRunOpts` around `provider`. The runner always
+/// streams (`no_stream: true` only quiets the display), and it races that
+/// `provider.stream` call against the pause token — the deterministic
 /// boundary these tests exploit (mirrors `rupu_orchestrator::runner`'s own
 /// pause tests).
 #[allow(clippy::too_many_arguments)]
@@ -188,9 +187,7 @@ fn linear_agent_opts(
         on_stream_event: None,
         on_usage: None,
         concerns: None,
-        max_tokens: DEFAULT_MAX_TOKENS,
-        context_window_tokens: None,
-        compact_at_percent: None,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         scope_name: None,
         surface_tag: None,
         pause: None,

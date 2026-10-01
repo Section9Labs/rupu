@@ -599,6 +599,18 @@ pub fn attach_and_print_with(
                 printer.workflow_failed(workflow_name, run_id, err);
                 return Ok(AttachOutcome::Done);
             }
+            // Cancelled on disk by another process (the CLI's `cancel`, `cp
+            // serve`) while attached: terminal too — the record never leaves
+            // this status, so polling on would never end.
+            rupu_orchestrator::RunStatus::Cancelled => {
+                std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
+                flush_all_tailers(&mut steps, printer, &spend, opts.view_mode);
+
+                let reason = record.error_message.as_deref().unwrap_or("cancelled");
+                printer.stop_ticker();
+                printer.workflow_cancelled(workflow_name, run_id, reason);
+                return Ok(AttachOutcome::Done);
+            }
             _ => {}
         }
 
@@ -727,9 +739,12 @@ pub fn attach_and_render_interactive_with(
                     }
                     continue;
                 }
+                // `Cancelled`: on disk by another process while attached —
+                // terminal like the rest; the record never leaves it.
                 rupu_orchestrator::RunStatus::Completed
                 | rupu_orchestrator::RunStatus::Failed
-                | rupu_orchestrator::RunStatus::Rejected => {
+                | rupu_orchestrator::RunStatus::Rejected
+                | rupu_orchestrator::RunStatus::Cancelled => {
                     std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
                     drain_step_results_interactive(
                         &step_results_log,
@@ -811,6 +826,13 @@ pub fn attach_and_render_interactive_with(
                         workflow_name,
                         run_id,
                         record.error_message.as_deref().unwrap_or("unknown error"),
+                    );
+                }
+                rupu_orchestrator::RunStatus::Cancelled => {
+                    printer.workflow_cancelled(
+                        workflow_name,
+                        run_id,
+                        record.error_message.as_deref().unwrap_or("cancelled"),
                     );
                 }
                 _ => {}

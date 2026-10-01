@@ -62,8 +62,22 @@ pub enum ProviderError {
     #[error("transient error: {0}")]
     Transient(#[source] anyhow::Error),
 
+    /// SIGTERM has arrived (`credential_writes::terminating()`) and the
+    /// request was not sent: nothing started now would finish.
+    #[error("the process is terminating (SIGTERM); the request was not sent")]
+    Terminating,
+
     #[error("provider error: {0}")]
     Other(#[source] anyhow::Error),
+
+    /// A request carrying the 1M-context beta (`context-1m-2025-08-07`) was
+    /// refused with Anthropic's 429 "Extra usage is required for long context
+    /// requests": this account has no extra-usage entitlement for 1M context.
+    /// The client has stopped sending the beta, so a retry goes out at the
+    /// standard window. Never retryable as-is — the agent runner clamps the
+    /// input limit and retries once.
+    #[error("long context unavailable (1M beta disabled): {message}")]
+    LongContextUnavailable { message: String },
 }
 
 impl From<reqwest::Error> for ProviderError {
@@ -87,6 +101,39 @@ impl From<serde_json::Error> for ProviderError {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e.to_string())
     }
+}
+
+impl ProviderError {
+    /// Anthropic's long-context refusal in either shape: the extra-usage 429
+    /// on a request without the 1M beta (`Api { status: 429 }`), or
+    /// [`ProviderError::LongContextUnavailable`] after one with it. The same
+    /// request is refused the same way every time, so no retry layer — the
+    /// providers' (`tuned::is_retryable`) or the agent runner's — retries
+    /// it. The one predicate both use.
+    pub fn is_long_context_refusal(&self) -> bool {
+        match self {
+            ProviderError::LongContextUnavailable { .. } => true,
+            ProviderError::Api {
+                status: 429,
+                message,
+            } => is_long_context_refusal(message),
+            _ => false,
+        }
+    }
+}
+
+/// Anthropic's refusal of a long-context request on an account without
+/// extra-usage billing: a 429 whose body says "Extra usage is required for
+/// long context requests" (see the `anthropic-beta` comment in
+/// `anthropic.rs`). It is triggered by the 1M-context beta header, not by
+/// the request's size, so it is refused the same way on every attempt — not
+/// a rate limit, and the retry layers must not spend their budget on it. The
+/// Anthropic client turns it into [`ProviderError::LongContextUnavailable`]
+/// and stops sending the beta.
+pub fn is_long_context_refusal(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("extra usage is required for long context")
 }
 
 /// Build the right `ProviderError` from a non-2xx HTTP response. 429s parse
@@ -118,6 +165,96 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .ok()?
         .trim();
     v.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// First `max` characters of a response body, for log lines. Char-based so a
+/// multi-byte boundary can never panic.
+fn body_preview(body: &str, max: usize) -> String {
+    body.chars().take(max).collect()
+}
+
+/// Parse a model-listing response body as JSON.
+///
+/// The server answered — so a body that is not the expected JSON is a decode
+/// failure ([`ProviderError::Json`]), not a transport failure
+/// ([`ProviderError::Http`]); callers (and the operator reading the error)
+/// must be able to tell "unreachable" from "reachable but sent garbage". A
+/// short preview of the body is logged so the garbage is visible.
+pub(crate) fn parse_listing_json<T: serde::de::DeserializeOwned>(
+    provider: &str,
+    body: &str,
+) -> Result<T, ProviderError> {
+    serde_json::from_str(body).map_err(|e| {
+        tracing::warn!(
+            provider,
+            error = %e,
+            body_preview = %body_preview(body, 200),
+            "model listing body is not the expected JSON"
+        );
+        ProviderError::Json(format!("{provider} model listing: {e}"))
+    })
+}
+
+/// The error for a model listing that parsed as JSON but has none of the
+/// shapes the provider documents (e.g. no `data` array). Never an empty
+/// catalog: "the server told us it has no models" and "the server told us
+/// something we don't understand" must not look the same. The top-level keys
+/// are logged so a changed wire format is diagnosable.
+pub(crate) fn listing_shape_error(
+    provider: &str,
+    expected: &str,
+    body: &serde_json::Value,
+) -> ProviderError {
+    let keys: Vec<&str> = body
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    tracing::warn!(
+        provider,
+        expected,
+        top_level_keys = ?keys,
+        "model listing has an unexpected shape"
+    );
+    ProviderError::Json(format!(
+        "{provider} model listing has an unexpected shape (expected {expected})"
+    ))
+}
+
+#[cfg(test)]
+mod listing_helper_tests {
+    use super::*;
+
+    #[test]
+    fn parse_listing_json_maps_garbage_to_json_not_http() {
+        let err = parse_listing_json::<serde_json::Value>("acme", "not json").unwrap_err();
+        match err {
+            ProviderError::Json(m) => assert!(m.contains("acme"), "{m}"),
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_listing_json_accepts_valid_json() {
+        let v = parse_listing_json::<serde_json::Value>("acme", r#"{"data":[]}"#).unwrap();
+        assert!(v["data"].is_array());
+    }
+
+    #[test]
+    fn listing_shape_error_is_json_and_names_the_provider_and_expectation() {
+        let err = listing_shape_error("acme", "a `data` array", &serde_json::json!({"weird": 1}));
+        match err {
+            ProviderError::Json(m) => {
+                assert!(m.contains("acme") && m.contains("`data` array"), "{m}")
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_preview_is_char_safe() {
+        let s = "é".repeat(300);
+        assert_eq!(body_preview(&s, 200).chars().count(), 200);
+    }
 }
 
 #[cfg(test)]

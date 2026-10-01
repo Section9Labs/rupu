@@ -47,6 +47,12 @@ pub enum TokenBodyFormat {
 pub struct ProviderOAuth {
     pub flow: OAuthFlow,
     pub client_id: &'static str,
+    /// The installed application's client secret, sent on the token
+    /// exchange and the refresh grant when the IdP wants one (Google does:
+    /// gemini-cli constructs its `OAuth2Client` with both). `None` for
+    /// public PKCE clients. Not a secret in any meaningful sense — it ships
+    /// in every copy of the vendor's own CLI.
+    pub client_secret: Option<&'static str>,
     pub authorize_url: &'static str,
     pub token_url: &'static str,
     pub device_url: Option<&'static str>, // device-code only
@@ -66,6 +72,11 @@ pub struct ProviderOAuth {
     pub extra_authorize_params: &'static [(&'static str, &'static str)],
     /// Format for the token-exchange request body.
     pub token_body_format: TokenBodyFormat,
+    /// Format for the refresh-grant request body. Can differ from the
+    /// exchange: Codex sends the authorization-code grant form-encoded and
+    /// the refresh grant as JSON (openai/codex
+    /// `codex-rs/login/src/oauth/client.rs`).
+    pub refresh_body_format: TokenBodyFormat,
     /// Use the PKCE verifier as the state value rather than a fresh
     /// random nonce. Anthropic's server appears to require this; pi.dev's
     /// known-working impl does this.
@@ -87,6 +98,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // request matt's "Pi Coding Agent" sends and we know it
             // succeeds against the consent screen.
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            client_secret: None,
             // claude.ai/oauth/authorize directly — NOT
             // claude.com/cai/oauth/authorize (that was a v0.1.3
             // misread of the prod config; pi.dev hits claude.ai).
@@ -114,6 +126,16 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // anthropic.ts: JSON body, state == verifier, state
             // included in token-exchange body.
             token_body_format: TokenBodyFormat::Json,
+            // The refresh grant is JSON too — what Claude Code's own
+            // `refreshOAuthToken` sends (oboard/claude-code-rev,
+            // `src/services/oauth/client.ts`: `axios.post(TOKEN_URL,
+            // { grant_type: 'refresh_token', refresh_token, client_id,
+            // scope }, { headers: { 'Content-Type': 'application/json' } })`),
+            // and what rupu's own Anthropic client sends
+            // (`refresh_anthropic_token_at`). The client's `scope`
+            // restatement is not sent: optional (RFC 6749 §6), and it would
+            // refuse a grant whose scopes predate the login's current list.
+            refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: true,
             include_state_in_token_body: true,
         }),
@@ -122,6 +144,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // Codex CLI's public client_id. Mirrored from
             // openai/codex codex-rs/login/src/auth/manager.rs.
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+            client_secret: None,
             authorize_url: "https://auth.openai.com/oauth/authorize",
             // NOTE: this is auth.openai.com, NOT api.openai.com. The
             // earlier rupu config pointed at console.anthropic.com/...
@@ -152,12 +175,23 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
                 ("originator", "codex_cli_rs"),
             ],
             token_body_format: TokenBodyFormat::Form,
+            // "ChatGPT refresh uses JSON; authorization-code and gateway
+            // grants use form encoding" — openai/codex
+            // codex-rs/login/src/oauth/client.rs.
+            refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
         ProviderId::Gemini => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
-            client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
+            // The Gemini CLI installed-app client, id and secret both: the
+            // same pair rupu's Gemini client refreshes with, and the pair
+            // gemini-cli's `OAuth2Client` is constructed with
+            // (packages/core/src/code_assist/oauth2.ts). Google's token
+            // endpoint wants the secret on the code exchange and on the
+            // refresh grant for this client type.
+            client_id: rupu_providers::google_gemini::GEMINI_CLI_CLIENT_ID,
+            client_secret: Some(rupu_providers::google_gemini::GEMINI_CLI_CLIENT_SECRET),
             authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
             device_url: None,
@@ -171,13 +205,15 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
         ProviderId::Copilot => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
             client_id: "Iv1.b507a08c87ecfe98", // GitHub Copilot's public client_id
-            authorize_url: "",                 // unused for device flow
+            client_secret: None,
+            authorize_url: "", // unused for device flow
             token_url: "https://github.com/login/oauth/access_token",
             device_url: Some("https://github.com/login/device/code"),
             scopes: &["read:user"],
@@ -186,6 +222,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
@@ -205,6 +242,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // `gh auth login`. See TODO.md "Register rupu-specific
             // OAuth clients" for the proper long-term cure.
             client_id: "178c6fc778ccc68e1d6a",
+            client_secret: None,
             authorize_url: "",
             token_url: "https://github.com/login/oauth/access_token",
             device_url: Some("https://github.com/login/device/code"),
@@ -219,6 +257,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
@@ -228,6 +267,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // OAuth app and replace this placeholder. See TODO.md "Register
             // rupu-specific OAuth clients".
             client_id: "rupu-gitlab-pkce-placeholder",
+            client_secret: None,
             authorize_url: "https://gitlab.com/oauth/authorize",
             token_url: "https://gitlab.com/oauth/token",
             device_url: None,
@@ -237,6 +277,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),

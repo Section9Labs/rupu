@@ -26,6 +26,10 @@ pub struct AppState {
     /// Optional repo-lister port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs the registry-backed adapter via [`AppState::with_repos`].
     pub repos: Option<Arc<dyn crate::repos::RepoLister>>,
+    /// Optional model-catalog port (discovered model limits + manual
+    /// refetch). Defaults to `None`; rupu-cli's `cp serve` installs the
+    /// runtime-backed adapter via [`AppState::with_model_catalog`].
+    pub model_catalog: Option<Arc<dyn crate::model_catalog::ModelCatalog>>,
     /// Optional agent-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_agent_launcher`].
     pub agent_launcher: Option<Arc<dyn crate::agent_launcher::AgentLauncher>>,
@@ -134,6 +138,7 @@ impl AppState {
             launcher: None,
             session_sender: None,
             repos: None,
+            model_catalog: None,
             agent_launcher: None,
             session_starter: None,
             generator: None,
@@ -172,6 +177,15 @@ impl AppState {
     /// Install a repo-lister adapter (or clear it with `None`).
     pub fn with_repos(mut self, repos: Option<Arc<dyn crate::repos::RepoLister>>) -> Self {
         self.repos = repos;
+        self
+    }
+
+    /// Install a model-catalog adapter (or clear it with `None`).
+    pub fn with_model_catalog(
+        mut self,
+        catalog: Option<Arc<dyn crate::model_catalog::ModelCatalog>>,
+    ) -> Self {
+        self.model_catalog = catalog;
         self
     }
 

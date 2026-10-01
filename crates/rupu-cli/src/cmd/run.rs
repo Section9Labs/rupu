@@ -39,7 +39,9 @@ pub struct Args {
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
-    /// Skip token streaming; receive the full response at once.
+    /// Don't render tokens as they arrive; show each response once it is
+    /// complete. The request still streams on the wire, so long responses
+    /// can't hit the request timeout.
     #[arg(long)]
     pub no_stream: bool,
     /// Control live output density (`focused` | `full`).
@@ -673,7 +675,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             )),
             kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
         };
-        let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
+        let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
             &provider_name,
             &model,
             auth_hint,
@@ -812,6 +814,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // renders dispatch children post-hoc from the parent transcript's
         // tool_call/tool_result entries rather than tailing `events.jsonl`.
         let findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
+        let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
         let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
             global.clone(),
             project_root.clone(),
@@ -832,6 +835,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             // dispatched children are counted by the CP's fallback over
             // sub-run transcripts.
             None,
+            limits_ctx.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -908,6 +912,18 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 
         let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
 
+        // Discover the model's real limits (spec 2026-09-30 §6.1): agent pin →
+        // config → live model list → unknown. Resolved through the same
+        // provider the run is about to use, before it moves into the opts.
+        let limits = rupu_runtime::model_limits::resolve(
+            rupu_runtime::model_limits::LimitOverrides::from_spec(&spec),
+            &provider_name,
+            &model,
+            provider.as_mut(),
+            &limits_ctx,
+        )
+        .await;
+
         let opts = AgentRunOpts {
             seed_source: None,
             agent_name: spec.name.clone(),
@@ -951,13 +967,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             on_stream_event: None,
             on_usage: None,
             concerns: spec.concerns.clone(),
-            max_tokens: spec
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            limits,
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: spec.context_window_tokens,
-            compact_at_percent: spec.compact_at_percent,
             pause: None,
             codename: Some(codename.to_string()),
         };

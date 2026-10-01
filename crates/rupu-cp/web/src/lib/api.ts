@@ -1799,6 +1799,34 @@ export interface RepoEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Model catalog (spec 2026-09-30 model-limits discovery §8)
+// ---------------------------------------------------------------------------
+
+/** One model from `GET /api/models`. A limit is null when unknown. */
+export interface CatalogModel {
+  id: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  source: 'live' | 'custom' | 'baked-in';
+}
+
+/** One provider block from `GET /api/models`. */
+export interface CatalogProvider {
+  provider: string;
+  fetched_at: string | null;
+  stale: boolean;
+  models: CatalogModel[];
+}
+
+/** One provider's result from `POST /api/models/refresh`. */
+export interface RefreshOutcome {
+  provider: string;
+  ok: boolean;
+  count: number;
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -2906,6 +2934,18 @@ export const api = {
       if (e instanceof ApiError && e.status === 501) return [];
       throw e;
     }
+  },
+
+  // --- Model catalog ---
+
+  getModelCatalog(): Promise<CatalogProvider[]> {
+    return request<CatalogProvider[]>('/api/models');
+  },
+  refreshModels(provider?: string): Promise<RefreshOutcome[]> {
+    return request<RefreshOutcome[]>('/api/models/refresh', {
+      method: 'POST',
+      body: JSON.stringify(provider ? { provider } : {}),
+    });
   },
 
   // --- Transcripts ---

@@ -58,6 +58,12 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
 /// model unavailable, …) fail fast so we don't spin on a permanent problem.
 fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
     use rupu_providers::ProviderError as E;
+    // Anthropic's extra-usage 429 is refused the same way on every attempt
+    // (the 1M beta triggers it, not load) — the same predicate
+    // `tuned::is_retryable` uses.
+    if e.is_long_context_refusal() {
+        return false;
+    }
     match e {
         E::Http(_)
         | E::SseParse(_)
@@ -75,15 +81,12 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
         | E::BadRequest { .. }
         | E::ModelUnavailable { .. }
         | E::Preflight(_)
+        | E::LongContextUnavailable { .. }
         | E::Other(_) => false,
+        // The process is exiting: nothing started now would finish.
+        E::Terminating => false,
     }
 }
-
-/// Default per-request output-token budget when an agent doesn't set
-/// `maxTokens`. 4096 was too low for output-heavy agents (it truncated
-/// responses before a tool call could be emitted, especially with extended
-/// thinking, which draws from the same budget).
-pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Callback invoked by `run_agent` immediately before each tool
 /// dispatch (`step_id`, `tool_name`, `blocked`). The runner translates
@@ -182,12 +185,157 @@ fn trim_oldest_exchange(messages: &mut Vec<Message>) -> usize {
     0
 }
 
-/// Return true when the provider error string signals a context-window overflow.
-fn is_context_overflow(err: &str) -> bool {
+/// A provider context-overflow error, with the numbers when the message
+/// carries them (spec 2026-09-30 §7; formats are observed, not documented).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Overflow {
+    pub tokens: Option<u32>,
+    pub max: Option<u32>,
+}
+
+/// The input limit a run falls back to on `ProviderError::LongContextUnavailable`
+/// (no extra-usage entitlement for 1M context): the standard window.
+const STANDARD_CONTEXT_WINDOW: u32 = 200_000;
+
+pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
     let e = err.to_ascii_lowercase();
-    e.contains("prompt is too long")
+    let after = |needle: &str| e.find(needle).map(|i| &e[i + needle.len()..]);
+    // Anthropic: "prompt is too long: N tokens > M maximum"
+    if let Some(rest) = after("prompt is too long:") {
+        let n = numbers(rest);
+        return Some(Overflow {
+            tokens: n.first().copied(),
+            max: n.get(1).copied(),
+        });
+    }
+    // Anthropic (pre-4.5 validation): "input length and `max_tokens` exceed
+    // context limit: A + B > C". The input alone (A) fits; it is the output
+    // reservation that does not, so C is no input limit — no max. The runner
+    // first lowers the request's cap (`parse_output_cap_overflow`); this arm
+    // is the fall-through when that is not possible.
+    if let Some(cap) = parse_output_cap_overflow(err) {
+        return Some(Overflow {
+            tokens: Some(cap.input),
+            max: None,
+        });
+    }
+    // GitHub Copilot (CAPI `model_max_prompt_tokens_exceeded`): "prompt token
+    // count of N exceeds the limit of M" (microsoft/vscode
+    // extensions/copilot/test/inline/inlineEditCode.stest.ts).
+    if let Some(rest) = after("prompt token count of") {
+        if rest.contains("exceeds the limit of") {
+            let n = numbers(rest);
+            return Some(Overflow {
+                tokens: n.first().copied(),
+                max: n.get(1).copied(),
+            });
+        }
+    }
+    // OpenAI / Copilot: "maximum context length is M tokens … resulted in N tokens"
+    if let Some(rest) = after("maximum context length is") {
+        let n = numbers(rest);
+        return Some(Overflow {
+            max: n.first().copied(),
+            tokens: n.get(1).copied(),
+        });
+    }
+    // vLLM: "Input length (N) exceeds model's maximum context length (M)"
+    if e.contains("exceeds model's maximum context length") {
+        if let Some(rest) = after("input length") {
+            let n = numbers(rest);
+            return Some(Overflow {
+                tokens: n.first().copied(),
+                max: n.get(1).copied(),
+            });
+        }
+    }
+    // Gemini: "input token count (N) exceeds the maximum number of tokens allowed (M)"
+    if let Some(rest) = after("input token count") {
+        if rest.contains("exceeds") {
+            let n = numbers(rest);
+            return Some(Overflow {
+                tokens: n.first().copied(),
+                max: n.get(1).copied(),
+            });
+        }
+    }
+    if e.contains("prompt is too long")
         || e.contains("too many tokens")
         || e.contains("context window")
+    {
+        return Some(Overflow {
+            tokens: None,
+            max: None,
+        });
+    }
+    None
+}
+
+/// Anthropic's pre-4.5 validation error, "input length and `max_tokens`
+/// exceed context limit: A + B > C": the input (A) fits the window (C), the
+/// output reservation (B) does not. Wording verified against real API
+/// responses quoted in anthropics/claude-code#42 and #228.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputCapOverflow {
+    pub input: u32,
+    pub max_tokens: u32,
+    pub window: u32,
+}
+
+/// Room left between the input and the window when lowering the output cap
+/// after an [`OutputCapOverflow`] (token counts are estimates on both sides).
+const OUTPUT_CAP_MARGIN: u32 = 1000;
+/// The smallest output cap worth retrying with; below it, compact instead.
+const MIN_LOWERED_OUTPUT_CAP: u32 = 1024;
+
+impl OutputCapOverflow {
+    /// `window − input − 1000`, or `None` when that is under 1024 (the input
+    /// itself is what has to shrink).
+    pub(crate) fn lowered_max_tokens(&self) -> Option<u32> {
+        self.window
+            .checked_sub(self.input)?
+            .checked_sub(OUTPUT_CAP_MARGIN)
+            .filter(|n| *n >= MIN_LOWERED_OUTPUT_CAP)
+    }
+}
+
+pub(crate) fn parse_output_cap_overflow(err: &str) -> Option<OutputCapOverflow> {
+    let e = err.to_ascii_lowercase();
+    let needle = "input length and `max_tokens` exceed context limit";
+    let rest = &e[e.find(needle)? + needle.len()..];
+    let n = numbers(rest);
+    Some(OutputCapOverflow {
+        input: *n.first()?,
+        max_tokens: *n.get(1)?,
+        window: *n.get(2)?,
+    })
+}
+
+/// Every integer in `s`, in order. A `,` or `_` between digits is a thousands separator.
+fn numbers(s: &str) -> Vec<u32> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut cur: Option<u64> = None;
+    for (i, &c) in b.iter().enumerate() {
+        if c.is_ascii_digit() {
+            cur = Some(
+                cur.unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(c - b'0')),
+            );
+        } else if (c == b',' || c == b'_')
+            && cur.is_some()
+            && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+        {
+            // thousands separator
+        } else if let Some(n) = cur.take() {
+            out.push(n.min(u64::from(u32::MAX)) as u32);
+        }
+    }
+    if let Some(n) = cur {
+        out.push(n.min(u64::from(u32::MAX)) as u32);
+    }
+    out
 }
 
 /// Estimate token count for a slice of messages using chars/4 approximation.
@@ -232,17 +380,6 @@ fn message_chars(m: &Message) -> usize {
         .sum()
 }
 
-/// Compute the token count at which compaction triggers.
-/// Returns `None` if `context_window_tokens` is `None` (compaction disabled).
-pub(crate) fn effective_compact_threshold(
-    context_window_tokens: Option<u32>,
-    compact_at_percent: Option<u8>,
-) -> Option<u64> {
-    let window = context_window_tokens?;
-    let pct = compact_at_percent.unwrap_or(80).clamp(10, 95) as u64;
-    Some(window as u64 * pct / 100)
-}
-
 /// Partition `messages` into `(middle_start, recent_start)` for compaction.
 ///
 /// - `messages[0..middle_start]` = task (always index 0, so `middle_start = 1`)
@@ -274,12 +411,9 @@ pub(crate) fn partition_for_compaction(
 
     for i in (middle_start..messages.len()).rev() {
         let msg_chars = message_chars(&messages[i]);
-        if recent_start <= min_recent_start {
-            // We've reached the minimum we must keep — stop.
-            break;
-        }
-        if accumulated + msg_chars > recent_budget_chars && recent_start <= messages.len() - 2 {
-            // Adding this message would exceed the budget and we already have ≥2.
+        if recent_start <= min_recent_start && accumulated + msg_chars > recent_budget_chars {
+            // We already keep the minimum two, and this message would exceed
+            // the budget — stop.
             break;
         }
         accumulated += msg_chars;
@@ -325,6 +459,10 @@ pub(crate) fn rebuild_compacted(
     result
 }
 
+/// Output cap of the compaction summariser call — and so the most the summary
+/// adds to the compacted history.
+const SUMMARY_MAX_TOKENS: u32 = 8192;
+
 /// Result of compacting a conversation: the new (shorter) message list and how
 /// many middle messages were replaced by the summary.
 pub struct CompactionOutcome {
@@ -339,6 +477,17 @@ pub struct CompactionOutcome {
 /// `Ok(Some(outcome))` when compaction was performed, `Ok(None)` when the
 /// history is too short or there is nothing to summarise.
 ///
+/// `compact_threshold` is the input-token count compaction keeps the history
+/// under — [`ModelLimits::compact_threshold`](rupu_providers::model_limits::ModelLimits::compact_threshold),
+/// the same value that triggers proactive compaction (spec 2026-09-30 §6.4,
+/// headroom rule included). The compacted conversation — the task message,
+/// the summary (up to [`SUMMARY_MAX_TOKENS`]) and the recent messages kept
+/// verbatim — is sized to about half of it: the recent budget is half the
+/// threshold NET of the task and the summary, so it lands under the
+/// threshold instead of re-triggering compaction on the next turn. The last
+/// two messages are always kept, so a task too large for any budget
+/// degrades to keeping those two rather than to a no-op.
+///
 /// `last_input_tokens` is the provider's real input token count from the most
 /// recent turn. It is used to calibrate a char→token ratio so the recent-message
 /// budget is expressed in raw chars that correspond to the correct token count,
@@ -348,17 +497,18 @@ pub async fn compact_messages(
     messages: &[Message],
     provider: &mut dyn LlmProvider,
     model: &str,
-    context_window_tokens: u32,
-    compact_at_percent: Option<u8>,
+    compact_threshold: u64,
     last_input_tokens: u32,
 ) -> Result<Option<CompactionOutcome>, rupu_providers::ProviderError> {
     // Calibrate: derive tokens-per-char from what the provider actually charged.
     let total_chars: usize = messages.iter().map(message_chars).sum();
     let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
 
-    let threshold = effective_compact_threshold(Some(context_window_tokens), compact_at_percent)
-        .unwrap_or(context_window_tokens as u64 / 2);
-    let target_recent_tokens = (threshold / 2) as f64;
+    // The task message and the summary survive outside the recent slice:
+    // the budget is net of both.
+    let fixed_tokens = messages.first().map_or(0, message_chars) as f64 * tokens_per_char
+        + f64::from(SUMMARY_MAX_TOKENS);
+    let target_recent_tokens = ((compact_threshold / 2) as f64 - fixed_tokens).max(0.0);
     let recent_budget_chars = (target_recent_tokens / tokens_per_char) as usize;
 
     let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget_chars)
@@ -374,12 +524,11 @@ conclusions; findings and their locations; files/areas already examined; the \
 current state; and any open threads or planned next steps. Omit chit-chat and \
 redundant tool output. This summary replaces the omitted turns, so it must be \
 self-contained.";
-    let summary_max_tokens = 8192u32;
     let summary_req = LlmRequest {
         model: model.to_string(),
         system: Some(summary_prompt.to_string()),
         messages: messages[..recent_start].to_vec(),
-        max_tokens: summary_max_tokens,
+        max_tokens: Some(SUMMARY_MAX_TOKENS),
         tools: vec![],
         cell_id: None,
         trace_id: None,
@@ -408,6 +557,13 @@ self-contained.";
         disable_prompt_cache: true,
     };
 
+    // The summariser is an LLM call: none once SIGTERM has arrived. Checked
+    // here, in the library, so every caller is covered — the agent loop
+    // (which also refuses earlier, closing its transcript as aborted),
+    // `rupu session compact` and the session worker's compaction turn.
+    if rupu_providers::credential_writes::terminating() {
+        return Err(rupu_providers::ProviderError::Terminating);
+    }
     let summary_resp = provider.send(&summary_req).await?;
 
     // Extract summary text from the response.
@@ -465,9 +621,10 @@ async fn compact_context(
     writer: &mut JsonlWriter,
     last_input_tokens: u32,
 ) -> bool {
-    let context_window_tokens = match opts.context_window_tokens {
-        Some(w) => w,
-        None => return false,
+    // The same threshold that triggers proactive compaction (headroom rule
+    // included); `None` = input limit unknown, so nothing to size against.
+    let Some(threshold) = opts.limits.compact_threshold() else {
+        return false;
     };
 
     // Best-effort dump of the full pre-compaction messages as JSON before
@@ -498,8 +655,7 @@ async fn compact_context(
         messages,
         opts.provider.as_mut(),
         &opts.model,
-        context_window_tokens,
-        opts.compact_at_percent,
+        threshold,
         last_input_tokens,
     )
     .await
@@ -591,6 +747,12 @@ pub enum RunError {
     NonTtyAskAbort,
     #[error("operator stopped run at turn {turn}")]
     OperatorStop { turn: u32 },
+    /// SIGTERM has arrived (`rupu_providers::credential_writes::terminating`)
+    /// and the loop refused to start another LLM call or tool dispatch: the
+    /// process is exiting as soon as its pending credential writes are
+    /// drained, and nothing started now would finish.
+    #[error("run aborted: the process is terminating (SIGTERM)")]
+    Terminating,
     #[error("coverage setup: {0}")]
     Coverage(String),
     /// The agent loop returned `Ok` — no transport/provider failure — but the
@@ -600,6 +762,75 @@ pub enum RunError {
     /// [`RunResult::terminal_error`], never returned by [`run_agent`] itself.
     #[error("agent run ended in status {status:?} ({detail})")]
     TerminalStatus { status: RunStatus, detail: String },
+}
+
+/// The run's exit once SIGTERM has arrived: close the transcript as
+/// `Aborted` (saying why) and hand back [`RunError::Terminating`] — or the
+/// transcript error, if even that could not be written.
+fn terminated(
+    writer: &mut JsonlWriter,
+    run_id: &str,
+    total_tokens: u64,
+    started: Instant,
+) -> RunError {
+    let closed = writer
+        .write(&Event::RunComplete {
+            run_id: run_id.to_string(),
+            status: RunStatus::Aborted,
+            total_tokens,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error: Some("terminating (SIGTERM)".into()),
+        })
+        .and_then(|_| writer.flush());
+    match closed {
+        Ok(()) => RunError::Terminating,
+        Err(e) => RunError::Transcript(e),
+    }
+}
+
+/// Write a turn's content blocks to the transcript in the provider's own
+/// order — thinking, text and tool_use land exactly as the model produced
+/// them (spec §3 emission-order contract) — and return the tool calls to
+/// dispatch, as `(call_id, tool, input)`.
+fn emit_turn_content(
+    writer: &mut JsonlWriter,
+    content: &[ContentBlock],
+) -> Result<Vec<(String, String, serde_json::Value)>, RunError> {
+    let mut tool_uses = Vec::new();
+    for block in content {
+        match block {
+            ContentBlock::Text { text } => {
+                writer.write(&Event::AssistantMessage {
+                    content: text.clone(),
+                    thinking: None,
+                })?;
+            }
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => {
+                writer.write(&Event::Thinking {
+                    text: text.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    raw: raw.clone(),
+                })?;
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                writer.write(&Event::ToolCall {
+                    call_id: id.clone(),
+                    tool: name.clone(),
+                    input: input.clone(),
+                })?;
+                tool_uses.push((id.clone(), name.clone(), input.clone()));
+            }
+            ContentBlock::ToolResult { .. } => {}
+            ContentBlock::Unknown => {}
+        }
+    }
+    Ok(tool_uses)
 }
 
 /// Pluggable permission decider. Three production impls + a `Bypass`
@@ -697,8 +928,11 @@ pub struct AgentRunOpts {
     /// Absolute turn index for the first turn in this run.
     pub turn_index_offset: u32,
     pub mode_str: String,
-    /// If true, skip token streaming and use `provider.send` for one-shot
-    /// completions. Default is false (streaming). Used by --no-stream.
+    /// If true, don't render tokens as they arrive and don't write
+    /// `AssistantDelta`/`ThinkingDelta` transcript events (the transcript keeps
+    /// its final-message-only shape). Display only: the request still streams
+    /// on the wire, so a long response cannot hit the HTTP request timeout and
+    /// the full output cap applies. Default is false. Used by --no-stream.
     pub no_stream: bool,
     /// If true, suppress stdout writes from the streaming code path.
     /// The provider's text deltas still flow into the JSONL transcript
@@ -780,12 +1014,12 @@ pub struct AgentRunOpts {
     /// the catalog to the system prompt. `None` (default) disables all
     /// coverage harness machinery.
     pub concerns: Option<rupu_coverage::ConcernsBlock>,
-    /// Per-request output-token budget (`max_tokens`). See `DEFAULT_MAX_TOKENS`.
-    pub max_tokens: u32,
-    /// Model context-window size in tokens for compaction. `None` = compaction disabled.
-    pub context_window_tokens: Option<u32>,
-    /// Threshold percentage for compaction. Defaults to 80, clamped to [10, 95].
-    pub compact_at_percent: Option<u8>,
+    /// Resolved model limits (spec 2026-09-30 §5): the request `max_tokens`
+    /// (`output`), the compaction threshold (`compact_threshold()`), and the
+    /// run-start notice. Launch sites build this with
+    /// `rupu_runtime::model_limits::resolve`; tests use `ModelLimits::unknown()`
+    /// / `fixed(..)`.
+    pub limits: rupu_providers::model_limits::ModelLimits,
     /// Override the `scope_name` used when deriving the coverage `target_id`.
     /// When `None` (default, standalone agent runs), falls back to `agent_name`.
     /// Workflow runs set this to the workflow name so all steps accumulate
@@ -843,6 +1077,9 @@ pub struct RunResult {
     /// finished — badly. Callers must not read `Result::is_ok()` as "the
     /// agent did its job"; see [`RunResult::terminal_error`].
     pub error: Option<String>,
+    /// `opts.limits` as the run ended, including any limit learned from an
+    /// overflow error (spec §7). Sessions persist this.
+    pub final_limits: rupu_providers::model_limits::ModelLimits,
 }
 
 impl RunResult {
@@ -920,7 +1157,26 @@ enum LoopOutcome {
 
 /// Drive one agent run to completion. Writes a JSONL transcript at
 /// `opts.transcript_path` and returns turn/token counts on success.
-pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
+pub async fn run_agent(opts: AgentRunOpts) -> Result<RunResult, RunError> {
+    run_agent_with_limits(opts).await.0
+}
+
+/// [`run_agent`], plus the run's final `opts.limits` on EVERY exit path —
+/// `Err` included. A limit learned from an overflow error (spec 2026-09-30
+/// §7) is otherwise lost whenever the run then fails (trim exhaustion,
+/// retries exhausted, …), because [`RunResult::final_limits`] only exists on
+/// `Ok`. Sessions persist the returned value after every turn (§6.5).
+pub async fn run_agent_with_limits(
+    mut opts: AgentRunOpts,
+) -> (
+    Result<RunResult, RunError>,
+    rupu_providers::model_limits::ModelLimits,
+) {
+    let result = run_agent_inner(&mut opts).await;
+    (result, opts.limits)
+}
+
+async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError> {
     // Truncate/create a fresh, empty transcript, then hold an
     // APPEND-mode writer for the rest of the run. This is deliberate,
     // not equivalent-by-accident to `JsonlWriter::create`: the
@@ -1035,6 +1291,12 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         schema: Some(2),
         system_prompt: Some(opts.agent_system_prompt.clone()),
         codename: opts.codename.clone(),
+    })?;
+    // One notice per run, before the first turn: what the run resolved, and
+    // where each number came from (spec 2026-09-30 §6.6).
+    writer.write(&Event::Notice {
+        kind: "model_limits".into(),
+        message: opts.limits.describe(&opts.provider_name, Utc::now()),
     })?;
     writer.flush()?;
 
@@ -1214,6 +1476,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // -----------------------------------------------------------------------
     let inner_result: Result<RunResult, RunError> = async {
         let mut compaction_seq = 0u32;
+        // Input tokens the provider billed on the most recent completed turn;
+        // calibrates an overflow-triggered compaction whose error message
+        // carried no token count (spec §7).
+        let mut last_turn_input_tokens: u32 = 0;
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
                 break 'turns LoopOutcome::Status(
@@ -1226,7 +1492,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
                 messages: messages.clone(),
-                max_tokens: opts.max_tokens,
+                max_tokens: opts.limits.output.tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
                 trace_id: None,
@@ -1241,14 +1507,44 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 disable_prompt_cache: false,
             };
             let mut trim_attempts = 0u32;
+            // Compact-on-overflow runs at most once per turn (spec §7); a
+            // repeat overflow falls through to the trim loop.
+            let mut overflow_compacted = false;
+            // An `input + max_tokens > window` error lowers this request's
+            // output cap and retries at most once per turn.
+            let mut output_cap_lowered = false;
+            // `LongContextUnavailable` falls back to the standard window and
+            // retries at most once per turn.
+            let mut long_context_fallback = false;
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
+                // No new LLM call once SIGTERM has arrived (nor a retry).
+                if rupu_providers::credential_writes::terminating() {
+                    return Err(terminated(
+                        &mut writer,
+                        &opts.run_id,
+                        total_in + total_out,
+                        started,
+                    ));
+                }
                 let step: CallStep = if opts.no_stream {
-                    // Race the one-shot completion against the pause token so a
-                    // pause takes effect immediately rather than only after the
-                    // provider returns.
+                    // `no_stream` only changes DISPLAY: the request still
+                    // streams on the wire, so a long response cannot hit the
+                    // HTTP request timeout and the discovered output cap needs
+                    // no clamping. The sink is quiet — it forwards each event
+                    // to `on_stream_event` (if set) but prints nothing and
+                    // writes no `AssistantDelta`/`ThinkingDelta`, so the
+                    // transcript keeps its final-message-only shape.
+                    let mut quiet = |ev: StreamEvent| {
+                        if let Some(cb) = opts.on_stream_event.as_ref() {
+                            cb(ev);
+                        }
+                    };
+                    // Race the stream against the pause token so a pause takes
+                    // effect immediately rather than only after the provider
+                    // returns; a dropped partial is never committed.
                     tokio::select! {
-                        r = opts.provider.send(&req) => match r {
+                        r = opts.provider.stream(&req, &mut quiet) => match r {
                             Ok(x) => CallStep::Ok(x),
                             Err(e) => CallStep::Err(e),
                         },
@@ -1327,8 +1623,135 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     CallStep::Paused => break CallOutcome::Paused,
                     CallStep::Err(e) => {
                         let e_str = e.to_string();
-                        if is_context_overflow(&e_str) && trim_attempts <= 64 {
-                            if trim_oldest_exchange(&mut req.messages) > 0 {
+                        // The account has no extra-usage entitlement for 1M
+                        // context, and the client has stopped sending the 1M
+                        // beta. Fall back to the standard window and retry
+                        // once; if the input is still too large, the server
+                        // answers `prompt is too long` and the overflow
+                        // handling below compacts.
+                        if matches!(e, rupu_providers::ProviderError::LongContextUnavailable { .. })
+                            && !long_context_fallback
+                        {
+                            use rupu_providers::model_limits::group_thousands;
+                            long_context_fallback = true;
+                            let before = opts.limits.input.tokens;
+                            let clamped = opts.limits.clamp_input(STANDARD_CONTEXT_WINDOW);
+                            writer.write(&Event::Notice {
+                                kind: "model_limits_clamped".into(),
+                                // The hint matters most on a session's later
+                                // turns: the clamp is already persisted (no
+                                // "input X → Y"), yet every run still sends
+                                // one refused request first — and a session
+                                // keeps the model and window it started with,
+                                // so editing the agent won't reach it.
+                                message: format!(
+                                    "this account has no extra-usage entitlement for 1M context — using the {} window (1M beta disabled){} — remove `[1m]` from the model / `contextWindow: 1m` from the agent to skip this refused request each run{}",
+                                    group_thousands(u64::from(STANDARD_CONTEXT_WINDOW)),
+                                    if clamped {
+                                        format!(
+                                            "; input {} → {}",
+                                            before.map_or("unknown".to_string(), |b| {
+                                                group_thousands(u64::from(b))
+                                            }),
+                                            group_thousands(u64::from(STANDARD_CONTEXT_WINDOW)),
+                                        )
+                                    } else {
+                                        String::new()
+                                    },
+                                    if opts.surface_tag.as_deref() == Some("session") {
+                                        " (an existing session keeps the model and window it started with — start a new session to apply the change)"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                            })?;
+                            writer.flush()?;
+                            continue;
+                        }
+                        // `input + max_tokens > window`: the input fits, the
+                        // output reservation does not. Lower THIS request's
+                        // cap and retry once; the input limit is untouched.
+                        // When no useful cap is left, it falls through to the
+                        // overflow handling below (compaction).
+                        if !output_cap_lowered {
+                            if let Some((cap, lowered)) = parse_output_cap_overflow(&e_str)
+                                .and_then(|c| Some((c, c.lowered_max_tokens()?)))
+                            {
+                                use rupu_providers::model_limits::group_thousands;
+                                output_cap_lowered = true;
+                                req.max_tokens = Some(lowered);
+                                writer.write(&Event::Notice {
+                                    kind: "model_limits_clamped".into(),
+                                    message: format!(
+                                        "output {} → {} for this request (provider error: input {} + max_tokens {} > {}); the input limit is unchanged",
+                                        group_thousands(u64::from(cap.max_tokens)),
+                                        group_thousands(u64::from(lowered)),
+                                        group_thousands(u64::from(cap.input)),
+                                        group_thousands(u64::from(cap.max_tokens)),
+                                        group_thousands(u64::from(cap.window)),
+                                    ),
+                                })?;
+                                writer.flush()?;
+                                continue;
+                            }
+                        }
+                        if let Some(overflow) = parse_context_overflow(&e_str) {
+                            // Learn the real limit, then compact once per turn
+                            // (spec §7).
+                            if !overflow_compacted {
+                                overflow_compacted = true;
+                                if let Some(max) = overflow.max.filter(|m| *m > 0) {
+                                    let before = opts.limits.input.tokens;
+                                    if opts.limits.clamp_input(max) {
+                                        writer.write(&Event::Notice {
+                                            kind: "model_limits_clamped".into(),
+                                            message: format!(
+                                                "input {} → {} (provider error); if this recurs, pin contextWindowTokens on the agent",
+                                                before.map_or("unknown".to_string(), |b| {
+                                                    rupu_providers::model_limits::group_thousands(
+                                                        u64::from(b),
+                                                    )
+                                                }),
+                                                rupu_providers::model_limits::group_thousands(
+                                                    u64::from(max)
+                                                ),
+                                            ),
+                                        })?;
+                                        writer.flush()?;
+                                    }
+                                }
+                                let run_id_clone = opts.run_id.clone();
+                                let calibration =
+                                    overflow.tokens.unwrap_or(last_turn_input_tokens).max(1);
+                                // The summariser is an LLM call too: none once
+                                // SIGTERM has arrived.
+                                if rupu_providers::credential_writes::terminating() {
+                                    return Err(terminated(
+                                        &mut writer,
+                                        &opts.run_id,
+                                        total_in + total_out,
+                                        started,
+                                    ));
+                                }
+                                if compact_context(
+                                    &mut messages,
+                                    opts,
+                                    &run_id_clone,
+                                    compaction_seq + 1,
+                                    &mut writer,
+                                    calibration,
+                                )
+                                .await
+                                {
+                                    // Numbered only once it ran: no gaps.
+                                    compaction_seq += 1;
+                                    req.messages = messages.clone();
+                                    continue;
+                                }
+                            }
+                            // Last resort: the delete-oldest trim loop (no max
+                            // parsed, compaction failed, or still overflowing).
+                            if trim_attempts <= 64 && trim_oldest_exchange(&mut req.messages) > 0 {
                                 trim_attempts += 1;
                                 writer.write(&Event::Notice {
                                     kind: "context_trim".into(),
@@ -1459,66 +1882,48 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 purpose: None,
             })?;
             total_cached += resp.usage.cached_tokens as u64;
+            last_turn_input_tokens = resp.usage.input_tokens;
 
             // Proactive context compaction: if the previous turn's input exceeded
             // the configured threshold, summarise older turns before building the
             // next request. Must run after usage accounting.
-            if let Some(threshold) =
-                effective_compact_threshold(opts.context_window_tokens, opts.compact_at_percent)
-            {
+            if let Some(threshold) = opts.limits.compact_threshold() {
                 if resp.usage.input_tokens as u64 > threshold {
-                    compaction_seq += 1;
+                    // The summariser is an LLM call too: none once SIGTERM
+                    // has arrived. The turn the model already answered is
+                    // not dropped: its content lands before the abort, as
+                    // it does when the abort happens at the tool dispatch.
+                    if rupu_providers::credential_writes::terminating() {
+                        emit_turn_content(&mut writer, &resp.content)?;
+                        return Err(terminated(
+                            &mut writer,
+                            &opts.run_id,
+                            total_in + total_out,
+                            started,
+                        ));
+                    }
                     let run_id_clone = opts.run_id.clone();
                     let last_input_tokens = resp.usage.input_tokens;
-                    let _ = compact_context(
+                    if compact_context(
                         &mut messages,
-                        &mut opts,
+                        opts,
                         &run_id_clone,
-                        compaction_seq,
+                        compaction_seq + 1,
                         &mut writer,
                         last_input_tokens,
                     )
-                    .await;
+                    .await
+                    {
+                        // Numbered only once it ran: no gaps.
+                        compaction_seq += 1;
+                    }
                 }
             }
 
             // Emit the turn's content blocks in the provider's own order —
             // thinking, text, and tool_use land in the transcript exactly as
             // the model produced them (spec §3 emission-order contract).
-            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-            for block in &resp.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        writer.write(&Event::AssistantMessage {
-                            content: text.clone(),
-                            thinking: None,
-                        })?;
-                    }
-                    ContentBlock::Reasoning {
-                        text,
-                        provider,
-                        model,
-                        raw,
-                    } => {
-                        writer.write(&Event::Thinking {
-                            text: text.clone(),
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            raw: raw.clone(),
-                        })?;
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        writer.write(&Event::ToolCall {
-                            call_id: id.clone(),
-                            tool: name.clone(),
-                            input: input.clone(),
-                        })?;
-                        tool_uses.push((id.clone(), name.clone(), input.clone()));
-                    }
-                    ContentBlock::ToolResult { .. } => {}
-                    ContentBlock::Unknown => {}
-                }
-            }
+            let tool_uses = emit_turn_content(&mut writer, &resp.content)?;
 
             // Dispatch tool calls in order.
             let mut tool_results: Vec<(String, String, Option<String>)> = Vec::new();
@@ -1599,6 +2004,15 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 // `blocked: true`). `blocked` is derived from the actual
                 // outcome below. Exactly one callback invocation per call,
                 // same as before.
+                // No new tool dispatch once SIGTERM has arrived.
+                if rupu_providers::credential_writes::terminating() {
+                    return Err(terminated(
+                        &mut writer,
+                        &opts.run_id,
+                        total_in + total_out,
+                        started,
+                    ));
+                }
                 let started_tool = Instant::now();
                 let invoke_result = tool.invoke(input.clone(), &opts.tool_context).await;
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
@@ -1773,6 +2187,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             final_messages: messages,
             paused,
             error: terminal_error,
+            final_limits: opts.limits.clone(),
         })
     }
     .await;
@@ -1863,12 +2278,13 @@ mod on_tool_call_tests {
     async fn on_tool_call_fires_once_per_tool_invocation() {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push(format!("{step_id}:{tool_name}:{blocked}"));
-        });
+        let cb: OnToolCallCallback =
+            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+                calls_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("{step_id}:{tool_name}:{blocked}"));
+            });
 
         // Two-turn script: turn 0 → tool use (read_file), turn 1 → final text.
         // The read_file tool needs a `path` input; we point it at a real
@@ -1935,11 +2351,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -1971,12 +2385,14 @@ mod on_tool_call_tests {
         // hard run failure).
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((step_id.to_string(), tool_name.to_string(), blocked));
-        });
+        let cb: OnToolCallCallback =
+            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+                calls_clone.lock().unwrap().push((
+                    step_id.to_string(),
+                    tool_name.to_string(),
+                    blocked,
+                ));
+            });
 
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test_denied.jsonl");
@@ -2037,11 +2453,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2052,7 +2466,11 @@ mod on_tool_call_tests {
         assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
 
         let log = calls.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected exactly one on_tool_call, got {log:?}"
+        );
         assert_eq!(log[0], ("s1".to_string(), "bash".to_string(), true));
 
         // The model got a tool error back, not a hard failure.
@@ -2066,7 +2484,10 @@ mod on_tool_call_tests {
                 Event::ToolResult { error: Some(msg), .. } if msg.contains("unknown tool: bash")
             )
         });
-        assert!(saw_tool_error, "expected a tool-error ToolResult for the denied call; got {events:?}");
+        assert!(
+            saw_tool_error,
+            "expected a tool-error ToolResult for the denied call; got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -2083,12 +2504,14 @@ mod on_tool_call_tests {
         // exactly this case. It must now report `blocked: true`.
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-            calls_clone
-                .lock()
-                .unwrap()
-                .push((step_id.to_string(), tool_name.to_string(), blocked));
-        });
+        let cb: OnToolCallCallback =
+            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+                calls_clone.lock().unwrap().push((
+                    step_id.to_string(),
+                    tool_name.to_string(),
+                    blocked,
+                ));
+            });
 
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test_readonly_denied.jsonl");
@@ -2153,11 +2576,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2168,7 +2589,11 @@ mod on_tool_call_tests {
         assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
 
         let log = calls.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected exactly one on_tool_call, got {log:?}"
+        );
         assert_eq!(
             log[0],
             ("s1".to_string(), "issues.create".to_string(), true),
@@ -2227,11 +2652,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
         };
         let result = run_agent(opts).await.unwrap();
@@ -2327,11 +2750,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2405,11 +2826,9 @@ mod on_tool_call_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         };
@@ -2505,11 +2924,9 @@ mod on_tool_call_tests {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             };
@@ -2668,7 +3085,10 @@ mod retry_tests {
 
 #[cfg(test)]
 mod context_trim_tests {
-    use super::{is_context_overflow, trim_oldest_exchange};
+    use super::{
+        parse_context_overflow, parse_output_cap_overflow, trim_oldest_exchange, OutputCapOverflow,
+        Overflow,
+    };
     use rupu_providers::types::{ContentBlock, Message, Role};
 
     fn user_msg(text: &str) -> Message {
@@ -2752,18 +3172,177 @@ mod context_trim_tests {
     }
 
     #[test]
-    fn is_context_overflow_matches_known_phrases() {
-        assert!(is_context_overflow("prompt is too long for the model"));
-        assert!(is_context_overflow("too many tokens in request"));
-        assert!(is_context_overflow("exceeds context window limit"));
-        assert!(is_context_overflow("PROMPT IS TOO LONG")); // case-insensitive
+    fn overflow_formats_parse_tokens_and_max() {
+        let cases = [
+            (
+                r#"bad request: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 maximum"}}"#,
+                Some(215_000),
+                Some(200_000),
+            ),
+            (
+                "API error 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130500 tokens.",
+                Some(130_500),
+                Some(128_000),
+            ),
+            (
+                "API error 400: Input length (140000) exceeds model's maximum context length (131072).",
+                Some(140_000),
+                Some(131_072),
+            ),
+            (
+                "bad request: The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).",
+                Some(1_100_000),
+                Some(1_048_576),
+            ),
+            ("prompt is too long for the model", None, None),
+            ("too many tokens in request", None, None),
+            ("exceeds context window limit", None, None),
+            ("PROMPT IS TOO LONG", None, None), // case-insensitive
+        ];
+        for (msg, tokens, max) in cases {
+            assert_eq!(
+                parse_context_overflow(msg),
+                Some(Overflow { tokens, max }),
+                "{msg}"
+            );
+        }
+    }
+
+    /// Anthropic's pre-4.5 validation error: `input + max_tokens > window`.
+    /// Verbatim wording from real API responses quoted in
+    /// anthropics/claude-code#42 and #228 (numbers invented).
+    const ANTHROPIC_INPUT_PLUS_MAX_TOKENS: &str = r#"API error 400: {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 183500 + 20000 > 201000, decrease input length or `max_tokens` and try again"}}"#;
+
+    #[test]
+    fn input_plus_max_tokens_format_parses_all_three_numbers() {
+        assert_eq!(
+            parse_output_cap_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
+            Some(OutputCapOverflow {
+                input: 183_500,
+                max_tokens: 20_000,
+                window: 201_000,
+            })
+        );
+        // Thousands separators, and case-insensitive.
+        assert_eq!(
+            parse_output_cap_overflow(
+                "INPUT LENGTH AND `MAX_TOKENS` EXCEED CONTEXT LIMIT: 1,000 + 2,000 > 2,500"
+            ),
+            Some(OutputCapOverflow {
+                input: 1_000,
+                max_tokens: 2_000,
+                window: 2_500,
+            })
+        );
+        // Not this format.
+        assert_eq!(
+            parse_output_cap_overflow("prompt is too long: 215000 tokens > 200000 maximum"),
+            None
+        );
+        // The format with its numbers missing is not usable for lowering.
+        assert_eq!(
+            parse_output_cap_overflow("input length and `max_tokens` exceed context limit"),
+            None
+        );
+    }
+
+    /// `input + max_tokens > window` lowers the output cap to
+    /// `window − input − 1000`, floor 1024; below the floor there is nothing
+    /// to lower to.
+    #[test]
+    fn input_plus_max_tokens_lowered_cap_keeps_a_margin_and_a_floor() {
+        let c = |input, window| OutputCapOverflow {
+            input,
+            max_tokens: 20_000,
+            window,
+        };
+        assert_eq!(c(183_500, 201_000).lowered_max_tokens(), Some(16_500));
+        assert_eq!(
+            c(100, 2_124).lowered_max_tokens(),
+            Some(1_024),
+            "exactly the floor"
+        );
+        assert_eq!(c(100, 2_123).lowered_max_tokens(), None, "below the floor");
+        assert_eq!(
+            c(205_000, 201_000).lowered_max_tokens(),
+            None,
+            "input alone overflows"
+        );
+    }
+
+    /// The same error, when the cap cannot be lowered, is still an overflow:
+    /// the input count is known, the input LIMIT is not (the window `C`
+    /// counts output too), so no max.
+    #[test]
+    fn input_plus_max_tokens_is_an_overflow_without_an_input_max() {
+        assert_eq!(
+            parse_context_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
+            Some(Overflow {
+                tokens: Some(183_500),
+                max: None
+            })
+        );
+    }
+
+    /// GitHub Copilot (CAPI) `model_max_prompt_tokens_exceeded`. Verbatim
+    /// wording from microsoft/vscode `extensions/copilot/test/inline/
+    /// inlineEditCode.stest.ts` (the vscode-copilot-chat sources).
+    #[test]
+    fn copilot_prompt_limit_format_parses_tokens_and_max() {
+        assert_eq!(
+            parse_context_overflow(
+                r#"API error 400: {"error":{"message":"prompt token count of 13613 exceeds the limit of 12288","code":"model_max_prompt_tokens_exceeded"}}"#
+            ),
+            Some(Overflow {
+                tokens: Some(13_613),
+                max: Some(12_288)
+            })
+        );
+    }
+
+    /// Anthropic's extra-usage 429 is triggered by the 1M beta header, not by
+    /// the request's size (see the `anthropic-beta` comment in
+    /// rupu-providers/src/anthropic.rs), so it is no overflow: compacting
+    /// cannot make the same request acceptable. The client turns it into
+    /// `ProviderError::LongContextUnavailable`, handled on its own.
+    #[test]
+    fn long_context_entitlement_429_is_not_an_overflow() {
+        assert_eq!(
+            parse_context_overflow(
+                "API error 429: Extra usage is required for long context requests"
+            ),
+            None
+        );
+    }
+
+    /// The Gemini arm needs the "exceeds" verb: a message that merely
+    /// mentions an input token count is not an overflow.
+    #[test]
+    fn gemini_arm_requires_exceeds() {
+        assert_eq!(
+            parse_context_overflow(
+                "API error 500: internal error (input token count 1200, output token count 30)"
+            ),
+            None
+        );
     }
 
     #[test]
-    fn is_context_overflow_does_not_match_unrelated_errors() {
-        assert!(!is_context_overflow("network error"));
-        assert!(!is_context_overflow("invalid api key"));
-        assert!(!is_context_overflow("rate limited"));
+    fn overflow_ignores_unrelated_errors() {
+        for msg in ["network error", "invalid api key", "rate limited"] {
+            assert_eq!(parse_context_overflow(msg), None);
+        }
+    }
+
+    #[test]
+    fn overflow_numbers_accept_thousands_separators() {
+        assert_eq!(
+            parse_context_overflow("prompt is too long: 215,000 tokens > 200,000 maximum"),
+            Some(Overflow {
+                tokens: Some(215_000),
+                max: Some(200_000)
+            })
+        );
     }
 }
 
@@ -2856,7 +3435,9 @@ impl LlmProvider for MockProvider {
             rupu_providers::ProviderError::Other(anyhow::anyhow!("mock script exhausted"))
         })?;
         match turn {
-            ScriptedTurn::ProviderError(e) => Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e))),
+            ScriptedTurn::ProviderError(e) => {
+                Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
+            }
             ScriptedTurn::AssistantText {
                 text,
                 stop,
@@ -3056,44 +3637,6 @@ mod compaction_tests {
     }
 
     #[test]
-    fn effective_compact_threshold_none_when_window_none() {
-        assert_eq!(effective_compact_threshold(None, None), None);
-        assert_eq!(effective_compact_threshold(None, Some(75)), None);
-    }
-
-    #[test]
-    fn effective_compact_threshold_1m_at_75_pct() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), Some(75)),
-            Some(750_000)
-        );
-    }
-
-    #[test]
-    fn effective_compact_threshold_default_80_when_percent_none() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), None),
-            Some(800_000)
-        );
-    }
-
-    #[test]
-    fn effective_compact_threshold_clamps_high_to_95() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), Some(99)),
-            Some(950_000)
-        );
-    }
-
-    #[test]
-    fn effective_compact_threshold_clamps_low_to_10() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), Some(5)),
-            Some(100_000)
-        );
-    }
-
-    #[test]
     fn partition_keeps_last_2_and_returns_middle() {
         // 10-message alternating convo
         let mut msgs = vec![text_msg(Role::User, "task")];
@@ -3169,6 +3712,32 @@ mod compaction_tests {
     /// ~500k budget — and the entire history was treated as "recent", leaving nothing
     /// to summarize. This test asserts that a char budget well below the total chars
     /// of a dense conversation correctly identifies a non-empty middle section.
+    /// The recent-history budget is honoured: beyond the two messages always
+    /// kept, older messages stay verbatim while they fit. (It used to stop at
+    /// exactly two whatever the budget, so the budget — and every threshold
+    /// it was derived from — had no effect.)
+    #[test]
+    fn partition_keeps_recent_messages_while_they_fit_the_budget() {
+        let chunk = "x".repeat(1000);
+        let mut msgs = vec![text_msg(Role::User, &chunk)];
+        for _ in 0..4 {
+            msgs.push(text_msg(Role::Assistant, &chunk));
+            msgs.push(text_msg(Role::User, &chunk));
+        }
+        // 9 messages of 1000 chars: a 3500-char budget keeps the last three.
+        assert_eq!(
+            partition_for_compaction(&msgs, 3_500),
+            Some((1, msgs.len() - 3))
+        );
+        // A budget smaller than two messages still keeps the minimum two.
+        assert_eq!(
+            partition_for_compaction(&msgs, 10),
+            Some((1, msgs.len() - 2))
+        );
+        // A budget covering everything after the task leaves no middle.
+        assert_eq!(partition_for_compaction(&msgs, 1_000_000), None);
+    }
+
     #[test]
     fn partition_budget_in_chars_reclaims_middle_for_dense_content() {
         // Build 8 messages with large char payloads (simulating JSON/code content).
@@ -3317,11 +3886,11 @@ mod compaction_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown()
+                .with_input(1_000_000)
+                .with_percent(75),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: Some(1_000_000),
-            compact_at_percent: Some(75),
             pause: None,
             codename: None,
         };
@@ -3380,14 +3949,13 @@ mod compaction_tests {
             output_tokens: 10,
         }]);
 
-        // With a 1000-token window and ~11k chars at high token density, compaction
-        // should find a non-empty middle.
+        // With an 800-token threshold (a 1000-token window at 80%) and ~11k
+        // chars at high token density, compaction should find a non-empty middle.
         let result = compact_messages(
             &msgs,
             &mut provider,
             "mock-1",
-            1000,
-            Some(80),
+            800,
             900, // simulate near-threshold input tokens
         )
         .await;
@@ -3442,7 +4010,7 @@ mod compaction_tests {
             output_tokens: 10,
         }]);
 
-        let result = compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900).await;
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 800, 900).await;
         result.expect("no provider error").expect("should compact");
 
         let captured = provider.captured_requests();
@@ -3478,7 +4046,7 @@ mod compaction_tests {
             output_tokens: 8,
         }]);
 
-        compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900)
+        compact_messages(&msgs, &mut provider, "mock-1", 800, 900)
             .await
             .expect("no provider error")
             .expect("should compact");
@@ -3491,6 +4059,69 @@ mod compaction_tests {
         );
     }
 
+    /// `[task, then `n` alternating 5,000-char messages]`; the task is
+    /// `task_chars` long.
+    fn sized_history(task_chars: usize, n: usize) -> Vec<Message> {
+        let mut msgs = vec![text_msg(Role::User, &"t".repeat(task_chars))];
+        for i in 0..n {
+            let role = if i % 2 == 0 {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            msgs.push(text_msg(role, &"x".repeat(5_000)));
+        }
+        msgs
+    }
+
+    /// The task message and the summary (up to 8,192 tokens) survive
+    /// compaction outside the "recent" slice, so the recent budget is net of
+    /// them: with a 30K-token task at a 50K threshold, the compacted history
+    /// (task + summary + recent) must land under the threshold — a
+    /// `threshold / 2` recent budget alone would put it at ~63K and compact
+    /// again on the next turn.
+    #[tokio::test]
+    async fn compaction_budget_is_net_of_the_task_and_the_summary() {
+        let msgs = sized_history(30_000, 10); // 80,000 chars
+        let mut provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary.".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 10,
+            output_tokens: 2,
+        }]);
+        // 80,000 billed tokens over 80,000 chars: one token per char.
+        let outcome = compact_messages(&msgs, &mut provider, "mock-1", 50_000, 80_000)
+            .await
+            .expect("no provider error")
+            .expect("compacts");
+        let recent: usize = outcome.messages[1..].iter().map(message_chars).sum();
+        assert!(
+            30_000 + 8_192 + recent < 50_000,
+            "task 30,000 + summary 8,192 + recent {recent} must stay under 50,000"
+        );
+    }
+
+    /// A task larger than half the history used to make compaction a silent
+    /// no-op while over threshold (everything after the task fit the gross
+    /// budget, so there was no middle). With the budget net of the task it
+    /// degrades to keeping the minimum two messages — it still compacts.
+    #[tokio::test]
+    async fn a_task_larger_than_half_the_history_still_compacts() {
+        let msgs = sized_history(60_000, 4); // 80,000 chars
+        let mut provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary.".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 10,
+            output_tokens: 2,
+        }]);
+        let outcome = compact_messages(&msgs, &mut provider, "mock-1", 50_000, 80_000)
+            .await
+            .expect("no provider error")
+            .expect("a large task must not turn compaction into a no-op");
+        assert_eq!(outcome.summarized_messages, 2);
+        assert_eq!(outcome.messages.len(), 3, "task+summary, then the last two");
+    }
+
     #[tokio::test]
     async fn compact_messages_returns_none_for_tiny_history() {
         let msgs = vec![
@@ -3500,7 +4131,7 @@ mod compaction_tests {
 
         let mut provider = MockProvider::new(vec![]);
 
-        let result = compact_messages(&msgs, &mut provider, "mock-1", 1_000_000, None, 100).await;
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 800_000, 100).await;
 
         assert!(
             result.expect("no error").is_none(),
@@ -3621,11 +4252,9 @@ mod pause_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause,
             codename: None,
         }
@@ -3961,11 +4590,9 @@ mod reasoning_tests {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: None,
-            compact_at_percent: None,
             pause: None,
             codename: None,
         }
@@ -4100,15 +4727,20 @@ mod reasoning_tests {
             }
             other => panic!("first event must be run_start, got {other:?}"),
         }
+        // Every run announces its resolved model limits right after RunStart.
         assert!(matches!(
             &events[1],
+            rupu_transcript::Event::Notice { kind, .. } if kind == "model_limits"
+        ));
+        assert!(matches!(
+            &events[2],
             rupu_transcript::Event::Seed {
                 message_count: 2,
                 ..
             }
         ));
         assert!(matches!(
-            &events[2],
+            &events[3],
             rupu_transcript::Event::UserMessage { .. }
         ));
     }

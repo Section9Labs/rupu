@@ -1,10 +1,10 @@
 //! Plaintext JSON file backend with chmod-600 enforcement.
 //!
 //! Used when the OS keychain is unreachable. Each call to [`store`]
-//! resets the file's permissions to mode 0600. [`retrieve`] warns
-//! (via `tracing::warn!`) if the file's permissions are wider than
-//! 0600, but does not refuse to read — refusing would prevent
-//! recovery on a misconfigured machine.
+//! writes the file through a private (0600) temp file + rename.
+//! [`retrieve`] warns (via `tracing::warn!`) if the file's permissions
+//! are wider than 0600, but does not refuse to read — refusing would
+//! prevent recovery on a misconfigured machine.
 //!
 //! [`store`]: <crate::AuthBackend::store>
 //! [`retrieve`]: <crate::AuthBackend::retrieve>
@@ -48,33 +48,13 @@ impl JsonFileBackend {
         Ok(s)
     }
 
+    /// Private temp file + rename (`private_file`): the file is 0600 from
+    /// the moment it exists and a reader never sees a half-written one.
     fn write(&self, s: &Stored) -> Result<(), AuthError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let body = serde_json::to_string_pretty(s)?;
-        std::fs::write(&self.path, body)?;
-        self.set_mode_0600();
+        rupu_providers::private_file::write_private_atomic(&self.path, body.as_bytes())?;
         Ok(())
     }
-
-    #[cfg(unix)]
-    fn set_mode_0600(&self) {
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(&self.path, perms) {
-                warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "could not enforce mode 0600 on auth.json — file may be readable by other users"
-                );
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn set_mode_0600(&self) {}
 
     #[cfg(unix)]
     fn warn_on_wrong_mode(&self) {

@@ -215,7 +215,7 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
         model: "claude-sonnet-4-6".into(),
         system: None,
         messages: vec![Message::user("hi")],
-        max_tokens: 16,
+        max_tokens: Some(16),
         tools: vec![],
         cell_id: None,
         trace_id: None,

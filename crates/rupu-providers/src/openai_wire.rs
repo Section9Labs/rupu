@@ -142,9 +142,11 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
     let mut body = serde_json::json!({
         "model": request.model,
         "messages": messages,
-        "max_tokens": request.max_tokens,
         "stream": stream,
     });
+    if let Some(n) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
 
     // Ask the server to emit a final usage chunk on streamed responses.
     // OpenAI-compatible endpoints (vLLM, OpenAI, Copilot, …) omit usage from
@@ -874,9 +876,20 @@ mod tests {
         LlmRequest {
             model: "deepseek-reasoner".into(),
             messages,
-            max_tokens: 128,
+            max_tokens: Some(128),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unset_max_tokens_is_omitted_from_chat_body() {
+        let mut r = req(vec![Message::user("hi")]);
+        r.max_tokens = None;
+        let body = build_chat_request_body(&r, false);
+        assert!(body.get("max_tokens").is_none());
+        r.max_tokens = Some(512);
+        let body = build_chat_request_body(&r, false);
+        assert_eq!(body["max_tokens"], 512);
     }
 
     /// An `openai_chat` reasoning block carrying `raw` verbatim.

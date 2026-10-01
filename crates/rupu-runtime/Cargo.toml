@@ -23,6 +23,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
+futures-util.workspace = true
 
 # In-workspace (needed by provider_factory)
 rupu-providers = { path = "../rupu-providers" }
@@ -38,4 +39,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }
 httpmock.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 serial_test.workspace = true

@@ -284,8 +284,11 @@ impl HostConnector for LocalHostConnector {
 
     async fn cancel_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
+        // On the blocking pool: `cancel` waits (bounded) for the run lock.
+        let id = run_id.to_string();
         self.run_store
-            .cancel(run_id, "connector", "Cancelled via connector", now)
+            .blocking(move |store| store.cancel(&id, "connector", "Cancelled via connector", now))
+            .await
             .map(|_| ())
             .map_err(|e| map_cancel_err(run_id, e))
     }
@@ -301,8 +304,13 @@ impl HostConnector for LocalHostConnector {
     /// flip succeeds.
     async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
+        // Under the run lock, on the blocking pool (its wait blocks the
+        // thread): a cancel that lands meanwhile is refused, never
+        // overwritten.
+        let id = run_id.to_string();
         self.run_store
-            .pause(run_id, now)
+            .blocking(move |store| store.pause(&id, now))
+            .await
             .map_err(|e| map_pause_err(run_id, e))?;
         // Deliver the pause to a detached run process via the marker.
         self.run_store

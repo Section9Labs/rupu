@@ -54,6 +54,23 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Fetch the live model catalog with limits (spec 2026-09-30 §3).
+    /// `&mut self` so OAuth providers can refresh their token first. Unlike
+    /// `list_models`, a failure is an `Err`, never an empty list.
+    /// `Err(ProviderError::NotImplemented)` means the provider exposes no
+    /// model listing.
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        Err(ProviderError::NotImplemented {
+            provider: self.provider_id().to_string(),
+        })
+    }
+
+    /// Whether generated output counts against the same window as the
+    /// input (spec §3). Copilot and Gemini have independent budgets.
+    fn output_shares_context(&self) -> bool {
+        true
+    }
+
     /// Liveness + authorization probe: does this provider answer an
     /// authenticated request right now?
     ///
@@ -127,6 +144,26 @@ mod tests {
         );
     }
 
+    /// A provider that overrides neither `fetch_models` nor
+    /// `output_shares_context` gets the trait defaults: "no model listing" (an
+    /// `Err`, never an empty `Ok` that would read as "this provider has no
+    /// models") and "output shares the input window".
+    #[tokio::test]
+    async fn fetch_models_and_output_shares_context_defaults() {
+        let mut p = MockProvider {
+            response: mock_response(),
+        };
+        let err = p
+            .fetch_models()
+            .await
+            .expect_err("the default must not report an empty catalog");
+        assert!(
+            matches!(&err, ProviderError::NotImplemented { provider } if provider == "anthropic"),
+            "expected NotImplemented for anthropic, got {err:?}"
+        );
+        assert!(p.output_shares_context());
+    }
+
     fn mock_response() -> LlmResponse {
         LlmResponse {
             id: "msg_mock".into(),
@@ -152,7 +189,7 @@ mod tests {
             model: "mock".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -179,7 +216,7 @@ mod tests {
             model: "mock".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -238,7 +275,7 @@ mod tests {
             model: "x".into(),
             system: None,
             messages: vec![],
-            max_tokens: 1,
+            max_tokens: Some(1),
             tools: vec![],
             cell_id: None,
             trace_id: None,

@@ -286,6 +286,10 @@ fn replay_with_printer(
                 let err = rec["error_message"].as_str().unwrap_or("unknown");
                 printer.workflow_failed(workflow_name, run_id, err);
             }
+            "cancelled" => {
+                let reason = rec["error_message"].as_str().unwrap_or("cancelled");
+                printer.workflow_cancelled(workflow_name, run_id, reason);
+            }
             _ => {}
         }
     }

@@ -43,7 +43,9 @@ impl From<&LlmRequest> for LlmRequestWire {
             model: r.model.clone(),
             system: r.system.clone(),
             messages: r.messages.clone(),
-            max_tokens: r.max_tokens,
+            max_tokens: r
+                .max_tokens
+                .unwrap_or(crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS),
             tools: r.tools.clone(),
             cell_id: r.cell_id.clone(),
             trace_id: r.trace_id.clone(),
@@ -58,7 +60,7 @@ impl From<LlmRequestWire> for LlmRequest {
             model: w.model,
             system: w.system,
             messages: w.messages,
-            max_tokens: w.max_tokens,
+            max_tokens: Some(w.max_tokens),
             tools: w.tools,
             cell_id: w.cell_id,
             trace_id: w.trace_id,
@@ -186,7 +188,7 @@ mod tests {
             model: "claude-sonnet-4-6-20250514".into(),
             system: Some("sys".into()),
             messages: vec![crate::types::Message::user("hi")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: Some("cell".into()),
             trace_id: Some("trace".into()),
@@ -207,6 +209,33 @@ mod tests {
         let back: LlmRequest = wire.into();
         assert_eq!(back.model, "claude-sonnet-4-6-20250514");
         assert_eq!(back.cell_id, Some("cell".into()));
+    }
+
+    /// The wire field is a required `u32`, so an unset cap is carried as the
+    /// Anthropic fallback; a cap that came off the wire is a pinned cap.
+    #[test]
+    fn unset_max_tokens_goes_on_the_wire_as_the_fallback_and_comes_back_pinned() {
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![crate::types::Message::user("hi")],
+            max_tokens: None,
+            ..Default::default()
+        };
+        let wire = LlmRequestWire::from(&request);
+        assert_eq!(wire.max_tokens, 8192);
+        assert_eq!(
+            wire.max_tokens,
+            crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS
+        );
+
+        let pinned = LlmRequestWire::from(&LlmRequest {
+            max_tokens: Some(4096),
+            ..request.clone()
+        });
+        assert_eq!(pinned.max_tokens, 4096);
+
+        let back: LlmRequest = wire.into();
+        assert_eq!(back.max_tokens, Some(8192));
     }
 
     #[test]

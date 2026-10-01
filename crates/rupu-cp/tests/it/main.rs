@@ -23,6 +23,7 @@ mod host_registry;
 mod host_run_netflow;
 mod hosts_api;
 mod legacy_codenames;
+mod models_api;
 mod netflow_api;
 mod netflow_explorer;
 mod node_tunnel;

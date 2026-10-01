@@ -3,9 +3,14 @@
 //! graph, so each file here is a module instead. Add new tests as a module
 //! below, not as a new `tests/*.rs` — `rupu-cli`'s `tests/it/test_layout.rs`
 //! enforces this.
+//!
+//! `tests/terminating.rs` deliberately stays its own binary: it raises
+//! `credential_writes::request_termination()`'s process-wide flag, which is
+//! never cleared and would make every other run here stop as terminating.
 
 mod action_step;
 mod branch_runner;
+mod cancel_vs_completion;
 mod dispatch_agent;
 mod dispatch_agents_parallel;
 mod distributed_fanout_e2e;

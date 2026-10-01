@@ -27,7 +27,7 @@ async fn live_non_streaming_completion() {
         messages: vec![Message::user(
             "What is 17 * 23? Reply with just the number.",
         )],
-        max_tokens: 64,
+        max_tokens: Some(64),
         ..Default::default()
     };
     let resp = client.send(&req).await.expect("send");

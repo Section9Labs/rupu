@@ -275,10 +275,14 @@ async fn cancel_run(
     let reason = body
         .and_then(|b| b.0.reason)
         .unwrap_or_else(|| "Cancelled from control plane".to_string());
-    let _outcome: CancelOutcome = s
-        .run_store
-        .cancel(&id, "web", &reason, now)
-        .map_err(|e| map_cancel_err(&id, e))?;
+    // On the blocking pool: `cancel` waits (bounded) for the run lock.
+    let _outcome: CancelOutcome = {
+        let (run_id, reason) = (id.clone(), reason.clone());
+        s.run_store
+            .blocking(move |store| store.cancel(&run_id, "web", &reason, now))
+            .await
+            .map_err(|e| map_cancel_err(&id, e))?
+    };
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
@@ -333,8 +337,12 @@ async fn pause_run(
     // does not re-read its own record status. Mirrors
     // `LocalHostConnector::pause_run`.
     let now = chrono::Utc::now();
+    // Under the run lock, on the blocking pool (its wait blocks the
+    // thread): a cancel that lands meanwhile is refused, never overwritten.
+    let run_id = id.clone();
     s.run_store
-        .pause(&id, now)
+        .blocking(move |store| store.pause(&run_id, now))
+        .await
         .map_err(|e| map_pause_err(&id, e))?;
     s.run_store
         .set_pause_marker(&id)
@@ -1440,7 +1448,7 @@ pub(crate) fn validate_id(id: &str) -> Result<(), ApiError> {
 /// Map a [`RunStoreError`] to an [`ApiError`]:
 /// - `NotFound` → 404
 /// - `NotTerminal` / `AlreadyExists` → 409
-/// - `Io` / `Json` → 500
+/// - `Io` / `Json` / `TaskFailed` → 500
 fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
     match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
@@ -1452,6 +1460,7 @@ fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
         }
         RunStoreError::Io(err) => ApiError::internal(err.to_string()),
         RunStoreError::Json(err) => ApiError::internal(err.to_string()),
+        RunStoreError::TaskFailed(msg) => ApiError::internal(msg),
     }
 }
 

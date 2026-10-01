@@ -320,6 +320,7 @@ async fn rebuild_opts_from_disk(
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
+    let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -340,6 +341,7 @@ async fn rebuild_opts_from_disk(
         Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
             &store_arc, run_id,
         )),
+        limits_ctx.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -389,6 +391,7 @@ async fn rebuild_opts_from_disk(
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
         findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
+        limits_ctx,
     });
 
     // Rebuild the `run:` step policy from the resolved mode + layered config

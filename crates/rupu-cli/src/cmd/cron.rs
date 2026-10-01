@@ -459,6 +459,9 @@ async fn tick_cron(global: &Path, dry_run: bool) -> anyhow::Result<()> {
                     );
                 }
             }
+            Err(e) if super::workflow::run_was_cancelled(&e) => {
+                info!(workflow = %w.name, error = %e, "workflow run cancelled");
+            }
             Err(e) => {
                 warn!(workflow = %w.name, error = %e, "workflow run failed");
             }
@@ -673,6 +676,13 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                                 workflow = %wf.name,
                                 run_id = %run_id,
                                 "event already dispatched; skipping"
+                            );
+                        } else if super::workflow::run_was_cancelled(&e) {
+                            info!(
+                                workflow = %wf.name,
+                                run_id = %run_id,
+                                error = %e,
+                                "workflow run cancelled"
                             );
                         } else {
                             warn!(

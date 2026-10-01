@@ -20,7 +20,7 @@ fn minimal_request(model: &str) -> LlmRequest {
         model: model.into(),
         system: None,
         messages: vec![Message::user("Say hi.")],
-        max_tokens: 64,
+        max_tokens: Some(64),
         tools: vec![],
         cell_id: None,
         trace_id: None,
@@ -193,7 +193,7 @@ async fn live_anthropic_prompt_cache_reads_on_second_request() {
     let mut req = minimal_request(&cache_test_model());
     req.system = Some(cacheable_system_prompt());
     req.messages = vec![Message::user("Say hi.")];
-    req.max_tokens = 16;
+    req.max_tokens = Some(16);
 
     let first = client
         .stream(&req, |_| {})
@@ -269,7 +269,7 @@ async fn live_anthropic_turn_ending_in_empty_tool_result_succeeds_with_caching()
             }],
         },
     ];
-    req.max_tokens = 32;
+    req.max_tokens = Some(32);
 
     let resp = client
         .stream(&req, |_| {})

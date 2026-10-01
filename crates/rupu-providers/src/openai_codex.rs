@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
 use crate::error::ProviderError;
@@ -15,6 +15,13 @@ const DEFAULT_API_URL: &str = "https://api.openai.com/v1/responses";
 const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// The Codex model catalog. The only OpenAI endpoint that carries
+/// per-model limits; the public `/v1/models` has ids only (spec 2026-09-30 §3).
+const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0";
+/// Bound on the API-key path's first attempt (the chatgpt.com catalog), so
+/// a hanging catalog still leaves the ids-only `/v1/models` fallback time to
+/// run inside the caller's overall listing timeout (10s, spec §3).
+const CODEX_CATALOG_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Netflow-instrumented client bound to `sink`. No run context is
 /// available at construction — stamped
@@ -169,6 +176,21 @@ pub struct OpenAiCodexClient {
     /// `[providers.openai].org_id` — sent as `OpenAI-Organization` on the
     /// platform API (ISSUES.md I-12).
     org_id: Option<String>,
+    chatgpt_models_url: String,
+    /// [`CODEX_CATALOG_ATTEMPT_TIMEOUT`]; tests shorten it.
+    catalog_attempt_timeout: std::time::Duration,
+    /// The OAuth token endpoint ([`OPENAI_TOKEN_URL`]; tests point it at a
+    /// mock).
+    token_url: String,
+    /// A token refresh this client started and is (or was) waiting for. Kept
+    /// across a dropped call so the next call adopts it instead of starting
+    /// a second refresh with the rotated-out refresh token.
+    pending_refresh: Option<tokio::task::JoinHandle<Result<RefreshedOpenAiToken, ProviderError>>>,
+    /// The credential store's refresher (rupu-auth's `KeychainResolver`):
+    /// when set, token refreshes go through it — under the store's
+    /// cross-process lock, persisted — instead of this client's own token
+    /// request, whose rotation would otherwise live only in memory.
+    oauth_refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
 }
 
 /// The `OpenAI-Organization` header value for a request to `api_url`, if any.
@@ -203,20 +225,7 @@ impl OpenAiCodexClient {
                 expires,
                 extra,
             } => {
-                let account_id = extract_account_id(&access)
-                    .or_else(|| {
-                        extra
-                            .get("account_id")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .or_else(|| {
-                        extra
-                            .get("accountId")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .unwrap_or_default();
+                let account_id = account_id_of(&access, &extra).unwrap_or_default();
 
                 // OAuth tokens from ChatGPT use the backend URL; allow override via extra
                 let api_url = extra
@@ -243,6 +252,11 @@ impl OpenAiCodexClient {
                     auth_json_path,
                     credential_store: None,
                     org_id: None,
+                    chatgpt_models_url: CODEX_MODELS_URL.to_string(),
+                    catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
+                    token_url: OPENAI_TOKEN_URL.to_string(),
+                    pending_refresh: None,
+                    oauth_refresher: None,
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
@@ -256,6 +270,11 @@ impl OpenAiCodexClient {
                 auth_json_path,
                 credential_store: None,
                 org_id: None,
+                chatgpt_models_url: CODEX_MODELS_URL.to_string(),
+                catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
+                token_url: OPENAI_TOKEN_URL.to_string(),
+                pending_refresh: None,
+                oauth_refresher: None,
             }),
         }
     }
@@ -519,9 +538,12 @@ impl OpenAiCodexClient {
             "parallel_tool_calls": true,
         });
 
-        // max_output_tokens is not supported by all models (e.g., gpt-5.x)
-        if !request.model.starts_with("gpt-5") {
-            body["max_output_tokens"] = serde_json::json!(request.max_tokens);
+        // max_output_tokens is not supported by all models (e.g., gpt-5.x);
+        // unset means the model's own max (spec 2026-09-30 §6.3).
+        if let Some(n) = request.max_tokens {
+            if !request.model.starts_with("gpt-5") {
+                body["max_output_tokens"] = serde_json::json!(n);
+            }
         }
 
         if let Some(system) = &request.system {
@@ -728,92 +750,108 @@ impl OpenAiCodexClient {
         Ok(())
     }
 
+    /// Hand token refreshes to the credential store's refresher (see the
+    /// `oauth_refresher` field). `None` keeps the client's own refresh.
+    pub fn with_oauth_refresher(
+        mut self,
+        refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
+    ) -> Self {
+        self.oauth_refresher = refresher;
+        self
+    }
+
+    /// Cancel-safe. OpenAI rotates the refresh token, so the refresh and its
+    /// persistence run as their own task (tracked by
+    /// [`crate::credential_writes`], which the binary drains before exit —
+    /// once per refresh: through a refresher, the refresher's own task is
+    /// the tracked one): a caller dropped mid-flight (a pause, a listing
+    /// timeout) only stops waiting. The task's handle stays on the client, so the next call
+    /// adopts the refresh in flight (or its finished result) instead of
+    /// starting a second one with the rotated-out refresh token.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
-            return Ok(());
+        // Two rounds at most: an adopted refresh is checked like any other
+        // token — one that finished long ago on an idle client can itself
+        // be expired already, and is then refreshed once more.
+        for _ in 0..2 {
+            if self.pending_refresh.is_none() {
+                if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
+                    return Ok(());
+                }
+                self.pending_refresh = Some(match self.oauth_refresher.clone() {
+                    Some(refresher) => {
+                        let stale = AuthCredentials::OAuth {
+                            access: self.access_token.clone(),
+                            refresh: self.refresh_token.clone(),
+                            expires: self.expires_ms,
+                            extra: HashMap::new(),
+                        };
+                        let account_id = self.account_id.clone();
+                        // Not tracked here: the refresher's own
+                        // refresh-and-persist task is the tracked write
+                        // (one refresh, one count); this task only waits
+                        // on it and reshapes the result.
+                        tokio::spawn(async move {
+                            refreshed_openai_token(refresher.refresh(stale).await?, account_id)
+                        })
+                    }
+                    None => crate::credential_writes::spawn(refresh_and_persist_openai_token(
+                        self.client.clone(),
+                        self.token_url.clone(),
+                        self.refresh_token.clone(),
+                        self.account_id.clone(),
+                        self.credential_store.clone(),
+                        self.auth_json_path.clone(),
+                    )),
+                });
+            }
+            let Some(job) = self.pending_refresh.as_mut() else {
+                return Ok(());
+            };
+            // A cancellation point: dropped here, the handle stays on `self`.
+            let finished = job.await;
+            self.pending_refresh = None;
+            let refreshed = finished.map_err(|e| {
+                ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+            })??;
+            self.access_token = refreshed.access_token;
+            self.refresh_token = refreshed.refresh_token;
+            self.expires_ms = refreshed.expires_ms;
+            self.account_id = refreshed.account_id;
         }
+        Ok(())
+    }
 
-        info!("refreshing OpenAI OAuth token");
-
-        // OpenAI token endpoint accepts JSON, not form-urlencoded
-        // (matches the Codex CLI's request_chatgpt_token_refresh implementation)
-        let response = self
-            .client
-            .post(OPENAI_TOKEN_URL)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "client_id": OPENAI_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": &self.refresh_token,
-            }))
+    async fn get_models_json(&self, url: &str) -> Result<serde_json::Value, ProviderError> {
+        let mut req = self.client.get(url).header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", self.access_token),
+        );
+        if !self.account_id.is_empty() {
+            req = req.header("chatgpt-account-id", &self.account_id);
+        }
+        let resp = req
             .send()
             .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::TokenRefreshFailed(format!(
-                "HTTP {status}: {}",
-                truncate_error(&body, 500)
-            )));
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message,
+            });
         }
-
-        let body: serde_json::Value = response
-            .json()
+        let body = resp
+            .text()
             .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        self.access_token = body["access_token"]
-            .as_str()
-            .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
-            .to_string();
-
-        if let Some(rt) = body["refresh_token"].as_str() {
-            self.refresh_token = rt.to_string();
-        }
-
-        let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.expires_ms = now_ms + (expires_in_secs * 1000);
-
-        // Update account_id from new token
-        if let Some(id) = extract_account_id(&self.access_token) {
-            self.account_id = id;
-        }
-
-        info!("OpenAI token refreshed, expires in {expires_in_secs}s");
-
-        // Persist refreshed credentials via CredentialStore or legacy path
-        let mut extra = HashMap::new();
-        if !self.account_id.is_empty() {
-            extra.insert(
-                "account_id".to_string(),
-                serde_json::Value::String(self.account_id.clone()),
-            );
-        }
-        let creds = AuthCredentials::OAuth {
-            access: self.access_token.clone(),
-            refresh: self.refresh_token.clone(),
-            expires: self.expires_ms,
-            extra,
-        };
-        if let Some(ref store) = self.credential_store {
-            if let Err(e) = store.update(crate::provider_id::ProviderId::OpenaiCodex, creds) {
-                warn!(error = %e, "failed to persist refreshed OpenAI credentials via store");
-            }
-        } else if let Some(ref path) = self.auth_json_path {
-            if let Err(e) =
-                save_provider_auth(path, crate::provider_id::ProviderId::OpenaiCodex, &creds)
-            {
-                warn!(error = %e, "failed to persist refreshed OpenAI credentials");
-            }
-        }
-
-        Ok(())
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        crate::error::parse_listing_json("openai_codex", &body)
     }
 }
 
@@ -952,6 +990,191 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
             .map(|id| make_model_info(id, crate::provider_id::ProviderId::OpenaiCodex))
             .collect()
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.ensure_valid_token().await?;
+        let pid = crate::provider_id::ProviderId::OpenaiCodex;
+        if self.api_url.contains("/backend-api/codex/responses") {
+            let url = format!(
+                "{}?client_version=0.50.0",
+                self.api_url.replace("/responses", "/models")
+            );
+            return models_from_listing(&self.get_models_json(&url).await?, false, pid);
+        }
+        // API key: Codex metadata is only on the ChatGPT backend. Try it
+        // first, then fall back to ids-only `/v1/models`.
+        let backend = self.chatgpt_models_url.clone();
+        let attempt =
+            tokio::time::timeout(self.catalog_attempt_timeout, self.get_models_json(&backend))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ProviderError::Http(format!(
+                        "codex model catalog did not answer within {}s",
+                        self.catalog_attempt_timeout.as_secs_f32()
+                    )))
+                });
+        match attempt {
+            Ok(v) => match models_from_listing(&v, true, pid) {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                // A 200 whose every entry is `supported_in_api: false`
+                // (or that lists nothing): nothing usable with an API key.
+                Ok(_) => tracing::debug!(
+                    "codex model catalog has no API-usable models with an API key; \
+                     falling back to /v1/models"
+                ),
+                Err(e) => tracing::debug!(
+                    error = %e,
+                    "codex model catalog has an unrecognized shape with an API key; \
+                     falling back to /v1/models"
+                ),
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "codex model catalog unavailable with an API key; falling back to /v1/models")
+            }
+        }
+        let base = self
+            .api_url
+            .trim_end_matches("/v1/responses")
+            .trim_end_matches('/');
+        let v = self.get_models_json(&format!("{base}/v1/models")).await?;
+        models_from_listing(&v, false, pid)
+    }
+}
+
+/// The token state an OpenAI OAuth refresh produced.
+struct RefreshedOpenAiToken {
+    access_token: String,
+    refresh_token: String,
+    expires_ms: u64,
+    account_id: String,
+}
+
+/// The client's token state from a refresher's credential.
+fn refreshed_openai_token(
+    creds: AuthCredentials,
+    account_id: String,
+) -> Result<RefreshedOpenAiToken, ProviderError> {
+    let AuthCredentials::OAuth {
+        access,
+        refresh,
+        expires,
+        extra,
+    } = creds
+    else {
+        return Err(ProviderError::TokenRefreshFailed(
+            "the credential store returned an API key for an OAuth refresh".into(),
+        ));
+    };
+    let account_id = account_id_of(&access, &extra).unwrap_or(account_id);
+    Ok(RefreshedOpenAiToken {
+        access_token: access,
+        refresh_token: refresh,
+        expires_ms: expires,
+        account_id,
+    })
+}
+
+/// Refresh the OpenAI OAuth token and persist the rotated credentials via the
+/// CredentialStore or auth.json. Owns everything it needs so it can run as its
+/// own task (see `OpenAiCodexClient::ensure_valid_token`).
+async fn refresh_and_persist_openai_token(
+    client: ClientWithMiddleware,
+    token_url: String,
+    refresh_token: String,
+    account_id: String,
+    credential_store: Option<Arc<dyn crate::credential_source::CredentialSource>>,
+    auth_json_path: Option<PathBuf>,
+) -> Result<RefreshedOpenAiToken, ProviderError> {
+    info!("refreshing OpenAI OAuth token");
+
+    // OpenAI token endpoint accepts JSON, not form-urlencoded
+    // (matches the Codex CLI's request_chatgpt_token_refresh implementation)
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "client_id": OPENAI_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": &refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::TokenRefreshFailed(format!(
+            "HTTP {status}: {}",
+            truncate_error(&body, 500)
+        )));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    let access_token = body["access_token"]
+        .as_str()
+        .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
+        .to_string();
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(refresh_token);
+    // The grant rotates the ID token too; persisted like codex-rs does.
+    let id_token = body["id_token"].as_str().map(str::to_string);
+
+    let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let expires_ms = now_ms + (expires_in_secs * 1000);
+
+    // Update account_id from the new tokens
+    let account_id = extract_account_id(&access_token)
+        .or_else(|| id_token.as_deref().and_then(extract_account_id))
+        .unwrap_or(account_id);
+
+    info!("OpenAI token refreshed, expires in {expires_in_secs}s");
+
+    // Persist refreshed credentials via CredentialStore or legacy path
+    let mut extra = HashMap::new();
+    if !account_id.is_empty() {
+        extra.insert(
+            "account_id".to_string(),
+            serde_json::Value::String(account_id.clone()),
+        );
+    }
+    if let Some(id_token) = id_token {
+        extra.insert("id_token".to_string(), serde_json::Value::String(id_token));
+    }
+    let creds = AuthCredentials::OAuth {
+        access: access_token.clone(),
+        refresh: refresh_token.clone(),
+        expires: expires_ms,
+        extra,
+    };
+    if let Some(ref store) = credential_store {
+        if let Err(e) = store.update(crate::provider_id::ProviderId::OpenaiCodex, creds) {
+            error!(error = %e, "the refreshed OpenAI token could not be persisted via the credential store; this process keeps using it, the next one will need to log in again");
+        }
+    } else if let Some(ref path) = auth_json_path {
+        if let Err(e) =
+            save_provider_auth(path, crate::provider_id::ProviderId::OpenaiCodex, &creds)
+        {
+            error!(path = %path.display(), error = %e, "the refreshed OpenAI token could not be written; this process keeps using it, the next one will need to log in again");
+        }
+    }
+
+    Ok(RefreshedOpenAiToken {
+        access_token,
+        refresh_token,
+        expires_ms,
+        account_id,
+    })
 }
 
 /// Lenient model-id extractor for the assorted shapes OpenAI's
@@ -976,25 +1199,8 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
 /// Free function so the unit tests below can exercise it directly
 /// without spinning up an HTTP mock.
 pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
-    fn id_from_object(v: &serde_json::Value) -> Option<String> {
-        for key in ["id", "slug", "display_name", "name"] {
-            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
-            }
-        }
-        None
-    }
-
     fn entries_from_array(arr: &[serde_json::Value]) -> Vec<String> {
-        arr.iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Object(_) => id_from_object(v),
-                _ => None,
-            })
-            .collect()
+        arr.iter().filter_map(listing_entry_id).collect()
     }
 
     if let serde_json::Value::Array(arr) = parsed {
@@ -1010,6 +1216,85 @@ pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
         return entries_from_array(arr);
     }
     Vec::new()
+}
+
+/// The model id of one listing entry: a non-empty plain string is the id
+/// itself; an object probes `id`, `slug`, `display_name`, then `name` (first non-empty).
+/// The one order every listing path uses, so `list_models` and
+/// `fetch_models` can never name the same model differently.
+fn listing_entry_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        // An empty string is no more an id than an empty object field is.
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Object(_) => ["id", "slug", "display_name", "name"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A Codex `/codex/models` entry's usable input limit (spec §3):
+/// `context_window × effective_context_window_percent / 100` (percent
+/// defaults to 95, as in Codex), falling back to `max_context_window`
+/// when `context_window` is absent. 0 means unknown.
+pub(crate) fn codex_input_limit(entry: &serde_json::Value) -> u32 {
+    let window = entry
+        .get("context_window")
+        .and_then(|v| v.as_u64())
+        .or_else(|| entry.get("max_context_window").and_then(|v| v.as_u64()));
+    let Some(window) = window else { return 0 };
+    let pct = entry
+        .get("effective_context_window_percent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(95)
+        .clamp(1, 100);
+    u32::try_from(window.saturating_mul(pct) / 100).unwrap_or(u32::MAX)
+}
+
+/// Model listing → `ModelInfo`s. The Codex `models` array carries limits
+/// (`codex_input_limit`); the public `/v1/models` `data` array, a bare
+/// top-level array, and plain string entries carry ids only (limits 0). In
+/// API-key mode, entries with `supported_in_api: false` are dropped.
+///
+/// A body with none of those arrays is an `Err` — never an empty catalog:
+/// "the server listed no models" (`{"models": []}`) and "the server sent
+/// something this parser does not understand" must not look alike. Of the
+/// recognized arrays the first non-empty one wins (top-level, `models`,
+/// `data`); if all are empty the catalog is genuinely empty.
+pub(crate) fn models_from_listing(
+    parsed: &serde_json::Value,
+    api_key_mode: bool,
+    provider: crate::provider_id::ProviderId,
+) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+    let candidates = [
+        parsed.as_array(),
+        parsed.get("models").and_then(|v| v.as_array()),
+        parsed.get("data").and_then(|v| v.as_array()),
+    ];
+    let Some(arr) = candidates
+        .iter()
+        .flatten()
+        .find(|a| !a.is_empty())
+        .or_else(|| candidates.iter().flatten().next())
+    else {
+        return Err(crate::error::listing_shape_error(
+            "openai_codex",
+            "a `models` array, a `data` array, or a top-level array",
+            parsed,
+        ));
+    };
+    Ok(arr
+        .iter()
+        .filter(|e| {
+            !(api_key_mode && e.get("supported_in_api").and_then(|v| v.as_bool()) == Some(false))
+        })
+        .filter_map(|e| {
+            let mut mi = make_model_info(listing_entry_id(e)?, provider);
+            mi.context_window = codex_input_limit(e);
+            Some(mi)
+        })
+        .collect())
 }
 
 // ── model_pool helper ────────────────────────────────────────────────
@@ -1031,7 +1316,20 @@ fn make_model_info(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Extract chatgpt_account_id from an OpenAI JWT access token.
+/// The ChatGPT account id a stored credential identifies: the access
+/// token's claim, else the stored ID token's (`extra.id_token`, the token
+/// codex-rs reads it from — persisted by the login and every refresh), else
+/// an `account_id` / `accountId` recorded in `extra`.
+fn account_id_of(access: &str, extra: &HashMap<String, serde_json::Value>) -> Option<String> {
+    let from_extra = |key: &str| extra.get(key).and_then(|v| v.as_str()).map(String::from);
+    extract_account_id(access)
+        .or_else(|| from_extra("id_token").and_then(|t| extract_account_id(&t)))
+        .or_else(|| from_extra("account_id"))
+        .or_else(|| from_extra("accountId"))
+}
+
+/// Extract chatgpt_account_id from an OpenAI JWT (an access token or an ID
+/// token: both carry the claim under `https://api.openai.com/auth`).
 fn extract_account_id(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1328,7 +1626,7 @@ mod tool_name_sanitize_tests {
             model: "gpt-5".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 10,
+            max_tokens: Some(10),
             tools: vec![ToolDefinition {
                 name: "scm.repos.list_owned".into(),
                 description: "list owned repos".into(),
@@ -1370,7 +1668,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: Some("Be helpful.".into()),
             messages: vec![Message::user("Hello")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1406,7 +1704,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: None,
             messages: vec![Message::user("read file")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![ToolDefinition {
                 name: "read_file".into(),
                 description: "Read a file".into(),
@@ -1445,7 +1743,7 @@ mod tests {
             model: "o3".into(),
             system: None,
             messages: vec![Message::user("think")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1477,7 +1775,7 @@ mod tests {
             model: "gpt-5.2".into(),
             system: None,
             messages: vec![Message::user("deep")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1595,6 +1893,127 @@ mod tests {
         );
         let token = format!("{header}.{payload}.signature");
         assert_eq!(extract_account_id(&token), Some("acc_test123".to_string()));
+    }
+
+    /// A JWT whose `https://api.openai.com/auth` claim names `account`.
+    fn jwt_for_account(account: &str) -> String {
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+        );
+        let payload = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            format!(r#"{{"https://api.openai.com/auth":{{"chatgpt_account_id":"{account}"}}}}"#),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    /// The account id comes from the access token's claim, else from the
+    /// stored ID token's (what a refresh through the store persists, as
+    /// codex-rs does), else from `extra.account_id` — so it survives a
+    /// refresh whose access token carries no claim.
+    #[test]
+    fn the_account_id_falls_back_to_the_stored_id_token() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "id_token".to_string(),
+            serde_json::Value::String(jwt_for_account("acc_from_id")),
+        );
+        extra.insert(
+            "account_id".to_string(),
+            serde_json::Value::String("acc_from_extra".into()),
+        );
+        assert_eq!(
+            account_id_of(&jwt_for_account("acc_from_access"), &extra).as_deref(),
+            Some("acc_from_access"),
+            "the access token's claim wins"
+        );
+        assert_eq!(
+            account_id_of("opaque-access-token", &extra).as_deref(),
+            Some("acc_from_id"),
+            "then the ID token's"
+        );
+        extra.remove("id_token");
+        assert_eq!(
+            account_id_of("opaque-access-token", &extra).as_deref(),
+            Some("acc_from_extra"),
+            "then the recorded one"
+        );
+
+        // The client built from such a credential sends that id.
+        let mut extra = HashMap::new();
+        extra.insert(
+            "id_token".to_string(),
+            serde_json::Value::String(jwt_for_account("acc_client")),
+        );
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "opaque-access-token".into(),
+                refresh: "refresh-1".into(),
+                expires: 0,
+                extra: extra.clone(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert_eq!(client.account_id, "acc_client");
+        assert_eq!(client.api_url, CODEX_BACKEND_URL, "a ChatGPT account");
+
+        // And a refresher's credential is read the same way.
+        let refreshed = refreshed_openai_token(
+            AuthCredentials::OAuth {
+                access: "opaque-access-token-2".into(),
+                refresh: "refresh-2".into(),
+                expires: 0,
+                extra,
+            },
+            "acc_before".into(),
+        )
+        .unwrap();
+        assert_eq!(refreshed.account_id, "acc_client");
+    }
+
+    /// The client's own refresh persists the rotated ID token next to the
+    /// access and refresh tokens (codex-rs's `persist_tokens`), and takes
+    /// the account id from it when the new access token has no claim.
+    #[tokio::test]
+    async fn a_refresh_persists_the_id_token_and_keeps_the_account_id() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let id_token = jwt_for_account("acc_after");
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "opaque-access-2",
+                "refresh_token": "refresh-2",
+                "id_token": id_token,
+                "expires_in": 3600
+            }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "opaque-access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: HashMap::new(),
+            },
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        client.ensure_valid_token().await.unwrap();
+        token.assert_hits(1);
+        assert_eq!(client.account_id, "acc_after");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &saved[crate::provider_id::ProviderId::OpenaiCodex.auth_key()];
+        assert_eq!(entry["refresh"], "refresh-2");
+        assert_eq!(entry["id_token"], jwt_for_account("acc_after"));
+        assert_eq!(entry["account_id"], "acc_after");
     }
 
     #[test]
@@ -1805,7 +2224,7 @@ mod tests {
                 Message::assistant("Hi there!"),
                 Message::user("How are you?"),
             ],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1842,7 +2261,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: None,
             messages: vec![Message::tool_result("call_abc", "file contents", false)],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1878,7 +2297,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: None,
             messages: vec![Message::tool_result("call_empty", "", false)],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1933,7 +2352,7 @@ mod tests {
                 },
                 Message::tool_result("call_123", "file1.rs\nfile2.rs", false),
             ],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -2185,7 +2604,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             ..Default::default()
         };
@@ -2208,7 +2627,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Text),
             ..Default::default()
         };
@@ -2244,7 +2663,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::High),
             ..Default::default()
         };
@@ -2271,7 +2690,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::Auto),
             ..Default::default()
         };
@@ -2293,7 +2712,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: None,
             ..Default::default()
         };
@@ -2313,7 +2732,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "o3".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::Auto),
             ..Default::default()
         };
@@ -2332,7 +2751,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-4.1".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: None,
             ..Default::default()
         };
@@ -2360,7 +2779,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-4.1".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::High),
             ..Default::default()
         };
@@ -2762,8 +3181,54 @@ mod reasoning_capture_tests {
         LlmRequest {
             model: "gpt-5".into(),
             messages,
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unset_max_tokens_omits_max_output_tokens() {
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        let mut r = request_with(vec![Message::user("hi")]);
+        r.model = "o4-mini".into(); // not gated like gpt-5.x
+        r.max_tokens = None;
+        assert!(client
+            .build_request_body(&r, false)
+            .get("max_output_tokens")
+            .is_none());
+        r.max_tokens = Some(900);
+        assert_eq!(
+            client.build_request_body(&r, false)["max_output_tokens"],
+            900
+        );
+    }
+
+    /// The `gpt-5` gate: those models reject `max_output_tokens`, so even an
+    /// explicit pin must not reach the wire.
+    #[test]
+    fn gpt5_omits_max_output_tokens_even_when_a_cap_is_pinned() {
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        for model in ["gpt-5", "gpt-5.4", "gpt-5-mini"] {
+            let mut r = request_with(vec![Message::user("hi")]);
+            r.model = model.into();
+            r.max_tokens = Some(900);
+            assert!(
+                client
+                    .build_request_body(&r, false)
+                    .get("max_output_tokens")
+                    .is_none(),
+                "{model} must not send max_output_tokens"
+            );
         }
     }
 
@@ -3102,5 +3567,787 @@ mod tuning_tests {
             .unwrap()
             .get("OpenAI-Organization")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod fetch_models_tests {
+    use super::*;
+    use crate::provider_id::ProviderId;
+
+    #[test]
+    fn codex_input_limit_applies_effective_percent() {
+        let e = serde_json::json!({ "slug": "a", "context_window": 272000, "effective_context_window_percent": 95 });
+        assert_eq!(codex_input_limit(&e), 258_400);
+    }
+
+    #[test]
+    fn codex_input_limit_defaults_percent_to_95_and_falls_back_to_max_window() {
+        assert_eq!(
+            codex_input_limit(&serde_json::json!({ "context_window": 100000 })),
+            95_000
+        );
+        assert_eq!(
+            codex_input_limit(&serde_json::json!({ "max_context_window": 200000 })),
+            190_000
+        );
+        assert_eq!(codex_input_limit(&serde_json::json!({ "slug": "x" })), 0);
+    }
+
+    #[test]
+    fn codex_input_limit_does_not_overflow_on_an_absurd_window() {
+        // `window * pct` would wrap (release) or panic (debug) in u64; the
+        // saturating multiply keeps the result clamped to u32::MAX instead.
+        for window in [u64::MAX, u64::MAX / 50, 1u64 << 63] {
+            for pct in [95u64, 100] {
+                let e = serde_json::json!({
+                    "context_window": window,
+                    "effective_context_window_percent": pct
+                });
+                assert_eq!(codex_input_limit(&e), u32::MAX, "window={window} pct={pct}");
+            }
+        }
+        let e = serde_json::json!({ "max_context_window": u64::MAX });
+        assert_eq!(codex_input_limit(&e), u32::MAX);
+    }
+
+    #[test]
+    fn listing_filters_supported_in_api_only_in_api_key_mode() {
+        let v = serde_json::json!({ "models": [
+            { "slug": "m-api", "context_window": 1000, "supported_in_api": true },
+            { "slug": "m-app", "context_window": 1000, "supported_in_api": false }
+        ]});
+        let ids = |ms: Result<Vec<crate::model_pool::ModelInfo>, ProviderError>| {
+            ms.unwrap().into_iter().map(|m| m.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(models_from_listing(&v, true, ProviderId::OpenaiCodex)),
+            ["m-api"]
+        );
+        assert_eq!(
+            ids(models_from_listing(&v, false, ProviderId::OpenaiCodex)),
+            ["m-api", "m-app"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_oauth_backend_reads_limits() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models").header("chatgpt-account-id", "acct-1");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "slug": "gpt-test-1", "context_window": 272000, "max_context_window": 872000, "effective_context_window_percent": 95 }
+            ]}));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "t".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        client.account_id = "acct-1".into();
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        m.assert();
+        assert_eq!(models[0].id, "gpt-test-1");
+        assert_eq!(
+            (models[0].context_window, models[0].max_output_tokens),
+            (258_400, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_api_key_tries_codex_backend_first() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let backend = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .header("authorization", "Bearer sk-k");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "slug": "gpt-api", "context_window": 200000, "supported_in_api": true },
+                { "slug": "gpt-app-only", "context_window": 200000, "supported_in_api": false }
+            ]}));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        backend.assert();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-api"]
+        );
+        assert_eq!(models[0].context_window, 190_000);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_to_v1_models_ids() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(401);
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        public.assert();
+        assert_eq!(models[0].id, "gpt-plain");
+        assert_eq!(models[0].context_window, 0);
+    }
+
+    /// API-key path: the chatgpt.com catalog attempt has its own short
+    /// timeout, so a hanging catalog still leaves the ids-only `/v1/models`
+    /// fallback time to run inside the caller's overall 10s listing budget.
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_when_the_catalog_hangs() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .delay(std::time::Duration::from_secs(2))
+                .json_body(serde_json::json!({ "models": [
+                    { "slug": "gpt-api", "context_window": 200000, "supported_in_api": true }
+                ]}));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        client.catalog_attempt_timeout = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "the catalog attempt was cut off, not waited out"
+        );
+        public.assert();
+        assert_eq!(models[0].id, "gpt-plain");
+    }
+
+    /// A token refresh started by a call that is then dropped (a listing
+    /// timeout, a pause) must still persist the rotated token — the old
+    /// refresh token is already invalidated. The refresh runs as its own
+    /// task, so it finishes and persists after the caller is gone.
+    #[tokio::test]
+    async fn an_abandoned_token_refresh_still_persists_the_rotated_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1, // long expired (0 means "no expiry info")
+                extra: std::collections::HashMap::new(),
+            },
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the caller gave up mid-refresh: {dropped:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|s| s.contains("refresh-2"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        token.assert_hits(1);
+        let saved = std::fs::read_to_string(&path).expect("the refresh persisted");
+        assert!(
+            saved.contains("refresh-2") && saved.contains("access-2"),
+            "{saved}"
+        );
+    }
+
+    /// A client left behind by a dropped call adopts the refresh still in
+    /// flight on its next call instead of starting a second one with the
+    /// rotated-out refresh token (`invalid_grant`; reuse can revoke the
+    /// grant).
+    #[tokio::test]
+    async fn a_reused_client_adopts_the_refresh_in_flight() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1, // long expired
+                extra: std::collections::HashMap::new(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        let _ =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client).await;
+        token.assert_hits(1);
+        assert_eq!(client.access_token, "access-2");
+        assert_eq!(client.refresh_token, "refresh-2");
+    }
+
+    /// An adopted refresh is checked like any other token: one that
+    /// finished long ago on an idle client (or was issued short-lived) may
+    /// already be expired, and must be refreshed again rather than sent.
+    #[tokio::test]
+    async fn an_adopted_refresh_that_is_already_expired_is_refreshed_again() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth/token")
+                .body_contains("refresh-1");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                // Already inside the 5-minute expiry buffer when it lands.
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 1
+                }));
+        });
+        let second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/oauth/token")
+                .body_contains("refresh-2");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-3",
+                "refresh_token": "refresh-3",
+                "expires_in": 3600
+            }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: std::collections::HashMap::new(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.ensure_valid_token(),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        client.ensure_valid_token().await.unwrap();
+        first.assert_hits(1);
+        second.assert_hits(1);
+        assert_eq!(client.access_token, "access-3");
+    }
+
+    /// An OAuthRefresher that records the stale refresh token it was handed
+    /// and returns a fixed fresh credential.
+    struct FakeRefresher {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credential_writes::OAuthRefresher for FakeRefresher {
+        async fn refresh(&self, stale: AuthCredentials) -> Result<AuthCredentials, ProviderError> {
+            if let AuthCredentials::OAuth { refresh, .. } = &stale {
+                self.seen.lock().unwrap().push(refresh.clone());
+            }
+            Ok(AuthCredentials::OAuth {
+                access: "access-9".into(),
+                refresh: "refresh-9".into(),
+                expires: u64::MAX / 2,
+                extra: Default::default(),
+            })
+        }
+    }
+
+    /// With a refresher (the store that owns the credential), the client
+    /// hands its refresh over — so the rotation is persisted under the
+    /// store's lock — and never calls the token endpoint itself.
+    #[tokio::test]
+    async fn a_client_with_a_refresher_hands_it_the_refresh() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let own = server.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "own" }));
+        });
+        let refresher = std::sync::Arc::new(FakeRefresher {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: std::collections::HashMap::new(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap()
+        .with_oauth_refresher(Some(refresher.clone()));
+        client.token_url = server.url("/oauth/token");
+        client.ensure_valid_token().await.unwrap();
+        own.assert_hits(0);
+        assert_eq!(
+            *refresher.seen.lock().unwrap(),
+            vec!["refresh-1".to_string()]
+        );
+        assert_eq!(client.access_token, "access-9");
+        assert_eq!(client.refresh_token, "refresh-9");
+    }
+
+    #[test]
+    fn the_catalog_attempt_timeout_defaults_to_3s() {
+        assert_eq!(
+            CODEX_CATALOG_ATTEMPT_TIMEOUT,
+            std::time::Duration::from_secs(3)
+        );
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert_eq!(
+            client.catalog_attempt_timeout,
+            CODEX_CATALOG_ATTEMPT_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_errors_when_both_listings_fail() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let catalog = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(500);
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(500);
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models");
+        let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        // Both endpoints were tried, once each.
+        catalog.assert_hits(1);
+        public.assert_hits(1);
+        // The public `/v1/models` failure is the one reported.
+        assert!(
+            matches!(err, ProviderError::Api { status: 500, .. }),
+            "{err:?}"
+        );
+    }
+
+    // ── review fixes: shapes, decode errors, fallback, production URL ─────
+
+    /// The query string the production catalog URL carries — tests build
+    /// their mock URLs from it so they track the real constant.
+    fn prod_catalog_query() -> &'static str {
+        CODEX_MODELS_URL
+            .split_once('?')
+            .expect("the production catalog URL carries a query")
+            .1
+    }
+
+    fn oauth_backend_client(server: &httpmock::MockServer) -> OpenAiCodexClient {
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "t".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        client.account_id = "acct-1".into();
+        client
+    }
+
+    fn api_key_client(server: &httpmock::MockServer) -> OpenAiCodexClient {
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = format!(
+            "{}?{}",
+            server.url("/backend-api/codex/models"),
+            prod_catalog_query()
+        );
+        client
+    }
+
+    #[test]
+    fn production_catalog_url_and_default_carry_client_version() {
+        assert_eq!(
+            CODEX_MODELS_URL,
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0"
+        );
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert_eq!(client.chatgpt_models_url, CODEX_MODELS_URL);
+    }
+
+    #[tokio::test]
+    async fn catalog_requests_carry_client_version_on_both_paths() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        // ChatGPT OAuth path: URL derived from `api_url`.
+        let oauth = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .query_param("client_version", "0.50.0");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [{ "slug": "gpt-q", "context_window": 1000 }] }),
+            );
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        oauth.assert_hits(1);
+        assert_eq!(models[0].id, "gpt-q");
+
+        // API-key path: the `chatgpt_models_url` built from the production
+        // constant's query.
+        let server = MockServer::start();
+        let backend = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .query_param("client_version", "0.50.0");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [{ "slug": "gpt-r", "context_window": 1000 }] }),
+            );
+        });
+        let mut client = api_key_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        backend.assert_hits(1);
+        assert_eq!(models[0].id, "gpt-r");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_models_array_of_strings_yields_ids_with_zero_limits() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "models": ["gpt-s-1", "gpt-s-2"] }));
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-s-1", "gpt-s-2"]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.context_window == 0 && m.max_output_tokens == 0));
+    }
+
+    /// A 200 that is valid JSON but has no model list at all must be an
+    /// error — never `Ok(vec![])`, which reads as "this account has no
+    /// models".
+    #[tokio::test]
+    async fn fetch_models_unrecognized_shape_is_an_error_not_an_empty_catalog() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "weird": 1 }));
+        });
+        let mut client = oauth_backend_client(&server);
+        let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// A genuinely empty listing is still an empty catalog (the server said
+    /// so), distinct from the unrecognized shape above.
+    #[tokio::test]
+    async fn fetch_models_empty_models_array_is_an_empty_catalog() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "models": [] }));
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert!(models.is_empty());
+    }
+
+    /// `id` wins over `slug` — the same order `extract_model_ids` uses.
+    #[tokio::test]
+    async fn fetch_models_probes_id_before_slug() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "id": "the-id", "slug": "the-slug", "context_window": 1000 }
+            ]}));
+        });
+        let mut client = oauth_backend_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "the-id");
+        assert_eq!(models[0].context_window, 950);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200).body("not json");
+        });
+        let mut client = oauth_backend_client(&server);
+        let err = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// The catalog answers 200 but every entry is `supported_in_api: false`:
+    /// nothing usable with an API key, so fall back to the public listing.
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_when_every_catalog_entry_is_filtered() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let backend = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "slug": "app-only-1", "context_window": 1000, "supported_in_api": false },
+                { "slug": "app-only-2", "context_window": 1000, "supported_in_api": false }
+            ]}));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = api_key_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        backend.assert_hits(1);
+        public.assert_hits(1);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-plain"]
+        );
+        assert_eq!(models[0].context_window, 0);
+    }
+
+    /// An unrecognized catalog shape with an API key also falls back (the
+    /// error is logged at debug), rather than surfacing or returning empty.
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_when_the_catalog_shape_is_unrecognized() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "weird": 1 }));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = api_key_client(&server);
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        public.assert_hits(1);
+        assert_eq!(models[0].id, "gpt-plain");
+    }
+
+    /// An empty-string entry is not a model id: skipped, in both the
+    /// limit-carrying `models_from_listing` and the id-only
+    /// `extract_model_ids`, for every container shape.
+    #[test]
+    fn empty_string_entries_are_not_model_ids() {
+        let pid = ProviderId::OpenaiCodex;
+        for v in [
+            serde_json::json!({ "models": ["", "gpt-x"] }),
+            serde_json::json!({ "data": ["", "gpt-x"] }),
+            serde_json::json!(["", "gpt-x"]),
+            // An object whose every id field is empty is skipped too.
+            serde_json::json!({ "models": [{ "id": "", "slug": "" }, "gpt-x"] }),
+        ] {
+            let ids: Vec<String> = models_from_listing(&v, false, pid)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(ids, ["gpt-x"], "models_from_listing on {v}");
+            assert_eq!(extract_model_ids(&v), ["gpt-x"], "extract_model_ids on {v}");
+        }
+        // A listing of nothing but empty strings is an empty catalog, with no
+        // blank-id model in it.
+        let only_blank = serde_json::json!({ "models": ["", ""] });
+        assert!(models_from_listing(&only_blank, false, pid)
+            .unwrap()
+            .is_empty());
+        assert!(extract_model_ids(&only_blank).is_empty());
+    }
+
+    #[test]
+    fn listing_shapes_pure() {
+        let pid = ProviderId::OpenaiCodex;
+        let ids = |v: serde_json::Value, api: bool| {
+            models_from_listing(&v, api, pid).map(|ms| {
+                ms.into_iter()
+                    .map(|m| (m.id, m.context_window))
+                    .collect::<Vec<_>>()
+            })
+        };
+        // models: strings, limits 0
+        assert_eq!(
+            ids(serde_json::json!({ "models": ["a", "b"] }), false).unwrap(),
+            [("a".to_string(), 0), ("b".to_string(), 0)]
+        );
+        // bare top-level array of strings and of objects
+        assert_eq!(
+            ids(serde_json::json!(["a"]), false).unwrap(),
+            [("a".to_string(), 0)]
+        );
+        assert_eq!(
+            ids(
+                serde_json::json!([{ "id": "o", "context_window": 1000 }]),
+                false
+            )
+            .unwrap(),
+            [("o".to_string(), 950)]
+        );
+        // public listing: ids only
+        assert_eq!(
+            ids(serde_json::json!({ "data": [{ "id": "p" }] }), true).unwrap(),
+            [("p".to_string(), 0)]
+        );
+        // empty-but-recognized is an empty catalog; unrecognized is an error
+        assert!(ids(serde_json::json!({ "models": [] }), false)
+            .unwrap()
+            .is_empty());
+        assert!(ids(serde_json::json!({ "data": [] }), false)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            ids(serde_json::json!({ "weird": 1 }), false),
+            Err(ProviderError::Json(_))
+        ));
+        assert!(matches!(
+            ids(serde_json::json!("a string"), false),
+            Err(ProviderError::Json(_))
+        ));
+        assert!(matches!(
+            ids(serde_json::json!({ "models": "nope", "data": 3 }), false),
+            Err(ProviderError::Json(_))
+        ));
     }
 }

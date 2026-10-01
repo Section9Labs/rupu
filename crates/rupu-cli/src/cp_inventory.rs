@@ -6,9 +6,10 @@
 //! network, so one hung provider can never stall a page render.
 //!
 //! Providers are built as CONCRETE client types rather than through
-//! `ProviderRegistry`'s `Box<dyn LlmProvider>`, mirroring `cmd/models.rs`'s
-//! `populate_live`: `async_trait` imposes a `Sync` bound on `&self` methods of
-//! a boxed trait object that the concrete types sidestep.
+//! `ProviderRegistry`'s `Box<dyn LlmProvider>`: `async_trait` imposes a `Sync`
+//! bound on `&self` methods of a boxed trait object that the concrete types
+//! sidestep. This is its own probe path, separate from `rupu models refresh`
+//! (which lives in `rupu_runtime::model_limits`).
 
 #![deny(clippy::all)]
 
@@ -35,8 +36,9 @@ pub const SCM_TTL_SECS: u64 = 900;
 /// semantics stay correct either way.
 pub const ISSUE_FETCH_CAP: u32 = 500;
 
-/// The providers rupu knows how to authenticate. Same list `rupu models`
-/// refreshes — one place to add a provider, not two.
+/// The providers rupu knows how to authenticate. A separate list from
+/// `rupu_runtime::model_limits::BUILTIN_PROVIDERS` (what `rupu models`
+/// operates on): adding a built-in vendor means updating both.
 const PROVIDERS: [&str; 4] = ["anthropic", "openai", "gemini", "copilot"];
 
 /// Everything the SCM half needs. Built once by `cp serve`, which already has

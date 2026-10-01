@@ -1666,7 +1666,7 @@ impl Drop for AltScreenGuard {
 /// in this task — Task 2 wires the selection into the focus zone's
 /// rendering. Any other key, or a non-Press event (key-repeat/release
 /// under kitty-protocol terminals), is a no-op.
-fn handle_live_run_keypress(
+async fn handle_live_run_keypress(
     key: crossterm::event::KeyEvent,
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
@@ -1677,7 +1677,11 @@ fn handle_live_run_keypress(
         return;
     }
     match key.code {
-        KeyCode::Esc if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() => {
+        KeyCode::Esc
+            if crate::cmd::workflow::pause_with_store(store, run_id)
+                .await
+                .is_ok() =>
+        {
             state.push_activity(
                 Utc::now(),
                 ActivityKind::Text,
@@ -1762,7 +1766,7 @@ pub async fn run_live_view(
         // stale reads for the next iteration.
         while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
             if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                handle_live_run_keypress(key, &store, &run_id, &mut state);
+                handle_live_run_keypress(key, &store, &run_id, &mut state).await;
             }
         }
 
@@ -3482,8 +3486,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn esc_keypress_requests_pause_and_pushes_activity_line() {
+    #[tokio::test]
+    async fn esc_keypress_requests_pause_and_pushes_activity_line() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
         store
@@ -3499,7 +3503,7 @@ mod tests {
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state).await;
 
         assert!(
             state
@@ -3515,8 +3519,8 @@ mod tests {
         assert!(store.pause_marker_exists("run_01ABC"));
     }
 
-    #[test]
-    fn esc_keypress_noop_on_already_terminal_run() {
+    #[tokio::test]
+    async fn esc_keypress_noop_on_already_terminal_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
         store
@@ -3531,7 +3535,7 @@ mod tests {
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state).await;
 
         assert!(
             state.active.feed.is_empty(),
@@ -3540,8 +3544,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_esc_keypress_is_ignored() {
+    #[tokio::test]
+    async fn non_esc_keypress_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
         store
@@ -3556,7 +3560,7 @@ mod tests {
             crossterm::event::KeyCode::Char('q'),
             crossterm::event::KeyModifiers::NONE,
         );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state).await;
 
         assert!(state.active.feed.is_empty());
         assert_eq!(store.load("run_01ABC").unwrap().status, RunStatus::Running);
@@ -3608,8 +3612,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn release_key_clears_selection_to_auto_follow() {
+    #[tokio::test]
+    async fn release_key_clears_selection_to_auto_follow() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
         store
@@ -3625,7 +3629,7 @@ mod tests {
             crossterm::event::KeyCode::Char('a'),
             crossterm::event::KeyModifiers::NONE,
         );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state).await;
 
         assert_eq!(state.selected, None);
     }
@@ -3650,8 +3654,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn esc_still_pauses_with_selection_active() {
+    #[tokio::test]
+    async fn esc_still_pauses_with_selection_active() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
         store
@@ -3667,7 +3671,7 @@ mod tests {
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         );
-        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state).await;
 
         assert!(
             state

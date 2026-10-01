@@ -35,6 +35,13 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+    /// OpenAI's ChatGPT grant returns an ID token next to the access token;
+    /// stored (`extra.id_token`) as codex-rs stores it, so the Codex client
+    /// can take its account id from it when the access token has no claim.
+    /// Stored for OpenAI only ([`stored_credential_for`]): Gemini's
+    /// (`openid` + `email` scopes) carries the user's email and is dropped.
+    #[serde(default)]
+    id_token: Option<String>,
     /// Anthropic-shaped account block (uuid, email, …). Optional — other
     /// OAuth providers don't return this. We capture the uuid only; other
     /// fields are intentionally ignored to avoid storing extra PII.
@@ -214,6 +221,9 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         ("redirect_uri", redirect_uri.clone()),
         ("code_verifier", pkce.verifier.clone()),
     ];
+    if let Some(secret) = oauth.client_secret {
+        params.push(("client_secret", secret.into()));
+    }
     if oauth.include_state_in_token_body {
         params.push(("state", state.clone()));
     }
@@ -236,15 +246,22 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         .await
         .context("token exchange json")?;
 
+    Ok(stored_credential_for(provider, token))
+}
+
+/// What of a token response is stored for `provider`: the tokens and their
+/// expiry, plus the Anthropic account/organization UUIDs (so the Anthropic
+/// adapter can send `metadata.user_id.account_uuid`, binding traffic to
+/// the user's Pro/Max quota pool) and — for OpenAI only — the ID token the
+/// Codex client takes its account id from. Any other provider's ID token
+/// (Gemini's carries the user's email) is not stored.
+fn stored_credential_for(provider: ProviderId, token: TokenResponse) -> StoredCredential {
     let expires_at = token
         .expires_in
         .map(|s| Utc::now() + chrono::Duration::seconds(s));
 
     let expires_ms = expires_at.map(|d| d.timestamp_millis() as u64).unwrap_or(0);
 
-    // Persist account/organization UUIDs in `extra` so the Anthropic
-    // adapter can include `metadata.user_id.account_uuid` on each
-    // request, binding traffic to the user's Pro/Max quota pool.
     let mut extra: std::collections::HashMap<String, serde_json::Value> = Default::default();
     if let Some(uuid) = token.account.as_ref().and_then(|a| a.uuid.clone()) {
         extra.insert("account_uuid".into(), serde_json::Value::String(uuid));
@@ -252,8 +269,13 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     if let Some(uuid) = token.organization.as_ref().and_then(|o| o.uuid.clone()) {
         extra.insert("organization_uuid".into(), serde_json::Value::String(uuid));
     }
+    if provider == ProviderId::Openai {
+        if let Some(id_token) = token.id_token {
+            extra.insert("id_token".into(), serde_json::Value::String(id_token));
+        }
+    }
 
-    Ok(StoredCredential {
+    StoredCredential {
         credentials: AuthCredentials::OAuth {
             access: token.access_token,
             refresh: token.refresh_token.clone().unwrap_or_default(),
@@ -262,7 +284,7 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         },
         refresh_token: token.refresh_token,
         expires_at,
-    })
+    }
 }
 
 fn build_authorize_url(
@@ -315,6 +337,48 @@ fn bind_listener(fixed_ports: Option<&'static [u16]>) -> Result<tiny_http::Serve
         }
         None => {
             tiny_http::Server::http("127.0.0.1:0").map_err(|e| anyhow!("bind 127.0.0.1:0: {e}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_with_id_token() -> TokenResponse {
+        serde_json::from_value(serde_json::json!({
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 3600,
+            "id_token": "eyJ.id-token"
+        }))
+        .unwrap()
+    }
+
+    fn extra_of(sc: &StoredCredential) -> &std::collections::HashMap<String, serde_json::Value> {
+        match &sc.credentials {
+            AuthCredentials::OAuth { extra, .. } => extra,
+            other => panic!("expected OAuth, got {other:?}"),
+        }
+    }
+
+    /// OpenAI's ID token is stored (the Codex client takes its account id
+    /// from it); no other provider's is.
+    #[test]
+    fn only_openai_s_id_token_is_stored() {
+        let openai = stored_credential_for(ProviderId::Openai, token_with_id_token());
+        assert_eq!(
+            extra_of(&openai).get("id_token").and_then(|v| v.as_str()),
+            Some("eyJ.id-token")
+        );
+        for provider in [ProviderId::Gemini, ProviderId::Anthropic] {
+            let sc = stored_credential_for(provider, token_with_id_token());
+            assert!(
+                !extra_of(&sc).contains_key("id_token"),
+                "{provider}: {:?}",
+                extra_of(&sc)
+            );
+            assert_eq!(sc.refresh_token.as_deref(), Some("refresh"));
         }
     }
 }

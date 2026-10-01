@@ -126,10 +126,12 @@ struct Frontmatter {
     /// system prompt.
     #[serde(default)]
     concerns: Option<ConcernsBlock>,
-    /// Per-request output-token budget (`max_tokens` in the LLM request).
-    /// `None` falls back to `runner::DEFAULT_MAX_TOKENS` (8192). Raise it for
-    /// agents that emit large output (e.g. writing reports) — note extended
-    /// thinking (`effort`) draws from this same budget.
+    /// Optional pin for the per-request output-token cap (`max_tokens` in the
+    /// LLM request). When set it overrides the cap discovered from the
+    /// provider's model list; when neither is known, Anthropic gets 8192 and
+    /// other providers get no cap. Pin it for agents that emit large output
+    /// (e.g. writing reports) — note extended thinking (`effort`) draws from
+    /// this same budget.
     #[serde(default, rename = "maxTokens")]
     max_tokens: Option<u32>,
     /// Model context-window size in tokens. When set, enables proactive
@@ -178,8 +180,9 @@ pub struct AgentSpec {
     pub dispatchable_agents: Option<Vec<String>>,
     /// Coverage concerns block parsed from `concerns:` frontmatter.
     pub concerns: Option<ConcernsBlock>,
-    /// Per-request output-token budget. `None` falls back to
-    /// `runner::DEFAULT_MAX_TOKENS` (8192).
+    /// Optional agent pin for the per-request output-token cap, overriding the
+    /// cap discovered from the provider's model list. When neither is known,
+    /// Anthropic gets 8192 and other providers get no cap.
     pub max_tokens: Option<u32>,
     /// Model context-window size in tokens. When set, enables LLM context compaction.
     pub context_window_tokens: Option<u32>,

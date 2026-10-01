@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
 use crate::error::ProviderError;
@@ -47,15 +47,18 @@ fn gemini_http_client(
 /// Canonical provider tag stamped on Reasoning blocks; gates the replay.
 pub(crate) const PROVIDER_TAG: &str = "google_gemini";
 
-// Google's public CLI OAuth client IDs and secrets (same as Pi).
-// These are embedded in all CLI tools that use Google OAuth (safe to embed).
-const GEMINI_CLI_CLIENT_ID: &str =
+// Google's public CLI OAuth client IDs and secrets (same as Pi, and as
+// google-gemini/gemini-cli's `packages/core/src/code_assist/oauth2.ts`).
+// These are embedded in all CLI tools that use Google OAuth (safe to embed:
+// an installed application's "secret" is not treated as one). Public so
+// `rupu-auth`'s login and refresh send the same pair this client does.
+pub const GEMINI_CLI_CLIENT_ID: &str =
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
-const GEMINI_CLI_CLIENT_SECRET: &str = "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";
+pub const GEMINI_CLI_CLIENT_SECRET: &str = "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";
 
-const ANTIGRAVITY_CLIENT_ID: &str =
+pub const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
 
 /// Which Google Gemini variant to use. The first two are Cloud Code
 /// Assist (OAuth, paid Gemini-CLI / Antigravity quotas); `AiStudio`
@@ -72,6 +75,19 @@ pub enum GeminiVariant {
 }
 
 impl GeminiVariant {
+    /// The OAuth variant a stored credential's `extra.variant` hint names:
+    /// `"antigravity"` → [`GeminiVariant::Antigravity`], anything else (or
+    /// no hint) → the production [`GeminiVariant::GeminiCli`]. The one
+    /// mapping the factory and the credential store's refresh share, so a
+    /// refresh always carries the client id/secret pair the credential was
+    /// issued to.
+    pub fn from_credential_hint(hint: Option<&str>) -> Self {
+        match hint {
+            Some("antigravity") => GeminiVariant::Antigravity,
+            _ => GeminiVariant::GeminiCli,
+        }
+    }
+
     /// `true` when this variant uses an AI Studio api-key (no OAuth
     /// refresh, different URL pattern, different request body shape).
     fn is_api_key(&self) -> bool {
@@ -86,7 +102,8 @@ impl GeminiVariant {
         }
     }
 
-    fn client_id(&self) -> &'static str {
+    /// The OAuth client id this variant's tokens were issued to.
+    pub fn client_id(&self) -> &'static str {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_CLIENT_ID,
             GeminiVariant::Antigravity => ANTIGRAVITY_CLIENT_ID,
@@ -97,7 +114,8 @@ impl GeminiVariant {
         }
     }
 
-    fn client_secret(&self) -> &'static str {
+    /// The matching client secret (empty for AI Studio, which has none).
+    pub fn client_secret(&self) -> &'static str {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_CLIENT_SECRET,
             GeminiVariant::Antigravity => ANTIGRAVITY_CLIENT_SECRET,
@@ -139,7 +157,24 @@ pub struct GoogleGeminiClient {
     expires_ms: u64,
     project_id: String,
     auth_json_path: Option<PathBuf>,
+    /// Test seam: replaces variant.endpoint() for model listing only.
+    pub(crate) api_base_override: Option<String>,
+    /// The OAuth token endpoint ([`GOOGLE_TOKEN_URL`]; tests point it at a
+    /// mock).
+    token_url: String,
+    /// A token refresh this client started and is (or was) waiting for. Kept
+    /// across a dropped call so the next call adopts it instead of starting
+    /// a second refresh.
+    pending_refresh: Option<PendingGoogleRefresh>,
+    /// The credential store's refresher (rupu-auth's `KeychainResolver`):
+    /// when set, token refreshes go through it — under the store's
+    /// cross-process lock, persisted — instead of this client's own token
+    /// request, whose result would otherwise live only in memory.
+    oauth_refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
 }
+
+/// A spawned Google token refresh: `(access_token, refresh_token, expires_ms)`.
+type PendingGoogleRefresh = tokio::task::JoinHandle<Result<(String, String, u64), ProviderError>>;
 
 impl GoogleGeminiClient {
     /// Apply `[providers.<name>]` tuning — currently the `timeout_ms`
@@ -200,6 +235,10 @@ impl GoogleGeminiClient {
                     expires_ms: expires,
                     project_id,
                     auth_json_path,
+                    api_base_override: None,
+                    token_url: GOOGLE_TOKEN_URL.to_string(),
+                    pending_refresh: None,
+                    oauth_refresher: None,
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
@@ -211,6 +250,10 @@ impl GoogleGeminiClient {
                 expires_ms: 0,
                 project_id: String::new(),
                 auth_json_path: None,
+                api_base_override: None,
+                token_url: GOOGLE_TOKEN_URL.to_string(),
+                pending_refresh: None,
+                oauth_refresher: None,
             }),
             (AuthCredentials::ApiKey { .. }, _) => Err(ProviderError::AuthConfig(
                 "Google Cloud Code Assist (gemini-cli / antigravity) requires OAuth, \
@@ -378,9 +421,10 @@ impl GoogleGeminiClient {
         }
 
         // Generation config
-        let mut gen_config = serde_json::json!({
-            "maxOutputTokens": request.max_tokens,
-        });
+        let mut gen_config = serde_json::json!({});
+        if let Some(n) = request.max_tokens {
+            gen_config["maxOutputTokens"] = serde_json::json!(n);
+        }
 
         // Thinking config. `Auto` uses Gemini's dynamic-budget sentinel
         // (`thinkingBudget: -1`); the level field is omitted in that
@@ -467,81 +511,167 @@ impl GoogleGeminiClient {
         })
     }
 
+    /// Hand token refreshes to the credential store's refresher (see the
+    /// `oauth_refresher` field). `None` keeps the client's own refresh.
+    pub fn with_oauth_refresher(
+        mut self,
+        refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
+    ) -> Self {
+        self.oauth_refresher = refresher;
+        self
+    }
+
+    /// Cancel-safe: the refresh and its persistence run as their own task
+    /// (tracked by [`crate::credential_writes`], which the binary drains
+    /// before exit — once per refresh: through a refresher, the refresher's
+    /// own task is the tracked one), so a caller dropped mid-flight (a
+    /// pause, a timeout) only stops waiting. The task's handle stays on the client, so the next
+    /// call adopts the refresh in flight (or its finished result) instead of
+    /// starting a second one.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        // AI Studio uses a stable api-key — no refresh path.
-        if self.variant.is_api_key() {
-            return Ok(());
-        }
-        if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
-            return Ok(());
-        }
-
-        info!(variant = ?self.variant, "refreshing Google OAuth token");
-
-        let response = self
-            .client
-            .post(GOOGLE_TOKEN_URL)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", self.variant.client_id()),
-                ("client_secret", self.variant.client_secret()),
-                ("refresh_token", &self.refresh_token),
-            ])
-            .send()
-            .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::TokenRefreshFailed(format!(
-                "HTTP {status}: {}",
-                truncate(&body, 500)
-            )));
-        }
-
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        self.access_token = body["access_token"]
-            .as_str()
-            .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
-            .to_string();
-
-        if let Some(rt) = body["refresh_token"].as_str() {
-            self.refresh_token = rt.to_string();
-        }
-
-        let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
-        let now = now_ms();
-        self.expires_ms = now + (expires_in_secs * 1000);
-
-        info!("Google token refreshed, expires in {expires_in_secs}s");
-
-        // Persist refreshed credentials
-        if let Some(ref path) = self.auth_json_path {
-            let mut extra = HashMap::new();
-            if !self.project_id.is_empty() {
-                extra.insert(
-                    "project_id".to_string(),
-                    serde_json::Value::String(self.project_id.clone()),
-                );
+        // Two rounds at most: an adopted refresh is checked like any other
+        // token — one that finished long ago on an idle client can itself
+        // be expired already, and is then refreshed once more.
+        for _ in 0..2 {
+            if self.pending_refresh.is_none() {
+                // AI Studio uses a stable api-key — no refresh path.
+                if self.variant.is_api_key() {
+                    return Ok(());
+                }
+                if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
+                    return Ok(());
+                }
+                self.pending_refresh = Some(match self.oauth_refresher.clone() {
+                    Some(refresher) => {
+                        let stale = AuthCredentials::OAuth {
+                            access: self.access_token.clone(),
+                            refresh: self.refresh_token.clone(),
+                            expires: self.expires_ms,
+                            extra: HashMap::new(),
+                        };
+                        // Not tracked here: the refresher's own
+                        // refresh-and-persist task is the tracked write
+                        // (one refresh, one count); this task only waits
+                        // on it and reshapes the result.
+                        tokio::spawn(async move {
+                            match refresher.refresh(stale).await? {
+                                AuthCredentials::OAuth {
+                                    access,
+                                    refresh,
+                                    expires,
+                                    ..
+                                } => Ok((access, refresh, expires)),
+                                AuthCredentials::ApiKey { .. } => {
+                                    Err(ProviderError::TokenRefreshFailed(
+                                        "the credential store returned an API key for an OAuth refresh"
+                                            .into(),
+                                    ))
+                                }
+                            }
+                        })
+                    }
+                    None => crate::credential_writes::spawn(refresh_and_persist_google_token(
+                        self.client.clone(),
+                        self.token_url.clone(),
+                        self.variant,
+                        self.refresh_token.clone(),
+                        self.project_id.clone(),
+                        self.auth_json_path.clone(),
+                    )),
+                });
             }
-            let creds = AuthCredentials::OAuth {
-                access: self.access_token.clone(),
-                refresh: self.refresh_token.clone(),
-                expires: self.expires_ms,
-                extra,
+            let Some(job) = self.pending_refresh.as_mut() else {
+                return Ok(());
             };
-            if let Err(e) = save_provider_auth(path, self.variant.provider_id(), &creds) {
-                warn!(error = %e, "failed to persist refreshed Google credentials");
-            }
+            // A cancellation point: dropped here, the handle stays on `self`.
+            let finished = job.await;
+            self.pending_refresh = None;
+            let (access_token, refresh_token, expires_ms) = finished.map_err(|e| {
+                ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+            })??;
+            self.access_token = access_token;
+            self.refresh_token = refresh_token;
+            self.expires_ms = expires_ms;
         }
-
         Ok(())
     }
+}
+
+/// Refresh a Google OAuth token and persist the refreshed credentials to
+/// auth.json. Owns everything it needs so it can run as its own task (see
+/// `GoogleGeminiClient::ensure_valid_token`). Returns
+/// `(access_token, refresh_token, expires_ms)`.
+async fn refresh_and_persist_google_token(
+    client: ClientWithMiddleware,
+    token_url: String,
+    variant: GeminiVariant,
+    refresh_token: String,
+    project_id: String,
+    auth_json_path: Option<PathBuf>,
+) -> Result<(String, String, u64), ProviderError> {
+    info!(variant = ?variant, "refreshing Google OAuth token");
+
+    let response = client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", variant.client_id()),
+            ("client_secret", variant.client_secret()),
+            ("refresh_token", &refresh_token),
+        ])
+        .send()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::TokenRefreshFailed(format!(
+            "HTTP {status}: {}",
+            truncate(&body, 500)
+        )));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    let access_token = body["access_token"]
+        .as_str()
+        .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
+        .to_string();
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(refresh_token);
+
+    let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+    let expires_ms = now_ms() + (expires_in_secs * 1000);
+
+    info!("Google token refreshed, expires in {expires_in_secs}s");
+
+    // Persist refreshed credentials
+    if let Some(ref path) = auth_json_path {
+        let mut extra = HashMap::new();
+        if !project_id.is_empty() {
+            extra.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(project_id.clone()),
+            );
+        }
+        let creds = AuthCredentials::OAuth {
+            access: access_token.clone(),
+            refresh: refresh_token.clone(),
+            expires: expires_ms,
+            extra,
+        };
+        if let Err(e) = save_provider_auth(path, variant.provider_id(), &creds) {
+            error!(path = %path.display(), error = %e, "the refreshed Google token could not be written; this process keeps using it, the next one will need to log in again");
+        }
+    }
+
+    Ok((access_token, refresh_token, expires_ms))
 }
 
 #[async_trait::async_trait]
@@ -565,6 +695,141 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
     fn provider_id(&self) -> crate::provider_id::ProviderId {
         self.variant.provider_id()
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        // Code Assist (`v1internal`) has no listing method (spec §3).
+        if self.variant != GeminiVariant::AiStudio {
+            return Err(ProviderError::NotImplemented {
+                provider: self.provider_id().to_string(),
+            });
+        }
+        let base = self
+            .api_base_override
+            .clone()
+            .unwrap_or_else(|| self.variant.endpoint().to_string());
+        let provider = self.provider_id().to_string();
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        // Every token already requested: a server that cycles (A -> B -> A)
+        // would otherwise re-collect the same models until the page cap.
+        let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every model id already collected: a server that ignores `pageToken`
+        // and re-sends a page must not leave its models in the result twice
+        // (the first occurrence wins).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..50 {
+            let mut query: Vec<(&str, String)> = vec![("pageSize", "1000".to_string())];
+            if let Some(t) = &page_token {
+                query.push(("pageToken", t.clone()));
+            }
+            let resp = self
+                .client
+                .get(format!("{base}/v1beta/models"))
+                .query(&query)
+                .header("x-goog-api-key", &self.access_token)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let message: String = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(500)
+                    .collect();
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message,
+                });
+            }
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let v: serde_json::Value = crate::error::parse_listing_json(&provider, &body)?;
+            let (models, next) = gemini_models_from_listing(&v, self.variant.provider_id());
+            out.extend(models.into_iter().filter(|m| seen_ids.insert(m.id.clone())));
+            match next {
+                Some(t) => {
+                    // The token just requested, or any earlier one (a cycle).
+                    if !seen_tokens.insert(t.clone()) {
+                        warn!(
+                            provider = %provider,
+                            page_token = %t,
+                            collected = out.len(),
+                            "model listing stopped: page token already seen; \
+                             returning the models collected so far"
+                        );
+                        break;
+                    }
+                    // If this is the last iteration and we still have a next token, we hit the cap
+                    if i == 49 {
+                        warn!(
+                            provider = %provider,
+                            collected = out.len(),
+                            "model listing stopped: page limit (50) reached while a next \
+                             token is present; returning the models collected so far"
+                        );
+                    }
+                    page_token = Some(t);
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn output_shares_context(&self) -> bool {
+        false
+    }
+}
+
+// ── Model Listing ───────────────────────────────────────────────────
+
+/// AI Studio `GET /v1beta/models` page → (`ModelInfo`s, next page token)
+/// (spec 2026-09-30 §3). Keeps models that support `generateContent`.
+pub(crate) fn gemini_models_from_listing(
+    v: &serde_json::Value,
+    provider: crate::provider_id::ProviderId,
+) -> (Vec<crate::model_pool::ModelInfo>, Option<String>) {
+    let models = v
+        .get("models")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e.get("supportedGenerationMethods")
+                .and_then(|m| m.as_array())
+                .is_none_or(|ms| ms.iter().any(|x| x.as_str() == Some("generateContent")))
+        })
+        .filter_map(|e| {
+            let name = e.get("name")?.as_str()?;
+            let n = |k: &str| {
+                e.get(k)
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x.min(u32::MAX as u64) as u32)
+                    .unwrap_or(0)
+            };
+            Some(crate::model_pool::ModelInfo {
+                id: name.strip_prefix("models/").unwrap_or(name).to_string(),
+                provider,
+                context_window: n("inputTokenLimit"),
+                max_output_tokens: n("outputTokenLimit"),
+                capabilities: Vec::new(),
+                cost: crate::model_pool::ModelCost::default(),
+                status: crate::model_pool::ModelStatus::default(),
+            })
+        })
+        .collect();
+    let next = v
+        .get("nextPageToken")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    (models, next)
 }
 
 // ── Message Conversion ───────────────────────────────────────────────
@@ -1015,6 +1280,260 @@ fn extract_google_error(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// An adopted refresh is checked like any other token: one that
+    /// finished long ago on an idle client (or was issued short-lived) may
+    /// already be expired, and must be refreshed again rather than sent.
+    #[tokio::test]
+    async fn an_adopted_refresh_that_is_already_expired_is_refreshed_again() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST).path("/token").body_contains("refresh-1");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                // Already inside the 5-minute expiry buffer when it lands.
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 1
+                }));
+        });
+        let second = server.mock(|when, then| {
+            when.method(POST).path("/token").body_contains("refresh-2");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-3",
+                "refresh_token": "refresh-3",
+                "expires_in": 3600
+            }));
+        });
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1;
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.ensure_valid_token(),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        client.ensure_valid_token().await.unwrap();
+        first.assert_hits(1);
+        second.assert_hits(1);
+        assert_eq!(client.access_token, "access-3");
+    }
+
+    /// An OAuthRefresher that records the stale refresh token it was handed
+    /// and returns a fixed fresh credential.
+    struct FakeRefresher {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credential_writes::OAuthRefresher for FakeRefresher {
+        async fn refresh(&self, stale: AuthCredentials) -> Result<AuthCredentials, ProviderError> {
+            if let AuthCredentials::OAuth { refresh, .. } = &stale {
+                self.seen.lock().unwrap().push(refresh.clone());
+            }
+            Ok(AuthCredentials::OAuth {
+                access: "access-9".into(),
+                refresh: "refresh-9".into(),
+                expires: u64::MAX / 2,
+                extra: Default::default(),
+            })
+        }
+    }
+
+    /// With a refresher (the store that owns the credential), the client
+    /// hands its refresh over — so the rotation is persisted under the
+    /// store's lock — and never calls the token endpoint itself.
+    #[tokio::test]
+    async fn a_client_with_a_refresher_hands_it_the_refresh() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let own = server.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "own" }));
+        });
+        let refresher = std::sync::Arc::new(FakeRefresher {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1;
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap()
+        .with_oauth_refresher(Some(refresher.clone()));
+        client.token_url = server.url("/token");
+        client.ensure_valid_token().await.unwrap();
+        own.assert_hits(0);
+        assert_eq!(
+            *refresher.seen.lock().unwrap(),
+            vec!["refresh-1".to_string()]
+        );
+        assert_eq!(client.access_token, "access-9");
+        assert_eq!(client.refresh_token, "refresh-9");
+    }
+
+    /// A client left behind by a dropped call adopts the refresh still in
+    /// flight on its next call instead of starting a second one with a
+    /// possibly rotated-out refresh token.
+    #[tokio::test]
+    async fn a_reused_client_adopts_the_refresh_in_flight() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1; // long expired
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/token");
+        let request = LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            system: None,
+            messages: vec![Message::user("Hello")],
+            max_tokens: Some(16),
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            disable_prompt_cache: false,
+        };
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        // The next call's token step (what `send` runs first) — calling it
+        // directly keeps the test off the real Code Assist endpoint.
+        client.ensure_valid_token().await.unwrap();
+        token.assert_hits(1);
+        assert_eq!(client.access_token, "access-2");
+        assert_eq!(client.refresh_token, "refresh-2");
+    }
+
+    /// A token refresh started by a call that is then dropped (a pause, a
+    /// timeout) must still persist the refreshed credentials. The refresh
+    /// runs as its own task, so it finishes and persists after the caller is
+    /// gone.
+    #[tokio::test]
+    async fn an_abandoned_token_refresh_still_persists_the_rotated_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1; // long expired (0 means "no expiry info")
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/token");
+        let request = LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            system: None,
+            messages: vec![Message::user("Hello")],
+            max_tokens: Some(16),
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            disable_prompt_cache: false,
+        };
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(
+            dropped.is_err(),
+            "the caller gave up mid-refresh: {dropped:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|s| s.contains("refresh-2"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        token.assert_hits(1);
+        let saved = std::fs::read_to_string(&path).expect("the refresh persisted");
+        assert!(
+            saved.contains("refresh-2") && saved.contains("access-2"),
+            "{saved}"
+        );
+    }
+
     fn test_creds(project_id: &str) -> AuthCredentials {
         let mut extra = HashMap::new();
         extra.insert(
@@ -1089,7 +1608,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: Some("Be helpful.".into()),
             messages: vec![Message::user("Hello")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1119,6 +1638,39 @@ mod tests {
     }
 
     #[test]
+    fn unset_max_tokens_omits_max_output_tokens() {
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+
+        let mut request = LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            messages: vec![Message::user("Hello")],
+            max_tokens: None,
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request);
+        // `Value::get` on a missing/null `generationConfig` would also be
+        // `None`; prove the object is really there and only the cap is absent.
+        assert!(
+            body["request"]["generationConfig"].is_object(),
+            "generationConfig must still be sent: {}",
+            body["request"]
+        );
+        assert!(body["request"]["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none());
+
+        request.max_tokens = Some(2048);
+        let body = client.build_request_body(&request);
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 2048);
+    }
+
+    #[test]
     fn test_build_request_body_antigravity_user_agent() {
         let client = GoogleGeminiClient::new(
             test_creds("proj"),
@@ -1132,7 +1684,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("Hi")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1165,7 +1717,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: None,
             messages: vec![Message::user("read file")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![ToolDefinition {
                 name: "read_file".into(),
                 description: "Read a file".into(),
@@ -1206,7 +1758,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: None,
             messages: vec![Message::user("think hard")],
-            max_tokens: 16000,
+            max_tokens: Some(16000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1247,7 +1799,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: None,
             messages: vec![Message::user("max")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1285,7 +1837,7 @@ mod tests {
             model: "gemini-3-pro-preview".into(),
             system: None,
             messages: vec![Message::user("think hard")],
-            max_tokens: 16000,
+            max_tokens: Some(16000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1335,7 +1887,7 @@ mod tests {
                     model: model.into(),
                     system: None,
                     messages: vec![Message::user("test")],
-                    max_tokens: 4096,
+                    max_tokens: Some(4096),
                     tools: vec![],
                     cell_id: None,
                     trace_id: None,
@@ -2179,7 +2731,7 @@ mod tests {
                 model: "gemini-2.5-pro".into(),
                 system: None,
                 messages: vec![Message::user("test")],
-                max_tokens: 64000,
+                max_tokens: Some(64000),
                 tools: vec![],
                 cell_id: None,
                 trace_id: None,
@@ -2262,12 +2814,9 @@ mod llm_provider_impl_tests {
     }
 
     #[tokio::test]
-    async fn list_models_returns_empty_until_ai_studio_wired() {
-        // Plan 3 reality: Vertex/CLI endpoint has no equivalent of AI Studio's
-        // `/v1beta/models?key=...` listing. Gemini API-key path is deferred
-        // (see TODO.md). Until then, list_models defaults to empty and the
-        // ModelRegistry's baked-in fallback (Plan 3 Task 5) provides a
-        // curated v0 list.
+    async fn list_models_is_empty_for_code_assist() {
+        // `list_models` is not overridden, so it keeps the trait default
+        // (empty); live limits come from `fetch_models`.
         let client = GoogleGeminiClient::new(
             oauth_creds(),
             GeminiVariant::GeminiCli,
@@ -2278,8 +2827,390 @@ mod llm_provider_impl_tests {
         let models = <GoogleGeminiClient as LlmProvider>::list_models(&client).await;
         assert!(
             models.is_empty(),
-            "Gemini list_models should be empty until AI Studio endpoint is wired; got {} entries",
+            "Gemini list_models keeps the empty trait default; got {} entries",
             models.len()
         );
+    }
+
+    fn no_page_token(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        !req.query_params
+            .as_ref()
+            .is_some_and(|q| q.iter().any(|(k, _)| k == "pageToken"))
+    }
+
+    #[test]
+    fn gemini_listing_strips_prefix_and_reads_limits() {
+        let v = serde_json::json!({ "models": [
+            { "name": "models/gemini-test-pro", "inputTokenLimit": 1048576, "outputTokenLimit": 65536,
+              "supportedGenerationMethods": ["generateContent", "countTokens"] },
+            { "name": "models/text-embed-1", "inputTokenLimit": 2048, "outputTokenLimit": 1,
+              "supportedGenerationMethods": ["embedContent"] }
+        ], "nextPageToken": "p2" });
+        let (ms, next) =
+            gemini_models_from_listing(&v, crate::provider_id::ProviderId::GoogleGeminiCli);
+        assert_eq!(next.as_deref(), Some("p2"));
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].id, "gemini-test-pro");
+        assert_eq!(
+            (ms[0].context_window, ms[0].max_output_tokens),
+            (1_048_576, 65_536)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_ai_studio_follows_pages() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .header("x-goog-api-key", "g-key")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok2" }));
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok2");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-two", "inputTokenLimit": 20, "outputTokenLimit": 6, "supportedGenerationMethods": ["generateContent"] }
+            ]}));
+        });
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert();
+        p2.assert();
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one", "g-two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_code_assist_has_no_listing() {
+        let mut client = GoogleGeminiClient::new(
+            oauth_creds(),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::NotImplemented { .. }));
+        assert!(!<GoogleGeminiClient as LlmProvider>::output_shares_context(
+            &client
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_ai_studio_surfaces_non_2xx_as_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(403);
+        });
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Api { status: 403, .. }));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_duplicate_token_stops_early() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "t" }));
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "t");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-two", "inputTokenLimit": 20, "outputTokenLimit": 6, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "t" }));
+        });
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        // Each id should appear exactly once (no duplicates on duplicate token loop)
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one", "g-two"]
+        );
+        // First page (no pageToken) should be hit once
+        p1.assert_hits(1);
+        // Second page with pageToken=t should be hit exactly once (duplicate token stops loop)
+        p2.assert_hits(1);
+    }
+
+    fn ai_studio_client(base: String) -> GoogleGeminiClient {
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(base);
+        client
+    }
+
+    /// An A -> B -> A page-token cycle (not just an immediate repeat) must
+    /// stop before re-requesting a page, so no model is collected twice.
+    #[tokio::test]
+    async fn fetch_models_stops_on_an_a_b_a_token_cycle() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let entry = |id: &str| {
+            serde_json::json!({ "name": format!("models/{id}"), "inputTokenLimit": 10,
+                "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] })
+        };
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(
+                serde_json::json!({ "models": [entry("g-one")], "nextPageToken": "tok-a" }),
+            );
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok-a");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [entry("g-two")], "nextPageToken": "tok-b" }),
+            );
+        });
+        let p3 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok-b");
+            then.status(200).json_body(
+                serde_json::json!({ "models": [entry("g-three")], "nextPageToken": "tok-a" }),
+            );
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert_hits(1);
+        p2.assert_hits(1);
+        p3.assert_hits(1);
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one", "g-two", "g-three"],
+            "no duplicates"
+        );
+    }
+
+    /// A server that ignores `pageToken` and answers every request with the
+    /// same page: the repeated token stops the loop, but the repeated page
+    /// must not leave its models in the result twice.
+    #[tokio::test]
+    async fn fetch_models_dedupes_ids_when_the_server_ignores_the_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok-a" }));
+        });
+        // Same page again, same token again.
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok-a");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 999, "outputTokenLimit": 99, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok-a" }));
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert_hits(1);
+        p2.assert_hits(1);
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one"],
+            "no duplicate ids"
+        );
+        // The first occurrence wins.
+        assert_eq!((ms[0].context_window, ms[0].max_output_tokens), (10, 5));
+    }
+
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(200).body("not json");
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// Every page — not just the first — asks for `pageSize=1000` and
+    /// authenticates with `x-goog-api-key`.
+    #[tokio::test]
+    async fn fetch_models_page_two_keeps_page_size_and_api_key_header() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok2" }));
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok2")
+                .query_param("pageSize", "1000")
+                .header("x-goog-api-key", "g-key");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-two", "inputTokenLimit": 20, "outputTokenLimit": 6, "supportedGenerationMethods": ["generateContent"] }
+            ]}));
+        });
+        let mut client = ai_studio_client(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert_hits(1);
+        p2.assert_hits(1);
+        assert_eq!(ms.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_respects_50_page_limit() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+
+        // Page 1 mock (no pageToken)
+        let page1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({
+                "models": [{"name": "models/g-1", "inputTokenLimit": 1000, "outputTokenLimit": 100, "supportedGenerationMethods": ["generateContent"]}],
+                "nextPageToken": "t1"
+            }));
+        });
+
+        // Pages 2-50 mocks (pageToken t1..t49, each with nextPageToken t2..t50)
+        let mut page_mocks = Vec::new();
+        for i in 1..=49 {
+            let token = format!("t{}", i);
+            let next_token = format!("t{}", i + 1);
+            let model_name = format!("g-{}", i + 1);
+            let mock = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/v1beta/models")
+                    .query_param("pageToken", token.as_str());
+                then.status(200).json_body(serde_json::json!({
+                    "models": [{"name": format!("models/{}", model_name), "inputTokenLimit": 1000 + i, "outputTokenLimit": 100, "supportedGenerationMethods": ["generateContent"]}],
+                    "nextPageToken": next_token
+                }));
+            });
+            page_mocks.push(mock);
+        }
+
+        // Page 51 mock (pageToken t50) — should never be called because cap stops at 50 iterations
+        let page51 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "t50");
+            then.status(200).json_body(serde_json::json!({
+                "models": [{"name": "models/g-51", "inputTokenLimit": 1000, "outputTokenLimit": 100, "supportedGenerationMethods": ["generateContent"]}],
+                "nextPageToken": "t51"
+            }));
+        });
+
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+
+        // Verify exactly 50 pages fetched
+        assert_eq!(ms.len(), 50, "should fetch exactly 50 models at the cap");
+
+        // Verify no duplicates
+        let ids: std::collections::HashSet<_> = ms.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 50, "all 50 model ids should be unique");
+
+        // Verify page 1 (no pageToken) was hit exactly once
+        page1.assert_hits(1);
+
+        // Verify pages 2-50 (pageToken t1..t49) were each hit exactly once
+        for mock in &page_mocks {
+            mock.assert_hits(1);
+        }
+
+        // Verify page 51 (pageToken t50) was never called — the cap stopped at 50
+        page51.assert_hits(0);
     }
 }

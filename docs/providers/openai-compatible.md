@@ -33,11 +33,13 @@ to `<root>/v1/chat/completions`.
 
 Set `stream = false` for servers (or server versions) that do not implement
 the server-sent-event (SSE) streaming endpoint. rupu will send a standard
-blocking request and synthesise the same event sequence for the agent loop.
+blocking request and synthesise the same event sequence for the agent loop. Such a server has no streaming to keep a long generation alive, so a request with no known output cap carries `max_tokens: 8192` (the pre-discovery default) to keep one response inside the HTTP timeout; servers that stream omit the field.
 
 Each `[[providers.oracle.models]]` entry requires `id`; `context_window`
-and `max_output` are optional (rupu applies defaults of 32768 and 8192
-respectively when omitted). These appear in `rupu models list
+and `max_output` are optional. When omitted, rupu reads `max_model_len` from
+the server's `/v1/models` and uses it as the input limit; if that is missing
+too, the limit is unknown (there is no made-up default) and the run's
+`model_limits` transcript notice says so. These appear in `rupu models list
 --provider oracle` with source `custom`.
 
 You can name the provider anything — replace `oracle` with `vllm`, `together`,
@@ -91,6 +93,7 @@ rupu run oracle-codereview
 To verify the model list:
 
 ```sh
+rupu models refresh --provider oracle   # fetches the server's /v1/models
 rupu models list --provider oracle
 ```
 
@@ -108,8 +111,8 @@ Each `[[providers.<name>.models]]` entry:
 | Field            | Type   | Required | Description                    |
 | ---------------- | ------ | :------: | ------------------------------ |
 | `id`             | string | yes      | Model id passed verbatim to the API.  |
-| `context_window` | u32    | no       | Maximum context in tokens (default 32768). |
-| `max_output`     | u32    | no       | Maximum output tokens (default 8192). |
+| `context_window` | u32    | no       | Input-token limit, used for compaction. When omitted, the server's `/v1/models` `max_model_len`; unknown if that is missing too. |
+| `max_output`     | u32    | no       | Maximum output tokens. When omitted, unknown and no cap is sent, so the server's own default applies (a `stream = false` server gets `8192`); set `max_output`, or `maxTokens` on the agent, if replies are truncated. |
 
 ## Limitations
 
@@ -118,9 +121,14 @@ Each `[[providers.<name>.models]]` entry:
 - Workflow steps and dispatched subagents support openai-compatible providers
   the same way `rupu run` does — a step whose agent sets `provider: oracle`
   resolves `[providers.oracle]` from config and builds the same client.
-- Model listing (`rupu models list`) returns only the models declared in
-  `[[providers.<name>.models]]` — rupu does not call `/v1/models` on these
-  endpoints.
+- `rupu models refresh` fetches the server's `/v1/models` (with the account's
+  Bearer key) and caches it for an hour; `rupu models list` reads that cache
+  plus the models declared in `[[providers.<name>.models]]`. A server without
+  a usable `/v1/models` — or one whose reply has no `data` array — makes
+  refresh report an error for that account (and exit non-zero if it was the only
+  provider targeted), and its models are then only those declared in config.
+  Only `max_model_len` is read from the listing (as the input limit; a LoRA
+  entry without one of its own takes its parent's); no output cap is reported.
 - Cost tracking reports $0.00 for openai-compatible providers (no pricing
   tables are available). Usage token counts are still captured in JSONL
   transcripts if the server returns them.
@@ -136,8 +144,12 @@ The `base_url` is unreachable. Verify the server is running and the URL is
 correct.
 
 **Model not found**
-openai-compatible providers don't query `/v1/models`. Add the model id under
-`[[providers.oracle.models]]` in `~/.rupu/config.toml`.
+The model id is sent to the server verbatim, so it must be one the server
+serves. Run `rupu models refresh --provider oracle` then
+`rupu models list --provider oracle` to see the ids the server reports (a run
+whose model isn't in that list says so in its `model_limits` notice). If the
+server has no `/v1/models`, nothing is listed — declare the model under
+`[[providers.oracle.models]]` in `~/.rupu/config.toml` so its limits are known.
 
 **No text in response (`resp.text()` is `None`)**
 Some servers return tool-call blocks even for plain text prompts. Check the

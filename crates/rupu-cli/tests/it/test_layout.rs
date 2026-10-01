@@ -9,6 +9,13 @@ use std::path::{Path, PathBuf};
 const OWN_BINARY: &[&str] = &[
     // Lowers the process's RLIMIT_NOFILE.
     "crates/rupu-agent/tests/fd_pressure.rs",
+    // Raise `credential_writes::request_termination()`'s flag: process-wide
+    // and never cleared, so every runner in a shared binary would abort.
+    "crates/rupu-agent/tests/terminating.rs",
+    "crates/rupu-agent/tests/terminating_compact_messages.rs",
+    "crates/rupu-agent/tests/terminating_compaction.rs",
+    "crates/rupu-agent/tests/terminating_overflow.rs",
+    "crates/rupu-orchestrator/tests/terminating.rs",
 ];
 
 /// Calls that change state every thread and every spawned child sees.

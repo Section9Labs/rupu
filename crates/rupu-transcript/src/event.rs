@@ -266,7 +266,8 @@ pub enum Event {
         messages: Value,
     },
     /// A runtime intervention worth showing but not part of the
-    /// conversation: `kind` ∈ {"context_trim", "provider_retry"} today.
+    /// conversation: `kind` ∈ {"context_trim", "provider_retry",
+    /// "model_limits", "model_limits_clamped"} today.
     Notice {
         kind: String,
         message: String,

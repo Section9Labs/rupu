@@ -14,6 +14,7 @@ pub mod graph;
 pub mod host_fanout;
 pub mod host_info;
 pub mod hosts;
+pub mod models;
 pub mod netflow;
 pub mod projects;
 pub mod repo_scope;

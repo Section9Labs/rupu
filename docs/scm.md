@@ -34,7 +34,7 @@ or clone support.
 > New project? Run `rupu init --with-samples` to seed `.rupu/agents/scm-pr-review.md` and the rest of the curated templates.
 
 `rupu auth login --provider <github|gitlab|linear|jira> --mode <api-key|sso>` stores tokens
-in the OS keychain. Same flow as Slice B-1's LLM-provider auth; `rupu auth status`
+in `~/.rupu/auth.json` (mode 0600). Same flow as Slice B-1's LLM-provider auth; `rupu auth status`
 picks up SCM rows automatically. `--provider` is an alias for `--account` — a
 work identity and a personal identity on the same platform can coexist as two
 named accounts (`--account gh-work --kind github`, `--account gh-personal
@@ -273,7 +273,7 @@ Override per-platform via `[scm.<platform>].max_concurrency`.
 |-----------------------------------------------------|-----------------------------------------|-----|
 | `MissingScope { scope: "repo" }`                    | PAT was issued without `repo` scope     | `rupu auth logout --provider github && rupu auth login --provider github --mode sso` |
 | `RateLimited` after a few calls                     | Hit GitHub's secondary rate limit       | Drop `[scm.github].max_concurrency` to 4 |
-| `Unauthorized` after a token rotation               | Keychain still has the old token        | `rupu auth logout --provider github --mode api-key` |
+| `Unauthorized` after a token rotation               | The stored token is still the old one   | `rupu auth logout --provider github --mode api-key` |
 | `Network` from inside a container                   | Container can't reach api.github.com    | Confirm DNS + outbound TCP/443 |
 | `tool not in agent's tools: list`                   | Agent forgot to allowlist the tool      | Add `scm.*` (or specific tool name) to frontmatter |
 | `gitlab: 403 + insufficient_scope`                  | PAT missing `read_repository`           | Re-issue PAT with full scope set |

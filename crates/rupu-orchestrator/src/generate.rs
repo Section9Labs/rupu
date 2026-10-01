@@ -207,7 +207,7 @@ pub async fn generate_definition(
             model: req.model.clone(),
             system: Some(system.clone()),
             messages: messages.clone(),
-            max_tokens: MAX_TOKENS,
+            max_tokens: Some(MAX_TOKENS),
             ..Default::default()
         };
         let resp = provider.send(&llm_req).await?;
@@ -285,12 +285,14 @@ mod tests {
     use rupu_providers::AuthMode;
     use tokio::sync::Mutex as AsyncMutex;
 
-    // Env-var seam is process-global; serialize.
+    // Env-var seam is process-global; serialize (`#[serial]` too, so other
+    // modules' `#[serial]` tests that build providers don't see the mock).
     static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     const VALID_AGENT_MD: &str = "---\nname: gen-agent\ndescription: a test agent\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou are a helpful test agent.\n";
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn generate_returns_valid_content_first_try() {
         let _g = ENV_LOCK.lock().await;
         let script = serde_json::json!([
@@ -316,6 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn generate_repairs_invalid_then_succeeds() {
         let _g = ENV_LOCK.lock().await;
         // First turn: invalid (no frontmatter). Second turn: valid.
@@ -343,6 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn generate_errors_when_never_valid() {
         let _g = ENV_LOCK.lock().await;
         let script = serde_json::json!([

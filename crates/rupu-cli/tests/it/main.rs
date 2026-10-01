@@ -38,5 +38,7 @@ mod multi_provider_e2e;
 mod no_stream_flag;
 mod output_line_stream;
 mod run_header;
+mod run_model_limits;
 mod run_target_parse;
+mod sigterm_exit;
 mod test_layout;

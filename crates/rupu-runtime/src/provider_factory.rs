@@ -61,9 +61,6 @@ pub struct OpenAiCompatibleParams {
     pub models: Vec<rupu_providers::OpenAiCompatibleModel>,
 }
 
-const DEFAULT_OAI_CONTEXT_WINDOW: u32 = 32_768;
-const DEFAULT_OAI_MAX_OUTPUT: u32 = 8_192;
-
 /// Resolve `[providers.<name>]` into params iff it declares
 /// `kind = "openai-compatible"` with a `base_url`. Returns `None` otherwise.
 pub fn openai_compatible_params(
@@ -81,8 +78,10 @@ pub fn openai_compatible_params(
         .iter()
         .map(|m| rupu_providers::OpenAiCompatibleModel {
             id: m.id.clone(),
-            context_window: m.context_window.unwrap_or(DEFAULT_OAI_CONTEXT_WINDOW),
-            max_output: m.max_output.unwrap_or(DEFAULT_OAI_MAX_OUTPUT),
+            // Unset means unknown (0): the live `/v1/models` `max_model_len`
+            // fills it in (spec 2026-09-30 §3). Never invent a window.
+            context_window: m.context_window.unwrap_or(0),
+            max_output: m.max_output.unwrap_or(0),
         })
         .collect();
     Some(OpenAiCompatibleParams {
@@ -216,6 +215,21 @@ pub fn resolve_kind(
         return Some(name.to_string());
     }
     None
+}
+
+/// `ProviderConfig` for `name` with no agent-level overrides: what a bare
+/// model-listing call needs (spec 2026-09-30 §5).
+pub fn provider_config_for(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> ProviderConfig {
+    ProviderConfig {
+        anthropic_oauth_system_prefix: None,
+        anthropic_prompt_cache: None,
+        openai_compatible: openai_compatible_params(name, providers),
+        tuning: Some(provider_tuning(name, providers)),
+        kind: resolve_kind(name, providers),
+    }
 }
 
 /// [`resolve_kind`] for every declared `[providers.<name>]`, keyed by name.
@@ -401,12 +415,23 @@ pub async fn build_for_provider_with_config(
         .tuning
         .clone()
         .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(kind));
+    // An OAuth client refreshes through the store that owns the credential:
+    // under its cross-process lock, persisted. Refreshing alone it would keep
+    // the rotated refresh token in memory and leave a dead one stored.
+    let refresher = match &creds {
+        rupu_providers::auth::AuthCredentials::OAuth { .. } => resolver.oauth_refresher(name, kind),
+        rupu_providers::auth::AuthCredentials::ApiKey { .. } => None,
+    };
     let client = match kind {
-        "anthropic" => build_anthropic(creds, model, config, &tuning, sink.clone()).await?,
-        "openai" | "openai_codex" | "codex" => {
-            build_openai(creds, model, &tuning, sink.clone()).await?
+        "anthropic" => {
+            build_anthropic(creds, model, config, &tuning, refresher, sink.clone()).await?
         }
-        "gemini" | "google_gemini" => build_gemini(creds, model, &tuning, sink.clone()).await?,
+        "openai" | "openai_codex" | "codex" => {
+            build_openai(creds, model, &tuning, refresher, sink.clone()).await?
+        }
+        "gemini" | "google_gemini" => {
+            build_gemini(creds, model, &tuning, refresher, sink.clone()).await?
+        }
         "copilot" | "github_copilot" => build_copilot(creds, model, &tuning, sink.clone()).await?,
         "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
         _ => {
@@ -538,11 +563,16 @@ fn resolve_anthropic_prompt_cache(
         .unwrap_or(true)
 }
 
+/// The credential store's refresher for an OAuth client (see
+/// `rupu_auth::CredentialResolver::oauth_refresher`).
+type OAuthRefresherHandle = std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>;
+
 async fn build_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     config: &ProviderConfig,
     tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Convert the resolved credential into an Anthropic AuthMethod so OAuth
@@ -571,7 +601,8 @@ async fn build_anthropic(
     }
     .with_tuning(tuning)
     .with_oauth_account_uuid(account_uuid)
-    .with_prompt_cache(prompt_cache);
+    .with_prompt_cache(prompt_cache)
+    .with_oauth_refresher(refresher);
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);
     }
@@ -587,11 +618,13 @@ async fn build_openai(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None, sink)
         .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?
-        .with_tuning(tuning);
+        .with_tuning(tuning)
+        .with_oauth_refresher(refresher);
     Ok(Box::new(client))
 }
 
@@ -599,6 +632,7 @@ async fn build_gemini(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Branch on credential shape:
@@ -612,18 +646,14 @@ async fn build_gemini(
     use rupu_providers::google_gemini::{GeminiVariant, GoogleGeminiClient};
     let variant = match &creds {
         AuthCredentials::ApiKey { .. } => GeminiVariant::AiStudio,
-        AuthCredentials::OAuth { extra, .. } => extra
-            .get("variant")
-            .and_then(|v| v.as_str())
-            .map(|s| match s {
-                "antigravity" => GeminiVariant::Antigravity,
-                _ => GeminiVariant::GeminiCli,
-            })
-            .unwrap_or(GeminiVariant::GeminiCli),
+        AuthCredentials::OAuth { extra, .. } => {
+            GeminiVariant::from_credential_hint(extra.get("variant").and_then(|v| v.as_str()))
+        }
     };
     let client = GoogleGeminiClient::new(creds, variant, None, sink)
         .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?
-        .with_tuning(tuning);
+        .with_tuning(tuning)
+        .with_oauth_refresher(refresher);
     Ok(Box::new(client))
 }
 
@@ -992,6 +1022,26 @@ mod tests {
             Some("openai-compatible")
         );
     }
+
+    #[test]
+    fn openai_compatible_unset_limits_are_unknown_not_fabricated() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "box".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://127.0.0.1:1".into()),
+                models: vec![rupu_config::CustomModel {
+                    id: "m".into(),
+                    context_window: None,
+                    max_output: None,
+                }],
+                ..Default::default()
+            },
+        );
+        let p = openai_compatible_params("box", &providers).unwrap();
+        assert_eq!((p.models[0].context_window, p.models[0].max_output), (0, 0));
+    }
 }
 
 #[cfg(test)]
@@ -1214,7 +1264,7 @@ mod decorate_kind_tests {
             model: "m".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,

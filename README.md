@@ -11,7 +11,7 @@ issue-tracker events, gated by human approvals when you want them, with a JSONL
 transcript on every run. A single Rust binary that:
 
 - Drives any of four LLM providers (Anthropic, OpenAI, Gemini, GitHub Copilot)
-  via API key OR SSO, with credentials kept in the OS keychain or a chmod-600 file.
+  via API key OR SSO, with credentials kept in a chmod-600 file (`~/.rupu/auth.json`).
 - Loads agent + workflow definitions from `.rupu/` in your project (or globally
   from `~/.rupu/`); ships a curated starter set via `rupu init --with-samples`.
 - Talks to GitHub and GitLab through a single embedded MCP server (so the same
@@ -310,9 +310,9 @@ rupu auth login --provider anthropic --mode sso
 rupu auth status
 ```
 
-Credentials are stored at `~/.rupu/auth.json` (chmod-600 file, the default —
-matches `gh`, `aws`, `gcloud`). To use the OS keychain instead:
-`rupu auth backend --use keychain`. SSO entries auto-refresh near expiry;
+Credentials are stored at `~/.rupu/auth.json` (a chmod-600 file, the only
+store — matches `gh`, `aws`, `gcloud`; `rupu auth backend` reports where it is).
+SSO entries auto-refresh near expiry;
 failure surfaces an actionable error pointing at `rupu auth login --mode sso`.
 
 `--provider` above is an alias for `--account` — one credential per

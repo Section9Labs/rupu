@@ -1058,18 +1058,29 @@ pub async fn run_workflow(
         }
     } else if let Some(store) = &opts.run_store {
         // Resume path: load the existing record so the terminal-flip
-        // block at the bottom of the function can update it.
-        match store.load(&run_id) {
-            Ok(mut rec) => {
-                rec.runner_pid = Some(std::process::id());
-                if let Err(e) = store.update(&rec) {
-                    warn!(error = %e, "failed to persist resumed runner pid");
-                }
-                Some(rec)
+        // block at the bottom of the function can update it. Under the run
+        // lock: a `Cancelled` that landed since the resume was decided is
+        // preserved, and the run does not start.
+        let claimed = {
+            let run_id = run_id.clone();
+            store
+                .blocking(move |s| {
+                    s.modify_unless_cancelled(&run_id, |rec| {
+                        rec.runner_pid = Some(std::process::id());
+                        true
+                    })
+                })
+                .await
+        };
+        match claimed {
+            Ok(Some(rec)) => Some(rec),
+            Ok(None) => {
+                info!(run_id = %run_id, "the run was cancelled on disk before it resumed; not starting it");
+                return Err(RunWorkflowError::RunCancelled { aborted: 0 });
             }
             Err(e) => {
-                warn!(error = %e, "failed to load resumed run record");
-                None
+                warn!(error = %e, "failed to persist resumed runner pid");
+                store.load(&run_id).ok()
             }
         }
     } else {
@@ -1157,6 +1168,10 @@ pub async fn run_workflow(
     // awaiting_step_id + approval_prompt; Done = `Completed`;
     // Error = `Failed`.
     let mut awaiting: Option<AwaitingInfo> = None;
+    // Set when a `Cancelled` another process landed on disk while this run
+    // was finishing was preserved instead of overwritten: the cancel
+    // already appended its terminal event, so this run emits none.
+    let mut cancel_preserved = false;
     if let (Some(store), Some(record)) = (opts.run_store.as_ref(), run_record_opt.as_mut()) {
         // Task 4, spec §3: `run_loop_node`'s own checkpoint writes
         // (`persist_loop_progress`) go straight to disk via their own
@@ -1325,8 +1340,26 @@ pub async fn run_workflow(
                 }
             }
         }
-        if let Err(persist_err) = store.update(record) {
-            warn!(error = %persist_err, "failed to persist terminal run state");
+        // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
+        // `RunStore::cancel` from the CLI or `cp serve` writes `Cancelled`
+        // while this run finishes). The store re-reads under the run lock —
+        // on the blocking pool, since the lock wait blocks its thread.
+        let flipped = {
+            let record = record.clone();
+            store
+                .blocking(move |s| s.update_unless_cancelled(&record))
+                .await
+        };
+        match flipped {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(run_id = %record.id, "the run was cancelled on disk while finishing; keeping that status");
+                record.status = crate::runs::RunStatus::Cancelled;
+                cancel_preserved = true;
+            }
+            Err(persist_err) => {
+                warn!(error = %persist_err, "failed to persist terminal run state");
+            }
         }
     } else if let Ok(InnerOutcome::Paused {
         step_id,
@@ -1370,8 +1403,9 @@ pub async fn run_workflow(
     }
 
     // Emit terminal run events (skip for Paused — StepAwaitingApproval
-    // was already emitted by run_steps_inner).
-    if let Some(sink) = opts.event_sink.as_ref() {
+    // was already emitted by run_steps_inner; skip entirely when an on-disk
+    // cancel was preserved — its own terminal event is already there).
+    if let Some(sink) = opts.event_sink.as_ref().filter(|_| !cancel_preserved) {
         match &outcome {
             Ok(InnerOutcome::Done) => {
                 sink.emit(
@@ -1412,6 +1446,13 @@ pub async fn run_workflow(
         }
     }
 
+    // A cancel preserved on disk is the run's outcome: the record and the
+    // events say `Cancelled`, and so does the return — a caller handed the
+    // in-memory outcome instead would report the run as completed or paused
+    // (the issue summary, `workflow approve`, the autoflow claim, cron).
+    if cancel_preserved {
+        return Err(RunWorkflowError::RunCancelled { aborted: 0 });
+    }
     outcome?;
     Ok(OrchestratorRunResult {
         step_results,
@@ -1435,7 +1476,24 @@ fn pause_triggered(pause: &Option<CancellationToken>) -> bool {
 /// is a cheap no-op for every call site until [`run_scheduler`] is handed
 /// a real token.
 fn cancel_requested(cancel: Option<&CancellationToken>) -> bool {
-    cancel.is_some_and(|t| t.is_cancelled())
+    // A process that has received SIGTERM (and is only still alive to drain
+    // pending credential writes) launches no new node either: the run
+    // stops as cancelled at the same boundaries a whole-run cancel does.
+    cancel.is_some_and(|t| t.is_cancelled()) || rupu_providers::credential_writes::terminating()
+}
+
+/// [`UnitDispatcher::dispatch_unit`], unless the process is terminating
+/// (SIGTERM, with credential writes still draining): then the unit is not
+/// started at all — it would be killed mid-way on its host anyway.
+async fn dispatch_unit_unless_terminating(
+    dispatcher: &dyn UnitDispatcher,
+    unit: UnitDispatch,
+    host: &str,
+) -> Result<UnitOutcome, RunError> {
+    if rupu_providers::credential_writes::terminating() {
+        return Err(RunError::Terminating);
+    }
+    dispatcher.dispatch_unit(unit, host).await
 }
 
 /// True when any step in the workflow resolves to `workspace: sync`. Used to
@@ -2977,7 +3035,7 @@ async fn run_scheduler_scoped(
             // exactly; only WHERE the dispatch itself runs changed.
             let effective_continue_on_error =
                 step.continue_on_error.unwrap_or(workflow_default_continue);
-            persist_active_step(opts, run_id, step, None);
+            persist_active_step(opts, run_id, step, None).await;
             let step_kind = step_kind_for_run_record(step);
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
@@ -3182,7 +3240,7 @@ async fn run_scheduler_scoped(
             }
             NodeOutcome::Completed(mut result) => {
                 let done_step_id = wf.steps[i].id.clone();
-                clear_active_step(opts, run_id, &done_step_id);
+                clear_active_step(opts, run_id, &done_step_id).await;
                 if cancel_state.cancelled_by_us.remove(&i) {
                     // Lost the abort race — tokio's own docs note a task
                     // that had already finished when `.abort()` was
@@ -3503,7 +3561,7 @@ async fn run_loop_node(
         // call — a pause/cancel landing anywhere inside it (even before
         // any member has run) resumes at THIS iteration, never the
         // previous one.
-        persist_loop_progress(opts, run_id, loop_name, iteration);
+        persist_loop_progress(opts, run_id, loop_name, iteration).await;
 
         let mut loop_progress = std::collections::BTreeMap::new();
         loop_progress.insert(
@@ -3728,7 +3786,7 @@ enum LoopNodeOutcome {
 /// there's no run store or run id (in-memory harness / unit tests
 /// without persistence) — the loop still runs correctly in a single
 /// process, it just has nothing to resume FROM if the process exits.
-fn persist_loop_progress(
+async fn persist_loop_progress(
     opts: &OrchestratorRunOpts,
     run_id: &str,
     loop_name: &str,
@@ -3738,14 +3796,24 @@ fn persist_loop_progress(
     if run_id.is_empty() {
         return;
     }
-    let Ok(mut record) = store.load(run_id) else {
-        return;
-    };
-    record
-        .loop_progress
-        .insert(loop_name.to_string(), iteration);
-    if let Err(e) = store.update(&record) {
-        warn!(loop_name, iteration, error = %e, "failed to persist loop progress checkpoint");
+    let (run_id_owned, name) = (run_id.to_string(), loop_name.to_string());
+    let written = store
+        .blocking(move |s| {
+            s.modify_unless_cancelled(&run_id_owned, |record| {
+                record.loop_progress.insert(name, iteration);
+                true
+            })
+        })
+        .await;
+    match written {
+        Ok(Some(_)) => {}
+        Ok(None) => info!(
+            run_id,
+            loop_name, "the run was cancelled on disk; loop progress not recorded"
+        ),
+        Err(e) => {
+            warn!(loop_name, iteration, error = %e, "failed to persist loop progress checkpoint")
+        }
     }
 }
 
@@ -4500,6 +4568,14 @@ async fn run_steps_over(
             continue;
         }
 
+        // Step-boundary stop once SIGTERM has arrived: no further step is
+        // started (the scheduler path does the same through
+        // `cancel_requested`); the run ends as cancelled.
+        if rupu_providers::credential_writes::terminating() {
+            info!(step = %step.id, "the process is terminating; not starting this step");
+            return Err(RunWorkflowError::RunCancelled { aborted: 0 });
+        }
+
         // Step-boundary pause: if a cooperative pause was requested, stop
         // before dispatching the next step. Every step shape pauses cleanly
         // here (fan-out / panel / parallel steps run to completion, then pause
@@ -4792,7 +4868,7 @@ async fn run_steps_over(
 
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
-        persist_active_step(opts, run_id, step, None);
+        persist_active_step(opts, run_id, step, None).await;
 
         let step_kind = step_kind_for_run_record(step);
         if let Some(sink) = opts.event_sink.as_ref() {
@@ -4839,7 +4915,7 @@ async fn run_steps_over(
             }
             NodeOutcome::Completed(result) => {
                 persist_step_result(opts, run_id, &result);
-                clear_active_step(opts, run_id, &step.id);
+                clear_active_step(opts, run_id, &step.id).await;
                 step_results.push(result);
             }
         }
@@ -4922,7 +4998,7 @@ async fn run_node(
                         },
                     );
                 }
-                clear_active_step(opts, run_id, &step.id);
+                clear_active_step(opts, run_id, &step.id).await;
                 return Ok(NodeOutcome::Paused {
                     step_id,
                     seed: Vec::new(),
@@ -4990,7 +5066,7 @@ async fn run_node(
                         },
                     );
                 }
-                clear_active_step(opts, run_id, &step.id);
+                clear_active_step(opts, run_id, &step.id).await;
                 return Ok(NodeOutcome::Paused {
                     step_id,
                     seed,
@@ -6330,7 +6406,9 @@ pub async fn run_reject_cleanup(
     Ok(())
 }
 
-fn persist_active_step(
+/// Record `step` as the run's active step — under the run lock, never over
+/// an on-disk `Cancelled` (which has already cleared the active step).
+async fn persist_active_step(
     opts: &OrchestratorRunOpts,
     workflow_run_id: &str,
     step: &Step,
@@ -6340,35 +6418,57 @@ fn persist_active_step(
     if workflow_run_id.is_empty() {
         return;
     }
-    let Ok(mut record) = store.load(workflow_run_id) else {
-        return;
-    };
-    record.active_step_id = Some(step.id.clone());
-    record.active_step_kind = Some(step_kind_for_run_record(step));
-    record.active_step_agent = step.agent.clone();
-    record.active_step_transcript_path = transcript_path;
-    if let Err(e) = store.update(&record) {
-        warn!(step = %step.id, error = %e, "failed to persist active step");
+    let run_id = workflow_run_id.to_string();
+    let (step_id, kind, agent) = (
+        step.id.clone(),
+        step_kind_for_run_record(step),
+        step.agent.clone(),
+    );
+    let written = store
+        .blocking(move |s| {
+            s.modify_unless_cancelled(&run_id, |record| {
+                record.active_step_id = Some(step_id);
+                record.active_step_kind = Some(kind);
+                record.active_step_agent = agent;
+                record.active_step_transcript_path = transcript_path;
+                true
+            })
+        })
+        .await;
+    match written {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            info!(step = %step.id, "the run was cancelled on disk; active step not recorded")
+        }
+        Err(e) => warn!(step = %step.id, error = %e, "failed to persist active step"),
     }
 }
 
-fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
+/// Clear `step_id` as the run's active step if it still is — under the run
+/// lock, never over an on-disk `Cancelled`.
+async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
     let Some(store) = &opts.run_store else { return };
     if workflow_run_id.is_empty() {
         return;
     }
-    let Ok(mut record) = store.load(workflow_run_id) else {
-        return;
-    };
-    if record.active_step_id.as_deref() != Some(step_id) {
-        return;
-    }
-    record.active_step_id = None;
-    record.active_step_kind = None;
-    record.active_step_agent = None;
-    record.active_step_transcript_path = None;
-    if let Err(e) = store.update(&record) {
-        warn!(step = %step_id, error = %e, "failed to clear active step");
+    let (run_id, step) = (workflow_run_id.to_string(), step_id.to_string());
+    let written = store
+        .blocking(move |s| {
+            s.modify_unless_cancelled(&run_id, |record| {
+                if record.active_step_id.as_deref() != Some(step.as_str()) {
+                    return false;
+                }
+                record.active_step_id = None;
+                record.active_step_kind = None;
+                record.active_step_agent = None;
+                record.active_step_transcript_path = None;
+                true
+            })
+        })
+        .await;
+    match written {
+        Ok(_) => {}
+        Err(e) => warn!(step = %step_id, error = %e, "failed to clear active step"),
     }
 }
 
@@ -6439,7 +6539,7 @@ async fn dispatch_placed_step(
         run_id,
         transcript_path.to_path_buf(),
     );
-    match dispatcher.dispatch_unit(unit, host).await {
+    match dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await {
         Ok(outcome) if outcome.success => {
             let output = outcome.output;
             let ws_delta = outcome.workspace_delta;
@@ -6542,7 +6642,7 @@ async fn run_linear_step(
         .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
         .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
     let codename = step_codename(opts, step);
-    persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
+    persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone())).await;
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
     // `StepStarted`), so the UI has no way to learn it until the step
@@ -7297,7 +7397,13 @@ async fn run_fanout_step(
                                     &run_id_clone,
                                     transcript_clone.clone(),
                                 );
-                                match dispatcher.dispatch_unit(unit, &host).await {
+                                match dispatch_unit_unless_terminating(
+                                    dispatcher.as_ref(),
+                                    unit,
+                                    &host,
+                                )
+                                .await
+                                {
                                     Ok(outcome) => {
                                         // Important fix: when the agent ran but failed
                                         // (success=false), synthesize a raw_error so
@@ -7406,7 +7512,12 @@ async fn run_fanout_step(
                                             &retry_run_id,
                                             transcript_path.clone(),
                                         );
-                                        match dispatcher.dispatch_unit(retry_unit, retry_host).await
+                                        match dispatch_unit_unless_terminating(
+                                            dispatcher.as_ref(),
+                                            retry_unit,
+                                            retry_host,
+                                        )
+                                        .await
                                         {
                                             Ok(outcome) => {
                                                 // Same fix as primary path: synthesize
@@ -10342,9 +10453,7 @@ steps:
     // T3 — pause / resume (run + workflow)
     // -----------------------------------------------------------------------
 
-    use rupu_agent::runner::{
-        CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
-    };
+    use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
     use rupu_agent::{AgentRunOpts, BypassDecider};
     use rupu_providers::types::{
         ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent,
@@ -10419,8 +10528,9 @@ steps:
             initial_messages: Vec::new(),
             turn_index_offset: 0,
             mode_str: "bypass".into(),
-            // The one-shot completions path races `provider.send` against the
-            // pause token — the deterministic pause boundary for these tests.
+            // The runner always streams (`no_stream` only quiets the
+            // display) and races `provider.stream` against the pause token —
+            // the deterministic pause boundary for these tests.
             no_stream: true,
             suppress_stream_stdout: true,
             mcp_registry: None,
@@ -10439,9 +10549,7 @@ steps:
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
-            context_window_tokens: None,
-            compact_at_percent: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
             pause: None,
@@ -11603,7 +11711,7 @@ loops:
 #[cfg(test)]
 mod dag_scheduler_golden {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_mcp::{McpPermission, ToolDispatcher};
     use rupu_providers::types::StopReason;
     use rupu_scm::{
@@ -11680,11 +11788,9 @@ mod dag_scheduler_golden {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -12079,7 +12185,7 @@ steps:
 #[cfg(test)]
 mod scheduler_concurrency {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12227,11 +12333,9 @@ steps:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -12614,7 +12718,7 @@ steps:
 #[cfg(test)]
 mod bounded_loops {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12749,11 +12853,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -12945,11 +13047,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -13236,11 +13336,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -13433,11 +13531,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -13496,7 +13592,7 @@ loops:
 #[cfg(test)]
 mod loop_resume {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13662,11 +13758,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -13966,11 +14060,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -14118,11 +14210,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -14349,11 +14439,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -14899,7 +14987,7 @@ loops:
 #[cfg(test)]
 mod join_and_prune {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::Mutex;
@@ -14997,11 +15085,9 @@ mod join_and_prune {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -16535,7 +16621,7 @@ steps:
 #[cfg(test)]
 mod resume_and_cancel {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::Mutex;
@@ -16630,11 +16716,9 @@ mod resume_and_cancel {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -17311,7 +17395,7 @@ fn scan_for_json_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod agent_terminal_status {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_agent::AgentRunOpts;
     use rupu_providers::types::StopReason;
     use rupu_providers::LlmProvider;
@@ -17393,9 +17477,7 @@ mod agent_terminal_status {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
-                context_window_tokens: None,
-                compact_at_percent: None,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
                 pause: None,
@@ -17640,9 +17722,7 @@ steps:
 #[cfg(test)]
 mod manual_pause_drain {
     use super::*;
-    use rupu_agent::runner::{
-        BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
-    };
+    use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
     use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, StreamEvent};
     use rupu_providers::{LlmProvider, ProviderError, ProviderId};
     use std::collections::VecDeque;
@@ -17805,9 +17885,7 @@ mod manual_pause_drain {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
-                context_window_tokens: None,
-                compact_at_percent: None,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
                 pause: None,

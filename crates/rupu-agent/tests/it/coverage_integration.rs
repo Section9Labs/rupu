@@ -88,10 +88,8 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         on_usage: None,
         concerns: Some(stride_block()),
         scope_name: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         surface_tag: None,
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     };
@@ -201,10 +199,8 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
         on_usage: None,
         concerns: None,
         scope_name: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         surface_tag: None,
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     };
@@ -275,10 +271,8 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         on_usage: None,
         concerns: Some(stride_block()),
         scope_name: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         surface_tag: None,
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     };
@@ -358,12 +352,10 @@ async fn surface_tag_override_is_respected() {
         on_usage: None,
         // Enable coverage so the runner's surface_tag assignment fires.
         concerns: Some(stride_block()),
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         scope_name: None,
         // This is the field under test: override to "workflow".
         surface_tag: Some("workflow".to_string()),
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     };
@@ -437,10 +429,8 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
         on_usage: None,
         concerns: Some(stride_index_block()),
         scope_name: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         surface_tag: None,
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     };

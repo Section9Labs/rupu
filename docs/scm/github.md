@@ -12,7 +12,7 @@
 
 `rupu auth login --provider github --mode sso` prints a verification URL +
 user-code, opens https://github.com/login/device, prompts for the code, stores
-the access token in keychain.
+the access token in `~/.rupu/auth.json`.
 
 ## Sample agent
 
@@ -50,4 +50,4 @@ Run: `rupu run review-pr github:section9labs/rupu#42`
 ## See also
 
 - `docs/scm.md` — canonical reference
-- `docs/providers/github.md` — Copilot LLM provider (separate keychain entry)
+- `docs/providers/github.md` — Copilot LLM provider (separate credential entry)

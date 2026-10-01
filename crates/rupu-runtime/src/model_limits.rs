@@ -1,0 +1,710 @@
+//! Model-limit discovery + resolution (spec
+//! `docs/superpowers/specs/2026-09-30-rupu-model-limits-discovery-design.md`).
+//! The CLI (`rupu models`), the CP (`ModelCatalog` port) and every run
+//! launch share this module.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use rupu_providers::model_limits::{
+    clamp_compact_percent, fmt_age, Limit, LimitSource, ModelLimits, ANTHROPIC_FALLBACK_MAX_TOKENS,
+    DEFAULT_COMPACT_AT_PERCENT,
+};
+use rupu_providers::model_registry::match_model_id;
+use rupu_providers::{LlmProvider, ModelRegistry, ModelSource, ProviderError, ProviderId};
+use serde::{Deserialize, Serialize};
+
+use crate::provider_factory;
+
+/// Model-list fetch timeout (spec §3).
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What `resolve` needs from config. Owned, so long-lived holders (the step
+/// factory, the dispatcher) keep it without the whole `Config`.
+#[derive(Debug, Clone)]
+pub struct LimitsContext {
+    pub cache_dir: PathBuf,
+    /// `[providers.<name>].models`, keyed by provider/account name.
+    pub custom: HashMap<String, Vec<rupu_config::CustomModel>>,
+    /// Bound on a stale-cache refetch. [`FETCH_TIMEOUT`] everywhere but tests,
+    /// which inject a short one instead of pausing the clock.
+    pub fetch_timeout: Duration,
+}
+
+impl Default for LimitsContext {
+    fn default() -> Self {
+        Self::for_cache_dir(PathBuf::new())
+    }
+}
+
+impl LimitsContext {
+    pub fn from_config(cfg: &rupu_config::Config, global_dir: &Path) -> Self {
+        Self {
+            custom: cfg
+                .providers
+                .iter()
+                .filter(|(_, p)| !p.models.is_empty())
+                .map(|(n, p)| (n.clone(), p.models.clone()))
+                .collect(),
+            ..Self::for_cache_dir(cache_dir(global_dir))
+        }
+    }
+
+    pub fn for_cache_dir(cache_dir: PathBuf) -> Self {
+        Self {
+            cache_dir,
+            custom: HashMap::new(),
+            fetch_timeout: FETCH_TIMEOUT,
+        }
+    }
+}
+
+/// How long a failed (or timed-out) stale-cache refetch in [`resolve`]
+/// suppresses the next one. A manual [`refresh`] ignores it.
+pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// `<cache_dir>/<provider>.failed`: when `resolve`'s last refetch for
+/// `provider` failed, and why.
+#[derive(Debug, Serialize, Deserialize)]
+struct RefreshFailure {
+    failed_at: DateTime<Utc>,
+    error: String,
+}
+
+fn refresh_failure_path(cache_dir: &Path, provider: &str) -> PathBuf {
+    cache_dir.join(format!("{provider}.failed"))
+}
+
+/// The recorded failure's age and reason, when it is inside
+/// [`REFRESH_RETRY_AFTER`]. A missing, unreadable or future-dated marker
+/// suppresses nothing.
+fn recent_refresh_failure(
+    cache_dir: &Path,
+    provider: &str,
+    now: DateTime<Utc>,
+) -> Option<(chrono::Duration, String)> {
+    let body = std::fs::read_to_string(refresh_failure_path(cache_dir, provider)).ok()?;
+    let failure: RefreshFailure = serde_json::from_str(&body).ok()?;
+    let age = now - failure.failed_at;
+    let window = chrono::Duration::from_std(REFRESH_RETRY_AFTER).ok()?;
+    (age >= chrono::Duration::zero() && age < window).then_some((age, failure.error))
+}
+
+/// Record a failed refetch, atomically (temp file + rename, like the cache
+/// itself). Best effort: an unwritable marker only costs a retry.
+fn record_refresh_failure(cache_dir: &Path, provider: &str, error: &str) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let body = match serde_json::to_string(&RefreshFailure {
+        failed_at: Utc::now(),
+        error: error.to_string(),
+    }) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(error = %e, provider, "could not encode the refresh-failure marker");
+            return;
+        }
+    };
+    let tmp = cache_dir.join(format!(
+        ".{provider}.failed.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = std::fs::create_dir_all(cache_dir)
+        .and_then(|()| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, refresh_failure_path(cache_dir, provider)));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, provider, "could not record the refresh-failure marker");
+    }
+}
+
+/// Forget a recorded failure (a refetch or manual refresh succeeded).
+fn clear_refresh_failure(cache_dir: &Path, provider: &str) {
+    match std::fs::remove_file(refresh_failure_path(cache_dir, provider)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, provider, "could not clear the refresh-failure marker")
+        }
+    }
+}
+
+/// `10s`, or `50ms` for a sub-second (test-injected) timeout.
+fn fmt_timeout(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+/// `<global>/cache/models`, or `$RUPU_CACHE_DIR_OVERRIDE` (the existing
+/// `rupu models` test seam). Read at the edge only — the CLI, the CP adapter
+/// and [`LimitsContext::from_config`] call it; [`refresh`] and [`catalog`]
+/// take the resulting directory explicitly, so the library's behavior never
+/// depends on the environment.
+pub fn cache_dir(global_dir: &Path) -> PathBuf {
+    std::env::var("RUPU_CACHE_DIR_OVERRIDE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| global_dir.join("cache/models"))
+}
+
+/// Agent-frontmatter pins.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LimitOverrides {
+    pub context_window_tokens: Option<u32>,
+    pub max_tokens: Option<u32>,
+    pub compact_at_percent: Option<u8>,
+}
+
+impl LimitOverrides {
+    pub fn from_spec(spec: &rupu_agent::AgentSpec) -> Self {
+        Self {
+            context_window_tokens: spec.context_window_tokens,
+            max_tokens: spec.max_tokens,
+            compact_at_percent: spec.compact_at_percent,
+        }
+    }
+}
+
+/// Resolve the limits one run uses (spec §5). Precedence per field:
+/// agent → config → live cache (refetched through `provider` when stale)
+/// → unknown. Never errors: unknown is a valid, reported outcome.
+pub async fn resolve(
+    overrides: LimitOverrides,
+    provider_name: &str,
+    model: &str,
+    provider: &mut dyn LlmProvider,
+    ctx: &LimitsContext,
+) -> ModelLimits {
+    let registry = ModelRegistry::with_cache_dir(&ctx.cache_dir);
+    if let Err(e) = registry.load_cache(provider_name).await {
+        tracing::warn!(error = %e, provider = provider_name, "unreadable model cache; refetching");
+    }
+    // Every reason a limit is unknown, stale, or an input was ignored; joined
+    // into the run-start notice.
+    let mut notes: Vec<String> = Vec::new();
+    // An agent pin of 0 would compact every turn or send `max_tokens: 0`:
+    // treat it as unset and say so.
+    let pin = |value: Option<u32>, field: &str, notes: &mut Vec<String>| match value {
+        Some(0) => {
+            notes.push(format!("ignored {field}: 0"));
+            None
+        }
+        other => other,
+    };
+    let pinned_input = pin(
+        overrides.context_window_tokens,
+        "contextWindowTokens",
+        &mut notes,
+    );
+    let pinned_output = pin(overrides.max_tokens, "maxTokens", &mut notes);
+    if registry.cache_is_stale(provider_name).await {
+        if let Some((age, error)) =
+            recent_refresh_failure(&ctx.cache_dir, provider_name, Utc::now())
+        {
+            // A refetch failed moments ago: don't pay the fetch timeout again
+            // on every launch while the provider stays down.
+            notes.push(format!(
+                "model list refresh failed {} ({error}); retrying after {}m",
+                fmt_age(age),
+                REFRESH_RETRY_AFTER.as_secs() / 60
+            ));
+        } else {
+            let failed = match tokio::time::timeout(ctx.fetch_timeout, provider.fetch_models())
+                .await
+            {
+                // A listing that parsed to zero models is a failed refresh, not
+                // an answer: caching it would replace a good entry (and make
+                // every model "missing from the list" for an hour).
+                Ok(Ok(models)) if models.is_empty() => {
+                    notes.push("model list refresh returned no models".to_string());
+                    Some("returned no models".to_string())
+                }
+                Ok(Ok(models)) => {
+                    registry.set_live_cache(provider_name, models).await;
+                    if let Err(e) = registry.save_cache(provider_name).await {
+                        tracing::warn!(error = %e, provider = provider_name, "failed to write model cache");
+                        notes.push(format!(
+                            "could not write the model cache ({e}); every launch will refetch"
+                        ));
+                    }
+                    clear_refresh_failure(&ctx.cache_dir, provider_name);
+                    None
+                }
+                // Not a failure: the provider has no listing. Instant, so
+                // nothing to suppress.
+                Ok(Err(ProviderError::NotImplemented { .. })) => {
+                    notes.push(format!(
+                        "{provider_name} exposes no model limits; set contextWindowTokens/maxTokens on the agent or [[providers.{provider_name}.models]]"
+                    ));
+                    None
+                }
+                Ok(Err(e)) => {
+                    notes.push(format!("model list refresh failed: {e}"));
+                    Some(e.to_string())
+                }
+                Err(_) => {
+                    let why = format!("timed out after {}", fmt_timeout(ctx.fetch_timeout));
+                    notes.push(format!("model list refresh {why}"));
+                    Some(why)
+                }
+            };
+            if let Some(error) = failed {
+                record_refresh_failure(&ctx.cache_dir, provider_name, &error);
+            }
+        }
+    }
+    let fetched_at = registry.fetched_at(provider_name).await;
+    let stale = registry.cache_is_stale(provider_name).await;
+    let live = registry.find_live(provider_name, model).await;
+    let custom = ctx.custom.get(provider_name).and_then(|ms| {
+        let id = match_model_id(ms.iter().map(|m| m.id.as_str()), model)?;
+        ms.iter().find(|m| m.id == id)
+    });
+    let config_input = custom.and_then(|c| c.context_window).filter(|n| *n > 0);
+    let config_output = custom.and_then(|c| c.max_output).filter(|n| *n > 0);
+    // Config answers for the model only when it supplies a value; a bare
+    // entry is no reason to hide that the provider doesn't list it.
+    let config_answers = config_input.is_some() || config_output.is_some();
+    let pick = |pin: Option<u32>, cfg: Option<u32>, live: Option<u32>| -> Limit {
+        if let Some(n) = pin {
+            return Limit::new(n, LimitSource::Agent);
+        }
+        if let Some(n) = cfg {
+            return Limit::new(n, LimitSource::Config);
+        }
+        match (live.filter(|n| *n > 0), fetched_at) {
+            (Some(n), Some(fetched_at)) => Limit::new(n, LimitSource::Live { fetched_at, stale }),
+            _ => Limit::unknown(),
+        }
+    };
+    let input = pick(
+        pinned_input,
+        config_input,
+        live.as_ref().map(|m| m.context_window),
+    );
+    let output = pick(
+        pinned_output,
+        config_output,
+        live.as_ref().map(|m| m.max_output_tokens),
+    );
+    let still_unknown =
+        input.source == LimitSource::Unknown || output.source == LimitSource::Unknown;
+    match &live {
+        None if fetched_at.is_some() && !config_answers => notes.push(format!(
+            "model '{model}' is not in {provider_name}'s model list"
+        )),
+        // Listed, but with neither limit: say so when it leaves a gap.
+        Some(m) if m.context_window == 0 && m.max_output_tokens == 0 && still_unknown => {
+            notes.push(format!(
+                "{provider_name} lists '{model}' without limits; set contextWindowTokens/maxTokens or [[providers.{provider_name}.models]]"
+            ))
+        }
+        _ => {}
+    }
+    ModelLimits {
+        input,
+        output,
+        compact_at_percent: clamp_compact_percent(
+            overrides
+                .compact_at_percent
+                .unwrap_or(DEFAULT_COMPACT_AT_PERCENT),
+        ),
+        output_shares_context: provider.output_shares_context(),
+        output_fallback: (provider.provider_id() == ProviderId::Anthropic)
+            .then_some(ANTHROPIC_FALLBACK_MAX_TOKENS),
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+    }
+}
+
+/// The built-in vendor names, in the order they are listed/refreshed.
+///
+/// Deliberately NOT the set of names `rupu models` accepts — that is
+/// [`provider_names`], which appends every declared `[providers.<name>]`
+/// account. Treating this array as the accepted set is what made
+/// `--provider <account>` a silent no-op: the filter was compared against
+/// these four strings, so a declared account matched no iteration and the
+/// loop body never ran.
+pub const BUILTIN_PROVIDERS: [&str; 4] = ["anthropic", "openai", "gemini", "copilot"];
+
+/// Every provider name the model commands operate on: the built-in vendors,
+/// then every declared `[providers.<name>]` account that resolves to a
+/// dispatchable kind (`provider_factory::is_dispatchable_provider` — the
+/// same predicate `rupu run`'s pre-flight gate uses, so the two cannot
+/// drift). Built-ins keep their historical position so table output is
+/// stable; accounts follow in config order, duplicates skipped.
+pub fn provider_names(cfg: &rupu_config::Config) -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
+    for name in cfg.providers.keys() {
+        if !names.contains(name) && provider_factory::is_dispatchable_provider(name, &cfg.providers)
+        {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// `--provider <name>` named something that is neither a built-in vendor nor
+/// a declared dispatchable account.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UnknownProvider(pub String);
+
+/// Resolve `--provider <name>` into the list of names to act on.
+///
+/// `None` means "all of them". A name that resolves to nothing is a hard
+/// error: previously it matched no loop iteration and the command exited 0
+/// having printed nothing, so a typo was indistinguishable from success.
+pub fn resolve_targets(
+    filter: Option<&str>,
+    cfg: &rupu_config::Config,
+    cfg_path: &Path,
+) -> Result<Vec<String>, UnknownProvider> {
+    let Some(only) = filter else {
+        return Ok(provider_names(cfg));
+    };
+    if !provider_factory::is_dispatchable_provider(only, &cfg.providers) {
+        return Err(UnknownProvider(format!(
+            "unknown provider '{only}': it is not a built-in vendor name \
+             (anthropic | openai | gemini | copilot), and no [providers.{only}] in {} \
+             declares its vendor kind. Declare the account with `rupu auth login \
+             --account {only} --kind <vendor>`, or declare an openai-compatible \
+             endpoint as [providers.{only}] with kind = \"openai-compatible\" and a \
+             base_url.",
+            cfg_path.display()
+        )));
+    }
+    Ok(vec![only.to_string()])
+}
+
+/// The resolved vendor kind for a provider name, falling back to the name
+/// itself (which for an undeclared built-in IS its own kind).
+fn kind_of(name: &str, cfg: &rupu_config::Config) -> String {
+    provider_factory::resolve_kind(name, &cfg.providers).unwrap_or_else(|| name.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshOutcome {
+    pub provider: String,
+    pub ok: bool,
+    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What [`refresh`] produced.
+#[derive(Debug)]
+pub struct RefreshReport {
+    /// One per targeted provider, in target order. A job still running when
+    /// its wait timed out is reported as `timed out after …`.
+    pub outcomes: Vec<RefreshOutcome>,
+    /// Those still-running jobs. They are never aborted: one may be mid-way
+    /// through an OAuth/SSO token refresh whose rotated token must still be
+    /// persisted. A long-lived caller (`cp serve`) drops them and they finish
+    /// detached; a one-shot process must await them before it exits, or its
+    /// runtime's shutdown cancels them.
+    pub unfinished: Vec<UnfinishedRefresh>,
+}
+
+/// A provider refresh job still running when its wait timed out.
+#[derive(Debug)]
+pub struct UnfinishedRefresh {
+    pub provider: String,
+    pub job: tokio::task::JoinHandle<RefreshOutcome>,
+}
+
+/// Refetch live model lists (spec §8). Providers run in parallel, each
+/// bounded by `fetch_timeout` ([`FETCH_TIMEOUT`] outside tests) as a whole
+/// (client build, credential resolution and any token refresh included, not
+/// just the HTTP listing); one failing or hanging never fails the others.
+///
+/// Each provider's job is its own spawned task, and the timeout bounds only
+/// the WAIT for it: a job that outlives it is reported as timed out, keeps
+/// running, and comes back in [`RefreshReport::unfinished`].
+pub async fn refresh(
+    cfg: &rupu_config::Config,
+    cache_dir: &Path,
+    cfg_path: &Path,
+    resolver: Arc<dyn rupu_auth::CredentialResolver>,
+    only: Option<&str>,
+    fetch_timeout: Duration,
+) -> Result<RefreshReport, UnknownProvider> {
+    let names = resolve_targets(only, cfg, cfg_path)?;
+    let cfg = Arc::new(cfg.clone());
+    let jobs = names.into_iter().map(|name| {
+        let mut job = tokio::spawn({
+            let (name, cfg, resolver) = (name.clone(), Arc::clone(&cfg), Arc::clone(&resolver));
+            let cache_dir = cache_dir.to_path_buf();
+            async move { refresh_one(&name, &cfg, resolver.as_ref(), &cache_dir).await }
+        });
+        async move {
+            let fail = |error: String| RefreshOutcome {
+                provider: name.clone(),
+                ok: false,
+                count: 0,
+                error: Some(error),
+            };
+            match tokio::time::timeout(fetch_timeout, &mut job).await {
+                Ok(Ok(outcome)) => (outcome, None),
+                Ok(Err(e)) => (fail(format!("refresh task failed: {e}")), None),
+                // Still running: hand the job back, never abort it.
+                Err(_) => (
+                    fail(format!("timed out after {}", fmt_timeout(fetch_timeout))),
+                    Some(UnfinishedRefresh {
+                        provider: name.clone(),
+                        job,
+                    }),
+                ),
+            }
+        }
+    });
+    let (outcomes, unfinished): (Vec<_>, Vec<_>) = futures_util::future::join_all(jobs)
+        .await
+        .into_iter()
+        .unzip();
+    Ok(RefreshReport {
+        outcomes,
+        unfinished: unfinished.into_iter().flatten().collect(),
+    })
+}
+
+/// One provider's refresh: build the client, fetch, write the cache. The
+/// caller bounds its wait with the fetch timeout but never cancels it; the
+/// cache write is an atomic rename either way.
+async fn refresh_one(
+    name: &str,
+    cfg: &rupu_config::Config,
+    resolver: &dyn rupu_auth::CredentialResolver,
+    cache_dir: &Path,
+) -> RefreshOutcome {
+    let registry = ModelRegistry::with_cache_dir(cache_dir);
+    let fail = |error: String| RefreshOutcome {
+        provider: name.to_string(),
+        ok: false,
+        count: 0,
+        error: Some(error),
+    };
+    // Kind first: a kind with no listing wired fails here, before any
+    // credential lookup could misreport it as a missing credential.
+    if kind_of(name, cfg) == "local" {
+        return fail("provider kind \"local\" is not wired for listing".to_string());
+    }
+    let pcfg = provider_factory::provider_config_for(name, &cfg.providers);
+    let model = provider_factory::resolve_model(
+        None,
+        cfg.default_model.as_deref(),
+        pcfg.openai_compatible
+            .as_ref()
+            .map(|p| p.default_model.as_str()),
+    );
+    let mut provider = match provider_factory::build_for_provider_with_config(
+        name,
+        &model,
+        None,
+        resolver,
+        &pcfg,
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await
+    {
+        Ok((_, p)) => p,
+        Err(provider_factory::FactoryError::NotWiredInV0(k)) => {
+            return fail(format!("provider kind \"{k}\" is not wired for listing"))
+        }
+        Err(e) => return fail(e.to_string()),
+    };
+    match provider.fetch_models().await {
+        // An empty listing is a failed refresh: never replace a good cache.
+        Ok(models) if models.is_empty() => fail("provider returned no models".to_string()),
+        Ok(models) => {
+            let count = models.len();
+            registry.set_live_cache(name, models).await;
+            if let Err(e) = registry.save_cache(name).await {
+                return fail(format!(
+                    "fetched {count} models but could not write the cache: {e}"
+                ));
+            }
+            // A manual refresh ignores `resolve`'s failure marker; success
+            // clears it.
+            clear_refresh_failure(cache_dir, name);
+            RefreshOutcome {
+                provider: name.to_string(),
+                ok: true,
+                count,
+                error: None,
+            }
+        }
+        Err(ProviderError::NotImplemented { .. }) => fail(format!(
+            "no live model-list endpoint — declare limits in [[providers.{name}.models]]"
+        )),
+        Err(e) => fail(e.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogModel {
+    pub id: String,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    /// `live` | `custom` | `baked-in`
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogProvider {
+    pub provider: String,
+    pub fetched_at: Option<DateTime<Utc>>,
+    pub stale: bool,
+    pub models: Vec<CatalogModel>,
+}
+
+/// The cached catalog, with no network (spec §8).
+pub async fn catalog(
+    cfg: &rupu_config::Config,
+    cache_dir: &Path,
+    cfg_path: &Path,
+    only: Option<&str>,
+) -> Result<Vec<CatalogProvider>, UnknownProvider> {
+    let names = resolve_targets(only, cfg, cfg_path)?;
+    let registry = build_registry(cfg, cache_dir).await;
+    let mut out = Vec::new();
+    for p in names {
+        let fetched_at = registry.fetched_at(&p).await;
+        let stale = fetched_at.is_some() && registry.cache_is_stale(&p).await;
+        let mut models = Vec::new();
+        for m in registry.list(&p).await {
+            // `list` lets a config entry replace the live one wholesale, so
+            // its unset fields read 0. `resolve` fills those per field from
+            // the live cache; so does the catalog, or the two would disagree
+            // about the same model. The row stays `custom`: config owns it.
+            let live = match m.source {
+                ModelSource::Custom => registry.find_live(&p, &m.entry.id).await,
+                _ => None,
+            };
+            let pick = |own: u32, live: Option<u32>| {
+                Some(own).filter(|n| *n > 0).or(live.filter(|n| *n > 0))
+            };
+            models.push(CatalogModel {
+                input_tokens: pick(
+                    m.entry.context_window,
+                    live.as_ref().map(|l| l.context_window),
+                ),
+                output_tokens: pick(
+                    m.entry.max_output_tokens,
+                    live.as_ref().map(|l| l.max_output_tokens),
+                ),
+                source: match m.source {
+                    ModelSource::Custom => "custom",
+                    ModelSource::Live => "live",
+                    ModelSource::BakedIn => "baked-in",
+                }
+                .to_string(),
+                id: m.entry.id,
+            });
+        }
+        out.push(CatalogProvider {
+            provider: p,
+            fetched_at,
+            stale,
+            models,
+        });
+    }
+    Ok(out)
+}
+
+async fn build_registry(cfg: &rupu_config::Config, cache_dir: &Path) -> ModelRegistry {
+    let registry = ModelRegistry::with_cache_dir(cache_dir);
+
+    // Baked-in id fallbacks: Copilot, and Gemini's Code Assist (OAuth) path,
+    // which has no model listing (an AI Studio API key lists live).
+    registry
+        .set_baked_in(
+            "copilot",
+            ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4", "o4-mini"]
+                .iter()
+                .map(|id| make_model_info(id, "copilot"))
+                .collect(),
+        )
+        .await;
+    registry
+        .set_baked_in(
+            "gemini",
+            ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro"]
+                .iter()
+                .map(|id| make_model_info(id, "gemini"))
+                .collect(),
+        )
+        .await;
+
+    // Load custom models from config.toml. Keyed by ACCOUNT name (that is
+    // how `[providers.<name>].models` is written and how `list` reads it
+    // back), but tagged with the account's resolved vendor KIND.
+    for (name, pcfg) in &cfg.providers {
+        if pcfg.models.is_empty() {
+            continue;
+        }
+        let kind = kind_of(name, cfg);
+        registry
+            .set_custom(
+                name,
+                pcfg.models
+                    .iter()
+                    .map(|m| {
+                        let mut mi = make_model_info(&m.id, &kind);
+                        if let Some(cw) = m.context_window {
+                            mi.context_window = cw;
+                        }
+                        if let Some(mo) = m.max_output {
+                            mi.max_output_tokens = mo;
+                        }
+                        mi
+                    })
+                    .collect(),
+            )
+            .await;
+    }
+
+    // Load any persisted live caches — over the same name set `refresh`
+    // writes, or a named account's freshly-refreshed cache would be written
+    // and then never read back.
+    for p in &provider_names(cfg) {
+        if let Err(e) = registry.load_cache(p).await {
+            tracing::warn!(
+                provider = %p,
+                path = %cache_dir.join(format!("{p}.json")).display(),
+                error = %e,
+                "unreadable model cache; listing the provider as never fetched"
+            );
+        }
+    }
+    registry
+}
+
+/// Build a `ModelInfo` tagged with the vendor for `kind`.
+///
+/// Takes the resolved KIND, not the account name — `make_model_info(id,
+/// "oracle")` used to fall through to the `_` arm and label every custom
+/// openai-compatible model as `Anthropic`.
+fn make_model_info(id: &str, kind: &str) -> rupu_providers::ModelInfo {
+    let pid = match kind {
+        "anthropic" => ProviderId::Anthropic,
+        "openai" | "openai_codex" | "codex" => ProviderId::OpenaiCodex,
+        "gemini" | "google_gemini" => ProviderId::GoogleGeminiCli,
+        "copilot" | "github_copilot" => ProviderId::GithubCopilot,
+        "openai-compatible" => ProviderId::OpenaiCompatible,
+        _ => ProviderId::Anthropic,
+    };
+    rupu_providers::ModelInfo {
+        id: id.to_string(),
+        provider: pid,
+        context_window: 0,
+        max_output_tokens: 0,
+        capabilities: Vec::new(),
+        cost: rupu_providers::ModelCost::default(),
+        status: rupu_providers::ModelStatus::default(),
+    }
+}

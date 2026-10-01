@@ -80,8 +80,14 @@ reqwest-middleware.workspace = true
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
 [dev-dependencies]
 insta.workspace = true
+# `cmd::workflow`'s resume-vs-cancel test holds a run's `run.json.lock`
+# (an flock) from the test thread while the resume runs.
+rustix.workspace = true
 assert_fs.workspace = true
 assert_cmd = { workspace = true }
 predicates.workspace = true

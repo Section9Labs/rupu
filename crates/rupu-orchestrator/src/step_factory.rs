@@ -178,6 +178,10 @@ pub struct DefaultStepFactory {
     /// Artifact store + limits for recording findings; the per-step profile
     /// is resolved in `build_opts_for_step` and set on a clone of this.
     pub findings_base: rupu_coverage::FindingWriteOptions,
+    /// Model-limit discovery context (cache dir + `[providers.*].models`
+    /// overrides). Each step resolves the limits of ITS agent's own
+    /// provider/model through it (spec 2026-09-30 §6.1).
+    pub limits_ctx: rupu_runtime::model_limits::LimitsContext,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -314,8 +318,12 @@ impl StepFactory for DefaultStepFactory {
         // instead of failing with "unknown provider".
         let provider_name: String;
         let model: String;
-        let provider: Box<dyn rupu_providers::LlmProvider> = match load_err {
+        // False once `provider` is an error stub (the agent failed to load, or
+        // its provider failed to build): there is no model to ask about limits.
+        let mut provider_is_real = true;
+        let mut provider: Box<dyn rupu_providers::LlmProvider> = match load_err {
             Some(msg) => {
+                provider_is_real = false;
                 provider_name = "unresolved".to_string();
                 model = "-".to_string();
                 Box::new(agent_load_error_stub(msg))
@@ -361,13 +369,35 @@ impl StepFactory for DefaultStepFactory {
                 .await
                 {
                     Ok((_resolved_auth, p)) => p,
-                    Err(e) => Box::new(provider_build_error_stub(
-                        provider_name.clone(),
-                        model.clone(),
-                        e.to_string(),
-                    )),
+                    Err(e) => {
+                        provider_is_real = false;
+                        Box::new(provider_build_error_stub(
+                            provider_name.clone(),
+                            model.clone(),
+                            e.to_string(),
+                        ))
+                    }
                 }
             }
+        };
+
+        // Discover the step agent's real limits (agent pin → config → live
+        // model list → unknown). Computed while `spec` is still whole. An
+        // error stub (agent load or provider build failure) has no real
+        // provider to ask — asking it would only report a false "exposes no
+        // model limits" note in front of the error the run is about to raise —
+        // so it gets `unknown()`.
+        let limits = if !provider_is_real {
+            rupu_providers::model_limits::ModelLimits::unknown()
+        } else {
+            rupu_runtime::model_limits::resolve(
+                rupu_runtime::model_limits::LimitOverrides::from_spec(&spec),
+                &provider_name,
+                &model,
+                provider.as_mut(),
+                &self.limits_ctx,
+            )
+            .await
         };
 
         let agent_system_prompt = match self.system_prompt_suffix.as_deref() {
@@ -487,9 +517,7 @@ impl StepFactory for DefaultStepFactory {
             // When the workflow declares `concerns:`, every step uses it —
             // the agent frontmatter's `concerns:` is ignored for this run.
             concerns: resolve_step_concerns(self.workflow.concerns.clone(), spec.concerns),
-            max_tokens: spec
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            limits,
             // All steps of a workflow share the same target_id (keyed on the
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.
@@ -498,8 +526,6 @@ impl StepFactory for DefaultStepFactory {
             // FileTouchEvents are correctly attributed; the runner defaults
             // to "agent" when this is None.
             surface_tag: Some("workflow".to_string()),
-            context_window_tokens: spec.context_window_tokens,
-            compact_at_percent: spec.compact_at_percent,
             pause: None,
             codename: None,
         }
@@ -867,7 +893,7 @@ mod provider_build_error_stub_tests {
             model: "test-model".into(),
             system: None,
             messages: vec![],
-            max_tokens: 1,
+            max_tokens: Some(1),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1216,7 +1242,31 @@ steps:
     actions: []
 "#;
 
+    /// A limits context for tests that build a step through the REAL factory.
+    ///
+    /// These agents pin no provider, so they fall back to `anthropic`; on a
+    /// machine with a stored (or env) Anthropic credential the provider build
+    /// SUCCEEDS and limit discovery (spec 2026-09-30 §6.1) would then run a
+    /// live `GET /v1/models` with that credential. Seeding a FRESH (empty) v2
+    /// model-list cache for the fallback provider makes `resolve` read the
+    /// cache and never fetch, whatever credentials the machine has — no env
+    /// mutation needed. (Fresh = `fetched_at` now, inside the 1h TTL.)
+    fn hermetic_limits_ctx(global: &std::path::Path) -> rupu_runtime::model_limits::LimitsContext {
+        let cache_dir = global.join("cache/models");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("anthropic.json"),
+            format!(
+                r#"{{"schema":2,"fetched_at":"{}","models":[]}}"#,
+                chrono::Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+        rupu_runtime::model_limits::LimitsContext::for_cache_dir(cache_dir)
+    }
+
     fn factory(global: std::path::PathBuf) -> DefaultStepFactory {
+        let limits_ctx = hermetic_limits_ctx(&global);
         DefaultStepFactory {
             workflow: Workflow::parse(WF).expect("workflow must parse"),
             global,
@@ -1234,6 +1284,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
+            limits_ctx,
         }
     }
 
@@ -1245,6 +1296,52 @@ steps:
             "---\nname: ag\ntools: [issues.list, issues.create]\n---\nDo the thing.\n",
         )
         .unwrap();
+    }
+
+    /// A step whose provider cannot be built runs against an error stub. The
+    /// stub has no listing to ask, so it gets `ModelLimits::unknown()` with
+    /// no note: resolving it would only put a false "exposes no model
+    /// limits" in front of the build error the run is about to raise.
+    ///
+    /// `#[serial]`: `generate.rs`'s tests set `RUPU_MOCK_PROVIDER_SCRIPT`,
+    /// which would make the build succeed against the mock.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_provider_build_error_gets_unknown_limits_without_a_note() {
+        const WF_BAD_PROVIDER: &str = r#"
+name: w
+steps:
+  - id: s
+    agent: bad
+    prompt: p
+"#;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("bad.md"),
+            "---\nname: bad\nprovider: no-such-provider\n---\nDo the thing.\n",
+        )
+        .unwrap();
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(WF_BAD_PROVIDER).expect("workflow must parse");
+        let opts = f
+            .build_opts_for_step(
+                "s",
+                "bad",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            opts.limits,
+            rupu_providers::model_limits::ModelLimits::unknown()
+        );
+        assert_eq!(opts.limits.note, None);
     }
 
     #[tokio::test]
@@ -1801,7 +1898,11 @@ steps:
     actions: ["issues.get", "issues.list"]
 "#;
 
+    // `#[serial]`: `build_opts_for_step` builds the provider through the
+    // factory, which reads `RUPU_MOCK_PROVIDER_SCRIPT` — set by
+    // `generate.rs`'s tests in this same binary.
     #[tokio::test]
+    #[serial_test::serial]
     async fn declared_and_blocked_call_writes_the_correct_tool_audit_fields() {
         // `issues.list` IS declared (in `actions:`) and IS granted (agent's
         // `tools:`) — a normal, allowed call.
@@ -1824,6 +1925,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
+            limits_ctx: hermetic_limits_ctx(tmp.path()),
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -1851,7 +1953,11 @@ steps:
         assert_eq!(lines[0]["data"]["blocked"], false);
     }
 
+    // `#[serial]`: `build_opts_for_step` builds the provider through the
+    // factory, which reads `RUPU_MOCK_PROVIDER_SCRIPT` — set by
+    // `generate.rs`'s tests in this same binary.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_step_declaring_an_ungranted_tool_emits_granted_false() {
         // `issues.get` IS declared (in `actions:`) but the agent's `tools:`
         // grant (`[issues.list, issues.create]`) does NOT cover it — spec
@@ -1879,6 +1985,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
+            limits_ctx: hermetic_limits_ctx(tmp.path()),
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -1926,7 +2033,11 @@ steps:
     actions: ["scm.prs.get"]
 "#;
 
+    // `#[serial]`: `build_opts_for_step` builds the provider through the
+    // factory, which reads `RUPU_MOCK_PROVIDER_SCRIPT` — set by
+    // `generate.rs`'s tests in this same binary.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wildcard_granted_agent_reports_granted_true_not_a_naive_match_false() {
         // Regression for the naive-exact-match bug narrow_agent_tools
         // itself guards on the enforcement side (spec §2's rewrite): an
@@ -1958,6 +2069,7 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
+            limits_ctx: hermetic_limits_ctx(tmp.path()),
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
@@ -2158,11 +2270,22 @@ steps:
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
+            limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                tmp.path().join("cache/models"),
+            ),
         };
         // The account `acct-x` is declared as kind `openai` — a builtin
         // vendor, but a name the factory's dispatch `match` would never
         // recognize on its own.
         f.kinds.insert("acct-x".to_string(), "openai".to_string());
+
+        // Limit discovery (spec 2026-09-30 §6.1) asks the REAL provider for its
+        // model list when no fresh cache exists. Seed a fresh (empty) one so
+        // this test never reaches the network with its dummy credential.
+        let registry =
+            rupu_providers::ModelRegistry::with_cache_dir(tmp.path().join("cache/models"));
+        registry.set_live_cache("acct-x", Vec::new()).await;
+        registry.save_cache("acct-x").await.unwrap();
 
         let opts = f
             .build_opts_for_step(
@@ -2187,6 +2310,155 @@ steps:
             opts.provider.provider_id(),
             rupu_providers::ProviderId::OpenaiCodex,
             "a declared multi-account's kind did not reach the provider build"
+        );
+    }
+
+    const WF_LIMITS: &str = r#"
+name: w
+steps:
+  - id: pinned_step
+    agent: pinned
+    prompt: p
+  - id: missing_step
+    agent: no_such_agent
+    prompt: p
+"#;
+
+    fn limits_factory(tmp: &std::path::Path) -> DefaultStepFactory {
+        DefaultStepFactory {
+            workflow: Workflow::parse(WF_LIMITS).expect("workflow must parse"),
+            global: tmp.to_path_buf(),
+            project_root: None,
+            resolver: Arc::new(rupu_auth::KeychainResolver::new()),
+            mode_str: "bypass".to_string(),
+            mcp_registry: Arc::new(rupu_scm::Registry::empty()),
+            system_prompt_suffix: None,
+            dispatcher: None,
+            openai_compatible: std::collections::HashMap::new(),
+            provider_tuning: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
+            findings_base: rupu_coverage::FindingWriteOptions::default(),
+            limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                tmp.join("cache/models"),
+            ),
+        }
+    }
+
+    /// Spec 2026-09-30 §6.1: a workflow step resolves the limits of ITS
+    /// agent's provider/model through the runtime resolver — agent pins first,
+    /// then the live model list. Hermetic: a real (non-stub) Anthropic client
+    /// built from a temp-file credential store (no network at build), plus a
+    /// fresh seeded model-list cache so discovery never leaves the process.
+    #[tokio::test]
+    #[serial]
+    async fn a_step_resolves_its_agents_limits_from_pins_then_the_live_list() {
+        let _guard = ENV_LOCK.lock().await;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("pinned.md"),
+            "---\nname: pinned\nprovider: anthropic\nmodel: claude-test-1\n\
+             maxTokens: 1234\n---\nDo it.\n",
+        )
+        .unwrap();
+
+        let resolver = {
+            let _env = EnvVarGuard::set("RUPU_AUTH_FILE", &tmp.path().join("auth.json"));
+            let resolver = rupu_auth::KeychainResolver::new();
+            resolver
+                .store_named(
+                    "anthropic",
+                    rupu_providers::AuthMode::ApiKey,
+                    &rupu_auth::StoredCredential::api_key("dummy-key-for-limits-test"),
+                )
+                .await
+                .unwrap();
+            resolver
+        };
+        let mut f = limits_factory(tmp.path());
+        f.resolver = Arc::new(resolver);
+
+        let registry =
+            rupu_providers::ModelRegistry::with_cache_dir(tmp.path().join("cache/models"));
+        registry
+            .set_live_cache(
+                "anthropic",
+                vec![rupu_providers::ModelInfo {
+                    id: "claude-test-1".to_string(),
+                    provider: rupu_providers::ProviderId::Anthropic,
+                    context_window: 300_000,
+                    max_output_tokens: 50_000,
+                    capabilities: Vec::new(),
+                    cost: rupu_providers::ModelCost::default(),
+                    status: rupu_providers::ModelStatus::default(),
+                }],
+            )
+            .await;
+        registry.save_cache("anthropic").await.unwrap();
+
+        let opts = f
+            .build_opts_for_step(
+                "pinned_step",
+                "pinned",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+
+        use rupu_providers::model_limits::LimitSource;
+        let l = &opts.limits;
+        // Pinned by the agent...
+        assert_eq!(l.output.tokens, Some(1234));
+        assert!(matches!(l.output.source, LimitSource::Agent));
+        // ...and discovered for the field the agent left unpinned.
+        assert_eq!(l.input.tokens, Some(300_000));
+        assert!(
+            matches!(l.input.source, LimitSource::Live { .. }),
+            "an unpinned limit comes from the live list: {:?}",
+            l.input.source
+        );
+        assert_eq!(l.note, None);
+    }
+
+    /// A step whose agent file is missing gets a load-error stub provider:
+    /// there is no provider/model to ask, so its limits are plain unknown —
+    /// no discovery attempt against "unresolved", no misleading note.
+    #[tokio::test]
+    #[serial]
+    async fn a_step_whose_agent_fails_to_load_gets_unknown_limits() {
+        let _guard = ENV_LOCK.lock().await;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let f = limits_factory(tmp.path());
+
+        let opts = f
+            .build_opts_for_step(
+                "missing_step",
+                "no_such_agent",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+
+        assert_eq!(opts.provider_name, "unresolved");
+        assert_eq!(opts.limits.input.tokens, None);
+        assert_eq!(opts.limits.output.tokens, None);
+        assert_eq!(opts.limits.note, None);
+        assert!(
+            !tmp.path().join("cache/models").exists(),
+            "no model-list cache may be written for a stub provider"
         );
     }
 }
