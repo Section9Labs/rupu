@@ -39,7 +39,9 @@ pub struct Args {
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
-    /// Skip token streaming; receive the full response at once.
+    /// Don't render tokens as they arrive; show each response once it is
+    /// complete. The request still streams on the wire, so long responses
+    /// can't hit the request timeout.
     #[arg(long)]
     pub no_stream: bool,
     /// Control live output density (`focused` | `full`).

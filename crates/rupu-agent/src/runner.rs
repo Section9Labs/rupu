@@ -775,8 +775,11 @@ pub struct AgentRunOpts {
     /// Absolute turn index for the first turn in this run.
     pub turn_index_offset: u32,
     pub mode_str: String,
-    /// If true, skip token streaming and use `provider.send` for one-shot
-    /// completions. Default is false (streaming). Used by --no-stream.
+    /// If true, don't render tokens as they arrive and don't write
+    /// `AssistantDelta`/`ThinkingDelta` transcript events (the transcript keeps
+    /// its final-message-only shape). Display only: the request still streams
+    /// on the wire, so a long response cannot hit the HTTP request timeout and
+    /// the full output cap applies. Default is false. Used by --no-stream.
     pub no_stream: bool,
     /// If true, suppress stdout writes from the streaming code path.
     /// The provider's text deltas still flow into the JSONL transcript
@@ -1119,18 +1122,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).
-    let mut limits_notice = opts.limits.describe(&opts.provider_name, Utc::now());
-    if opts.no_stream && opts.limits.non_streaming_cap_applies() {
-        limits_notice.push_str(&format!(
-            "; output capped at {} for non-streaming requests",
-            rupu_providers::model_limits::group_thousands(
-                rupu_providers::model_limits::NON_STREAMING_MAX_TOKENS as u64
-            )
-        ));
-    }
     writer.write(&Event::Notice {
         kind: "model_limits".into(),
-        message: limits_notice,
+        message: opts.limits.describe(&opts.provider_name, Utc::now()),
     })?;
     writer.flush()?;
 
@@ -1326,10 +1320,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
                 messages: messages.clone(),
-                // Non-streaming requests clamp a discovered output cap so one
-                // response cannot outlive the HTTP timeout; an agent pin is
-                // honoured as-is (`ModelLimits::request_max_tokens`).
-                max_tokens: opts.limits.request_max_tokens(!opts.no_stream),
+                max_tokens: opts.limits.output.tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
                 trace_id: None,
@@ -1350,11 +1341,23 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
                 let step: CallStep = if opts.no_stream {
-                    // Race the one-shot completion against the pause token so a
-                    // pause takes effect immediately rather than only after the
-                    // provider returns.
+                    // `no_stream` only changes DISPLAY: the request still
+                    // streams on the wire, so a long response cannot hit the
+                    // HTTP request timeout and the discovered output cap needs
+                    // no clamping. The sink is quiet — it forwards each event
+                    // to `on_stream_event` (if set) but prints nothing and
+                    // writes no `AssistantDelta`/`ThinkingDelta`, so the
+                    // transcript keeps its final-message-only shape.
+                    let mut quiet = |ev: StreamEvent| {
+                        if let Some(cb) = opts.on_stream_event.as_ref() {
+                            cb(ev);
+                        }
+                    };
+                    // Race the stream against the pause token so a pause takes
+                    // effect immediately rather than only after the provider
+                    // returns; a dropped partial is never committed.
                     tokio::select! {
-                        r = opts.provider.send(&req) => match r {
+                        r = opts.provider.stream(&req, &mut quiet) => match r {
                             Ok(x) => CallStep::Ok(x),
                             Err(e) => CallStep::Err(e),
                         },

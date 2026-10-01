@@ -9,13 +9,6 @@ use serde::{Deserialize, Serialize};
 /// discovered, this is what goes on the wire (spec §6.3).
 pub const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 8192;
 
-/// Ceiling on the `max_tokens` of a non-streaming request. A non-streaming
-/// response is one HTTP exchange, so a discovered 64K–128K output cap would let
-/// a single generation outlive the HTTP total timeout — and the resulting error
-/// is retryable, so it would be re-sent and re-billed. An agent `maxTokens` pin
-/// is exempt: it is the operator's explicit choice.
-pub const NON_STREAMING_MAX_TOKENS: u32 = 16_384;
-
 /// Compaction percentage when the agent doesn't set `compactAtPercent`.
 pub const DEFAULT_COMPACT_AT_PERCENT: u8 = 80;
 
@@ -140,25 +133,6 @@ impl ModelLimits {
             _ => None,
         };
         Some(headroom.map_or(by_pct, |h| by_pct.min(h)))
-    }
-
-    /// The `max_tokens` a request should carry: the resolved output limit,
-    /// clamped to [`NON_STREAMING_MAX_TOKENS`] for a non-streaming request
-    /// unless the limit is an agent pin. `None` when the output is unknown (the
-    /// provider's own fallback applies).
-    pub fn request_max_tokens(&self, streaming: bool) -> Option<u32> {
-        let known = self.output.tokens?;
-        if streaming || self.output.source == LimitSource::Agent {
-            Some(known)
-        } else {
-            Some(known.min(NON_STREAMING_MAX_TOKENS))
-        }
-    }
-
-    /// Whether a non-streaming request would send a smaller `max_tokens` than
-    /// the resolved output limit (what [`Self::request_max_tokens`] clamps).
-    pub fn non_streaming_cap_applies(&self) -> bool {
-        self.request_max_tokens(false) != self.output.tokens
     }
 
     /// Neither limit has a source: nothing was pinned, configured, or
@@ -393,41 +367,6 @@ mod tests {
         assert_eq!(group_thousands(0), "0");
         assert_eq!(group_thousands(999), "999");
         assert_eq!(group_thousands(1_048_576), "1,048,576");
-    }
-
-    #[test]
-    fn non_streaming_cap_clamps_a_discovered_output_only() {
-        let live = LimitSource::Live {
-            fetched_at: at(12, 0),
-            stale: false,
-        };
-        let mut l = ModelLimits::unknown();
-        l.output = Limit::new(128_000, live.clone());
-        assert_eq!(
-            l.request_max_tokens(true),
-            Some(128_000),
-            "streaming: as-is"
-        );
-        assert_eq!(
-            l.request_max_tokens(false),
-            Some(NON_STREAMING_MAX_TOKENS),
-            "non-streaming: clamped"
-        );
-        assert!(l.non_streaming_cap_applies());
-
-        l.output = Limit::new(128_000, LimitSource::Config);
-        assert_eq!(l.request_max_tokens(false), Some(NON_STREAMING_MAX_TOKENS));
-
-        l.output = Limit::new(8_192, live);
-        assert_eq!(l.request_max_tokens(false), Some(8_192), "already below");
-        assert!(!l.non_streaming_cap_applies());
-
-        l.output = Limit::new(128_000, LimitSource::Agent);
-        assert_eq!(l.request_max_tokens(false), Some(128_000), "pin honoured");
-        assert!(!l.non_streaming_cap_applies());
-
-        assert_eq!(ModelLimits::unknown().request_max_tokens(false), None);
-        assert!(!ModelLimits::unknown().non_streaming_cap_applies());
     }
 
     #[test]

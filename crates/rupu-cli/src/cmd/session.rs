@@ -146,7 +146,9 @@ pub struct StartArgs {
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
-    /// Skip token streaming provider mode for every turn in this session.
+    /// Don't render tokens as they arrive, for every turn in this session. The
+    /// request still streams on the wire, so long responses can't hit the
+    /// request timeout.
     #[arg(long)]
     pub no_stream: bool,
     /// For repo targets: clone into this directory instead of `./<repo>/`.

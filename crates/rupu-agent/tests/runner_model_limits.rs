@@ -6,11 +6,14 @@
 use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
-use rupu_providers::types::{ContentBlock, LlmRequest, Message, Role, StopReason, Usage};
-use rupu_providers::LlmProvider;
+use rupu_providers::types::{
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
+};
+use rupu_providers::{LlmProvider, ProviderError, ProviderId};
 use rupu_tools::ToolContext;
 use rupu_transcript::{Event, JsonlReader};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn usage(input: u32, output: u32, cached: u32) -> Usage {
     Usage {
@@ -318,36 +321,48 @@ async fn overflow_with_a_max_that_does_not_lower_the_limit_still_compacts() {
     assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
 }
 
-/// Run one turn with the given limits and streaming mode; returns the
-/// captured request's `max_tokens` and the run-start `model_limits` notice.
-async fn first_request_cap_and_notice(
-    limits: ModelLimits,
-    no_stream: bool,
-) -> (Option<u32>, String) {
-    let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
-        text: "done".into(),
-        stop: StopReason::EndTurn,
-        input_tokens: 1,
-        output_tokens: 1,
-    }]);
-    let captured = provider.captured.clone();
-    let tmp = tempfile::tempdir().unwrap();
-    let transcript = tmp.path().join("run.jsonl");
-    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.no_stream = no_stream;
-    opts.suppress_stream_stdout = true;
-    opts.limits = limits;
-    run_agent(opts).await.unwrap();
-    let max_tokens = captured.lock().unwrap()[0].max_tokens;
-    let notice = notices(&transcript)
-        .into_iter()
-        .find(|(k, _)| k == "model_limits")
-        .map(|(_, m)| m)
-        .expect("model_limits notice");
-    (max_tokens, notice)
+/// A provider that can only stream: `send` fails loudly, `stream` emits a few
+/// events and returns a complete response. Every streamed request is captured.
+struct StreamOnlyProvider {
+    captured: Arc<Mutex<Vec<LlmRequest>>>,
 }
 
-const CAP_TEXT: &str = "output capped at 16,384 for non-streaming requests";
+#[async_trait::async_trait]
+impl LlmProvider for StreamOnlyProvider {
+    async fn send(&mut self, _req: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+        Err(ProviderError::Other(anyhow::anyhow!(
+            "send() must not be used: requests stream on the wire"
+        )))
+    }
+
+    async fn stream(
+        &mut self,
+        req: &LlmRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<LlmResponse, ProviderError> {
+        self.captured.lock().unwrap().push(req.clone());
+        on_event(StreamEvent::TextDelta("hel".into()));
+        on_event(StreamEvent::TextDelta("lo".into()));
+        on_event(StreamEvent::UsageSnapshot(usage(5, 2, 0)));
+        Ok(LlmResponse {
+            id: "stream-only".into(),
+            model: "mock-1".into(),
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: usage(5, 2, 0),
+        })
+    }
+
+    fn default_model(&self) -> &str {
+        "mock-1"
+    }
+
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Anthropic
+    }
+}
 
 fn discovered(input: u32, output: u32, src: LimitSource) -> ModelLimits {
     let mut l = ModelLimits::unknown();
@@ -356,11 +371,52 @@ fn discovered(input: u32, output: u32, src: LimitSource) -> ModelLimits {
     l
 }
 
-/// Non-streaming requests must not outlive the HTTP timeout: a discovered
-/// 128K output cap is clamped to `NON_STREAMING_MAX_TOKENS`, and the notice
-/// says so.
+fn assistant_delta_count(path: &std::path::Path) -> usize {
+    JsonlReader::iter(path)
+        .unwrap()
+        .filter(|e| matches!(e, Ok(Event::AssistantDelta { .. })))
+        .count()
+}
+
+/// Run one turn against a [`StreamOnlyProvider`]; returns the captured
+/// requests, the transcript path, the forwarded-event count and the run's
+/// `model_limits` notice.
+async fn run_stream_only(
+    limits: ModelLimits,
+    no_stream: bool,
+    tmp: &tempfile::TempDir,
+) -> (Vec<LlmRequest>, std::path::PathBuf, usize, String) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = StreamOnlyProvider {
+        captured: captured.clone(),
+    };
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), tmp, transcript.clone());
+    opts.no_stream = no_stream;
+    opts.suppress_stream_stdout = true;
+    opts.limits = limits;
+    let forwarded = Arc::new(AtomicUsize::new(0));
+    let counter = forwarded.clone();
+    opts.on_stream_event = Some(Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    run_agent(opts).await.expect("run completes");
+    let notice = notices(&transcript)
+        .into_iter()
+        .find(|(k, _)| k == "model_limits")
+        .map(|(_, m)| m)
+        .expect("model_limits notice");
+    let reqs = captured.lock().unwrap().clone();
+    (reqs, transcript, forwarded.load(Ordering::SeqCst), notice)
+}
+
+/// `no_stream` only changes display: the request still streams on the wire (so
+/// a long generation cannot hit the HTTP timeout) and carries the FULL
+/// discovered output cap — nothing is capped to dodge a timeout. The
+/// transcript keeps its non-streaming shape (no `AssistantDelta`), and the
+/// stream-event callback still sees every event.
 #[tokio::test]
-async fn non_streaming_clamps_a_discovered_output_cap() {
+async fn no_stream_streams_under_the_hood_and_sends_the_full_output_cap() {
     for src in [
         LimitSource::Config,
         LimitSource::Live {
@@ -368,52 +424,37 @@ async fn non_streaming_clamps_a_discovered_output_cap() {
             stale: false,
         },
     ] {
-        let (cap, notice) =
-            first_request_cap_and_notice(discovered(1_000_000, 128_000, src.clone()), true).await;
-        assert_eq!(cap, Some(16_384), "source {src:?}");
-        assert!(notice.contains(CAP_TEXT), "{notice}");
-        assert!(
-            notice.contains("output 128,000"),
-            "the notice still reports the discovered limit: {notice}"
+        let tmp = tempfile::tempdir().unwrap();
+        let (reqs, transcript, forwarded, notice) =
+            run_stream_only(discovered(1_000_000, 128_000, src.clone()), true, &tmp).await;
+        assert_eq!(reqs.len(), 1, "one streamed request, source {src:?}");
+        assert_eq!(reqs[0].max_tokens, Some(128_000), "source {src:?}");
+        assert_eq!(
+            assistant_delta_count(&transcript),
+            0,
+            "a --no-stream transcript has no AssistantDelta events"
         );
+        assert_eq!(forwarded, 3, "the quiet sink still forwards every event");
+        assert!(
+            !notice.contains("capped"),
+            "nothing is capped for non-streaming runs: {notice}"
+        );
+        assert!(notice.contains("output 128,000"), "{notice}");
     }
 }
 
-/// An agent `maxTokens` pin is the operator's explicit choice — honoured as-is
-/// even for a non-streaming request.
+/// Control for the test above: a streaming run over the same provider DOES
+/// write `AssistantDelta` events, so the zero count above is meaningful.
 #[tokio::test]
-async fn non_streaming_honours_an_agent_output_pin() {
-    let (cap, notice) =
-        first_request_cap_and_notice(ModelLimits::fixed(1_000_000, 100_000), true).await;
-    assert_eq!(cap, Some(100_000));
-    assert!(!notice.contains(CAP_TEXT), "{notice}");
-}
-
-/// Streaming requests send the discovered cap unchanged.
-#[tokio::test]
-async fn streaming_sends_the_full_discovered_output_cap() {
-    let (cap, notice) =
-        first_request_cap_and_notice(discovered(1_000_000, 128_000, LimitSource::Config), false)
-            .await;
-    assert_eq!(cap, Some(128_000));
-    assert!(!notice.contains(CAP_TEXT), "{notice}");
-}
-
-/// A discovered cap already under the non-streaming ceiling is not touched,
-/// and the notice does not claim a cap that did not apply.
-#[tokio::test]
-async fn non_streaming_leaves_a_small_discovered_cap_alone() {
-    let (cap, notice) =
-        first_request_cap_and_notice(discovered(200_000, 8_192, LimitSource::Config), true).await;
-    assert_eq!(cap, Some(8_192));
-    assert!(!notice.contains(CAP_TEXT), "{notice}");
-}
-
-/// An unknown output stays `None` on the wire (the provider's own handling
-/// applies); no cap text.
-#[tokio::test]
-async fn non_streaming_unknown_output_stays_none() {
-    let (cap, notice) = first_request_cap_and_notice(ModelLimits::unknown(), true).await;
-    assert_eq!(cap, None);
-    assert!(!notice.contains(CAP_TEXT), "{notice}");
+async fn streaming_run_writes_assistant_deltas() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (reqs, transcript, forwarded, _) = run_stream_only(
+        discovered(1_000_000, 128_000, LimitSource::Config),
+        false,
+        &tmp,
+    )
+    .await;
+    assert_eq!(reqs[0].max_tokens, Some(128_000));
+    assert_eq!(assistant_delta_count(&transcript), 2, "\"hel\" + \"lo\"");
+    assert_eq!(forwarded, 3);
 }

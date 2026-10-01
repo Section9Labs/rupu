@@ -1,16 +1,17 @@
 //! `rupu run` discovers the model's real limits and sends them (spec
 //! 2026-09-30 §6.1). The httpmock server plays Anthropic: it serves the model
 //! listing (with `max_tokens`) and accepts the messages request only when it
-//! carries the expected cap. The runs here pass `--no-stream`, so a discovered
-//! output cap above `NON_STREAMING_MAX_TOKENS` (16,384) goes out clamped.
+//! carries the discovered cap.
+//!
+//! The run passes `--no-stream`, which only changes display: the request still
+//! streams on the wire, so the mock serves an SSE body and the full discovered
+//! cap goes out (nothing is capped to dodge an HTTP timeout).
 
 use assert_cmd::Command;
 use httpmock::prelude::*;
 
-/// Run `rupu run probe --no-stream` against a mocked Anthropic that lists the
-/// model with `discovered_max` output tokens and only accepts a messages
-/// request carrying `wire_max_tokens`. Returns the run's transcript text.
-fn run_probe(discovered_max: u32, wire_max_tokens: u32) -> String {
+#[test]
+fn rupu_run_sends_the_discovered_output_cap_and_announces_limits() {
     let server = MockServer::start();
     let list = server.mock(|when, then| {
         when.method(GET).path("/v1/models");
@@ -19,7 +20,7 @@ fn run_probe(discovered_max: u32, wire_max_tokens: u32) -> String {
                 "id": "claude-test-1",
                 "type": "model",
                 "max_input_tokens": 300000,
-                "max_tokens": discovered_max
+                "max_tokens": 50000
             }],
             "has_more": false
         }));
@@ -27,16 +28,28 @@ fn run_probe(discovered_max: u32, wire_max_tokens: u32) -> String {
     let msgs = server.mock(|when, then| {
         when.method(POST)
             .path("/v1/messages")
-            .body_contains(format!("\"max_tokens\":{wire_max_tokens}"));
-        then.status(200).json_body(serde_json::json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-test-1",
-            "content": [{ "type": "text", "text": "ok" }],
-            "stop_reason": "end_turn",
-            "usage": { "input_tokens": 5, "output_tokens": 1 }
-        }));
+            .body_contains("\"max_tokens\":50000")
+            .body_contains("\"stream\":true");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",",
+                "\"model\":\"claude-test-1\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+                "\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ));
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -66,24 +79,17 @@ fn run_probe(discovered_max: u32, wire_max_tokens: u32) -> String {
     list.assert();
     msgs.assert();
 
-    std::fs::read_dir(home.join("transcripts"))
+    // The run-start notice states what was resolved and where it came from.
+    let transcripts = std::fs::read_dir(home.join("transcripts"))
         .unwrap()
         .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
-        .collect::<String>()
-}
-
-#[test]
-fn rupu_run_sends_the_discovered_output_cap_and_announces_limits() {
-    // 12,000 is under the non-streaming ceiling, so it goes out as discovered.
-    let transcripts = run_probe(12_000, 12_000);
-
-    // The run-start notice states what was resolved and where it came from.
+        .collect::<String>();
     assert!(
         transcripts.contains("\"kind\":\"model_limits\""),
         "no model_limits notice in the transcript: {transcripts}"
     );
     assert!(
-        transcripts.contains("input 300,000 · output 12,000"),
+        transcripts.contains("input 300,000 · output 50,000"),
         "notice should state the discovered limits: {transcripts}"
     );
     assert!(
@@ -91,23 +97,13 @@ fn rupu_run_sends_the_discovered_output_cap_and_announces_limits() {
         "notice should name the limit source: {transcripts}"
     );
     assert!(
-        !transcripts.contains("for non-streaming requests"),
-        "no cap applied, so the notice must not claim one: {transcripts}"
+        !transcripts.contains("capped"),
+        "nothing is capped for a --no-stream run: {transcripts}"
     );
-}
-
-#[test]
-fn rupu_run_no_stream_clamps_a_large_discovered_output_cap() {
-    // 50,000 is discovered, but a non-streaming request carries 16,384 and the
-    // notice says so while still reporting the discovered limit.
-    let transcripts = run_probe(50_000, 16_384);
-
+    // `--no-stream` keeps the transcript's final-message-only shape even
+    // though the request streamed.
     assert!(
-        transcripts.contains("input 300,000 · output 50,000"),
-        "notice should still state the discovered limits: {transcripts}"
-    );
-    assert!(
-        transcripts.contains("output capped at 16,384 for non-streaming requests"),
-        "notice should say the non-streaming cap applied: {transcripts}"
+        !transcripts.contains("\"type\":\"assistant_delta\""),
+        "a --no-stream transcript has no assistant_delta events: {transcripts}"
     );
 }
