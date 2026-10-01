@@ -7,7 +7,7 @@
 //!
 //! ## Honest acknowledgements
 //!
-//! We currently impersonate two existing first-party CLI clients:
+//! We impersonate existing first-party CLI clients:
 //!
 //! - Anthropic: Claude Code's `9d1c250a-...` client_id; consent
 //!   screen reads "Claude Code wants access ...". Endpoints and
@@ -19,10 +19,14 @@
 //!   range (1455 / 1457) and `/auth/callback` path are pinned because
 //!   they're allowlisted on OpenAI's Hydra registration for that
 //!   client.
+//! - GitLab: glab's gitlab.com application (`oauth::gitlab`); port
+//!   7171, `/auth/redirect` and the scope set are its registration. A
+//!   self-managed instance uses its own application, configured per
+//!   account.
 //!
-//! Long-term we should register our own OAuth clients for rupu (see
-//! `TODO.md`). Until then, mirroring the upstream CLI's request shape
-//! is necessary for the flow to succeed.
+//! Vendors don't approve third-party rupu-branded clients for
+//! subscriber inference, so mirroring the upstream CLI's request shape
+//! is the durable answer, not a stopgap (TODO.md's Re-MITM section).
 
 use crate::backend::ProviderId;
 
@@ -86,6 +90,23 @@ pub struct ProviderOAuth {
     /// server seems to want it.
     pub include_state_in_token_body: bool,
 }
+
+/// An OAuth application chosen at login rather than built in: a GitLab
+/// account's configured application, or its self-managed instance's
+/// endpoints ([`crate::oauth::gitlab::oauth_client`]). The login records
+/// `client_id` and `token_url` on the credential, so its refreshes go to
+/// the application and endpoint that issued it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthClient {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+}
+
+/// The `extra` key a credential records its [`OAuthClient::client_id`] under.
+pub const EXTRA_CLIENT_ID: &str = "oauth_client_id";
+/// The `extra` key a credential records its [`OAuthClient::token_url`] under.
+pub const EXTRA_TOKEN_URL: &str = "oauth_token_url";
 
 pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
     match p {
@@ -263,18 +284,21 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
         }),
         ProviderId::Gitlab => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
-            // TODO(rupu-specific OAuth client): register a real gitlab.com
-            // OAuth app and replace this placeholder. See TODO.md "Register
-            // rupu-specific OAuth clients".
-            client_id: "rupu-gitlab-pkce-placeholder",
+            // GitLab's own CLI's gitlab.com application (a public PKCE
+            // client, no secret) — the same call GitHub makes with `gh`'s.
+            // Its redirect URI, port and scope set are glab's registration:
+            // GitLab checks the redirect URI exactly and refuses a scope the
+            // application wasn't registered for. A self-managed instance has
+            // its own application: `crate::oauth::gitlab::oauth_client`.
+            client_id: crate::oauth::gitlab::GITLAB_COM_CLIENT_ID,
             client_secret: None,
             authorize_url: "https://gitlab.com/oauth/authorize",
             token_url: "https://gitlab.com/oauth/token",
             device_url: None,
-            scopes: &["api", "read_user", "read_repository", "write_repository"],
-            redirect_path: "/callback",
+            scopes: crate::oauth::gitlab::SCOPES,
+            redirect_path: crate::oauth::gitlab::REDIRECT_PATH,
             redirect_host: "localhost",
-            fixed_ports: None,
+            fixed_ports: Some(&[crate::oauth::gitlab::REDIRECT_PORT]),
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
             refresh_body_format: TokenBodyFormat::Form,
@@ -403,18 +427,45 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_metadata_is_browser_callback_with_full_scope_set() {
+    fn gitlab_metadata_is_browser_callback_against_gitlab_com() {
         let p = provider_oauth(crate::backend::ProviderId::Gitlab)
             .expect("gitlab oauth config present");
         assert_eq!(p.authorize_url, "https://gitlab.com/oauth/authorize");
         assert_eq!(p.token_url, "https://gitlab.com/oauth/token");
         assert_eq!(p.flow, OAuthFlow::Callback);
-        assert!(p.scopes.contains(&"api"));
-        assert!(p.scopes.contains(&"read_repository"));
-        assert!(p.scopes.contains(&"write_repository"));
-        assert!(p.scopes.contains(&"read_user"));
+        assert_eq!(p.client_secret, None, "a public PKCE client");
         assert_eq!(p.token_body_format, TokenBodyFormat::Form);
+        assert_eq!(p.refresh_body_format, TokenBodyFormat::Form);
         assert!(!p.state_is_verifier);
         assert!(!p.include_state_in_token_body);
+    }
+
+    /// GitLab's own CLI's gitlab.com application (gitlab-org/cli
+    /// `internal/glinstance/host.go` `DefaultClientID`,
+    /// `internal/oauth2/config.go`). GitLab checks the redirect URI exactly
+    /// against the application's registration, and a scope outside its
+    /// registered set fails the authorize request with `invalid_scope`, so
+    /// all three must match what glab registered.
+    #[test]
+    fn gitlab_uses_glab_s_registered_gitlab_com_application() {
+        let p = provider_oauth(crate::backend::ProviderId::Gitlab)
+            .expect("gitlab oauth config present");
+        assert_eq!(
+            p.client_id,
+            "41d48f9422ebd655dd9cf2947d6979681dfaddc6d0c56f7628f6ada59559af1e"
+        );
+        assert_eq!(p.redirect_host, "localhost");
+        assert_eq!(p.fixed_ports, Some(&[7171u16][..]));
+        assert_eq!(p.redirect_path, "/auth/redirect");
+        let registered = ["openid", "profile", "read_user", "write_repository", "api"];
+        for scope in p.scopes {
+            assert!(
+                registered.contains(scope),
+                "{scope} is outside glab's registered scopes"
+            );
+        }
+        for needed in ["api", "read_user", "write_repository"] {
+            assert!(p.scopes.contains(&needed), "{needed} missing");
+        }
     }
 }

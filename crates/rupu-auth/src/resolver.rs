@@ -659,6 +659,20 @@ impl KeychainResolver {
             }
             _ => (oauth.client_id, oauth.client_secret),
         };
+        // A credential that recorded the application it was issued to (a
+        // login with a chosen application: a GitLab account's configured
+        // one, or a self-managed instance's — `oauth::callback::
+        // run_with_client`) refreshes as that public client, at that
+        // endpoint, which the built-in endpoints' test seam never
+        // redirects.
+        let recorded = |key: &str| match &sc.credentials {
+            AuthCredentials::OAuth { extra, .. } => extra.get(key).and_then(|v| v.as_str()),
+            AuthCredentials::ApiKey { .. } => None,
+        };
+        let (client_id, client_secret) = match recorded(crate::oauth::providers::EXTRA_CLIENT_ID) {
+            Some(id) => (id, None),
+            None => (client_id, client_secret),
+        };
         let mut params: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -667,8 +681,11 @@ impl KeychainResolver {
         if let Some(secret) = client_secret {
             params.push(("client_secret", secret));
         }
-        let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
-            .unwrap_or_else(|_| oauth.token_url.to_string());
+        let token_url = match recorded(crate::oauth::providers::EXTRA_TOKEN_URL) {
+            Some(url) => url.to_string(),
+            None => std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
+                .unwrap_or_else(|_| oauth.token_url.to_string()),
+        };
         // Deliberately `NullSink`, not a stopgap: matt's scope call for this
         // plan was explicit — "I do not care about update or login" — and a
         // token refresh is login traffic even when it fires mid-run (a
