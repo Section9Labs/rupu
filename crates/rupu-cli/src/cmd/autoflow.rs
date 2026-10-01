@@ -40,9 +40,9 @@ use rupu_orchestrator::{
     RunStore, StepKind, StepResultRecord, Workflow, WorkflowOutputContract,
 };
 use rupu_runtime::{
-    AutoflowCycleEvent, AutoflowCycleRecord, AutoflowHistoryEventRecord, AutoflowHistoryStore,
-    RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
-    WakeSource, WakeStore, WakeStoreError,
+    AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryEventRecord,
+    AutoflowHistoryStore, RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind,
+    WakeEvent, WakeRecord, WakeSource, WakeStore, WakeStoreError,
 };
 use rupu_scm::{
     EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Pr, PrFilter,
@@ -9466,7 +9466,9 @@ fn visible_autoflows() -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
         )?;
     }
 
-    for resolved in discover_tick_autoflows(&global, &repo_store)? {
+    // A listing, not a tick: the skip-past errors were logged by discovery
+    // and there is no cycle here to record them on.
+    for resolved in discover_tick_autoflows(&global, &repo_store, &mut Vec::new())? {
         let key = visible_autoflow_key(
             Some(&resolved.repo_ref),
             &resolved.scope,
@@ -9546,9 +9548,27 @@ fn visible_autoflow_key(repo_ref: Option<&str>, scope: &str, path: &Path) -> Str
     format!("{}|{}|{}", repo_ref.unwrap_or("-"), scope, path.display())
 }
 
+/// A `cycle_failed` event for an error a tick logged and continued past
+/// (an unreachable source, a failed poll, a claim it could not clean up).
+/// The tick records it on its cycle so that cycle is kept — an idle cycle
+/// is not persisted (`AutoflowCycleRecord::is_idle`) — and the error shows
+/// in `autoflow monitor` / `autoflow history` and the CP's autoflow feed,
+/// not only in the daemon's log. Callers fill in the source / repo /
+/// workflow / issue the error concerns.
+pub(crate) fn tick_error(detail: String) -> AutoflowCycleEvent {
+    AutoflowCycleEvent {
+        kind: AutoflowCycleEventKind::CycleFailed,
+        detail: Some(detail),
+        ..Default::default()
+    }
+}
+
+/// Every autoflow workflow a tick should consider. Errors it skips past are
+/// pushed onto `errors` as [`tick_error`] events (logged as well).
 pub(crate) fn discover_tick_autoflows(
     global: &Path,
     repo_store: &RepoRegistryStore,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<Vec<ResolvedAutoflowWorkflow>> {
     let mut out = Vec::new();
     let global_cfg = resolve_config(global, None)?;
@@ -9573,6 +9593,12 @@ pub(crate) fn discover_tick_autoflows(
                     repo_ref,
                     "skipping global autoflows because repo is not tracked"
                 );
+                errors.push(AutoflowCycleEvent {
+                    repo_ref: Some(repo_ref),
+                    ..tick_error(
+                        "skipping global autoflows: [autoflow].repo is not a tracked repo".into(),
+                    )
+                });
             }
         }
     }
@@ -9617,13 +9643,16 @@ pub(crate) fn discover_tick_autoflows(
     Ok(out)
 }
 
+/// Poll the wake sources due this tick and gather the wakes now due. Errors
+/// it skips past are pushed onto `errors` as [`tick_error`] events.
 pub(crate) async fn collect_wake_hints(
     global: &Path,
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<WakeHints> {
     let store = WakeStore::new(paths::autoflow_wakes_dir(global));
-    enqueue_polled_wakes(global, discovered, resolver).await?;
+    enqueue_polled_wakes(global, discovered, resolver, errors).await?;
     let mut wake_hints = WakeHints::default();
     let repo_refs = wake_enabled_repo_refs(discovered)?;
     if repo_refs.is_empty() {
@@ -9659,6 +9688,7 @@ async fn enqueue_polled_wakes(
     global: &Path,
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<()> {
     let cursors_root = paths::autoflow_event_cursors_dir(global);
     paths::ensure_dir(&cursors_root)?;
@@ -9669,9 +9699,19 @@ async fn enqueue_polled_wakes(
         if resolved.autoflow()?.wake_on.is_empty() {
             continue;
         }
-        let Ok(source_ref) = resolved_source_ref_text(resolved) else {
-            warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, "invalid autoflow source; skipping wake polling");
-            continue;
+        let source_ref = match resolved_source_ref_text(resolved) {
+            Ok(source_ref) => source_ref,
+            Err(err) => {
+                warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, "invalid autoflow source; skipping wake polling");
+                errors.push(AutoflowCycleEvent {
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "invalid autoflow source; skipping wake polling: {err}"
+                    ))
+                });
+                continue;
+            }
         };
         workflows_by_source
             .entry(source_ref)
@@ -9689,9 +9729,16 @@ async fn enqueue_polled_wakes(
         }) else {
             continue;
         };
-        let Ok(event_source) = source_ref.parse::<EventSourceRef>() else {
-            warn!(source_ref, "invalid autoflow source for wake polling");
-            continue;
+        let event_source = match source_ref.parse::<EventSourceRef>() {
+            Ok(event_source) => event_source,
+            Err(err) => {
+                warn!(source_ref, "invalid autoflow source for wake polling");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.clone()),
+                    ..tick_error(format!("invalid autoflow source for wake polling: {err}"))
+                });
+                continue;
+            }
         };
         let last_polled_file = autoflow_last_polled_at_path(&cursors_root, &event_source);
         match autoflow_poll_source_due(source, &last_polled_file, chrono::Utc::now()) {
@@ -9699,6 +9746,12 @@ async fn enqueue_polled_wakes(
             Ok(false) => continue,
             Err(err) => {
                 warn!(source_ref, error = %err, "invalid autoflow poll interval; polling anyway");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.clone()),
+                    ..tick_error(format!(
+                        "invalid autoflow poll interval; polling anyway: {err}"
+                    ))
+                });
             }
         }
         let registry = Arc::new(
@@ -9725,10 +9778,20 @@ async fn enqueue_polled_wakes(
                     source_ref,
                     "no event connector configured for autoflow wake polling"
                 );
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.clone()),
+                    ..tick_error("no event connector configured for autoflow wake polling".into())
+                });
                 continue;
             }
             Err(err) => {
                 warn!(source_ref, error = %err, "account resolution failed for autoflow wake polling; skipping");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.clone()),
+                    ..tick_error(format!(
+                        "account resolution failed for autoflow wake polling: {err}"
+                    ))
+                });
                 continue;
             }
         };
@@ -9742,6 +9805,10 @@ async fn enqueue_polled_wakes(
             Ok(result) => result,
             Err(err) => {
                 warn!(source_ref, error = %err, "failed to poll autoflow wake events");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.clone()),
+                    ..tick_error(format!("failed to poll autoflow wake events: {err}"))
+                });
                 continue;
             }
         };
@@ -9751,6 +9818,12 @@ async fn enqueue_polled_wakes(
                 error = %err,
                 "failed to persist autoflow wake cursor; events may be replayed on next tick"
             );
+            errors.push(AutoflowCycleEvent {
+                source_ref: Some(source_ref.clone()),
+                ..tick_error(format!(
+                    "failed to persist autoflow wake cursor; events may be replayed on next tick: {err}"
+                ))
+            });
         }
         if let Err(err) = write_last_polled_at(&last_polled_file, chrono::Utc::now()) {
             warn!(
@@ -9758,6 +9831,12 @@ async fn enqueue_polled_wakes(
                 error = %err,
                 "failed to persist autoflow last-polled timestamp; source may poll early next tick"
             );
+            errors.push(AutoflowCycleEvent {
+                source_ref: Some(source_ref.clone()),
+                ..tick_error(format!(
+                    "failed to persist autoflow last-polled timestamp; source may poll early next tick: {err}"
+                ))
+            });
         }
         let bound_repo_refs = workflows
             .iter()
@@ -9771,6 +9850,13 @@ async fn enqueue_polled_wakes(
                         Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
                         Err(err) => {
                             warn!(repo_ref, source_ref, error = %err, "failed to enqueue polled autoflow wake");
+                            errors.push(AutoflowCycleEvent {
+                                repo_ref: Some(repo_ref.clone()),
+                                source_ref: Some(source_ref.clone()),
+                                ..tick_error(format!(
+                                    "failed to enqueue polled autoflow wake: {err}"
+                                ))
+                            });
                         }
                     }
                 }
@@ -9794,9 +9880,12 @@ fn wake_enabled_repo_refs(
     Ok(repo_refs)
 }
 
+/// The open issues each issue autoflow in `discovered` selects. Errors it
+/// skips past are pushed onto `errors` as [`tick_error`] events.
 pub(crate) async fn collect_issue_matches(
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<Vec<IssueMatch>> {
     let mut out = Vec::new();
     for resolved in discovered {
@@ -9810,6 +9899,13 @@ pub(crate) async fn collect_issue_matches(
             Ok(source_ref) => source_ref,
             Err(err) => {
                 warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, error = %err, "skipping autoflow because source resolution failed");
+                errors.push(AutoflowCycleEvent {
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "skipping autoflow because source resolution failed: {err}"
+                    ))
+                });
                 continue;
             }
         };
@@ -9832,6 +9928,14 @@ pub(crate) async fn collect_issue_matches(
             Ok((_account, conn)) => conn,
             Err(err) => {
                 warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping autoflow because no issue account resolved");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.to_string()),
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "skipping autoflow because no issue account resolved: {err}"
+                    ))
+                });
                 continue;
             }
         };
@@ -9841,6 +9945,14 @@ pub(crate) async fn collect_issue_matches(
             Ok(issues) => issues,
             Err(err) => {
                 warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping autoflow because issue listing failed");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.to_string()),
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "skipping autoflow because issue listing failed: {err}"
+                    ))
+                });
                 continue;
             }
         };
@@ -9857,13 +9969,20 @@ pub(crate) async fn collect_issue_matches(
                 .map(|(_account, conn)| conn),
             None => None,
         };
+        let first_error = errors.len();
         issues = filter_issues_by_author_allowlist(
             repo_connector.as_deref(),
             repo_ref.as_ref(),
             autoflow,
             issues,
+            errors,
         )
         .await;
+        for error in &mut errors[first_error..] {
+            error.source_ref = Some(source_ref.to_string());
+            error.repo_ref = Some(resolved.repo_ref.clone());
+            error.workflow = Some(resolved.name.clone());
+        }
 
         issues.sort_by_key(|issue| issue.r.number);
         if let Some(limit) = autoflow.selector.limit {
@@ -9902,6 +10021,7 @@ async fn filter_issues_by_author_allowlist(
     repo: Option<&RepoRef>,
     autoflow: &rupu_orchestrator::Autoflow,
     issues: Vec<Issue>,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> Vec<Issue> {
     let selector = &autoflow.selector;
     if selector.authors.is_empty() && selector.authors_from.is_none() {
@@ -9934,6 +10054,10 @@ async fn filter_issues_by_author_allowlist(
                                     error = %err,
                                     "is_collaborator check failed; treating issue author as not allowed (fail-closed)"
                                 );
+                                errors.push(tick_error(format!(
+                                    "is_collaborator check for `{}` failed; treating them as not allowed (fail-closed): {err}",
+                                    issue.author
+                                )));
                                 false
                             }
                         }
@@ -9947,6 +10071,10 @@ async fn filter_issues_by_author_allowlist(
                             author = %issue.author,
                             "no repo connector available to verify issue author's collaborator status; treating as not allowed (fail-closed)"
                         );
+                        errors.push(tick_error(format!(
+                            "no repo connector available to verify `{}`'s collaborator status; treating them as not allowed (fail-closed)",
+                            issue.author
+                        )));
                         false
                     }
                 };
@@ -10474,10 +10602,13 @@ impl AutoflowWinner {
 /// claimed (dedup by head SHA). Returns candidates for the shared reconcile
 /// loop; claiming + dispatch happen in [`execute_autoflow_cycle`]. The PR
 /// analogue of [`collect_issue_matches`].
+/// The open PRs each pull-request autoflow in `discovered` selects. Errors
+/// it skips past are pushed onto `errors` as [`tick_error`] events.
 pub(crate) async fn collect_pr_matches(
     discovered: &[ResolvedAutoflowWorkflow],
     claim_store: &AutoflowClaimStore,
     resolver: &dyn CredentialResolver,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<Vec<PrMatch>> {
     let mut out = Vec::new();
     for resolved in discovered {
@@ -10489,6 +10620,13 @@ pub(crate) async fn collect_pr_matches(
             Ok(source_ref) => source_ref,
             Err(err) => {
                 warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, error = %err, "skipping PR autoflow because source resolution failed");
+                errors.push(AutoflowCycleEvent {
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "skipping PR autoflow because source resolution failed: {err}"
+                    ))
+                });
                 continue;
             }
         };
@@ -10496,6 +10634,15 @@ pub(crate) async fn collect_pr_matches(
             EventSourceRef::Repo { repo } => repo,
             EventSourceRef::TrackerProject { .. } => {
                 warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, "pull_request autoflow source is a tracker project, not a repo; skipping");
+                errors.push(AutoflowCycleEvent {
+                    source_ref: Some(source_ref.to_string()),
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(
+                        "pull_request autoflow source is a tracker project, not a repo; skipping"
+                            .into(),
+                    )
+                });
                 continue;
             }
         };
@@ -10507,15 +10654,34 @@ pub(crate) async fn collect_pr_matches(
             Ok((_account, conn)) => conn,
             Err(err) => {
                 warn!(source = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping PR autoflow because no repo account resolved");
+                errors.push(AutoflowCycleEvent {
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "skipping PR autoflow because no repo account resolved: {err}"
+                    ))
+                });
                 continue;
             }
         };
-        let eligible = match select_eligible_prs(connector.as_ref(), claim_store, autoflow, &repo)
-            .await
-        {
+        let first_error = errors.len();
+        let selected =
+            select_eligible_prs(connector.as_ref(), claim_store, autoflow, &repo, errors).await;
+        for error in &mut errors[first_error..] {
+            error.repo_ref = Some(resolved.repo_ref.clone());
+            error.workflow = Some(resolved.name.clone());
+        }
+        let eligible = match selected {
             Ok(eligible) => eligible,
             Err(err) => {
                 warn!(source = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping PR autoflow because PR selection failed");
+                errors.push(AutoflowCycleEvent {
+                    repo_ref: Some(resolved.repo_ref.clone()),
+                    workflow: Some(resolved.name.clone()),
+                    ..tick_error(format!(
+                        "skipping PR autoflow because PR selection failed: {err}"
+                    ))
+                });
                 continue;
             }
         };
@@ -10536,11 +10702,16 @@ pub(crate) async fn collect_pr_matches(
 /// fail-closed on error), skip already-claimed `(repo, pr, head_sha)`, and fetch
 /// the diff for each survivor (leaving a PR unclaimed if the diff fetch fails).
 /// Unit-testable with a fake connector + temp-dir claim store.
+///
+/// The errors it continues past (a failed `is_collaborator` check, a failed
+/// `needs-human` label, a failed diff fetch) are pushed onto `errors` as
+/// [`tick_error`] events.
 pub(crate) async fn select_eligible_prs(
     connector: &dyn RepoConnector,
     claim_store: &AutoflowClaimStore,
     autoflow: &rupu_orchestrator::Autoflow,
     repo: &RepoRef,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<Vec<EligiblePr>> {
     use anyhow::Context as _;
 
@@ -10599,6 +10770,10 @@ pub(crate) async fn select_eligible_prs(
                             error = %err,
                             "is_collaborator check failed; treating author as not allowed (fail-closed)"
                         );
+                        errors.push(tick_error(format!(
+                            "is_collaborator check for `{}` failed; treating them as not allowed (fail-closed): {err}",
+                            pr.author
+                        )));
                         false
                     }
                 };
@@ -10624,6 +10799,10 @@ pub(crate) async fn select_eligible_prs(
                         error = %err,
                         "on_skip label_needs_human failed; skipping PR anyway"
                     );
+                    errors.push(tick_error(format!(
+                        "on_skip label_needs_human failed for PR #{}; skipping it anyway: {err}",
+                        pr.r.number
+                    )));
                 }
             }
             continue;
@@ -10648,6 +10827,10 @@ pub(crate) async fn select_eligible_prs(
                     error = %err,
                     "diff_pr failed; leaving PR unclaimed to retry next tick"
                 );
+                errors.push(tick_error(format!(
+                    "diff_pr failed for PR #{}; leaving it unclaimed to retry next tick: {err}",
+                    pr.r.number
+                )));
                 continue;
             }
         };
@@ -11922,7 +12105,7 @@ fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Valu
     Ok(value)
 }
 
-fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<Config> {
+pub(crate) fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<Config> {
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.map(|root| root.join(".rupu/config.toml"));
     Ok(rupu_config::layer_files_locked(
@@ -11931,12 +12114,16 @@ fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<
     )?)
 }
 
+/// Delete terminal claims (and their worktrees) past `[autoflow].cleanup_after`.
+/// A claim it fails to clean up is pushed onto `errors` as a [`tick_error`]
+/// event and retried next tick.
 pub(crate) fn cleanup_terminal_claims(
     global: &Path,
     repo_store: &RepoRegistryStore,
     claim_store: &AutoflowClaimStore,
     now: chrono::DateTime<chrono::Utc>,
     repo_filter: Option<&str>,
+    errors: &mut Vec<AutoflowCycleEvent>,
 ) -> anyhow::Result<usize> {
     let mut cleaned = 0usize;
     for claim in claim_store.list()? {
@@ -11957,12 +12144,19 @@ pub(crate) fn cleanup_terminal_claims(
                 claim_store.delete(&claim.issue_ref)?;
                 cleaned += 1;
             }
-            Err(err) => warn!(
-                issue_ref = %claim.issue_ref,
-                repo_ref = %claim.repo_ref,
-                error = %err,
-                "failed to cleanup terminal autoflow claim"
-            ),
+            Err(err) => {
+                warn!(
+                    issue_ref = %claim.issue_ref,
+                    repo_ref = %claim.repo_ref,
+                    error = %err,
+                    "failed to cleanup terminal autoflow claim"
+                );
+                errors.push(AutoflowCycleEvent {
+                    issue_ref: Some(claim.issue_ref.clone()),
+                    repo_ref: Some(claim.repo_ref.clone()),
+                    ..tick_error(format!("failed to cleanup terminal autoflow claim: {err}"))
+                });
+            }
         }
     }
     Ok(cleaned)
@@ -15518,6 +15712,181 @@ steps:
             .contains("issue-123"));
     }
 
+    /// An idle tick (no tracked repos, nothing to do) persists no cycle, and
+    /// every tick applies `[autoflow].history_retention_days` (default 30):
+    /// whole UTC days of cycles and events older than the window go, the
+    /// window's own days stay.
+    #[tokio::test]
+    async fn idle_tick_persists_no_cycle_and_prunes_history_past_retention() {
+        let _guard = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(&global).unwrap();
+        let history = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+        let now = chrono::Utc::now();
+        let seed = |days_ago: i64| {
+            let at = now - chrono::Duration::days(days_ago);
+            let mut cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, at);
+            cycle.ran_cycles = 1;
+            history.save(&cycle).unwrap();
+            history
+                .append_cycle_event(&cycle, AutoflowCycleEvent::default(), at)
+                .unwrap();
+            cycle.cycle_id
+        };
+        seed(31);
+        let kept = seed(30);
+
+        std::env::set_var("RUPU_HOME", &global);
+        let report =
+            crate::cmd::autoflow_runtime::tick_with_resolver(Arc::new(InMemoryResolver::new()))
+                .await
+                .unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(report.workflow_count, 0);
+        let cycles = history.list_recent(10).unwrap();
+        assert_eq!(
+            cycles
+                .iter()
+                .map(|c| c.cycle_id.clone())
+                .collect::<Vec<_>>(),
+            vec![kept],
+            "the idle tick's own cycle was persisted, or retention pruned the wrong days"
+        );
+        assert_eq!(history.list_recent_events(10).unwrap().len(), 1);
+    }
+
+    /// `history_retention_days = 0` keeps history forever.
+    #[tokio::test]
+    async fn zero_history_retention_keeps_everything() {
+        let _guard = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(
+            global.join("config.toml"),
+            "[autoflow]\nhistory_retention_days = 0\n",
+        )
+        .unwrap();
+        let history = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+        let mut ancient = AutoflowCycleRecord::new(
+            AutoflowCycleMode::Tick,
+            chrono::Utc::now() - chrono::Duration::days(400),
+        );
+        ancient.ran_cycles = 1;
+        history.save(&ancient).unwrap();
+
+        std::env::set_var("RUPU_HOME", &global);
+        tick_with_resolver(Arc::new(InMemoryResolver::new()))
+            .await
+            .unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(history.list_recent(10).unwrap().len(), 1);
+    }
+
+    /// A cycle that ran nothing but hit an error it continued past — here
+    /// the tracker's issue listing failing — is NOT idle: the error lands on
+    /// the cycle as a `cycle_failed` event, so the cycle and the event are
+    /// both persisted and show in `autoflow monitor` / `history` and the CP.
+    #[tokio::test]
+    async fn tick_that_skips_past_an_error_persists_the_cycle_with_the_error() {
+        ensure_crypto_provider();
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(500).body("upstream exploded");
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  selector:
+    states: ["open"]
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        }
+        .upsert(
+            "github:Section9Labs/rupu",
+            &project,
+            Some("https://github.com/Section9Labs/rupu.git"),
+            Some("HEAD"),
+        )
+        .unwrap();
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        let report = crate::cmd::autoflow_runtime::tick_with_resolver(resolver)
+            .await
+            .unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(report.workflow_count, 1);
+        assert_eq!((report.ran_cycles, report.failed_cycles), (0, 0));
+        let history = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+        let cycles = history.list_recent(10).unwrap();
+        assert_eq!(cycles.len(), 1, "the erroring cycle was not persisted");
+        let failure = cycles[0]
+            .events
+            .iter()
+            .find(|e| e.kind == AutoflowCycleEventKind::CycleFailed)
+            .unwrap_or_else(|| panic!("no cycle_failed event: {:?}", cycles[0].events));
+        assert!(
+            failure
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("issue listing failed")),
+            "{failure:?}"
+        );
+        assert_eq!(
+            failure.workflow.as_deref(),
+            Some("issue-supervisor-dispatch")
+        );
+        assert_eq!(
+            failure.repo_ref.as_deref(),
+            Some("github:Section9Labs/rupu")
+        );
+        let events = history.list_recent_events(10).unwrap();
+        assert!(
+            events.iter().any(|e| e.cycle_id == cycles[0].cycle_id
+                && e.event.kind == AutoflowCycleEventKind::CycleFailed),
+            "{events:?}"
+        );
+    }
+
     /// The PR analogue of `tick_discovers_tracked_repo_and_runs_autoflow_cycle`
     /// above — closes the review's flagged end-to-end gap. The 6 PR unit
     /// tests in `pr_autoflow` below exercise `select_eligible_prs` directly;
@@ -17659,7 +18028,7 @@ steps:
             };
             let af = collaborator_review_autoflow();
 
-            let eligible = select_eligible_prs(&connector, &store, &af, &repo)
+            let eligible = select_eligible_prs(&connector, &store, &af, &repo, &mut Vec::new())
                 .await
                 .unwrap();
 
@@ -17684,7 +18053,7 @@ steps:
             };
 
             // First tick: eligible.
-            let first = select_eligible_prs(&build("sha-c"), &store, &af, &repo)
+            let first = select_eligible_prs(&build("sha-c"), &store, &af, &repo, &mut Vec::new())
                 .await
                 .unwrap();
             assert_eq!(first.len(), 1);
@@ -17721,13 +18090,13 @@ steps:
                 .unwrap();
 
             // Same head SHA -> already claimed -> not re-dispatched.
-            let same = select_eligible_prs(&build("sha-c"), &store, &af, &repo)
+            let same = select_eligible_prs(&build("sha-c"), &store, &af, &repo, &mut Vec::new())
                 .await
                 .unwrap();
             assert!(same.is_empty());
 
             // A new push -> new head SHA -> fresh claim ref -> re-review.
-            let pushed = select_eligible_prs(&build("sha-d"), &store, &af, &repo)
+            let pushed = select_eligible_prs(&build("sha-d"), &store, &af, &repo, &mut Vec::new())
                 .await
                 .unwrap();
             assert_eq!(pushed.len(), 1);
@@ -17747,10 +18116,14 @@ steps:
             };
 
             // The collection must NOT abort — it returns Ok with the PR skipped.
-            let eligible = select_eligible_prs(&connector, &store, &af, &repo)
+            let mut errors = Vec::new();
+            let eligible = select_eligible_prs(&connector, &store, &af, &repo, &mut errors)
                 .await
                 .expect("is_collaborator error must not abort the collection");
             assert!(eligible.is_empty());
+            // ...and the cycle records the error it continued past.
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].kind, AutoflowCycleEventKind::CycleFailed);
             // Nothing was claimed.
             assert!(store
                 .load(&pr_claim_ref(&repo, 3, "sha-c"))
@@ -17812,7 +18185,7 @@ steps:
             };
             let af = closed_states_review_autoflow();
 
-            let eligible = select_eligible_prs(&connector, &store, &af, &repo)
+            let eligible = select_eligible_prs(&connector, &store, &af, &repo, &mut Vec::new())
                 .await
                 .unwrap();
 
@@ -18027,8 +18400,14 @@ steps:
             let af = collaborator_only_autoflow();
             let issues = vec![make_issue(1, "stranger")];
 
-            let out =
-                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+            let out = filter_issues_by_author_allowlist(
+                Some(&connector),
+                Some(&repo),
+                &af,
+                issues,
+                &mut Vec::new(),
+            )
+            .await;
 
             assert!(
                 out.is_empty(),
@@ -18046,8 +18425,14 @@ steps:
             let af = collaborator_only_autoflow();
             let issues = vec![make_issue(1, "collab")];
 
-            let out =
-                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+            let out = filter_issues_by_author_allowlist(
+                Some(&connector),
+                Some(&repo),
+                &af,
+                issues,
+                &mut Vec::new(),
+            )
+            .await;
 
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].r.number, 1);
@@ -18065,13 +18450,22 @@ steps:
 
             // The gate must NOT abort collection — it returns the issue
             // filtered out, same as `select_eligible_prs`'s fail-closed path.
-            let out =
-                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+            let mut errors = Vec::new();
+            let out = filter_issues_by_author_allowlist(
+                Some(&connector),
+                Some(&repo),
+                &af,
+                issues,
+                &mut errors,
+            )
+            .await;
 
             assert!(
                 out.is_empty(),
                 "is_collaborator error must fail closed (skip), not abort collection"
             );
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].kind, AutoflowCycleEventKind::CycleFailed);
         }
 
         #[tokio::test]
@@ -18143,8 +18537,14 @@ steps:
             let af = no_author_restriction_autoflow();
             let issues = vec![make_issue(1, "stranger"), make_issue(2, "anyone")];
 
-            let out =
-                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+            let out = filter_issues_by_author_allowlist(
+                Some(&connector),
+                Some(&repo),
+                &af,
+                issues,
+                &mut Vec::new(),
+            )
+            .await;
 
             assert_eq!(
                 out.len(),
@@ -18162,12 +18562,14 @@ steps:
             let af = collaborator_only_autoflow();
             let issues = vec![make_issue(1, "anyone")];
 
-            let out = filter_issues_by_author_allowlist(None, None, &af, issues).await;
+            let mut errors = Vec::new();
+            let out = filter_issues_by_author_allowlist(None, None, &af, issues, &mut errors).await;
 
             assert!(
                 out.is_empty(),
                 "no repo connector to verify collaborator status must fail closed"
             );
+            assert_eq!(errors.len(), 1, "{errors:?}");
         }
     }
 }

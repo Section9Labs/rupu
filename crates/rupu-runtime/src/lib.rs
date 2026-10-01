@@ -11,6 +11,7 @@ pub use artifacts::{ArtifactKind, ArtifactManifest, ArtifactRef};
 pub use autoflow_history::{
     AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
     AutoflowHistoryEventRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
+    HistoryPruneReport, HistoryWindow,
 };
 pub use backend::{ExecutionBackend, PreparedRun, RunResult, RunResultStatus};
 pub use provider_factory::{

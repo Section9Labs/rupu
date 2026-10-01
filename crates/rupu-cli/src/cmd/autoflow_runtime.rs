@@ -196,12 +196,16 @@ pub(crate) async fn tick_with_options(
             root: paths::autoflow_claims_dir(&global),
         };
         let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+        // Errors the helpers below continue past land on this cycle as
+        // `cycle_failed` events, so a cycle that hit one is persisted and
+        // shown even though it otherwise did nothing.
         let cleaned = legacy::cleanup_terminal_claims(
             &global,
             &repo_store,
             &claim_store,
             chrono::Utc::now(),
             options.repo_filter.as_deref(),
+            &mut cycle_record.events,
         )?;
         if cleaned > 0 {
             cycle_record.events.push(AutoflowCycleEvent {
@@ -210,10 +214,19 @@ pub(crate) async fn tick_with_options(
                 ..Default::default()
             });
         }
-        let mut discovered = legacy::discover_tick_autoflows(&global, &repo_store)?;
+        let mut discovery_errors = Vec::new();
+        let mut discovered =
+            legacy::discover_tick_autoflows(&global, &repo_store, &mut discovery_errors)?;
         if let Some(repo_filter) = options.repo_filter.as_deref() {
             discovered.retain(|resolved| resolved.repo_ref == repo_filter);
+            discovery_errors.retain(|error| {
+                error
+                    .repo_ref
+                    .as_deref()
+                    .is_none_or(|repo_ref| repo_ref == repo_filter)
+            });
         }
+        cycle_record.events.extend(discovery_errors);
 
         let mut report = TickReport {
             workflow_count: discovered.len(),
@@ -224,18 +237,29 @@ pub(crate) async fn tick_with_options(
             return Ok(report);
         }
 
-        let wake_hints = legacy::collect_wake_hints(&global, &discovered, resolver.as_ref())
-            .await
-            .context("collect autoflow wake hints")?;
+        let wake_hints = legacy::collect_wake_hints(
+            &global,
+            &discovered,
+            resolver.as_ref(),
+            &mut cycle_record.events,
+        )
+        .await
+        .context("collect autoflow wake hints")?;
         report.polled_event_count = wake_hints.total_polled_events;
         report.webhook_event_count = wake_hints.total_webhook_events;
 
-        let matches = legacy::collect_issue_matches(&discovered, resolver.as_ref())
-            .await
-            .context("discover autoflow issue matches")?;
-        let pr_matches = legacy::collect_pr_matches(&discovered, &claim_store, resolver.as_ref())
-            .await
-            .context("discover autoflow pull-request matches")?;
+        let matches =
+            legacy::collect_issue_matches(&discovered, resolver.as_ref(), &mut cycle_record.events)
+                .await
+                .context("discover autoflow issue matches")?;
+        let pr_matches = legacy::collect_pr_matches(
+            &discovered,
+            &claim_store,
+            resolver.as_ref(),
+            &mut cycle_record.events,
+        )
+        .await
+        .context("discover autoflow pull-request matches")?;
         let mut contenders_by_issue = legacy::summarize_issue_contenders(&matches);
         contenders_by_issue.extend(legacy::summarize_pr_contenders(&pr_matches));
         // Issue and PR winners share one claim keyspace (issue refs vs `pr:`
@@ -594,6 +618,10 @@ pub(crate) async fn tick_with_options(
             }
             if let Err(error) = wake_store.mark_processed(wake_id) {
                 tracing::warn!(wake_id, %error, "failed to mark wake processed");
+                cycle_record.events.push(AutoflowCycleEvent {
+                    wake_id: Some(wake_id.clone()),
+                    ..legacy::tick_error(format!("failed to mark wake processed: {error}"))
+                });
             }
         }
 
@@ -638,9 +666,16 @@ pub(crate) async fn tick_with_options(
             }
         }
     }
-    if let Err(error) = history_store.save(&cycle_record) {
-        tracing::warn!(%error, cycle_id = %cycle_record.cycle_id, "failed to persist autoflow cycle history");
+    // A cycle that did nothing (see `AutoflowCycleRecord::is_idle`) is not
+    // persisted: a 60s tick loop writes ~1,400 of them a day and no reader
+    // wants them. Any error the cycle hit is a `cycle_failed` event, so an
+    // erroring cycle is never idle.
+    if !cycle_record.is_idle() {
+        if let Err(error) = history_store.save(&cycle_record) {
+            tracing::warn!(%error, cycle_id = %cycle_record.cycle_id, "failed to persist autoflow cycle history");
+        }
     }
+    prune_autoflow_history(&global, &history_store, chrono::Utc::now());
 
     result.map(|report| TickOutcome {
         report,
@@ -753,6 +788,52 @@ fn cycle_mode(options: &TickOptions) -> AutoflowCycleMode {
     match options.worker.as_ref().map(|worker| worker.kind) {
         Some(WorkerKind::AutoflowServe) => AutoflowCycleMode::Serve,
         _ => AutoflowCycleMode::Tick,
+    }
+}
+
+/// Apply `[autoflow].history_retention_days` (global config only — the
+/// history is machine-wide): delete whole UTC days of cycle and event history
+/// older than the retention window. Runs after every tick, so every writer
+/// (`cp serve`'s reconcile loop, `autoflow tick`, `autoflow serve`) keeps the
+/// store bounded; it costs two directory listings. Best
+/// effort — a failure is logged and never fails the tick, and an unreadable
+/// config keeps everything rather than guessing a window.
+fn prune_autoflow_history(
+    global: &std::path::Path,
+    history_store: &AutoflowHistoryStore,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let cfg = match legacy::resolve_config(global, None) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            tracing::warn!(%error, "autoflow history not pruned: global config unreadable");
+            return;
+        }
+    };
+    let Some(days) = cfg.autoflow.history_retention_days() else {
+        return;
+    };
+    let Some(cutoff) = now
+        .date_naive()
+        .checked_sub_days(chrono::Days::new(days.into()))
+    else {
+        return;
+    };
+    match history_store.prune_before(cutoff) {
+        Ok(report) => {
+            if report.cycle_days + report.event_days > 0 {
+                tracing::info!(
+                    cycle_days = report.cycle_days,
+                    event_days = report.event_days,
+                    %cutoff,
+                    "pruned autoflow history past [autoflow].history_retention_days"
+                );
+            }
+            for (day, error) in report.failures {
+                tracing::warn!(%error, day = %day.display(), "failed to prune autoflow history day");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "failed to prune autoflow history"),
     }
 }
 

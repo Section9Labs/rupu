@@ -394,6 +394,18 @@ export function AutoflowTab({ prov, lockList, fieldValue, onChange, onToggleLock
           onToggleLock={onToggleLock}
           lockedReadOnly={lockedReadOnly}
         />
+        <ConfigField
+          label="History retention (days)"
+          dottedKey="autoflow.history_retention_days"
+          kind="number"
+          placeholder="30"
+          value={fieldValue('autoflow.history_retention_days')}
+          provenance={prov['autoflow.history_retention_days']}
+          locked={lockList.includes('autoflow.history_retention_days')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
       </FieldGroup>
     </div>
   );

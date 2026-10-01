@@ -357,6 +357,8 @@ For tracker-native issues such as Linear or Jira, `rupu autoflow run` and `rupu 
 
 `rupu autoflow history` is the durable event stream over the same cycle records. Use it when you need to answer what happened recently, export recent run launches or retries, or isolate one issue / worker / source over time.
 
+Only cycles that did something are recorded: a cycle that launched, failed, cleaned up, consumed a wake, or hit an error. A tick that evaluated its autoflows and found nothing due leaves no record, so `cycles=` counts active cycles. An error a tick logs and continues past (an unreachable tracker, a failed poll, a claim it could not clean up) is recorded as a `cycle_failed` event on that cycle, so it shows up here and in the control plane, not only in the daemon log. History older than `[autoflow].history_retention_days` (default 30 days; `0` keeps everything) is deleted a whole day at a time after each tick — see [configuration.md](configuration.md#autoflow).
+
 `rupu autoflow explain` now includes the most recent cycle events for one issue, a direct `rupu watch <run_id>` handoff when a last run exists, and the same execution summary data surfaced in the live timeline: routing, branch/PR, agents/models, message/tool counts, tokens/cost, workspace diff, and merge target. `rupu autoflow claims` and `rupu autoflow status` also surface recent change context so operators can see the last event without leaving the summary views.
 
 ### Inspect usage and structured reports

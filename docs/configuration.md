@@ -118,6 +118,7 @@ Narrative reference: [using-rupu.md](using-rupu.md#autoflow-mode).
 | `strict_templates` | bool    | `false`     | |
 | `max_active`       | integer | none (unbounded) | Cap on concurrently active autoflow claims |
 | `cleanup_after`    | string  | none (never pruned) | e.g. `7d` — completed/released claims and their worktrees are pruned by a later `rupu autoflow tick` once elapsed |
+| `history_retention_days` | integer | `30` | Whole UTC days of autoflow cycle/event history (`<global>/autoflows/history`) to keep; older days are deleted after every tick (`rupu autoflow tick` / `serve`, and `cp serve`'s reconcile loop). `0` keeps history forever. Read from the global config only |
 
 ---
 

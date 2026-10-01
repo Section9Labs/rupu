@@ -230,9 +230,14 @@ impl CpFleetInventory {
         let repo_store = rupu_workspace::RepoRegistryStore {
             root: deps.global_dir.join("repos"),
         };
+        // Sources the scheduler would skip past this tick are skipped here
+        // too (and logged by the helpers), so the count still matches what
+        // it would pick up; there is no cycle to record those errors on.
+        let mut skipped_errors = Vec::new();
         let discovered = match crate::cmd::autoflow::discover_tick_autoflows(
             &deps.global_dir,
             &repo_store,
+            &mut skipped_errors,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -244,6 +249,7 @@ impl CpFleetInventory {
         let matches = match crate::cmd::autoflow::collect_issue_matches(
             &discovered,
             deps.resolver.as_ref(),
+            &mut skipped_errors,
         )
         .await
         {

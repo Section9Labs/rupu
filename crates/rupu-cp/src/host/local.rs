@@ -13,7 +13,9 @@ use rupu_orchestrator::{
     runs::{CancelError, PauseError, RunStore},
     ApprovalError, RunStoreError,
 };
-use rupu_runtime::{AutoflowHistoryStore, AutoflowHistoryStoreError};
+use rupu_runtime::{
+    AutoflowCycleEventKind, AutoflowHistoryStore, AutoflowHistoryStoreError, HistoryWindow,
+};
 
 use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
@@ -425,7 +427,8 @@ impl HostConnector for LocalHostConnector {
             .run_store
             .list()
             .map_err(|e| HostConnectorError::Invalid(format!("run store list failed: {e}")))?;
-        let cycles = match collect_cycle_rollups(&self.global_dir) {
+        let now = chrono::Utc::now();
+        let cycles = match collect_cycle_rollups(&self.global_dir, range.since(now)) {
             Ok(c) => c,
             Err(e) => {
                 // Degrade to empty, but never silently: an IO failure must not
@@ -454,28 +457,38 @@ impl HostConnector for LocalHostConnector {
             findings_open,
             fleet,
             range,
-            chrono::Utc::now(),
+            now,
         ))
     }
 }
 
 // ── Dashboard summary helpers ────────────────────────────────────────────────
 
-/// Read this host's autoflow cycle history and reduce each cycle to a
+/// Read every autoflow cycle this host recorded since `since` (all of them
+/// for `None`) and reduce each to a
 /// [`summary_build::CycleRollup`](crate::host::summary_build::CycleRollup) —
 /// just `started_at` (range filtering) and `failed` (the clean/with-failures
 /// split), which is all `build_summary` needs for [`CycleCounts`]
 /// (`dashboard_summary.rs`). Reads through `AutoflowHistoryStore` exactly as
 /// `list_autoflow_runs` (`api/run_streams.rs`) does — one place that parses
 /// `AutoflowCycleRecord`.
+///
+/// Every cycle in range, not the newest N: a count is wrong the moment it is
+/// capped. Only cycles that did something are on disk (the writer skips
+/// idle ones) and retention bounds the rest, so this stays small.
 fn collect_cycle_rollups(
     global_dir: &std::path::Path,
+    since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Vec<crate::host::summary_build::CycleRollup>, HostConnectorError> {
     use crate::host::summary_build::CycleRollup;
 
     let store_root = global_dir.join("autoflows").join("history");
     let store = AutoflowHistoryStore::new(store_root);
-    let records = match store.list_recent(100) {
+    let window = HistoryWindow {
+        since,
+        ..HistoryWindow::default()
+    };
+    let records = match store.list_cycles(window) {
         Ok(r) => r,
         Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Vec::new()
@@ -487,7 +500,13 @@ fn collect_cycle_rollups(
         .iter()
         .map(|r| CycleRollup {
             started_at: parse_rfc3339_or_now(&r.started_at),
-            failed: r.failed_cycles as u64,
+            // Failed issues plus the errors the cycle continued past (each a
+            // `cycle_failed` event): either makes it a cycle with failures.
+            failed: (r.failed_cycles
+                + r.events
+                    .iter()
+                    .filter(|e| e.kind == AutoflowCycleEventKind::CycleFailed)
+                    .count()) as u64,
         })
         .collect())
 }
@@ -546,7 +565,7 @@ mod dashboard_summary_tests {
         });
         store.save(&record).unwrap();
 
-        let rollups = collect_cycle_rollups(global.path()).unwrap();
+        let rollups = collect_cycle_rollups(global.path(), None).unwrap();
         assert_eq!(rollups.len(), 1);
         let rollup = &rollups[0];
         assert_eq!(
@@ -557,6 +576,56 @@ mod dashboard_summary_tests {
             (rollup.started_at - started).num_seconds().abs() < 2,
             "started_at must round-trip through the real store"
         );
+    }
+
+    /// The count is every cycle in range — it used to read the newest 100
+    /// and filter those, so a 30-day dashboard on a busy host said "100".
+    #[test]
+    fn collect_cycle_rollups_counts_every_cycle_in_range_not_the_newest_100() {
+        let global = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(global.path().join("autoflows").join("history"));
+        let now = chrono::Utc::now();
+        for minutes in 0..150 {
+            let mut record = AutoflowCycleRecord::new(
+                AutoflowCycleMode::Tick,
+                now - chrono::Duration::minutes(minutes),
+            );
+            record.ran_cycles = 1;
+            store.save(&record).unwrap();
+        }
+        let mut old =
+            AutoflowCycleRecord::new(AutoflowCycleMode::Tick, now - chrono::Duration::days(8));
+        old.ran_cycles = 1;
+        store.save(&old).unwrap();
+
+        let since = Some(now - chrono::Duration::days(7));
+        assert_eq!(
+            collect_cycle_rollups(global.path(), since).unwrap().len(),
+            150
+        );
+        assert_eq!(
+            collect_cycle_rollups(global.path(), None).unwrap().len(),
+            151
+        );
+    }
+
+    /// A cycle that only hit an error it continued past (a `cycle_failed`
+    /// event, no failed issue) is a cycle with failures, not a clean one.
+    #[test]
+    fn a_skipped_past_error_counts_as_a_failure() {
+        let global = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(global.path().join("autoflows").join("history"));
+        let mut record = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, chrono::Utc::now());
+        record.events.push(AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::CycleFailed,
+            detail: Some("skipping autoflow because issue listing failed: 500".into()),
+            ..Default::default()
+        });
+        store.save(&record).unwrap();
+
+        let rollups = collect_cycle_rollups(global.path(), None).unwrap();
+        assert_eq!(rollups.len(), 1);
+        assert!(rollups[0].failed > 0);
     }
 }
 

@@ -13,6 +13,7 @@ use axum::{
 };
 use rupu_runtime::{
     AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
+    HistoryWindow,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1031,9 +1032,14 @@ async fn list_autoflow_runs(
     }
 
     // ── Load local cycles ─────────────────────────────────────────────────────
+    // Exactly the cycles in range that can reach this page, newest first: a
+    // page `[offset, offset + limit)` of the (merged) newest-first list holds
+    // none of this host's cycles past its own newest `offset + limit` in
+    // range. Reading "the newest 100, then filter by range" instead returned
+    // short or empty pages for any range or offset past those 100.
     let store_root = s.global_dir.join("autoflows").join("history");
     let store = AutoflowHistoryStore::new(store_root);
-    let local_records = match store.list_recent(100) {
+    let local_records = match store.list_cycles(local_window(&q.range(), &q.page())) {
         Ok(r) => r,
         Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Vec::new()
@@ -1047,14 +1053,8 @@ async fn list_autoflow_runs(
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
-        // list_recent already returns newest-first. Filter by date range,
-        // paginate, then roll up usage across each cycle's runs on the page
-        // only.
-        let range = q.range();
-        let local_rows: Vec<AutoflowCycleRow> = local_rows
-            .into_iter()
-            .filter(|r| range.contains_str(Some(&r.started_at)))
-            .collect();
+        // Already newest-first and narrowed to the range: paginate, then roll
+        // up usage across each cycle's runs on the page only.
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
         let run_ids: Vec<String> = page_rows
             .iter()
@@ -1189,6 +1189,20 @@ fn kind_to_snake_case(kind: AutoflowCycleEventKind) -> String {
 
 /// Only these event kinds represent actionable per-launch activity worth
 /// surfacing as a row on the Autoflows page.
+/// The slice of this host's autoflow history a list page can draw on: the
+/// requested range, and no more than the page's end (`offset + limit`) —
+/// the newest-first page can hold nothing older than that from one host.
+fn local_window(
+    range: &crate::pagination::DateRangeQuery,
+    page: &crate::pagination::PageQuery,
+) -> HistoryWindow {
+    HistoryWindow {
+        since: range.since(),
+        until: range.until(),
+        limit: Some(page.offset().saturating_add(page.limit())),
+    }
+}
+
 fn is_actionable_kind(kind: AutoflowCycleEventKind) -> bool {
     matches!(
         kind,
@@ -1238,7 +1252,13 @@ async fn list_autoflow_events(
     // ── Load local events ─────────────────────────────────────────────────────
     let store_root = s.global_dir.join("autoflows").join("history");
     let store = AutoflowHistoryStore::new(store_root);
-    let local_records = match store.list_recent_events(200) {
+    // Exactly the actionable events in range that can reach this page — see
+    // `list_autoflow_runs`. Filtering by kind and range only after reading
+    // the newest 200 events of any kind hid every actionable event behind
+    // the newest 200.
+    let local_records = match store.list_events(local_window(&q.range(), &q.page()), |rec| {
+        is_actionable_kind(rec.event.kind)
+    }) {
         Ok(r) => r,
         Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Vec::new()
@@ -1248,7 +1268,6 @@ async fn list_autoflow_events(
 
     let local_rows: Vec<AutoflowEventRow> = local_records
         .into_iter()
-        .filter(|rec| is_actionable_kind(rec.event.kind))
         .map(|rec| AutoflowEventRow {
             event_id: rec.event_id,
             cycle_id: rec.cycle_id,
@@ -1273,11 +1292,6 @@ async fn list_autoflow_events(
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
-        let range = q.range();
-        let local_rows: Vec<AutoflowEventRow> = local_rows
-            .into_iter()
-            .filter(|r| range.contains_str(Some(&r.at)))
-            .collect();
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
         let run_ids: Vec<String> = page_rows.iter().filter_map(|r| r.run_id.clone()).collect();
         let mut all_metrics = crate::usage::run_metrics_blocking(
@@ -2596,6 +2610,115 @@ mod tests {
         .expect("ok");
 
         assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
-        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
+        assert_eq!(
+            rows[0]["started_at"],
+            serde_json::json!(day(10).to_rfc3339())
+        );
+    }
+
+    /// A range or an offset past the newest 100 cycles still finds its
+    /// cycles — the endpoint used to read the newest 100 and filter those,
+    /// returning short or empty pages beyond them.
+    #[tokio::test]
+    async fn list_autoflow_runs_reaches_past_the_newest_100_cycles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let history = AutoflowHistoryStore::new(s.global_dir.join("autoflows").join("history"));
+        history
+            .save(&AutoflowCycleRecord::new(AutoflowCycleMode::Tick, day(1)))
+            .unwrap();
+        for second in 0..120 {
+            history
+                .save(&AutoflowCycleRecord::new(
+                    AutoflowCycleMode::Tick,
+                    day(20) + chrono::Duration::seconds(second),
+                ))
+                .unwrap();
+        }
+        let query = |offset: Option<usize>, since: Option<&str>, until: Option<&str>| {
+            Query(AutoflowRunsQuery {
+                offset,
+                limit: Some(20),
+                host: Some("local".into()),
+                since: since.map(str::to_owned),
+                until: until.map(str::to_owned),
+            })
+        };
+
+        let Json(old) = list_autoflow_runs(
+            State(s.clone()),
+            query(
+                None,
+                Some("2026-08-01T00:00:00Z"),
+                Some("2026-08-02T00:00:00Z"),
+            ),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(old.len(), 1, "the Aug 1 cycle sits behind 120 newer ones");
+        assert_eq!(old[0]["started_at"], serde_json::json!(day(1).to_rfc3339()));
+
+        let Json(deep) = list_autoflow_runs(State(s), query(Some(110), None, None))
+            .await
+            .expect("ok");
+        assert_eq!(deep.len(), 11, "offset 110 of 121 cycles");
+        assert_eq!(
+            deep[10]["started_at"],
+            serde_json::json!(day(1).to_rfc3339())
+        );
+    }
+
+    /// An actionable event behind 200 newer non-actionable ones is still
+    /// listed — the kind filter used to run after reading the newest 200.
+    #[tokio::test]
+    async fn list_autoflow_events_finds_actionable_events_behind_newer_noise() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let history = AutoflowHistoryStore::new(s.global_dir.join("autoflows").join("history"));
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, day(1));
+        history
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent {
+                    kind: AutoflowCycleEventKind::AwaitingHuman,
+                    ..Default::default()
+                },
+                day(1),
+            )
+            .unwrap();
+        for second in 0..210 {
+            history
+                .append_cycle_event(
+                    &cycle,
+                    AutoflowCycleEvent {
+                        kind: AutoflowCycleEventKind::WakeConsumed,
+                        ..Default::default()
+                    },
+                    day(20) + chrono::Duration::seconds(second),
+                )
+                .unwrap();
+        }
+
+        let Json(rows) = list_autoflow_events(
+            State(s),
+            Query(AutoflowEventsQuery {
+                offset: None,
+                limit: None,
+                host: Some("local".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["kind"], serde_json::json!("awaiting_human"));
     }
 }

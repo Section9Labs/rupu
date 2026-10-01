@@ -17,6 +17,26 @@ pub struct AutoflowConfig {
     pub strict_templates: Option<bool>,
     pub max_active: Option<u32>,
     pub cleanup_after: Option<String>,
+    /// Days of autoflow cycle/event history to keep under
+    /// `<global>/autoflows/history`; `0` keeps it forever. Absent means
+    /// [`AutoflowConfig::DEFAULT_HISTORY_RETENTION_DAYS`]. Read from the
+    /// global config only — the history is machine-wide, not per project.
+    pub history_retention_days: Option<u32>,
+}
+
+impl AutoflowConfig {
+    pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 30;
+
+    /// How many whole UTC days of history to keep, or `None` to keep it all.
+    pub fn history_retention_days(&self) -> Option<u32> {
+        match self
+            .history_retention_days
+            .unwrap_or(Self::DEFAULT_HISTORY_RETENTION_DAYS)
+        {
+            0 => None,
+            days => Some(days),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +68,7 @@ mod tests {
             strict_templates = true
             max_active = 2
             cleanup_after = "7d"
+            history_retention_days = 14
         "#;
         let cfg: AutoflowConfig = toml::from_str(toml).expect("parse");
         assert_eq!(cfg.enabled, Some(true));
@@ -61,6 +82,15 @@ mod tests {
         assert_eq!(cfg.strict_templates, Some(true));
         assert_eq!(cfg.max_active, Some(2));
         assert_eq!(cfg.cleanup_after.as_deref(), Some("7d"));
+        assert_eq!(cfg.history_retention_days(), Some(14));
+    }
+
+    #[test]
+    fn history_retention_defaults_to_30_days_and_zero_keeps_everything() {
+        let unset: AutoflowConfig = toml::from_str("").expect("parse");
+        assert_eq!(unset.history_retention_days(), Some(30));
+        let forever: AutoflowConfig = toml::from_str("history_retention_days = 0").expect("parse");
+        assert_eq!(forever.history_retention_days(), None);
     }
 
     #[test]
