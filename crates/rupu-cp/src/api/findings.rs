@@ -1251,6 +1251,7 @@ mod tests {
                 declared_at: at(declared_at),
                 profile: rupu_coverage::FindingProfile::Summary,
                 report: None,
+                asset: None,
             },
         }
     }
@@ -1624,6 +1625,7 @@ mod tests {
             declared_at: at("2026-01-01T00:00:00Z"),
             profile: rupu_coverage::FindingProfile::Summary,
             report: None,
+            asset: None,
         };
         let mut without_loc = with_loc.clone();
         without_loc.id = "fnd_no_loc".to_string();
