@@ -25,6 +25,8 @@ use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 pub struct GitlabEventConnector {
     http: reqwest_middleware::ClientWithMiddleware,
     token: String,
+    /// API root, default `https://gitlab.com/api/v4` — the same
+    /// interpretation of `[scm.gitlab].base_url` as `GitlabClient`.
     base_url: String,
 }
 
@@ -34,7 +36,7 @@ impl GitlabEventConnector {
         base_url: Option<String>,
         sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
-        let base_url = base_url.unwrap_or_else(|| "https://gitlab.com".to_string());
+        let base_url = base_url.unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
         Self {
             // Infallible constructor (`-> Self`); `.expect()` preserves the
             // deleted `http::client()` fallback's panic-on-failure behaviour.
@@ -90,7 +92,7 @@ impl EventConnector for GitlabEventConnector {
             .format("%Y-%m-%d")
             .to_string();
         let url = format!(
-            "{}/api/v4/projects/{}/events?after={}&per_page=100&sort=asc",
+            "{}/projects/{}/events?after={}&per_page=100&sort=asc",
             self.base_url.trim_end_matches('/'),
             project_id_enc,
             after_date,
@@ -397,6 +399,18 @@ mod tests {
         let r = c.poll_events(&source, None, 50).await.unwrap();
         assert_eq!(r.events.len(), 0);
         assert!(r.next_cursor.contains("since:"));
+    }
+
+    /// Default must match `GitlabClient`'s API-root default, so a user
+    /// with no `base_url` polls the same `https://gitlab.com/api/v4/...`.
+    #[test]
+    fn default_base_url_is_the_api_root() {
+        let c = GitlabEventConnector::new(
+            "fake".into(),
+            None,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
+        assert_eq!(c.base_url, "https://gitlab.com/api/v4");
     }
 
     #[test]

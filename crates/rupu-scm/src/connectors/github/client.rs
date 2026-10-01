@@ -43,6 +43,8 @@ pub struct GithubClient {
     /// `api.github.com`. Computed once at construction — `with_retry_octocrab`
     /// needs a `&str` per attempt and must not derive or leak one per call.
     host_label: String,
+    /// The `base_url` host when it isn't github.com — see `enterprise_host`.
+    enterprise_host: Option<String>,
     /// `octocrab` owns its own hyper/tower stack, so it never goes through
     /// `rupu_netflow::http::client_with` for its main traffic — this is the
     /// only client field that observes it, via the `Fidelity::Coarse` record
@@ -89,6 +91,7 @@ impl GithubClient {
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
             .unwrap_or_else(|| "api.github.com".to_string());
+        let enterprise_host = enterprise_host_for(opts.base_url.as_deref());
         let mut builder = Octocrab::builder()
             .personal_token(token.clone())
             .set_connect_timeout(Some(opts.timeout))
@@ -110,6 +113,7 @@ impl GithubClient {
             timeout: opts.timeout,
             clone_protocol: opts.clone_protocol,
             host_label,
+            enterprise_host,
             sink,
         }
     }
@@ -119,6 +123,13 @@ impl GithubClient {
     /// `graphql_url` — see the `host_label` field doc.
     pub(crate) fn host_label(&self) -> &str {
         &self.host_label
+    }
+
+    /// The `base_url` host when it isn't github.com (a GitHub Enterprise
+    /// Server install, or a `base_url` with no host), for `clone_to`, whose
+    /// URLs only know github.com.
+    pub(crate) fn enterprise_host(&self) -> Option<&str> {
+        self.enterprise_host.as_deref()
     }
 
     /// The configured clone protocol, read by `GithubRepoConnector::clone_to`.
@@ -450,6 +461,20 @@ fn graphql_url_for(base_url: Option<&str>) -> Result<String, url::ParseError> {
     Ok(url.to_string())
 }
 
+/// `None` for github.com — an unset `base_url`, or one on `api.github.com` /
+/// `github.com`; otherwise the host (the raw `base_url` if it has none).
+fn enterprise_host_for(base_url: Option<&str>) -> Option<String> {
+    let base_url = base_url?;
+    let host = Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    match host.as_deref() {
+        Some("api.github.com" | "github.com") => None,
+        Some(other) => Some(other.to_string()),
+        None => Some(base_url.to_string()),
+    }
+}
+
 fn graphql_error_message(body: &serde_json::Value) -> Option<String> {
     body.get("message")
         .and_then(serde_json::Value::as_str)
@@ -541,6 +566,28 @@ mod tests {
         assert_eq!(
             graphql_url_for(Some("https://ghe.example.com/api/v3")).unwrap(),
             "https://ghe.example.com/api/graphql"
+        );
+    }
+
+    /// `clone_to` refuses exactly the accounts whose `base_url` is off
+    /// github.com — an unset one, or one on either github.com host, clones.
+    #[test]
+    fn enterprise_host_is_none_only_for_github_com() {
+        for base_url in [
+            None,
+            Some("https://api.github.com"),
+            Some("https://API.GitHub.com/"),
+            Some("https://github.com/api/v3"),
+        ] {
+            assert_eq!(enterprise_host_for(base_url), None, "{base_url:?}");
+        }
+        assert_eq!(
+            enterprise_host_for(Some("https://ghe.example.com/api/v3")).as_deref(),
+            Some("ghe.example.com")
+        );
+        assert_eq!(
+            enterprise_host_for(Some("not a url")).as_deref(),
+            Some("not a url")
         );
     }
 

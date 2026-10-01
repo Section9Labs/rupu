@@ -4618,6 +4618,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "unicode-width",
  "which",
  "whoami",
  "zip",
@@ -4662,6 +4663,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "ulid",
 ]

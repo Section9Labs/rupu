@@ -8,7 +8,7 @@ use crate::number;
 use crate::text::{longest_backtick_run, one_line};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::report::{
-    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, FindingReport, HopRole, Likelihood,
+    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, EvidenceBlock, FindingReport, HopRole, Likelihood,
     OrSentinel, Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
 };
 use rupu_coverage::FindingRecord;
@@ -424,6 +424,9 @@ fn full_blocks(
         if let Some(x) = nonblank(&e.excerpt) {
             b.push(code(e.lang.as_deref(), x));
         }
+        for eb in &e.blocks {
+            b.extend(evidence_block_to_blocks(eb));
+        }
     }
 
     b.push(heading("Remediation"));
@@ -634,4 +637,51 @@ pub fn project_blocks(
         b.extend(finding_blocks(f, &numbers));
     }
     b
+}
+
+pub fn evidence_block_to_blocks(b: &EvidenceBlock) -> Vec<Block> {
+    use rupu_coverage::report::EvidenceBlock as E;
+    match b {
+        E::Text { text } => vec![Block::Prose(text.clone())],
+        E::CodeSlice { excerpt, lang } => vec![code(lang.as_deref(), excerpt)],
+        E::Diff { diff } => vec![code(Some("diff"), diff)],
+        E::Table { headers, rows } => vec![Block::Table { headers: headers.clone(), rows: rows.clone() }],
+        E::Disasm { arch, listing } => {
+            let body = listing.iter().map(|l| format!("{}  {}", l.addr, l.text)).collect::<Vec<_>>().join("\n");
+            vec![Block::Note(format!("disassembly ({arch})")), code(Some("asm"), &body)]
+        }
+        E::Hexdump { base, artifact, rendered } => {
+            let body = rendered.clone().unwrap_or_else(|| format!("(hexdump artifact: {artifact})"));
+            vec![Block::Note(format!("hexdump @ {base:#x}")), code(None, &body)]
+        }
+        E::Decompile { lang, listing } => vec![code(Some(lang), listing)],
+        E::HttpExchange { request, response } => {
+            vec![code(Some("http"), request), code(Some("http"), response)]
+        }
+        E::ScanOutput { tool, output } => {
+            vec![Block::Note(format!("scan: {tool}")), code(None, output)]
+        }
+        E::PcapRef { artifact, summary } => vec![Block::Note(format!("pcap {artifact}: {summary}"))],
+        E::Image { artifact, caption } => {
+            vec![Block::Note(format!("image {artifact}{}", caption.as_ref().map(|c| format!(" — {c}")).unwrap_or_default()))]
+        }
+    }
+}
+
+#[cfg(test)]
+mod block_map_tests {
+    use super::*;
+    use crate::markdown;
+    use rupu_coverage::report::DisasmLine;
+
+    #[test]
+    fn disasm_renders_as_asm_code_fence() {
+        let b = EvidenceBlock::Disasm {
+            arch: "x86_64".into(),
+            listing: vec![DisasmLine { addr: "0x401000".into(), text: "mov eax, edi".into() }],
+        };
+        let md = markdown::render(&evidence_block_to_blocks(&b));
+        assert!(md.contains("```asm"), "{md}");
+        assert!(md.contains("0x401000  mov eax, edi"), "{md}");
+    }
 }

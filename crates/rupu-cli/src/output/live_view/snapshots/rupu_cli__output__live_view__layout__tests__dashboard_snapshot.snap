@@ -1,0 +1,7 @@
+---
+source: crates/rupu-cli/src/output/live_view/layout.rs
+expression: render_plain(&rows)
+---
+assess-services  ● mint-tundra  ◐ running · 4m 12s
+step 2/3  ████████████████░░░░░░░░  ◐ scan
+⇡6100000 ⇣420000 $18.40 · ⚑5

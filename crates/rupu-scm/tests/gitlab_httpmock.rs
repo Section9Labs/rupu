@@ -437,3 +437,40 @@ async fn update_issue_state_uses_state_event() {
     .unwrap();
     m.assert();
 }
+
+/// `[scm.gitlab].base_url` is the API ROOT (`https://gitlab.com/api/v4`,
+/// as `GitlabClient` and `docs/scm.md` both treat it). The events poller
+/// must append `/projects/...` to it directly — not re-add `/api/v4`,
+/// which turned the documented value into `/api/v4/api/v4/...` (404).
+#[tokio::test]
+async fn events_poll_treats_base_url_as_api_root() {
+    use rupu_scm::connectors::gitlab::GitlabEventConnector;
+    use rupu_scm::event_connector::EventConnector;
+
+    let server = MockServer::start_async().await;
+    let m = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v4/projects/section9labs%2Frupu/events");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+    let conn = GitlabEventConnector::new(
+        "fake-token".into(),
+        Some(format!("{}/api/v4", server.base_url())),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    );
+    let source = rupu_scm::EventSourceRef::Repo {
+        repo: rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Gitlab,
+            owner: "section9labs".into(),
+            repo: "rupu".into(),
+        },
+    };
+    // A `since:` cursor skips the warmup fast-path (no HTTP on first poll).
+    let result = conn
+        .poll_events(&source, Some("since:2026-05-01T00:00:00+00:00"), 10)
+        .await;
+    m.assert_hits(1);
+    assert!(result.expect("poll against the mock").events.is_empty());
+}

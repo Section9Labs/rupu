@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release macos-fixtures cp-codename-palette
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release cp-codename-palette
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -113,7 +113,7 @@ macos-gen:
 # "notifications are not allowed for this application" and the app never
 # appears in System Settings > Notifications, so the Settings > Notifications
 # toggles could never work from a `make macos-run` build. Ad-hoc needs no
-# identity/keychain, so CI's macos-app job builds identically.
+# identity/keychain.
 macos-build: macos-gen
 	xcodebuild -project apps/rupu-macos/rupu.xcodeproj -scheme rupu \
 		-configuration Debug -derivedDataPath apps/rupu-macos/DerivedData \
@@ -141,15 +141,6 @@ macos-release: macos-gen
 		CURRENT_PROJECT_VERSION=$(or $(RUPU_RELEASE_VERSION),0.0.0-dev)
 	@echo "Built: apps/rupu-macos/DerivedData/Build/Products/Release/rupu.app"
 	@echo "Version: $(or $(RUPU_RELEASE_VERSION),0.0.0-dev)"
-
-# Regenerate the golden JSON fixtures the Swift app's decode/encode tests
-# check against (apps/rupu-macos/Fixtures/*.json,
-# apps/rupu-macos/Fixtures/requests/*.json). Run this after changing
-# rupu_orchestrator::executor::Event, HostInfoResponse, or any of the
-# write-path DTOs/request bodies, then update the Swift models to match.
-macos-fixtures:
-	REGEN_FIXTURES=1 cargo test -p rupu-cp fixture_is_current
-	REGEN_FIXTURES=1 cargo test -p rupu-cp request_fixture_roundtrips
 
 # Regenerate the web UI's codename palette from rupu-codename.
 cp-codename-palette:
@@ -179,7 +170,6 @@ help:
 	@echo "  macos-release  macos-gen + xcodebuild Release, ad-hoc signed, hardened runtime on"
 	@echo "                 (usage: make macos-release RUPU_RELEASE_VERSION=X.Y.Z)"
 	@echo "  cp-codename-palette regenerate crates/rupu-cp/web/src/lib/codenamePalette.gen.ts"
-	@echo "  macos-fixtures regenerate apps/rupu-macos/Fixtures/*.json golden fixtures"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"
 	@echo ""

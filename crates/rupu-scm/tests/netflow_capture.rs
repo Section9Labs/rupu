@@ -113,8 +113,12 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             })
             .await;
 
-        let connector =
-            GitlabEventConnector::new("glpat-fake".into(), Some(server.base_url()), sink.clone());
+        // `base_url` is the API root, as `[scm.gitlab].base_url` documents.
+        let connector = GitlabEventConnector::new(
+            "glpat-fake".into(),
+            Some(format!("{}/api/v4", server.base_url())),
+            sink.clone(),
+        );
         let source = EventSourceRef::Repo {
             repo: RepoRef {
                 platform: Platform::Gitlab,

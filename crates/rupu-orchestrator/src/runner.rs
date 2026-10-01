@@ -1673,17 +1673,21 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// (`base_context_for_step` builds a `BTreeMap`), so no template-visible
 /// behavior depends on inter-sibling order.
 ///
-/// **Error / pause unwinding.** A hard failure (`run_node` returning `Err`
-/// — i.e. NOT `continue_on_error`) or any pause (approval-gate parking, the
-/// legacy inline gate, the step-boundary check, or a mid-dispatch pause
+/// **Error / pause unwinding.** An approval pause — a gate node, the legacy
+/// inline gate, or either of those inside a loop (surfacing as
+/// [`LoopNodeOutcome::Paused`]) — batch-parks (`parked`, spec §7): the
+/// scheduler keeps dispatching every other ready node and drains the
+/// `JoinSet` to completion, then pauses with the full gate set, so a
+/// sibling on an unrelated path is recorded rather than aborted. A hard
+/// failure (`run_node` returning `Err` — i.e. NOT `continue_on_error`) or
+/// a manual pause (the step-boundary check, or a mid-dispatch pause
 /// bubbling out as `NodeOutcome::Paused`) stops launching new nodes and
-/// returns immediately — "like the loop does" per this task's brief. Any
-/// sibling tasks still in the `JoinSet` are ABORTED when it drops (tokio's
-/// documented `JoinSet` drop behavior), not gracefully drained to a safe
-/// boundary; full in-flight cancellation (a token threaded through
-/// `dispatch_one`, §8 of the design doc) is later in this arc. Every
-/// sample this task's golden test covers has graph width 1, so there is
-/// never another task in flight when this fires — unobservable there.
+/// returns immediately; any sibling tasks still in the `JoinSet` are
+/// ABORTED when it drops (tokio's documented `JoinSet` drop behavior), not
+/// gracefully drained to a safe boundary. A whole-run cancel goes through
+/// [`cancel_finalize`] instead (spec §8). Every sample this task's golden
+/// test covers has graph width 1, so there is never another task in
+/// flight when any of this fires — unobservable there.
 async fn run_scheduler(
     opts: &OrchestratorRunOpts,
     run_id: &str,
@@ -2694,7 +2698,13 @@ async fn run_scheduler_scoped(
             // already gets for free), and reusing this path would mean
             // widening `NodeOutcome`'s pause/abort-handle plumbing to a
             // second dispatch shape for no required gain — see this
-            // task's report for the tradeoff (Task 4 may revisit).
+            // task's report for the tradeoff (Task 4 may revisit). The
+            // cost of awaiting inline: an outer sibling that finishes while
+            // the loop runs is not drained until the loop resolves — so
+            // the approval-pause and cancel exits below hand `in_flight`
+            // to the normal drain / `cancel_finalize` rather than
+            // returning over it (a hard failure or a manual pause still
+            // returns immediately, like every other site here).
             //
             // Phase 3 fix: this `StepStarted` (and the `StepResult`
             // `run_loop_node` returns below) now carries
@@ -2768,16 +2778,51 @@ async fn run_scheduler_scoped(
                             );
                         }
                         // Task 4 (spec §3/§5): a member (or a gate on
-                        // one) paused mid-iteration. NOT a failure —
-                        // forward it as the exact same hard-return every
-                        // other pause site in this function uses (no
-                        // `StepFailed`/`StepCompleted` event for the
-                        // loop itself; the paused member's own event was
-                        // already emitted deep inside the recursive
-                        // call). A later resume re-enters this loop at
-                        // its checkpointed iteration (`run_loop_node`'s
+                        // one) paused mid-iteration. NOT a failure, and no
+                        // `StepFailed`/`StepCompleted` event for the loop
+                        // itself — the paused member's own event was
+                        // already emitted deep inside the recursive call.
+                        // A later resume re-enters this loop at its
+                        // checkpointed iteration (`run_loop_node`'s
                         // `load_loop_start_iteration`) and re-runs only
                         // that iteration's not-done members.
+                        //
+                        // An approval pause batch-parks exactly like a
+                        // direct gate (spec §7): fold the loop's parked
+                        // gates into `parked` and keep scheduling, so the
+                        // OUTER siblings already in `in_flight` drain to
+                        // completion (result recorded, not re-run on
+                        // resume) instead of being aborted by the
+                        // `JoinSet` drop a hard return would cause. The
+                        // loop super-node stays not-done, so nothing
+                        // downstream of it becomes ready. Its `seed`/
+                        // `fanout_completed_units` are always empty here —
+                        // only a manual pause produces either.
+                        Ok(LoopNodeOutcome::Paused {
+                            step_id,
+                            prompt,
+                            timeout_seconds,
+                            reason: PauseReason::Approval,
+                            seed,
+                            fanout_completed_units,
+                            gates,
+                        }) => {
+                            debug_assert!(seed.is_empty() && fanout_completed_units.is_empty());
+                            if gates.is_empty() {
+                                parked.push(GateParked {
+                                    step_id,
+                                    prompt,
+                                    timeout_seconds,
+                                });
+                            } else {
+                                parked.extend(gates);
+                            }
+                        }
+                        // A manual pause keeps the same hard-return
+                        // contract as every other manual pause site in
+                        // this function (it carries a single paused
+                        // step's seed / fan-out checkpoint, which the
+                        // awaiting-set model can't merge).
                         Ok(LoopNodeOutcome::Paused {
                             step_id,
                             prompt,
@@ -2807,6 +2852,36 @@ async fn run_scheduler_scoped(
                                         error: e.to_string(),
                                     },
                                 );
+                            }
+                            // A whole-run cancel that landed while the
+                            // loop was awaited inline: its own members
+                            // were already torn down by the recursive
+                            // call's `cancel_finalize`, but the OUTER
+                            // siblings in `in_flight` must go through
+                            // that same path too (spec §8) rather than a
+                            // bare `JoinSet` drop, so one that already
+                            // finished keeps its real result.
+                            if let RunWorkflowError::RunCancelled {
+                                aborted: loop_aborted,
+                            } = e
+                            {
+                                return match cancel_finalize(
+                                    opts,
+                                    run_id,
+                                    step_results,
+                                    &mut in_flight,
+                                    &mut cancel_state,
+                                    current_loop_iteration,
+                                )
+                                .await
+                                {
+                                    Err(RunWorkflowError::RunCancelled { aborted }) => {
+                                        Err(RunWorkflowError::RunCancelled {
+                                            aborted: loop_aborted + aborted,
+                                        })
+                                    }
+                                    other => other,
+                                };
                             }
                             return Err(e);
                         }
@@ -3527,8 +3602,9 @@ async fn run_loop_node(
 /// can't also carry `InnerOutcome::Done`, which `run_loop_node` never
 /// produces this way — it uses `Completed` instead). The caller
 /// (`run_scheduler_scoped`'s loop-supernode dispatch interception)
-/// turns `Paused` into a normal `InnerOutcome::Paused` hard-return —
-/// this is what makes a mid-loop pause resumable instead of the
+/// batch-parks an approval `Paused` alongside any direct gates (draining
+/// the outer in-flight siblings first) and hard-returns a manual one —
+/// either way a normal, resumable `InnerOutcome::Paused` instead of the
 /// fail-loud `LoopIterationPaused` Task 3 shipped (now removed).
 enum LoopNodeOutcome {
     Completed(StepResult, crate::templates::LoopProgress),
@@ -13896,10 +13972,6 @@ steps:
   - id: ship
     agent: shipper
     prompt: "ship"
-    # After the loop (collapsed: `loop:refine -> ship`). Without the edge
-    # `ship` is a root racing the loop concurrently, and whether its result
-    # is folded in before the gate parks is an interleaving accident.
-    depends_on: [review]
 loops:
   refine:
     nodes: [work, review]
@@ -14022,14 +14094,17 @@ loops:
         assert_eq!(awaiting1.gates.len(), 1);
         assert_eq!(awaiting1.gates[0].step_id, "review");
         assert_eq!(count_ids(&res1.step_results, "work"), 1);
-        assert_eq!(count_ids(&res1.step_results, "ship"), 0);
+        // `ship` has no dependencies — a root sibling running in parallel
+        // with the loop. The in-loop gate batch-parks like a direct gate,
+        // so `ship` is drained and recorded here rather than aborted.
+        assert_eq!(count_ids(&res1.step_results, "ship"), 1);
 
         let rec1 = store.load(&run_id).unwrap();
         assert_eq!(rec1.loop_progress.get("refine"), Some(&0));
 
         // --- Approve + resume: the gate resolves, `until` holds
         // (non-empty decision JSON), the loop converges at iteration 0,
-        // `ship` runs exactly once.
+        // and `ship` (already done in phase 1) is not re-run.
         store
             .approve_gate(&run_id, "matt", chrono::Utc::now(), None)
             .unwrap();
@@ -14074,6 +14149,447 @@ loops:
             1,
             "ship exactly once"
         );
+    }
+
+    const LOOP_GATE_WITH_SIBLING_WF: &str = r#"
+name: loop-gate-with-sibling
+steps:
+  - id: work
+    agent: worker
+    prompt: "work {{ loops.refine.iteration }}"
+  - id: review
+    approval:
+      prompt: "approve iteration {{ loops.refine.iteration }}?"
+    depends_on: [work]
+  - id: side
+    agent: sider
+    prompt: "side"
+loops:
+  refine:
+    nodes: [work, review]
+    until: "{{ steps.review.output }}"
+    max_iterations: 3
+"#;
+
+    /// Records every event and runs `hook` on each — the tests below use
+    /// it to fire a [`tokio::sync::Notify`] (or a cancel token) at an
+    /// exact scheduler boundary, so ordering is by construction rather
+    /// than by a timing race.
+    struct HookSink {
+        events: Mutex<Vec<crate::executor::Event>>,
+        hook: Box<dyn Fn(&crate::executor::Event) + Send + Sync>,
+    }
+    impl HookSink {
+        fn new(hook: impl Fn(&crate::executor::Event) + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Vec::new()),
+                hook: Box::new(hook),
+            })
+        }
+        fn position(&self, pred: impl Fn(&crate::executor::Event) -> bool) -> Option<usize> {
+            self.events.lock().unwrap().iter().position(pred)
+        }
+    }
+    impl crate::executor::EventSink for HookSink {
+        fn emit(&self, _run_id: &str, ev: &crate::executor::Event) {
+            self.events.lock().unwrap().push(ev.clone());
+            (self.hook)(ev);
+        }
+    }
+
+    fn is_awaiting(ev: &crate::executor::Event, id: &str) -> bool {
+        matches!(ev, crate::executor::Event::StepAwaitingApproval { step_id, .. } if step_id == id)
+    }
+    fn is_completed(ev: &crate::executor::Event, id: &str) -> bool {
+        matches!(ev, crate::executor::Event::StepCompleted { step_id, .. } if step_id == id)
+    }
+
+    /// Records every dispatched step id; a step listed in `waits` blocks
+    /// on its [`tokio::sync::Notify`] before its agent run is built (a
+    /// `Notify` nobody ever fires blocks it forever). `notify_one` stores
+    /// a permit when nobody is waiting yet, so a waiter can never miss a
+    /// signal that fired first.
+    struct WaitingFactory {
+        calls: Arc<Mutex<Vec<String>>>,
+        waits: Vec<(&'static str, Arc<tokio::sync::Notify>)>,
+    }
+    impl WaitingFactory {
+        fn new(waits: Vec<(&'static str, Arc<tokio::sync::Notify>)>) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                waits,
+            }
+        }
+    }
+    #[async_trait]
+    impl StepFactory for WaitingFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if let Some((_, signal)) = self.waits.iter().find(|(id, _)| *id == step_id) {
+                signal.notified().await;
+            }
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: format!("out-{step_id}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                seed_source: None,
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                on_usage: None,
+                concerns: None,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                scope_name: None,
+                surface_tag: None,
+                pause: None,
+                codename: None,
+            }
+        }
+    }
+
+    fn sibling_opts(
+        tmp: &tempfile::TempDir,
+        factory: WaitingFactory,
+        event_sink: Option<Arc<HookSink>>,
+        run_store: Option<Arc<crate::runs::RunStore>>,
+        resume_from: Option<ResumeState>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            run_step: Default::default(),
+            workflow: Workflow::parse(LOOP_GATE_WITH_SIBLING_WF).unwrap(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_sibling".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store,
+            workflow_yaml: Some(LOOP_GATE_WITH_SIBLING_WF.to_string()),
+            resume_from,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: event_sink.map(|s| s as Arc<dyn crate::executor::EventSink>),
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+            naming: None,
+        }
+    }
+
+    /// A gate parking INSIDE a loop must drain the outer scheduler's
+    /// in-flight siblings before the run parks — exactly what the
+    /// direct-gate batch-park path (`parked`) already does — instead of
+    /// hard-returning and dropping the outer `JoinSet`, which aborts every
+    /// sibling mid-flight. `side` is a root sibling running in parallel
+    /// with the loop that only finishes AFTER `review` has parked. It must
+    /// complete with a terminal `StepCompleted`, a persisted
+    /// `step_results.jsonl` record and a transcript ending in
+    /// `RunComplete`, and must NOT be re-dispatched on resume.
+    #[tokio::test]
+    async fn loop_gate_pause_drains_in_flight_sibling_instead_of_aborting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+
+        let gate_parked = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&gate_parked);
+        let sink = HookSink::new(move |ev| {
+            if is_awaiting(ev, "review") {
+                signal.notify_one();
+            }
+        });
+        let opts1 = sibling_opts(
+            &tmp,
+            WaitingFactory::new(vec![("side", gate_parked)]),
+            Some(Arc::clone(&sink)),
+            Some(Arc::clone(&store)),
+            None,
+        );
+        let res1 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts1))
+            .await
+            .expect("phase 1 must not hang")
+            .expect("phase 1 must park, not error");
+        let run_id = res1.run_id.clone();
+        let awaiting1 = res1
+            .awaiting
+            .clone()
+            .expect("the in-loop gate must park the run");
+        assert_eq!(awaiting1.reason, PauseReason::Approval);
+        assert_eq!(awaiting1.step_id, "review");
+        assert_eq!(
+            awaiting1
+                .gates
+                .iter()
+                .map(|g| g.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["review"]
+        );
+
+        // The sibling finished and its result was recorded — in memory...
+        let side = res1
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "side")
+            .unwrap_or_else(|| {
+                panic!(
+                    "side must be drained and recorded, not aborted: {:?}",
+                    res1.step_results
+                        .iter()
+                        .map(|sr| &sr.step_id)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(side.success);
+        assert_eq!(count_ids(&res1.step_results, "side"), 1);
+        // ...and on disk.
+        assert_eq!(
+            store
+                .read_step_results(&run_id)
+                .unwrap()
+                .iter()
+                .filter(|r| r.step_id == "side")
+                .count(),
+            1,
+            "side must be persisted to step_results.jsonl exactly once"
+        );
+
+        // Its transcript ran to completion (an aborted agent run leaves a
+        // transcript with no `RunComplete`).
+        let has_run_complete = JsonlReader::iter(&side.transcript_path)
+            .expect("side's transcript must exist")
+            .any(|ev| matches!(ev, Ok(Event::RunComplete { .. })));
+        assert!(
+            has_run_complete,
+            "side's transcript must end in RunComplete: {}",
+            side.transcript_path.display()
+        );
+
+        // A terminal event, and it landed strictly after the gate parked —
+        // proof the scheduler drained a still-running sibling rather than
+        // merely recording one that happened to finish first.
+        let parked_at = sink
+            .position(|ev| is_awaiting(ev, "review"))
+            .expect("review must emit StepAwaitingApproval");
+        let completed_at = sink
+            .position(|ev| is_completed(ev, "side"))
+            .expect("side must emit a terminal StepCompleted");
+        assert!(
+            completed_at > parked_at,
+            "side must finish after the gate parked (parked at {parked_at}, completed at {completed_at})"
+        );
+
+        // --- Approve + resume: the loop converges; `side` is done and must
+        // NOT be re-dispatched (no duplicated LLM cost / side effects).
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), None)
+            .unwrap();
+        let factory2 = WaitingFactory::new(Vec::new());
+        let calls2 = Arc::clone(&factory2.calls);
+        let opts2 = sibling_opts(
+            &tmp,
+            factory2,
+            None,
+            Some(Arc::clone(&store)),
+            Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "review".to_string(),
+            )),
+        );
+        let res2 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts2))
+            .await
+            .expect("resume must not hang")
+            .expect("resume must converge and complete");
+        assert!(res2.awaiting.is_none());
+        let calls2 = calls2.lock().unwrap().clone();
+        assert!(
+            !calls2.iter().any(|s| s == "side"),
+            "side already completed in phase 1 and must not re-run: {calls2:?}"
+        );
+        assert_eq!(count_ids(&res2.step_results, "side"), 1);
+        assert_eq!(
+            store
+                .read_step_results(&run_id)
+                .unwrap()
+                .iter()
+                .filter(|r| r.step_id == "side")
+                .count(),
+            1,
+            "side must still have exactly one persisted record after resume"
+        );
+    }
+
+    /// Pause-vs-cancel, half 1: a whole-run cancel landing WHILE the outer
+    /// scheduler drains siblings after an in-loop gate parked tears them
+    /// down through the same `cancel_finalize` path as any other cancel
+    /// (abort, no `StepResult`, `RunCancelled`) — the drain must never
+    /// wait on a sibling that would otherwise run forever. `side` blocks
+    /// on a signal nobody fires; the cancel fires only once the gate has
+    /// parked (the spawned task can't run until the outer scheduler first
+    /// yields, which is its post-pause drain).
+    #[tokio::test]
+    async fn cancel_during_post_loop_pause_drain_aborts_sibling_instead_of_awaiting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate_parked = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&gate_parked);
+        let sink = HookSink::new(move |ev| {
+            if is_awaiting(ev, "review") {
+                signal.notify_one();
+            }
+        });
+        let never = Arc::new(tokio::sync::Notify::new());
+        let factory = WaitingFactory::new(vec![("side", never)]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = sibling_opts(&tmp, factory, Some(Arc::clone(&sink)), None, None);
+
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        tokio::spawn(async move {
+            gate_parked.notified().await;
+            trigger.cancel();
+        });
+
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                Some(&cancel_token),
+            ),
+        )
+        .await
+        .expect("cancel must stop the drain, not await the sibling forever");
+        match outcome {
+            Err(RunWorkflowError::RunCancelled { aborted }) => {
+                assert_eq!(aborted, 1, "the still-running side must be aborted");
+            }
+            other => panic!("expected Err(RunCancelled), got {other:?}"),
+        }
+        assert!(sink.position(|ev| is_awaiting(ev, "review")).is_some());
+        assert!(
+            calls.lock().unwrap().iter().any(|s| s == "side"),
+            "side must have been dispatched before the cancel"
+        );
+        assert_eq!(
+            count_ids(&step_results, "side"),
+            0,
+            "an aborted sibling has no checkpoint and must restart clean: {step_results:?}"
+        );
+    }
+
+    /// Pause-vs-cancel, half 2: a whole-run cancel landing while the loop
+    /// super-node is still being awaited inline (here: the instant its
+    /// gate parks, so the cancel wins over the pause) must also tear the
+    /// OUTER siblings down through `cancel_finalize` instead of dropping
+    /// the `JoinSet` — so a sibling that had already FINISHED but not yet
+    /// been drained keeps its real result (spec §8: a node that raced to
+    /// completion before its abort is still recorded) instead of being
+    /// silently discarded and re-run on restart. `work` waits for `side`'s
+    /// `StepCompleted` so `side` is guaranteed done-but-undrained.
+    #[tokio::test]
+    async fn cancel_during_inline_loop_keeps_already_finished_sibling_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let side_done = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&side_done);
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        let sink = HookSink::new(move |ev| {
+            if is_completed(ev, "side") {
+                signal.notify_one();
+            }
+            if is_awaiting(ev, "review") {
+                trigger.cancel();
+            }
+        });
+        let opts = sibling_opts(
+            &tmp,
+            WaitingFactory::new(vec![("work", side_done)]),
+            Some(Arc::clone(&sink)),
+            None,
+            None,
+        );
+
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                Some(&cancel_token),
+            ),
+        )
+        .await
+        .expect("cancel must not hang");
+        assert!(
+            matches!(outcome, Err(RunWorkflowError::RunCancelled { .. })),
+            "expected Err(RunCancelled), got {outcome:?}"
+        );
+        assert!(
+            sink.position(|ev| is_completed(ev, "side")).unwrap()
+                < sink.position(|ev| is_awaiting(ev, "review")).unwrap(),
+            "precondition: side finished before the cancel landed"
+        );
+        let side = step_results
+            .iter()
+            .find(|sr| sr.step_id == "side")
+            .expect("side finished before the cancel — its result must be kept, not dropped");
+        assert!(side.success);
+        assert_eq!(count_ids(&step_results, "side"), 1);
     }
 
     /// Plan Task 4 Step 5 / spec §3: cancel mid-loop (Phase-2 hard

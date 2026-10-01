@@ -129,7 +129,32 @@ pub async fn resume_run(
         via_timeout,
     ));
 
-    let result = run_workflow(opts).await?;
+    // Hand the resumed (possibly detached) run a cooperative-pause channel,
+    // the same one a fresh `rupu workflow run` wires — pre-fix the rebuild
+    // left `pause: None`, so `rupu workflow pause` / Esc could never stop a
+    // run once it had been approved and resumed. A marker already present
+    // (a pause requested while the run was parked at the gate) is honored
+    // immediately; the poller then watches for one requested mid-resume.
+    let pause_token = tokio_util::sync::CancellationToken::new();
+    let pause_poller = opts.run_store.as_ref().map(|store_arc| {
+        if store_arc.pause_marker_exists(run_id) {
+            pause_token.cancel();
+        }
+        crate::cmd::workflow::spawn_pause_marker_poller(
+            Arc::clone(store_arc),
+            run_id.to_string(),
+            pause_token.clone(),
+        )
+    });
+    opts.pause = Some(pause_token);
+
+    let result = run_workflow(opts).await;
+    // Stop the poller the moment the run reaches any terminal/parked state so
+    // it never outlives its run (mirrors the fresh-run path's `.abort()`).
+    if let Some(handle) = pause_poller {
+        handle.abort();
+    }
+    let result = result?;
     Ok(ResumeOutcome {
         awaited_step_id,
         result,
@@ -354,7 +379,7 @@ async fn rebuild_opts_from_disk(
         global: global.clone(),
         project_root: project_root.clone(),
         resolver,
-        mode_str,
+        mode_str: mode_str.clone(),
         mcp_registry,
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
@@ -369,8 +394,30 @@ async fn rebuild_opts_from_disk(
         limits_ctx,
     });
 
+    // Rebuild the `run:` step policy from the resolved mode + layered config
+    // + workspace, exactly as the fresh-run path does
+    // (`cmd/workflow.rs::run_step_policy_for`). Defaulting it here (the
+    // pre-fix behavior) silently discarded the operator's
+    // `[workflow] run_step_enabled`/allowlist, so a `run:` step reached after
+    // the gate — or in an `on_reject` cleanup chain — was refused with
+    // `ConfigDisabled` regardless of config.
+    let run_step =
+        crate::cmd::workflow::run_step_policy_for(&mode_str, &cfg, workspace_path.clone());
+
+    // Rebuild the fan-out unit dispatcher the same way the fresh-run path
+    // does (`build_dispatcher_if_needed`): `None` when the workflow has no
+    // `distribute:`/`host:` step, a real dispatcher otherwise. Defaulting it
+    // to `None` here would have failed any distributed fan-out step reached
+    // after the gate. Wired to the same store the resumed run reads.
+    let unit_dispatcher = crate::fleet_unit_dispatcher::build_dispatcher_if_needed(
+        &workflow,
+        &global,
+        Arc::clone(&store_arc),
+        cfg.pricing.clone(),
+    );
+
     let opts = OrchestratorRunOpts {
-        run_step: Default::default(),
+        run_step,
         workflow,
         inputs: inputs_map,
         workspace_id: record.workspace_id.clone(),
@@ -386,8 +433,11 @@ async fn rebuild_opts_from_disk(
         run_id_override: None,
         strict_templates: false,
         event_sink: event_sink_for_resume,
-        unit_dispatcher: None,
+        unit_dispatcher,
         action_dispatcher: Some(action_dispatcher),
+        // `pause` is wired by `resume_run` (the approve-resume path), not
+        // here: the reject-cleanup path runs uninterrupted by design (see
+        // `run_reject_cleanup`), so it must keep `None`.
         pause: None,
         naming: Some(naming),
     };

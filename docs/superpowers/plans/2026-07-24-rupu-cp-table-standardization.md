@@ -62,6 +62,11 @@ the same rollup that produces `run_count`, so wiring it onto agents is thin.
 
 AutoflowRuns additionally keeps **Issue Ref** (slot 4b) — page-specific, justified.
 
+**Later exception (#642, 2026-09-01):** on AutoflowRuns, **Started** sits second — immediately after
+Status — instead of at slot 13, and is not right-aligned. That table is where walls of CYCLE FAILED
+rows get read, and as the trailing column the failure time sat past the horizontal scroll. The other
+three run-like tables keep the order above. Pinned by `AutoflowRuns.columnOrder.test.tsx`.
+
 **Definition tables** — Agents, Workflows, AutoflowsDefs:
 `[Name subject] [Scope] [Trigger?] [Description?] [Runs] [Tokens] [Cost] [Last run] [(actions)]`
 
