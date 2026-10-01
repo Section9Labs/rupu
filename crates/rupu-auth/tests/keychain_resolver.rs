@@ -255,3 +255,73 @@ async fn explicit_sso_hint_is_not_satisfied_by_env_api_key_for_undeclared_accoun
 
     std::env::remove_var("RUPU_AUTH_FILE");
 }
+
+/// An SSO credential near expiry is refreshed inline by `get`. The OAuth
+/// server rotates the refresh token, so a `get` dropped mid-refresh (a
+/// pause, a listing timeout) must still persist the new token, and the next
+/// `get` must not start a second refresh with the rotated-out one: it waits
+/// for the refresh in flight and reads what it stored. Exactly one token
+/// request reaches the server.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_abandoned_sso_refresh_still_persists_and_is_not_repeated() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .delay(std::time::Duration::from_millis(300))
+            .json_body(serde_json::json!({
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600
+            }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+
+    let r = KeychainResolver::new();
+    r.store(
+        ProviderId::Anthropic,
+        AuthMode::Sso,
+        &StoredCredential {
+            credentials: rupu_providers::auth::AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: Default::default(),
+            },
+            refresh_token: Some("refresh-1".into()),
+            // Inside the refresh buffer.
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
+        },
+    )
+    .await
+    .expect("store");
+
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        r.get("anthropic", Some(AuthMode::Sso)),
+    )
+    .await;
+    assert!(dropped.is_err(), "the caller gave up mid-refresh");
+
+    let (_, creds) = r
+        .get("anthropic", Some(AuthMode::Sso))
+        .await
+        .expect("the next get succeeds");
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth {
+            access, refresh, ..
+        } => {
+            assert_eq!(access, "access-2");
+            assert_eq!(refresh, "refresh-2");
+        }
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+    token.assert_hits(1);
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(saved.contains("refresh-2"), "{saved}");
+}

@@ -154,9 +154,13 @@ impl KeychainResolver {
     }
 
     fn write_account(&self, account: &str, payload: &str) -> Result<()> {
-        let mut map = Self::read_file_map(&self.path)?;
+        Self::write_account_at(&self.path, account, payload)
+    }
+
+    fn write_account_at(path: &std::path::Path, account: &str, payload: &str) -> Result<()> {
+        let mut map = Self::read_file_map(path)?;
         map.insert(account.to_string(), payload.to_string());
-        Self::write_file_map(&self.path, &map)?;
+        Self::write_file_map(path, &map)?;
         Ok(())
     }
 
@@ -188,8 +192,17 @@ impl KeychainResolver {
         legacy_base: Option<&str>,
         mode: AuthMode,
     ) -> Result<Option<StoredCredential>> {
+        Self::read_account_at(&self.path, account_base, legacy_base, mode)
+    }
+
+    fn read_account_at(
+        path: &std::path::Path,
+        account_base: &str,
+        legacy_base: Option<&str>,
+        mode: AuthMode,
+    ) -> Result<Option<StoredCredential>> {
         let account = format!("{account_base}/{}", mode.as_str());
-        let map = Self::read_file_map(&self.path)?;
+        let map = Self::read_file_map(path)?;
         if let Some(s) = map.get(&account) {
             return Ok(Some(parse_stored_credential(s, mode)?));
         }
@@ -247,9 +260,60 @@ impl KeychainResolver {
         mode: AuthMode,
         sc: &StoredCredential,
     ) -> Result<()> {
+        Self::store_named_at(&self.path, name, mode, sc)
+    }
+
+    fn store_named_at(
+        path: &std::path::Path,
+        name: &str,
+        mode: AuthMode,
+        sc: &StoredCredential,
+    ) -> Result<()> {
         let account = format!("{name}/{}", mode.as_str());
         let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        self.write_account(&account, &payload)
+        Self::write_account_at(path, &account, &payload)
+    }
+
+    /// Refresh `account`'s stored `mode` credential and persist it — as a
+    /// tracked task ([`rupu_providers::credential_writes`], which the binary
+    /// drains before exit), under a process-wide per-credential lock.
+    ///
+    /// Cancel-safe: the OAuth server rotates the refresh token, so a refresh
+    /// abandoned between its response and the write (the caller dropped — a
+    /// pause, a listing timeout) would leave only a dead token behind. Here
+    /// the caller only waits; the task finishes and persists. The lock plus
+    /// a re-read under it means a later caller (in any resolver of this
+    /// process) waits for a refresh in flight and reads what it stored,
+    /// instead of starting a second refresh with the rotated-out token.
+    /// `only_if_near_expiry` (the `get` path) skips the refresh when the
+    /// re-read credential is already fresh; the forced `refresh` path always
+    /// refreshes, from the latest stored token.
+    async fn refresh_and_store(
+        &self,
+        account: &str,
+        kind: ProviderId,
+        mode: AuthMode,
+        only_if_near_expiry: bool,
+    ) -> Result<StoredCredential> {
+        let path = self.path.clone();
+        let account = account.to_string();
+        let legacy = Self::legacy_base(&account).map(str::to_string);
+        let job = rupu_providers::credential_writes::spawn(async move {
+            let lock = refresh_lock(&path, &account);
+            let _guard = lock.lock().await;
+            let sc = Self::read_account_at(&path, &account, legacy.as_deref(), mode)?
+                .ok_or_else(|| anyhow::anyhow!("no stored credential for {account}/{mode:?}"))?;
+            if only_if_near_expiry
+                && !sc.is_near_expiry(chrono::Utc::now(), EXPIRY_REFRESH_BUFFER_SECS)
+            {
+                return Ok(sc);
+            }
+            let new = Self::refresh_inner(&account, kind, &sc).await?;
+            Self::store_named_at(&path, &account, mode, &new)?;
+            Ok(new)
+        });
+        job.await
+            .map_err(|e| anyhow::anyhow!("credential refresh task failed: {e}"))?
     }
 
     /// Forget a named credential. No-op if absent.
@@ -401,7 +465,6 @@ impl KeychainResolver {
     /// `anthropic-work` and `anthropic-personal` to re-authenticate the
     /// wrong one.
     async fn refresh_inner(
-        &self,
         account: &str,
         kind: ProviderId,
         sc: &StoredCredential,
@@ -508,6 +571,21 @@ impl Default for KeychainResolver {
     }
 }
 
+/// The process-wide lock serializing refreshes of one account's stored
+/// credentials, keyed by auth file and account. Every `KeychainResolver` in
+/// the process shares it: the CLI builds a fresh resolver per command and
+/// per step.
+fn refresh_lock(path: &std::path::Path, account: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let key = format!("{}#{account}", path.display());
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(key).or_default().clone()
+}
+
 /// Deserialize a keychain entry's payload into a [`StoredCredential`].
 ///
 /// Most entries hold the canonical JSON-serialized `StoredCredential`. For
@@ -550,9 +628,7 @@ impl CredentialResolver for KeychainResolver {
                 if let Some(mut sc) = self.read_account(provider, legacy, mode)? {
                     let now = chrono::Utc::now();
                     if mode == AuthMode::Sso && sc.is_near_expiry(now, EXPIRY_REFRESH_BUFFER_SECS) {
-                        let new = self.refresh_inner(provider, kind, &sc).await?;
-                        self.store_named(provider, mode, &new).await?;
-                        sc = new;
+                        sc = self.refresh_and_store(provider, kind, mode, true).await?;
                     }
                     return Ok((mode, sc.credentials));
                 }
@@ -584,12 +660,7 @@ impl CredentialResolver for KeychainResolver {
     async fn refresh(&self, provider: &str, mode: AuthMode) -> Result<AuthCredentials> {
         let kind = crate::account::resolve_provider_id(provider, &self.accounts)
             .ok_or_else(|| anyhow::anyhow!("unknown provider or account: {provider}"))?;
-        let legacy = Self::legacy_base(provider);
-        let sc = self
-            .read_account(provider, legacy, mode)?
-            .ok_or_else(|| anyhow::anyhow!("no stored credential for {provider}/{mode:?}"))?;
-        let new = self.refresh_inner(provider, kind, &sc).await?;
-        self.store_named(provider, mode, &new).await?;
+        let new = self.refresh_and_store(provider, kind, mode, false).await?;
         Ok(new.credentials)
     }
 }
