@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use rupu_agent::runner::BypassDecider;
 use rupu_agent::AgentRunOpts;
-use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
+use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory};
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, Usage};
 use rupu_providers::{LlmProvider, ProviderError, StreamEvent};
@@ -174,8 +174,14 @@ async fn a_cancel_that_lands_while_the_run_finishes_is_not_overwritten() {
         pause: None,
         naming: None,
     };
-    // The step itself ran to completion; what the record says is the point.
-    let _ = run_workflow(opts).await;
+    // The step itself ran to completion; what the record says is the point —
+    // and the outcome handed back must say the same, or the caller reports
+    // a cancelled run as completed.
+    let outcome = run_workflow(opts).await;
+    match outcome {
+        Err(RunWorkflowError::RunCancelled { aborted: 0 }) => {}
+        other => panic!("a preserved cancel is returned as cancelled, got {other:?}"),
+    }
 
     let record = store.load(RUN_ID).expect("run record");
     assert_eq!(

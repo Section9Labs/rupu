@@ -26,6 +26,15 @@ steps:
     prompt: hi
 "#;
 
+/// One step that stays `Running` for a second (a `bash` tool call), so a
+/// cancel can land on disk while the run is in flight.
+const SLOW_MOCK_SCRIPT: &str = r#"
+[
+  { "AssistantToolUse": { "text": null, "tool_id": "call_1", "tool_name": "bash", "tool_input": { "command": "sleep 1" }, "stop": "tool_use" } },
+  { "AssistantText": { "text": "step output", "stop": "end_turn" } }
+]
+"#;
+
 const FANOUT_WORKFLOW_YAML: &str = r#"name: fanout-wf
 inputs:
   files:
@@ -278,6 +287,91 @@ async fn workflow_show_missing_exits_nonzero() {
         format!("{:?}", std::process::ExitCode::from(0)),
         "workflow show for missing workflow should exit nonzero"
     );
+}
+
+/// A cancel that lands on disk while the run finishes (`cp serve`, or a
+/// CLI `cancel` that cannot signal the runner) is what the run reports: the
+/// record stays `Cancelled`, and `workflow run` exits non-zero as for any
+/// cancel — instead of printing a completed run and exiting 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_run_reports_a_cancel_that_lands_while_the_run_finishes() {
+    use rupu_orchestrator::RunStatus;
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str("---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nyou echo.")
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/hello-wf.yaml")
+        .write_str(WORKFLOW_YAML)
+        .unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", SLOW_MOCK_SCRIPT);
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Another process's cancel, as soon as the run is running. In-process,
+    // `cancel` does not signal its own pid — exactly the `cp serve` shape —
+    // so the run keeps going and its terminal flip meets the cancel.
+    let runs_dir = global.path().join("runs");
+    let canceller = tokio::spawn(async move {
+        let store = rupu_orchestrator::RunStore::new(runs_dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(run) = store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|r| r.status == RunStatus::Running)
+            {
+                store
+                    .cancel(&run.id, "another-process", "stop it", chrono::Utc::now())
+                    .expect("a running run can be cancelled");
+                return run.id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never became Running"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "hello-wf".into(),
+        "--mode".into(),
+        "bypass".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_HOME");
+
+    let run_id = canceller.await.expect("the canceller finished");
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(1)),
+        "a cancelled run exits non-zero, as any cancel does"
+    );
+    let record = rupu_orchestrator::RunStore::new(global.path().join("runs"))
+        .load(&run_id)
+        .unwrap();
+    assert_eq!(
+        record.status,
+        RunStatus::Cancelled,
+        "the cancel on disk wins"
+    );
+    assert_eq!(record.error_message.as_deref(), Some("stop it"));
 }
 
 #[tokio::test]

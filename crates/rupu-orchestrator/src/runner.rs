@@ -1393,6 +1393,13 @@ pub async fn run_workflow(
         }
     }
 
+    // A cancel preserved on disk is the run's outcome: the record and the
+    // events say `Cancelled`, and so does the return — a caller handed the
+    // in-memory outcome instead would report the run as completed or paused
+    // (the issue summary, `workflow approve`, the autoflow claim, cron).
+    if cancel_preserved {
+        return Err(RunWorkflowError::RunCancelled { aborted: 0 });
+    }
     outcome?;
     Ok(OrchestratorRunResult {
         step_results,

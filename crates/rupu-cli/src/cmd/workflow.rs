@@ -5053,8 +5053,12 @@ async fn execute_workflow_invocation(
     // own terse completion line.
     let print_summary = summary_enabled(ctx.attach_ui, ctx.shared_printer.is_some());
 
-    let workflow_result = if use_live_view {
-        match run_workflow_with_live_view(
+    // The run's outcome, `Err` included: a runner `Err` (agent / render /
+    // action failure, or a cancel that landed on disk while the run was
+    // finishing) still leaves a terminal run on disk, so the shared summary
+    // and the issue notification below see it before it propagates.
+    let run_outcome: anyhow::Result<OrchestratorRunResult> = if use_live_view {
+        run_workflow_with_live_view(
             opts,
             workflow_for_resume.clone(),
             runs_dir.clone(),
@@ -5062,20 +5066,7 @@ async fn execute_workflow_invocation(
             cfg.pricing.clone(),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                // A runner `Err` (agent / render / action failure) still
-                // leaves a Failed run on disk, and the view is already torn
-                // down: print the summary before the error propagates so the
-                // operator keeps the run id + final state (the retired bare
-                // `failed · run_…` line used to provide it).
-                if print_summary {
-                    print_completion_summary(&runs_dir, &run_id, &cfg.pricing);
-                }
-                return Err(to_anyhow_with_input_snippet(e, &path, &body));
-            }
-        }
+        .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
     } else if ctx.attach_ui {
         let runner_task = tokio::spawn(run_workflow(opts));
         let rid = run_id.clone();
@@ -5178,21 +5169,15 @@ async fn execute_workflow_invocation(
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
             {
                 Ok(result) => result,
-                Err(e) => {
-                    // Same as the live-view branch: the printer has finished,
-                    // so print the summary before the runner's error
-                    // propagates (the printer's own failure line above keeps
-                    // the `error:` text).
-                    if print_summary {
-                        print_completion_summary(&runs_dir, &current_run_id, &cfg.pricing);
-                    }
-                    return Err(to_anyhow_with_input_snippet(e, &path, &body));
-                }
+                // The printer has finished; the shared summary below still
+                // prints before the runner's error propagates (the printer's
+                // own failure line above keeps the `error:` text).
+                Err(e) => break Err(to_anyhow_with_input_snippet(e, &path, &body)),
             };
 
             match outcome {
                 AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
-                    break result;
+                    break Ok(result);
                 }
                 AttachOutcome::Cancelled => {
                     unreachable!("cancelled outcome is handled before join")
@@ -5280,7 +5265,7 @@ async fn execute_workflow_invocation(
     } else {
         run_workflow(opts)
             .await
-            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
+            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
     };
 
     // The run has finished (terminal or paused); the marker poller has no
@@ -5293,11 +5278,34 @@ async fn execute_workflow_invocation(
     // and the retained / line-printer attach (which suppress their terse
     // success line via `AttachOpts::suppress_done_line`). Not printed for the
     // no-UI path or shared-printer callers (see `print_summary` above). Also
-    // covers a run that parked at a gate: the formatter branches on
-    // `AwaitingApproval` and prints the gate + approve/reject block.
+    // covers a run that parked at a gate (the formatter branches on
+    // `AwaitingApproval` and prints the gate + approve/reject block) and a
+    // run that failed or was cancelled, so the operator keeps the run id +
+    // final state before the error propagates.
     if print_summary {
         print_completion_summary(&runs_dir, &run_id, &cfg.pricing);
     }
+
+    if notify_issue_enabled {
+        if let (Some(ref_text), Some(payload), Some(outcome)) = (
+            &issue_ref_text_for_notify,
+            &issue_payload_for_notify,
+            run_summary_outcome(&run_outcome),
+        ) {
+            post_run_summary_to_issue(
+                &registry_for_notify,
+                ref_text,
+                payload,
+                &workflow_name_for_notify,
+                &run_id,
+                &outcome,
+                notify_cwd_for_notify.as_deref(),
+            )
+            .await;
+        }
+    }
+
+    let workflow_result = run_outcome?;
 
     let artifact_manifest_path = persist_portable_run_metadata(
         run_store_for_resume.as_ref(),
@@ -5305,22 +5313,6 @@ async fn execute_workflow_invocation(
         run_envelope.trigger.wake_id.as_deref(),
     )?
     .map(|(path, _)| path);
-
-    if notify_issue_enabled {
-        if let (Some(ref_text), Some(payload)) =
-            (&issue_ref_text_for_notify, &issue_payload_for_notify)
-        {
-            post_run_summary_to_issue(
-                &registry_for_notify,
-                ref_text,
-                payload,
-                &workflow_name_for_notify,
-                &workflow_result,
-                notify_cwd_for_notify.as_deref(),
-            )
-            .await;
-        }
-    }
 
     Ok(RunOutcomeSummary {
         run_id: workflow_result.run_id,
@@ -5331,16 +5323,44 @@ async fn execute_workflow_invocation(
     })
 }
 
+/// Whether `err` is the orchestrator reporting the run as cancelled —
+/// `RunWorkflowError::RunCancelled`, the outcome of a whole-run cancel and
+/// of a cancel that landed on disk while the run was finishing.
+pub(crate) fn run_was_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        matches!(
+            e.downcast_ref::<RunWorkflowError>(),
+            Some(RunWorkflowError::RunCancelled { .. })
+        )
+    })
+}
+
+/// The outcome clause of the issue summary comment, or `None` when the run
+/// ended in an error that is not reported there (a hard failure).
+fn run_summary_outcome(result: &anyhow::Result<OrchestratorRunResult>) -> Option<String> {
+    match result {
+        Ok(result) => Some(match &result.awaiting {
+            Some(info) => format!("paused at step `{}` awaiting approval", info.step_id),
+            // Every step in the result succeeded: the orchestrator returns
+            // `Err` on a hard failure, so reaching here means a clean run.
+            None => format!("completed ({} steps)", result.step_results.len()),
+        }),
+        Err(e) if run_was_cancelled(e) => Some("cancelled".to_string()),
+        Err(_) => None,
+    }
+}
+
 /// Post a one-line summary comment to the targeted issue describing
-/// the run's outcome. Best-effort — surfaces a `tracing::warn!` on
-/// failure rather than propagating, so a slow / down issue tracker
-/// doesn't fail an otherwise-successful run.
+/// the run's `outcome` (see [`run_summary_outcome`]). Best-effort —
+/// surfaces a `tracing::warn!` on failure rather than propagating, so a
+/// slow / down issue tracker doesn't fail an otherwise-successful run.
 async fn post_run_summary_to_issue(
     registry: &rupu_scm::Registry,
     ref_text: &str,
     payload: &serde_json::Value,
     workflow_name: &str,
-    result: &rupu_orchestrator::OrchestratorRunResult,
+    run_id: &str,
+    outcome: &str,
     cwd: Option<&std::path::Path>,
 ) {
     // Reconstruct an `IssueRef` from the persisted text + payload.
@@ -5408,23 +5428,11 @@ async fn post_run_summary_to_issue(
         }
     };
 
-    let outcome = match &result.awaiting {
-        Some(info) => format!("paused at step `{}` awaiting approval", info.step_id),
-        None => {
-            // Distinguish failure from success by checking that
-            // every step in the result succeeded. The orchestrator
-            // would have returned Err earlier if there was a hard
-            // failure, so reaching here means a clean run.
-            let step_count = result.step_results.len();
-            format!("completed ({step_count} steps)")
-        }
-    };
-
     let body = format!(
         "🤖 rupu workflow `{}` (run `{}`) {}.\n\n\
          Inspect: `rupu workflow show-run {}`\n\
          Live: `rupu watch {}`",
-        workflow_name, result.run_id, outcome, result.run_id, result.run_id,
+        workflow_name, run_id, outcome, run_id, run_id,
     );
 
     if let Err(e) = conn.comment_issue(&r, &body).await {
@@ -5617,6 +5625,50 @@ mod tests {
             Some(v) => std::env::set_var("RUPU_LIVE_VIEW", v),
             None => std::env::remove_var("RUPU_LIVE_VIEW"),
         }
+    }
+
+    /// The issue summary's outcome clause: paused / completed / cancelled,
+    /// and nothing for a hard failure (not posted).
+    #[test]
+    fn run_summary_outcome_reports_paused_completed_and_cancelled() {
+        let completed = OrchestratorRunResult {
+            step_results: vec![Default::default(), Default::default()],
+            run_id: "run_x".into(),
+            awaiting: None,
+        };
+        assert_eq!(
+            run_summary_outcome(&Ok(completed.clone())).as_deref(),
+            Some("completed (2 steps)")
+        );
+        let paused = OrchestratorRunResult {
+            awaiting: Some(rupu_orchestrator::runner::AwaitingInfo {
+                step_id: "review".into(),
+                prompt: "ok?".into(),
+                expires_at: None,
+                reason: rupu_orchestrator::runner::PauseReason::Approval,
+                resume_seed: Vec::new(),
+                fanout_completed_units: BTreeMap::new(),
+                gates: Vec::new(),
+            }),
+            ..completed
+        };
+        assert_eq!(
+            run_summary_outcome(&Ok(paused)).as_deref(),
+            Some("paused at step `review` awaiting approval")
+        );
+        let cancelled: anyhow::Error = RunWorkflowError::RunCancelled { aborted: 0 }.into();
+        assert!(run_was_cancelled(&cancelled));
+        assert_eq!(
+            run_summary_outcome(&Err(cancelled)).as_deref(),
+            Some("cancelled")
+        );
+        // Through a context layer too (the CLI wraps errors on the way up).
+        let wrapped = anyhow::Error::from(RunWorkflowError::RunCancelled { aborted: 2 })
+            .context("resume run_x");
+        assert!(run_was_cancelled(&wrapped));
+        let failed: anyhow::Error = RunWorkflowError::Io(std::io::Error::other("disk")).into();
+        assert!(!run_was_cancelled(&failed));
+        assert_eq!(run_summary_outcome(&Err(failed)), None);
     }
 
     fn sample_run_record(status: RunStatus, runner_pid: Option<u32>) -> RunRecord {
