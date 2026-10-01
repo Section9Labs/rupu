@@ -7728,10 +7728,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         // The session's limits: the value stored by an earlier turn (including
         // any limit learned from an overflow error), else resolved now — the
-        // first turn — through this turn's provider (spec 2026-09-30 §6.5).
+        // first turn — through this turn's provider (spec 2026-09-30 §6.5). A
+        // stored value with NO known side is a transient first-turn failure
+        // (timeout, network blip), not an answer: resolve again — a cache read
+        // unless stale — and persist the result below.
         let limits = match session.model_limits.clone() {
-            Some(l) => l,
-            None => {
+            Some(l) if !l.is_unresolved() => l,
+            _ => {
                 rupu_runtime::model_limits::resolve(
                     rupu_runtime::model_limits::LimitOverrides {
                         context_window_tokens: session.context_window_tokens,
@@ -10881,6 +10884,79 @@ mod tests {
             after.model_limits.is_some(),
             "the first turn's resolution is persisted for later turns"
         );
+    }
+
+    /// Seed a fresh `anthropic` model-list cache (200K input / 64K output for
+    /// the test session's model) under `global`'s cache dir.
+    fn seed_fresh_anthropic_cache(global: &Path) {
+        let dir = global.join("cache/models");
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        let body = format!(
+            r#"{{"schema":2,"fetched_at":"{}","models":[{{"id":"claude-sonnet-4-6","context_window":200000,"max_output_tokens":64000}}]}}"#,
+            Utc::now().to_rfc3339()
+        );
+        std::fs::write(dir.join("anthropic.json"), body).expect("write cache");
+    }
+
+    /// A transient first-turn failure (fetch timeout, network blip) stores
+    /// all-`Unknown` limits. That must not lock the session to unknown for its
+    /// whole life: the next turn re-resolves (a cache read unless stale) and
+    /// persists what it finds. A stored value with ANY known side — notably
+    /// one learned from an overflow — is still reused verbatim.
+    #[tokio::test]
+    async fn all_unknown_stored_limits_are_re_resolved_on_the_next_turn() {
+        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+
+        let (global, mut unknown) = idle_dense_session(&tmp, "ses_limits_unkn01");
+        let (_, mut learned) = idle_dense_session(&tmp, "ses_limits_lrnd01");
+        for r in [&mut unknown, &mut learned] {
+            r.message_history = Vec::new();
+            r.compact_at_percent = None;
+            r.context_window_tokens = None;
+            r.max_tokens = None;
+        }
+        unknown.model_limits = Some(ModelLimits::unknown());
+        let mut partial = ModelLimits::unknown();
+        partial.input = Limit::new(150_000, LimitSource::Observed);
+        learned.model_limits = Some(partial);
+        write_session(&global, SessionScope::Active, &unknown).expect("write unknown session");
+        write_session(&global, SessionScope::Active, &learned).expect("write learned session");
+        seed_fresh_anthropic_cache(&global);
+
+        for (rec, run_id) in [(&unknown, "run_limits_unkn"), (&learned, "run_limits_lrnd")] {
+            with_mock_home(
+                &global,
+                r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+                run_turn(RunTurnArgs {
+                    session_id: rec.session_id.clone(),
+                    run_id: run_id.into(),
+                    prompt: "go".into(),
+                }),
+            )
+            .await
+            .expect("turn completes");
+        }
+
+        let notice = model_limits_notice(&unknown.transcripts_dir.join("run_limits_unkn.jsonl"));
+        assert!(
+            notice.contains("input 200,000 · output 64,000"),
+            "all-unknown stored limits must be re-resolved: {notice}"
+        );
+        let (after, _) = read_session(&global, &unknown.session_id).expect("read unknown");
+        let l = after.model_limits.expect("limits persisted");
+        assert_eq!(l.input.tokens, Some(200_000));
+        assert_eq!(l.output.tokens, Some(64_000));
+
+        let notice = model_limits_notice(&learned.transcripts_dir.join("run_limits_lrnd.jsonl"));
+        assert!(
+            notice.contains("input 150,000"),
+            "a partially known stored value is reused, not re-resolved: {notice}"
+        );
+        let (after, _) = read_session(&global, &learned.session_id).expect("read learned");
+        let l = after.model_limits.expect("limits kept");
+        assert_eq!(l.input, Limit::new(150_000, LimitSource::Observed));
     }
 
     /// A turn's cached tokens come from its `RunResult` — the summed

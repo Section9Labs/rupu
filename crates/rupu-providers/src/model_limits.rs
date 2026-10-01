@@ -161,6 +161,13 @@ impl ModelLimits {
         self.request_max_tokens(false) != self.output.tokens
     }
 
+    /// Neither limit has a source: nothing was pinned, configured, or
+    /// discovered. A session that stored such a value (a transient first-turn
+    /// failure) should resolve again rather than keep it.
+    pub fn is_unresolved(&self) -> bool {
+        self.input.source == LimitSource::Unknown && self.output.source == LimitSource::Unknown
+    }
+
     /// Lower the input limit to `max` (source `Observed`) when `max` is below
     /// the current value or the current value is unknown. Never raises it.
     /// Returns `true` when the limit changed.
@@ -421,6 +428,21 @@ mod tests {
 
         assert_eq!(ModelLimits::unknown().request_max_tokens(false), None);
         assert!(!ModelLimits::unknown().non_streaming_cap_applies());
+    }
+
+    #[test]
+    fn is_unresolved_only_when_both_sources_are_unknown() {
+        assert!(ModelLimits::unknown().is_unresolved());
+        assert!(!ModelLimits::unknown().with_input(1000).is_unresolved());
+        assert!(!ModelLimits::unknown().with_output(1000).is_unresolved());
+        let mut observed = ModelLimits::unknown();
+        observed.clamp_input(1000);
+        assert!(!observed.is_unresolved());
+        // A note or fallback alone does not make it resolved.
+        let mut noted = ModelLimits::unknown();
+        noted.note = Some("refresh failed".into());
+        noted.output_fallback = Some(ANTHROPIC_FALLBACK_MAX_TOKENS);
+        assert!(noted.is_unresolved());
     }
 
     #[test]
