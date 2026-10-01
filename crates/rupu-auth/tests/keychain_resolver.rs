@@ -637,3 +637,84 @@ async fn the_refresher_refreshes_and_persists_the_token_its_client_holds() {
     let saved = std::fs::read_to_string(&auth_path).unwrap();
     assert!(saved.contains("refresh-2"), "persisted: {saved}");
 }
+
+// ---- private files: modes and symlinks ---------------------------------------
+
+#[cfg(unix)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Both files the store creates are private: `auth.json` (the secrets) and
+/// `auth.json.lock` (which every process opens for writing).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn the_auth_file_and_its_lock_file_are_created_private() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    KeychainResolver::new()
+        .store(
+            ProviderId::Anthropic,
+            AuthMode::ApiKey,
+            &StoredCredential::api_key("sk-private"),
+        )
+        .await
+        .expect("store");
+    assert_eq!(mode_of(&auth_path), 0o600, "auth.json");
+    assert_eq!(mode_of(&sidecar(&auth_path)), 0o600, "auth.json.lock");
+}
+
+/// A user who keeps `auth.json` as a symlink (a dotfiles checkout, a shared
+/// volume) keeps it: the write lands in the link's target, and the lock
+/// sits next to that target so every path to the same file takes the same
+/// lock.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_symlinked_auth_file_is_written_through_to_its_target() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let real = tmp.path().join("real").join("creds.json");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "{}").unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    std::os::unix::fs::symlink(&real, &auth_path).unwrap();
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+
+    let r = KeychainResolver::new();
+    r.store(
+        ProviderId::Anthropic,
+        AuthMode::ApiKey,
+        &StoredCredential::api_key("sk-through-link"),
+    )
+    .await
+    .expect("store");
+
+    assert!(
+        std::fs::symlink_metadata(&auth_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "auth.json is still the symlink"
+    );
+    assert!(
+        std::fs::read_to_string(&real)
+            .unwrap()
+            .contains("sk-through-link"),
+        "the target holds the credential"
+    );
+    assert!(sidecar(&real).exists(), "the lock sits next to the target");
+    assert!(
+        !sidecar(&auth_path).exists(),
+        "no lock next to the link itself"
+    );
+    let (_, creds) = r
+        .get("anthropic", Some(AuthMode::ApiKey))
+        .await
+        .expect("reads back through the link");
+    assert!(
+        matches!(creds, rupu_providers::auth::AuthCredentials::ApiKey { key } if key == "sk-through-link")
+    );
+}

@@ -29,6 +29,7 @@ pub mod stored;
 pub use stored::StoredCredential;
 
 pub mod in_memory;
+mod private_file;
 pub mod resolver;
 
 pub mod stranded;

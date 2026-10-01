@@ -149,59 +149,39 @@ impl KeychainResolver {
         serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
     }
 
-    /// Write the whole map through a temp file + rename, mode 0600 set on
-    /// the temp file before it is renamed into place: a reader (in any
-    /// process) never sees a half-written file. Callers hold the
+    /// Write the whole map through a private temp file + rename
+    /// ([`crate::private_file::write_private_atomic`]): a reader (in any
+    /// process) never sees a half-written file, and no byte of it is ever
+    /// visible with a mode looser than 0600. Callers hold the
     /// [`AuthFileLock`] around their read-modify-write.
     fn write_file_map(
         path: &std::path::Path,
         map: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("mkdir {}: {e}", parent.display()))?;
-        }
         let body =
             serde_json::to_string_pretty(map).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "auth.json".into());
-        let tmp = path.with_file_name(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let written = std::fs::write(&tmp, body)
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))
-            .and_then(|()| {
-                // 0600 before the rename, so the file is never visible
-                // with a looser mode.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                        .map_err(|e| anyhow::anyhow!("chmod {}: {e}", tmp.display()))?;
-                }
-                std::fs::rename(&tmp, path)
-                    .map_err(|e| anyhow::anyhow!("rename to {}: {e}", path.display()))
-            });
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written
+        crate::private_file::write_private_atomic(path, body.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// The file the credentials actually live in: `self.path` followed
+    /// through any symlink. Resolved per operation (the link can appear or
+    /// change between two calls), so a write replaces the link's target —
+    /// never the link — and the lock sits next to that target.
+    fn auth_file(&self) -> PathBuf {
+        crate::private_file::resolve_symlink(&self.path)
     }
 
     /// Run `f` on the auth file under its [`AuthFileLock`], on the blocking
-    /// pool (flock blocks while another holder, in this or another process,
-    /// is mid-way through its read-modify-write or refresh).
+    /// pool (the lock waits — bounded — while another holder, in this or
+    /// another process, is mid-way through its read-modify-write or
+    /// refresh).
     async fn with_file_lock<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
     {
-        let path = self.path.clone();
+        let path = self.auth_file();
         tokio::task::spawn_blocking(move || {
             let _lock = AuthFileLock::acquire(&path)?;
             f(&path)
@@ -252,7 +232,7 @@ impl KeychainResolver {
         legacy_base: Option<&str>,
         mode: AuthMode,
     ) -> Result<Option<StoredCredential>> {
-        Self::read_account_at(&self.path, account_base, legacy_base, mode)
+        Self::read_account_at(&self.auth_file(), account_base, legacy_base, mode)
     }
 
     fn read_account_at(
@@ -394,7 +374,7 @@ impl KeychainResolver {
         when: RefreshWhen,
     ) -> Result<StoredCredential> {
         Self::refresh_and_store_at(
-            self.path.clone(),
+            self.auth_file(),
             account.to_string(),
             kind,
             mode,
@@ -685,7 +665,8 @@ fn refresh_lock(path: &std::path::Path, account: &str) -> std::sync::Arc<tokio::
 /// across re-read → token request → write — so concurrent `rupu` processes
 /// never clobber each other's writes or refresh the same token twice. flock
 /// locks belong to an open file description, so two holders in one process
-/// exclude each other too.
+/// exclude each other too. The lock file is created private (0600) like
+/// the auth file itself.
 struct AuthFileLock {
     _file: std::fs::File,
 }
@@ -705,11 +686,7 @@ impl AuthFileLock {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("mkdir {}: {e}", parent.display()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
+        let file = crate::private_file::open_private_for_lock(&path)
             .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
         file.lock_exclusive()
             .map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))?;
@@ -875,7 +852,7 @@ impl CredentialResolver for KeychainResolver {
     ) -> Option<std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>> {
         let kind = crate::account::resolve_provider_id(provider, &self.accounts)?;
         Some(std::sync::Arc::new(KeychainRefresher {
-            path: self.path.clone(),
+            path: self.auth_file(),
             account: provider.to_string(),
             kind,
             timeout: self.refresh_timeout,
