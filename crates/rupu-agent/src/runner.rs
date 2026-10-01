@@ -1669,6 +1669,16 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                 let run_id_clone = opts.run_id.clone();
                                 let calibration =
                                     overflow.tokens.unwrap_or(last_turn_input_tokens).max(1);
+                                // The summariser is an LLM call too: none once
+                                // SIGTERM has arrived.
+                                if rupu_providers::credential_writes::terminating() {
+                                    return Err(terminated(
+                                        &mut writer,
+                                        &opts.run_id,
+                                        total_in + total_out,
+                                        started,
+                                    ));
+                                }
                                 if compact_context(
                                     &mut messages,
                                     opts,
@@ -1825,6 +1835,16 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // next request. Must run after usage accounting.
             if let Some(threshold) = opts.limits.compact_threshold() {
                 if resp.usage.input_tokens as u64 > threshold {
+                    // The summariser is an LLM call too: none once SIGTERM
+                    // has arrived.
+                    if rupu_providers::credential_writes::terminating() {
+                        return Err(terminated(
+                            &mut writer,
+                            &opts.run_id,
+                            total_in + total_out,
+                            started,
+                        ));
+                    }
                     let run_id_clone = opts.run_id.clone();
                     let last_input_tokens = resp.usage.input_tokens;
                     if compact_context(
