@@ -213,7 +213,7 @@ The observed value is **not** written to the model cache, because it reflects th
 ### 8.1 CLI
 
 - `rupu models list` gains `output` and `fetched` columns next to the existing `context` column. The CSV and JSON reports get matching fields.
-- `rupu models refresh` keeps its interface, now backed by `rupu_runtime::model_limits::refresh`.
+- `rupu models refresh` keeps its interface, now backed by `rupu_runtime::model_limits::refresh`. It prints one line per targeted provider and exits non-zero when every targeted provider failed; one success is enough for exit 0.
 
 ### 8.2 CP backend
 

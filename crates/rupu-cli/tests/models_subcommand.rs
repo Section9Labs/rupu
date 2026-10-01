@@ -62,7 +62,8 @@ fn models_cmd(home: &std::path::Path) -> Command {
 /// The headline bug: a declared account is a no-op that exits 0 in silence.
 /// With no credential for it the refresh must still *fail loudly for that
 /// account* — which proves it entered the loop rather than being filtered
-/// out before anything was attempted.
+/// out before anything was attempted — and, being the only target, fail the
+/// command.
 #[test]
 fn models_refresh_named_account_is_not_a_silent_no_op() {
     let dir = tempfile::tempdir().unwrap();
@@ -77,7 +78,7 @@ fn models_refresh_named_account_is_not_a_silent_no_op() {
         )
         .args(["models", "refresh", "--provider", "anthropic-work"])
         .assert()
-        .success()
+        .failure()
         .stderr(predicate::str::contains("anthropic-work"));
 }
 
@@ -237,7 +238,8 @@ fn models_refresh_openai_compatible_account_fetches_its_v1_models() {
 
 /// An openai-compatible account whose endpoint serves no model list (the
 /// vendor is real, the route is not) reports that failure against the
-/// account instead of claiming a refresh of nothing.
+/// account instead of claiming a refresh of nothing — and, as the only
+/// target, exits non-zero.
 #[test]
 fn models_refresh_openai_compatible_account_reports_a_missing_listing() {
     let server = httpmock::MockServer::start();
@@ -258,7 +260,7 @@ fn models_refresh_openai_compatible_account_reports_a_missing_listing() {
         .env("RUPU_BOXY_API_KEY", "sk-boxy-test-key")
         .args(["models", "refresh", "--provider", "boxy"])
         .assert()
-        .success()
+        .failure()
         .stderr(predicate::str::contains("skip boxy"))
         .stderr(predicate::str::contains("404"));
 }
@@ -362,8 +364,9 @@ fn models_refresh_builtin_name_still_resolves() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     std::fs::create_dir_all(home).unwrap();
-    // No credentials, so the refresh reports a skip — but it must resolve
-    // the name and attempt it, exiting 0 as it always has.
+    // No credentials (or only the closed port below), so the refresh
+    // reports a skip — but it must resolve the name and attempt it. With
+    // the only target failed, the command fails.
     models_cmd(home)
         // Same hermetic seam as above: never the real vendor endpoint.
         .env(
@@ -372,6 +375,6 @@ fn models_refresh_builtin_name_still_resolves() {
         )
         .args(["models", "refresh", "--provider", "anthropic"])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("anthropic"));
+        .failure()
+        .stderr(predicate::str::contains("skip anthropic"));
 }

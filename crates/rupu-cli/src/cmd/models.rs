@@ -243,28 +243,89 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
         rupu_runtime::model_limits::FETCH_TIMEOUT,
     )
     .await?;
-    for o in outcomes {
-        match (o.ok, o.count, o.error) {
+    let (lines, any_refreshed) = refresh_report(outcomes);
+    for line in lines {
+        match line {
+            ReportLine::Out(l) => println!("{l}"),
+            ReportLine::Err(l) => eprintln!("{l}"),
+        }
+    }
+    if !any_refreshed {
+        anyhow::bail!("no provider was refreshed");
+    }
+    Ok(())
+}
+
+/// One printed line of a `rupu models refresh` report.
+#[derive(Debug, PartialEq, Eq)]
+enum ReportLine {
+    Out(String),
+    Err(String),
+}
+
+/// One line per outcome, and whether the command succeeded: at least one
+/// targeted provider refreshed. Every one failing used to exit 0, so a
+/// scripted refresh could not tell "refreshed" from "nothing worked".
+fn refresh_report(
+    outcomes: Vec<rupu_runtime::model_limits::RefreshOutcome>,
+) -> (Vec<ReportLine>, bool) {
+    let any_refreshed = outcomes.iter().any(|o| o.ok);
+    let lines = outcomes
+        .into_iter()
+        .map(|o| match (o.ok, o.count, o.error) {
             // The fetch succeeded but the listing was empty. A failing
             // fetch surfaces as `skip …` below, so this is a provider that
             // genuinely answered with nothing (or one whose client swallows
             // a body it cannot parse); `RUST_LOG=warn` surfaces that client's
             // tracing logs.
-            (true, 0, _) => eprintln!(
+            (true, 0, _) => ReportLine::Err(format!(
                 "rupu: refreshed {} (0 models — re-run with `RUST_LOG=warn` to see why)",
                 o.provider
-            ),
-            (true, n, _) => println!("rupu: refreshed {} ({n} models)", o.provider),
-            (false, _, Some(e)) => eprintln!("rupu: skip {}: {e}", o.provider),
-            (false, _, None) => eprintln!("rupu: skip {}", o.provider),
-        }
-    }
-    Ok(())
+            )),
+            (true, n, _) => ReportLine::Out(format!("rupu: refreshed {} ({n} models)", o.provider)),
+            (false, _, Some(e)) => ReportLine::Err(format!("rupu: skip {}: {e}", o.provider)),
+            (false, _, None) => ReportLine::Err(format!("rupu: skip {}", o.provider)),
+        })
+        .collect();
+    (lines, any_refreshed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(provider: &str, ok: bool) -> rupu_runtime::model_limits::RefreshOutcome {
+        rupu_runtime::model_limits::RefreshOutcome {
+            provider: provider.into(),
+            ok,
+            count: if ok { 3 } else { 0 },
+            error: (!ok).then(|| "401 — not logged in".to_string()),
+        }
+    }
+
+    /// One provider refreshed, one failed: the command succeeded at what it
+    /// could do, and reports both.
+    #[test]
+    fn a_mixed_refresh_succeeds_and_reports_every_provider() {
+        let (lines, ok) = refresh_report(vec![outcome("oracle", true), outcome("boxy", false)]);
+        assert!(ok);
+        assert_eq!(
+            lines,
+            vec![
+                ReportLine::Out("rupu: refreshed oracle (3 models)".into()),
+                ReportLine::Err("rupu: skip boxy: 401 — not logged in".into()),
+            ]
+        );
+    }
+
+    /// Every targeted provider failed: nothing was refreshed, so the command
+    /// fails (it used to exit 0).
+    #[test]
+    fn a_refresh_where_every_provider_failed_fails() {
+        let (lines, ok) = refresh_report(vec![outcome("oracle", false), outcome("boxy", false)]);
+        assert!(!ok);
+        assert_eq!(lines.len(), 2, "every failure is still reported");
+    }
 
     #[test]
     fn fetched_age_is_a_dash_when_there_is_no_timestamp() {
