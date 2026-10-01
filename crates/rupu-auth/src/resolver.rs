@@ -10,6 +10,11 @@ use rupu_providers::AuthMode;
 /// Buffer (seconds) before expiry at which we proactively refresh.
 pub const EXPIRY_REFRESH_BUFFER_SECS: i64 = 60;
 
+/// Bound on one SSO token refresh (the whole HTTP exchange). The refresh
+/// holds the account's refresh lock, so a stalled token endpoint must fail
+/// rather than block every later `get` for that account.
+pub const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[async_trait]
 pub trait CredentialResolver: Send + Sync {
     /// Resolve credentials for `provider`. `hint` may force a specific
@@ -52,6 +57,8 @@ pub struct KeychainResolver {
     /// Accounts declared in config. Empty means "built-in vendor names
     /// only", which is exactly the pre-multi-account behavior.
     accounts: Vec<crate::account::AccountSpec>,
+    /// [`REFRESH_TIMEOUT`]; tests shorten it.
+    refresh_timeout: std::time::Duration,
 }
 
 /// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
@@ -95,7 +102,15 @@ impl KeychainResolver {
         Self {
             path,
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
         }
+    }
+
+    /// Bound each SSO token refresh by `timeout` instead of
+    /// [`REFRESH_TIMEOUT`].
+    pub fn with_refresh_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.refresh_timeout = timeout;
+        self
     }
 
     /// Declare the config's accounts so `get` / `refresh` can resolve a
@@ -298,6 +313,7 @@ impl KeychainResolver {
         let path = self.path.clone();
         let account = account.to_string();
         let legacy = Self::legacy_base(&account).map(str::to_string);
+        let timeout = self.refresh_timeout;
         let job = rupu_providers::credential_writes::spawn(async move {
             let lock = refresh_lock(&path, &account);
             let _guard = lock.lock().await;
@@ -308,7 +324,7 @@ impl KeychainResolver {
             {
                 return Ok(sc);
             }
-            let new = Self::refresh_inner(&account, kind, &sc).await?;
+            let new = Self::refresh_inner(&account, kind, &sc, timeout).await?;
             Self::store_named_at(&path, &account, mode, &new)?;
             Ok(new)
         });
@@ -468,6 +484,7 @@ impl KeychainResolver {
         account: &str,
         kind: ProviderId,
         sc: &StoredCredential,
+        timeout: std::time::Duration,
     ) -> Result<StoredCredential> {
         let oauth = crate::oauth::providers::provider_oauth(kind)
             .ok_or_else(|| anyhow::anyhow!("no oauth config for {kind}"))?;
@@ -493,7 +510,8 @@ impl KeychainResolver {
         // not silent.
         let client = rupu_netflow::http::client_with(
             rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
-            reqwest::Client::builder(),
+            // Bounded: the caller holds the account's refresh lock.
+            reqwest::Client::builder().timeout(timeout),
             std::sync::Arc::new(rupu_netflow::NullSink),
         )?;
         let resp = client
@@ -900,6 +918,7 @@ mod tests {
                 crate::account::AccountSpec::new("anthropic-work", "anthropic"),
                 crate::account::AccountSpec::new("anthropic-personal", "anthropic"),
             ],
+            refresh_timeout: REFRESH_TIMEOUT,
         };
 
         resolver
@@ -939,6 +958,7 @@ mod tests {
                 "anthropic-work",
                 "anthropic",
             )],
+            refresh_timeout: REFRESH_TIMEOUT,
         };
 
         resolver
@@ -984,6 +1004,7 @@ mod tests {
         let resolver = KeychainResolver {
             path: path.clone(),
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
         };
         resolver
             .store(
@@ -1012,6 +1033,7 @@ mod tests {
         let resolver = KeychainResolver {
             path: path.clone(),
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
         };
 
         let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
@@ -1026,6 +1048,7 @@ mod tests {
         let resolver = KeychainResolver {
             path: dir.path().join("auth.json"),
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
         };
         let err = resolver.get("anthropic-typo", None).await.unwrap_err();
         assert!(
@@ -1047,6 +1070,7 @@ mod tests {
             path: path.clone(),
             // Deliberately NOT declared, so `get` routes into `get_named`.
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
         };
 
         let sso = StoredCredential {

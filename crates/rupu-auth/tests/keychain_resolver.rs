@@ -325,3 +325,67 @@ async fn an_abandoned_sso_refresh_still_persists_and_is_not_repeated() {
     let saved = std::fs::read_to_string(&auth_path).unwrap();
     assert!(saved.contains("refresh-2"), "{saved}");
 }
+
+/// Store an Anthropic SSO credential inside the refresh buffer.
+async fn store_near_expiry_sso(r: &KeychainResolver) {
+    r.store(
+        ProviderId::Anthropic,
+        AuthMode::Sso,
+        &StoredCredential {
+            credentials: rupu_providers::auth::AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: Default::default(),
+            },
+            refresh_token: Some("refresh-1".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
+        },
+    )
+    .await
+    .expect("store");
+}
+
+/// The refresh is bounded: a stalled token endpoint fails the `get` after
+/// the refresh timeout instead of hanging — and the per-account refresh lock
+/// is released, so the next `get` for that account isn't blocked behind it
+/// (long-lived processes: the session daemon, `cp serve`).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_stalled_token_endpoint_times_out_and_releases_the_lock() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .delay(std::time::Duration::from_secs(3))
+            .json_body(serde_json::json!({ "access_token": "late" }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new().with_refresh_timeout(std::time::Duration::from_millis(100));
+    store_near_expiry_sso(&r).await;
+
+    for attempt in 0..2 {
+        let started = std::time::Instant::now();
+        let err = r
+            .get("anthropic", Some(AuthMode::Sso))
+            .await
+            .expect_err("a stalled refresh fails");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "attempt {attempt}: bounded by the refresh timeout, not the endpoint ({err})"
+        );
+    }
+}
+
+/// Production refreshes are bounded at 30s.
+#[test]
+fn the_refresh_timeout_defaults_to_30s() {
+    assert_eq!(
+        rupu_auth::resolver::REFRESH_TIMEOUT,
+        std::time::Duration::from_secs(30)
+    );
+}
