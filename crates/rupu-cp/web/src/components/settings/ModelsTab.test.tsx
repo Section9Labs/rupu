@@ -130,6 +130,58 @@ describe('ModelsTab', () => {
     expect(screen.getByRole('button', { name: 'Refetch all' })).toBeEnabled();
   });
 
+  it('marks the refreshing provider aria-busy and keeps the button name stable', async () => {
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    let resolveRefresh: (o: RefreshOutcome[]) => void = () => {};
+    vi.spyOn(api, 'refreshModels').mockReturnValue(
+      new Promise<RefreshOutcome[]>((resolve) => {
+        resolveRefresh = resolve;
+      }),
+    );
+    render(<ModelsTab />);
+    const button = await screen.findByRole('button', { name: 'Refetch anthropic' });
+    expect(button).toHaveAttribute('aria-busy', 'false');
+    expect(sectionFor('anthropic')).toHaveAttribute('aria-busy', 'false');
+
+    fireEvent.click(button);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch anthropic' })).toHaveAttribute('aria-busy', 'true'));
+    expect(sectionFor('anthropic')).toHaveAttribute('aria-busy', 'true');
+    // Only the provider being refreshed is busy.
+    expect(screen.getByRole('button', { name: 'Refetch gemini' })).toHaveAttribute('aria-busy', 'false');
+    expect(sectionFor('gemini')).toHaveAttribute('aria-busy', 'false');
+
+    resolveRefresh([{ provider: 'anthropic', ok: true, count: 1 }]);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch anthropic' })).toHaveAttribute('aria-busy', 'false'));
+    expect(sectionFor('anthropic')).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('marks every provider aria-busy while Refetch all is in flight', async () => {
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    let resolveRefresh: (o: RefreshOutcome[]) => void = () => {};
+    vi.spyOn(api, 'refreshModels').mockReturnValue(
+      new Promise<RefreshOutcome[]>((resolve) => {
+        resolveRefresh = resolve;
+      }),
+    );
+    render(<ModelsTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Refetch all' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch all' })).toHaveAttribute('aria-busy', 'true'));
+    expect(sectionFor('anthropic')).toHaveAttribute('aria-busy', 'true');
+    expect(sectionFor('gemini')).toHaveAttribute('aria-busy', 'true');
+
+    resolveRefresh([]);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch all' })).toHaveAttribute('aria-busy', 'false'));
+    expect(sectionFor('anthropic')).toHaveAttribute('aria-busy', 'false');
+    expect(sectionFor('gemini')).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('names Refetch all by its visible text, with no redundant aria-label', async () => {
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    render(<ModelsTab />);
+    const all = await screen.findByRole('button', { name: 'Refetch all' });
+    expect(all).not.toHaveAttribute('aria-label');
+  });
+
   it('clears a provider inline error after a later successful refetch of it', async () => {
     vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
     vi.spyOn(api, 'refreshModels')

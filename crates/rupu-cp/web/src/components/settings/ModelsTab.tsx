@@ -90,42 +90,50 @@ export function ModelsTab() {
           <code className="mx-1">[[providers.&lt;name&gt;.models]]</code>
           override them.
         </p>
-        <Button variant="secondary" size="sm" disabled={busy !== null} onClick={() => void refetch()} aria-label="Refetch all">
+        <Button variant="secondary" size="sm" disabled={busy !== null} aria-busy={busy === '*'} onClick={() => void refetch()}>
           Refetch all
         </Button>
       </div>
       {loadError && <ErrorBanner>{loadError}</ErrorBanner>}
-      {catalog.map((p) => (
-        <section key={p.provider} className="space-y-2">
-          <div className="flex items-center gap-3">
-            <h3 className="font-medium">{p.provider}</h3>
-            <span className="text-sm">{p.fetched_at ? `fetched ${relativeTime(p.fetched_at)}` : 'never fetched'}</span>
-            {p.stale && <Badge tone="amber">stale</Badge>}
-            <div className="ml-auto">
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busy !== null}
-                onClick={() => void refetch(p.provider)}
-                aria-label={`Refetch ${p.provider}`}
-              >
-                {busy === p.provider ? 'Refetching…' : 'Refetch'}
-              </Button>
+      {catalog.map((p) => {
+        // A provider is refreshing during its own Refetch and during Refetch all.
+        const refreshing = busy === '*' || busy === p.provider;
+        return (
+          <section key={p.provider} className="space-y-2" aria-busy={refreshing}>
+            <div className="flex items-center gap-3">
+              <h3 className="font-medium">{p.provider}</h3>
+              <span className="text-sm">{p.fetched_at ? `fetched ${relativeTime(p.fetched_at)}` : 'never fetched'}</span>
+              {p.stale && <Badge tone="amber">stale</Badge>}
+              <div className="ml-auto">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy !== null}
+                  onClick={() => void refetch(p.provider)}
+                  // The explicit label keeps the name stable ("Refetch <provider>")
+                  // while the visible text flips to "Refetching…"; aria-busy is what
+                  // tells assistive tech the refresh is in flight.
+                  aria-label={`Refetch ${p.provider}`}
+                  aria-busy={refreshing}
+                >
+                  {busy === p.provider ? 'Refetching…' : 'Refetch'}
+                </Button>
+              </div>
             </div>
-          </div>
-          {errors[p.provider] && <ErrorBanner>{`${p.provider}: ${errors[p.provider]}`}</ErrorBanner>}
-          {p.models.length > 0 ? (
-            <SortableTable<CatalogModel>
-              columns={COLUMNS}
-              rows={p.models}
-              rowKey={(m) => m.id}
-              initialSort={{ key: 'id', dir: 'asc' }}
-            />
-          ) : (
-            <p className="text-sm">No models listed.</p>
-          )}
-        </section>
-      ))}
+            {errors[p.provider] && <ErrorBanner>{`${p.provider}: ${errors[p.provider]}`}</ErrorBanner>}
+            {p.models.length > 0 ? (
+              <SortableTable<CatalogModel>
+                columns={COLUMNS}
+                rows={p.models}
+                rowKey={(m) => m.id}
+                initialSort={{ key: 'id', dir: 'asc' }}
+              />
+            ) : (
+              <p className="text-sm">No models listed.</p>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }
