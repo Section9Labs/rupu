@@ -160,6 +160,8 @@ Compaction also sizes what it keeps from this threshold: half of it stays verbat
 
 The resolved `ModelLimits`, including sources, is stored on the session record on the session's **first turn**. `session start` builds no provider, so the first `_run-turn` resolves and writes it. This is an additive serde field: an older record without it resolves on its next turn. Later turns reuse the stored value; it never refetches in the middle of a session. After each turn, the run's final limits are written back, so a limit learned from an overflow error (§7) persists. That holds when the turn fails too: `run_agent_with_limits` returns the run's final limits on every exit path, `Err` included (`RunResult.final_limits` exists only on `Ok`), and the session writes them on success and on failure.
 
+A stored value with no known limit at all (a transient first-turn failure) is not an answer: the next turn resolves again, subject to the negative cache (§5). Until then, compaction and the gauge use the agent pins (`contextWindowTokens`, `compactAtPercent`); the default percentage carried by such a value never outranks a pinned one.
+
 ### 6.6 Run-start notice
 
 Each run writes one `Event::Notice { kind: "model_limits", message }` before the first turn. For example:

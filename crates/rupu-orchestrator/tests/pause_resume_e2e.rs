@@ -134,8 +134,9 @@ impl<P: LlmProvider> LlmProvider for CancelAfterInner<P> {
     }
 }
 
-/// Build a minimal `AgentRunOpts` around `provider`. `no_stream: true` races
-/// `provider.send` directly against the pause token — the deterministic
+/// Build a minimal `AgentRunOpts` around `provider`. The runner always
+/// streams (`no_stream: true` only quiets the display), and it races that
+/// `provider.stream` call against the pause token — the deterministic
 /// boundary these tests exploit (mirrors `rupu_orchestrator::runner`'s own
 /// pause tests).
 #[allow(clippy::too_many_arguments)]

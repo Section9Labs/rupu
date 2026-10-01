@@ -79,14 +79,6 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
     }
 }
 
-/// The output budget an Anthropic request falls back to when `maxTokens` is
-/// neither pinned nor discovered (Anthropic requires the field). Same value as
-/// `rupu_providers::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS`, which is the
-/// constant the provider applies; this name stays because the agent DTOs and
-/// docs still cite it. A run no longer sends it itself: an unknown output
-/// limit goes on the wire as `max_tokens: None`.
-pub const DEFAULT_MAX_TOKENS: u32 = 8192;
-
 /// Callback invoked by `run_agent` immediately before each tool
 /// dispatch (`step_id`, `tool_name`, `blocked`). The runner translates
 /// this into `Event::StepWorking { note: Some(tool_name) }` so the

@@ -449,10 +449,15 @@ struct SessionRecord {
     /// Anthropic gets 8192 and other providers get no cap.
     #[serde(default)]
     max_tokens: Option<u32>,
-    /// Model context-window size in tokens for compaction. Captured from spec at session start.
+    /// Agent pin for the input limit (`contextWindowTokens`), captured from
+    /// the spec at session start. Overrides the discovered limit (`resolve`
+    /// applies pins first); compaction and the gauge read
+    /// `effective_context_window()`.
     #[serde(default)]
     context_window_tokens: Option<u32>,
-    /// Compact-at percentage. Captured from spec at session start.
+    /// Agent pin for the compaction percentage (`compactAtPercent`), captured
+    /// from the spec at session start; read through
+    /// `effective_compact_at_percent()`.
     #[serde(default)]
     compact_at_percent: Option<u8>,
     /// Limits resolved on the session's first turn (spec 2026-09-30 §6.5),
@@ -488,11 +493,16 @@ impl SessionRecord {
             .or(self.context_window_tokens)
     }
 
-    /// The compact-at percentage compaction uses: the stored resolved value,
-    /// else the agent pin, else the default.
+    /// The compact-at percentage compaction uses: the stored value when the
+    /// stored limits actually resolved something (it already reflects the
+    /// pin — `resolve` applies pins first), else the agent pin, else the
+    /// default. Unresolved stored limits (`ModelLimits::unknown()`, a
+    /// transient first-turn failure) carry only the default percentage, which
+    /// must not outrank a pin.
     fn effective_compact_at_percent(&self) -> u8 {
         self.model_limits
             .as_ref()
+            .filter(|l| !l.is_unresolved())
             .map(|l| l.compact_at_percent)
             .or(self.compact_at_percent)
             .unwrap_or(rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT)
@@ -2401,7 +2411,9 @@ struct SessionInteractiveState {
     coverage_checked_at: Option<std::time::SystemTime>,
     /// Input-token count from the most recent completed turn (a single-turn
     /// prompt size, not a cumulative total). Used to render the context gauge
-    /// against `session.context_window_tokens`. Updated each time a
+    /// against the session's effective input limit
+    /// (`SessionRecord::effective_context_window`: the resolved, possibly
+    /// learned, limit, else the agent pin). Updated each time a
     /// `TranscriptEvent::Usage` event is received; reset to 0 on `RunStart`.
     last_turn_input_tokens: u64,
 }
@@ -6551,7 +6563,10 @@ fn format_token_count(n: u64) -> String {
 use crate::output::fmt::format_token_compact;
 
 /// Build the context gauge segment for the status header, e.g. `ctx 52K/200K 26%`.
-/// Returns `None` when `context_window_tokens` is absent or `last_input` is 0.
+/// Measured against the session's effective input limit
+/// (`SessionRecord::effective_context_window`: the resolved, possibly learned,
+/// limit, else the agent pin). Returns `None` when no input limit is known or
+/// `last_input` is 0.
 fn session_context_gauge(
     session: &SessionRecord,
     state: &SessionInteractiveState,
@@ -10259,6 +10274,29 @@ mod tests {
         // Stored limits whose input is unknown fall back to the pin too.
         s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
         assert_eq!(s.effective_context_window(), Some(1_000_000));
+    }
+
+    /// Stored limits that resolved nothing (`ModelLimits::unknown()`, from a
+    /// transient first-turn failure) carry only the DEFAULT percentage — not
+    /// a decision. The agent's `compactAtPercent` pin must win over it.
+    #[test]
+    fn an_unresolved_stored_percent_does_not_outrank_the_agent_pin() {
+        let mut s = test_session_record();
+        s.compact_at_percent = Some(60);
+        s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        assert_eq!(s.effective_compact_at_percent(), 60);
+        // No pin: the default.
+        s.compact_at_percent = None;
+        assert_eq!(
+            s.effective_compact_at_percent(),
+            rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT
+        );
+        // Resolved stored limits keep their own percentage (which already
+        // reflects the pin — `resolve` applies pins first).
+        s.compact_at_percent = Some(60);
+        s.model_limits =
+            Some(rupu_providers::model_limits::ModelLimits::fixed(1_000, 100).with_percent(70));
+        assert_eq!(s.effective_compact_at_percent(), 70);
     }
 
     /// An older session record on disk has no `model_limits`; it must still

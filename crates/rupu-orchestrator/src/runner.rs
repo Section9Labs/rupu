@@ -10183,8 +10183,9 @@ steps:
             initial_messages: Vec::new(),
             turn_index_offset: 0,
             mode_str: "bypass".into(),
-            // The one-shot completions path races `provider.send` against the
-            // pause token — the deterministic pause boundary for these tests.
+            // The runner always streams (`no_stream` only quiets the
+            // display) and races `provider.stream` against the pause token —
+            // the deterministic pause boundary for these tests.
             no_stream: true,
             suppress_stream_stdout: true,
             mcp_registry: None,

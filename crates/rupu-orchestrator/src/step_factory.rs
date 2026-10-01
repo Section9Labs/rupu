@@ -1298,6 +1298,52 @@ steps:
         .unwrap();
     }
 
+    /// A step whose provider cannot be built runs against an error stub. The
+    /// stub has no listing to ask, so it gets `ModelLimits::unknown()` with
+    /// no note: resolving it would only put a false "exposes no model
+    /// limits" in front of the build error the run is about to raise.
+    ///
+    /// `#[serial]`: `generate.rs`'s tests set `RUPU_MOCK_PROVIDER_SCRIPT`,
+    /// which would make the build succeed against the mock.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_provider_build_error_gets_unknown_limits_without_a_note() {
+        const WF_BAD_PROVIDER: &str = r#"
+name: w
+steps:
+  - id: s
+    agent: bad
+    prompt: p
+"#;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("bad.md"),
+            "---\nname: bad\nprovider: no-such-provider\n---\nDo the thing.\n",
+        )
+        .unwrap();
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(WF_BAD_PROVIDER).expect("workflow must parse");
+        let opts = f
+            .build_opts_for_step(
+                "s",
+                "bad",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            opts.limits,
+            rupu_providers::model_limits::ModelLimits::unknown()
+        );
+        assert_eq!(opts.limits.note, None);
+    }
+
     #[tokio::test]
     async fn step_actions_narrows_the_agent_grant() {
         let tmp = assert_fs::TempDir::new().unwrap();
