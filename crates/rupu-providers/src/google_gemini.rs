@@ -523,8 +523,9 @@ impl GoogleGeminiClient {
 
     /// Cancel-safe: the refresh and its persistence run as their own task
     /// (tracked by [`crate::credential_writes`], which the binary drains
-    /// before exit), so a caller dropped mid-flight (a pause, a timeout) only
-    /// stops waiting. The task's handle stays on the client, so the next
+    /// before exit — once per refresh: through a refresher, the refresher's
+    /// own task is the tracked one), so a caller dropped mid-flight (a
+    /// pause, a timeout) only stops waiting. The task's handle stays on the client, so the next
     /// call adopts the refresh in flight (or its finished result) instead of
     /// starting a second one.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
@@ -548,7 +549,11 @@ impl GoogleGeminiClient {
                             expires: self.expires_ms,
                             extra: HashMap::new(),
                         };
-                        crate::credential_writes::spawn(async move {
+                        // Not tracked here: the refresher's own
+                        // refresh-and-persist task is the tracked write
+                        // (one refresh, one count); this task only waits
+                        // on it and reshapes the result.
+                        tokio::spawn(async move {
                             match refresher.refresh(stale).await? {
                                 AuthCredentials::OAuth {
                                     access,
