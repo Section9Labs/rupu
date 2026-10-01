@@ -54,20 +54,24 @@ pub fn drain_credential_writes_blocking(timeout: Duration) -> bool {
 }
 
 /// The exit status of a process killed by SIGTERM as the shell reports it
-/// (128 + 15). The handler's last resort only: it normally dies by the
-/// re-raised signal itself.
+/// (128 + 15). The last resort of the signal path only ([`die_by_sigterm`]):
+/// signal-hook's `emulate_default_handler` restores the default disposition
+/// and raises SIGTERM, which ends the process; if the raised signal somehow
+/// did not, signal-hook aborts it (SIGABRT), and this code is never
+/// reached. It is reached only when the disposition could not be restored
+/// or the signal could not be raised at all — the call returned an error.
 pub const SIGTERM_EXIT_CODE: i32 = 143;
 
 /// Handle SIGTERM on a dedicated OS thread — not a tokio task, so a wedged
-/// runtime can neither delay nor swallow it. On the signal the thread marks
-/// the process terminating (every runner then refuses to start an LLM call
-/// or a tool dispatch), waits — at most [`CREDENTIAL_WRITE_DRAIN`], on its
-/// own clock — for credential writes still being persisted, and then
-/// restores SIGTERM's default disposition and re-raises it: the process
-/// dies by the signal, exactly as an unhandled one would, so a cancel, the
-/// shell and `systemctl stop` all see a signal death and not an exit code.
-/// With nothing pending that happens at once. The run itself is never
-/// waited for.
+/// runtime can neither delay nor swallow it. On the signal the thread logs
+/// that it arrived (INFO), marks the process terminating (every runner then
+/// refuses to start an LLM call or a tool dispatch), waits — at most
+/// [`CREDENTIAL_WRITE_DRAIN`], on its own clock — for credential writes
+/// still being persisted, and then restores SIGTERM's default disposition
+/// and re-raises it: the process dies by the signal, exactly as an
+/// unhandled one would, so a cancel, the shell and `systemctl stop` all see
+/// a signal death and not an exit code. With nothing pending that happens
+/// at once. The run itself is never waited for.
 ///
 /// Commands that shut down gracefully on SIGTERM themselves (`autoflow
 /// serve`) don't install it.
@@ -100,14 +104,51 @@ pub fn install_sigterm_handler() {}
 /// What SIGTERM does, on the handler thread.
 #[cfg(unix)]
 fn on_sigterm() -> ! {
+    tracing::info!(
+        "SIGTERM received; terminating by it once pending credential writes are drained"
+    );
     rupu_providers::credential_writes::request_termination();
     drain_credential_writes_blocking(CREDENTIAL_WRITE_DRAIN);
-    // Default disposition back, then the signal again: death by SIGTERM.
+    die_by_sigterm()
+}
+
+/// Default disposition back, then the signal again: death by SIGTERM. The
+/// re-raised signal ends the process; failing that, signal-hook aborts it.
+/// [`SIGTERM_EXIT_CODE`] is reached only if neither could be done.
+#[cfg(unix)]
+fn die_by_sigterm() -> ! {
     let _ = signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTERM);
-    // Only reached if the re-raised signal did not end the process (some
-    // other handler got installed meanwhile); exit as the shell would
-    // report a SIGTERM death.
     std::process::exit(SIGTERM_EXIT_CODE)
+}
+
+/// `main`'s last step, after its own drain: a process that was signalled
+/// dies by the signal, never by the command's exit code. The handler thread
+/// re-raises only once the pending credential writes are drained, and its
+/// drain polls — so a command that returned while a write was pending (the
+/// run aborted as terminating) would otherwise let `main`'s own drain, woken
+/// the instant the write lands, exit with the command's code first. Returns
+/// only when the process was not signalled.
+pub fn exit_by_signal_if_terminating() {
+    #[cfg(unix)]
+    if rupu_providers::credential_writes::terminating() {
+        die_by_sigterm();
+    }
+}
+
+/// Test seam: with `RUPU_TEST_HOLD_CREDENTIAL_WRITE_MS=<ms>` set, keep one
+/// tracked credential write open for that long, so an integration test can
+/// observe the exit path with a write pending (`tests/sigterm_exit.rs`).
+/// Unset in production; a value that does not parse is ignored.
+pub fn hold_test_credential_write() {
+    let Some(ms) = std::env::var("RUPU_TEST_HOLD_CREDENTIAL_WRITE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return;
+    };
+    drop(rupu_providers::credential_writes::spawn(
+        tokio::time::sleep(Duration::from_millis(ms)),
+    ));
 }
 
 #[cfg(test)]

@@ -277,6 +277,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     ) {
         exit::install_sigterm_handler();
     }
+    exit::hold_test_credential_write();
 
     // Run / Workflow Run / Watch / Session Attach own a live stdout view.
     // Tracing on stderr would bleed through and corrupt that output.
@@ -315,15 +316,15 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     // agents exhausts). Children — detached runs, sub-agents — inherit it.
     // Fan-out admission (`rupu_agent::fd_budget`) grows it further on
     // demand, up to this value when set.
-    let env_max_open_files = std::env::var("RUPU_MAX_OPEN_FILES")
-        .ok()
-        .and_then(|v| match v.trim().parse::<u64>() {
+    let env_max_open_files = std::env::var("RUPU_MAX_OPEN_FILES").ok().and_then(|v| {
+        match v.trim().parse::<u64>() {
             Ok(n) => Some(n),
             Err(_) => {
                 tracing::warn!(value = %v, "ignoring RUPU_MAX_OPEN_FILES: not a positive integer");
                 None
             }
-        });
+        }
+    });
     let fd_report = rupu_agent::fd_budget::configure(
         cli.max_open_files
             .or(env_max_open_files)
@@ -708,15 +709,15 @@ mod arg_parse_tests {
 
     #[test]
     fn cron_list_honours_all_columns() {
-        let cli = crate::Cli::try_parse_from(["rupu", "cron", "list", "--all-columns"])
-            .expect("parses");
+        let cli =
+            crate::Cli::try_parse_from(["rupu", "cron", "list", "--all-columns"]).expect("parses");
         assert!(cli.all_columns);
     }
 
     #[test]
     fn agent_list_honours_absolute() {
-        let cli = crate::Cli::try_parse_from(["rupu", "agent", "list", "--absolute"])
-            .expect("parses");
+        let cli =
+            crate::Cli::try_parse_from(["rupu", "agent", "list", "--absolute"]).expect("parses");
         assert!(cli.absolute);
     }
 }

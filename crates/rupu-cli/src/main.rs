@@ -20,5 +20,10 @@ async fn main() -> ExitCode {
     // let an OAuth token refresh in flight finish persisting its rotated
     // token (e.g. `rupu workflow run` exiting right after a pause).
     rupu_cli::exit::drain_credential_writes(rupu_cli::exit::CREDENTIAL_WRITE_DRAIN).await;
+    // A process that was signalled dies by the signal, never by `code`: the
+    // SIGTERM handler thread may still be waiting on the very write this
+    // drain just let land, and the command may have returned early because
+    // it was terminating. Returns only when no signal arrived.
+    rupu_cli::exit::exit_by_signal_if_terminating();
     code
 }
