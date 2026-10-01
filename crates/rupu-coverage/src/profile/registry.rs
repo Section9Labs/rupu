@@ -128,6 +128,14 @@ impl ActiveSet {
         self.selected.iter().map(String::as_str).collect()
     }
 
+    /// Every active ORIGIN profile (the selected ids plus everything they
+    /// transitively include), each once, in id order. A composite appears as
+    /// itself with its own (usually empty) declarations; its members are
+    /// separate entries.
+    pub fn profiles(&self) -> impl Iterator<Item = &EngagementProfile> {
+        self.entries.values().map(|e| &e.profile)
+    }
+
     /// The ORIGIN profile that owns `namespaced_kind` (`network:service` =>
     /// `network`), with that profile's own completeness/taxonomy — whether it
     /// was selected directly or through a composite.

@@ -147,6 +147,12 @@ struct Frontmatter {
     /// it: `full` (a complete report) or `summary`. Absent => `full`.
     #[serde(default, rename = "findingsProfile")]
     findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Engagement profiles this agent works under (`binary`, `web`, ...) when
+    /// no workflow step or workflow default overrides them. Empty falls
+    /// through to the built-in `code` profile. Unknown ids are rejected when
+    /// the run's profile registry is resolved, not here.
+    #[serde(default, rename = "engagementProfiles")]
+    engagement_profiles: Vec<String>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -187,6 +193,8 @@ pub struct AgentSpec {
     pub compact_at_percent: Option<u8>,
     /// Findings contract for this agent. See `findingsProfile` frontmatter.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Engagement profiles for this agent. See `engagementProfiles` frontmatter.
+    pub engagement_profiles: Vec<String>,
     pub system_prompt: String,
     /// The full original file text (frontmatter + body) verbatim. Lets the CP
     /// render the definition source with syntax highlighting; agents are
@@ -239,6 +247,7 @@ impl AgentSpec {
             context_window_tokens: fm.context_window_tokens,
             compact_at_percent: fm.compact_at_percent,
             findings_profile: fm.findings_profile,
+            engagement_profiles: fm.engagement_profiles,
             system_prompt: body.to_string(),
             raw,
         })
@@ -291,6 +300,37 @@ You are a test agent.
         );
         let s = "---\nname: a\n---\nbody\n";
         assert_eq!(AgentSpec::parse(s).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn parses_engagement_profiles() {
+        let s = "---\nname: a\nengagementProfiles: [binary]\n---\nbody\n";
+        assert_eq!(
+            AgentSpec::parse(s).unwrap().engagement_profiles,
+            vec!["binary".to_string()]
+        );
+        let s = "---\nname: a\nengagementProfiles:\n  - binary\n  - web\n---\nbody\n";
+        assert_eq!(
+            AgentSpec::parse(s).unwrap().engagement_profiles,
+            vec!["binary".to_string(), "web".to_string()]
+        );
+        // Absent => empty (the resolver falls through to the built-in default).
+        let s = "---\nname: a\n---\nbody\n";
+        assert!(AgentSpec::parse(s).unwrap().engagement_profiles.is_empty());
+    }
+
+    #[test]
+    fn engagement_profiles_typo_is_still_rejected() {
+        // `deny_unknown_fields` must keep catching the snake_case / misspelt
+        // forms of the new key, not silently ignore them.
+        for key in [
+            "engagement_profiles",
+            "engagementProfile",
+            "engagementprofiles",
+        ] {
+            let s = format!("---\nname: a\n{key}: [binary]\n---\nbody\n");
+            assert!(AgentSpec::parse(&s).is_err(), "{key} should be rejected");
+        }
     }
 
     #[test]

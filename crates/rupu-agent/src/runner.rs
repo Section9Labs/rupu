@@ -1008,16 +1008,27 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // Findings contract for this run. Resolved before `RunStart` is written
     // so the guidance is part of the recorded system prompt.
     let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
-    let records_findings = coverage.is_some()
-        || opts
-            .agent_tools
+    let grants = |name: &str| {
+        opts.agent_tools
             .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == "report_finding"));
-    if records_findings {
-        if let Some(g) = rupu_coverage::report::guidance(&findings_opts) {
-            opts.agent_system_prompt.push_str("\n\n");
-            opts.agent_system_prompt.push_str(&g);
-        }
+            .is_some_and(|list| list.iter().any(|t| t == name))
+    };
+    let records_findings = coverage.is_some() || grants("report_finding");
+    // `asset_mark` is an explicit `tools:` grant (never ambient), on the
+    // `concerns:` path and off it.
+    let marks_assets = grants("asset_mark");
+    let guidance = if records_findings {
+        rupu_coverage::report::guidance(&findings_opts)
+    } else if marks_assets {
+        // No findings contract to give, but the agent still needs to know
+        // which asset kinds and depth rungs it may mark.
+        rupu_coverage::report::engagement_guidance(&findings_opts)
+    } else {
+        None
+    };
+    if let Some(g) = guidance {
+        opts.agent_system_prompt.push_str("\n\n");
+        opts.agent_system_prompt.push_str(&g);
     }
 
     if let Some(line) = opts.codename.as_deref().and_then(call_sign_line) {
@@ -1068,6 +1079,13 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             bundle.paths.clone(),
             findings_opts.clone(),
         );
+        if marks_assets {
+            coverage_tools::register_asset_mark(
+                &mut registry,
+                bundle.paths.clone(),
+                findings_opts.clone(),
+            );
+        }
     }
 
     // Findings WITHOUT the coverage harness.
@@ -1089,25 +1107,29 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // registry insert happens after `filter_to` for the same reason the
     // coverage tools do — the grant list gates the six builtins, and these
     // are registered on top of it.
-    if coverage.is_none()
-        && opts
-            .agent_tools
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == "report_finding"))
-    {
+    //
+    // `asset_mark` rides the same path: it writes the asset store beside the
+    // findings ledger and needs no catalog either.
+    let records_findings_alone = coverage.is_none() && grants("report_finding");
+    if coverage.is_none() && (records_findings_alone || marks_assets) {
         let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
         let target = target_id(&opts.workspace_path, scope);
         let paths = CoveragePaths::new(&opts.workspace_path, &target);
         paths
             .ensure_dir()
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
-        registry.insert(
-            "report_finding",
-            std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
-                paths,
-                findings_opts.clone(),
-            )),
-        );
+        if records_findings_alone {
+            registry.insert(
+                "report_finding",
+                std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
+                    paths.clone(),
+                    findings_opts.clone(),
+                )),
+            );
+        }
+        if marks_assets {
+            coverage_tools::register_asset_mark(&mut registry, paths, findings_opts.clone());
+        }
     }
 
     // MCP server: spin up before the loop if we have a Registry.

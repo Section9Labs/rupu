@@ -15,7 +15,7 @@ pub mod types;
 pub mod validate;
 
 pub use artifacts::{sha256_file, sha256_reader, ArtifactError, ArtifactStore, IngestLimits};
-pub use guidance::guidance;
+pub use guidance::{engagement_guidance, guidance};
 pub use options::{
     FindingWriteOptions, DEFAULT_ARTIFACT_MAX_BYTES, DEFAULT_ARTIFACT_MAX_FILES,
     DEFAULT_ARTIFACT_TOTAL_MAX_BYTES, DEFAULT_REPORT_MAX_BYTES,
