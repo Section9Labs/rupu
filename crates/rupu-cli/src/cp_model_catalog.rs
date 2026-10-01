@@ -22,7 +22,7 @@ impl ModelCatalog for RuntimeModelCatalog {
         let cache_dir = rupu_runtime::model_limits::cache_dir(&self.global_dir);
         rupu_runtime::model_limits::catalog(&cfg, &cache_dir, &cfg_path, None)
             .await
-            .map_err(|e| ModelCatalogError::UnknownProvider(e.to_string()))
+            .map_err(ModelCatalogError::from)
     }
 
     async fn refresh(
@@ -40,6 +40,6 @@ impl ModelCatalog for RuntimeModelCatalog {
             rupu_runtime::model_limits::FETCH_TIMEOUT,
         )
         .await
-        .map_err(|e| ModelCatalogError::UnknownProvider(e.to_string()))
+        .map_err(ModelCatalogError::from)
     }
 }
