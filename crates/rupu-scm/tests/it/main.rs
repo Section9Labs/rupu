@@ -10,6 +10,8 @@ mod common;
 mod github_clone;
 mod github_translation;
 mod gitlab_httpmock;
+mod gitlab_oauth;
+mod gitlab_oauth_refresh;
 mod gitlab_translation;
 mod jira_httpmock;
 mod linear_httpmock;
