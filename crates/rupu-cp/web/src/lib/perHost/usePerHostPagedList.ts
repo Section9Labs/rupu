@@ -155,7 +155,10 @@ export function usePerHostPagedList<T extends HostTagged>({
     }
     api.getRegisteredHosts().then(
       (hs) => {
-        if (engineRef.current === engine) engine.reconcile(hs);
+        if (engineRef.current !== engine) return;
+        // The host list is readable again: "showing this host only" is no longer true.
+        setListError(null);
+        engine.reconcile(hs);
       },
       () => {
         if (engineRef.current === engine) engine.reconcile(engine.current.map(toSeed));

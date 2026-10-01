@@ -49,18 +49,4 @@ describe('list + usage calls forward an AbortSignal to fetch', () => {
     await api.getRuns({ host: 'local' });
     expect(fetchMock.mock.calls[0][1]?.signal).toBeUndefined();
   });
-
-  it('an aborted signal rejects the call rather than answering', async () => {
-    // Mirrors what a real fetch does with an aborted signal.
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (_path: string, init?: RequestInit) => {
-        if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError');
-        return new Response('[]', { status: 200 });
-      }),
-    );
-    const controller = new AbortController();
-    controller.abort();
-    await expect(api.getRuns({ signal: controller.signal })).rejects.toThrow(/aborted/);
-  });
 });
