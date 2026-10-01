@@ -70,7 +70,7 @@ rupu can't clone from a self-managed instance yet: its GitLab clone URLs always
 point at gitlab.com (see `TODO.md`), which would receive the account's token, so
 `clone_to` (`rupu run` / session repo targets) refuses with an error for such an
 account. Clone the repository with `git` directly; API calls (issues, MRs, file
-reads, pipelines) work.
+reads, pipelines, event polling) work.
 
 ## Sample agent
 

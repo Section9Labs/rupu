@@ -256,11 +256,9 @@ async fn the_event_poller_refreshes_an_expired_token_before_polling() {
         .await
         .unwrap();
     let token = token_endpoint(&server);
-    // Matched on the tail of the path so it holds whichever way the events
-    // connector joins `base_url` and `/api/v4`.
     let events = server.mock(|when, then| {
         when.method(GET)
-            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .path("/api/v4/projects/section9labs%2Frupu-mirror/events")
             .header("authorization", "Bearer a2");
         then.status(200)
             .header("content-type", "application/json")
@@ -317,7 +315,7 @@ async fn the_repo_connector_and_the_event_poller_refresh_once_between_them() {
     let project = project_endpoint(&server);
     let events = server.mock(|when, then| {
         when.method(GET)
-            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .path("/api/v4/projects/section9labs%2Frupu-mirror/events")
             .header("authorization", "Bearer a2");
         then.status(200)
             .header("content-type", "application/json")
@@ -455,13 +453,13 @@ async fn a_re_login_reaches_a_running_event_poller_on_its_next_401() {
         .unwrap();
     let refused = server.mock(|when, then| {
         when.method(GET)
-            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .path("/api/v4/projects/section9labs%2Frupu-mirror/events")
             .header("authorization", "Bearer a1");
         then.status(401).body(r#"{"message":"401 Unauthorized"}"#);
     });
     let accepted = server.mock(|when, then| {
         when.method(GET)
-            .path_contains("/projects/section9labs%2Frupu-mirror/events")
+            .path("/api/v4/projects/section9labs%2Frupu-mirror/events")
             .header("authorization", "Bearer a-new");
         then.status(200)
             .header("content-type", "application/json")
