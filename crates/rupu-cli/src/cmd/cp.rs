@@ -1466,6 +1466,12 @@ mod tests {
         );
     }
 
+    /// How long a spawned fake `rupu` gets to run and leave its output
+    /// behind. Generous on purpose: the child is a detached `/bin/sh` the
+    /// test never waits for, and a loaded CI runner can take seconds to
+    /// schedule it. The polls return as soon as the output is there.
+    const SPAWNED_SCRIPT_BUDGET: Duration = Duration::from_secs(10);
+
     /// Poll for the capture script's argv output and return it.
     ///
     /// Waits for a NON-EMPTY read, which is the whole point: the script is
@@ -1477,7 +1483,8 @@ mod tests {
     /// silently satisfies any `!captured.contains(..)` assertion, so this
     /// was both a flake and a false-negative.
     async fn poll_captured_argv(capture_path: &std::path::Path) -> String {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + SPAWNED_SCRIPT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if let Ok(s) = std::fs::read_to_string(capture_path) {
                 if !s.trim().is_empty() {
                     return s;
@@ -1486,10 +1493,69 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!(
-            "capture script should have run and recorded its argv within 2s \
+            "capture script should have run and recorded its argv within {SPAWNED_SCRIPT_BUDGET:?} \
              (at {})",
             capture_path.display()
         );
+    }
+
+    /// A shell script standing in for the real `rupu` binary, ready to be
+    /// exec'd by the code under test.
+    ///
+    /// Written at `path` with `body` under a `#!/bin/sh` line that first
+    /// honours `RUPU_TEST_SCRIPT_DRYRUN` (set: exit 0 before doing
+    /// anything), made executable, and then exec'd once in that dry-run
+    /// mode — retried on `ExecutableFileBusy` for up to 5s — before it is
+    /// handed over. On Linux an exec fails with ETXTBSY while any process
+    /// holds the file open for writing: another test thread that forks
+    /// while `std::fs::write`'s descriptor is still open gives its child a
+    /// copy that lives until that child's own exec closes it (CLOEXEC),
+    /// and a `resume_one_run` / `run_gate_sweep` spawn landing in that
+    /// window fails as a plain spawn error — logged, the marker cleared,
+    /// nothing captured — which is what the CI failure at
+    /// `poll_captured_argv` was. Once one exec has succeeded no writer is
+    /// left (the descriptor is closed here, and the forked copies only ever
+    /// go away), so the spawn under test cannot hit it.
+    fn exec_ready_script(path: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n[ -n \"$RUPU_TEST_SCRIPT_DRYRUN\" ] && exit 0\n{body}"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(path)
+                .env("RUPU_TEST_SCRIPT_DRYRUN", "1")
+                .status()
+            {
+                Ok(status) => {
+                    assert!(status.success(), "dry run of {}: {status}", path.display());
+                    return path.to_path_buf();
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("dry run of {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// [`exec_ready_script`] that appends its argv to `capture_path`.
+    fn capture_script(
+        script_path: &std::path::Path,
+        capture_path: &std::path::Path,
+    ) -> std::path::PathBuf {
+        exec_ready_script(
+            script_path,
+            &format!("echo \"$@\" >> {}\n", capture_path.display()),
+        )
     }
 
     /// A 2-gate `AwaitingApproval` run for the resume-worker round-trip
@@ -1568,8 +1634,6 @@ mod tests {
     /// revert, see the T5b-2b-i report) and PASS with the fix.
     #[tokio::test]
     async fn resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
         let rec = multi_gate_resume_record("run_resume_worker_gate_b");
@@ -1596,15 +1660,7 @@ mod tests {
         // A capture script standing in for the real `rupu` binary: appends
         // its argv to a file instead of actually running anything.
         let capture_path = tmp.path().join("captured_argv.txt");
-        let script_path = tmp.path().join("capture.sh");
-        std::fs::write(
-            &script_path,
-            format!("#!/bin/sh\necho \"$@\" >> {}\n", capture_path.display()),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+        let script_path = capture_script(&tmp.path().join("capture.sh"), &capture_path);
 
         resume_one_run(
             Arc::clone(&store),
@@ -1645,8 +1701,6 @@ mod tests {
     /// omitted, exactly like before this field existed.
     #[tokio::test]
     async fn resume_one_run_omits_gate_for_a_sole_gate_marker() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
         let mut rec = multi_gate_resume_record("run_resume_worker_sole");
@@ -1667,15 +1721,7 @@ mod tests {
         assert_eq!(store.load(&rec.id).unwrap().resume_gate_id, None);
 
         let capture_path = tmp.path().join("captured_argv.txt");
-        let script_path = tmp.path().join("capture.sh");
-        std::fs::write(
-            &script_path,
-            format!("#!/bin/sh\necho \"$@\" >> {}\n", capture_path.display()),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+        let script_path = capture_script(&tmp.path().join("capture.sh"), &capture_path);
 
         resume_one_run(
             Arc::clone(&store),
