@@ -1136,20 +1136,73 @@ async fn an_openai_refresh_posts_a_json_body() {
     expect_rotated(creds);
 }
 
-/// Anthropic's endpoint takes the refresh grant form-encoded — what rupu's
-/// own Anthropic client sends (`refresh_anthropic_token_at`).
+/// OpenAI's grant rotates the ID token with the access token; it is
+/// persisted with the credential (`extra.id_token`), as codex-rs's
+/// `persist_tokens` persists `id_token`, `access_token` and
+/// `refresh_token` — the Codex client takes its account id from it when
+/// the access token carries no claim.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn an_anthropic_refresh_posts_a_form_body() {
+async fn an_openai_refresh_persists_the_id_token() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "id_token": "id-token-2",
+            "expires_in": 3600
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    let mut prior = std::collections::HashMap::new();
+    prior.insert(
+        "id_token".to_string(),
+        serde_json::Value::String("id-token-1".into()),
+    );
+    store_near_expiry_sso_for(&r, ProviderId::Openai, prior).await;
+    let (_, creds) = r.get("openai", Some(AuthMode::Sso)).await.expect("refresh");
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth { access, extra, .. } => {
+            assert_eq!(access, "access-2");
+            assert_eq!(
+                extra.get("id_token").and_then(|v| v.as_str()),
+                Some("id-token-2"),
+                "the rotated ID token replaces the stored one"
+            );
+        }
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(
+        saved.contains("id-token-2") && !saved.contains("id-token-1"),
+        "{saved}"
+    );
+}
+
+/// Anthropic's refresh grant goes as JSON — what Claude Code's own
+/// `refreshOAuthToken` sends (oboard/claude-code-rev,
+/// `src/services/oauth/client.ts`: `axios.post(TOKEN_URL, { grant_type:
+/// 'refresh_token', refresh_token, client_id, scope }, { headers: {
+/// 'Content-Type': 'application/json' } })`), and what rupu's own
+/// Anthropic client sends (`refresh_anthropic_token_at`).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_anthropic_refresh_posts_a_json_body() {
     use httpmock::prelude::*;
     let server = MockServer::start();
     let token = server.mock(|when, then| {
         when.method(POST)
             .path("/token")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body_contains("grant_type=refresh_token")
-            .body_contains("refresh_token=refresh-1")
-            .body_contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+            .header("content-type", "application/json")
+            .json_body_partial(
+                r#"{"grant_type":"refresh_token","refresh_token":"refresh-1","client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"}"#,
+            );
         then.status(200)
             .json_body(serde_json::json!({ "access_token": "access-2" }));
     });

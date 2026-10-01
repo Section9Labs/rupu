@@ -690,6 +690,12 @@ impl KeychainResolver {
             refresh_token: Option<String>,
             #[serde(default)]
             expires_in: Option<i64>,
+            /// OpenAI's ChatGPT grant rotates the ID token with the access
+            /// token; it is persisted (`extra.id_token`) as codex-rs does,
+            /// since the Codex client takes its account id from it when
+            /// the access token carries no claim.
+            #[serde(default)]
+            id_token: Option<String>,
         }
         let r: R = resp
             .json()
@@ -700,10 +706,13 @@ impl KeychainResolver {
         // re-emit the account block, but those identifiers don't change
         // for the lifetime of the OAuth grant, so carrying them forward
         // keeps `metadata.user_id.account_uuid` populated post-refresh.
-        let prior_extra = match &sc.credentials {
+        let mut prior_extra = match &sc.credentials {
             rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => extra.clone(),
             _ => Default::default(),
         };
+        if let Some(id_token) = r.id_token {
+            prior_extra.insert("id_token".into(), serde_json::Value::String(id_token));
+        }
         // `credentials.expires` is the SAME field the provider crates'
         // `is_token_expired(expires_ms)` checks, and they all interpret
         // it as ABSOLUTE milliseconds-since-Unix-epoch (see e.g.

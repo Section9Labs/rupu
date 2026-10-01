@@ -764,7 +764,14 @@ pub(crate) fn load_claude_code_keychain() -> Option<AuthMethod> {
 }
 
 /// Refresh an Anthropic OAuth token. Returns updated AuthMethod.
-/// Uses application/x-www-form-urlencoded as required by the token endpoint.
+///
+/// The grant goes as JSON — what Claude Code's own `refreshOAuthToken`
+/// sends (oboard/claude-code-rev, `src/services/oauth/client.ts`:
+/// `axios.post(TOKEN_URL, { grant_type: 'refresh_token', refresh_token,
+/// client_id, scope }, { headers: { 'Content-Type': 'application/json' } })`).
+/// The client's `scope` restatement is not sent: optional (RFC 6749 §6),
+/// and it would refuse a grant whose scopes predate the login's current
+/// list.
 pub async fn refresh_anthropic_token(
     client: &ClientWithMiddleware,
     refresh_token: &str,
@@ -782,11 +789,11 @@ async fn refresh_anthropic_token_at(
 
     let response = client
         .post(token_url)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", ANTHROPIC_CLIENT_ID),
-            ("refresh_token", refresh_token),
-        ])
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": ANTHROPIC_CLIENT_ID,
+            "refresh_token": refresh_token,
+        }))
         .send()
         .await
         .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
@@ -5601,6 +5608,36 @@ mod tests {
             );
         }
         m.assert_hits(2);
+    }
+
+    /// The refresh grant is posted as JSON — the shape Claude Code's own
+    /// `refreshOAuthToken` sends (see `refresh_anthropic_token`).
+    #[tokio::test]
+    async fn the_token_refresh_posts_a_json_grant() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                .header("content-type", "application/json")
+                .json_body_partial(format!(
+                    r#"{{"grant_type":"refresh_token","refresh_token":"refresh-1","client_id":"{ANTHROPIC_CLIENT_ID}"}}"#
+                ));
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600
+            }));
+        });
+        let (client, _sink) = build_http_client(Arc::new(rupu_netflow::NullSink));
+        let refreshed =
+            refresh_anthropic_token_at(&client, &server.url("/v1/oauth/token"), "refresh-1")
+                .await
+                .unwrap();
+        token.assert_hits(1);
+        assert!(
+            matches!(refreshed, AuthMethod::OAuth { ref access_token, .. } if access_token == "access-2")
+        );
     }
 
     /// A token refresh started by a request that is then dropped (a pause, a

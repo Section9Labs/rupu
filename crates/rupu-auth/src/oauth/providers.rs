@@ -126,9 +126,16 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // anthropic.ts: JSON body, state == verifier, state
             // included in token-exchange body.
             token_body_format: TokenBodyFormat::Json,
-            // The refresh grant is form-encoded, as rupu's own Anthropic
-            // client sends it (`refresh_anthropic_token_at`).
-            refresh_body_format: TokenBodyFormat::Form,
+            // The refresh grant is JSON too — what Claude Code's own
+            // `refreshOAuthToken` sends (oboard/claude-code-rev,
+            // `src/services/oauth/client.ts`: `axios.post(TOKEN_URL,
+            // { grant_type: 'refresh_token', refresh_token, client_id,
+            // scope }, { headers: { 'Content-Type': 'application/json' } })`),
+            // and what rupu's own Anthropic client sends
+            // (`refresh_anthropic_token_at`). The client's `scope`
+            // restatement is not sent: optional (RFC 6749 §6), and it would
+            // refuse a grant whose scopes predate the login's current list.
+            refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: true,
             include_state_in_token_body: true,
         }),

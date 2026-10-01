@@ -225,20 +225,7 @@ impl OpenAiCodexClient {
                 expires,
                 extra,
             } => {
-                let account_id = extract_account_id(&access)
-                    .or_else(|| {
-                        extra
-                            .get("account_id")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .or_else(|| {
-                        extra
-                            .get("accountId")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .unwrap_or_default();
+                let account_id = account_id_of(&access, &extra).unwrap_or_default();
 
                 // OAuth tokens from ChatGPT use the backend URL; allow override via extra
                 let api_url = extra
@@ -1078,14 +1065,7 @@ fn refreshed_openai_token(
             "the credential store returned an API key for an OAuth refresh".into(),
         ));
     };
-    let account_id = extract_account_id(&access)
-        .or_else(|| {
-            extra
-                .get("account_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .unwrap_or(account_id);
+    let account_id = account_id_of(&access, &extra).unwrap_or(account_id);
     Ok(RefreshedOpenAiToken {
         access_token: access,
         refresh_token: refresh,
@@ -1143,6 +1123,8 @@ async fn refresh_and_persist_openai_token(
         .as_str()
         .map(str::to_string)
         .unwrap_or(refresh_token);
+    // The grant rotates the ID token too; persisted like codex-rs does.
+    let id_token = body["id_token"].as_str().map(str::to_string);
 
     let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
     let now_ms = SystemTime::now()
@@ -1151,8 +1133,10 @@ async fn refresh_and_persist_openai_token(
         .as_millis() as u64;
     let expires_ms = now_ms + (expires_in_secs * 1000);
 
-    // Update account_id from new token
-    let account_id = extract_account_id(&access_token).unwrap_or(account_id);
+    // Update account_id from the new tokens
+    let account_id = extract_account_id(&access_token)
+        .or_else(|| id_token.as_deref().and_then(extract_account_id))
+        .unwrap_or(account_id);
 
     info!("OpenAI token refreshed, expires in {expires_in_secs}s");
 
@@ -1163,6 +1147,9 @@ async fn refresh_and_persist_openai_token(
             "account_id".to_string(),
             serde_json::Value::String(account_id.clone()),
         );
+    }
+    if let Some(id_token) = id_token {
+        extra.insert("id_token".to_string(), serde_json::Value::String(id_token));
     }
     let creds = AuthCredentials::OAuth {
         access: access_token.clone(),
@@ -1329,7 +1316,20 @@ fn make_model_info(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Extract chatgpt_account_id from an OpenAI JWT access token.
+/// The ChatGPT account id a stored credential identifies: the access
+/// token's claim, else the stored ID token's (`extra.id_token`, the token
+/// codex-rs reads it from — persisted by the login and every refresh), else
+/// an `account_id` / `accountId` recorded in `extra`.
+fn account_id_of(access: &str, extra: &HashMap<String, serde_json::Value>) -> Option<String> {
+    let from_extra = |key: &str| extra.get(key).and_then(|v| v.as_str()).map(String::from);
+    extract_account_id(access)
+        .or_else(|| from_extra("id_token").and_then(|t| extract_account_id(&t)))
+        .or_else(|| from_extra("account_id"))
+        .or_else(|| from_extra("accountId"))
+}
+
+/// Extract chatgpt_account_id from an OpenAI JWT (an access token or an ID
+/// token: both carry the claim under `https://api.openai.com/auth`).
 fn extract_account_id(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1893,6 +1893,127 @@ mod tests {
         );
         let token = format!("{header}.{payload}.signature");
         assert_eq!(extract_account_id(&token), Some("acc_test123".to_string()));
+    }
+
+    /// A JWT whose `https://api.openai.com/auth` claim names `account`.
+    fn jwt_for_account(account: &str) -> String {
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+        );
+        let payload = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            format!(r#"{{"https://api.openai.com/auth":{{"chatgpt_account_id":"{account}"}}}}"#),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    /// The account id comes from the access token's claim, else from the
+    /// stored ID token's (what a refresh through the store persists, as
+    /// codex-rs does), else from `extra.account_id` — so it survives a
+    /// refresh whose access token carries no claim.
+    #[test]
+    fn the_account_id_falls_back_to_the_stored_id_token() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "id_token".to_string(),
+            serde_json::Value::String(jwt_for_account("acc_from_id")),
+        );
+        extra.insert(
+            "account_id".to_string(),
+            serde_json::Value::String("acc_from_extra".into()),
+        );
+        assert_eq!(
+            account_id_of(&jwt_for_account("acc_from_access"), &extra).as_deref(),
+            Some("acc_from_access"),
+            "the access token's claim wins"
+        );
+        assert_eq!(
+            account_id_of("opaque-access-token", &extra).as_deref(),
+            Some("acc_from_id"),
+            "then the ID token's"
+        );
+        extra.remove("id_token");
+        assert_eq!(
+            account_id_of("opaque-access-token", &extra).as_deref(),
+            Some("acc_from_extra"),
+            "then the recorded one"
+        );
+
+        // The client built from such a credential sends that id.
+        let mut extra = HashMap::new();
+        extra.insert(
+            "id_token".to_string(),
+            serde_json::Value::String(jwt_for_account("acc_client")),
+        );
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "opaque-access-token".into(),
+                refresh: "refresh-1".into(),
+                expires: 0,
+                extra: extra.clone(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert_eq!(client.account_id, "acc_client");
+        assert_eq!(client.api_url, CODEX_BACKEND_URL, "a ChatGPT account");
+
+        // And a refresher's credential is read the same way.
+        let refreshed = refreshed_openai_token(
+            AuthCredentials::OAuth {
+                access: "opaque-access-token-2".into(),
+                refresh: "refresh-2".into(),
+                expires: 0,
+                extra,
+            },
+            "acc_before".into(),
+        )
+        .unwrap();
+        assert_eq!(refreshed.account_id, "acc_client");
+    }
+
+    /// The client's own refresh persists the rotated ID token next to the
+    /// access and refresh tokens (codex-rs's `persist_tokens`), and takes
+    /// the account id from it when the new access token has no claim.
+    #[tokio::test]
+    async fn a_refresh_persists_the_id_token_and_keeps_the_account_id() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let id_token = jwt_for_account("acc_after");
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "opaque-access-2",
+                "refresh_token": "refresh-2",
+                "id_token": id_token,
+                "expires_in": 3600
+            }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "opaque-access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra: HashMap::new(),
+            },
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        client.ensure_valid_token().await.unwrap();
+        token.assert_hits(1);
+        assert_eq!(client.account_id, "acc_after");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &saved[crate::provider_id::ProviderId::OpenaiCodex.auth_key()];
+        assert_eq!(entry["refresh"], "refresh-2");
+        assert_eq!(entry["id_token"], jwt_for_account("acc_after"));
+        assert_eq!(entry["account_id"], "acc_after");
     }
 
     #[test]

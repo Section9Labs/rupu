@@ -35,6 +35,11 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+    /// OpenAI's ChatGPT grant returns an ID token next to the access token;
+    /// stored (`extra.id_token`) as codex-rs stores it, so the Codex client
+    /// can take its account id from it when the access token has no claim.
+    #[serde(default)]
+    id_token: Option<String>,
     /// Anthropic-shaped account block (uuid, email, …). Optional — other
     /// OAuth providers don't return this. We capture the uuid only; other
     /// fields are intentionally ignored to avoid storing extra PII.
@@ -254,6 +259,9 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     }
     if let Some(uuid) = token.organization.as_ref().and_then(|o| o.uuid.clone()) {
         extra.insert("organization_uuid".into(), serde_json::Value::String(uuid));
+    }
+    if let Some(id_token) = token.id_token {
+        extra.insert("id_token".into(), serde_json::Value::String(id_token));
     }
 
     Ok(StoredCredential {
