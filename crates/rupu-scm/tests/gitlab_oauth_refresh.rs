@@ -5,12 +5,12 @@
 //! token rotates on every refresh, while a `Registry` — and the connectors
 //! it built — lives as long as its process (`cp serve`, `mcp serve`, session
 //! daemons). These tests drive the real `KeychainResolver` (a temp
-//! `RUPU_HOME`) and a mocked token endpoint, and check that a request goes
-//! out with the refreshed token and that the rotation lands in `auth.json`
-//! for the next process.
+//! `RUPU_HOME`) holding credentials shaped as a GitLab login stores them —
+//! recording the application and token endpoint that issued them, here a
+//! mock — and check that a request goes out with the refreshed token and
+//! that the rotation lands in `auth.json` for the next process.
 //!
-//! `RUPU_HOME` and the token-endpoint seam are process-wide env vars, so the
-//! tests are `#[serial]`.
+//! `RUPU_HOME` is a process-wide env var, so the tests are `#[serial]`.
 
 use std::sync::Arc;
 
@@ -44,15 +44,30 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// A stored SSO credential whose access token expires `expires_in` from now.
-fn sso(access: &str, refresh: &str, expires_in: chrono::Duration) -> StoredCredential {
+/// A stored SSO credential whose access token expires `expires_in` from
+/// now, issued by application `rupu-test-app` at `server`'s token endpoint
+/// (what `rupu auth login` records).
+fn sso(
+    server: &MockServer,
+    access: &str,
+    refresh: &str,
+    expires_in: chrono::Duration,
+) -> StoredCredential {
     let at = chrono::Utc::now() + expires_in;
     StoredCredential {
         credentials: AuthCredentials::OAuth {
             access: access.into(),
             refresh: refresh.into(),
             expires: at.timestamp_millis() as u64,
-            extra: Default::default(),
+            extra: [
+                ("oauth_client_id".to_string(), "rupu-test-app".into()),
+                (
+                    "oauth_token_url".to_string(),
+                    server.url("/oauth/token").into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
         },
         refresh_token: Some(refresh.into()),
         expires_at: Some(at),
@@ -81,13 +96,15 @@ fn mirror() -> RepoRef {
     }
 }
 
-/// The token endpoint: rotates `r1` into `a2` / `r2`, valid two hours.
+/// The token endpoint: rotates `r1` into `a2` / `r2`, valid two hours, for
+/// the application that issued it.
 fn token_endpoint(server: &MockServer) -> httpmock::Mock<'_> {
     server.mock(|when, then| {
         when.method(POST)
             .path("/oauth/token")
             .body_contains("grant_type=refresh_token")
-            .body_contains("refresh_token=r1");
+            .body_contains("refresh_token=r1")
+            .body_contains("client_id=rupu-test-app");
         then.status(200)
             .header("content-type", "application/json")
             .json_body(serde_json::json!({
@@ -139,14 +156,13 @@ async fn an_undeclared_account_s_expired_token_is_refreshed_and_persisted_before
     let home = tempfile::tempdir().unwrap();
     let server = MockServer::start_async().await;
     let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
-    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/oauth/token"));
 
     let resolver = KeychainResolver::new();
     resolver
         .store_named(
             "gl-work",
             AuthMode::Sso,
-            &sso("a1", "r1", -chrono::Duration::minutes(1)),
+            &sso(&server, "a1", "r1", -chrono::Duration::minutes(1)),
         )
         .await
         .unwrap();
@@ -186,14 +202,13 @@ async fn a_token_that_nears_expiry_after_the_connector_is_built_is_refreshed_bef
     let home = tempfile::tempdir().unwrap();
     let server = MockServer::start_async().await;
     let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
-    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/oauth/token"));
 
     let resolver = KeychainResolver::new();
     resolver
         .store_named(
             "gitlab",
             AuthMode::Sso,
-            &sso("a1", "r1", chrono::Duration::minutes(3)),
+            &sso(&server, "a1", "r1", chrono::Duration::minutes(3)),
         )
         .await
         .unwrap();
@@ -230,14 +245,13 @@ async fn the_event_poller_refreshes_an_expired_token_before_polling() {
     let home = tempfile::tempdir().unwrap();
     let server = MockServer::start_async().await;
     let _home = EnvVarGuard::set("RUPU_HOME", home.path().to_str().unwrap());
-    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/oauth/token"));
 
     let resolver = KeychainResolver::new();
     resolver
         .store_named(
             "gl-work",
             AuthMode::Sso,
-            &sso("a1", "r1", -chrono::Duration::minutes(1)),
+            &sso(&server, "a1", "r1", -chrono::Duration::minutes(1)),
         )
         .await
         .unwrap();
