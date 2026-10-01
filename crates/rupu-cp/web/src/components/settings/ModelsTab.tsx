@@ -54,7 +54,11 @@ export function ModelsTab() {
       });
       await load();
     } catch (e) {
-      setLoadError(apiErrorMessage(e));
+      // A single-provider refetch that throws (400 unknown provider, 500,
+      // network) lands inline under that provider (spec §8.3); only a thrown
+      // Refetch all falls back to the page-level banner.
+      if (provider) setErrors((prev) => ({ ...prev, [provider]: apiErrorMessage(e) }));
+      else setLoadError(apiErrorMessage(e));
     } finally {
       setBusy(null);
     }
