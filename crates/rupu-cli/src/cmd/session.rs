@@ -490,7 +490,8 @@ impl SessionRecord {
         self.model_limits
             .as_ref()
             .and_then(|l| l.input.tokens)
-            .or(self.context_window_tokens)
+            // A 0 pin is no limit (`resolve` ignores it too).
+            .or(self.context_window_tokens.filter(|n| *n > 0))
     }
 
     /// The compact-at percentage compaction uses: the stored value when the
@@ -520,7 +521,7 @@ impl SessionRecord {
         let mut limits = match &self.model_limits {
             Some(l) if !l.is_unresolved() => l.clone(),
             stored => {
-                let mut l = ModelLimits::from_pins(None, self.max_tokens, None);
+                let mut l = ModelLimits::from_pins(None, self.max_tokens.filter(|n| *n > 0), None);
                 if let Some(stored) = stored {
                     l.output_shares_context = stored.output_shares_context;
                 }
@@ -10274,6 +10275,20 @@ mod tests {
         // Stored limits whose input is unknown fall back to the pin too.
         s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
         assert_eq!(s.effective_context_window(), Some(1_000_000));
+    }
+
+    /// A 0 pin is no limit (spec 2026-09-30 §5: `resolve` ignores it too):
+    /// it must not become a 0-token window for the gauge or manual compaction.
+    #[test]
+    fn a_zero_pin_is_not_an_input_limit() {
+        let mut s = test_session_record();
+        s.model_limits = None;
+        s.context_window_tokens = Some(0);
+        s.max_tokens = Some(0);
+        assert_eq!(s.effective_context_window(), None);
+        assert_eq!(s.compaction_threshold(None), None);
+        // With `--window`, a 0 output pin doesn't zero the headroom either.
+        assert_eq!(s.compaction_threshold(Some(100_000)), Some(80_000));
     }
 
     /// Stored limits that resolved nothing (`ModelLimits::unknown()`, from a
