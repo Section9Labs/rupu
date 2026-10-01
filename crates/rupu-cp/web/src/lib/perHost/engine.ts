@@ -9,7 +9,10 @@
 //   the host re-anchors on a fresh page 0 and retries once, never silently
 //   ending its list.
 // - Bounds every fetch (FETCH_TIMEOUT_MS), so one host that never answers
-//   cannot hold its own queue, or loadMore's scroll lock, forever.
+//   cannot hold its own queue, or loadMore's scroll lock, forever. A fetch the
+//   engine stops waiting for (timeout, dispose) is ABORTED through the signal
+//   it was handed, so abandoned requests do not pile up in the browser's
+//   per-origin connection pool.
 //
 // The React hook (usePerHostPagedList.ts) owns one engine per filter
 // generation and disposes it on change. A disposed engine ignores every
@@ -31,12 +34,19 @@ export interface PerHostFetchParams {
   host: string;
   offset: number;
   limit: number;
+  /** Aborted when the engine stops waiting (timeout or dispose); pass it to fetch. */
+  signal?: AbortSignal;
 }
+
+/** What `head()` reports to a caller that needs to know whether it got an answer. */
+type HeadResult = { ok: true } | { ok: false; reason: string };
 
 export class PerHostListEngine<T extends HostTagged> {
   private slices: HostSlice<T>[] = [];
   private readonly queues = new Map<string, Promise<void>>();
   private readonly headQueued = new Set<string>();
+  /** One controller per fetch still awaited; `dispose()` aborts them all. */
+  private readonly inflight = new Set<AbortController>();
   private disposed = false;
 
   constructor(
@@ -53,6 +63,8 @@ export class PerHostListEngine<T extends HostTagged> {
 
   dispose(): void {
     this.disposed = true;
+    for (const c of [...this.inflight]) c.abort();
+    this.inflight.clear();
   }
 
   /** Seed one `loading` slice per host and fire every host's page 0 independently. */
@@ -108,7 +120,9 @@ export class PerHostListEngine<T extends HostTagged> {
     if (!this.find(id)?.pagingFailed) return Promise.resolve();
     return this.enqueue(id, async () => {
       if (!this.find(id)?.pagingFailed) return;
-      this.patch(id, (s) => ({ ...s, pagingFailed: false, reason: null }));
+      // Stay out of gating (catchingUp) while re-anchoring: gating again at this host's
+      // old, shallower coverage would lift the floor and hide rows right where Retry was clicked.
+      this.patch(id, (s) => ({ ...s, pagingFailed: false, reason: null, catchingUp: s.hasMore }));
       await this.head(id);
       await this.join(id);
     });
@@ -157,30 +171,40 @@ export class PerHostListEngine<T extends HostTagged> {
     return next;
   }
 
-  /** One fetch, bounded: rejects with a plain Error if the host has not answered in FETCH_TIMEOUT_MS. */
-  private async fetchBounded(p: PerHostFetchParams): Promise<T[]> {
+  /**
+   * One fetch, bounded: rejects with a plain Error if the host has not answered in
+   * FETCH_TIMEOUT_MS, and aborts the request then (the timeout error is rejected
+   * first, so the AbortError the fetch answers with afterwards loses the race).
+   */
+  private async fetchBounded(p: Omit<PerHostFetchParams, 'signal'>): Promise<T[]> {
+    const controller = new AbortController();
+    this.inflight.add(controller);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`no answer after ${FETCH_TIMEOUT_MS / 1000}s`)), FETCH_TIMEOUT_MS);
+      timer = setTimeout(() => {
+        reject(new Error(`no answer after ${FETCH_TIMEOUT_MS / 1000}s`));
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
     });
     try {
-      return await Promise.race([this.fetchPage(p), timeout]);
+      return await Promise.race([this.fetchPage({ ...p, signal: controller.signal }), timeout]);
     } finally {
       clearTimeout(timer);
+      this.inflight.delete(controller);
     }
   }
 
-  private async head(id: string): Promise<void> {
-    if (this.disposed || !this.find(id)) return;
+  /** Load page 0. `ok: false` carries the failure reason; a disposed engine or a vanished host is `ok`. */
+  private async head(id: string): Promise<HeadResult> {
+    if (this.disposed || !this.find(id)) return { ok: true };
     let page: T[];
     try {
       page = withHost(await this.fetchBounded({ host: id, offset: 0, limit: PAGE }), id);
     } catch (e) {
-      this.fail(id, e);
-      return;
+      return { ok: false, reason: this.fail(id, e) };
     }
     const cur = this.find(id);
-    if (this.disposed || !cur) return;
+    if (this.disposed || !cur) return { ok: true };
     if (cur.state !== 'ok') {
       // First answer or recovery: hold it out of gating until join() decides.
       const hasMore = page.length === PAGE;
@@ -195,7 +219,7 @@ export class PerHostListEngine<T extends HostTagged> {
         receivedAt: Date.now(),
       }));
       await this.join(id);
-      return;
+      return { ok: true };
     }
     const { rows, fullyListed, replaced } = spliceHead(cur.rows, page, PAGE, this.access, id);
     this.patch(id, (s) => ({
@@ -205,6 +229,7 @@ export class PerHostListEngine<T extends HostTagged> {
       reason: null,
       receivedAt: Date.now(),
     }));
+    return { ok: true };
   }
 
   /**
@@ -276,25 +301,32 @@ export class PerHostListEngine<T extends HostTagged> {
         this.patch(id, (s) => ({ ...s, pagingFailed: true, catchingUp: false, reason: 'list shifted while paging' }));
         return null;
       }
-      await this.head(id);
-      if (this.disposed) return null;
+      const head = await this.head(id);
+      if (this.disposed || !this.find(id)) return this.disposed ? null : 0;
+      if (!head.ok) {
+        // The host could not even answer page 0: say why, and do not spend another request on the page.
+        this.patch(id, (s) => ({ ...s, pagingFailed: true, catchingUp: false, reason: head.reason }));
+        return null;
+      }
       return this.next(id, want, true);
     }
     this.patch(id, (s) => ({ ...s, rows, hasMore: full && added > 0 }));
     return added;
   }
 
-  private fail(id: string, e: unknown): void {
-    if (this.disposed) return;
+  /** Record a failed page 0 and return its reason. */
+  private fail(id: string, e: unknown): string {
     const f = classifyFailure(e);
+    if (this.disposed) return f.reason;
     if (f.kind === 'gone' && this.allHosts && id !== 'local') {
       this.commit(this.slices.filter((s) => s.hostId !== id));
-      return;
+      return f.reason;
     }
     this.patch(id, (s) =>
       s.state === 'ok'
         ? { ...s, reason: f.reason } // stale-on-error: keep last-good rows
         : { ...s, state: f.kind === 'unavailable' ? 'unavailable' : 'offline', reason: f.reason, catchingUp: false },
     );
+    return f.reason;
   }
 }

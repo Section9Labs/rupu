@@ -83,7 +83,7 @@ describe('PerHostListEngine', () => {
     await engine.loadMore();
     // local covers 19 min, remote 190 min → the floor is local's; only local pages.
     expect(fetch.mock.calls.map((c) => c[0].host)).toEqual(['local']);
-    expect(fetch.mock.calls[0][0]).toEqual({ host: 'local', offset: 15, limit: 25 });
+    expect(fetch.mock.calls[0][0]).toMatchObject({ host: 'local', offset: 15, limit: 25 });
   });
 
   it('a late host catches up instead of shrinking the visible list', async () => {
@@ -391,5 +391,101 @@ describe('PerHostListEngine', () => {
     expect(by('added')?.state).toBe('loading');
     expect(by('remote')).toMatchObject({ name: 'renamed', transportKind: 'http_cp', state: 'ok' });
     expect(by('remote')?.rows).toHaveLength(3);
+  });
+
+  it('retry stays out of gating while it re-anchors, so the visible list never shrinks', async () => {
+    const local = rows('local', 60, 1); // one a minute: a page covers 19 min
+    const remote = rows('remote', 200, 5); // one per 5 min: a page covers 95 min
+    let failNext = true;
+    let headGate: Promise<void> | null = null;
+    const { engine, history, visible } = harness(async (p) => {
+      if (p.host === 'local') {
+        if (p.offset > 0 && failNext) throw new ApiError(502, 'x', '{"error":"down"}');
+        if (p.offset === 0 && headGate) await headGate;
+      }
+      return pager(p.host === 'local' ? local : remote)(p);
+    });
+    engine.start([LOCAL, REMOTE]);
+    await flush();
+    await engine.loadMore(); // local sits at the floor and fails: it stops gating
+    expect(engine.current.find((s) => s.hostId === 'local')?.pagingFailed).toBe(true);
+    const before = visible().length;
+    expect(before).toBe(40); // local's 20 + remote's 20: the floor is remote's deeper coverage
+
+    failNext = false;
+    const gate = deferred<void>();
+    headGate = gate.promise;
+    const base = history.length;
+    const retry = engine.retryPaging('local');
+    await flush(); // the re-anchor page 0 is in flight
+    expect(engine.current.find((s) => s.hostId === 'local')).toMatchObject({ pagingFailed: false, catchingUp: true });
+    expect(visible().length).toBeGreaterThanOrEqual(before); // NOT gating at local's shallow coverage
+
+    gate.resolve();
+    await retry;
+    for (const h of history.slice(base)) expect(watermarkMerge(h, access).visible.length).toBeGreaterThanOrEqual(before);
+    expect(engine.current.find((s) => s.hostId === 'local')).toMatchObject({ pagingFailed: false, catchingUp: false });
+  });
+
+  it('a failed re-anchor ends the page with the head\'s own reason and makes no third request', async () => {
+    let server = rows('local', 40, 1);
+    let headDown = false;
+    const { engine, fetch } = harness((p) => {
+      if (p.offset === 0 && headDown) return Promise.reject(new ApiError(502, 'x', '{"error":"down"}'));
+      return pager(server)(p);
+    });
+    engine.start([LOCAL]);
+    await flush();
+    await engine.loadMore();
+    expect(engine.current[0].rows).toHaveLength(40);
+
+    // 25 runs land on top: the next window falls entirely on rows this slice already holds.
+    server = [...rows('new', 25, 1, -100), ...server];
+    headDown = true;
+    fetch.mockClear();
+    await engine.loadMore();
+    expect(fetch.mock.calls.map((c) => c[0].offset)).toEqual([35, 0]);
+    expect(engine.current[0]).toMatchObject({ pagingFailed: true, catchingUp: false, hasMore: true, reason: 'down' });
+  });
+
+  it('a timed-out fetch is aborted, and the AbortError it then rejects with changes nothing', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const signals: (AbortSignal | undefined)[] = [];
+    const { engine } = harness(
+      (p) =>
+        new Promise<Row[]>((_, reject) => {
+          signals.push(p.signal);
+          p.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        }),
+    );
+    engine.start([LOCAL]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(engine.current[0]).toMatchObject({ state: 'offline', reason: 'no answer after 45s' });
+  });
+
+  it('dispose aborts the fetches still in flight, and only those', async () => {
+    const signals: Record<string, AbortSignal | undefined> = {};
+    const hang = deferred<Row[]>();
+    const { engine, history } = harness((p) => {
+      signals[p.host] = p.signal;
+      return p.host === 'done' ? Promise.resolve(rows('done', 2, 1)) : hang.promise;
+    });
+    engine.start([LOCAL, { ...REMOTE, id: 'done' }]);
+    await flush();
+    expect(signals.local?.aborted).toBe(false);
+    expect(signals.done?.aborted).toBe(false); // a settled fetch is never aborted later
+    const n = history.length;
+
+    engine.dispose();
+    expect(signals.local?.aborted).toBe(true);
+    expect(signals.done?.aborted).toBe(false);
+    hang.reject(new DOMException('aborted', 'AbortError'));
+    await flush();
+    expect(history.length).toBe(n);
   });
 });
