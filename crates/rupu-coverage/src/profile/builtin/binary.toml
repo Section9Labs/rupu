@@ -1,0 +1,19 @@
+id = "binary"
+name = "Binary"
+
+[[asset_kinds]]
+id = "binary"
+coordinates = ["sha256"]
+label = "Binary"
+
+[[asset_kinds]]
+id = "function"
+parent = "binary"
+coordinates = ["sha256", "address", "symbol"]
+label = "Function"
+
+[coverage]
+enumerates = ["binary", "function"]
+depth_ladder = ["located", "disassembled", "analyzed"]
+
+[bundle]
