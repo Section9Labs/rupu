@@ -161,11 +161,32 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
         !evs.iter().any(|e| matches!(e, Event::Compaction { .. })),
         "nothing was compacted: {evs:?}"
     );
-    assert!(
-        evs.iter().any(|e| matches!(
+    let aborted_at = evs
+        .iter()
+        .position(|e| matches!(
             e,
             Event::RunComplete { status: RunStatus::Aborted, error: Some(err), .. } if err.contains("terminat")
-        )),
-        "the transcript ends aborted, saying why: {evs:?}"
+        ))
+        .unwrap_or_else(|| panic!("the transcript ends aborted, saying why: {evs:?}"));
+    assert_eq!(aborted_at, evs.len() - 1, "the abort is the last record");
+    // The turn the model already answered is not dropped: its usage and its
+    // content land in the transcript before the abort, as they do when the
+    // abort happens at the tool dispatch.
+    let usage_at = evs
+        .iter()
+        .position(|e| matches!(e, Event::Usage { .. }))
+        .unwrap_or_else(|| panic!("the answered turn's usage is recorded: {evs:?}"));
+    let content_at = evs
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::AssistantMessage { content, .. } if content == "over the threshold"
+            )
+        })
+        .unwrap_or_else(|| panic!("the answered turn's content is recorded: {evs:?}"));
+    assert!(
+        usage_at < content_at && content_at < aborted_at,
+        "usage, then the turn's content, then the abort: usage={usage_at} content={content_at} aborted={aborted_at}"
     );
 }

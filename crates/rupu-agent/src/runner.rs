@@ -779,6 +779,51 @@ fn terminated(
     }
 }
 
+/// Write a turn's content blocks to the transcript in the provider's own
+/// order — thinking, text and tool_use land exactly as the model produced
+/// them (spec §3 emission-order contract) — and return the tool calls to
+/// dispatch, as `(call_id, tool, input)`.
+fn emit_turn_content(
+    writer: &mut JsonlWriter,
+    content: &[ContentBlock],
+) -> Result<Vec<(String, String, serde_json::Value)>, RunError> {
+    let mut tool_uses = Vec::new();
+    for block in content {
+        match block {
+            ContentBlock::Text { text } => {
+                writer.write(&Event::AssistantMessage {
+                    content: text.clone(),
+                    thinking: None,
+                })?;
+            }
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => {
+                writer.write(&Event::Thinking {
+                    text: text.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    raw: raw.clone(),
+                })?;
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                writer.write(&Event::ToolCall {
+                    call_id: id.clone(),
+                    tool: name.clone(),
+                    input: input.clone(),
+                })?;
+                tool_uses.push((id.clone(), name.clone(), input.clone()));
+            }
+            ContentBlock::ToolResult { .. } => {}
+            ContentBlock::Unknown => {}
+        }
+    }
+    Ok(tool_uses)
+}
+
 /// Pluggable permission decider. Three production impls + a `Bypass`
 /// for tests.
 pub trait PermissionDecider: Send + Sync {
@@ -1836,8 +1881,11 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             if let Some(threshold) = opts.limits.compact_threshold() {
                 if resp.usage.input_tokens as u64 > threshold {
                     // The summariser is an LLM call too: none once SIGTERM
-                    // has arrived.
+                    // has arrived. The turn the model already answered is
+                    // not dropped: its content lands before the abort, as
+                    // it does when the abort happens at the tool dispatch.
                     if rupu_providers::credential_writes::terminating() {
+                        emit_turn_content(&mut writer, &resp.content)?;
                         return Err(terminated(
                             &mut writer,
                             &opts.run_id,
@@ -1866,40 +1914,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // Emit the turn's content blocks in the provider's own order —
             // thinking, text, and tool_use land in the transcript exactly as
             // the model produced them (spec §3 emission-order contract).
-            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-            for block in &resp.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        writer.write(&Event::AssistantMessage {
-                            content: text.clone(),
-                            thinking: None,
-                        })?;
-                    }
-                    ContentBlock::Reasoning {
-                        text,
-                        provider,
-                        model,
-                        raw,
-                    } => {
-                        writer.write(&Event::Thinking {
-                            text: text.clone(),
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            raw: raw.clone(),
-                        })?;
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        writer.write(&Event::ToolCall {
-                            call_id: id.clone(),
-                            tool: name.clone(),
-                            input: input.clone(),
-                        })?;
-                        tool_uses.push((id.clone(), name.clone(), input.clone()));
-                    }
-                    ContentBlock::ToolResult { .. } => {}
-                    ContentBlock::Unknown => {}
-                }
-            }
+            let tool_uses = emit_turn_content(&mut writer, &resp.content)?;
 
             // Dispatch tool calls in order.
             let mut tool_results: Vec<(String, String, Option<String>)> = Vec::new();
