@@ -6595,15 +6595,19 @@ mod tests {
             .expect("the launcher shell itself must run");
         assert!(status.success(), "launcher shell must exit 0: {cmd}");
 
+        // `>` creates the file empty before `echo` writes to it, so a read
+        // can land in between and see `""` — only a complete line counts.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if let Ok(contents) = std::fs::read_to_string(&tmpfile) {
+            let contents = std::fs::read_to_string(&tmpfile).ok();
+            if let Some(contents) = contents.as_deref().filter(|c| c.ends_with('\n')) {
                 assert_eq!(contents, "started\n", "unexpected output: {contents:?}");
                 return;
             }
             if std::time::Instant::now() >= deadline {
                 panic!(
-                    "nohup-launched process on a setsid-less PATH never wrote {}: {cmd}",
+                    "nohup-launched process on a setsid-less PATH never wrote {} \
+                     (last read: {contents:?}): {cmd}",
                     tmpfile.display()
                 );
             }
