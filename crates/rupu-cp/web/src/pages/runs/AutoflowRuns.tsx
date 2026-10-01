@@ -6,8 +6,10 @@
 // One Control Language migration (Phase 2, Task E): the Runs/Cycles/Claims
 // strip is now `Segmented` in FilterBar's view slot; the host filter is the
 // shared `HostSelect allowAll`; fetch/paginate/poll for the Runs and Cycles
-// tabs is owned by `usePagedList` (Claims stays a single lazily-fetched list,
-// same as before — no server-side pagination for that endpoint). Table rules
+// tabs is owned by `usePerHostPagedList` (per-host progressive loading, spec
+// 2026-10-01: All hosts by default, local paints at once, each remote merges
+// in as it answers). Claims stays a single lazily-fetched `usePagedList` —
+// its endpoint is local-only with no server-side pagination. Table rules
 // (fit/subject columns) applied to all three tables. Task A2's Event column,
 // `cycle_failed` detail expansion, and whole-row nav on run rows are
 // preserved verbatim.
@@ -18,7 +20,7 @@
 // `matchesAutoflowQuery` below) — composing with (not replacing) the host
 // scope select.
 
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import {
@@ -41,6 +43,9 @@ import { Spinner } from '../../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { RUN_STATUS_STYLES, StatusPill } from '../../components/StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
+import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import { PagingFailures, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
+import { notIncluded, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -504,40 +509,51 @@ const VIEW_OPTIONS: SegmentedOption[] = [
 
 export default function AutoflowRuns() {
   const [tab, setTab] = useState<Tab>('runs');
-  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
-  const [hostFilter, setHostFilter] = useState<string>('local');
+  // All hosts by default: local paints at once, each remote merges in as it
+  // answers (usePerHostPagedList). A picked host lists only that host.
+  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
   // Row-action (archive/delete) failures — kept separate from the
   // list-fetch error each tab's own hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
   // The primary "Runs" (events) feed and the "Cycles" feed each get their own
-  // usePagedList instance (independent pagination + sentinel), matching the
-  // pre-migration two-list-machine shape. Both poll every 5s regardless of
-  // the active tab — unchanged from before (so switching tabs always shows
-  // fresh data, not a stale snapshot from before the tab was last visited).
-  const events = usePagedList<AutoflowEventRow>({
-    fetch: ({ offset, limit }) => {
-      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      return api.getAutoflowEvents({ offset, limit, host });
-    },
-    deps: [hostFilter],
+  // usePerHostPagedList instance (independent pagination + sentinel), matching
+  // the pre-migration two-list-machine shape. Both poll regardless of the
+  // active tab — unchanged from before (so switching tabs always shows fresh
+  // data, not a stale snapshot from before the tab was last visited): local
+  // every 5 s, remotes every 60 s while the tab is visible. Both feeds share
+  // one SSH `autoflow history` listing per host via the server's listing cache.
+  const scopeHost = hostFilter === ALL_HOSTS ? null : hostFilter;
+  const fetchEvents = useCallback(
+    ({ host, offset, limit, signal }: PerHostFetchParams) => api.getAutoflowEvents({ offset, limit, host, signal }),
+    [],
+  );
+  const fetchCycles = useCallback(
+    ({ host, offset, limit, signal }: PerHostFetchParams) => api.getAutoflowRuns({ offset, limit, host, signal }),
+    [],
+  );
+  const events = usePerHostPagedList<AutoflowEventRow>({
+    host: scopeHost,
+    fetch: fetchEvents,
+    timeField: 'at',
+    idField: 'event_id',
+    deps: [],
     poll: true,
   });
-
-  const cycles = usePagedList<AutoflowCycleRow>({
-    fetch: ({ offset, limit }) => {
-      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      return api.getAutoflowRuns({ offset, limit, host });
-    },
-    deps: [hostFilter],
+  const cycles = usePerHostPagedList<AutoflowCycleRow>({
+    host: scopeHost,
+    fetch: fetchCycles,
+    timeField: 'started_at',
+    idField: 'cycle_id',
+    deps: [],
     poll: true,
   });
 
   // Claims tab: lazily fetched on selection, same as before — the endpoint
   // has no offset/limit (a single full-list fetch), so any page beyond the
   // first returns `[]` (mirrors the WorkflowRuns Archived-tab precedent) and
-  // the hook settles as `ended` after that one page. No poll (unchanged).
+  // the hook settles as `ended` after that one page. No poll (the default).
   const claims = usePagedList<AutoflowClaim>({
     fetch: ({ offset }) => {
       if (tab !== 'claims') return Promise.resolve([]);
@@ -545,7 +561,6 @@ export default function AutoflowRuns() {
       return api.getAutoflowClaims();
     },
     deps: [tab],
-    poll: false,
   });
 
   // Row actions on the Runs tab (runs-section row-actions plan, Task 3) —
@@ -559,7 +574,9 @@ export default function AutoflowRuns() {
     try {
       await api.archiveRun(runId, host);
       setActionError(null);
-      events.refresh();
+      // The event row stays in the history (only the launched run changed),
+      // so no removeRow — just re-sync the host that owns the run.
+      events.refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
@@ -575,7 +592,9 @@ export default function AutoflowRuns() {
     try {
       await api.deleteRun(runId, host);
       setActionError(null);
-      events.refresh();
+      // The event row stays in the history (only the launched run changed),
+      // so no removeRow — just re-sync the host that owns the run.
+      events.refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
@@ -813,6 +832,9 @@ export default function AutoflowRuns() {
         />
       </div>
 
+      {tab === 'runs' && <PerHostStrip slices={events.slices} />}
+      {tab === 'cycles' && <PerHostStrip slices={cycles.slices} />}
+
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {tab === 'runs' ? (
@@ -820,10 +842,16 @@ export default function AutoflowRuns() {
           <div className="py-16 flex items-center justify-center">
             <Spinner label="Loading autoflow activity…" />
           </div>
+        ) : events.rows.length === 0 && waitingLabel(events.slices) ? (
+          <div className="py-16 flex items-center justify-center">
+            <Spinner label={waitingLabel(events.slices) ?? ''} />
+          </div>
         ) : events.rows.length === 0 ? (
           <EmptyState
             title="No autoflow activity yet"
-            hint="Runs launched by the autoflow worker will appear here, each linking to its run graph."
+            hint={`Runs launched by the autoflow worker will appear here, each linking to its run graph.${
+              notIncluded(events.slices) ? ` Not included: ${notIncluded(events.slices)}.` : ''
+            }`}
           />
         ) : visibleEvents.length === 0 ? (
           <EmptyState title="No matches" hint={`No autoflow activity matches "${query}".`} />
@@ -832,7 +860,7 @@ export default function AutoflowRuns() {
             <SortableTable<AutoflowEventRow>
               columns={runColumns}
               rows={visibleEvents}
-              rowKey={(e) => e.event_id}
+              rowKey={(e) => `${e.host_id ?? 'local'}:${e.event_id}`}
               rowHref={eventHref}
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={EventDetail}
@@ -840,12 +868,9 @@ export default function AutoflowRuns() {
             <div ref={events.sentinelRef} className="py-2 text-center text-note text-ink-mute">
               {q
                 ? `${visibleEvents.length} matches of ${events.rows.length} loaded`
-                : events.loading
-                  ? 'loading more…'
-                  : events.hasMore
-                    ? 'scroll for more'
-                    : `— end of ${events.rows.length} —`}
+                : perHostFooterText({ slices: events.slices, loading: events.loading, hasMore: events.hasMore, ended: events.ended, count: events.rows.length })}
             </div>
+            <PagingFailures slices={events.slices} onRetry={events.retryPaging} />
           </section>
         )
       ) : tab === 'cycles' ? (
@@ -853,10 +878,16 @@ export default function AutoflowRuns() {
           <div className="py-16 flex items-center justify-center">
             <Spinner label="Loading autoflow cycles…" />
           </div>
+        ) : cycles.rows.length === 0 && waitingLabel(cycles.slices) ? (
+          <div className="py-16 flex items-center justify-center">
+            <Spinner label={waitingLabel(cycles.slices) ?? ''} />
+          </div>
         ) : cycles.rows.length === 0 ? (
           <EmptyState
             title="No autoflow cycles yet"
-            hint="Autoflow scheduling cycles will appear here once the autoflow worker runs."
+            hint={`Autoflow scheduling cycles will appear here once the autoflow worker runs.${
+              notIncluded(cycles.slices) ? ` Not included: ${notIncluded(cycles.slices)}.` : ''
+            }`}
           />
         ) : visibleCycles.length === 0 ? (
           <EmptyState title="No matches" hint={`No autoflow cycles match "${query}".`} />
@@ -865,19 +896,16 @@ export default function AutoflowRuns() {
             <SortableTable<AutoflowCycleRow>
               columns={CYCLE_COLUMNS}
               rows={visibleCycles}
-              rowKey={(c) => c.cycle_id}
+              rowKey={(c) => `${c.host_id ?? 'local'}:${c.cycle_id}`}
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={CycleDetail}
             />
             <div ref={cycles.sentinelRef} className="py-2 text-center text-note text-ink-mute">
               {q
                 ? `${visibleCycles.length} matches of ${cycles.rows.length} loaded`
-                : cycles.loading
-                  ? 'loading more…'
-                  : cycles.hasMore
-                    ? 'scroll for more'
-                    : `— end of ${cycles.rows.length} —`}
+                : perHostFooterText({ slices: cycles.slices, loading: cycles.loading, hasMore: cycles.hasMore, ended: cycles.ended, count: cycles.rows.length })}
             </div>
+            <PagingFailures slices={cycles.slices} onRetry={cycles.retryPaging} />
           </section>
         )
       ) : claims.loading && claims.rows.length === 0 ? (

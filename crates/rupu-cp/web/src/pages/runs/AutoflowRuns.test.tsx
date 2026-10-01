@@ -12,11 +12,13 @@ import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-li
 import { MemoryRouter } from 'react-router-dom';
 import {
   api,
+  ApiError,
   type AutoflowClaim,
   type AutoflowCycleRow,
   type AutoflowEventRow,
   type HostView,
 } from '../../lib/api';
+import { callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import AutoflowRuns from './AutoflowRuns';
 
 afterEach(() => {
@@ -81,7 +83,7 @@ const CLAIM: AutoflowClaim = {
 };
 
 function stubPage() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
   vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
   vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 }
@@ -149,21 +151,19 @@ describe('AutoflowRuns — Claims tab', () => {
 });
 
 describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () => {
-  it('default fetch passes host: "local" to both events and runs', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  it('defaults to All hosts: events and cycles are fetched per registered host', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     const eventsSpy = vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
     const runsSpy = vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
-
     renderPage();
-
-    await waitFor(() =>
-      expect(eventsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' })),
-    );
-    expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' }));
+    await waitFor(() => expect(callsFor(eventsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(eventsSpy, 'host_prod')).toHaveLength(1);
+    expect(callsFor(runsSpy, 'local')).toHaveLength(1);
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
   });
 
   it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -174,25 +174,20 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
   });
 
-  it('"All hosts" option fetches without a host param', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  it('This host fetches only local', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     const eventsSpy = vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
-
     renderPage();
     await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: '__all__' } });
-
-    await waitFor(() => {
-      const calls = eventsSpy.mock.calls;
-      const lastParams = calls[calls.length - 1]?.[0];
-      expect(lastParams?.host).toBeUndefined();
-    });
+    eventsSpy.mockClear();
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'local' } });
+    await waitFor(() => expect(callsFor(eventsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(eventsSpy, 'host_prod')).toHaveLength(0);
   });
 
   it('Host column renders host_id on the Runs tab', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -211,7 +206,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
       run_id: 'run-9',
       usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([eventWithRun]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -235,7 +230,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
       host_id: 'host_prod',
       usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([remoteRunEvent]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -257,7 +252,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
       run_id: 'run-11',
       usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([eventWithRun]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -286,7 +281,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
   });
 
   it('Cycles tab is reachable and renders the batch cycle view', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([CYCLE]);
 
@@ -354,7 +349,7 @@ describe('AutoflowRuns — Segmented view control (One Control Language kit)', (
 
 describe('AutoflowRuns — kit loading state', () => {
   it('shows the kit Spinner while the Runs tab first page is in flight', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     let resolveFn: (v: AutoflowEventRow[]) => void = () => {};
     vi.spyOn(api, 'getAutoflowEvents').mockReturnValue(
       new Promise((r) => {
@@ -375,7 +370,7 @@ describe('AutoflowRuns — kit loading state', () => {
 
 describe('AutoflowRuns — table rules (fit/subject columns)', () => {
   it('the Workflow column is the one flexible/truncating subject column on the Runs tab', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
     renderPage();
@@ -387,7 +382,7 @@ describe('AutoflowRuns — table rules (fit/subject columns)', () => {
   });
 
   it('Run/Event/Host/Status columns are fit (nowrap) on the Runs tab', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
     const { container } = renderPage();
@@ -402,7 +397,7 @@ describe('AutoflowRuns — table rules (fit/subject columns)', () => {
   });
 
   it('Cycle detail table columns are all fit (no dominant subject column)', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([CYCLE]);
     renderPage();
@@ -436,7 +431,7 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
       detail: 'workflow validation failed: missing step "build"',
       usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([failedEvent]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -459,7 +454,7 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
       issue_display_ref: 'github:acme/widgets#7',
       usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([failedEvent]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -479,7 +474,7 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
       status: 'running',
       usage: { input_tokens: 120, output_tokens: 40, cached_tokens: 0, total_tokens: 160, cost_usd: 0.05, priced: true, runs: 1 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([launched]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -507,7 +502,7 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
       issue_display_ref: 'github:acme/widgets#9',
       usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([failedEvent]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -541,7 +536,7 @@ describe('AutoflowRuns — Find', () => {
   };
 
   it('narrows the Runs tab by workflow, run id, issue ref, host id, or worker name', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT, EVENT_B]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -555,7 +550,7 @@ describe('AutoflowRuns — Find', () => {
   });
 
   it('footer shows "N matches of M loaded" while a query is active on the Runs tab', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT, EVENT_B]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -568,7 +563,7 @@ describe('AutoflowRuns — Find', () => {
   });
 
   it('Esc clears the query', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT, EVENT_B]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -591,9 +586,11 @@ describe('AutoflowRuns — Find', () => {
       cycle_id: 'cyc-99',
       worker_name: 'worker-solo',
     };
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
-    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([CYCLE, CYCLE_B]);
+    // These cycle rows carry no host_id, so an every-host mock would answer
+    // them once per registered host (distinct merge keys) — only local owns them.
+    vi.spyOn(api, 'getAutoflowRuns').mockImplementation(onlyHost('local', [CYCLE, CYCLE_B]));
 
     renderPage();
     fireEvent.click(screen.getByText('Cycles'));
@@ -623,5 +620,117 @@ describe('AutoflowRuns — Find', () => {
 
     await waitFor(() => expect(screen.queryByText('acme/widgets#42')).not.toBeInTheDocument());
     expect(screen.getByText('acme/other#3')).toBeInTheDocument();
+  });
+});
+
+// ── Per-host progressive loading (spec 2026-10-01) ─────────────────────────
+
+describe('AutoflowRuns — per-host state (events + cycles)', () => {
+  const OFFLINE = () => Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}'));
+
+  it('paints local events while a remote is still loading, naming it in the strip', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([{ ...REMOTE_EVENT, event_id: 'evt-l', host_id: 'local' }])
+        : new Promise(() => {}),
+    );
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+    expect(screen.getByText('loading…')).toBeInTheDocument();
+  });
+
+  it('names the host still loading while no event has painted yet, instead of "no activity"', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
+    );
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No autoflow activity yet')).not.toBeInTheDocument();
+  });
+
+  it('does not claim "no activity yet" without saying which host was not included', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : OFFLINE(),
+    );
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByText(/Not included: prod \(offline\)\./)).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('Cycles tab: names the host still loading while no cycle has painted yet', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
+    );
+    renderPage();
+    fireEvent.click(screen.getByText('Cycles'));
+    await waitFor(() => expect(screen.getByText('Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No autoflow cycles yet')).not.toBeInTheDocument();
+  });
+
+  it('Cycles tab: an offline remote is named in the empty-state hint and the footer keeps local rows', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([{ ...CYCLE, host_id: 'local' }]) : OFFLINE(),
+    );
+    renderPage();
+    fireEvent.click(screen.getByText('Cycles'));
+    await waitFor(() => expect(screen.getByText('worker-1')).toBeInTheDocument());
+    expect(screen.getByText(/not included: prod \(offline\)/)).toBeInTheDocument();
+  });
+
+  it('the per-host strip shows on the Runs and Cycles tabs, never on Claims', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
+    );
+    vi.spyOn(api, 'getAutoflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
+    );
+    vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('loading…')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('Cycles'));
+    await waitFor(() => expect(screen.getByText('loading…')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('Claims'));
+    await waitFor(() => expect(screen.getByText('No active claims')).toBeInTheDocument());
+    expect(screen.queryByText('loading…')).not.toBeInTheDocument();
+  });
+
+  it('archiving a remote run re-syncs only that host, and the event row stays in the history', async () => {
+    const remoteRunEvent: AutoflowEventRow = {
+      ...REMOTE_EVENT,
+      event_id: 'evt-arch',
+      run_id: 'run-arch',
+    };
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    const eventsSpy = vi
+      .spyOn(api, 'getAutoflowEvents')
+      .mockImplementation(onlyHost('host_prod', [remoteRunEvent]));
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    const archiveSpy = vi.spyOn(api, 'archiveRun').mockResolvedValue(undefined);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+    await waitFor(() => expect(callsFor(eventsSpy, 'local')).toHaveLength(1));
+
+    fireEvent.click(screen.getByLabelText('Archive run run-arch'));
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledWith('run-arch', 'host_prod'));
+    await waitFor(() => expect(callsFor(eventsSpy, 'host_prod')).toHaveLength(2));
+    expect(callsFor(eventsSpy, 'local')).toHaveLength(1);
+    // The event row is history, not the run: it is still listed.
+    expect(screen.getByText('fix-issue')).toBeInTheDocument();
   });
 });
