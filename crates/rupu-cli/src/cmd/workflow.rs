@@ -3085,11 +3085,11 @@ async fn approve(
 /// partially-completed fan-out step re-runs but its already-succeeded units
 /// are replayed from the `unit_checkpoints.jsonl` instead of re-dispatched.
 ///
-/// A `Paused` run additionally carries a persisted mid-step seed transcript
-/// (`RunStore::read_paused_seed`) when the pause landed inside a linear
-/// step's agent turn (see `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`
-/// Task 4) — when present it seeds `ResumeState::paused_step` so the exact
-/// paused step re-runs from where the agent left off instead of from
+/// A `Paused` run additionally carries persisted mid-step seed transcripts
+/// (`RunStore::read_paused_seeds`) when the pause landed inside linear
+/// steps' agent turns (see `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`
+/// Task 4) — when present they seed `ResumeState::paused_steps` so each
+/// paused step re-runs from where its agent left off instead of from
 /// scratch. A step-boundary pause (no seed) just replays like a terminal
 /// resume.
 pub(crate) async fn resume_run(
@@ -3367,40 +3367,40 @@ pub(crate) async fn resume_run(
     // fresh one. `None`/empty for a step-boundary pause or a terminal
     // (Failed/Rejected/Cancelled) resume — those replay from
     // `step_results.jsonl` alone, same as today.
-    let (reason, paused_step) = if original_status == RunStatus::Paused {
+    let (reason, paused_steps) = if original_status == RunStatus::Paused {
         // Distinguish "no sidecar" (a step-boundary pause — expected empty)
-        // from a real read/parse failure of an existing seed. `read_paused_seed`
-        // returns an empty `Vec` for a missing file and an `Err` only for an
-        // IO/JSON failure; surface the latter loudly rather than silently
-        // resuming from scratch and dropping a mid-step transcript.
-        let seed = match store.read_paused_seed(run_id) {
-            Ok(seed) => seed,
+        // from a real read/parse failure of an existing seed.
+        // `read_paused_seeds` returns an empty map for missing files and an
+        // `Err` only for an IO/JSON failure; surface the latter loudly rather
+        // than silently resuming from scratch and dropping mid-step
+        // transcripts. Several seeds when a DAG run's manual-pause drain
+        // caught concurrent steps pausing together; a run paused by an
+        // older binary falls back to its single seed + `awaiting_step_id`.
+        let seeds = match store.read_paused_seeds(run_id, record.awaiting_step_id.as_deref()) {
+            Ok(seeds) => seeds,
             Err(e) => {
                 tracing::warn!(
                     run_id,
                     error = %e,
-                    "failed to read persisted paused-step seed; resuming from the step boundary without the mid-step transcript (the paused step will re-run from its prompt)"
+                    "failed to read persisted paused-step seeds; resuming from the step boundary without the mid-step transcripts (the paused steps will re-run from their prompts)"
                 );
-                Vec::new()
+                Default::default()
             }
         };
         if let Err(e) = store.clear_paused_seed(run_id) {
             tracing::warn!(run_id, error = %e, "failed to clear persisted paused-step seed");
         }
-        let paused_step = if seed.is_empty() {
-            None
-        } else {
-            record
-                .awaiting_step_id
-                .clone()
-                .map(|step_id| rupu_orchestrator::PausedStep {
-                    step_id,
-                    seed_messages: seed,
-                })
-        };
-        (rupu_orchestrator::PauseReason::Manual, paused_step)
+        let paused_steps = seeds
+            .into_iter()
+            .filter(|(_, seed)| !seed.is_empty())
+            .map(|(step_id, seed_messages)| rupu_orchestrator::PausedStep {
+                step_id,
+                seed_messages,
+            })
+            .collect();
+        (rupu_orchestrator::PauseReason::Manual, paused_steps)
     } else {
-        (rupu_orchestrator::PauseReason::Approval, None)
+        (rupu_orchestrator::PauseReason::Approval, Vec::new())
     };
 
     let already_done_steps: Vec<String> = done_step_ids.iter().cloned().collect();
@@ -3410,7 +3410,7 @@ pub(crate) async fn resume_run(
         approved_step_id: String::new(),
         completed_units,
         reason,
-        paused_step,
+        paused_steps,
         rejected_reason: None,
         ..Default::default()
     };

@@ -476,10 +476,10 @@ async fn run_pause_then_resume_completes() {
             approved_step_id: String::new(),
             completed_units: BTreeMap::new(),
             reason: PauseReason::Manual,
-            paused_step: Some(PausedStep {
+            paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: seed,
-            }),
+            }],
             rejected_reason: None,
             ..Default::default()
         }),
@@ -732,7 +732,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
             approved_step_id: String::new(),
             completed_units: BTreeMap::new(),
             reason: PauseReason::Manual,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             ..Default::default()
         }),
@@ -973,7 +973,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
             approved_step_id: String::new(),
             completed_units,
             reason: PauseReason::Manual,
-            paused_step: None,
+            paused_steps: Vec::new(),
             rejected_reason: None,
             ..Default::default()
         }),
