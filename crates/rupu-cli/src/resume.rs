@@ -14,6 +14,7 @@ use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult};
 use rupu_orchestrator::{DefaultStepFactory, RunStore, Workflow};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Build the `action_dispatcher` every `OrchestratorRunOpts` construction
@@ -120,7 +121,9 @@ pub async fn resume_run(
     via_timeout: bool,
 ) -> anyhow::Result<ResumeOutcome> {
     let awaited_step_id = awaited_step_id.to_string();
-    let (mut opts, prior_step_results) = rebuild_opts_from_disk(store, run_id, mode).await?;
+    let global = paths::global_dir()?;
+    let (mut opts, prior_step_results) =
+        rebuild_opts_from_disk(store, &global, run_id, mode).await?;
     opts.resume_from = Some(rupu_orchestrator::ResumeState::from_approval_with_actor(
         run_id.to_string(),
         prior_step_results,
@@ -176,14 +179,22 @@ pub async fn resume_run(
 /// (0 for a legacy inline-approval step, an unknown step id, or an empty
 /// chain) so the caller can print `cleanup: <n> step(s) executed` without
 /// re-deriving it after `opts.workflow` has moved into the cleanup call.
+///
+/// `global` is the rupu home the caller's `store` lives under
+/// (`<global>/runs`): the rebuilt opts read their config from it and
+/// write the chain's step results, events and netflow ledger back under
+/// it, so the caller names it rather than this resolving `$RUPU_HOME`
+/// on its own — the gate sweep's tests give it a temporary one.
 pub async fn build_reject_cleanup_opts(
     store: &RunStore,
+    global: &Path,
     run_id: &str,
     rejected_step_id: &str,
     reason: &str,
     mode: Option<&str>,
 ) -> anyhow::Result<(OrchestratorRunOpts, usize)> {
-    let (mut opts, prior_step_results) = rebuild_opts_from_disk(store, run_id, mode).await?;
+    let (mut opts, prior_step_results) =
+        rebuild_opts_from_disk(store, global, run_id, mode).await?;
     let chain_len = opts
         .workflow
         .steps
@@ -207,13 +218,15 @@ pub async fn build_reject_cleanup_opts(
 /// `OrchestratorRunOpts` wiring (resolver, layered config, SCM registry,
 /// dispatcher, `DefaultStepFactory`, event sink) exactly as the original
 /// run used. Returns the opts with `resume_from: None` — callers set it
-/// afterward to the resume shape they need.
+/// afterward to the resume shape they need. `global` is the rupu home
+/// `store` lives under (see [`build_reject_cleanup_opts`]).
 async fn rebuild_opts_from_disk(
     store: &RunStore,
+    global: &Path,
     run_id: &str,
     mode: Option<&str>,
 ) -> anyhow::Result<(OrchestratorRunOpts, Vec<rupu_orchestrator::StepResult>)> {
-    let global = paths::global_dir()?;
+    let global = global.to_path_buf();
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
     let store_arc = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));

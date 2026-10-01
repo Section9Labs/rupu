@@ -1498,10 +1498,14 @@ impl RunStore {
     ///
     /// The wait blocks the calling thread (a polled non-blocking flock with
     /// a short sleep), so the methods that take it (`cancel`, `pause`,
-    /// `reap_if_orphaned`, `update_unless_cancelled`,
-    /// `modify_unless_cancelled`, `modify_if_status`) are called from an
-    /// async context through [`RunStore::blocking`], never directly on a
-    /// runtime worker.
+    /// `reap_if_orphaned`, `expire_if_overdue`, `expire_gate_if_overdue`,
+    /// `approve_gate`, `reject_gate`, `request_resume_approval`,
+    /// `claim_resume`, `clear_resume`, `clear_reject_cleanup`,
+    /// `update_unless_cancelled`, `modify_unless_cancelled`,
+    /// `modify_if_status`, `modify_fields`) are called from an async
+    /// context through [`RunStore::blocking`], never directly on a runtime
+    /// worker. Not re-entrant: a holder calls the `_locked` variants, never
+    /// a method that takes it again.
     fn lock_run_json(&self, run_id: &str) -> Option<File> {
         if !self.run_dir(run_id).is_dir() {
             return None;
@@ -1606,6 +1610,30 @@ impl RunStore {
         modify(&mut record);
         self.update(&record)?;
         Ok(Ok(record))
+    }
+
+    /// Load → `modify` → write `run.json` under the run lock, whatever the
+    /// run's status: for the fields no status transition owns and every
+    /// status carries — the portable-run metadata written after a workflow
+    /// run (backend, worker, wake, manifest path), which a run cancelled or
+    /// failed meanwhile needs as much as a completed one (`source_wake_id`
+    /// is what labels its trigger). `modify` touches only such fields,
+    /// never the status, the terminal fields or the gate set, so a cancel
+    /// (or any other write) that landed since the caller's last look is
+    /// kept exactly as it is; it returns whether the record is to be
+    /// written. Returns the record after `modify`. The wait blocks its
+    /// thread: async callers go through [`RunStore::blocking`].
+    pub fn modify_fields(
+        &self,
+        run_id: &str,
+        modify: impl FnOnce(&mut RunRecord) -> bool,
+    ) -> Result<RunRecord, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if modify(&mut record) {
+            self.update(&record)?;
+        }
+        Ok(record)
     }
 
     /// Run `f` with a handle to this store on the blocking pool — for the
@@ -1931,7 +1959,37 @@ impl RunStore {
     /// case (every record producible today, and every DAG run until Task
     /// 5b-2 lands) this is unchanged — the set always has exactly one
     /// element there, so this guard never fires.
+    ///
+    /// `record` is what the caller loaded earlier; the decision is made
+    /// again from what the disk holds, under the run lock, so a cancel
+    /// (a reject), an approve or a resume that landed since is preserved —
+    /// never overwritten with the expiry. `record` is brought up to date
+    /// with the disk whenever the lock was taken (the early returns on
+    /// the caller's copy touch nothing). The wait blocks its thread: async
+    /// callers go through [`RunStore::blocking`].
     pub fn expire_if_overdue(
+        &self,
+        record: &mut RunRecord,
+        now: DateTime<Utc>,
+        on_timeout: Option<TimeoutAction>,
+    ) -> Result<Option<TimeoutAction>, RunStoreError> {
+        if record.status != RunStatus::AwaitingApproval
+            || record.awaiting_gates().len() > 1
+            || record.expires_at.is_none_or(|expires_at| now <= expires_at)
+        {
+            return Ok(None);
+        }
+        let _lock = self.lock_run_json(&record.id);
+        let mut current = self.load(&record.id)?;
+        let outcome = self.expire_if_overdue_locked(&mut current, now, on_timeout);
+        *record = current;
+        outcome
+    }
+
+    /// [`expire_if_overdue`](Self::expire_if_overdue)'s decision and write
+    /// on a record loaded under the run lock the caller holds (the gate
+    /// methods, which load → decide → write under one lock).
+    fn expire_if_overdue_locked(
         &self,
         record: &mut RunRecord,
         now: DateTime<Utc>,
@@ -2137,7 +2195,39 @@ impl RunStore {
     /// wasn't overdue — covering: the run isn't `AwaitingApproval`,
     /// `step_id` isn't currently one of the parked gates, or that gate has
     /// no `timeout_seconds` set.
+    ///
+    /// `record` is what the caller listed earlier; the decision is made
+    /// again from what the disk holds, under the run lock, so a reject, an
+    /// approve or a resume that landed since is preserved — never
+    /// overwritten with the expiry. `record` is brought up to date with
+    /// the disk whenever the lock was taken (the early returns on the
+    /// caller's copy touch nothing). The wait blocks its thread: async
+    /// callers go through [`RunStore::blocking`].
     pub fn expire_gate_if_overdue(
+        &self,
+        record: &mut RunRecord,
+        step_id: &str,
+        now: DateTime<Utc>,
+        on_timeout: Option<TimeoutAction>,
+    ) -> Result<Option<TimeoutAction>, RunStoreError> {
+        let overdue = record.status == RunStatus::AwaitingApproval
+            && record
+                .awaiting_gates()
+                .iter()
+                .any(|g| g.step_id == step_id && g.expires_at.is_some_and(|at| now > at));
+        if !overdue {
+            return Ok(None);
+        }
+        let _lock = self.lock_run_json(&record.id);
+        let mut current = self.load(&record.id)?;
+        let outcome = self.expire_gate_if_overdue_locked(&mut current, step_id, now, on_timeout);
+        *record = current;
+        outcome
+    }
+
+    /// [`expire_gate_if_overdue`](Self::expire_gate_if_overdue)'s decision
+    /// and write on a record loaded under the run lock the caller holds.
+    fn expire_gate_if_overdue_locked(
         &self,
         record: &mut RunRecord,
         step_id: &str,
@@ -2366,6 +2456,9 @@ impl RunStore {
         now: chrono::DateTime<chrono::Utc>,
         gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
+        // Under the run lock across load → decide → write: a cancel (reject),
+        // approve or resume landing meanwhile is seen, never overwritten.
+        let _lock = self.lock_run_json(run_id);
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
@@ -2375,7 +2468,7 @@ impl RunStore {
         // includes clearing `awaiting_step_id`).
         let step_id_before_expiry = record.awaiting_step_id.clone();
         let on_timeout = self.gate_on_timeout(&record);
-        match self.expire_if_overdue(&mut record, now, on_timeout)? {
+        match self.expire_if_overdue_locked(&mut record, now, on_timeout)? {
             Some(TimeoutAction::Fail) => {
                 return Err(ApprovalError::Expired(
                     record
@@ -2490,6 +2583,22 @@ impl RunStore {
         now: chrono::DateTime<chrono::Utc>,
         gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
+        // Under the run lock across load → decide → write: a cancel (reject),
+        // approve or resume landing meanwhile is seen, never overwritten.
+        let _lock = self.lock_run_json(run_id);
+        self.reject_gate_locked(run_id, approver, reason, now, gate_id)
+    }
+
+    /// [`reject_gate`](Self::reject_gate) under a run lock the caller
+    /// already holds (`cancel`, which rejects an awaiting run).
+    fn reject_gate_locked(
+        &self,
+        run_id: &str,
+        approver: &str,
+        reason: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
@@ -2497,7 +2606,7 @@ impl RunStore {
         // Captured before `expire_if_overdue` can clear it.
         let step_id_before_expiry = record.awaiting_step_id.clone();
         let on_timeout = self.gate_on_timeout(&record);
-        match self.expire_if_overdue(&mut record, now, on_timeout)? {
+        match self.expire_if_overdue_locked(&mut record, now, on_timeout)? {
             Some(TimeoutAction::Fail) => {
                 return Err(ApprovalError::Expired(
                     record
@@ -2667,6 +2776,9 @@ impl RunStore {
         now: chrono::DateTime<chrono::Utc>,
         gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
+        // Under the run lock across load → decide → write: a cancel (reject),
+        // approve or resume landing meanwhile is seen, never overwritten.
+        let _lock = self.lock_run_json(run_id);
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
@@ -2674,7 +2786,7 @@ impl RunStore {
         // Captured before `expire_if_overdue` can clear it.
         let step_id_before_expiry = record.awaiting_step_id.clone();
         let on_timeout = self.gate_on_timeout(&record);
-        match self.expire_if_overdue(&mut record, now, on_timeout)? {
+        match self.expire_if_overdue_locked(&mut record, now, on_timeout)? {
             Some(TimeoutAction::Fail) => {
                 return Err(ApprovalError::Expired(
                     record
@@ -2856,16 +2968,23 @@ impl RunStore {
         worker_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, RunStoreError> {
-        let mut record = self.load(run_id)?;
-        if let Some(claimed) = record.resume_claimed_at {
-            if now - claimed <= Self::RESUME_LEASE {
-                return Ok(false);
+        // Under the run lock, from the record as it is now: a cancel that
+        // landed is never overwritten — and never claimed (`Ok(false)`),
+        // so the resume worker does not resume a cancelled run. The wait
+        // blocks its thread: async callers go through [`RunStore::blocking`].
+        let claimed = std::cell::Cell::new(false);
+        self.modify_unless_cancelled(run_id, |record| {
+            if let Some(at) = record.resume_claimed_at {
+                if now - at <= Self::RESUME_LEASE {
+                    return false;
+                }
             }
-        }
-        record.resume_claimed_at = Some(now);
-        record.resume_claimed_by = Some(worker_id.to_string());
-        self.update(&record)?;
-        Ok(true)
+            record.resume_claimed_at = Some(now);
+            record.resume_claimed_by = Some(worker_id.to_string());
+            claimed.set(true);
+            true
+        })?;
+        Ok(claimed.get())
     }
 
     /// Clear the pending-resume marker + claim after a worker finishes
@@ -2877,14 +2996,19 @@ impl RunStore {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), RunStoreError> {
         let _ = now;
-        let mut record = self.load(run_id)?;
-        record.resume_requested_at = None;
-        record.resume_claimed_at = None;
-        record.resume_claimed_by = None;
-        record.resume_mode = None;
-        record.resume_gate_id = None;
-        record.resume_approver = None;
-        self.update(&record)?;
+        // Under the run lock, touching only its own fields on the record as
+        // it is now: a `Running` / `runner_pid` the spawned resume already
+        // wrote stays, and a `Cancelled` is left alone entirely. The wait
+        // blocks its thread: async callers go through [`RunStore::blocking`].
+        self.modify_unless_cancelled(run_id, |record| {
+            record.resume_requested_at = None;
+            record.resume_claimed_at = None;
+            record.resume_claimed_by = None;
+            record.resume_mode = None;
+            record.resume_gate_id = None;
+            record.resume_approver = None;
+            true
+        })?;
         Ok(())
     }
 
@@ -2913,10 +3037,16 @@ impl RunStore {
     /// by any synchronous caller of `reject_gate` (the CLI `reject`
     /// command) that already ran the chain itself, so the sweep does not
     /// repeat the work on its next tick.
+    ///
+    /// Under the run lock, touching only the marker on the record as it is
+    /// now; a `Cancelled` is left alone (the sweep lists `Rejected` runs
+    /// only, so its marker is never re-processed). The wait blocks its
+    /// thread: async callers go through [`RunStore::blocking`].
     pub fn clear_reject_cleanup(&self, run_id: &str) -> Result<(), RunStoreError> {
-        let mut record = self.load(run_id)?;
-        record.reject_cleanup_pending = None;
-        self.update(&record)?;
+        self.modify_unless_cancelled(run_id, |record| {
+            record.reject_cleanup_pending = None;
+            true
+        })?;
         Ok(())
     }
 
@@ -2983,7 +3113,7 @@ impl RunStore {
             | RunStatus::Rejected
             | RunStatus::Cancelled => Err(CancelError::AlreadyTerminal(record.status)),
             RunStatus::AwaitingApproval => {
-                self.reject(run_id, approver, reason, now)
+                self.reject_gate_locked(run_id, approver, reason, now, None)
                     .map_err(|e| match e {
                         ApprovalError::NotFound(s) => CancelError::NotFound(s),
                         other => CancelError::Store(other.to_string()),
@@ -3057,8 +3187,10 @@ impl RunStore {
     /// `record` is what the caller listed earlier; the decision is made
     /// again from what the disk holds, under the run lock, so a cancel (or
     /// a pid hand-off) that landed since is preserved — never overwritten
-    /// with `Failed`. `record` is brought up to date with the disk either
-    /// way. The wait blocks its thread: async callers go through
+    /// with `Failed`. `record` is brought up to date with the disk whenever
+    /// the lock was taken; the two early returns on the caller's copy (not
+    /// `Pending`/`Running`, or no dead recorded pid) touch neither the disk
+    /// nor `record`. The wait blocks its thread: async callers go through
     /// [`RunStore::blocking`].
     pub fn reap_if_orphaned(
         &self,
@@ -6125,6 +6257,324 @@ mod tests {
             store.modify_if_status("run_missing", RunStatus::Paused, |_| {}),
             Err(RunStoreError::NotFound(_))
         ));
+    }
+
+    /// `modify_fields` writes its fields onto the record whatever its
+    /// status — here a cancel that landed under the run lock while the
+    /// writer waited for it: the cancel's status, message and terminal time
+    /// stay exactly as written, and the fields land next to them. `false`
+    /// from `modify` writes nothing.
+    #[test]
+    fn modify_fields_writes_onto_a_cancel_that_landed_under_the_run_lock() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_fields_vs_cancel");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let mut cancelled = rec.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        cancelled.finished_at = Some(Utc::now());
+        let holder = another_process_writes_under_the_lock(
+            tmp.path().to_path_buf(),
+            cancelled.clone(),
+            std::time::Duration::from_millis(200),
+        );
+        let started = std::time::Instant::now();
+        let written = store
+            .modify_fields(&rec.id, |r| {
+                r.source_wake_id = Some("wake_1".into());
+                r.backend_id = Some("local_worktree".into());
+                true
+            })
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the cancel holding the lock ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(
+            written.status,
+            RunStatus::Cancelled,
+            "modified the cancelled record"
+        );
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Cancelled);
+        assert_eq!(on_disk.error_message.as_deref(), Some("stop it"));
+        assert_eq!(on_disk.finished_at, cancelled.finished_at);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_1"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+
+        let before = std::fs::read(store.run_json(&rec.id)).unwrap();
+        let untouched = store
+            .modify_fields(&rec.id, |r| {
+                r.worker_id = Some("not written".into());
+                false
+            })
+            .unwrap();
+        assert_eq!(untouched.worker_id.as_deref(), Some("not written"));
+        assert_eq!(
+            std::fs::read(store.run_json(&rec.id)).unwrap(),
+            before,
+            "`false`: nothing written"
+        );
+        assert!(matches!(
+            store.modify_fields("run_missing", |_| true),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// Another process holds the run lock, writes `record` `after` the lock
+    /// is taken, then releases. Returns once the lock is held.
+    fn another_process_writes_under_the_lock(
+        root: std::path::PathBuf,
+        record: RunRecord,
+        after: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let lock_path = root.join(&record.id).join("run.json.lock");
+        let other_store = RunStore::new(root);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(after);
+            other_store.update(&record).unwrap();
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+        holder
+    }
+
+    /// `claim_resume` and a concurrent cancel serialize on the run lock: the
+    /// cancel lands first, and the claim — which waited for it — finds
+    /// `Cancelled`, claims nothing and writes nothing, so the resume worker
+    /// never resumes a cancelled run.
+    #[test]
+    fn a_claim_resume_waits_for_a_cancel_holding_the_run_lock_and_claims_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_claim_vs_cancel");
+        rec.status = RunStatus::Paused;
+        rec.resume_requested_at = Some(Utc::now());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let mut cancelled = rec.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        let holder = another_process_writes_under_the_lock(
+            tmp.path().to_path_buf(),
+            cancelled,
+            std::time::Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let claimed = store.claim_resume(&rec.id, "worker-1", Utc::now()).unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the holder ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert!(!claimed, "a cancelled run is never claimed");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+        assert_eq!(reloaded.resume_claimed_at, None);
+        assert_eq!(reloaded.resume_claimed_by, None);
+    }
+
+    /// `clear_resume` after the spawned child's flip: the child's `Running`
+    /// and `runner_pid` landed under the lock while the worker's clear
+    /// waited; the clear then touches only its own fields on the record as
+    /// it is now.
+    #[test]
+    fn a_clear_resume_keeps_the_child_s_flip_that_landed_under_the_run_lock() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_clear_vs_flip");
+        rec.status = RunStatus::Paused;
+        rec.runner_pid = None;
+        rec.resume_requested_at = Some(Utc::now());
+        rec.resume_claimed_at = Some(Utc::now());
+        rec.resume_claimed_by = Some("worker-1".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        // The child flips to Running with its pid and leaves the markers
+        // (it does not own them).
+        let mut flipped = rec.clone();
+        flipped.status = RunStatus::Running;
+        flipped.runner_pid = Some(4242);
+        let holder = another_process_writes_under_the_lock(
+            tmp.path().to_path_buf(),
+            flipped,
+            std::time::Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        store.clear_resume(&rec.id, Utc::now()).unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the holder ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(
+            reloaded.status,
+            RunStatus::Running,
+            "the child's flip stays"
+        );
+        assert_eq!(reloaded.runner_pid, Some(4242), "and its pid");
+        assert_eq!(
+            reloaded.resume_requested_at, None,
+            "the markers are cleared"
+        );
+        assert_eq!(reloaded.resume_claimed_at, None);
+        assert_eq!(reloaded.resume_claimed_by, None);
+    }
+
+    /// The expiry re-decides under the lock: a run cancelled (an awaiting
+    /// run's cancel rejects it) since the caller listed it as overdue is
+    /// left alone — no `Failed`, no second terminal event — and the
+    /// caller's copy follows the disk.
+    #[test]
+    fn an_expiry_preserves_a_reject_that_landed_since_the_record_was_listed() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = awaiting_set_record_for_timeout("run_expire_vs_cancel", now);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let mut listed = store.load(&rec.id).unwrap();
+        // Another process rejected it since (what its cancel does to an
+        // awaiting run).
+        let mut rejected = rec.clone();
+        rejected.status = RunStatus::Rejected;
+        rejected.awaiting.clear();
+        rejected.sync_awaiting_compat();
+        rejected.error_message = Some("rejected: stop it".into());
+        RunStore::new(tmp.path().to_path_buf())
+            .update(&rejected)
+            .unwrap();
+
+        let expired = store
+            .expire_if_overdue(&mut listed, now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(expired, None, "nothing to expire: rejected meanwhile");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert_eq!(
+            reloaded.error_message.as_deref(),
+            Some("rejected: stop it"),
+            "the reject is untouched"
+        );
+        let events = std::fs::read_to_string(store.run_dir(&rec.id).join("events.jsonl"))
+            .unwrap_or_default();
+        assert!(
+            !events.contains("approval expired"),
+            "no expiry event was appended: {events}"
+        );
+        assert_eq!(
+            listed.status,
+            RunStatus::Rejected,
+            "the caller's copy follows the disk"
+        );
+    }
+
+    /// `approve_gate` and a concurrent reject (an awaiting run's cancel)
+    /// serialize on the run lock: the reject lands first, and the approve —
+    /// which waited for it — finds the run no longer awaiting, refuses, and
+    /// writes nothing.
+    #[test]
+    fn an_approve_waits_for_a_reject_holding_the_run_lock_and_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_approve_vs_reject");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting = vec![AwaitingGate {
+            step_id: "deploy".into(),
+            prompt: Some("ok?".into()),
+            since: now,
+            expires_at: None,
+        }];
+        rec.sync_awaiting_compat();
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let mut rejected = rec.clone();
+        rejected.status = RunStatus::Rejected;
+        rejected.awaiting.clear();
+        rejected.sync_awaiting_compat();
+        rejected.error_message = Some("rejected: stop it".into());
+        let holder = another_process_writes_under_the_lock(
+            tmp.path().to_path_buf(),
+            rejected,
+            std::time::Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let err = store.approve_gate(&rec.id, "matt", now, None).unwrap_err();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the holder ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert!(
+            matches!(err, ApprovalError::NotAwaiting(ref s) if s == "rejected"),
+            "the reject that landed under the lock wins: {err:?}"
+        );
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert_eq!(reloaded.error_message.as_deref(), Some("rejected: stop it"));
+    }
+
+    /// The per-gate expiry re-decides under the lock too: a run rejected
+    /// since the sweep listed its gate as overdue is left alone — no
+    /// `Failed`, no expiry event — and the caller's copy follows the disk.
+    #[test]
+    fn a_gate_expiry_preserves_a_reject_that_landed_since_the_record_was_listed() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = awaiting_set_record_for_timeout("run_gate_expire_vs_cancel", now);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let mut listed = store.load(&rec.id).unwrap();
+        let mut rejected = rec.clone();
+        rejected.status = RunStatus::Rejected;
+        rejected.awaiting.clear();
+        rejected.sync_awaiting_compat();
+        rejected.error_message = Some("rejected: stop it".into());
+        RunStore::new(tmp.path().to_path_buf())
+            .update(&rejected)
+            .unwrap();
+
+        let expired = store
+            .expire_gate_if_overdue(&mut listed, "deploy", now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(expired, None, "nothing to expire: rejected meanwhile");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert_eq!(reloaded.error_message.as_deref(), Some("rejected: stop it"));
+        let events = std::fs::read_to_string(store.run_dir(&rec.id).join("events.jsonl"))
+            .unwrap_or_default();
+        assert!(!events.contains("approval expired"), "{events}");
+        assert_eq!(listed.status, RunStatus::Rejected);
+    }
+
+    /// A cancelled run is never claimed for a resume.
+    #[test]
+    fn claim_resume_never_claims_a_cancelled_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_claim_cancelled");
+        rec.status = RunStatus::Cancelled;
+        rec.resume_requested_at = Some(Utc::now());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store.claim_resume(&rec.id, "worker-1", Utc::now()).unwrap());
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.resume_claimed_at, None);
     }
 
     #[test]

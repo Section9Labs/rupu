@@ -339,15 +339,21 @@ impl WorkflowExecutor for InProcessExecutor {
     }
 
     async fn approve(&self, run_id: &str, approver: &str) -> Result<(), ExecutorError> {
+        // On the blocking pool: the gate methods take the run lock.
+        let (id, approver) = (run_id.to_string(), approver.to_string());
         self.run_store
-            .approve(run_id, approver, chrono::Utc::now())
+            .blocking(move |store| store.approve(&id, &approver, chrono::Utc::now()))
+            .await
             .map(|_| ())
             .map_err(map_approval_err)
     }
 
     async fn reject(&self, run_id: &str, reason: &str) -> Result<(), ExecutorError> {
+        // On the blocking pool: the gate methods take the run lock.
+        let (id, reason) = (run_id.to_string(), reason.to_string());
         self.run_store
-            .reject(run_id, "executor", reason, chrono::Utc::now())
+            .blocking(move |store| store.reject(&id, "executor", &reason, chrono::Utc::now()))
+            .await
             .map(|_| ())
             .map_err(map_approval_err)
     }
