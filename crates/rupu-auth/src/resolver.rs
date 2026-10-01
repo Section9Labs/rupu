@@ -297,6 +297,12 @@ impl KeychainResolver {
         self.read_account(p.as_str(), Some(&legacy_account_for(p)), mode)
     }
 
+    /// The file's raw entry for `key` (`<account>/<mode>`), exactly as
+    /// stored — what [`unpersisted`] compares a rotation's base against.
+    fn file_entry_at(path: &std::path::Path, key: &str) -> Result<Option<String>> {
+        Ok(Self::read_file_map(path)?.remove(key))
+    }
+
     fn parse_provider(name: &str) -> Result<ProviderId> {
         match name {
             "anthropic" => Ok(ProviderId::Anthropic),
@@ -374,10 +380,13 @@ impl KeychainResolver {
     /// [`RefreshWhen`] for when a request is still made.
     ///
     /// A rotation the file could not take (the write failed after the token
-    /// endpoint answered) is the live credential, kept in [`unpersisted`]:
-    /// it is what this re-read finds, ahead of the file, and the persist is
-    /// retried here first — so no later refresh in this process posts the
-    /// dead token the file still holds.
+    /// endpoint answered) is the live credential, kept in [`unpersisted`]
+    /// with the file's entry it started from: while the file still holds
+    /// that entry, it is what this re-read finds, ahead of the file, and the
+    /// persist is retried here first — so no later refresh in this process
+    /// posts the dead token the file still holds. Once the file's entry
+    /// differs (another process logged the account in or out, or rotated it
+    /// itself), the overlay entry is dropped and the file is the truth.
     async fn refresh_and_store_at(
         path: PathBuf,
         account: String,
@@ -398,12 +407,17 @@ impl KeychainResolver {
                     .map_err(|e| anyhow::anyhow!("auth file lock task failed: {e}"))??
             };
             let key = format!("{account}/{}", mode.as_str());
-            let sc = match unpersisted::get(&path, &key) {
+            // The overlay's rotation is the live credential only while the
+            // file still holds the entry it started from; a login, logout
+            // or rotation by another process since supersedes it.
+            let file_entry = Self::file_entry_at(&path, &key)?;
+            let sc = match unpersisted::get_based_on(&path, &key, file_entry.as_deref()) {
                 Some(pending) => {
                     let sc = parse_stored_credential(&pending, mode)?;
-                    // Land it now if the file will take it; the overlay
-                    // entry goes with a successful write.
-                    if let Err(e) = Self::store_named_at(&path, &account, mode, &sc) {
+                    // Land it now if the file will take it (the exact
+                    // pending payload, so the file then holds what the
+                    // overlay held); the entry goes with a successful write.
+                    if let Err(e) = Self::write_account_at(&path, &key, &pending) {
                         tracing::warn!(
                             path = %path.display(),
                             account,
@@ -421,11 +435,16 @@ impl KeychainResolver {
             if when.already_satisfied(&sc) {
                 return Ok(sc);
             }
+            // The base this rotation starts from: the file's entry as it is
+            // now, under the lock (the retry above may just have landed
+            // the pending one). Read before the token request, so a read
+            // failure costs nothing.
+            let base = Self::file_entry_at(&path, &key)?;
             let new = Self::refresh_inner(&account, kind, &sc, timeout).await?;
             if let Err(e) = Self::store_named_at(&path, &account, mode, &new) {
                 let payload =
                     serde_json::to_string(&new).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-                unpersisted::set(&path, &key, payload);
+                unpersisted::set(&path, &key, payload, base);
                 report_unpersisted_rotation(&path, &account, &e);
             }
             Ok(new)
@@ -755,24 +774,25 @@ impl Default for KeychainResolver {
 /// The token endpoint has already rotated the refresh token when the write
 /// of the new credential fails (a read-only directory, a full disk): the
 /// credential in hand is the only live one. It is handed back so the run
-/// continues and kept in [`unpersisted`] for every later refresh and write
-/// in this process (which retry the write), and the loss is reported loudly
-/// — the next process will find the dead refresh token in the file and need
-/// `rupu auth login` unless a later write in this one lands it first.
+/// continues and kept in [`unpersisted`] — every later refresh of the
+/// account and every later write of the file in this process retry the
+/// write — and the loss is reported loudly: the next process will find the
+/// dead refresh token in the file and need `rupu auth login` unless a later
+/// write in this one lands it first.
 fn report_unpersisted_rotation(path: &std::path::Path, account: &str, error: &anyhow::Error) {
     tracing::error!(
         path = %path.display(),
         account,
         error = %error,
         "the refreshed OAuth token could not be persisted; this process keeps using it and \
-         retries the write on its next credential write or refresh, the next process will need \
-         `rupu auth login` unless one lands"
+         retries the write on its next write of the credential file or refresh of this account, \
+         the next process will need `rupu auth login` unless one lands"
     );
     eprintln!(
         "rupu: the '{account}' token was refreshed but could not be written to {}: {error}. This \
-         process keeps using the new token and retries the write on its next credential write \
-         or refresh; if the next rupu command cannot authenticate, run: rupu auth login \
-         --account {account} --mode sso",
+         process keeps using the new token and retries the write on its next write of the \
+         credential file or refresh of this account; if the next rupu command cannot \
+         authenticate, run: rupu auth login --account {account} --mode sso",
         path.display()
     );
 }
@@ -799,10 +819,19 @@ fn file_mutex(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> 
 /// directory, a full disk), so the credential in hand is the only live one
 /// and the file keeps a dead refresh token. Keyed by the resolved auth file
 /// and the file-map key (`<account>/<mode>`); process-wide, like the file
-/// mutex, and only ever touched under the [`AuthFileLock`]. Every later
-/// refresh reads it ahead of the file, every later write of the file folds
-/// it in, and an entry leaves once the file holds it (or the account is
-/// forgotten). Without it, every later refresh in the process re-read the
+/// mutex, and only ever touched under the [`AuthFileLock`].
+///
+/// Each entry remembers its base: the file's entry for the key as it was
+/// when the rotation started (what the dead refresh token is stored in).
+/// The entry is the live credential only while the file still holds that
+/// base. Every later refresh of the account reads it ahead of the file, and
+/// every later write of the file folds it in — each after comparing the
+/// file's current entry with the base: a file that moved on (another
+/// process logged the account in or out, or rotated it itself) supersedes
+/// the entry, which is dropped, so a stale rotation is never written over
+/// a newer credential and never brings back a logged-out one. An entry also
+/// leaves once the file holds it, or when the account is forgotten.
+/// Without the overlay, every later refresh in the process re-read the
 /// file and posted the dead token — `invalid_grant`, and reuse detection
 /// can revoke the whole grant.
 mod unpersisted {
@@ -810,7 +839,14 @@ mod unpersisted {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    type Overlay = HashMap<(PathBuf, String), String>;
+    /// A rotation the file could not take, and the file's entry for its
+    /// key when it started (`None`: the file had none).
+    struct Entry {
+        payload: String,
+        base: Option<String>,
+    }
+
+    type Overlay = HashMap<(PathBuf, String), Entry>;
 
     fn entries() -> MutexGuard<'static, Overlay> {
         static ENTRIES: OnceLock<Mutex<Overlay>> = OnceLock::new();
@@ -820,17 +856,39 @@ mod unpersisted {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The pending payload for `key` in `path`, if any.
-    pub(super) fn get(path: &Path, key: &str) -> Option<String> {
-        entries()
-            .get(&(path.to_path_buf(), key.to_string()))
-            .cloned()
+    fn superseded(path: &Path, key: &str) {
+        tracing::info!(
+            path = %path.display(),
+            account = key,
+            "dropping an unpersisted token rotation: the stored credential was rewritten by \
+             another process since (a login, logout or its own refresh); using the file"
+        );
     }
 
-    /// Record a rotation the file could not take (a newer one replaces an
-    /// older one for the same key).
-    pub(super) fn set(path: &Path, key: &str, payload: String) {
-        entries().insert((path.to_path_buf(), key.to_string()), payload);
+    /// The pending payload for `key` in `path`, if its base is still what
+    /// the file holds (`file_entry`). An entry whose base the file no
+    /// longer holds is superseded: dropped, and `None`.
+    pub(super) fn get_based_on(path: &Path, key: &str, file_entry: Option<&str>) -> Option<String> {
+        let mut entries = entries();
+        let k = (path.to_path_buf(), key.to_string());
+        let entry = entries.get(&k)?;
+        if entry.base.as_deref() == file_entry {
+            return Some(entry.payload.clone());
+        }
+        entries.remove(&k);
+        drop(entries);
+        superseded(path, key);
+        None
+    }
+
+    /// Record a rotation the file could not take, started from `base` —
+    /// the file's entry for `key` at that moment (a newer rotation replaces
+    /// an older one for the same key).
+    pub(super) fn set(path: &Path, key: &str, payload: String, base: Option<String>) {
+        entries().insert(
+            (path.to_path_buf(), key.to_string()),
+            Entry { payload, base },
+        );
     }
 
     /// Drop the pending rotation for `key`, if any (superseded by a write
@@ -839,18 +897,34 @@ mod unpersisted {
         entries().remove(&(path.to_path_buf(), key.to_string()));
     }
 
-    /// Put every pending rotation for `path` into `map` (they are newer
-    /// than what the file holds). Returns what was folded, for
+    /// Put every pending rotation for `path` whose base `map` (the file,
+    /// just read under the lock) still holds into `map` — they are newer
+    /// than what the file holds. One whose base the file no longer holds is
+    /// superseded and dropped instead. Returns what was folded, for
     /// [`clear_folded`] once the write succeeded.
     pub(super) fn fold_into(
         path: &Path,
         map: &mut BTreeMap<String, String>,
     ) -> Vec<(String, String)> {
-        let folded: Vec<(String, String)> = entries()
-            .iter()
-            .filter(|((p, _), _)| p == path)
-            .map(|((_, key), payload)| (key.clone(), payload.clone()))
-            .collect();
+        let mut folded = Vec::new();
+        let mut stale = Vec::new();
+        {
+            let entries = entries();
+            for ((p, key), entry) in entries.iter() {
+                if p != path {
+                    continue;
+                }
+                if map.get(key).map(String::as_str) == entry.base.as_deref() {
+                    folded.push((key.clone(), entry.payload.clone()));
+                } else {
+                    stale.push(key.clone());
+                }
+            }
+        }
+        for key in stale {
+            remove(path, &key);
+            superseded(path, &key);
+        }
         for (key, payload) in &folded {
             map.insert(key.clone(), payload.clone());
         }
@@ -863,7 +937,7 @@ mod unpersisted {
         let mut entries = entries();
         for (key, payload) in folded {
             let k = (path.to_path_buf(), key.clone());
-            if entries.get(&k) == Some(payload) {
+            if entries.get(&k).map(|e| &e.payload) == Some(payload) {
                 entries.remove(&k);
             }
         }

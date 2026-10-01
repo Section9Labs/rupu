@@ -1065,6 +1065,209 @@ async fn an_unpersisted_rotation_is_used_by_later_refreshes_in_the_process() {
         .contains("refresh-10"));
 }
 
+/// An unpersisted rotation, then a write `another process` makes in the
+/// meantime with the directory writable again: a login of the account (the
+/// user followed the stderr advice), or a logout.
+#[cfg(unix)]
+struct OverlayFixture<'a> {
+    r: KeychainResolver,
+    auth_path: std::path::PathBuf,
+    /// Token mocks keyed on the refresh token they rotate: `refresh-1`
+    /// (what the file held), `refresh-2` (the overlay's rotation, which
+    /// must never be posted again) and `refresh-9` (the other process's
+    /// login).
+    from_1: httpmock::Mock<'a>,
+    from_2: httpmock::Mock<'a>,
+    from_9: httpmock::Mock<'a>,
+    _tmp: assert_fs::TempDir,
+    _env: [EnvVarGuard; 2],
+}
+
+/// `None` when directory modes are not enforced (root): nothing to test.
+#[cfg(unix)]
+async fn overlay_then_other_process_writes<'a>(
+    server: &'a httpmock::MockServer,
+    other_process_writes: &str,
+) -> Option<OverlayFixture<'a>> {
+    use httpmock::prelude::*;
+    use std::os::unix::fs::PermissionsExt;
+    let rotate = |from: &'static str, access: &'static str, refresh: &'static str| {
+        server.mock(move |when, then| {
+            when.method(POST).path("/token").body_contains(from);
+            then.status(200).json_body(serde_json::json!({
+                "access_token": access,
+                "refresh_token": refresh,
+                "expires_in": 3600
+            }));
+        })
+    };
+    let from_1 = rotate("refresh-1", "access-2", "refresh-2");
+    let from_2 = rotate("refresh-2", "access-3", "refresh-3");
+    let from_9 = rotate("refresh-9", "access-10", "refresh-10");
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let dir = tmp.path().join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth_path = dir.join("auth.json");
+    let env = [
+        EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap()),
+        EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token")),
+    ];
+    let r = KeychainResolver::new();
+    store_near_expiry_sso(&r).await;
+    let before = std::fs::read_to_string(&auth_path).unwrap();
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let restore = RestoreMode(dir.clone());
+    if std::fs::File::create(dir.join("probe")).is_ok() {
+        eprintln!("skipping: directory modes are not enforced for this user (root?)");
+        return None;
+    }
+    // The rotation lands in the overlay only.
+    let (_, creds) = r.get("anthropic", Some(AuthMode::Sso)).await.unwrap();
+    assert_eq!(access_of(creds), "access-2");
+    from_1.assert_hits(1);
+    assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), before);
+
+    // The directory is writable again and another process rewrites the
+    // file (temp + rename, as a real process writes).
+    drop(restore);
+    write_atomic(&auth_path, other_process_writes);
+    Some(OverlayFixture {
+        r,
+        auth_path,
+        from_1,
+        from_2,
+        from_9,
+        _tmp: tmp,
+        _env: env,
+    })
+}
+
+#[cfg(unix)]
+fn access_of(creds: rupu_providers::auth::AuthCredentials) -> String {
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn login_of_another_process() -> String {
+    serde_json::json!({
+        "anthropic/sso": sso_payload("access-9", "refresh-9", chrono::Duration::hours(1))
+    })
+    .to_string()
+}
+
+/// The file's entry no longer equals the base the overlay's rotation
+/// started from: another process logged the account in (the user followed
+/// the stderr advice). The next refresh of the account drops the overlay
+/// entry and works from the file — it posts the login's refresh token, not
+/// the overlay's — and a later unrelated write does not bring the stale
+/// rotation back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn another_process_s_login_supersedes_an_unpersisted_rotation_on_the_next_refresh() {
+    let server = httpmock::MockServer::start();
+    let Some(f) = overlay_then_other_process_writes(&server, &login_of_another_process()).await
+    else {
+        return;
+    };
+
+    let creds = f.r.refresh("anthropic", AuthMode::Sso).await.unwrap();
+    assert_eq!(access_of(creds), "access-10", "rotated from the login");
+    f.from_9.assert_hits(1);
+    f.from_2.assert_hits(0);
+    f.from_1.assert_hits(1);
+    let saved = std::fs::read_to_string(&f.auth_path).unwrap();
+    assert!(saved.contains("refresh-10"), "{saved}");
+
+    // The overlay entry is gone: an unrelated write folds nothing stale in.
+    f.r.store_named("vllm", AuthMode::ApiKey, &StoredCredential::api_key("k"))
+        .await
+        .unwrap();
+    let saved = std::fs::read_to_string(&f.auth_path).unwrap();
+    assert!(
+        saved.contains("refresh-10") && !saved.contains("refresh-2"),
+        "{saved}"
+    );
+}
+
+/// The same supersession seen from a write: after another process's login,
+/// the next unrelated write of the file (another account's credential)
+/// keeps the login and drops the overlay entry, so a later `get` hands out
+/// the login's token with no token request, and a later refresh rotates
+/// from the login.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn another_process_s_login_supersedes_an_unpersisted_rotation_on_the_next_write() {
+    let server = httpmock::MockServer::start();
+    let Some(f) = overlay_then_other_process_writes(&server, &login_of_another_process()).await
+    else {
+        return;
+    };
+
+    f.r.store_named("vllm", AuthMode::ApiKey, &StoredCredential::api_key("k"))
+        .await
+        .unwrap();
+    let saved = std::fs::read_to_string(&f.auth_path).unwrap();
+    assert!(
+        saved.contains("refresh-9")
+            && saved.contains("vllm/api-key")
+            && !saved.contains("refresh-2"),
+        "the login stays, the stale rotation is not folded over it: {saved}"
+    );
+
+    // The login is fresh: handed out as is.
+    let (_, creds) = f.r.get("anthropic", Some(AuthMode::Sso)).await.unwrap();
+    assert_eq!(access_of(creds), "access-9");
+    f.from_2.assert_hits(0);
+    f.from_9.assert_hits(0);
+
+    // A forced refresh rotates from the login.
+    let creds = f.r.refresh("anthropic", AuthMode::Sso).await.unwrap();
+    assert_eq!(access_of(creds), "access-10");
+    f.from_9.assert_hits(1);
+    f.from_2.assert_hits(0);
+}
+
+/// Another process logged the account out: the overlay entry is dropped
+/// too — the next write does not bring the credential back, and the next
+/// `get` / refresh of the account find nothing stored (and post nothing).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn another_process_s_logout_drops_an_unpersisted_rotation() {
+    let server = httpmock::MockServer::start();
+    let Some(f) = overlay_then_other_process_writes(&server, "{}").await else {
+        return;
+    };
+
+    f.r.store_named("vllm", AuthMode::ApiKey, &StoredCredential::api_key("k"))
+        .await
+        .unwrap();
+    let saved = std::fs::read_to_string(&f.auth_path).unwrap();
+    assert!(
+        !saved.contains("anthropic/sso") && saved.contains("vllm/api-key"),
+        "the logout stays: {saved}"
+    );
+
+    let err =
+        f.r.get("anthropic", Some(AuthMode::Sso))
+            .await
+            .expect_err("nothing stored");
+    assert!(err.to_string().contains("no credentials"), "{err}");
+    let err =
+        f.r.refresh("anthropic", AuthMode::Sso)
+            .await
+            .expect_err("nothing stored");
+    assert!(err.to_string().contains("no stored credential"), "{err}");
+    f.from_2.assert_hits(0);
+    f.from_9.assert_hits(0);
+}
+
 // ---- refresh request formats (per provider, as the vendor's own client) ------
 
 /// Store a near-expiry SSO credential for `kind` with the given `extra`.
