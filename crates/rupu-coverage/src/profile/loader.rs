@@ -52,7 +52,48 @@ pub fn expand_includes(
     go(all, id, &mut Vec::new())
 }
 
-fn dedup(p: &mut EngagementProfile) {
+/// The profile ids `id` expands to for routing: `id` itself first, then every
+/// profile it transitively includes (depth-first, in include order), each id
+/// exactly once — so a diamond (`full` -> `pentest` -> `network`, `full` ->
+/// `network`) lists `network` once.
+///
+/// Fails with the same `LoadError`s as [`expand_includes`] (cycle / missing
+/// include).
+pub fn include_closure(
+    all: &BTreeMap<String, EngagementProfile>,
+    id: &str,
+) -> Result<Vec<String>, LoadError> {
+    fn go(
+        all: &BTreeMap<String, EngagementProfile>,
+        id: &str,
+        stack: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) -> Result<(), LoadError> {
+        if stack.iter().any(|s| s == id) {
+            return Err(LoadError::IncludeCycle(id.to_string()));
+        }
+        let base = all
+            .get(id)
+            .ok_or_else(|| LoadError::MissingInclude(id.to_string()))?;
+        if out.iter().any(|s| s == id) {
+            return Ok(());
+        }
+        out.push(id.to_string());
+        stack.push(id.to_string());
+        for inc in &base.includes {
+            go(all, inc, stack, out)?;
+        }
+        stack.pop();
+        Ok(())
+    }
+    let mut out = Vec::new();
+    go(all, id, &mut Vec::new(), &mut out)?;
+    Ok(out)
+}
+
+/// Normalise a profile's list fields: sort+dedup evidence blocks and
+/// classification systems, keep-first dedup for the ordered lists.
+pub(crate) fn dedup(p: &mut EngagementProfile) {
     p.evidence_blocks.sort();
     p.evidence_blocks.dedup();
     p.classification_systems.sort();
@@ -134,6 +175,46 @@ mod tests {
         let ids: Vec<_> = p.asset_kinds.iter().map(|k| k.id.as_str()).collect();
         assert!(ids.contains(&"service") && ids.contains(&"route") && ids.contains(&"extra"));
         assert_eq!(p.id, "pentest");
+    }
+
+    #[test]
+    fn include_closure_lists_each_origin_once_in_include_order() {
+        let mut all = BTreeMap::new();
+        all.insert("network".into(), prof("network", &[], "service"));
+        all.insert("web".into(), prof("web", &[], "route"));
+        all.insert(
+            "pentest".into(),
+            prof("pentest", &["network", "web"], "scope"),
+        );
+        // `full` reaches `network` twice (via pentest and directly).
+        all.insert("full".into(), prof("full", &["pentest", "network"], "r"));
+
+        assert_eq!(
+            include_closure(&all, "full").unwrap(),
+            vec!["full", "pentest", "network", "web"]
+        );
+        assert_eq!(include_closure(&all, "network").unwrap(), vec!["network"]);
+    }
+
+    #[test]
+    fn include_closure_rejects_cycles_and_missing_includes() {
+        let mut all = BTreeMap::new();
+        all.insert("a".into(), prof("a", &["b"], "ka"));
+        all.insert("b".into(), prof("b", &["a"], "kb"));
+        assert!(matches!(
+            include_closure(&all, "a"),
+            Err(LoadError::IncludeCycle(_))
+        ));
+        let mut m = BTreeMap::new();
+        m.insert("x".into(), prof("x", &["missing"], "kx"));
+        assert!(matches!(
+            include_closure(&m, "x"),
+            Err(LoadError::MissingInclude(_))
+        ));
+        assert!(matches!(
+            include_closure(&m, "ghost"),
+            Err(LoadError::MissingInclude(_))
+        ));
     }
 
     #[test]
