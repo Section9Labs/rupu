@@ -239,11 +239,30 @@ fn transcript_owned_by_session(dir: &Path, run_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The crate-wide lock, not a module-local one: these tests set
+    // `RUPU_HOME` and the cwd, which every other env-mutating test in this
+    // binary (autoflow, cron, webhook) serializes on
+    // `crate::test_support::ENV_LOCK` — a lock of their own excluded only
+    // each other, and at a high `--test-threads` the others failed with
+    // "not found" while a completer test held the cwd elsewhere.
+    use crate::test_support::ENV_LOCK;
+
+    /// `RUPU_HOME` as it was, put back on drop — also on a panic.
+    struct RestoreHome(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("RUPU_HOME", v),
+                None => std::env::remove_var("RUPU_HOME"),
+            }
+        }
+    }
 
     #[test]
     fn session_completers_list_active_and_archived_ids() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
+        let _restore = RestoreHome(std::env::var_os("RUPU_HOME"));
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(home.join("sessions/ses_active")).unwrap();
@@ -265,12 +284,12 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].get_value(), OsStr::new("ses_archived"));
         assert_eq!(all.len(), 2);
-        std::env::remove_var("RUPU_HOME");
     }
 
     #[test]
     fn transcript_completer_filters_session_owned_for_standalone() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
+        let _restore = RestoreHome(std::env::var_os("RUPU_HOME"));
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
@@ -312,6 +331,5 @@ mod tests {
         assert_eq!(standalone.len(), 1);
         assert_eq!(standalone[0].get_value(), OsStr::new("run_free"));
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("RUPU_HOME");
     }
 }
