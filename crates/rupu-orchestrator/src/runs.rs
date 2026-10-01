@@ -156,6 +156,18 @@ pub struct RunRecord {
     /// trips byte-for-byte with its legacy shape intact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub awaiting: Vec<AwaitingGate>,
+    /// Gates decided since they parked whose decision no runner has applied
+    /// yet. A decision moves its gate out of `awaiting` into this list
+    /// under the run lock ([`RunStore::approve_gate`] /
+    /// [`RunStore::reject_gate`] and the CP's `request_resume_*`); the one
+    /// runner executing the run applies every entry and drops the ones it
+    /// applied when it parks or finishes ([`RunStore::finish_runner`]).
+    /// Recorded while a runner is executing, an entry is picked up by that
+    /// runner — a decision never starts a second one
+    /// ([`RunStore::claim_runner`]). A legacy single-cursor run records
+    /// only approvals here; its reject still finalizes the run directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_decisions: Vec<GateDecision>,
     /// id of the step the run is paused at, if any. DERIVED COMPAT — see
     /// `awaiting` above; authoritative only for a legacy record where
     /// `awaiting` is empty.
@@ -372,6 +384,42 @@ pub struct AwaitingGate {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// A gate decision recorded on a run but not yet applied by a runner — an
+/// element of `RunRecord.gate_decisions`. Gate decisions are path-scoped
+/// (spec §7): approving a gate releases only its own path; rejecting it
+/// prunes only what is reachable solely through it and runs its
+/// `on_reject` chain. Sibling gates stay parked and approvable either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateDecision {
+    pub step_id: String,
+    pub verdict: GateVerdict,
+    /// `"human"` for an operator's decision, `"timeout"` for the gate's own
+    /// `on_timeout:` policy — persisted into the gate's decision output.
+    pub via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// The rejection reason; `None` for an approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub decided_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateVerdict {
+    Approved,
+    Rejected,
+}
+
+impl GateVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 /// Field contract for [`RunRecord::reject_cleanup_pending`] (I-35). See
 /// that field's doc for the full set-by / cleared-by / matched-by story.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +500,42 @@ impl RunRecord {
                 self.expires_at = None;
             }
         }
+    }
+
+    /// The recorded, not-yet-applied decision on gate `step_id`, if any.
+    pub fn pending_decision(&self, step_id: &str) -> Option<&GateDecision> {
+        self.gate_decisions.iter().find(|d| d.step_id == step_id)
+    }
+
+    /// The recorded decision an approve/reject would decide again:
+    /// `gate_id`'s, or — with no gate named, none parked, and exactly one
+    /// decided — that one (a re-issued `rupu workflow approve <run>` after
+    /// its sole gate's approval was recorded but not yet applied).
+    fn targeted_decision(&self, gate_id: Option<&str>) -> Option<GateDecision> {
+        match gate_id {
+            Some(id) => self.pending_decision(id).cloned(),
+            None if self.awaiting_gates().is_empty() && self.gate_decisions.len() == 1 => {
+                self.gate_decisions.first().cloned()
+            }
+            None => None,
+        }
+    }
+
+    /// Move `decision`'s gate out of the parked set into
+    /// [`gate_decisions`](Self::gate_decisions). The run stays
+    /// `AwaitingApproval` while any other gate is parked and is `Running`
+    /// once none is — a runner applies the decision either way.
+    fn record_gate_decision(&mut self, decision: GateDecision) {
+        let mut gates = self.awaiting_gates();
+        gates.retain(|g| g.step_id != decision.step_id);
+        self.awaiting = gates;
+        self.status = if self.awaiting.is_empty() {
+            RunStatus::Running
+        } else {
+            RunStatus::AwaitingApproval
+        };
+        self.gate_decisions.push(decision);
+        self.sync_awaiting_compat();
     }
 
     /// How this run came to exist: `"manual"` | `"cron"` | `"event"`.
@@ -976,6 +1060,60 @@ const MAX_SUB_RUN_RECURSION_DEPTH: u32 = 64;
 
 /// How long [`RunStore::lock_run_json`] waits for `run.json.lock`.
 const RUN_JSON_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run directories a runner in THIS process is executing right now.
+/// `runner_pid` names the process, which cannot tell two runners of one
+/// process apart; this does (see [`RunStore::live_runner`]).
+static LOCAL_RUNNERS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn local_runners() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
+    LOCAL_RUNNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A runner of this process executing a run — held for the runner's whole
+/// lifetime ([`RunStore::claim_runner`], [`RunStore::register_runner`]).
+/// Dropping it unregisters the runner.
+#[derive(Debug)]
+pub struct RunnerGuard {
+    key: PathBuf,
+}
+
+impl Drop for RunnerGuard {
+    fn drop(&mut self) {
+        local_runners().remove(&self.key);
+    }
+}
+
+/// Outcome of [`RunStore::claim_runner`].
+#[derive(Debug)]
+pub enum RunnerClaim {
+    /// The caller is now the run's one runner. `record` is the on-disk
+    /// record after the claim.
+    Claimed {
+        record: Box<RunRecord>,
+        guard: RunnerGuard,
+    },
+    /// Another live runner (process `pid`) is executing the run; it applies
+    /// every recorded gate decision itself.
+    Live { pid: u32 },
+    /// The run is `Cancelled` on disk.
+    Cancelled,
+}
+
+/// Outcome of [`RunStore::finish_runner`].
+#[derive(Debug)]
+pub enum RunnerFinish {
+    /// The runner's final state was written; the record as written.
+    Written(Box<RunRecord>),
+    /// The run is `Cancelled` on disk; nothing was written.
+    Cancelled,
+    /// Gates the runner was about to park were decided meanwhile; nothing
+    /// was written. The runner applies these and carries on.
+    NewDecisions(Vec<GateDecision>),
+}
 
 impl RunStore {
     pub fn new(root: PathBuf) -> Self {
@@ -1657,6 +1795,119 @@ impl RunStore {
         }
     }
 
+    /// The pid of the live runner executing `record`, if one is: its
+    /// recorded `runner_pid` is a running process — for this process's own
+    /// pid, only while a runner of this process holds the run (a pid a
+    /// caller wrote just before handing the run to its runner is not one).
+    pub fn live_runner(&self, record: &RunRecord) -> Option<u32> {
+        let pid = record.runner_pid?;
+        let live = if pid == std::process::id() {
+            local_runners().contains(&self.run_dir(&record.id))
+        } else {
+            pid_is_running(pid)
+        };
+        live.then_some(pid)
+    }
+
+    /// Register this process as executing `run_id` (a fresh run, whose
+    /// record it just created with its own pid). Held until the runner
+    /// finishes.
+    pub fn register_runner(&self, run_id: &str) -> RunnerGuard {
+        let key = self.run_dir(run_id);
+        local_runners().insert(key.clone());
+        RunnerGuard { key }
+    }
+
+    /// Become the one runner of an existing run (a resume), under the run
+    /// lock: unless the run is `Cancelled` on disk or another live runner
+    /// already executes it ([`live_runner`](Self::live_runner)), record this
+    /// process as its runner. A gate decision recorded while a runner
+    /// executes the run therefore never starts a second runner — the
+    /// caller gets [`RunnerClaim::Live`] and the live runner applies the
+    /// decision itself. The wait blocks its thread: async callers go
+    /// through [`RunStore::blocking`].
+    pub fn claim_runner(&self, run_id: &str) -> Result<RunnerClaim, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if record.status == RunStatus::Cancelled {
+            return Ok(RunnerClaim::Cancelled);
+        }
+        if let Some(pid) = self.live_runner(&record) {
+            return Ok(RunnerClaim::Live { pid });
+        }
+        record.runner_pid = Some(std::process::id());
+        self.update(&record)?;
+        let guard = self.register_runner(run_id);
+        Ok(RunnerClaim::Claimed {
+            record: Box::new(record),
+            guard,
+        })
+    }
+
+    /// The runner's final write, under the run lock and against the
+    /// CURRENT on-disk record — never the runner's own snapshot, which
+    /// would undo a decision, marker or cancel another process recorded
+    /// while it ran:
+    /// - `Cancelled` on disk → nothing is written.
+    /// - a gate in `parked` (the gates the runner is about to leave
+    ///   parked) has a recorded decision → nothing is written; the runner
+    ///   applies it and carries on. Checked under the same lock as the
+    ///   write, so a decision landing between the runner's last look and
+    ///   its park is never lost: it is either seen here, or recorded after
+    ///   this write cleared `runner_pid`, when its decider can claim the
+    ///   run itself.
+    /// - otherwise `apply` updates the record, which is written.
+    ///
+    /// `applied` — the decisions the runner applied, as `(step_id,
+    /// decided_at)` — are dropped from `gate_decisions` first (a gate in a
+    /// loop parks again after its last iteration's decision was applied;
+    /// that one is not new).
+    ///
+    /// The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn finish_runner(
+        &self,
+        run_id: &str,
+        parked: &[String],
+        applied: &[(String, DateTime<Utc>)],
+        apply: impl FnOnce(&mut RunRecord),
+    ) -> Result<RunnerFinish, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if record.status == RunStatus::Cancelled {
+            return Ok(RunnerFinish::Cancelled);
+        }
+        record.gate_decisions.retain(|d| {
+            !applied
+                .iter()
+                .any(|(id, at)| *id == d.step_id && *at == d.decided_at)
+        });
+        let decided: Vec<GateDecision> = record
+            .gate_decisions
+            .iter()
+            .filter(|d| parked.contains(&d.step_id))
+            .cloned()
+            .collect();
+        if !decided.is_empty() {
+            return Ok(RunnerFinish::NewDecisions(decided));
+        }
+        apply(&mut record);
+        self.update(&record)?;
+        Ok(RunnerFinish::Written(Box::new(record)))
+    }
+
+    /// Whether this run's gate decisions are path-scoped decisions a runner
+    /// applies — a non-linear workflow, which the DAG scheduler runs and
+    /// which can park several gates at once — rather than the legacy
+    /// single-cursor run's, whose reject finalizes the run directly.
+    /// Best-effort: an unreadable snapshot keeps the legacy behavior.
+    fn path_scoped_gates(&self, run_id: &str) -> bool {
+        self.read_workflow_snapshot(run_id)
+            .ok()
+            .and_then(|body| crate::workflow::Workflow::parse(&body).ok())
+            .is_some_and(|wf| crate::workflow::is_nonlinear(&wf))
+    }
+
     /// Append one completed step's record to `step_results.jsonl`.
     /// We use append-mode + a single `write_all` so the entry is
     /// either fully present or absent — no partial JSON lines.
@@ -1961,6 +2212,11 @@ impl RunStore {
     /// 5b-2 lands) this is unchanged — the set always has exactly one
     /// element there, so this guard never fires.
     ///
+    /// On a path-scoped run ([`path_scoped_gates`](Self::path_scoped_gates))
+    /// `Reject` records the gate's rejection in `gate_decisions` for a
+    /// runner to apply instead of finalizing the run — see
+    /// [`reject_gate`](Self::reject_gate).
+    ///
     /// `record` is what the caller loaded earlier; the decision is made
     /// again from what the disk holds, under the run lock, so a cancel
     /// (a reject), an approve or a resume that landed since is preserved —
@@ -1982,7 +2238,7 @@ impl RunStore {
         }
         let _lock = self.lock_run_json(&record.id);
         let mut current = self.load(&record.id)?;
-        let outcome = self.expire_if_overdue_locked(&mut current, now, on_timeout);
+        let outcome = self.expire_if_overdue_locked(&mut current, now, on_timeout, None);
         *record = current;
         outcome
     }
@@ -1990,11 +2246,15 @@ impl RunStore {
     /// [`expire_if_overdue`](Self::expire_if_overdue)'s decision and write
     /// on a record loaded under the run lock the caller holds (the gate
     /// methods, which load → decide → write under one lock).
+    /// `path_scoped`: whether the run's gate decisions are path-scoped,
+    /// decided by the caller (`None`: read it from the snapshot, only when a
+    /// `Reject` actually fires).
     fn expire_if_overdue_locked(
         &self,
         record: &mut RunRecord,
         now: DateTime<Utc>,
         on_timeout: Option<TimeoutAction>,
+        path_scoped: Option<bool>,
     ) -> Result<Option<TimeoutAction>, RunStoreError> {
         if record.status != RunStatus::AwaitingApproval {
             return Ok(None);
@@ -2017,12 +2277,33 @@ impl RunStore {
             return Ok(Some(TimeoutAction::Approve));
         }
         let waited = expires_at - record.awaiting_since.unwrap_or(record.started_at);
-        record.finished_at = Some(now);
-        record.error_message = Some(format!(
+        let message = format!(
             "approval expired: paused at step `{}` waited longer than {}s without approval",
             record.awaiting_step_id.as_deref().unwrap_or("?"),
             waited.num_seconds()
-        ));
+        );
+        if action == TimeoutAction::Reject
+            && path_scoped.unwrap_or_else(|| self.path_scoped_gates(&record.id))
+        {
+            // Path-scoped (spec §7): the timeout rejects only this gate's
+            // path. Recorded for a runner to apply — the rest of the run
+            // (a join on another path, an independent branch) still runs.
+            let Some(step_id) = record.awaiting_step_id.clone() else {
+                return Ok(None);
+            };
+            record.record_gate_decision(GateDecision {
+                step_id,
+                verdict: GateVerdict::Rejected,
+                via: "timeout".to_string(),
+                approver: None,
+                reason: Some(message),
+                decided_at: now,
+            });
+            self.update(record)?;
+            return Ok(Some(TimeoutAction::Reject));
+        }
+        record.finished_at = Some(now);
+        record.error_message = Some(message);
         match action {
             TimeoutAction::Fail => {
                 record.status = RunStatus::Failed;
@@ -2197,6 +2478,12 @@ impl RunStore {
     /// `step_id` isn't currently one of the parked gates, or that gate has
     /// no `timeout_seconds` set.
     ///
+    /// On a path-scoped run ([`path_scoped_gates`](Self::path_scoped_gates))
+    /// `Reject` never finalizes the run: the gate's rejection is recorded in
+    /// `gate_decisions` for a runner to apply (prune its path, run its
+    /// `on_reject` chain) while every other path carries on — the caller
+    /// starts one, as for `Approve`.
+    ///
     /// `record` is what the caller listed earlier; the decision is made
     /// again from what the disk holds, under the run lock, so a reject, an
     /// approve or a resume that landed since is preserved — never
@@ -2284,6 +2571,18 @@ impl RunStore {
                 );
                 Ok(Some(TimeoutAction::Fail))
             }
+            TimeoutAction::Reject if self.path_scoped_gates(&record.id) => {
+                record.record_gate_decision(GateDecision {
+                    step_id: step_id.to_string(),
+                    verdict: GateVerdict::Rejected,
+                    via: "timeout".to_string(),
+                    approver: None,
+                    reason: Some(message),
+                    decided_at: now,
+                });
+                self.update(record)?;
+                Ok(Some(TimeoutAction::Reject))
+            }
             TimeoutAction::Reject => {
                 let mut remaining = gates;
                 remaining.retain(|g| g.step_id != step_id);
@@ -2310,6 +2609,16 @@ impl RunStore {
             TimeoutAction::Approve => unreachable!("handled above"),
         }
     }
+}
+
+/// Why a gate's `on_timeout: reject` fired: its recorded decision's reason
+/// on a path-scoped run, else the finalized run's error message.
+fn expired_reason(record: &RunRecord, step_id: &str) -> String {
+    record
+        .pending_decision(step_id)
+        .and_then(|d| d.reason.clone())
+        .or_else(|| record.error_message.clone())
+        .unwrap_or_else(|| "approval expired".into())
 }
 
 /// Outcome of an approve/reject library call. Returned to callers so
@@ -2381,6 +2690,15 @@ pub enum ApprovalError {
     /// run's currently-parked gates.
     #[error("gate `{step_id}` is not awaiting approval on run `{run_id}`")]
     GateNotFound { run_id: String, step_id: String },
+    /// The gate was already decided (`verdict`), and that decision is
+    /// recorded for a runner to apply (`RunRecord.gate_decisions`): it
+    /// stands; a second decision is refused, not applied.
+    #[error("gate `{step_id}` on run `{run_id}` was already {}", .verdict.as_str())]
+    GateAlreadyDecided {
+        run_id: String,
+        step_id: String,
+        verdict: GateVerdict,
+    },
     #[error("store: {0}")]
     Store(#[from] RunStoreError),
 }
@@ -2447,9 +2765,19 @@ impl RunStore {
     /// Gate-targeted approve (Task 5b-1, spec §7). `gate_id: None` behaves
     /// exactly like the legacy sole-gate [`approve`](Self::approve) —
     /// see that method's doc for the compat contract. `gate_id: Some(id)`
-    /// approves exactly that gate: it's removed from the awaiting set;
-    /// the run stays `AwaitingApproval` while other gates remain parked,
-    /// and only flips to `Running` once the set is empty.
+    /// approves exactly that gate.
+    ///
+    /// Path-scoped (spec §7): the gate moves from `awaiting` into
+    /// `gate_decisions` and only its own path is released — the run stays
+    /// `AwaitingApproval` while other gates remain parked (still
+    /// approvable), and is `Running` once none is. The decision is durable:
+    /// the runner the caller resumes applies it, or — when a runner is
+    /// already executing the run — that live runner does
+    /// ([`claim_runner`](Self::claim_runner)), so approving one gate never
+    /// starts a second runner. A gate whose decision is recorded but not yet
+    /// applied — either way — is [`ApprovalError::GateAlreadyDecided`]: the
+    /// first decision stands (`rupu workflow resume` hands it to a runner).
+    /// Under the run lock.
     pub fn approve_gate(
         &self,
         run_id: &str,
@@ -2460,6 +2788,18 @@ impl RunStore {
         // Under the run lock across load → decide → write: a cancel (reject),
         // approve or resume landing meanwhile is seen, never overwritten.
         let _lock = self.lock_run_json(run_id);
+        self.approve_gate_locked(run_id, approver, now, gate_id)
+    }
+
+    /// [`approve_gate`](Self::approve_gate) under a run lock the caller
+    /// already holds ([`request_resume_approval`](Self::request_resume_approval)).
+    fn approve_gate_locked(
+        &self,
+        run_id: &str,
+        approver: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
@@ -2469,7 +2809,7 @@ impl RunStore {
         // includes clearing `awaiting_step_id`).
         let step_id_before_expiry = record.awaiting_step_id.clone();
         let on_timeout = self.gate_on_timeout(&record);
-        match self.expire_if_overdue_locked(&mut record, now, on_timeout)? {
+        match self.expire_if_overdue_locked(&mut record, now, on_timeout, None)? {
             Some(TimeoutAction::Fail) => {
                 return Err(ApprovalError::Expired(
                     record
@@ -2479,12 +2819,10 @@ impl RunStore {
                 ));
             }
             Some(TimeoutAction::Reject) => {
+                let step_id = step_id_before_expiry.unwrap_or_default();
                 return Err(ApprovalError::ExpiredRejected {
-                    step_id: step_id_before_expiry.unwrap_or_default(),
-                    reason: record
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "approval expired".into()),
+                    reason: expired_reason(&record, &step_id),
+                    step_id,
                 });
             }
             // `Approve` leaves the record untouched — fall through
@@ -2492,17 +2830,21 @@ impl RunStore {
             // means it wasn't overdue at all.
             Some(TimeoutAction::Approve) | None => {}
         }
+        if let Some(decided) = record.targeted_decision(gate_id) {
+            return Err(ApprovalError::GateAlreadyDecided {
+                run_id: run_id.to_string(),
+                step_id: decided.step_id,
+                verdict: decided.verdict,
+            });
+        }
         if record.status != RunStatus::AwaitingApproval {
             return Err(ApprovalError::NotAwaiting(
                 record.status.as_str().to_string(),
             ));
         }
         // Normalize a legacy (or still-sole-gate) record into the
-        // canonical set, resolve WHICH gate this call targets, then
-        // remove it. `gates` is the set with the target already removed
-        // — the run stays `AwaitingApproval` while it's non-empty and
-        // only flips to `Running` once it's empty.
-        let mut gates = record.awaiting_gates();
+        // canonical set and resolve WHICH gate this call targets.
+        let gates = record.awaiting_gates();
         let step_id = match gate_id {
             Some(id) => {
                 if !gates.iter().any(|g| g.step_id == id) {
@@ -2524,23 +2866,31 @@ impl RunStore {
                 }
             },
         };
-        gates.retain(|g| g.step_id != step_id);
-        record.awaiting = gates;
-        record.status = if record.awaiting.is_empty() {
-            RunStatus::Running
+        // I-38: an approve landing on this gate after its own
+        // `on_timeout: approve` deadline is the gate's policy deciding, not
+        // a human — the runner records `via: "timeout"` for it.
+        let overdue = gates
+            .iter()
+            .find(|g| g.step_id == step_id)
+            .and_then(|g| g.expires_at)
+            .is_some_and(|exp| now > exp);
+        let via = if overdue
+            && self.gate_on_timeout_for_step(&record, &step_id) == Some(TimeoutAction::Approve)
+        {
+            "timeout"
         } else {
-            RunStatus::AwaitingApproval
+            "human"
         };
-        record.sync_awaiting_compat();
+        record.record_gate_decision(GateDecision {
+            step_id: step_id.clone(),
+            verdict: GateVerdict::Approved,
+            via: via.to_string(),
+            approver: Some(approver.to_string()),
+            reason: None,
+            decided_at: now,
+        });
         record.error_message = None;
         self.update(&record)?;
-        // I-36: `approver` is returned on the decision rather than persisted
-        // here — this method has no cross-process handoff point analogous
-        // to `reject_gate`'s `RejectCleanupMarker` (an approve-resume always
-        // re-enters `run_workflow` synchronously in the SAME process that
-        // called this method), so the immediate caller (the CLI's
-        // `resolve_approve_gate`) threads it straight into
-        // `ResumeState::from_approval_with_actor` on re-entry.
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
             step_id,
@@ -2563,19 +2913,26 @@ impl RunStore {
 
     /// Gate-targeted reject (Task 5b-1, spec §7). `gate_id: None` behaves
     /// exactly like the legacy sole-gate [`reject`](Self::reject).
-    /// `gate_id: Some(id)` rejects exactly that gate: it's removed from
-    /// the awaiting set; the run stays `AwaitingApproval` while other
-    /// gates remain parked, and only flips to `Rejected` once the set is
-    /// empty (mirroring [`approve_gate`](Self::approve_gate)'s
-    /// empties-the-set-transitions-out rule, using THIS call's own
-    /// Rejected outcome for the final transition).
+    /// `gate_id: Some(id)` rejects exactly that gate.
     ///
-    /// **5b-2 handoff note:** rejecting one gate out of a still-parked
-    /// multi-gate set does not run that gate's own `on_reject` cleanup
-    /// chain or cancel its downstream path — this method only tracks
-    /// set membership + the whole-run terminal transition. Driving a
-    /// single rejected path's cleanup while sibling gates stay parked is
-    /// part of the CP/CLI gate-sweep ripple Task 5b-2 owns.
+    /// On a path-scoped run (a non-linear workflow — see
+    /// [`path_scoped_gates`](Self::path_scoped_gates)) the rejection is
+    /// path-scoped (spec §7): the gate moves from `awaiting` into
+    /// `gate_decisions` exactly like an approval, and a runner applies it —
+    /// prunes only what is reachable solely through the gate, runs the
+    /// gate's `on_reject` chain, and carries on with every other path. The
+    /// run stays `AwaitingApproval` while other gates remain parked and is
+    /// `Running` once none is; it is never finalized here, so a sibling's
+    /// path (or a join it shares) is not ended by this gate's rejection.
+    /// The caller resumes the run (the CLI), asks the resume worker for a
+    /// runner ([`request_resume_rejection`](Self::request_resume_rejection)),
+    /// or leaves it to the live runner. A gate whose decision is recorded
+    /// but not yet applied — either way — is
+    /// [`ApprovalError::GateAlreadyDecided`]: the first decision stands.
+    ///
+    /// On a legacy single-cursor run (one gate at a time) the reject
+    /// finalizes the run `Rejected` here, and the caller runs the gate's
+    /// `on_reject` chain ([`RejectCleanupMarker`]). Under the run lock.
     pub fn reject_gate(
         &self,
         run_id: &str,
@@ -2587,11 +2944,15 @@ impl RunStore {
         // Under the run lock across load → decide → write: a cancel (reject),
         // approve or resume landing meanwhile is seen, never overwritten.
         let _lock = self.lock_run_json(run_id);
-        self.reject_gate_locked(run_id, approver, reason, now, gate_id)
+        let path_scoped = self.path_scoped_gates(run_id);
+        self.reject_gate_locked(run_id, approver, reason, now, gate_id, path_scoped)
     }
 
     /// [`reject_gate`](Self::reject_gate) under a run lock the caller
-    /// already holds (`cancel`, which rejects an awaiting run).
+    /// already holds (`cancel`, which rejects an awaiting run;
+    /// [`request_resume_rejection`](Self::request_resume_rejection)).
+    /// `path_scoped: false` forces the legacy finalize-the-run reject
+    /// (`cancel` on a run with one parked gate and no runner).
     fn reject_gate_locked(
         &self,
         run_id: &str,
@@ -2599,6 +2960,7 @@ impl RunStore {
         reason: &str,
         now: chrono::DateTime<chrono::Utc>,
         gate_id: Option<&str>,
+        path_scoped: bool,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
@@ -2607,7 +2969,7 @@ impl RunStore {
         // Captured before `expire_if_overdue` can clear it.
         let step_id_before_expiry = record.awaiting_step_id.clone();
         let on_timeout = self.gate_on_timeout(&record);
-        match self.expire_if_overdue_locked(&mut record, now, on_timeout)? {
+        match self.expire_if_overdue_locked(&mut record, now, on_timeout, Some(path_scoped))? {
             Some(TimeoutAction::Fail) => {
                 return Err(ApprovalError::Expired(
                     record
@@ -2622,13 +2984,11 @@ impl RunStore {
                 // have — report it as the same success the operator
                 // asked for so the caller runs the identical
                 // `on_reject` cleanup chain.
+                let step_id = step_id_before_expiry.unwrap_or_default();
                 return Ok(ApprovalDecision::Rejected {
                     run_id: run_id.to_string(),
-                    step_id: step_id_before_expiry.unwrap_or_default(),
-                    reason: record
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "approval expired".into()),
+                    reason: expired_reason(&record, &step_id),
+                    step_id,
                     // The gate's own timeout policy made this decision, not
                     // this call's `approver` — but the operator DID observe
                     // and report it (this early return only fires from an
@@ -2643,6 +3003,13 @@ impl RunStore {
             // auto-approve-on-timeout policy. `None` means it wasn't
             // overdue at all.
             Some(TimeoutAction::Approve) | None => {}
+        }
+        if let Some(decided) = record.targeted_decision(gate_id) {
+            return Err(ApprovalError::GateAlreadyDecided {
+                run_id: run_id.to_string(),
+                step_id: decided.step_id,
+                verdict: decided.verdict,
+            });
         }
         if record.status != RunStatus::AwaitingApproval {
             return Err(ApprovalError::NotAwaiting(
@@ -2671,6 +3038,23 @@ impl RunStore {
                 }
             },
         };
+        if path_scoped {
+            record.record_gate_decision(GateDecision {
+                step_id: step_id.clone(),
+                verdict: GateVerdict::Rejected,
+                via: "human".to_string(),
+                approver: Some(approver.to_string()),
+                reason: Some(reason.to_string()),
+                decided_at: now,
+            });
+            self.update(&record)?;
+            return Ok(ApprovalDecision::Rejected {
+                run_id: run_id.to_string(),
+                step_id,
+                reason: reason.to_string(),
+                approver: Some(approver.to_string()),
+            });
+        }
         gates.retain(|g| g.step_id != step_id);
         record.awaiting = gates;
         if record.awaiting.is_empty() {
@@ -2729,46 +3113,32 @@ impl RunStore {
     /// worker doesn't strand the resume.
     pub const RESUME_LEASE: chrono::Duration = chrono::Duration::minutes(5);
 
-    /// Web/delegated resume flow — **marker-only**. Validates the run is
-    /// still `AwaitingApproval` OR cooperatively `Paused` (same
-    /// expire-check + `NotAwaiting` error as [`approve`](Self::approve) for
-    /// the approval-gate case), then records the `resume_requested_at`
-    /// marker and persists. It does **not** flip the status or clear any
-    /// pause fields: the run stays `AwaitingApproval`/`Paused` so a
-    /// background worker — not the approving/resuming HTTP request — picks
-    /// it up via [`list_pending_resume`](Self::list_pending_resume) and
-    /// re-enters `run_workflow` (via [`approve`](Self::approve) for the
-    /// approval-gate case, or `rupu workflow resume` for a manual pause).
-    /// Leaving the run in its paused status with `awaiting_step_id` intact
-    /// is what lets the worker recover which gate/step to resume.
+    /// Web/delegated resume flow (the CP's `POST /api/runs/:id/approve`,
+    /// `LocalHostConnector`): the CP records decisions but has no execution
+    /// runtime, so a background worker — `rupu cp serve`'s resume worker,
+    /// via [`list_pending_resume`](Self::list_pending_resume) — runs the
+    /// run, not the approving HTTP request.
     ///
-    /// Returns `Approved { step_id }` with the still-present
-    /// `awaiting_step_id` so the caller can report which gate/step the
-    /// operator resumed. `step_id` is empty for a `Paused` run with no
-    /// `awaiting_step_id` (an externally-triggered pause that never
-    /// recorded one) — the resume path doesn't need it in that case, it
-    /// replays from `step_results.jsonl` instead.
+    /// - An `AwaitingApproval` run: the approval itself is recorded now,
+    ///   exactly as [`approve_gate`](Self::approve_gate) records it
+    ///   (path-scoped, durable in `gate_decisions` — so two web approvals of
+    ///   two gates are both kept, and a live runner picks either up), and
+    ///   the `resume_requested_at` marker asks the worker for a runner
+    ///   unless one is already executing the run. `gate_id` targets one
+    ///   parked gate; `None` is the sole-gate case
+    ///   ([`ApprovalError::AmbiguousGate`] on a multi-gate run), and a
+    ///   `gate_id` naming no parked gate is
+    ///   [`ApprovalError::GateNotFound`]. A gate whose `on_timeout: reject`
+    ///   already fired is [`ApprovalError::ExpiredRejected`] — on a
+    ///   path-scoped run that rejection is itself a recorded decision, and
+    ///   the marker is set for it too.
+    /// - A cooperatively `Paused` run: marker only — the worker runs
+    ///   `rupu workflow resume`, which replays from `step_results.jsonl`.
     ///
     /// `mode` is the permission mode the operator chose for the resumed
-    /// run (`ask` / `bypass` / `readonly`). It is validated and stored on
-    /// `resume_mode`; anything outside the three known modes (or `None`)
-    /// stores `None`, leaving the worker to fall back to its default.
-    ///
-    /// `gate_id` (Task 5b-2b, spec §7) targets a specific parked gate on a
-    /// genuinely multi-gate `AwaitingApproval` run — this marker-only path
-    /// has no way to hand the target gate id directly to the background
-    /// worker that eventually spawns `rupu workflow approve`, so instead it
-    /// REORDERS `record.awaiting` so the targeted gate becomes the first
-    /// element, then re-derives the compat fields
-    /// ([`RunRecord::sync_awaiting_compat`]) — `awaiting_step_id` (which the
-    /// worker already reads to build its `--gate` argv) now names exactly
-    /// this gate. `None` behaves exactly like before this task for a record
-    /// with at most one parked gate (the sole-gate back-compat contract);
-    /// for a genuine multi-gate record it returns
-    /// [`ApprovalError::AmbiguousGate`] rather than silently marking the
-    /// first gate. `Some(id)` that doesn't name a currently-parked gate
-    /// returns [`ApprovalError::GateNotFound`]. Only applies to the
-    /// `AwaitingApproval` case — a `Paused` run has no gate to target.
+    /// run (`ask` / `bypass` / `readonly`), stored on `resume_mode`;
+    /// anything else (or `None`) stores `None`. `approver` is stored on the
+    /// decision and on `resume_approver` (I-82).
     pub fn request_resume_approval(
         &self,
         run_id: &str,
@@ -2780,170 +3150,122 @@ impl RunStore {
         // Under the run lock across load → decide → write: a cancel (reject),
         // approve or resume landing meanwhile is seen, never overwritten.
         let _lock = self.lock_run_json(run_id);
-        let mut record = self.load(run_id).map_err(|e| match e {
+        let record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
         })?;
-        // Captured before `expire_if_overdue` can clear it.
-        let step_id_before_expiry = record.awaiting_step_id.clone();
-        let on_timeout = self.gate_on_timeout(&record);
-        match self.expire_if_overdue_locked(&mut record, now, on_timeout)? {
-            Some(TimeoutAction::Fail) => {
-                return Err(ApprovalError::Expired(
-                    record
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "paused run timed out".into()),
-                ));
-            }
-            Some(TimeoutAction::Reject) => {
-                // This marker-only path finalizes the run `Rejected` but
-                // does NOT run the gate's `on_reject` cleanup chain —
-                // that needs the full `OrchestratorRunOpts` wiring only a
-                // CLI command builds (see `run_reject_cleanup` in
-                // `runner.rs`). For web-initiated decisions that cleanup is
-                // executed out-of-band by the cp-serve gate sweep (Plan 4):
-                // the sweep re-reads this same `expire_if_overdue` contract,
-                // and on `Some(Reject)` runs `build_reject_cleanup_opts` +
-                // `run_reject_cleanup` for the timed-out gate. This call
-                // still just finalizes the status and returns
-                // `ExpiredRejected` so the CLI's own approve path can print
-                // + run the chain synchronously.
-                tracing::warn!(
-                    run_id,
-                    "gate auto-rejected on timeout; its on_reject cleanup chain is \
-                     executed by the cp-serve gate sweep (Plan 4) for the web path"
-                );
-                return Err(ApprovalError::ExpiredRejected {
-                    step_id: step_id_before_expiry.unwrap_or_default(),
-                    reason: record
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "approval expired".into()),
-                });
-            }
-            Some(TimeoutAction::Approve) | None => {}
+        if record.status == RunStatus::Paused {
+            // The resume path doesn't need a step id: it replays from
+            // `step_results.jsonl`. Empty for a pause with no known step.
+            let step_id = record.awaiting_step_id.clone().unwrap_or_default();
+            self.mark_resume_requested(record, approver, mode, None, now)?;
+            return Ok(ApprovalDecision::Approved {
+                run_id: run_id.to_string(),
+                step_id,
+                approver: Some(approver.to_string()),
+            });
         }
-        if !matches!(
-            record.status,
-            RunStatus::AwaitingApproval | RunStatus::Paused
-        ) {
-            return Err(ApprovalError::NotAwaiting(
-                record.status.as_str().to_string(),
-            ));
-        }
-        // Gate targeting (spec §7) — only meaningful while genuinely
-        // `AwaitingApproval`. A record with at most one parked gate takes
-        // the untouched byte-for-byte-identical path (whether `gate_id` is
-        // `None`, or `Some` naming that sole gate); only a record with >1
-        // parked gates needs the reorder-and-resync below.
-        //
-        // `resolved_gate_id` is separate from the `awaiting`
-        // reorder/`sync_awaiting_compat()` below: it's what actually gets
-        // persisted onto the MARKER itself (`record.resume_gate_id`,
-        // written further down). The reorder alone is not sufficient to
-        // get the target gate to the background resume worker — a second
-        // concurrent approve request could reorder `awaiting_step_id`
-        // again before this marker is consumed (T5b-2b-i correctness fix:
-        // the marker must carry its own immutable target, not rely on
-        // mutable live record state at resume time).
-        let mut resolved_gate_id: Option<String> = None;
-        if record.status == RunStatus::AwaitingApproval {
-            let gates = record.awaiting_gates();
-            if gates.len() > 1 {
-                match gate_id {
-                    None => {
-                        return Err(ApprovalError::AmbiguousGate {
-                            run_id: run_id.to_string(),
-                            candidates: gates.iter().map(|g| g.step_id.clone()).collect(),
-                        });
-                    }
-                    Some(id) => {
-                        let mut reordered = gates;
-                        let pos =
-                            reordered
-                                .iter()
-                                .position(|g| g.step_id == id)
-                                .ok_or_else(|| ApprovalError::GateNotFound {
-                                    run_id: run_id.to_string(),
-                                    step_id: id.to_string(),
-                                })?;
-                        let target = reordered.remove(pos);
-                        reordered.insert(0, target);
-                        record.awaiting = reordered;
-                        record.sync_awaiting_compat();
-                        resolved_gate_id = Some(id.to_string());
-                    }
+        match self.approve_gate_locked(run_id, approver, now, gate_id) {
+            Ok(decision) => {
+                if let ApprovalDecision::Approved { step_id, .. } = &decision {
+                    self.request_runner_for(run_id, step_id, gate_id, approver, mode, now)?;
                 }
-            } else if let Some(id) = gate_id {
-                // Sole-gate (or legacy compat-only) record: an explicit
-                // gate id must still name the one gate that's actually
-                // parked, but no reorder/resync is needed — the compat
-                // fields already mirror it. Still recorded on the marker
-                // (harmless — `approve_gate(Some(sole)) ==
-                // approve_gate(None)` — but robust against the same
-                // race the multi-gate branch above guards against).
-                if !gates.iter().any(|g| g.step_id == id) {
-                    return Err(ApprovalError::GateNotFound {
-                        run_id: run_id.to_string(),
-                        step_id: id.to_string(),
-                    });
-                }
-                resolved_gate_id = Some(id.to_string());
+                Ok(decision)
             }
+            Err(ApprovalError::ExpiredRejected { step_id, reason }) => {
+                self.request_runner_for(run_id, &step_id, gate_id, approver, mode, now)?;
+                Err(ApprovalError::ExpiredRejected { step_id, reason })
+            }
+            Err(e) => Err(e),
         }
-        // The approval-gate case always has `awaiting_step_id` set (the
-        // runner persists it alongside the gate); keep that a hard error so
-        // a corrupt AwaitingApproval record still surfaces loudly. A
-        // `Paused` run may not have one (an externally-triggered pause with
-        // no known active step) — the resume path doesn't need it, so fall
-        // back to empty rather than erroring.
-        let step_id = if record.status == RunStatus::AwaitingApproval {
-            record
-                .awaiting_step_id
-                .clone()
-                .ok_or(ApprovalError::NoAwaitingStep)?
-        } else {
-            record.awaiting_step_id.clone().unwrap_or_default()
-        };
-        // Marker-only: leave status AwaitingApproval/Paused and keep
-        // awaiting_step_id / approval_prompt / awaiting_since /
-        // expires_at intact for the worker to resume.
+    }
+
+    /// Web/delegated reject (the CP's `POST /api/runs/:id/reject`,
+    /// `LocalHostConnector`): [`reject_gate`](Self::reject_gate), plus —
+    /// when the rejection is a path-scoped decision a runner has to apply
+    /// (prune the gate's path, run its `on_reject` chain, carry on with
+    /// every other path) — the same `resume_requested_at` marker
+    /// [`request_resume_approval`](Self::request_resume_approval) sets, so
+    /// the cp-serve resume worker starts that runner unless one is already
+    /// executing the run. A legacy single-cursor run's reject finalizes the
+    /// run here and needs no runner: its `on_reject` chain is the gate
+    /// sweep's ([`RejectCleanupMarker`]).
+    pub fn request_resume_rejection(
+        &self,
+        run_id: &str,
+        approver: &str,
+        reason: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let _lock = self.lock_run_json(run_id);
+        let path_scoped = self.path_scoped_gates(run_id);
+        let decision =
+            self.reject_gate_locked(run_id, approver, reason, now, gate_id, path_scoped)?;
+        if let ApprovalDecision::Rejected { step_id, .. } = &decision {
+            self.request_runner_for(run_id, step_id, gate_id, approver, None, now)?;
+        }
+        Ok(decision)
+    }
+
+    /// Ask the resume worker for a runner for `step_id`'s recorded decision
+    /// — unless there is none (a legacy reject already finalized the run),
+    /// or a live runner already executes the run and will apply it.
+    /// `gate_id` is the gate the caller named, recorded on the marker.
+    /// Caller holds the run lock.
+    fn request_runner_for(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        gate_id: Option<&str>,
+        approver: &str,
+        mode: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), RunStoreError> {
+        let record = self.load(run_id)?;
+        if record.pending_decision(step_id).is_none() || self.live_runner(&record).is_some() {
+            return Ok(());
+        }
+        self.mark_resume_requested(record, approver, mode, gate_id, now)
+    }
+
+    /// Set the pending-resume marker [`list_pending_resume`](Self::list_pending_resume)
+    /// scans for. `gate` (`resume_gate_id`) names the gate the caller
+    /// targeted (`None` when it named none); `approver` is the requesting
+    /// actor (I-82).
+    fn mark_resume_requested(
+        &self,
+        mut record: RunRecord,
+        approver: &str,
+        mode: Option<&str>,
+        gate: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), RunStoreError> {
         record.resume_requested_at = Some(now);
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
             .map(str::to_string);
-        record.resume_gate_id = resolved_gate_id;
-        // I-82: persist the resolved actor onto the same marker so the
-        // cp-serve resume worker — which runs in a DIFFERENT process from
-        // this call — can carry it through to the eventual `rupu workflow
-        // approve --approver <this>` spawn, rather than that spawn falling
-        // back to re-deriving `whoami::username()` and losing the
-        // web-initiated identity. See `resume_approver`'s doc on
-        // `RunRecord`.
+        record.resume_gate_id = gate.map(str::to_string);
         record.resume_approver = Some(approver.to_string());
-        self.update(&record)?;
-        Ok(ApprovalDecision::Approved {
-            run_id: run_id.to_string(),
-            step_id,
-            approver: Some(approver.to_string()),
-        })
+        self.update(&record)
     }
 
-    /// Runs that a web/delegated approval OR manual-pause resume request
-    /// marked for resume and that no worker currently holds a live lease
-    /// on. A run is pending when it is still `AwaitingApproval` or
-    /// `Paused`, has a `resume_requested_at` marker, AND either has no
-    /// claim or a claim older than [`RESUME_LEASE`](Self::RESUME_LEASE).
+    /// Runs that a web/delegated gate decision OR manual-pause resume
+    /// request marked for resume and that no worker currently holds a live
+    /// lease on. A run is pending when it has a `resume_requested_at`
+    /// marker, is still `AwaitingApproval` or `Paused` — or `Running` with
+    /// a recorded gate decision no runner has applied (its last parked gate
+    /// was decided from the web) — AND either has no claim or a claim older
+    /// than [`RESUME_LEASE`](Self::RESUME_LEASE).
     ///
-    /// The `AwaitingApproval | Paused` requirement guards against a
-    /// reject/cancel-after-request race: if the run was rejected/cancelled
-    /// (or otherwise finished) after the marker was set, its status is no
-    /// longer one of those two and the stale marker must not cause the
-    /// worker to resume a terminal run. The caller (the `cp serve` resume
-    /// worker) dispatches on `status` to pick the right subprocess:
-    /// `AwaitingApproval` → `rupu workflow approve`; `Paused` → `rupu
-    /// workflow resume`.
+    /// The status requirement guards against a reject/cancel-after-request
+    /// race: a run that was cancelled (or otherwise finished) after the
+    /// marker was set must not be resumed by its stale marker. The caller
+    /// (the `cp serve` resume worker) spawns `rupu workflow resume` for a
+    /// `Paused` run or one with recorded gate decisions, and `rupu
+    /// workflow approve --gate` for a marker an older binary set without
+    /// recording its decision. A runner already executing the run makes the
+    /// spawned one hand off ([`RunStore::claim_runner`]).
     pub fn list_pending_resume(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -2951,7 +3273,11 @@ impl RunStore {
         Ok(self
             .list()?
             .into_iter()
-            .filter(|r| matches!(r.status, RunStatus::AwaitingApproval | RunStatus::Paused))
+            .filter(|r| match r.status {
+                RunStatus::AwaitingApproval | RunStatus::Paused => true,
+                RunStatus::Running => !r.gate_decisions.is_empty(),
+                _ => false,
+            })
             .filter(|r| r.resume_requested_at.is_some())
             .filter(|r| match r.resume_claimed_at {
                 None => true,
@@ -3131,15 +3457,31 @@ impl RunStore {
             | RunStatus::Failed
             | RunStatus::Rejected
             | RunStatus::Cancelled => Err(CancelError::AlreadyTerminal(record.status)),
-            RunStatus::AwaitingApproval => {
-                self.reject_gate_locked(run_id, approver, reason, now, None)
+            // Parked at its one gate with nothing executing: cancelling the
+            // run there is that gate's rejection — finalized `Rejected`
+            // here, its `on_reject` chain run by the gate sweep
+            // (`RejectCleanupMarker`), whatever the workflow's shape.
+            RunStatus::AwaitingApproval
+                if self.live_runner(&record).is_none()
+                    && record.gate_decisions.is_empty()
+                    && record.awaiting_gates().len() <= 1 =>
+            {
+                self.reject_gate_locked(run_id, approver, reason, now, None, false)
                     .map_err(|e| match e {
                         ApprovalError::NotFound(s) => CancelError::NotFound(s),
                         other => CancelError::Store(other.to_string()),
                     })?;
                 Ok(CancelOutcome::RejectedAwaitingApproval)
             }
-            RunStatus::Pending | RunStatus::Running | RunStatus::Paused => {
+            // Everything else stops the whole run: several gates parked (no
+            // one gate's rejection stands for the run), decisions recorded
+            // for a runner, or a runner executing an approved path while
+            // other gates stay parked — that runner is signalled like a
+            // `Running` run's.
+            RunStatus::Pending
+            | RunStatus::Running
+            | RunStatus::Paused
+            | RunStatus::AwaitingApproval => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
                 // Only signal a pid that is live AND is NOT our own
@@ -3158,10 +3500,9 @@ impl RunStore {
                 record.status = RunStatus::Cancelled;
                 record.finished_at = Some(now);
                 record.error_message = Some(reason.to_string());
-                record.awaiting_step_id = None;
-                record.approval_prompt = None;
-                record.awaiting_since = None;
-                record.expires_at = None;
+                record.awaiting.clear();
+                record.gate_decisions.clear();
+                record.sync_awaiting_compat();
                 record.runner_pid = None;
                 record.active_step_id = None;
                 record.active_step_kind = None;
@@ -3646,6 +3987,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }
@@ -4995,6 +5337,49 @@ mod tests {
         assert_eq!(reloaded.awaiting[0].step_id, "gate_b");
     }
 
+    /// The gate sweep lists runs, then expires each overdue gate. A
+    /// decision landing in between — here gate_a's approval, recorded by a
+    /// detached `workflow approve` — must survive gate_b's expiry: it is
+    /// decided from the record as it is on disk, never from the caller's
+    /// stale listing.
+    #[test]
+    fn expire_gate_if_overdue_never_writes_the_callers_stale_set() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_sweep_stale_listing",
+            None,
+            Some(now - chrono::Duration::seconds(30)),
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut listed = store.load(&rec.id).unwrap();
+        store
+            .approve_gate(&rec.id, "child", now, Some("gate_a"))
+            .unwrap();
+        let outcome = store
+            .expire_gate_if_overdue(&mut listed, "gate_b", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(
+            reloaded.awaiting.is_empty(),
+            "gate_a must not be resurrected: {:?}",
+            reloaded.awaiting
+        );
+        assert_eq!(
+            reloaded.pending_decision("gate_a").map(|d| d.verdict),
+            Some(GateVerdict::Approved),
+            "gate_a's approval survives gate_b's expiry"
+        );
+        assert_eq!(
+            listed.awaiting, reloaded.awaiting,
+            "the caller's copy is refreshed"
+        );
+    }
+
     #[test]
     fn expire_gate_if_overdue_reject_flips_rejected_once_the_sole_gate_empties_the_set() {
         // Single-gate parity: a run with exactly ONE overdue gate must
@@ -5309,7 +5694,7 @@ mod tests {
     }
 
     #[test]
-    fn request_resume_approval_is_marker_only_and_stays_awaiting() {
+    fn request_resume_approval_records_the_approval_and_asks_for_a_runner() {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = awaiting_record("run_resume_appr");
@@ -5319,7 +5704,6 @@ mod tests {
         let decision = store
             .request_resume_approval(&rec.id, "matt", None, now, None)
             .unwrap();
-        // The decision reports the still-present awaited step id.
         assert_eq!(
             decision,
             ApprovalDecision::Approved {
@@ -5330,16 +5714,22 @@ mod tests {
         );
 
         let reloaded = store.load(&rec.id).unwrap();
-        // Marker-only: the run stays AwaitingApproval with all pause
-        // fields intact; only resume_requested_at is added.
-        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
-        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
-        assert!(reloaded.approval_prompt.is_some());
-        assert!(reloaded.awaiting_since.is_some());
+        // The approval is recorded now (spec §7 — a second web approval of
+        // another gate can't overwrite it), and the marker asks the resume
+        // worker for the runner that applies it. Its only gate decided, the
+        // run is no longer parked.
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert!(reloaded.awaiting.is_empty());
+        assert_eq!(reloaded.awaiting_step_id, None);
+        assert_eq!(reloaded.gate_decisions.len(), 1);
+        let d = &reloaded.gate_decisions[0];
+        assert_eq!(
+            (d.step_id.as_str(), d.verdict, d.via.as_str()),
+            ("deploy", GateVerdict::Approved, "human")
+        );
+        assert_eq!(d.approver.as_deref(), Some("matt"));
         assert_eq!(reloaded.resume_requested_at, Some(now));
-        // `gate_id: None` and only one gate parked — the marker carries no
-        // gate id at all (the resume worker omits `--gate`, byte-for-byte
-        // the pre-T5b-2b-i behavior).
+        // `gate_id: None` — the marker names no gate.
         assert_eq!(reloaded.resume_gate_id, None);
     }
 
@@ -5369,17 +5759,9 @@ mod tests {
 
     #[test]
     fn request_resume_approval_with_gate_targets_that_gate_on_a_multi_gate_run() {
-        // Task 5b-2b (spec §7): the web marker path has no way to hand the
-        // target gate id directly to the resume worker, so it BOTH reorders
-        // `awaiting` (so the targeted gate is first and the derived-compat
-        // `awaiting_step_id` names it — useful for display / a first
-        // approximation) AND persists it on `resume_gate_id`, the field the
-        // marker itself carries the target through on (T5b-2b-i
-        // correctness fix: `awaiting_step_id` is live, mutable record
-        // state a second concurrent approve request could reorder again
-        // before the async resume worker gets to it — the worker reads
-        // `resume_gate_id`, not `awaiting_step_id`, for exactly that
-        // reason; see that field's doc).
+        // Spec §7: the targeted gate's approval is recorded on the run —
+        // durable and per gate, so a concurrent approval of the sibling is
+        // kept too — and only that gate leaves the parked set.
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = multi_gate_awaiting_record("run_resume_multi_b");
@@ -5399,17 +5781,16 @@ mod tests {
         );
 
         let reloaded = store.load(&rec.id).unwrap();
+        // gate_a stays parked and approvable; gate_b's approval waits for
+        // its runner.
         assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
-        // Both gates remain parked — targeting one for resume does not drop
-        // its sibling.
-        assert_eq!(reloaded.awaiting.len(), 2);
-        assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
-        assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
-        // gate_b is now first, so the derived-compat field names it too.
-        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_b"));
+        assert_eq!(reloaded.awaiting.len(), 1);
+        assert_eq!(reloaded.awaiting[0].step_id, "gate_a");
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_a"));
+        assert_eq!(reloaded.gate_decisions.len(), 1);
+        assert_eq!(reloaded.gate_decisions[0].step_id, "gate_b");
+        assert_eq!(reloaded.gate_decisions[0].approver.as_deref(), Some("web"));
         assert_eq!(reloaded.resume_requested_at, Some(now));
-        // The marker itself carries the target gate — this is what the
-        // resume worker actually reads to build its `--gate` argv.
         assert_eq!(reloaded.resume_gate_id.as_deref(), Some("gate_b"));
     }
 
@@ -5454,15 +5835,11 @@ mod tests {
     #[test]
     fn request_resume_approval_with_gate_id_matching_sole_gate_is_unchanged() {
         // Sole-gate parity: an explicit `gate_id` that happens to name the
-        // one parked gate on a 1-gate run resolves/resumes identically to
-        // `None` — primary safety invariant (`approve_gate(Some(sole)) ==
-        // approve_gate(None)`). The marker DOES still record
-        // `resume_gate_id: Some("deploy")` here (harmless — the worker's
-        // `--gate deploy` on a sole gate is a no-op-equivalent to omitting
-        // it), which is a deliberate robustness choice, not a behavior
-        // change: contrast with `request_resume_approval_is_marker_only_and_stays_awaiting`
-        // below, which omits `gate_id` entirely and asserts
-        // `resume_gate_id` stays `None`.
+        // one parked gate on a 1-gate run resolves identically to `None`
+        // (`approve_gate(Some(sole)) == approve_gate(None)`); the marker
+        // records the gate the caller named — contrast with
+        // `request_resume_approval_records_the_approval_and_asks_for_a_runner`,
+        // which names none and leaves `resume_gate_id` `None`.
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = awaiting_record("run_resume_sole_gate_named");
@@ -5481,8 +5858,10 @@ mod tests {
             }
         );
         let reloaded = store.load(&rec.id).unwrap();
-        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
-        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert_eq!(reloaded.awaiting_step_id, None);
+        assert_eq!(reloaded.gate_decisions.len(), 1);
+        assert_eq!(reloaded.gate_decisions[0].step_id, "deploy");
         assert_eq!(reloaded.resume_requested_at, Some(now));
         assert_eq!(reloaded.resume_gate_id.as_deref(), Some("deploy"));
     }
@@ -5875,10 +6254,10 @@ mod tests {
             .unwrap();
 
         let reloaded = store.load(&rec.id).unwrap();
-        // Marker set, mode stored, run stays paused.
+        // Marker set, mode stored for the runner it asks for.
         assert_eq!(reloaded.resume_mode.as_deref(), Some("bypass"));
         assert!(reloaded.resume_requested_at.is_some());
-        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.gate_decisions.len(), 1);
     }
 
     #[test]

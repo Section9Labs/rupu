@@ -722,6 +722,12 @@ pub struct OrchestratorRunResult {
     /// `None` when it ran to completion (or to a hard failure
     /// surfaced as `Err` from `run_workflow`).
     pub awaiting: Option<AwaitingInfo>,
+    /// `Some(pid)` when this call did not run anything because another live
+    /// runner (process `pid`) is already executing the run — a resume
+    /// requested while a decided gate's path runs. That runner applies
+    /// every recorded gate decision itself ([`crate::RunStore::claim_runner`]);
+    /// `step_results` is then just the prior results passed in.
+    pub handed_off_to: Option<u32>,
 }
 
 /// Snapshot of the state a paused run is waiting for. Returned to
@@ -887,6 +893,14 @@ impl ResumeState {
         }
     }
 
+    /// Resume context for a run whose gate decisions are all recorded on its
+    /// `RunRecord.gate_decisions` (`rupu workflow resume`, which the CP
+    /// resume worker spawns after a web decision): no in-memory approval —
+    /// the runner applies every recorded decision itself.
+    pub fn from_decisions(run_id: String, prior_step_results: Vec<StepResult>) -> Self {
+        Self::from_approval(run_id, prior_step_results, String::new())
+    }
+
     /// I-36/I-38: [`Self::from_approval`] plus the actor/timeout provenance
     /// the CLI's `resolve_approve_gate` already detects but previously
     /// discarded after a `println!`. Used by `resume_run` so a real
@@ -1001,10 +1015,13 @@ pub async fn run_workflow(
     // state reloads from `<run_dir>/codenames.json`.
     let naming = ensure_naming(&mut opts, &run_id);
 
+    // This process's registration as the run's one runner (spec §7),
+    // held until `run_workflow` returns — see `RunStore::claim_runner`.
+    let mut _runner_guard: Option<crate::runs::RunnerGuard> = None;
     // Create the on-disk record only on a fresh run. On resume the
     // record already exists and is mutated by the CLI's approve
     // path before we re-enter the loop.
-    let mut run_record_opt = if opts.resume_from.is_none() {
+    let run_record_opt = if opts.resume_from.is_none() {
         if let Some(store) = &opts.run_store {
             let yaml = opts.workflow_yaml.as_deref().unwrap_or("");
             let record = crate::runs::RunRecord {
@@ -1050,42 +1067,85 @@ pub async fn run_workflow(
                 permission_mode: opts.factory.permission_mode().map(str::to_string),
                 final_output: None,
                 loop_progress: std::collections::BTreeMap::new(),
+                gate_decisions: Vec::new(),
                 codename: Some(naming.crew().to_string()),
             };
-            Some(store.create(record, yaml).map_err(map_run_store_err)?)
+            let created = store.create(record, yaml).map_err(map_run_store_err)?;
+            _runner_guard = Some(store.register_runner(&run_id));
+            Some(created)
         } else {
             None
         }
     } else if let Some(store) = &opts.run_store {
-        // Resume path: load the existing record so the terminal-flip
-        // block at the bottom of the function can update it. Under the run
-        // lock: a `Cancelled` that landed since the resume was decided is
-        // preserved, and the run does not start.
+        // Resume path: become the run's one runner, under the run lock. A
+        // `Cancelled` that landed since the resume was decided is
+        // preserved, and the run does not start. A runner already executing
+        // the run (a gate decided while another gate's path runs) is left to
+        // apply the recorded decisions itself — a second runner would
+        // re-dispatch work the first already has in flight.
         let claimed = {
             let run_id = run_id.clone();
-            store
-                .blocking(move |s| {
-                    s.modify_unless_cancelled(&run_id, |rec| {
-                        rec.runner_pid = Some(std::process::id());
-                        true
-                    })
-                })
-                .await
+            store.blocking(move |s| s.claim_runner(&run_id)).await
         };
         match claimed {
-            Ok(Some(rec)) => Some(rec),
-            Ok(None) => {
+            Ok(crate::runs::RunnerClaim::Claimed { record, guard }) => {
+                _runner_guard = Some(guard);
+                Some(*record)
+            }
+            Ok(crate::runs::RunnerClaim::Live { pid }) => {
+                info!(run_id = %run_id, pid, "a runner is already executing this run; it applies the recorded gate decisions");
+                return Ok(OrchestratorRunResult {
+                    step_results,
+                    run_id,
+                    awaiting: None,
+                    handed_off_to: Some(pid),
+                });
+            }
+            Ok(crate::runs::RunnerClaim::Cancelled) => {
                 info!(run_id = %run_id, "the run was cancelled on disk before it resumed; not starting it");
                 return Err(RunWorkflowError::RunCancelled { aborted: 0 });
             }
-            Err(e) => {
-                warn!(error = %e, "failed to persist resumed runner pid");
-                store.load(&run_id).ok()
-            }
+            Err(e) => return Err(map_run_store_err(e)),
         }
     } else {
         None
     };
+
+    // The gate decisions this runner applies (spec §7: path-scoped). On a
+    // resume: every decision recorded on the run; and every gate already
+    // parked counts as announced, so a sibling that still waits re-parks
+    // silently (its `notify:` hooks fired when it first parked).
+    let gate_book = GateBook::default();
+    if let (Some(rec), Some(_)) = (run_record_opt.as_ref(), opts.resume_from.as_ref()) {
+        for d in &rec.gate_decisions {
+            if decision_in_history(d, &step_results) {
+                gate_book.retire(d);
+            } else {
+                gate_book.add([d.clone()]);
+            }
+        }
+        for g in rec.awaiting_gates() {
+            gate_book.announce(&g.step_id);
+        }
+    }
+    // A caller's in-memory approval — a run with no store, or an approval
+    // that was never recorded — unless the record holds a decision on it.
+    if let Some(gate) = approved_step_id.filter(|id| !id.is_empty()) {
+        let resume = opts.resume_from.as_ref();
+        gate_book.add([crate::runs::GateDecision {
+            step_id: gate,
+            verdict: crate::runs::GateVerdict::Approved,
+            via: if resume.is_some_and(|r| r.via_timeout) {
+                "timeout"
+            } else {
+                "human"
+            }
+            .to_string(),
+            approver: resume.and_then(|r| r.approver.clone()),
+            reason: None,
+            decided_at: chrono::Utc::now(),
+        }]);
+    }
 
     // Emit RunStarted before entering the step loop.
     if let Some(sink) = opts.event_sink.as_ref() {
@@ -1130,238 +1190,131 @@ pub async fn run_workflow(
     // the CP/CLI-facing plumbing to trigger it, is out of this task's
     // scope.
     //
-    // Concurrent-gate boundary (T5b): a non-linear workflow whose
-    // concurrent paths each reach an approval gate does NOT park all of
-    // them independently yet — `run_scheduler`'s ready-drain loop returns
-    // `InnerOutcome::Paused` on the FIRST gate it reaches (same as today),
-    // so multiple gates are handled sequentially across resumes rather
-    // than concurrently. This is correct (every gate is eventually
-    // handled, nothing silently skipped) but not the full "awaiting set"
-    // model spec §7 describes — that migration (`RunRecord.awaiting_
-    // step_id` -> `awaiting: Vec<AwaitingGate>`, approve/reject-by-gate-id,
-    // the CP UI, and the gate sweep) is Task 5b's job, not this one's.
-    let outcome = if is_nonlinear(&opts.workflow) {
-        run_scheduler(
-            &opts,
-            &run_id,
-            &resolved_inputs,
-            workflow_default_continue,
-            approved_step_id.as_deref(),
-            &mut step_results,
-            None,
-        )
-        .await
-    } else {
-        run_steps_inner(
-            &opts,
-            &run_id,
-            &resolved_inputs,
-            workflow_default_continue,
-            approved_step_id.as_deref(),
-            &mut step_results,
-        )
-        .await
-    };
-
-    // Map the inner outcome onto the persisted terminal status.
-    // Paused = `AwaitingApproval` and the record carries the
-    // awaiting_step_id + approval_prompt; Done = `Completed`;
-    // Error = `Failed`.
-    let mut awaiting: Option<AwaitingInfo> = None;
-    // Set when a `Cancelled` another process landed on disk while this run
-    // was finishing was preserved instead of overwritten: the cancel
-    // already appended its terminal event, so this run emits none.
+    // Gates (spec §7): the scheduler batch-parks every gate a wave
+    // reaches, and each is decided on its own — path-scoped. This runner
+    // applies the decisions it holds, and re-enters the scheduler for any
+    // gate decided while it was executing: a decision picked up mid-run
+    // (`run_scheduler_scoped`'s poll) and one that lands just before the
+    // run parks (`finish_runner`'s re-check) alike.
+    let path_scoped = is_nonlinear(&opts.workflow);
     let mut cancel_preserved = false;
-    if let (Some(store), Some(record)) = (opts.run_store.as_ref(), run_record_opt.as_mut()) {
-        // Task 4, spec §3: `run_loop_node`'s own checkpoint writes
-        // (`persist_loop_progress`) go straight to disk via their own
-        // load/mutate/update cycle WHILE the scheduler above was
-        // running — `record` here is a snapshot taken/created BEFORE
-        // that (at `run_workflow`'s own start), so it's stale on this
-        // one field. Refresh it from disk before this terminal-state
-        // update below writes `record` back out, or it would clobber
-        // every mid-run loop checkpoint back to empty (this run's own
-        // `RunRecord`, so no cross-run race — nothing else touches
-        // `loop_progress` between the scheduler returning and here).
-        if let Ok(fresh) = store.load(&record.id) {
-            record.loop_progress = fresh.loop_progress;
-        }
+    let mut written: Option<crate::runs::RunRecord> = None;
+    let outcome = loop {
+        let outcome = if path_scoped {
+            run_scheduler_scoped(
+                &opts,
+                &run_id,
+                &resolved_inputs,
+                workflow_default_continue,
+                Some(&gate_book),
+                &mut step_results,
+                None,
+                SchedulerScope::whole_workflow(),
+            )
+            .await
+        } else {
+            run_steps_inner(
+                &opts,
+                &run_id,
+                &resolved_inputs,
+                workflow_default_continue,
+                Some(&gate_book),
+                &mut step_results,
+            )
+            .await
+        };
+        let Some(store) = opts.run_store.as_ref().filter(|_| run_record_opt.is_some()) else {
+            break outcome;
+        };
+        // Files next to `run.json` the paused/finished state needs, written
+        // before the record says so. A resume in a fresh process (the
+        // CP-driven resume worker spawns a new `rupu workflow resume`)
+        // reconstructs `ResumeState::paused_steps` from them: every paused
+        // step's seed in `paused_seeds.json`, plus the primary one (paired
+        // with `awaiting_step_id`) in the legacy single sidecar a binary
+        // predating the multi-step map still reads.
         match &outcome {
-            Ok(InnerOutcome::Done) => {
-                record.status = crate::runs::RunStatus::Completed;
-                record.finished_at = Some(chrono::Utc::now());
-                record.awaiting_step_id = None;
-                record.approval_prompt = None;
-                record.awaiting_since = None;
-                record.expires_at = None;
-                record.runner_pid = None;
-                record.active_step_id = None;
-                record.active_step_kind = None;
-                record.active_step_agent = None;
-                record.active_step_transcript_path = None;
-                // Defensive: a completed run has no further use for a
-                // paused-step seed (there shouldn't be one, but a stale
-                // sidecar from an earlier pause/resume cycle must not
-                // leak into a future, unrelated pause).
-                if let Err(e) = store.clear_paused_seed(&record.id) {
-                    warn!(error = %e, "failed to clear paused-step seed on completion");
-                }
-            }
             Ok(InnerOutcome::Paused {
-                step_id,
-                prompt,
-                reason,
+                reason: PauseReason::Manual,
                 seed,
                 paused_steps,
-                fanout_completed_units,
-                gates,
-                // `timeout_seconds` is superseded by `gates` (each gate
-                // carries its own) for computing `expires_at` below.
                 ..
             }) => {
-                let now = chrono::Utc::now();
-                // Approval → non-terminal `AwaitingApproval` (existing shape).
-                // Manual   → non-terminal `Paused`.
-                record.status = match reason {
-                    PauseReason::Approval => crate::runs::RunStatus::AwaitingApproval,
-                    PauseReason::Manual => crate::runs::RunStatus::Paused,
-                };
-                // Batch-parking (Task 5b-1, spec §7): for an Approval pause,
-                // `gates` carries EVERY gate the scheduler reached in this
-                // drain wave (one element for the legacy single-cursor loop
-                // and for a DAG run whose wave reached exactly one gate;
-                // several for a DAG run whose wave reached concurrent gates
-                // on independent paths). All gates in one wave share the
-                // same `since` (this `now`) — the run paused once. A Manual
-                // pause is orthogonal to the gate model (`gates` is always
-                // empty for it, by construction — see `GateParked`'s doc) —
-                // `record.awaiting` stays EMPTY and only the legacy compat
-                // fields carry the primary paused-mid-step id (every paused
-                // step's seed goes to `paused_seeds.json` below).
-                // Task 5b-2a (5b-1 Minor #3): a gate that was ALREADY parked
-                // before this resume cycle must keep its ORIGINAL `since`/
-                // `expires_at` rather than restarting its timeout clock. On
-                // resume, `record` (loaded from disk above, before the
-                // scheduler ran) still carries the PRE-resume awaiting set —
-                // e.g. after approving gate A, `record.awaiting` here is
-                // exactly `[gate B]` with gate B's original park instant.
-                // The scheduler recomputes the ready-set from scratch and
-                // re-reports every still-parked gate (including B) in
-                // `gates` for THIS pass, so without this lookup B would get
-                // a fresh `since: now` / `expires_at: now + timeout` every
-                // single resume — silently extending its deadline forever.
-                // Only a genuinely NEW gate (not in `prior_gates`) gets a
-                // fresh clock.
-                let prior_gates = record.awaiting.clone();
-                let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
-                    PauseReason::Approval => gates
-                        .iter()
-                        .map(
-                            |g| match prior_gates.iter().find(|p| p.step_id == g.step_id) {
-                                Some(prior) => crate::runs::AwaitingGate {
-                                    step_id: g.step_id.clone(),
-                                    prompt: Some(g.prompt.clone()),
-                                    since: prior.since,
-                                    expires_at: prior.expires_at,
-                                },
-                                None => crate::runs::AwaitingGate {
-                                    step_id: g.step_id.clone(),
-                                    prompt: Some(g.prompt.clone()),
-                                    since: now,
-                                    expires_at: g
-                                        .timeout_seconds
-                                        .map(|secs| now + chrono::Duration::seconds(secs as i64)),
-                                },
-                            },
-                        )
-                        .collect(),
-                    PauseReason::Manual => Vec::new(),
-                };
-                record.awaiting = gate_set;
-                if *reason == PauseReason::Approval {
-                    record.sync_awaiting_compat();
-                } else {
-                    record.awaiting_step_id = Some(step_id.clone());
-                    record.approval_prompt = None;
-                    record.awaiting_since = Some(now);
-                    record.expires_at = None;
-                }
-                record.runner_pid = None;
-                record.active_step_id = None;
-                record.active_step_kind = None;
-                record.active_step_agent = None;
-                record.active_step_transcript_path = None;
-                // Persist the mid-step seed transcripts (if any) so a resume
-                // in a fresh process (the CP-driven resume worker spawns a
-                // new `rupu workflow resume` subprocess) can reconstruct
-                // `ResumeState::paused_steps` from disk: every paused
-                // step's seed in `paused_seeds.json`, plus the primary one
-                // (paired with `awaiting_step_id`) in the legacy single
-                // sidecar a binary predating the multi-step map still
-                // reads. Empty for approval and step-boundary pauses —
-                // nothing to persist.
-                if *reason == PauseReason::Manual && !seed.is_empty() {
-                    if let Err(e) = store.write_paused_seed(&record.id, seed) {
+                if !seed.is_empty() {
+                    if let Err(e) = store.write_paused_seed(&run_id, seed) {
                         warn!(error = %e, "failed to persist paused-step seed");
                     }
                 }
-                if *reason == PauseReason::Manual && !paused_steps.is_empty() {
+                if !paused_steps.is_empty() {
                     let seeds: std::collections::BTreeMap<String, Vec<Message>> = paused_steps
                         .iter()
                         .map(|ps| (ps.step_id.clone(), ps.seed_messages.clone()))
                         .collect();
-                    if let Err(e) = store.write_paused_seeds(&record.id, &seeds) {
+                    if let Err(e) = store.write_paused_seeds(&run_id, &seeds) {
                         warn!(error = %e, "failed to persist paused-step seeds");
                     }
                 }
-                // Don't set finished_at — the run hasn't ended.
-                awaiting = Some(AwaitingInfo {
-                    step_id: step_id.clone(),
-                    prompt: prompt.clone(),
-                    expires_at: record.expires_at,
-                    reason: *reason,
-                    resume_seed: seed.clone(),
-                    paused_steps: paused_steps.clone(),
-                    fanout_completed_units: fanout_completed_units.clone(),
-                    gates: record.awaiting.clone(),
-                });
             }
-            Err(e) => {
-                record.status = crate::runs::RunStatus::Failed;
-                record.finished_at = Some(chrono::Utc::now());
-                record.error_message = Some(e.to_string());
-                record.runner_pid = None;
-                record.active_step_id = None;
-                record.active_step_kind = None;
-                record.active_step_agent = None;
-                record.active_step_transcript_path = None;
-                if let Err(e) = store.clear_paused_seed(&record.id) {
-                    warn!(error = %e, "failed to clear paused-step seed on failure");
+            Ok(InnerOutcome::Paused { .. }) => {}
+            // A finished run has no further use for a paused-step seed (a
+            // stale sidecar from an earlier pause/resume cycle must not
+            // leak into a future, unrelated pause).
+            Ok(InnerOutcome::Done) | Err(_) => {
+                if let Err(e) = store.clear_paused_seed(&run_id) {
+                    warn!(error = %e, "failed to clear paused-step seed");
                 }
             }
         }
+        let parked: Vec<String> = match &outcome {
+            Ok(InnerOutcome::Paused {
+                reason: PauseReason::Approval,
+                gates,
+                ..
+            }) => gates.iter().map(|g| g.step_id.clone()).collect(),
+            _ => Vec::new(),
+        };
+        let applied = gate_book.applied();
+        let end = RunEnd::of(&outcome, &opts.workflow, &step_results, path_scoped);
+        let served_decisions = !applied.is_empty();
         // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
         // `RunStore::cancel` from the CLI or `cp serve` writes `Cancelled`
-        // while this run finishes). The store re-reads under the run lock —
-        // on the blocking pool, since the lock wait blocks its thread.
-        let flipped = {
-            let record = record.clone();
+        // while this run finishes), and never over decisions recorded since
+        // the run began: applied to the record as it is on disk, under the
+        // run lock — on the blocking pool, since the lock wait blocks its
+        // thread.
+        let finished = {
+            let run_id = run_id.clone();
             store
-                .blocking(move |s| s.update_unless_cancelled(&record))
+                .blocking(move |s| {
+                    s.finish_runner(&run_id, &parked, &applied, |rec| {
+                        end.apply(rec, served_decisions)
+                    })
+                })
                 .await
         };
-        match flipped {
-            Ok(true) => {}
-            Ok(false) => {
-                info!(run_id = %record.id, "the run was cancelled on disk while finishing; keeping that status");
-                record.status = crate::runs::RunStatus::Cancelled;
+        match finished {
+            Ok(crate::runs::RunnerFinish::NewDecisions(decisions)) => {
+                info!(run_id = %run_id, gates = decisions.len(), "gates were decided while the run executed; applying them");
+                gate_book.add(decisions);
+                continue;
+            }
+            Ok(crate::runs::RunnerFinish::Written(rec)) => written = Some(*rec),
+            Ok(crate::runs::RunnerFinish::Cancelled) => {
+                info!(run_id = %run_id, "the run was cancelled on disk while finishing; keeping that status");
                 cancel_preserved = true;
             }
             Err(persist_err) => {
                 warn!(error = %persist_err, "failed to persist terminal run state");
             }
         }
-    } else if let Ok(InnerOutcome::Paused {
+        break outcome;
+    };
+
+    // Map the inner outcome onto what the caller sees: the gates the run is
+    // parked at (as persisted — a gate parked before this resume keeps its
+    // original `since`/`expires_at`), or, with no store, computed here.
+    let mut awaiting: Option<AwaitingInfo> = None;
+    if let Ok(InnerOutcome::Paused {
         step_id,
         prompt,
         timeout_seconds,
@@ -1372,23 +1325,28 @@ pub async fn run_workflow(
         gates,
     }) = &outcome
     {
-        // No store but the run paused (approval gate or manual pause) — surface
-        // the paused state to the caller anyway.
-        let now = chrono::Utc::now();
-        let expires_at = timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
-        let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
-            PauseReason::Approval => gates
-                .iter()
-                .map(|g| crate::runs::AwaitingGate {
-                    step_id: g.step_id.clone(),
-                    prompt: Some(g.prompt.clone()),
-                    since: now,
-                    expires_at: g
-                        .timeout_seconds
-                        .map(|secs| now + chrono::Duration::seconds(secs as i64)),
-                })
-                .collect(),
-            PauseReason::Manual => Vec::new(),
+        let (gate_set, expires_at) = match &written {
+            Some(rec) => (rec.awaiting.clone(), rec.expires_at),
+            None => {
+                let now = chrono::Utc::now();
+                let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
+                    PauseReason::Approval => gates
+                        .iter()
+                        .map(|g| crate::runs::AwaitingGate {
+                            step_id: g.step_id.clone(),
+                            prompt: Some(g.prompt.clone()),
+                            since: now,
+                            expires_at: g
+                                .timeout_seconds
+                                .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                        })
+                        .collect(),
+                    PauseReason::Manual => Vec::new(),
+                };
+                let expires_at =
+                    timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+                (gate_set, expires_at)
+            }
         };
         awaiting = Some(AwaitingInfo {
             step_id: step_id.clone(),
@@ -1401,6 +1359,10 @@ pub async fn run_workflow(
             gates: gate_set,
         });
     }
+    let done_status = match &written {
+        Some(rec) => rec.status,
+        None => RunEnd::of(&outcome, &opts.workflow, &step_results, path_scoped).done_status(),
+    };
 
     // Emit terminal run events (skip for Paused — StepAwaitingApproval
     // was already emitted by run_steps_inner; skip entirely when an on-disk
@@ -1412,7 +1374,7 @@ pub async fn run_workflow(
                     &run_id,
                     &crate::executor::Event::RunCompleted {
                         run_id: run_id.clone(),
-                        status: crate::runs::RunStatus::Completed,
+                        status: done_status,
                         finished_at: chrono::Utc::now(),
                     },
                 );
@@ -1458,7 +1420,266 @@ pub async fn run_workflow(
         step_results,
         run_id,
         awaiting,
+        handed_off_to: None,
     })
+}
+
+/// How a runner's pass ended, as its final write records it on the run
+/// ([`crate::RunStore::finish_runner`] applies it to the record as it is on
+/// disk, under the run lock). Owned, so the write can run on the blocking
+/// pool.
+enum RunEnd {
+    Done {
+        status: crate::runs::RunStatus,
+        error: Option<String>,
+    },
+    ApprovalPause {
+        gates: Vec<GateParked>,
+    },
+    ManualPause {
+        step_id: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl RunEnd {
+    fn of(
+        outcome: &Result<InnerOutcome, RunWorkflowError>,
+        wf: &Workflow,
+        step_results: &[StepResult],
+        path_scoped: bool,
+    ) -> Self {
+        match outcome {
+            Ok(InnerOutcome::Done) => match rejected_outcome(wf, step_results, path_scoped) {
+                Some(error) => RunEnd::Done {
+                    status: crate::runs::RunStatus::Rejected,
+                    error: Some(error),
+                },
+                None => RunEnd::Done {
+                    status: crate::runs::RunStatus::Completed,
+                    error: None,
+                },
+            },
+            Ok(InnerOutcome::Paused {
+                reason: PauseReason::Approval,
+                gates,
+                ..
+            }) => RunEnd::ApprovalPause {
+                gates: gates.clone(),
+            },
+            Ok(InnerOutcome::Paused {
+                reason: PauseReason::Manual,
+                step_id,
+                ..
+            }) => RunEnd::ManualPause {
+                step_id: step_id.clone(),
+            },
+            Err(e) => RunEnd::Failed {
+                error: e.to_string(),
+            },
+        }
+    }
+
+    /// The terminal status of a `Done` pass (`Completed` otherwise — only
+    /// read for one).
+    fn done_status(&self) -> crate::runs::RunStatus {
+        match self {
+            RunEnd::Done { status, .. } => *status,
+            _ => crate::runs::RunStatus::Completed,
+        }
+    }
+
+    /// Record this end on `rec`. `served_decisions`: the runner applied
+    /// recorded gate decisions — once none is left, the resume request
+    /// that asked for a runner for them has been served.
+    fn apply(self, rec: &mut crate::runs::RunRecord, served_decisions: bool) {
+        let now = chrono::Utc::now();
+        match self {
+            RunEnd::Done { status, error } => {
+                rec.status = status;
+                rec.finished_at = Some(now);
+                rec.error_message = error;
+                rec.awaiting.clear();
+                rec.sync_awaiting_compat();
+            }
+            RunEnd::ApprovalPause { gates } => {
+                // Batch-parking (Task 5b-1, spec §7): every gate this pass
+                // left parked — one for the legacy single-cursor loop and
+                // for a wave that reached one gate, several for a DAG wave
+                // that reached concurrent gates. A gate that was already
+                // parked keeps its ORIGINAL `since`/`expires_at` (Task
+                // 5b-2a) rather than restarting its timeout clock on every
+                // resume; only a genuinely new gate gets this instant.
+                let prior = rec.awaiting_gates();
+                rec.awaiting = gates
+                    .iter()
+                    .map(|g| match prior.iter().find(|p| p.step_id == g.step_id) {
+                        Some(p) => crate::runs::AwaitingGate {
+                            step_id: g.step_id.clone(),
+                            prompt: Some(g.prompt.clone()),
+                            since: p.since,
+                            expires_at: p.expires_at,
+                        },
+                        None => crate::runs::AwaitingGate {
+                            step_id: g.step_id.clone(),
+                            prompt: Some(g.prompt.clone()),
+                            since: now,
+                            expires_at: g
+                                .timeout_seconds
+                                .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                        },
+                    })
+                    .collect();
+                rec.status = crate::runs::RunStatus::AwaitingApproval;
+                rec.sync_awaiting_compat();
+            }
+            RunEnd::ManualPause { step_id } => {
+                // Orthogonal to the gate model: `awaiting` stays empty and
+                // only the compat fields carry the primary paused step.
+                rec.status = crate::runs::RunStatus::Paused;
+                rec.awaiting.clear();
+                rec.awaiting_step_id = Some(step_id);
+                rec.approval_prompt = None;
+                rec.awaiting_since = Some(now);
+                rec.expires_at = None;
+            }
+            RunEnd::Failed { error } => {
+                rec.status = crate::runs::RunStatus::Failed;
+                rec.finished_at = Some(now);
+                rec.error_message = Some(error);
+            }
+        }
+        rec.runner_pid = None;
+        rec.active_step_id = None;
+        rec.active_step_kind = None;
+        rec.active_step_agent = None;
+        rec.active_step_transcript_path = None;
+        if served_decisions && rec.gate_decisions.is_empty() {
+            rec.resume_requested_at = None;
+            rec.resume_claimed_at = None;
+            rec.resume_claimed_by = None;
+            rec.resume_mode = None;
+            rec.resume_gate_id = None;
+            rec.resume_approver = None;
+        }
+    }
+}
+
+/// `Some(error)` when a path-scoped run that finished did so only because
+/// its gates were rejected: at least one gate was rejected and no end of
+/// the workflow (a step nothing follows) produced a real result — every one
+/// was pruned behind a rejection (or skipped). Such a run ends `Rejected`,
+/// whatever order its gates were decided in. A run where any end still
+/// ran — another path completed, or a join on a path that stayed live —
+/// is `Completed`: a gate's rejection is path-scoped, and the work its
+/// siblings did stands.
+fn rejected_outcome(
+    wf: &Workflow,
+    step_results: &[StepResult],
+    path_scoped: bool,
+) -> Option<String> {
+    if !path_scoped {
+        return None;
+    }
+    let rejections: Vec<String> = wf
+        .steps
+        .iter()
+        .filter_map(|step| {
+            let sr = step_results.iter().rev().find(|r| r.step_id == step.id)?;
+            is_rejection_record(sr).then(|| match gate_rejection_reason(sr) {
+                Some(reason) if !reason.is_empty() => format!("`{}`: {reason}", step.id),
+                _ => format!("`{}`", step.id),
+            })
+        })
+        .collect();
+    if rejections.is_empty() {
+        return None;
+    }
+    let edges = workflow_edges(wf);
+    let any_end_ran = wf
+        .steps
+        .iter()
+        .filter(|step| !edges.iter().any(|(from, _)| *from == step.id))
+        .any(|step| {
+            step_results
+                .iter()
+                .rev()
+                .find(|r| r.step_id == step.id)
+                .is_some_and(|r| !r.skipped && !is_rejection_record(r))
+        });
+    (!any_end_ran).then(|| format!("rejected: {}", rejections.join("; ")))
+}
+
+/// Whether recorded decision `d` was already applied: its gate node's
+/// latest decision result in `history` records the same verdict, decided no
+/// earlier than `d` (a runner that applied it stopped before dropping it
+/// from the record). A gate inside a loop that was decided again since has
+/// a newer decision than that result.
+fn decision_in_history(d: &crate::runs::GateDecision, history: &[StepResult]) -> bool {
+    let Some(sr) = history
+        .iter()
+        .rev()
+        .find(|r| r.step_id == d.step_id && r.kind == crate::runs::StepKind::ApprovalGate)
+    else {
+        return false;
+    };
+    let Ok(out) = serde_json::from_str::<serde_json::Value>(&sr.output) else {
+        return false;
+    };
+    let decided_at = out["decided_at"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    out["decision"] == d.verdict.as_str()
+        && decided_at.is_some_and(|t| t.with_timezone(&chrono::Utc) >= d.decided_at)
+}
+
+/// Whether `sr` records a rejected gate: a gate node's decision output, or
+/// the marker a rejected inline `approval:` step leaves.
+fn is_rejection_record(sr: &StepResult) -> bool {
+    if sr.skipped {
+        return sr.output == "rejected";
+    }
+    sr.kind == crate::runs::StepKind::ApprovalGate
+        && serde_json::from_str::<serde_json::Value>(&sr.output)
+            .is_ok_and(|v| v["decision"] == "rejected")
+}
+
+/// The operator's reason recorded on a rejected gate node's decision output.
+fn gate_rejection_reason(sr: &StepResult) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&sr.output)
+        .ok()?
+        .get("reason")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Resolves when `cancel` fires; never, without one.
+async fn cancelled_or_never(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Decisions recorded on the run since gates in `parked` parked (spec §7),
+/// added to `gates`: the ids of the parked gates that gained one.
+fn recorded_decisions_on(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    gates: &GateBook,
+    parked: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let Some(record) = opts.run_store.as_ref().and_then(|s| s.load(run_id).ok()) else {
+        return Vec::new();
+    };
+    gates.add(
+        record
+            .gate_decisions
+            .into_iter()
+            .filter(|d| parked.contains_key(&d.step_id)),
+    )
 }
 
 /// True when a cooperative pause has been requested (the token exists and
@@ -1618,6 +1839,102 @@ struct GateParked {
     timeout_seconds: Option<u64>,
 }
 
+/// How often a runner with parked gates looks for decisions recorded on
+/// them while other paths are still executing.
+const GATE_DECISION_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The gate decisions one runner applies (spec §7: path-scoped gates) —
+/// seeded from the run record's `gate_decisions` (plus the in-memory
+/// approval of a caller that has no store), and topped up with every
+/// decision recorded on a parked gate while the runner executes. Shared by
+/// all of the run's scheduler calls (the outer call and each loop
+/// iteration's), hence the lock.
+#[derive(Default)]
+struct GateBook {
+    state: std::sync::Mutex<GateBookState>,
+}
+
+#[derive(Default)]
+struct GateBookState {
+    /// Decisions not applied yet, by gate step id.
+    pending: BTreeMap<String, crate::runs::GateDecision>,
+    /// Decisions this runner applied, as `(step_id, decided_at)` — dropped
+    /// from the record when the runner finishes. A gate inside a loop is
+    /// decided once per iteration, so the id alone is not the key.
+    applied: std::collections::BTreeSet<(String, chrono::DateTime<chrono::Utc>)>,
+    /// Gates already parked and announced (`notify:` hooks,
+    /// `StepAwaitingApproval`): parking one of them again — a sibling still
+    /// waiting while another gate's path resumes — is silent.
+    announced: std::collections::BTreeSet<String>,
+}
+
+impl GateBook {
+    fn state(&self) -> std::sync::MutexGuard<'_, GateBookState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Add decisions not already pending or applied; the ids of the gates
+    /// that gained one.
+    fn add(&self, decisions: impl IntoIterator<Item = crate::runs::GateDecision>) -> Vec<String> {
+        let mut st = self.state();
+        let mut added = Vec::new();
+        for d in decisions {
+            if st.applied.contains(&(d.step_id.clone(), d.decided_at))
+                || st.pending.contains_key(&d.step_id)
+            {
+                continue;
+            }
+            added.push(d.step_id.clone());
+            st.pending.insert(d.step_id.clone(), d);
+        }
+        added
+    }
+
+    /// Take gate `step_id`'s decision to apply it now.
+    fn take(&self, step_id: &str) -> Option<crate::runs::GateDecision> {
+        let mut st = self.state();
+        let d = st.pending.remove(step_id)?;
+        st.applied.insert((d.step_id.clone(), d.decided_at));
+        st.announced.remove(step_id);
+        Some(d)
+    }
+
+    /// [`take`](Self::take), for an approval only — the legacy single-cursor
+    /// loop never applies a rejection (its reject finalizes the run).
+    fn take_approval(&self, step_id: &str) -> Option<crate::runs::GateDecision> {
+        let is_approval = self
+            .state()
+            .pending
+            .get(step_id)
+            .is_some_and(|d| d.verdict == crate::runs::GateVerdict::Approved);
+        if is_approval {
+            self.take(step_id)
+        } else {
+            None
+        }
+    }
+
+    /// Count a recorded decision as applied without applying it again: its
+    /// gate's result already records it (see [`decision_in_history`]).
+    fn retire(&self, d: &crate::runs::GateDecision) {
+        self.state()
+            .applied
+            .insert((d.step_id.clone(), d.decided_at));
+    }
+
+    /// Note gate `step_id` as parked; `true` when it was not already — the
+    /// caller announces it.
+    fn announce(&self, step_id: &str) -> bool {
+        self.state().announced.insert(step_id.to_string())
+    }
+
+    fn applied(&self) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+        self.state().applied.iter().cloned().collect()
+    }
+}
+
 /// A manual (cooperative) pause [`run_scheduler_scoped`] is draining toward
 /// — the cooperative-pause counterpart of its `parked` gate set. Once a
 /// pause is requested nothing new launches; every in-flight node runs to
@@ -1706,7 +2023,7 @@ async fn run_steps_inner(
     run_id: &str,
     resolved_inputs: &BTreeMap<String, String>,
     workflow_default_continue: bool,
-    approved_step_id: Option<&str>,
+    gates: Option<&GateBook>,
     step_results: &mut Vec<StepResult>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
     let order: Vec<&Step> = opts.workflow.steps.iter().collect();
@@ -1716,7 +2033,7 @@ async fn run_steps_inner(
         run_id,
         resolved_inputs,
         workflow_default_continue,
-        approved_step_id,
+        gates,
         step_results,
     )
     .await
@@ -1820,12 +2137,13 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// [`cancel_finalize`] instead (spec §8). Every sample this task's golden
 /// test covers has graph width 1, so there is never another task in
 /// flight when any of this fires — unobservable there.
+#[cfg(test)]
 async fn run_scheduler(
     opts: &OrchestratorRunOpts,
     run_id: &str,
     resolved_inputs: &BTreeMap<String, String>,
     workflow_default_continue: bool,
-    approved_step_id: Option<&str>,
+    gates: Option<&GateBook>,
     step_results: &mut Vec<StepResult>,
     cancel: Option<&CancellationToken>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
@@ -1834,7 +2152,7 @@ async fn run_scheduler(
         run_id,
         resolved_inputs,
         workflow_default_continue,
-        approved_step_id,
+        gates,
         step_results,
         cancel,
         SchedulerScope::whole_workflow(),
@@ -1900,7 +2218,10 @@ async fn run_scheduler_scoped(
     run_id: &str,
     resolved_inputs: &BTreeMap<String, String>,
     workflow_default_continue: bool,
-    approved_step_id: Option<&str>,
+    // The gate decisions this run applies (spec §7: path-scoped) — shared
+    // with every nested loop-iteration call. `None`: no decisions (a
+    // fresh run with no store; tests).
+    gates: Option<&GateBook>,
     step_results: &mut Vec<StepResult>,
     // Task 4, spec §8: a whole-run cancel signal, DISTINCT from
     // `opts.pause` (the pre-existing cooperative "stop at the next safe
@@ -1917,6 +2238,8 @@ async fn run_scheduler_scoped(
     cancel: Option<&CancellationToken>,
     scope: SchedulerScope,
 ) -> Result<InnerOutcome, RunWorkflowError> {
+    let no_gates = GateBook::default();
+    let gates = gates.unwrap_or(&no_gates);
     // Task 3 (spec §2b): the outer scheduler treats a loop as one
     // super-node collapsed from its members. `wants_loop_supernodes` is
     // true ONLY for the top-level call over a workflow that HAS loops
@@ -2109,15 +2432,35 @@ async fn run_scheduler_scoped(
         task_id_to_index: BTreeMap::new(),
         cancelled_by_us: std::collections::BTreeSet::new(),
     };
+    // Spec §7 (path-scoped gates): every gate rejected so far — each the
+    // root of a pruned path. Seeded from a persisted rejection (applied on
+    // an earlier pass, or recorded by an older binary's `rupu workflow
+    // reject`), and extended as this call applies one.
+    let mut rejected_gates: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // Edges a resolved branch did not take — cut, together with the
+    // rejected gates' out-edges, by `rejection_prune_set`.
+    let mut dead_edges: std::collections::BTreeSet<(usize, usize)> =
+        std::collections::BTreeSet::new();
     for sr in step_results.iter() {
         if let Some(&i) = index_of.get(sr.step_id.as_str()) {
             done[i] = true;
             if let Some(branch) = &wf.steps[i].branch {
-                match sr.output.as_str() {
-                    "then" => branch_skipped.extend(branch.r#else.iter().cloned()),
-                    "else" => branch_skipped.extend(branch.then.iter().cloned()),
-                    _ => {}
+                let untaken = match sr.output.as_str() {
+                    "then" => Some(&branch.r#else),
+                    "else" => Some(&branch.then),
+                    _ => None,
+                };
+                if let Some(untaken) = untaken {
+                    branch_skipped.extend(untaken.iter().cloned());
+                    for t in untaken {
+                        if let Some(&ti) = index_of.get(t.as_str()) {
+                            dead_edges.insert((i, ti));
+                        }
+                    }
                 }
+            }
+            if is_rejection_record(sr) {
+                rejected_gates.insert(i);
             }
             // Guarded on `sr.skipped` (always `true` for these two
             // markers, always `false` for a real dispatch/branch/split/
@@ -2143,6 +2486,20 @@ async fn run_scheduler_scoped(
                 indegree[s] = indegree[s].saturating_sub(1);
             }
         }
+    }
+    // A rejection already on disk keeps its path pruned: what is reachable
+    // only through a rejected gate resolves as `pruned` when it comes up,
+    // never runs, and never re-parks a gate behind it.
+    if graph_mode {
+        extend_rejection_prune(
+            &rejected_gates,
+            &dead_edges,
+            &successors,
+            &predecessors,
+            &done,
+            wf,
+            &mut pruned,
+        );
     }
 
     // Task 3: `effective_only` excludes every id NOT in the set from ever
@@ -2213,7 +2570,7 @@ async fn run_scheduler_scoped(
         if let Some(&i) = index_of.get(sr.step_id.as_str()) {
             resume_join_worklist.extend(track_join_arrivals(
                 i,
-                !sr.skipped,
+                !sr.skipped && !rejected_gates.contains(&i),
                 &successors,
                 &mut join_state,
             ));
@@ -2260,6 +2617,16 @@ async fn run_scheduler_scoped(
     // possible (both `ready` and `in_flight` empty); it just pauses with
     // EVERY gate reached in the wave in the set, not only the first.
     let mut parked: Vec<GateParked> = Vec::new();
+    // The gates in `parked` this call parked itself (not folded in from a
+    // loop iteration), by step id → node index: while other paths are
+    // still executing, a decision recorded on one of them is applied at
+    // once (see the decision poll below), so its path is not held back
+    // until they finish. A loop's gates are applied when the run re-checks
+    // before it parks (`RunStore::finish_runner`).
+    let mut parked_direct: BTreeMap<String, usize> = BTreeMap::new();
+    // Rejected gates' `on_reject` chains, running alongside the rest of the
+    // run; every one finishes before this call returns.
+    let mut cleanups: tokio::task::JoinSet<Vec<StepResult>> = tokio::task::JoinSet::new();
 
     // The cooperative-pause counterpart of `parked`: set once a manual
     // pause is requested (a step boundary, a node pausing mid-dispatch, or
@@ -2493,7 +2860,6 @@ async fn run_scheduler_scoped(
 
             if crate::workflow::is_approval_gate(step) {
                 let ap = step.approval.as_ref().expect("gate has approval");
-                let gate_suppressed = approved_step_id == Some(step.id.as_str());
                 let prompt = match &ap.prompt {
                     Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
                         .map_err(|e| RunWorkflowError::Render {
@@ -2506,54 +2872,115 @@ async fn run_scheduler_scoped(
                     ),
                 };
 
-                if gate_suppressed {
-                    // I-36/I-38: the resume-approve provenance the caller
-                    // (CLI `resolve_approve_gate`/`resume_run`) attached to
-                    // `opts.resume_from` — `via_timeout` distinguishes a
-                    // sweep-driven `on_timeout: approve` from a genuine
-                    // operator decision; `approver` carries who (when known).
-                    let via_timeout = opts.resume_from.as_ref().is_some_and(|r| r.via_timeout);
-                    let via = if via_timeout { "timeout" } else { "human" };
-                    let approver = opts
-                        .resume_from
-                        .as_ref()
-                        .and_then(|r| r.approver.as_deref());
-                    info!(step = %step.id, via, "gate: resuming with approval");
-                    emit_gate_result(
-                        opts,
-                        run_id,
-                        step,
-                        "approved",
-                        via,
-                        approver,
-                        None,
-                        step_results,
-                        current_loop_iteration,
-                    );
-                    let worklist = mark_done_and_track_joins(
-                        i,
-                        true, // gate resolved with a real decision — a live arrival
-                        &successors,
-                        &mut indegree,
-                        &mut ready,
-                        &mut done,
-                        &mut join_state,
-                    );
-                    drain_joins(
-                        worklist,
-                        wf,
-                        opts,
-                        run_id,
-                        step_results,
-                        &mut done,
-                        &successors,
-                        &predecessors,
-                        &mut indegree,
-                        &mut ready,
-                        &mut join_state,
-                        &mut cancel_state,
-                    );
-                    continue;
+                match gates.take(&step.id) {
+                    Some(decision) if decision.verdict == crate::runs::GateVerdict::Approved => {
+                        // I-36/I-38: the decision's provenance — `via`
+                        // tells a gate's own `on_timeout: approve` from an
+                        // operator's decision; `approver` is who (when
+                        // known). Releases only this gate's path.
+                        info!(step = %step.id, via = %decision.via, "gate: resuming with approval");
+                        emit_gate_result(
+                            opts,
+                            run_id,
+                            step,
+                            "approved",
+                            &decision.via,
+                            decision.approver.as_deref(),
+                            None,
+                            step_results,
+                            current_loop_iteration,
+                        );
+                        let worklist = mark_done_and_track_joins(
+                            i,
+                            true, // gate resolved with a real decision — a live arrival
+                            &successors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut done,
+                            &mut join_state,
+                        );
+                        drain_joins(
+                            worklist,
+                            wf,
+                            opts,
+                            run_id,
+                            step_results,
+                            &mut done,
+                            &successors,
+                            &predecessors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut join_state,
+                            &mut cancel_state,
+                        );
+                        continue;
+                    }
+                    Some(decision) => {
+                        // Path-scoped rejection (spec §7): the gate's own
+                        // decision is recorded, its `on_reject` chain runs
+                        // alongside the rest of the run, and only what is
+                        // reachable solely through it is pruned — every
+                        // other path, and a join it shares with one, goes
+                        // on.
+                        info!(step = %step.id, via = %decision.via, "gate: rejected — pruning its path");
+                        emit_gate_result(
+                            opts,
+                            run_id,
+                            step,
+                            "rejected",
+                            &decision.via,
+                            decision.approver.as_deref(),
+                            decision.reason.as_deref(),
+                            step_results,
+                            current_loop_iteration,
+                        );
+                        if !ap.on_reject.is_empty() {
+                            cleanups.spawn(run_on_reject_chain_task(
+                                Arc::clone(&opts_arc),
+                                run_id.to_string(),
+                                step.id.clone(),
+                                ap.on_reject.clone(),
+                                step_results.clone(),
+                            ));
+                        }
+                        rejected_gates.insert(i);
+                        if graph_mode {
+                            extend_rejection_prune(
+                                &rejected_gates,
+                                &dead_edges,
+                                &successors,
+                                &predecessors,
+                                &done,
+                                wf,
+                                &mut pruned,
+                            );
+                        }
+                        let worklist = mark_done_and_track_joins(
+                            i,
+                            false, // a rejected gate never arrives at a join
+                            &successors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut done,
+                            &mut join_state,
+                        );
+                        drain_joins(
+                            worklist,
+                            wf,
+                            opts,
+                            run_id,
+                            step_results,
+                            &mut done,
+                            &successors,
+                            &predecessors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut join_state,
+                            &mut cancel_state,
+                        );
+                        continue;
+                    }
+                    None => {}
                 }
                 if let Some(expr) = &ap.auto_approve {
                     let truthy =
@@ -2602,25 +3029,30 @@ async fn run_scheduler_scoped(
                     }
                 }
                 info!(step = %step.id, "gate: pausing for approval");
-                fire_notify_hooks(
-                    opts,
-                    run_id,
-                    &step.id,
-                    &ap.notify,
-                    &ctx,
-                    render_mode(opts.strict_templates),
-                    step_results,
-                )
-                .await;
-                if let Some(sink) = opts.event_sink.as_ref() {
-                    sink.emit(
+                // Announced once per park: a gate still waiting from an
+                // earlier pass (a sibling of a gate whose path just
+                // resumed) re-parks without re-firing its hooks.
+                if gates.announce(&step.id) {
+                    fire_notify_hooks(
+                        opts,
                         run_id,
-                        &crate::executor::Event::StepAwaitingApproval {
-                            run_id: run_id.to_string(),
-                            step_id: step.id.clone(),
-                            reason: prompt.clone(),
-                        },
-                    );
+                        &step.id,
+                        &ap.notify,
+                        &ctx,
+                        render_mode(opts.strict_templates),
+                        step_results,
+                    )
+                    .await;
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepAwaitingApproval {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                reason: prompt.clone(),
+                            },
+                        );
+                    }
                 }
                 // Batch-park (spec §7): record this gate and keep draining
                 // the rest of `ready` — do NOT return yet. A sibling on an
@@ -2633,12 +3065,77 @@ async fn run_scheduler_scoped(
                     prompt,
                     timeout_seconds: ap.timeout_seconds,
                 });
+                parked_direct.insert(step.id.clone(), i);
                 continue;
             }
 
             if let Some(approval) = &step.approval {
-                let gate_suppressed = approved_step_id == Some(step.id.as_str())
-                    || resume_paused_step_ids.contains(step.id.as_str());
+                let decision =
+                    if approval.required && !resume_paused_step_ids.contains(step.id.as_str()) {
+                        gates.take(&step.id)
+                    } else {
+                        None
+                    };
+                if decision
+                    .as_ref()
+                    .is_some_and(|d| d.verdict == crate::runs::GateVerdict::Rejected)
+                {
+                    // An inline gate's rejection: the step never runs, and
+                    // what is reachable only through it is pruned — the
+                    // same path-scoped rule as a gate node's (no
+                    // `on_reject` chain: only gate nodes carry one).
+                    info!(step = %step.id, "rejected at its approval gate — pruning its path");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepSkipped {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                reason: "rejected at its approval gate".into(),
+                            },
+                        );
+                    }
+                    rejected_gates.insert(i);
+                    if graph_mode {
+                        extend_rejection_prune(
+                            &rejected_gates,
+                            &dead_edges,
+                            &successors,
+                            &predecessors,
+                            &done,
+                            wf,
+                            &mut pruned,
+                        );
+                    }
+                    let result = StepResult {
+                        step_id: step.id.clone(),
+                        output: "rejected".to_string(),
+                        success: false,
+                        skipped: true,
+                        kind: step_kind_for_run_record(step),
+                        loop_iteration: current_loop_iteration,
+                        ..Default::default()
+                    };
+                    complete_and_drain_joins(
+                        i,
+                        false, // never ran — not a live join arrival
+                        result,
+                        wf,
+                        opts,
+                        run_id,
+                        step_results,
+                        &mut done,
+                        &successors,
+                        &predecessors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut join_state,
+                        &mut cancel_state,
+                    );
+                    continue;
+                }
+                let gate_suppressed =
+                    decision.is_some() || resume_paused_step_ids.contains(step.id.as_str());
                 if approval.required && !gate_suppressed {
                     let prompt = match &approval.prompt {
                         Some(template) => {
@@ -2654,7 +3151,11 @@ async fn run_scheduler_scoped(
                         ),
                     };
                     info!(step = %step.id, "pausing for approval");
-                    if let Some(sink) = opts.event_sink.as_ref() {
+                    if let Some(sink) = opts
+                        .event_sink
+                        .as_ref()
+                        .filter(|_| gates.announce(&step.id))
+                    {
                         sink.emit(
                             run_id,
                             &crate::executor::Event::StepAwaitingApproval {
@@ -2670,6 +3171,7 @@ async fn run_scheduler_scoped(
                         prompt,
                         timeout_seconds: approval.timeout_seconds,
                     });
+                    parked_direct.insert(step.id.clone(), i);
                     continue;
                 }
             }
@@ -2717,6 +3219,18 @@ async fn run_scheduler_scoped(
                     for idx in branch_prune_set(i, &untaken_idxs, &successors, &predecessors) {
                         pruned.insert(wf.steps[idx].id.clone());
                     }
+                    // A node fed only through a rejected gate and this
+                    // untaken arm is dead now too.
+                    dead_edges.extend(untaken_idxs.iter().map(|&t| (i, t)));
+                    extend_rejection_prune(
+                        &rejected_gates,
+                        &dead_edges,
+                        &successors,
+                        &predecessors,
+                        &done,
+                        wf,
+                        &mut pruned,
+                    );
                 } else if take {
                     branch_skipped.extend(branch.r#else.iter().cloned());
                 } else {
@@ -2874,7 +3388,7 @@ async fn run_scheduler_scoped(
                         workflow_default_continue,
                         step_results,
                         cancel,
-                        approved_step_id,
+                        gates,
                     ))
                     .await;
                     match loop_result {
@@ -3119,20 +3633,30 @@ async fn run_scheduler_scoped(
         // Task 4, spec §8: race the next dispatch completion against the
         // cancel signal itself, so a cancel fired WHILE we're awaiting a
         // long-running in-flight node is caught immediately rather than
-        // only after that node happens to finish on its own.
-        let join_next_result = if let Some(token) = cancel {
-            tokio::select! {
-                res = in_flight.join_next() => res,
-                () = token.cancelled() => {
-                    return cancel_finalize(
-                        opts, run_id, step_results, &mut in_flight, &mut cancel_state,
-                        current_loop_iteration,
-                    )
-                    .await;
-                }
+        // only after that node happens to finish on its own. Spec §7: and,
+        // while gates this call parked wait, against a decision recorded on
+        // one of them — applied now, so its path runs alongside the ones
+        // already in flight instead of after them.
+        let watch_decisions =
+            !parked_direct.is_empty() && !run_id.is_empty() && opts.run_store.is_some();
+        let join_next_result = tokio::select! {
+            res = in_flight.join_next() => res,
+            () = cancelled_or_never(cancel) => {
+                return cancel_finalize(
+                    opts, run_id, step_results, &mut in_flight, &mut cancel_state,
+                    current_loop_iteration,
+                )
+                .await;
             }
-        } else {
-            in_flight.join_next().await
+            () = tokio::time::sleep(GATE_DECISION_POLL), if watch_decisions => {
+                for id in recorded_decisions_on(opts, run_id, gates, &parked_direct) {
+                    if let Some(gi) = parked_direct.remove(&id) {
+                        parked.retain(|g| g.step_id != id);
+                        ready.insert(gi);
+                    }
+                }
+                continue;
+            }
         };
 
         let (i, node_result) = match join_next_result.expect("in_flight is non-empty") {
@@ -3273,6 +3797,15 @@ async fn run_scheduler_scoped(
                     &mut cancel_state,
                 );
             }
+        }
+    }
+
+    // Every rejected gate's `on_reject` chain finishes before this pass
+    // reports how it ended.
+    while let Some(joined) = cleanups.join_next().await {
+        match joined {
+            Ok(results) => step_results.extend(results),
+            Err(e) => warn!(error = %e, "an on_reject cleanup chain did not finish"),
         }
     }
 
@@ -3535,16 +4068,11 @@ async fn run_loop_node(
     workflow_default_continue: bool,
     outer_step_results: &mut Vec<StepResult>,
     cancel: Option<&CancellationToken>,
-    // Task 4, spec §3/§5 fix: the id of a gate an approve-resume just
-    // suppressed, forwarded from `run_workflow`/`run_scheduler_scoped`'s
-    // own parameter of the same name. Task 3 hardcoded `None` on the
-    // recursive call below — harmless for that task (no test exercised
-    // an approval gate INSIDE a loop) but silently broken for one: a
-    // loop member gate could never be suppressed on resume, so
-    // approving it would just re-park it forever. Threaded through
-    // unchanged; `run_scheduler_scoped`'s own gate-suppression check
-    // (`approved_step_id == Some(step.id.as_str())`) does the rest.
-    approved_step_id: Option<&str>,
+    // Task 4, spec §3/§5 fix: the run's gate decisions, forwarded from
+    // `run_scheduler_scoped` — a loop member gate decided on resume must
+    // be applied inside the iteration, or approving it would just re-park
+    // it forever. `run_scheduler_scoped`'s own gate arms do the rest.
+    gates: &GateBook,
 ) -> Result<LoopNodeOutcome, RunWorkflowError> {
     let wf = &opts.workflow;
     let member_ids: std::collections::BTreeSet<String> = loop_def.nodes.iter().cloned().collect();
@@ -3602,7 +4130,7 @@ async fn run_loop_node(
             run_id,
             resolved_inputs,
             workflow_default_continue,
-            approved_step_id,
+            Some(gates),
             &mut iteration_results,
             cancel,
             scope,
@@ -4136,6 +4664,66 @@ fn branch_prune_set(
         .collect()
 }
 
+/// What gate rejections remove from a run (spec §7, path-scoped gates):
+/// everything downstream of a rejected gate that can no longer be reached
+/// from any entry once the rejected gates' outgoing edges — and every edge
+/// a resolved branch did not take — are cut. Cumulative over every gate
+/// rejected so far, so a node fed only through rejected gates (a join
+/// behind two of them) goes, while one a live path still reaches stays: it
+/// runs when that path completes, and a join counts the pruned path as
+/// accounted for (non-live) — the same rule [`branch_prune_set`] applies to
+/// an untaken arm.
+fn rejection_prune_set(
+    rejected: &std::collections::BTreeSet<usize>,
+    dead_edges: &std::collections::BTreeSet<(usize, usize)>,
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+) -> std::collections::BTreeSet<usize> {
+    let starts: Vec<usize> = rejected
+        .iter()
+        .flat_map(|&g| successors[g].iter().copied())
+        .collect();
+    let downstream = reachable_via(&starts, successors);
+    let entries: Vec<usize> = (0..predecessors.len())
+        .filter(|&i| predecessors[i].is_empty())
+        .collect();
+    let mut live: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stack = entries;
+    while let Some(n) = stack.pop() {
+        if !live.insert(n) || rejected.contains(&n) {
+            continue;
+        }
+        stack.extend(
+            successors[n]
+                .iter()
+                .copied()
+                .filter(|&m| !dead_edges.contains(&(n, m))),
+        );
+    }
+    downstream.difference(&live).copied().collect()
+}
+
+/// Mark every not-yet-done node of [`rejection_prune_set`] `pruned`, so it
+/// resolves as a `"pruned"` no-op when it comes up.
+fn extend_rejection_prune(
+    rejected: &std::collections::BTreeSet<usize>,
+    dead_edges: &std::collections::BTreeSet<(usize, usize)>,
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+    done: &[bool],
+    wf: &Workflow,
+    pruned: &mut std::collections::BTreeSet<String>,
+) {
+    if rejected.is_empty() {
+        return;
+    }
+    for idx in rejection_prune_set(rejected, dead_edges, successors, predecessors) {
+        if !done[idx] {
+            pruned.insert(wf.steps[idx].id.clone());
+        }
+    }
+}
+
 /// The non-persisting half of "a node just resolved": mark it `done`,
 /// unlock its successors' indegree (a pruned/skipped/cancelled node's
 /// resolution counts exactly like a real completion for this purpose —
@@ -4488,9 +5076,11 @@ async fn run_steps_over(
     run_id: &str,
     resolved_inputs: &BTreeMap<String, String>,
     workflow_default_continue: bool,
-    approved_step_id: Option<&str>,
+    gates: Option<&GateBook>,
     step_results: &mut Vec<StepResult>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
+    let no_gates = GateBook::default();
+    let gates = gates.unwrap_or(&no_gates);
     let already_done: std::collections::BTreeSet<String> =
         step_results.iter().map(|sr| sr.step_id.clone()).collect();
 
@@ -4656,7 +5246,6 @@ async fn run_steps_over(
         // and pause twice).
         if crate::workflow::is_approval_gate(step) {
             let ap = step.approval.as_ref().expect("gate has approval");
-            let gate_suppressed = approved_step_id == Some(step.id.as_str());
             let prompt = match &ap.prompt {
                 Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
                     .map_err(|e| RunWorkflowError::Render {
@@ -4669,23 +5258,17 @@ async fn run_steps_over(
                 ),
             };
 
-            if gate_suppressed {
+            if let Some(approval) = gates.take_approval(&step.id) {
                 // I-36/I-38: see the identical comment on the scheduler's
-                // gate_suppressed branch above.
-                let via_timeout = opts.resume_from.as_ref().is_some_and(|r| r.via_timeout);
-                let via = if via_timeout { "timeout" } else { "human" };
-                let approver = opts
-                    .resume_from
-                    .as_ref()
-                    .and_then(|r| r.approver.as_deref());
-                info!(step = %step.id, via, "gate: resuming with approval");
+                // approved-gate branch.
+                info!(step = %step.id, via = %approval.via, "gate: resuming with approval");
                 emit_gate_result(
                     opts,
                     run_id,
                     step,
                     "approved",
-                    via,
-                    approver,
+                    &approval.via,
+                    approval.approver.as_deref(),
                     None,
                     step_results,
                     None,
@@ -4715,25 +5298,27 @@ async fn run_steps_over(
                 }
             }
             info!(step = %step.id, "gate: pausing for approval");
-            fire_notify_hooks(
-                opts,
-                run_id,
-                &step.id,
-                &ap.notify,
-                &ctx,
-                render_mode(opts.strict_templates),
-                step_results,
-            )
-            .await;
-            if let Some(sink) = opts.event_sink.as_ref() {
-                sink.emit(
+            if gates.announce(&step.id) {
+                fire_notify_hooks(
+                    opts,
                     run_id,
-                    &crate::executor::Event::StepAwaitingApproval {
-                        run_id: run_id.to_string(),
-                        step_id: step.id.clone(),
-                        reason: prompt.clone(),
-                    },
-                );
+                    &step.id,
+                    &ap.notify,
+                    &ctx,
+                    render_mode(opts.strict_templates),
+                    step_results,
+                )
+                .await;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepAwaitingApproval {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: prompt.clone(),
+                        },
+                    );
+                }
             }
             return Ok(InnerOutcome::Paused {
                 step_id: step.id.clone(),
@@ -4760,8 +5345,8 @@ async fn run_steps_over(
             // Suppress the gate on resume for the approved step AND for a
             // paused-mid-run step being re-run (it already cleared its gate
             // in the prior process).
-            let gate_suppressed = approved_step_id == Some(step.id.as_str())
-                || resume_paused_step_ids.contains(step.id.as_str());
+            let gate_suppressed = resume_paused_step_ids.contains(step.id.as_str())
+                || gates.take_approval(&step.id).is_some();
             if approval.required && !gate_suppressed {
                 let prompt = match &approval.prompt {
                     Some(template) => {
@@ -4777,7 +5362,11 @@ async fn run_steps_over(
                     ),
                 };
                 info!(step = %step.id, "pausing for approval");
-                if let Some(sink) = opts.event_sink.as_ref() {
+                if let Some(sink) = opts
+                    .event_sink
+                    .as_ref()
+                    .filter(|_| gates.announce(&step.id))
+                {
                     sink.emit(
                         run_id,
                         &crate::executor::Event::StepAwaitingApproval {
@@ -6169,8 +6758,91 @@ pub async fn run_reject_cleanup(
     //    extracting a shared helper would either drag that machinery along
     //    unused or require new plumbing on `run_linear_step` itself. The
     //    subset actually needed here is small enough to mirror directly.
+    run_on_reject_chain(
+        &opts,
+        &run_id,
+        rejected_step_id,
+        &chain,
+        &naming,
+        &mut step_results,
+    )
+    .await?;
+    // 4. Cleanup never changes the terminal status itself — that was
+    //    already decided by whichever `reject_gate`/`expire_gate_if_overdue`
+    //    call preceded this cleanup. Pre-5b-2a that was ALWAYS `Rejected`
+    //    (the sole gate, emptying the set). Task 5b-2a (spec §7): several
+    //    concurrent gates can each carry their own `on_reject` chain —
+    //    rejecting one gate of a still-parked set only removes it, and
+    //    the run stays `AwaitingApproval` until every gate resolves. This
+    //    cleanup call is scoped to ONE gate's chain regardless of which
+    //    case applies; step 5 below is what has to tell the difference.
+
+    // 5. `RunStore::reject_gate`/`expire_gate_if_overdue` already appended
+    //    a terminal `RunCompleted` event IF rejecting this gate emptied
+    //    the awaiting set (step 1 doc comment above), but
+    //    `emit_gate_result` (step 2 above) unconditionally emits the
+    //    gate's own `StepStarted`/`StepCompleted` events after that, and
+    //    every cleanup step dispatched in the loop above appends its own
+    //    `StepStarted`/`StepCompleted`/`StepFailed` events on top of
+    //    those — so `events.jsonl` ends with step events, not a terminal
+    //    one, even when the chain is empty. Newest-event-fold consumers
+    //    (Situation Room's live event stream) fold the log by treating
+    //    its last event as the run's current state; with a step event
+    //    trailing, a rejected run would briefly render as "active" until
+    //    a fresh terminal event lands. Re-append the same
+    //    `RunCompleted(Rejected)` event here — after the chain — so the
+    //    log ends closed. This is a deliberate duplicate: it is NOT
+    //    deduped downstream, it is simply an accepted trailing marker
+    //    that keeps the log's last line authoritative.
+    //
+    //    Task 5b-2a: this must NOT fire while the run is still active —
+    //    `AwaitingApproval` on a sibling gate, or `Running` another path
+    //    (spec §7: a rejection is path-scoped) — or it would falsely close
+    //    the event log for a run that's genuinely active. Reload the
+    //    persisted record and gate the re-append on it actually being
+    //    terminal (or unreadable — the same best-effort contract
+    //    `append_terminal_event` itself already has). Skipped entirely when
+    //    `opts.run_store` is `None` (in-memory runs have no `events.jsonl`
+    //    to close).
+    if let Some(store) = &opts.run_store {
+        let still_active = store.load(&run_id).is_ok_and(|r| !r.status.is_terminal());
+        if !still_active {
+            store.append_terminal_event(
+                &run_id,
+                &crate::executor::Event::RunCompleted {
+                    run_id: run_id.clone(),
+                    status: crate::runs::RunStatus::Rejected,
+                    finished_at: chrono::Utc::now(),
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch a rejected gate's `on_reject` chain (spec §4.1): each step in
+/// turn, through the same per-step machinery `run_workflow`'s linear arm
+/// uses (StepStarted event → factory `build_opts_for_step` → agent run →
+/// StepCompleted / StepFailed event → `persist_step_result` → push onto
+/// `step_results`, which also carries the template context). A failing
+/// step is logged and the chain continues — never returned; only an
+/// unresolvable input set is an `Err`.
+///
+/// Mirrored inline rather than shared with `run_linear_step`, which also
+/// carries host-redirect, cooperative-pause, and resume-seed logic a
+/// cleanup chain never needs (cleanup steps always run local,
+/// uninterrupted, fresh — no `host:`, no `opts.pause`, no mid-step seed).
+async fn run_on_reject_chain(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    rejected_step_id: &str,
+    chain: &[Step],
+    naming: &crate::codenames::RunNaming,
+    step_results: &mut Vec<StepResult>,
+) -> Result<(), RunWorkflowError> {
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
-    for step in &chain {
+    for step in chain {
         if step.action.is_some() {
             // Action steps dispatch through the same `execute_action_step`
             // helper the main loop uses (Plan 2). `continue_on_error:
@@ -6189,13 +6861,13 @@ pub async fn run_reject_cleanup(
                 &resolved_inputs,
                 opts.event.as_ref(),
                 opts.issue.as_ref(),
-                &step_results,
+                step_results,
             );
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
-                    &run_id,
+                    run_id,
                     &crate::executor::Event::StepStarted {
-                        run_id: run_id.clone(),
+                        run_id: run_id.to_string(),
                         step_id: step.id.clone(),
                         kind: crate::runs::StepKind::Action,
                         agent: None,
@@ -6227,9 +6899,9 @@ pub async fn run_reject_cleanup(
                 Ok(result) => {
                     if let Some(sink) = opts.event_sink.as_ref() {
                         sink.emit(
-                            &run_id,
+                            run_id,
                             &crate::executor::Event::StepCompleted {
-                                run_id: run_id.clone(),
+                                run_id: run_id.to_string(),
                                 step_id: step.id.clone(),
                                 success: result.success,
                                 duration_ms,
@@ -6247,9 +6919,9 @@ pub async fn run_reject_cleanup(
                     );
                     if let Some(sink) = opts.event_sink.as_ref() {
                         sink.emit(
-                            &run_id,
+                            run_id,
                             &crate::executor::Event::StepFailed {
-                                run_id: run_id.clone(),
+                                run_id: run_id.to_string(),
                                 step_id: step.id.clone(),
                                 error: e.to_string(),
                             },
@@ -6264,7 +6936,7 @@ pub async fn run_reject_cleanup(
                     }
                 }
             };
-            persist_step_result(&opts, &run_id, &result);
+            persist_step_result(opts, run_id, &result);
             step_results.push(result);
             continue;
         }
@@ -6273,7 +6945,7 @@ pub async fn run_reject_cleanup(
             &resolved_inputs,
             opts.event.as_ref(),
             opts.issue.as_ref(),
-            &step_results,
+            step_results,
         );
         let agent_name = step.agent.as_deref().unwrap_or_default();
         let prompt = step.prompt.as_deref().unwrap_or_default();
@@ -6283,9 +6955,9 @@ pub async fn run_reject_cleanup(
 
         if let Some(sink) = opts.event_sink.as_ref() {
             sink.emit(
-                &run_id,
+                run_id,
                 &crate::executor::Event::StepStarted {
-                    run_id: run_id.clone(),
+                    run_id: run_id.to_string(),
                     step_id: step.id.clone(),
                     kind: crate::runs::StepKind::Linear,
                     agent: step.agent.clone(),
@@ -6305,9 +6977,9 @@ pub async fn run_reject_cleanup(
                 );
                 if let Some(sink) = opts.event_sink.as_ref() {
                     sink.emit(
-                        &run_id,
+                        run_id,
                         &crate::executor::Event::StepFailed {
-                            run_id: run_id.clone(),
+                            run_id: run_id.to_string(),
                             step_id: step.id.clone(),
                             error: e.to_string(),
                         },
@@ -6321,7 +6993,7 @@ pub async fn run_reject_cleanup(
                     codename: Some(codename.to_string()),
                     ..Default::default()
                 };
-                persist_step_result(&opts, &run_id, &result);
+                persist_step_result(opts, run_id, &result);
                 step_results.push(result);
                 continue;
             }
@@ -6329,8 +7001,8 @@ pub async fn run_reject_cleanup(
 
         let step_timer = std::time::Instant::now();
         let on_usage = ledger_hook(
-            &opts,
-            &run_id,
+            opts,
+            run_id,
             crate::usage_ledger::LedgerTag {
                 step_id: Some(step.id.clone()),
                 unit_index: None,
@@ -6346,7 +7018,7 @@ pub async fn run_reject_cleanup(
             &step.id,
             agent_name,
             rendered.clone(),
-            step_run_id.clone(),
+            step_run_id.to_string(),
             opts.workspace_id.clone(),
             opts.workspace_path.clone(),
             transcript_path.clone(),
@@ -6355,7 +7027,7 @@ pub async fn run_reject_cleanup(
             None,
             AgentAnnounce {
                 sink: opts.event_sink.as_ref(),
-                workflow_run_id: &run_id,
+                workflow_run_id: run_id,
                 unit_index: None,
                 codename: Some(codename.clone()),
             },
@@ -6378,9 +7050,9 @@ pub async fn run_reject_cleanup(
         if let Some(sink) = opts.event_sink.as_ref() {
             if success {
                 sink.emit(
-                    &run_id,
+                    run_id,
                     &crate::executor::Event::StepCompleted {
-                        run_id: run_id.clone(),
+                        run_id: run_id.to_string(),
                         step_id: step.id.clone(),
                         success: true,
                         duration_ms,
@@ -6389,9 +7061,9 @@ pub async fn run_reject_cleanup(
                 );
             } else {
                 sink.emit(
-                    &run_id,
+                    run_id,
                     &crate::executor::Event::StepFailed {
-                        run_id: run_id.clone(),
+                        run_id: run_id.to_string(),
                         step_id: step.id.clone(),
                         error: error_text,
                     },
@@ -6411,64 +7083,44 @@ pub async fn run_reject_cleanup(
             codename: Some(codename.to_string()),
             ..Default::default()
         };
-        persist_step_result(&opts, &run_id, &result);
+        persist_step_result(opts, run_id, &result);
         step_results.push(result);
     }
 
-    // 4. Cleanup never changes the terminal status itself — that was
-    //    already decided by whichever `reject_gate`/`expire_gate_if_overdue`
-    //    call preceded this cleanup. Pre-5b-2a that was ALWAYS `Rejected`
-    //    (the sole gate, emptying the set). Task 5b-2a (spec §7): several
-    //    concurrent gates can each carry their own `on_reject` chain —
-    //    rejecting one gate of a still-parked set only removes it, and
-    //    the run stays `AwaitingApproval` until every gate resolves. This
-    //    cleanup call is scoped to ONE gate's chain regardless of which
-    //    case applies; step 5 below is what has to tell the difference.
-
-    // 5. `RunStore::reject_gate`/`expire_gate_if_overdue` already appended
-    //    a terminal `RunCompleted` event IF rejecting this gate emptied
-    //    the awaiting set (step 1 doc comment above), but
-    //    `emit_gate_result` (step 2 above) unconditionally emits the
-    //    gate's own `StepStarted`/`StepCompleted` events after that, and
-    //    every cleanup step dispatched in the loop above appends its own
-    //    `StepStarted`/`StepCompleted`/`StepFailed` events on top of
-    //    those — so `events.jsonl` ends with step events, not a terminal
-    //    one, even when the chain is empty. Newest-event-fold consumers
-    //    (Situation Room's live event stream) fold the log by treating
-    //    its last event as the run's current state; with a step event
-    //    trailing, a rejected run would briefly render as "active" until
-    //    a fresh terminal event lands. Re-append the same
-    //    `RunCompleted(Rejected)` event here — after the chain — so the
-    //    log ends closed. This is a deliberate duplicate: it is NOT
-    //    deduped downstream, it is simply an accepted trailing marker
-    //    that keeps the log's last line authoritative.
-    //
-    //    Task 5b-2a: this must NOT fire while the run is still
-    //    `AwaitingApproval` — a sibling gate rejected earlier in the same
-    //    set must not falsely close the event log for a run that's still
-    //    genuinely active on another path. Reload the persisted record
-    //    and gate the re-append on it actually being terminal. Skipped
-    //    entirely when `opts.run_store` is `None` (in-memory runs have no
-    //    `events.jsonl` to close) or the record can't be reloaded (same
-    //    best-effort contract `append_terminal_event` itself already has).
-    if let Some(store) = &opts.run_store {
-        let still_awaiting = store
-            .load(&run_id)
-            .map(|r| r.status == crate::runs::RunStatus::AwaitingApproval)
-            .unwrap_or(false);
-        if !still_awaiting {
-            store.append_terminal_event(
-                &run_id,
-                &crate::executor::Event::RunCompleted {
-                    run_id: run_id.clone(),
-                    status: crate::runs::RunStatus::Rejected,
-                    finished_at: chrono::Utc::now(),
-                },
-            );
-        }
-    }
-
     Ok(())
+}
+
+/// A rejected gate's `on_reject` chain, run by the scheduler alongside the
+/// rest of the run (spec §7, path-scoped gates) — see
+/// [`run_on_reject_chain`]. `step_results` is the run's history at the
+/// rejection (the chain's template context, including the gate's own
+/// rejected decision); returns the chain's own results, each already
+/// persisted.
+async fn run_on_reject_chain_task(
+    opts: Arc<OrchestratorRunOpts>,
+    run_id: String,
+    gate_id: String,
+    chain: Vec<Step>,
+    mut step_results: Vec<StepResult>,
+) -> Vec<StepResult> {
+    let seeded = step_results.len();
+    let naming = match &opts.naming {
+        Some(naming) => Arc::clone(naming),
+        None => Arc::new(crate::codenames::RunNaming::open(
+            &opts.workflow,
+            &run_id,
+            opts.run_store
+                .as_ref()
+                .map(|s| s.root.join(&run_id))
+                .as_deref(),
+        )),
+    };
+    if let Err(e) =
+        run_on_reject_chain(&opts, &run_id, &gate_id, &chain, &naming, &mut step_results).await
+    {
+        warn!(gate = %gate_id, error = %e, "on_reject cleanup chain could not run");
+    }
+    step_results.split_off(seeded)
 }
 
 /// Record `step` as the run's active step — under the run lock, never over
@@ -14897,6 +15549,7 @@ loops:
                     permission_mode: None,
                     final_output: None,
                     loop_progress: BTreeMap::new(),
+                    gate_decisions: Vec::new(),
                     codename: None,
                 },
                 REFINE_WF,

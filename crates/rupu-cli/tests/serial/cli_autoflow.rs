@@ -278,6 +278,7 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     }
 }

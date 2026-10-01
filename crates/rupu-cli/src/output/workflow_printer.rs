@@ -527,7 +527,15 @@ pub fn attach_and_print_with(
                         }
                         'a' | 'A' => {
                             let approver = whoami::username();
-                            match run_store.approve(run_id, &approver, chrono::Utc::now()) {
+                            // The gate this prompt shows — one of several
+                            // when concurrent paths parked together (spec
+                            // §7); the others stay parked.
+                            match run_store.approve_gate(
+                                run_id,
+                                &approver,
+                                chrono::Utc::now(),
+                                record.awaiting_step_id.as_deref(),
+                            ) {
                                 Ok(_) => {
                                     // Don't print step_done — the resumed run
                                     // will dispatch the same step's agent and
@@ -551,8 +559,17 @@ pub fn attach_and_print_with(
                                 &reason
                             };
                             let approver = whoami::username();
-                            let _ = run_store.reject(run_id, &approver, reason, chrono::Utc::now());
-                            println!("Run rejected.");
+                            if let Err(e) = run_store.reject_gate(
+                                run_id,
+                                &approver,
+                                reason,
+                                chrono::Utc::now(),
+                                record.awaiting_step_id.as_deref(),
+                            ) {
+                                eprintln!("rupu: reject failed: {e}");
+                                return Err(io::Error::other(e.to_string()));
+                            }
+                            println!("Gate `{step_id}` rejected.");
                             return Ok(AttachOutcome::Rejected);
                         }
                         _ => {
@@ -2339,8 +2356,15 @@ fn handle_workflow_approval_keypress(
         }
         (KeyCode::Char('a'), _) | (KeyCode::Char('A'), _) => {
             let approver = whoami::username();
+            // The gate this view shows; any other parked gate stays parked
+            // (spec §7).
             run_store
-                .approve(run_id, &approver, chrono::Utc::now())
+                .approve_gate(
+                    run_id,
+                    &approver,
+                    chrono::Utc::now(),
+                    record.awaiting_step_id.as_deref(),
+                )
                 .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(Some(AttachOutcome::Approved {
                 awaited_step_id: step_id,
@@ -2348,12 +2372,15 @@ fn handle_workflow_approval_keypress(
         }
         (KeyCode::Char('r'), _) | (KeyCode::Char('R'), _) => {
             let approver = whoami::username();
-            let _ = run_store.reject(
-                run_id,
-                &approver,
-                "rejected by operator",
-                chrono::Utc::now(),
-            );
+            run_store
+                .reject_gate(
+                    run_id,
+                    &approver,
+                    "rejected by operator",
+                    chrono::Utc::now(),
+                    record.awaiting_step_id.as_deref(),
+                )
+                .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(Some(AttachOutcome::Rejected))
         }
         (KeyCode::Char('q'), _)
@@ -4159,6 +4186,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }

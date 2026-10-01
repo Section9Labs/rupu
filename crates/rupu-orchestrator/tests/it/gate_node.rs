@@ -1648,7 +1648,11 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         events_path.display()
     );
 
-    // --- Now reject gate_b too: the set empties, the run finalizes. ---
+    // --- Now reject gate_b too: the set empties. A rejection is
+    // path-scoped (spec §7), so it is recorded for a runner rather than
+    // finalizing the run here; the runner prunes gate_b's path and, every
+    // path now rejected, ends the run `Rejected`. gate_a's decision, whose
+    // cleanup already ran above, is retired — not applied a second time. ---
     let decision2 = store
         .reject_gate(
             &run_id,
@@ -1659,9 +1663,49 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         )
         .expect("reject_gate(gate_b) succeeds");
     assert!(matches!(decision2, ApprovalDecision::Rejected { .. }));
+    let record_decided = store.load(&run_id).unwrap();
+    assert_eq!(record_decided.status, RunStatus::Running);
+    assert!(record_decided.awaiting.is_empty());
+
+    let prior: Vec<StepResult> = store
+        .read_step_results(&run_id)
+        .unwrap()
+        .iter()
+        .map(StepResult::from)
+        .collect();
+    let opts3 = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(WF_MULTI_GATE_REJECT).unwrap(),
+        inputs: BTreeMap::new(),
+        workspace_id: record_decided.workspace_id.clone(),
+        workspace_path: record_decided.workspace_path.clone(),
+        transcript_dir: record_decided.transcript_dir.clone(),
+        factory: factory.clone(),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_MULTI_GATE_REJECT.to_string()),
+        resume_from: Some(ResumeState::from_decisions(run_id.clone(), prior)),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let res3 = run_workflow(opts3).await.expect("the decided run finishes");
+    assert!(res3.awaiting.is_none());
+    assert_eq!(
+        factory.seen.lock().unwrap().clone(),
+        vec!["notify_fail_a".to_string()],
+        "gate_a's cleanup ran once; neither gated path ran"
+    );
     let record_terminal = store.load(&run_id).unwrap();
     assert_eq!(record_terminal.status, RunStatus::Rejected);
     assert!(record_terminal.awaiting.is_empty());
+    assert!(record_terminal.gate_decisions.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1843,5 +1887,111 @@ async fn notify_hook_transcript_is_referenced_by_a_persisted_step_result() {
         notify_record.transcript_path.exists(),
         "notify hook's transcript_path must exist on disk: {:?}",
         notify_record.transcript_path
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spec §7 (path-scoped gates): approving one gate of a batch-parked pair
+// resumes only that gate's path. The sibling stays parked — and quiet: its
+// `notify:` hooks fired once when it parked and must not fire again just
+// because ANOTHER gate's path resumed.
+// ---------------------------------------------------------------------------
+
+const WF_MULTI_GATE_NOTIFY: &str = r#"
+name: multi-gate-notify
+steps:
+  - id: fanout
+    split: [gate_a, gate_b]
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+    next: [a]
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+      notify:
+        - action: scm.prs.comment
+          with:
+            platform: github
+            owner: acme
+            repo: widget
+            number: 42
+            body: "gate_b is waiting"
+    next: [b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+#[tokio::test]
+async fn resuming_one_gates_path_does_not_refire_a_still_parked_siblings_notify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let (dispatcher, connector) = dispatcher_with_connector(false);
+    let factory = Arc::new(EchoFactory::default());
+    let opts = |resume: Option<ResumeState>| OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(WF_MULTI_GATE_NOTIFY).unwrap(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_multi_gate_notify".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: factory.clone(),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_MULTI_GATE_NOTIFY.to_string()),
+        resume_from: resume,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher.clone()),
+        pause: None,
+        naming: None,
+    };
+
+    let res1 = run_workflow(opts(None)).await.expect("both gates park");
+    let run_id = res1.run_id.clone();
+    assert_eq!(res1.awaiting.unwrap().gates.len(), 2);
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        1,
+        "gate_b announced once"
+    );
+
+    store
+        .approve_gate(&run_id, "operator", chrono::Utc::now(), Some("gate_a"))
+        .unwrap();
+    let prior: Vec<StepResult> = store
+        .read_step_results(&run_id)
+        .unwrap()
+        .iter()
+        .map(StepResult::from)
+        .collect();
+    let res2 = run_workflow(opts(Some(ResumeState::from_approval(
+        run_id.clone(),
+        prior,
+        "gate_a".into(),
+    ))))
+    .await
+    .expect("gate_a's path resumes");
+    let parked: Vec<String> = res2
+        .awaiting
+        .expect("gate_b still parked")
+        .gates
+        .iter()
+        .map(|g| g.step_id.clone())
+        .collect();
+    assert_eq!(parked, ["gate_b"]);
+    assert_eq!(factory.seen.lock().unwrap().clone(), vec!["a".to_string()]);
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        1,
+        "gate_b's notify must not fire again when gate_a's path resumes"
     );
 }

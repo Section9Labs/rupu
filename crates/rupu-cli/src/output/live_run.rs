@@ -526,14 +526,22 @@ async fn run_follow_up(
             via,
             approver,
         } => {
-            // The store lives at `<global>/runs`; the chain reads its config
-            // and writes its records under that same home.
-            let global = runs_dir.parent().ok_or_else(|| {
-                format!(
-                    "on_reject cleanup unavailable: {} has no parent rupu home",
-                    runs_dir.display()
-                )
-            })?;
+            // A path-scoped (DAG) run recorded the rejection for a runner to
+            // apply (spec §7): it prunes only the gate's own path, runs the
+            // gate's `on_reject` chain, and carries on with every other path —
+            // exactly what `rupu workflow reject` resumes into.
+            if store
+                .load(run_id)
+                .is_ok_and(|r| r.pending_decision(&step_id).is_some())
+            {
+                return crate::resume::resume_decided(&store, run_id, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("resume failed: {e:#}"));
+            }
+            let global = runs_dir
+                .parent()
+                .ok_or_else(|| "on_reject cleanup unavailable: no rupu home".to_string())?;
             let (opts, _chain_len) = crate::resume::build_reject_cleanup_opts(
                 &store, global, run_id, &step_id, &reason, None,
             )

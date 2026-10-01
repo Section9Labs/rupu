@@ -117,15 +117,16 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
         };
         match outcome {
             Ok(crate::output::workflow_printer::AttachOutcome::Approved { awaited_step_id }) => {
-                // We persisted the approval, but `rupu watch` doesn't have
+                // We recorded the approval, but `rupu watch` doesn't have
                 // the workflow YAML / factory needed to spin a resume run
-                // inline. Surface the next step to the operator.
+                // inline. Surface the next step to the operator: `resume`
+                // applies the recorded decision.
                 println!();
                 println!(
                     "Step `{awaited_step_id}` approved. The watcher process \
                      can't dispatch the resume itself — run:"
                 );
-                println!("  rupu workflow approve {run_id}");
+                println!("  rupu workflow resume {run_id}");
                 ExitCode::SUCCESS
             }
             Ok(_) => ExitCode::SUCCESS,

@@ -84,16 +84,18 @@ pub struct ResumeOutcome {
 
 /// Resume an already-approved run (phase 2 of approval).
 ///
-/// `store.approve(run_id, ...)` must have already recorded the decision
-/// and flipped the run to `Running`; this reloads the record, rebuilds the
-/// runtime from disk (workflow snapshot + prior step results +
-/// `KeychainResolver` + layered config + SCM registry + dispatcher +
-/// `DefaultStepFactory`), and re-enters `run_workflow`.
+/// `store.approve_gate(run_id, ...)` must have already recorded the
+/// decision; this reloads the record, rebuilds the runtime from disk
+/// (workflow snapshot + prior step results + `KeychainResolver` + layered
+/// config + SCM registry + dispatcher + `DefaultStepFactory`), and
+/// re-enters `run_workflow`, which applies every recorded gate decision —
+/// only the approved gate's path is released; a sibling gate still parked
+/// stays parked (spec §7). When a runner is already executing the run (a
+/// gate approved while another gate's path runs), nothing runs here: the
+/// result's `handed_off_to` names that runner, which applies the approval.
 ///
 /// `awaited_step_id` is the step the approval acted on (the `step_id`
-/// returned by `RunStore::approve`). It must be threaded in from phase 1
-/// because `approve` clears `awaiting_step_id` on the persisted record, so
-/// it is no longer recoverable from the reloaded record.
+/// returned by `RunStore::approve_gate`), reported back on the outcome.
 ///
 /// The `store` reference is used for the disk reads; the runtime store
 /// `Arc` is rebuilt internally from the global dir (identical to the CLI's
@@ -131,7 +133,43 @@ pub async fn resume_run(
         approver.to_string(),
         via_timeout,
     ));
+    let result = run_with_pause_channel(opts, run_id).await?;
+    Ok(ResumeOutcome {
+        awaited_step_id,
+        result,
+    })
+}
 
+/// Resume a run whose gate decisions are recorded on it
+/// (`RunRecord.gate_decisions`) without adding one: the runner applies
+/// every recorded decision — an approval releases its gate's path, a
+/// rejection prunes it and runs its `on_reject` chain — and carries on with
+/// the rest of the run (spec §7, path-scoped gates). Used by `rupu workflow
+/// reject` on a path-scoped run and by `rupu workflow resume` (which the
+/// cp-serve resume worker spawns after a web decision). When a runner is
+/// already executing the run, nothing runs here: the result's
+/// `handed_off_to` names it, and it applies the decisions itself.
+pub async fn resume_decided(
+    store: &RunStore,
+    run_id: &str,
+    mode: Option<&str>,
+) -> anyhow::Result<OrchestratorRunResult> {
+    let global = paths::global_dir()?;
+    let (mut opts, prior_step_results) =
+        rebuild_opts_from_disk(store, &global, run_id, mode).await?;
+    opts.resume_from = Some(rupu_orchestrator::ResumeState::from_decisions(
+        run_id.to_string(),
+        prior_step_results,
+    ));
+    run_with_pause_channel(opts, run_id).await
+}
+
+/// Re-enter `run_workflow` with `opts` (a resume), handing the run a
+/// cooperative-pause channel.
+async fn run_with_pause_channel(
+    mut opts: OrchestratorRunOpts,
+    run_id: &str,
+) -> anyhow::Result<OrchestratorRunResult> {
     // Hand the resumed (possibly detached) run a cooperative-pause channel,
     // the same one a fresh `rupu workflow run` wires — pre-fix the rebuild
     // left `pause: None`, so `rupu workflow pause` / Esc could never stop a
@@ -157,11 +195,7 @@ pub async fn resume_run(
     if let Some(handle) = pause_poller {
         handle.abort();
     }
-    let result = result?;
-    Ok(ResumeOutcome {
-        awaited_step_id,
-        result,
-    })
+    Ok(result?)
 }
 
 /// Rebuild `OrchestratorRunOpts` for a run's `on_reject` cleanup chain
