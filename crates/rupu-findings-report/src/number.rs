@@ -211,6 +211,7 @@ mod tests {
             declared_at: at.parse().unwrap(),
             profile: FindingProfile::Summary,
             report: None,
+            asset: None,
         }
     }
     fn input(ws: &str, r: FindingRecord) -> ExportInput {

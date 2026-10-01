@@ -555,6 +555,7 @@ mod tests {
             declared_at: chrono::Utc::now(),
             profile: FindingProfile::Summary,
             report: None,
+            asset: None,
         };
         let mut full = base.clone();
         full.id = "fnd_full".into();

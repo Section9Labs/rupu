@@ -39,6 +39,7 @@ fn full_record(id: &str, severity: Severity, run: &str) -> FindingRecord {
         declared_at: "2026-09-29T00:00:00Z".parse().unwrap(),
         profile: FindingProfile::Full,
         report: Some(report),
+        asset: None,
     }
 }
 

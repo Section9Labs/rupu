@@ -1572,6 +1572,7 @@ fn findings_global_fixture_is_current() {
                 declared_at: t,
                 profile: CoverageFindingProfile::Summary,
                 report: None,
+                asset: None,
             },
         },
         FindingOut {
@@ -1601,6 +1602,7 @@ fn findings_global_fixture_is_current() {
                 declared_at: t - chrono::Duration::hours(1),
                 profile: CoverageFindingProfile::Summary,
                 report: None,
+                asset: None,
             },
         },
         FindingOut {
@@ -1635,6 +1637,7 @@ fn findings_global_fixture_is_current() {
                 declared_at: t - chrono::Duration::days(1),
                 profile: CoverageFindingProfile::Summary,
                 report: None,
+                asset: None,
             },
         },
         FindingOut {
@@ -1664,6 +1667,7 @@ fn findings_global_fixture_is_current() {
                 declared_at: t - chrono::Duration::days(2),
                 profile: CoverageFindingProfile::Summary,
                 report: None,
+                asset: None,
             },
         },
     ];
@@ -1776,6 +1780,7 @@ fn coverage_detail_fixture_is_current() {
         declared_at: t,
         profile: CoverageFindingProfile::Summary,
         report: None,
+        asset: None,
     }];
 
     let files = vec![FileView {

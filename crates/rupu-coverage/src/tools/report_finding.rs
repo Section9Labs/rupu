@@ -30,6 +30,24 @@ pub struct ReportFindingInput {
     /// The full report. Required under the full profile; refused under summary.
     #[serde(default)]
     pub report: Option<crate::report::FindingReport>,
+    /// The asset this finding is about. Deliberately NOT part of
+    /// [`crate::report::FindingReport`]: the asset is ledger metadata about
+    /// what the finding concerns, not report content, so the report schema
+    /// (and its lockstep validator) is untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AssetInput>,
+}
+
+/// An asset as the reporting agent names it: the profile kind, the typed
+/// locator that identifies it, and optionally its parent asset and a label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetInput {
+    pub kind: String,
+    pub locator: crate::asset::Locator,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +205,10 @@ pub fn report_finding(
         declared_at: Utc::now(),
         profile: opts.profile,
         report,
+        // `input.asset` is accepted on the wire but not yet resolved into a
+        // ledger reference: registering it in the asset store and filling
+        // this in is the next task of the engagement-profiles wiring plan.
+        asset: None,
     };
     paths.ensure_dir()?;
     use std::io::Write;
@@ -323,7 +345,43 @@ mod tests {
                 references: vec![],
             }),
             report: None,
+            asset: None,
         }
+    }
+
+    #[test]
+    fn report_finding_input_asset_is_optional_and_round_trips() {
+        // Absent -> None, and None is not serialized.
+        let bare = serde_json::json!({
+            "scope": "repo",
+            "summary": "s",
+            "severity": "low",
+            "evidence": { "rationale": "r" },
+        });
+        let parsed: ReportFindingInput = serde_json::from_value(bare).unwrap();
+        assert!(parsed.asset.is_none());
+        assert!(serde_json::to_value(&parsed).unwrap().get("asset").is_none());
+
+        // Present: `parent` and `label` default; the locator is a coordinate list.
+        let with_asset = serde_json::json!({
+            "scope": "repo",
+            "summary": "s",
+            "severity": "low",
+            "evidence": { "rationale": "r" },
+            "asset": {
+                "kind": "network_service",
+                "locator": [{"host": "10.0.0.1"}, {"port": {"number": 443, "proto": "tcp"}}],
+            },
+        });
+        let parsed: ReportFindingInput = serde_json::from_value(with_asset).unwrap();
+        let asset = parsed.asset.clone().expect("asset");
+        assert_eq!(asset.kind, "network_service");
+        assert!(asset.locator.has("host") && asset.locator.has("port"));
+        assert_eq!(asset.parent, None);
+        assert_eq!(asset.label, None);
+        let again: ReportFindingInput =
+            serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        assert_eq!(again.asset.unwrap().locator, asset.locator);
     }
 
     #[test]
@@ -435,6 +493,7 @@ mod tests {
                     references: vec![],
                 }),
                 report: None,
+                asset: None,
             },
             &summary_opts(),
         )
@@ -465,6 +524,7 @@ mod tests {
                     references: vec![],
                 }),
                 report: None,
+                asset: None,
             },
             &summary_opts(),
         )
@@ -523,6 +583,7 @@ mod tests {
             concern_id: None,
             evidence: None,
             report: Some(report),
+            asset: None,
         }
     }
 

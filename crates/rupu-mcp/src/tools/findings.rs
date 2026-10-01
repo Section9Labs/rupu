@@ -174,6 +174,7 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         concern_id: args.concern_id,
         evidence,
         report: args.report,
+        asset: None,
     };
     // Locator, profile and report validation live in `report_finding` so both
     // the agent builtin and this tool enforce the same rule. Two paths

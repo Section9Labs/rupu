@@ -268,6 +268,21 @@ pub struct FindingRecord {
     /// docs), which loads with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<crate::report::FindingReport>,
+    /// The asset (see [`crate::asset`]) this finding is about, as a
+    /// reference into the append-only asset store. `None` on every ledger
+    /// line that predates assets, and on findings that name no asset; a
+    /// `None` is not serialized, so those lines stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AssetRef>,
+}
+
+/// Reference from a finding to the asset it is about. Carries the `kind`
+/// alongside the id so a reader can group or filter findings by asset kind
+/// without folding the asset store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetRef {
+    pub id: String,
+    pub kind: String,
 }
 
 /// Deserialization shape of [`FindingRecord`]: identical except that
@@ -295,6 +310,8 @@ struct FindingRecordWire {
     profile: crate::report::FindingProfile,
     #[serde(default)]
     report: Option<serde_json::Value>,
+    #[serde(default)]
+    asset: Option<AssetRef>,
 }
 
 impl From<FindingRecordWire> for FindingRecord {
@@ -328,6 +345,7 @@ impl From<FindingRecordWire> for FindingRecord {
             declared_at: w.declared_at,
             profile: w.profile,
             report,
+            asset: w.asset,
         }
     }
 }
@@ -448,6 +466,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: crate::report::FindingProfile::Summary,
             report: None,
+            asset: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let decoded: FindingRecord = serde_json::from_str(&json).unwrap();
@@ -507,6 +526,32 @@ mod tests {
     }
 
     #[test]
+    fn finding_record_asset_is_optional_and_round_trips() {
+        // Legacy line: no `asset` -> None, and a record without one
+        // serializes without the key (byte-compatible with older readers).
+        let line = r#"{"id":"fnd_1","scope":"repo","summary":"s","severity":"high",
+            "evidence":{"rationale":"r"},
+            "declared_by":{"run_id":"run_1","model":"m","surface":"workflow"},
+            "declared_at":"2026-09-01T00:00:00Z"}"#;
+        let legacy: FindingRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(legacy.asset, None);
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("asset").is_none(), "None asset must not serialize");
+
+        // With an asset: it serializes and survives the wire round trip.
+        let mut rec = legacy.clone();
+        rec.asset = Some(AssetRef {
+            id: "ast_abc".into(),
+            kind: "web_endpoint".into(),
+        });
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["asset"]["id"], "ast_abc");
+        assert_eq!(v["asset"]["kind"], "web_endpoint");
+        let back: FindingRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    #[test]
     fn full_record_round_trips_with_its_report() {
         let fixture = include_str!("../../tests/fixtures/finding_report/valid_full.json");
         let report: crate::report::FindingReport = serde_json::from_str(fixture).unwrap();
@@ -528,6 +573,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: crate::report::FindingProfile::Full,
             report: Some(report),
+            asset: None,
         };
         let back: FindingRecord =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();

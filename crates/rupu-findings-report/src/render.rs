@@ -378,6 +378,7 @@ mod tests {
                     declared_at: ts(),
                     profile: FindingProfile::Summary,
                     report: None,
+                    asset: None,
                 },
             },
         }
