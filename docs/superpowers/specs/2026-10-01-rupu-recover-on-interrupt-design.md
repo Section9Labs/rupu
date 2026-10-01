@@ -126,11 +126,13 @@ The new attempt gets a fresh agent run id; its transcript links to the previous 
 through the `Seed` reference, so a unit interrupted several times forms a chain that
 replay follows.
 
-**`rupu run --continue <agent_run_id>`** exposes the primitive for standalone agent
-runs (and is what remote hosts execute, §5): it resolves `<transcripts>/<id>.jsonl`,
-takes the agent name from the transcript's `RunStart`, loads that agent's *current*
-definition, and runs `prepare_continuation`. `Finished` prints the recovered output
-without calling the model; `Failed` exits non-zero with the recorded error.
+**`rupu run <agent> --continue <agent_run_id>`** exposes the primitive for
+standalone agent runs (and is what remote hosts execute, §5): it resolves
+`<transcripts>/<id>.jsonl`, refuses when the transcript's `RunStart` names a
+different agent, builds the run from that agent's *current* definition, and runs
+`prepare_continuation`. `Finished` prints the recovered output without calling the
+model; `Failed` exits non-zero with the recorded error. `--continue` takes no
+prompt or target.
 
 ### 2. The attempts ledger (`rupu-orchestrator`)
 
@@ -205,7 +207,7 @@ the CP, the resume request records the choice on the run's resume marker (next t
 - A remote unit continues **on the host that ran it** (ledger `host`, or
   `unit_started.host` in the fallback), because that host holds the transcript.
 - `UnitDispatch` gains `continue_from: Option<String>` — the previous attempt's agent
-  run id on that host. Connectors launch `rupu run --run-id <new> --continue <old> …`.
+  run id on that host. Connectors launch `rupu run <agent> --run-id <new> --continue <old> …`.
   The coordinator still mints the new run id up front, so the mirror path is known
   before dispatch.
 - Hosts advertise a new **`agent.continue`** capability exactly like
