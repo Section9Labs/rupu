@@ -1677,19 +1677,18 @@ async fn handle_live_run_keypress(
         return;
     }
     match key.code {
-        KeyCode::Esc => {
+        KeyCode::Esc
             if crate::cmd::workflow::pause_with_store(store, run_id)
                 .await
-                .is_ok()
-            {
-                state.push_activity(
-                    Utc::now(),
-                    ActivityKind::Text,
-                    format!(
-                        "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
-                    ),
-                );
-            }
+                .is_ok() =>
+        {
+            state.push_activity(
+                Utc::now(),
+                ActivityKind::Text,
+                format!(
+                    "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
+                ),
+            );
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => state.select_next(),
         KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => state.select_prev(),
