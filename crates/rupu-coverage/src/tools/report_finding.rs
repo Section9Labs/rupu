@@ -1,8 +1,11 @@
+use crate::asset::{append_asset, read_asset_graph, Asset, AssetId, Coordinate, Locator};
 use crate::catalog::types::Severity;
 use crate::ledger::events::{
-    Attribution, FindingEvidence, FindingRecord, FindingScope, ScopeLocator,
+    AssetRef, Attribution, FindingEvidence, FindingRecord, FindingScope, ScopeLocator,
 };
 use crate::ledger::paths::CoveragePaths;
+use crate::profile::{unsatisfied, ActiveSet, EngagementProfile};
+use crate::report::FieldError;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -90,10 +93,21 @@ pub fn report_finding(
     use crate::report::{FindingProfile, ValidateCtx};
 
     validate_locator(&input)?;
+    // With engagement profiles active, route the finding to the profile that
+    // owns its asset kind. `None` is the native `code` path, byte-for-byte.
+    let engaged = opts
+        .engagement
+        .as_deref()
+        .map(|engagement| engage(engagement, &input));
     let (summary, severity, evidence, report) = match opts.profile {
         FindingProfile::Summary => {
             if input.report.is_some() {
                 return Err(ReportFindingError::ReportInSummaryMode);
+            }
+            if let Some(engaged) = engaged.as_ref().filter(|e| !e.problems.is_empty()) {
+                return Err(ReportFindingError::Report(
+                    crate::report::ReportValidationError(engaged.problems.clone()),
+                ));
             }
             (
                 input
@@ -138,6 +152,12 @@ pub fn report_finding(
                 )
             {
                 problems.extend(errors);
+            }
+            if let Some(engaged) = &engaged {
+                problems.extend(engaged.problems.iter().cloned());
+                if let Some(profile) = engaged.profile {
+                    problems.extend(profile_problems(profile, &report, &engaged.locator));
+                }
             }
             if !problems.is_empty() {
                 return Err(ReportFindingError::Report(
@@ -190,6 +210,21 @@ pub fn report_finding(
         }
     };
 
+    // Register the asset before the finding that references it, so a record
+    // never points at an asset the store lacks (an orphaned asset, should the
+    // finding write then fail, is harmless).
+    let asset_ref = match engaged.and_then(|e| e.asset) {
+        Some(EngagedAsset { asset, label_given }) => {
+            let asset_ref = AssetRef {
+                id: asset.id.0.clone(),
+                kind: asset.kind.clone(),
+            };
+            upsert_asset(paths, asset, label_given, &attribution)?;
+            Some(asset_ref)
+        }
+        None => None,
+    };
+
     let id = format!("fnd_{}", Ulid::new());
     let record = FindingRecord {
         id: id.clone(),
@@ -205,10 +240,7 @@ pub fn report_finding(
         declared_at: Utc::now(),
         profile: opts.profile,
         report,
-        // `input.asset` is accepted on the wire but not yet resolved into a
-        // ledger reference: registering it in the asset store and filling
-        // this in is the next task of the engagement-profiles wiring plan.
-        asset: None,
+        asset: asset_ref,
     };
     paths.ensure_dir()?;
     use std::io::Write;
@@ -225,6 +257,246 @@ pub fn report_finding(
     f.write_all(line.as_bytes())?;
     f.flush()?;
     Ok(ReportFindingOutput { id })
+}
+
+/// The kind a finding that names no `asset` is filed under: the legacy
+/// `scope`/`file_path` locators describe a file in the native `code` profile.
+const LEGACY_KIND: &str = "code:file";
+
+/// What `report_finding` resolved for a run with engagement profiles active.
+struct Engaged<'a> {
+    /// The ORIGIN profile that owns the finding's kind -- `None` when the
+    /// kind could not be routed (then `problems` says why, and no profile's
+    /// checks are run against a kind the agent will have to change anyway).
+    profile: Option<&'a EngagementProfile>,
+    /// What the completeness predicates see as the finding's locator.
+    locator: Locator,
+    /// The asset to register; `None` when the finding names none (a legacy
+    /// finding with no `file_path`, such as a `repo`-scope one).
+    asset: Option<EngagedAsset>,
+    /// Routing failures, as report problems so they list alongside the rest.
+    problems: Vec<FieldError>,
+}
+
+struct EngagedAsset {
+    asset: Asset,
+    /// Whether the agent named the label; a derived one never overwrites an
+    /// existing asset's.
+    label_given: bool,
+}
+
+/// Resolve the finding's asset kind and route it to the profile that owns it.
+///
+/// The kind is the explicit `asset.kind`, else `code:file` (the legacy
+/// `scope`/`file_path` shape). It must be owned by an active profile AND be
+/// one that profile declares: `ActiveSet::profile_for_kind` routes by
+/// namespace alone, so `binary:nope` would otherwise reach `binary`.
+fn engage<'a>(engagement: &'a ActiveSet, input: &ReportFindingInput) -> Engaged<'a> {
+    let (kind, locator, parent, label) = match &input.asset {
+        Some(a) => (
+            a.kind.clone(),
+            a.locator.clone(),
+            a.parent.clone(),
+            a.label.clone(),
+        ),
+        None => (
+            LEGACY_KIND.to_string(),
+            Locator(
+                input
+                    .file_path
+                    .iter()
+                    .map(|p| Coordinate::Path(p.clone()))
+                    .collect(),
+            ),
+            None,
+            None,
+        ),
+    };
+    let active = || engagement.ids().join(", ");
+    let mut problems = Vec::new();
+    let mut profile = None;
+    let mut kind_def = None;
+    match engagement.profile_for_kind(&kind) {
+        None => {
+            let how = if input.asset.is_some() {
+                format!("asset kind `{kind}` belongs to no active engagement profile")
+            } else {
+                format!(
+                    "this finding names no `asset`, so its scope maps to `{LEGACY_KIND}`, which belongs to no active engagement profile"
+                )
+            };
+            problems.push(FieldError {
+                path: "asset.kind".into(),
+                message: format!(
+                    "{how} (active: {}); name an `asset` whose kind one of them declares",
+                    active()
+                ),
+            });
+        }
+        Some(p) => match p.asset_kinds.iter().find(|k| k.id == kind) {
+            None => problems.push(FieldError {
+                path: "asset.kind".into(),
+                message: format!(
+                    "engagement profile `{}` does not declare asset kind `{kind}` (it declares: {})",
+                    p.id,
+                    p.asset_kinds
+                        .iter()
+                        .map(|k| k.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+            Some(def) => {
+                profile = Some(p);
+                kind_def = Some(def);
+            }
+        },
+    }
+
+    // Only a routed kind becomes an asset; a legacy finding with no file has
+    // nothing to register.
+    let named = input.asset.is_some() || input.file_path.is_some();
+    let asset = (named && profile.is_some()).then(|| {
+        let label_given = label.is_some();
+        let label = label.unwrap_or_else(|| {
+            kind_def
+                .and_then(|d| locator.render_label(&d.label))
+                .unwrap_or_else(|| {
+                    let described = locator.describe();
+                    if described.is_empty() {
+                        kind.clone()
+                    } else {
+                        described
+                    }
+                })
+        });
+        let mut asset = Asset::new(kind.clone(), locator.clone(), label);
+        asset.parent = parent.map(AssetId);
+        EngagedAsset { asset, label_given }
+    });
+    Engaged {
+        profile,
+        locator,
+        asset,
+        problems,
+    }
+}
+
+/// What the owning profile requires of a full report beyond the universal
+/// validation: its completeness checks, the evidence block kinds it permits,
+/// and the classification systems it recognises. Every problem is returned
+/// (not just the first) so the agent fixes them all in one retry.
+fn profile_problems(
+    profile: &EngagementProfile,
+    report: &crate::report::FindingReport,
+    locator: &Locator,
+) -> Vec<FieldError> {
+    let mut problems = Vec::new();
+    match unsatisfied(&profile.completeness, report, locator) {
+        Ok(missing) => {
+            for id in missing {
+                let label = profile
+                    .completeness
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map_or("", |c| c.label.as_str());
+                problems.push(FieldError {
+                    path: "report".into(),
+                    message: format!(
+                        "engagement profile `{}` requires `{id}` ({label}), and this report does not satisfy it",
+                        profile.id
+                    ),
+                });
+            }
+        }
+        // A profile whose own predicate is malformed cannot be enforced:
+        // fail closed rather than let everything through.
+        Err(e) => problems.push(FieldError {
+            path: "report".into(),
+            message: format!(
+                "engagement profile `{}` has an invalid completeness check: {e}",
+                profile.id
+            ),
+        }),
+    }
+
+    for (i, claim) in report.evidence.iter().enumerate() {
+        for (j, block) in claim.blocks.iter().enumerate() {
+            let kind = block.kind();
+            if !profile.evidence_blocks.iter().any(|b| b == kind) {
+                problems.push(FieldError {
+                    path: format!("report.evidence[{i}].blocks[{j}]"),
+                    message: format!(
+                        "evidence block `{kind}` is not permitted by engagement profile `{}` (permitted: {})",
+                        profile.id,
+                        profile.evidence_blocks.join(", ")
+                    ),
+                });
+            }
+        }
+    }
+
+    // The systems the agent named: explicit classifications, plus CWE when
+    // `cwe` lists any. The rating's CVSS vector is how every finding is
+    // scored, not a weakness taxonomy a profile has to list.
+    let mut systems: Vec<&str> = report
+        .classifications
+        .iter()
+        .map(|c| c.system.as_str())
+        .collect();
+    if !report.cwe.is_empty() {
+        systems.push("CWE");
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for system in systems {
+        let permitted = profile
+            .classification_systems
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(system));
+        if !permitted && !seen.iter().any(|s| s.eq_ignore_ascii_case(system)) {
+            seen.push(system.to_string());
+            problems.push(FieldError {
+                path: "report.classifications".into(),
+                message: format!(
+                    "classification system `{system}` is not recognised by engagement profile `{}` (recognised: {})",
+                    profile.id,
+                    profile.classification_systems.join(", ")
+                ),
+            });
+        }
+    }
+    problems
+}
+
+/// Register `asset` in the append-only asset store.
+///
+/// The store folds last-write-wins on the WHOLE record, so a bare
+/// `Asset::new` would erase what an earlier pass recorded (a coverage `depth`,
+/// attributes, an agent-given label). The new record is therefore merged over
+/// the existing one first, and nothing is appended when that changes nothing,
+/// so a hundred findings on one function leave one line, not a hundred.
+fn upsert_asset(
+    paths: &CoveragePaths,
+    mut asset: Asset,
+    label_given: bool,
+    attribution: &Attribution,
+) -> std::io::Result<()> {
+    let graph = read_asset_graph(paths);
+    let existing = graph.get(&asset.id);
+    if let Some(old) = existing {
+        if !label_given {
+            asset.label = old.label.clone();
+        }
+        if asset.parent.is_none() {
+            asset.parent = old.parent.clone();
+        }
+        asset.depth = old.depth.clone();
+        asset.attributes = old.attributes.clone();
+    }
+    if existing == Some(&asset) {
+        return Ok(());
+    }
+    append_asset(paths, &asset, attribution)
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
@@ -360,7 +632,10 @@ mod tests {
         });
         let parsed: ReportFindingInput = serde_json::from_value(bare).unwrap();
         assert!(parsed.asset.is_none());
-        assert!(serde_json::to_value(&parsed).unwrap().get("asset").is_none());
+        assert!(serde_json::to_value(&parsed)
+            .unwrap()
+            .get("asset")
+            .is_none());
 
         // Present: `parent` and `label` default; the locator is a coordinate list.
         let with_asset = serde_json::json!({
@@ -903,6 +1178,346 @@ mod tests {
             matches!(err, ReportFindingError::MissingField("severity")),
             "{err}"
         );
+    }
+
+    // --- engagement profiles: routing + completeness gate + asset upsert ---
+
+    fn engaged_opts(store: &std::path::Path, ids: &[&str]) -> crate::report::FindingWriteOptions {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        let set = crate::profile::builtin_registry()
+            .unwrap()
+            .active_set(&ids)
+            .unwrap();
+        full_opts(store).with_engagement(Some(std::sync::Arc::new(set)))
+    }
+
+    fn disasm() -> crate::report::EvidenceBlock {
+        crate::report::EvidenceBlock::Disasm {
+            arch: "x86_64".into(),
+            listing: vec![crate::report::DisasmLine {
+                addr: "0x401000".into(),
+                text: "push rbp".into(),
+            }],
+        }
+    }
+
+    fn function_asset(kind: &str) -> AssetInput {
+        use crate::asset::Coordinate;
+        AssetInput {
+            kind: kind.into(),
+            locator: crate::asset::Locator(vec![
+                Coordinate::Sha256("ab".repeat(32)),
+                Coordinate::Address(0x401000),
+                Coordinate::Symbol("main".into()),
+            ]),
+            parent: None,
+            label: None,
+        }
+    }
+
+    fn binary_input(with_listing: bool, kind: &str) -> ReportFindingInput {
+        let mut r = fixture_report();
+        r.evidence[0].blocks = if with_listing { vec![disasm()] } else { vec![] };
+        let mut i = full_input(r);
+        i.asset = Some(function_asset(kind));
+        i
+    }
+
+    #[test]
+    fn a_binary_finding_with_a_listing_passes_and_registers_its_asset() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        report_finding(
+            &paths,
+            attribution(),
+            binary_input(true, "binary:function"),
+            &opts,
+        )
+        .expect("a binary finding with a disasm block satisfies the profile");
+
+        // The asset line was appended, with the full record.
+        let graph = crate::asset::read_asset_graph(&paths);
+        let assets: Vec<_> = graph.iter().collect();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, "binary:function");
+        assert_eq!(assets[0].label, format!("main @ 0x401000"));
+        assert_eq!(
+            std::fs::read_to_string(&paths.assets)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // The record references it, kind alongside the id.
+        let rec = only_record(&paths);
+        let r = rec.asset.expect("record.asset stamped");
+        assert_eq!(r.id, assets[0].id.0);
+        assert_eq!(r.kind, "binary:function");
+    }
+
+    #[test]
+    fn a_binary_finding_without_a_listing_is_rejected_by_its_completeness_check() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        let err = report_finding(
+            &paths,
+            attribution(),
+            binary_input(false, "binary:function"),
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("evidence_has_listing"), "{err}");
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+        assert!(!paths.assets.exists(), "no asset registered on rejection");
+    }
+
+    #[test]
+    fn completeness_problems_are_listed_with_the_other_report_problems() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        let mut i = binary_input(false, "binary:function");
+        i.report.as_mut().unwrap().cwe.clear();
+        i.report.as_mut().unwrap().classifications.clear();
+        i.report.as_mut().unwrap().root_cause = String::new();
+        let err = report_finding(&paths, attribution(), i, &opts)
+            .unwrap_err()
+            .to_string();
+        // One error, everything in it: the validator's own problem plus
+        // each unmet profile check.
+        assert!(err.contains("report.root_cause"), "{err}");
+        assert!(err.contains("evidence_has_listing"), "{err}");
+        assert!(err.contains("has_root_cause"), "{err}");
+        assert!(err.contains("classified"), "{err}");
+    }
+
+    #[test]
+    fn a_kind_outside_the_active_set_is_rejected_naming_the_active_profiles() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        let err = report_finding(
+            &paths,
+            attribution(),
+            binary_input(true, "web:route"),
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("web:route"), "{err}");
+        assert!(err.contains("binary"), "names the active profiles: {err}");
+        assert!(!paths.findings.exists());
+        assert!(!paths.assets.exists());
+    }
+
+    #[test]
+    fn a_kind_its_owner_does_not_declare_is_rejected() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        // `binary` is active, but declares no `nope` kind: routing by
+        // namespace alone would let this through.
+        let err = report_finding(
+            &paths,
+            attribution(),
+            binary_input(true, "binary:nope"),
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("binary:nope"), "{err}");
+        assert!(err.contains("does not declare"), "{err}");
+        assert!(!paths.findings.exists());
+        assert!(!paths.assets.exists());
+    }
+
+    #[test]
+    fn a_finding_with_no_asset_maps_its_file_to_code_file() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["code", "binary"]);
+        let mut r = fixture_report();
+        r.classifications.clear(); // `code` permits CWE only
+        let mut i = full_input(r);
+        i.scope = FindingScope::File;
+        i.file_path = Some("src/routes/notes.rs".into());
+        report_finding(&paths, attribution(), i, &opts).expect("code:file, empty completeness");
+
+        let rec = only_record(&paths);
+        let r = rec
+            .asset
+            .expect("the legacy file is registered as an asset");
+        assert_eq!(r.kind, "code:file");
+        let graph = crate::asset::read_asset_graph(&paths);
+        let a = graph.iter().next().unwrap();
+        assert_eq!(a.id.0, r.id);
+        assert_eq!(a.label, "src/routes/notes.rs");
+        assert_eq!(
+            a.locator,
+            crate::asset::Locator(vec![crate::asset::Coordinate::Path(
+                "src/routes/notes.rs".into()
+            )])
+        );
+    }
+
+    #[test]
+    fn a_repo_scope_finding_with_no_asset_routes_to_code_but_names_no_asset() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["code", "binary"]);
+        let mut r = fixture_report();
+        r.classifications.clear();
+        report_finding(&paths, attribution(), full_input(r), &opts).expect("passes");
+        assert!(only_record(&paths).asset.is_none());
+        assert!(!paths.assets.exists(), "no file, so no asset to register");
+    }
+
+    #[test]
+    fn a_legacy_finding_is_rejected_when_code_is_not_active() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        let err = report_finding(&paths, attribution(), full_input(fixture_report()), &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code:file"), "{err}");
+        assert!(err.contains("binary"), "{err}");
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn evidence_blocks_and_classification_systems_are_held_to_the_owner_profile() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["code"]);
+        // `code` permits text/code_slice/diff and CWE: a disasm block and the
+        // fixture's CVE classification are both outside it.
+        let mut r = fixture_report();
+        r.evidence[0].blocks = vec![disasm()];
+        let mut i = full_input(r);
+        i.scope = FindingScope::File;
+        i.file_path = Some("src/a.rs".into());
+        let err = report_finding(&paths, attribution(), i, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.evidence[0].blocks[0]"), "{err}");
+        assert!(err.contains("`disasm`"), "{err}");
+        assert!(err.contains("CVE"), "{err}");
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn a_cvss_rating_is_not_a_classification_system() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+        let mut i = binary_input(true, "binary:function");
+        i.report.as_mut().unwrap().rating.cvss_v3 =
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".into();
+        report_finding(&paths, attribution(), i, &opts)
+            .expect("the rating's CVSS vector is not a taxonomy the profile must list");
+    }
+
+    #[test]
+    fn engagement_none_applies_no_profile_gates() {
+        // The native path: a disasm block, a CVE classification and a stray
+        // asset are all untouched -- no routing, no completeness, no asset.
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut i = binary_input(true, "web:route");
+        i.report.as_mut().unwrap().root_cause = "x".into();
+        report_finding(&paths, attribution(), i, &full_opts(store.path())).expect("today's path");
+        assert!(only_record(&paths).asset.is_none());
+        assert!(!paths.assets.exists());
+    }
+
+    #[test]
+    fn summary_profile_findings_are_routed_and_register_their_asset_too() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"])
+            .with_profile(crate::report::FindingProfile::Summary);
+
+        let mut bad = input(FindingScope::Repo);
+        bad.asset = Some(function_asset("web:route"));
+        let err = report_finding(&paths, attribution(), bad, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("web:route"), "{err}");
+        assert!(!paths.findings.exists());
+
+        let mut good = input(FindingScope::Repo);
+        good.asset = Some(function_asset("binary:function"));
+        report_finding(&paths, attribution(), good, &opts).expect("summary + asset");
+        assert_eq!(
+            only_record(&paths).asset.map(|a| a.kind).as_deref(),
+            Some("binary:function")
+        );
+        assert_eq!(crate::asset::read_asset_graph(&paths).iter().count(), 1);
+    }
+
+    #[test]
+    fn re_reporting_an_asset_keeps_its_depth_and_does_not_re_append_an_unchanged_record() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = engaged_opts(store.path(), &["binary"]);
+
+        // The asset already exists, marked analyzed by an earlier pass.
+        let wire = function_asset("binary:function");
+        let mut existing =
+            crate::asset::Asset::new(wire.kind.clone(), wire.locator.clone(), "main @ 0x401000");
+        existing.depth = Some("analyzed".into());
+        crate::asset::append_asset(&paths, &existing, &attribution()).unwrap();
+
+        // A finding on the same asset must not clobber the depth (the store
+        // is last-write-wins on the whole record) ...
+        report_finding(
+            &paths,
+            attribution(),
+            binary_input(true, "binary:function"),
+            &opts,
+        )
+        .unwrap();
+        let graph = crate::asset::read_asset_graph(&paths);
+        assert_eq!(graph.iter().count(), 1);
+        assert_eq!(
+            graph.get(&existing.id).unwrap().depth.as_deref(),
+            Some("analyzed")
+        );
+        // ... and, being unchanged, adds no line.
+        assert_eq!(
+            std::fs::read_to_string(&paths.assets)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // A new label does update the record (full record, merged).
+        let mut relabeled = binary_input(true, "binary:function");
+        relabeled.asset.as_mut().unwrap().label = Some("entry".into());
+        report_finding(&paths, attribution(), relabeled, &opts).unwrap();
+        let graph = crate::asset::read_asset_graph(&paths);
+        let a = graph.get(&existing.id).unwrap();
+        assert_eq!(a.label, "entry");
+        assert_eq!(a.depth.as_deref(), Some("analyzed"));
     }
 
     #[test]

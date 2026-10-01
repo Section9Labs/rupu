@@ -15,5 +15,5 @@ pub use coverage_mark::{coverage_mark, CoverageMarkError, CoverageMarkInput, Cov
 pub use coverage_remaining::{coverage_remaining, CoverageRemainingInput, RemainingItem};
 pub use coverage_status::{coverage_status, CoverageStatusInput};
 pub use report_finding::{
-    report_finding, ReportFindingError, ReportFindingInput, ReportFindingOutput,
+    report_finding, AssetInput, ReportFindingError, ReportFindingInput, ReportFindingOutput,
 };

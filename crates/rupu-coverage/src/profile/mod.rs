@@ -8,7 +8,7 @@ pub use loader::{discover, expand_includes, include_closure, LoadError};
 pub use package::{
     parse_profile, AssetKindDef, Bundle, CoverageSpec, EngagementProfile, ProfileError,
 };
-pub use predicate::{score, CompletenessCheck, Predicate, PredicateError};
+pub use predicate::{score, unsatisfied, CompletenessCheck, Predicate, PredicateError};
 pub use registry::{ActiveSet, ProfileRegistry, RegistryError};
 
 pub const DEFAULT_PROFILE: &str = "code";

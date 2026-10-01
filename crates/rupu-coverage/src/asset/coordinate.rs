@@ -70,6 +70,30 @@ impl Coordinate {
                 | "resource_id"
         )
     }
+
+    /// The coordinate's value as it reads in a label (addresses in hex).
+    pub fn display_value(&self) -> String {
+        match self {
+            Coordinate::Path(v)
+            | Coordinate::Symbol(v)
+            | Coordinate::Commit(v)
+            | Coordinate::Sha256(v)
+            | Coordinate::Host(v)
+            | Coordinate::Url(v)
+            | Coordinate::Param(v) => v.clone(),
+            Coordinate::LineRange { start, end } => format!("{start}-{end}"),
+            Coordinate::Offset(n) | Coordinate::Address(n) => format!("0x{n:x}"),
+            Coordinate::Port { number, proto } => format!(
+                "{number}/{}",
+                match proto {
+                    Proto::Tcp => "tcp",
+                    Proto::Udp => "udp",
+                }
+            ),
+            Coordinate::HttpRoute { method, path } => format!("{method} {path}"),
+            Coordinate::ResourceId { scheme, id } => format!("{scheme}:{id}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +102,39 @@ pub struct Locator(pub Vec<Coordinate>);
 impl Locator {
     pub fn has(&self, tag: &str) -> bool {
         self.0.iter().any(|c| c.tag() == tag)
+    }
+
+    /// Fill a profile kind's label template (`"{symbol} @ {address}"`): each
+    /// `{tag}` becomes the value of this locator's coordinate with that tag.
+    /// `None` when the template names a coordinate the locator lacks, so the
+    /// caller can fall back rather than show a half-rendered label.
+    pub fn render_label(&self, template: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('}') else {
+                // An unclosed brace is literal text.
+                out.push_str(&rest[open..]);
+                return Some(out);
+            };
+            let tag = &after[..close];
+            out.push_str(&self.0.iter().find(|c| c.tag() == tag)?.display_value());
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
+    /// Every coordinate's value, space-separated: the label of last resort
+    /// when a kind's template cannot be filled.
+    pub fn describe(&self) -> String {
+        self.0
+            .iter()
+            .map(Coordinate::display_value)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -98,6 +155,26 @@ mod tests {
         assert_eq!(Coordinate::Address(0x401000).tag(), "address");
         let j = serde_json::to_string(&loc).unwrap();
         assert_eq!(serde_json::from_str::<Locator>(&j).unwrap(), loc);
+    }
+
+    #[test]
+    fn render_label_fills_tags_and_declines_a_missing_one() {
+        let loc = Locator(vec![
+            Coordinate::Address(0x401000),
+            Coordinate::Symbol("main".into()),
+        ]);
+        assert_eq!(
+            loc.render_label("{symbol} @ {address}").as_deref(),
+            Some("main @ 0x401000")
+        );
+        assert_eq!(loc.render_label("plain").as_deref(), Some("plain"));
+        assert_eq!(
+            loc.render_label("{symbol} {oops").as_deref(),
+            Some("main {oops")
+        );
+        assert_eq!(loc.render_label("{path}"), None, "no such coordinate");
+        assert_eq!(loc.describe(), "0x401000 main");
+        assert_eq!(Locator(vec![]).describe(), "");
     }
 
     /// One value per `Coordinate` variant. If you add a variant, add it here —

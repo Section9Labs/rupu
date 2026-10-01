@@ -24,7 +24,7 @@ pub use tools::{
     coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
     coverage_status, report_finding, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
     CoverageConcernsSearchInput, CoverageMarkError, CoverageMarkInput, CoverageMarkOutput,
-    CoverageRemainingInput, CoverageStatusInput, RemainingItem, ReportFindingError,
+    AssetInput, CoverageRemainingInput, CoverageStatusInput, RemainingItem, ReportFindingError,
     ReportFindingInput, ReportFindingOutput, SearchResult, SearchResultForm, SearchResultSummary,
 };
 
@@ -45,8 +45,8 @@ pub use ledger::{
     append_manifest, discover_targets, file_views, find_manifest, read_concern_assertions,
     read_file_events, read_findings, read_manifests, target_id, AssertionStatus, Attribution,
     ConcernAssertion, CoveragePaths, CoverageWriter, CoverageWriterHandle, DiscoveredTarget,
-    Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope, RunManifest,
-    Surface,
+    AssetRef, Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope,
+    RunManifest, Surface,
 };
 pub use report::{FindingProfile, FindingReport, FindingWriteOptions};
 pub use rerun::{plan_rerun, RerunError, RerunInvocation};

@@ -115,6 +115,22 @@ pub fn score(
     Ok((ok, total))
 }
 
+/// The ids of the REQUIRED checks `r` does not satisfy, in profile order.
+/// Optional checks never block a finding, so they are never listed.
+pub fn unsatisfied(
+    checks: &[CompletenessCheck],
+    r: &FindingReport,
+    loc: &Locator,
+) -> Result<Vec<String>, PredicateError> {
+    let mut missing = Vec::new();
+    for c in checks.iter().filter(|c| c.required) {
+        if !evaluate(&c.satisfied_when, r, loc)? {
+            missing.push(c.id.clone());
+        }
+    }
+    Ok(missing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +202,28 @@ mod tests {
             },
         ];
         assert_eq!(score(&checks, &r, &loc).unwrap(), (1, 2));
+        assert_eq!(unsatisfied(&checks, &r, &loc).unwrap(), vec!["http"]);
+    }
+
+    #[test]
+    fn unsatisfied_lists_only_required_checks_and_propagates_predicate_errors() {
+        let r = build_report();
+        let loc = Locator(vec![]);
+        let check = |id: &str, required: bool, p: Predicate| CompletenessCheck {
+            id: id.into(),
+            label: id.into(),
+            required,
+            satisfied_when: p,
+        };
+        let checks = vec![
+            check("a", true, Predicate::HasBlockKind("disasm".into())),
+            check("b", false, Predicate::HasBlockKind("disasm".into())),
+            check("c", true, Predicate::HasField("root_cause".into())),
+        ];
+        assert_eq!(unsatisfied(&checks, &r, &loc).unwrap(), vec!["a"]);
+        assert!(unsatisfied(&[], &r, &loc).unwrap().is_empty());
+        let bad = vec![check("x", true, Predicate::HasField("nope".into()))];
+        assert!(unsatisfied(&bad, &r, &loc).is_err());
     }
 
     #[test]

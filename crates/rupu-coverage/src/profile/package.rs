@@ -96,6 +96,18 @@ mod tests {
     }
 
     #[test]
+    fn the_builtin_binary_profile_permits_its_blocks_and_systems() {
+        // Top-level keys written after a `[[asset_kinds]]` header would be
+        // swallowed by that table and silently dropped: pin that they landed.
+        let p = parse_profile(BINARY).unwrap();
+        assert_eq!(
+            p.evidence_blocks,
+            ["text", "code_slice", "diff", "hexdump", "disasm"]
+        );
+        assert_eq!(p.classification_systems, ["CWE", "CVE"]);
+    }
+
+    #[test]
     fn unknown_coordinate_is_rejected() {
         let bad = r#"
 id = "x"

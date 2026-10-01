@@ -1,5 +1,10 @@
 id = "binary"
 name = "Binary reverse engineering"
+# Top-level keys must precede the first table header: after a `[[asset_kinds]]`
+# they would belong to that kind (and be silently ignored), leaving the profile
+# with no permitted evidence blocks or classification systems.
+evidence_blocks = ["text", "code_slice", "diff", "hexdump", "disasm"]
+classification_systems = ["CWE", "CVE"]
 
 [[asset_kinds]]
 id = "binary"
@@ -11,9 +16,6 @@ id = "function"
 parent = "binary"
 coordinates = ["sha256", "address", "symbol"]
 label = "{symbol} @ {address}"
-
-evidence_blocks = ["text", "code_slice", "diff", "hexdump", "disasm"]
-classification_systems = ["CWE", "CVE"]
 
 [[completeness]]
 id = "evidence_has_listing"

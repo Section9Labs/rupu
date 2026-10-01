@@ -7,8 +7,8 @@ pub mod views;
 pub mod writer;
 pub use discover::{discover_targets, DiscoveredTarget};
 pub use events::{
-    AssertionStatus, Attribution, ConcernAssertion, Evidence, FileTouchEvent, FindingEvidence,
-    FindingRecord, FindingScope, Surface,
+    AssertionStatus, AssetRef, Attribution, ConcernAssertion, Evidence, FileTouchEvent,
+    FindingEvidence, FindingRecord, FindingScope, Surface,
 };
 pub use manifest::{append_manifest, find_manifest, read_manifests, RunManifest};
 pub use paths::CoveragePaths;
