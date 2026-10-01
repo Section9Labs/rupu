@@ -138,8 +138,13 @@ fn sigterm_with_nothing_pending_kills_by_the_signal() {
 /// — also when the command had already returned and `main` was the one
 /// waiting for the write: `main` hands off to the signal path instead of
 /// exiting with the command's code.
+///
+/// The `RUPU_TEST_HOLD_CREDENTIAL_WRITE_MS` seam exists in debug builds
+/// only (`cargo test` builds the binary in debug); a release binary ignores
+/// it, so the test is skipped there.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(debug_assertions), ignore)]
 fn sigterm_with_a_pending_write_still_kills_by_the_signal() {
     use std::os::unix::process::ExitStatusExt;
     let home = tempfile::tempdir().unwrap();

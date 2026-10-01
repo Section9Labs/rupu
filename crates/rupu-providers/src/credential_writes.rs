@@ -13,7 +13,7 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -114,13 +114,27 @@ pub fn wait_blocking(timeout: Duration) -> bool {
 }
 
 /// Set once SIGTERM has arrived and the process is on its way out (the
-/// handler holds the exit only for credential writes still draining).
-static TERMINATING: AtomicBool = AtomicBool::new(false);
+/// handler holds the exit only for credential writes still draining). An
+/// `Arc` so the signal handler itself can set it (`signal_hook::flag`),
+/// async-signal-safely, the instant the signal is delivered.
+fn terminating_slot() -> &'static Arc<AtomicBool> {
+    static TERMINATING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    TERMINATING.get_or_init(Default::default)
+}
 
-/// Mark the process as terminating. Called by the SIGTERM handler before it
-/// waits for pending writes; never cleared.
+/// The flag [`terminating`] reads, for registering with the signal
+/// handler: set to `true` inside the handler on delivery, so a check that
+/// runs after the signal was delivered sees it even before the handler
+/// thread has woken.
+pub fn terminating_flag() -> Arc<AtomicBool> {
+    terminating_slot().clone()
+}
+
+/// Mark the process as terminating. Called by the SIGTERM handler thread
+/// before it waits for pending writes (the signal handler itself already
+/// set the flag on delivery); never cleared.
 pub fn request_termination() {
-    TERMINATING.store(true, Ordering::SeqCst);
+    terminating_slot().store(true, Ordering::SeqCst);
 }
 
 /// Whether SIGTERM has arrived. Every runner checks this before starting an
@@ -129,7 +143,7 @@ pub fn request_termination() {
 /// pending credential writes are done, and nothing started now would
 /// finish.
 pub fn terminating() -> bool {
-    TERMINATING.load(Ordering::SeqCst)
+    terminating_slot().load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
