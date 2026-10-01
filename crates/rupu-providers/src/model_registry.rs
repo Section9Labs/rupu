@@ -1,7 +1,8 @@
 //! Model resolution aggregator. Sources, in order:
 //! 1. Custom (~/.rupu/config.toml [[providers.X.models]])
 //! 2. Live cache (~/.rupu/cache/models/<provider>.json, TTL 1h)
-//! 3. Baked-in fallback (Copilot only)
+//! 3. Baked-in id fallback (Copilot, and Gemini's Code Assist path, which has no
+//!    listing). Ids only: it never supplies a limit.
 //!
 //! Spec §6a-c.
 
