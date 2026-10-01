@@ -56,7 +56,9 @@ tokens expire two hours after issue: every GitLab connector refreshes its token
 through the credential store before a request when it is within five minutes of
 expiry, so a long-lived `rupu cp serve` / `rupu mcp serve` / session keeps working,
 and the rotated token is persisted (under `auth.json.lock`) for every other process.
-GitHub SSO tokens don't expire.
+A request GitLab refuses (401) is retried once with the token now in the store, so a
+`rupu auth login` reaches processes that are already running. GitHub SSO tokens don't
+expire.
 
 Linear and Jira currently use API-key mode only:
 
