@@ -1,0 +1,13 @@
+---
+source: crates/rupu-app-canvas/tests/it/git_graph_snapshots.rs
+expression: rows
+---
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: hello
+    - Space: 2
+    - Meta: greeter
+  anchor:
+    - hello
+    - waiting

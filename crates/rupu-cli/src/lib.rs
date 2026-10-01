@@ -499,7 +499,7 @@ fn ensure_output_format_supported(
 /// `rupu workflow pause|resume <id>` parse to the expected typed
 /// variants. These are pure clap-derive + `cmd::run::classify` checks —
 /// no I/O, no run-store — so they stay fast and independent of the
-/// heavier end-to-end tests in `tests/cli_run.rs` / `tests/cli_workflow.rs`.
+/// heavier end-to-end tests in `tests/serial/cli_run.rs` / `tests/serial/cli_workflow.rs`.
 ///
 /// The `run_*` tests here cover the T7 regression directly: `Cmd::Run`
 /// captures raw argv (not a clap subcommand — see `cmd::run`'s module

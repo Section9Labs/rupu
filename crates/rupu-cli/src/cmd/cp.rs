@@ -2232,7 +2232,7 @@ mod tests {
     // the REAL `build_reject_cleanup_opts`/`run_reject_cleanup` path (not
     // a test-double factory) via the `RUPU_MOCK_PROVIDER_SCRIPT` seam
     // (`crates/rupu-runtime/src/provider_factory.rs`), mirroring
-    // `crates/rupu-cli/tests/workflow_runs_no_side_effects.rs`'s fixture
+    // `crates/rupu-cli/tests/serial/workflow_runs_no_side_effects.rs`'s fixture
     // shape: a real `write_file` tool call is the only reliable proof the
     // chain genuinely executed, as opposed to merely flipping a flag.
 

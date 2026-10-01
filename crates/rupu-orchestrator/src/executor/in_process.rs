@@ -409,7 +409,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Minimal `StepFactory` test double — mirrors the `FakeFactory` used
-    /// by `tests/executor_in_process.rs`, kept local here so this
+    /// by `tests/it/executor_in_process.rs`, kept local here so this
     /// module-internal unit test can reach `InProcessExecutor`'s private
     /// `runs` map and `RunState`'s private `cancel`/`pause` tokens
     /// directly (an external integration test cannot).

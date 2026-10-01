@@ -9047,7 +9047,7 @@ mod tests {
 
     /// Build the minimal `OrchestratorRunOpts` for a distributed fan-out
     /// test.  Mirrors the pattern used by the integration tests in
-    /// `tests/linear_runner.rs` but keeps `run_store: None` (no disk
+    /// `tests/it/linear_runner.rs` but keeps `run_store: None` (no disk
     /// persistence) and injects a `UnitDispatcher`.
     fn make_opts(
         wf: Workflow,
@@ -11456,7 +11456,7 @@ mod dag_scheduler_golden {
 
     /// Echoes `step {id} agent {agent} echo: {prompt}` for every agent
     /// dispatch, across every sample workflow — deterministic and
-    /// content-agnostic (mirrors `FakeFactory` in `tests/linear_runner.rs`).
+    /// content-agnostic (mirrors `FakeFactory` in `tests/it/linear_runner.rs`).
     /// A panel step's panelist output under this factory is plain prose,
     /// not `{"findings": [...]}` JSON — but `parse_findings` treats
     /// unparseable text as zero findings rather than an error (see that
@@ -11741,7 +11741,7 @@ mod dag_scheduler_golden {
             // real benchmark script — slow, environment-dependent, and
             // irrelevant to step ORDERING, which is all this compares.
             // `run:` dispatch has its own coverage in
-            // tests/run_step_workflow.rs.
+            // tests/it/run_step_workflow.rs.
             if Workflow::parse(&raw)
                 .map(|wf| wf.steps.iter().any(|st| st.run.is_some()))
                 .unwrap_or(false)
@@ -15794,7 +15794,7 @@ steps:
     /// ever dispatched — a clean, deterministic instance of "ONE approval
     /// gate parks" (spec §7's simplest case; T5b's full concurrent
     /// awaiting-set is NOT exercised here — see this task's report for the
-    /// boundary). Approve-resume (mirroring `tests/gate_node.rs`'s
+    /// boundary). Approve-resume (mirroring `tests/it/gate_node.rs`'s
     /// pattern) then completes the run, dispatching both fork targets.
     const NONLINEAR_GATE_WF: &str = r#"
 name: nonlinear-gate
@@ -15839,7 +15839,7 @@ steps:
             calls1.lock().unwrap()
         );
 
-        // --- Phase 2: approve + resume — mirrors `tests/gate_node.rs`'s
+        // --- Phase 2: approve + resume — mirrors `tests/it/gate_node.rs`'s
         // approve-resume pattern, adapted for the in-memory (no run_store)
         // shape this module's `opts_for` uses. ---
         let factory2 = JoinTestFactory::new(&[]);
@@ -16920,7 +16920,7 @@ steps:
     /// inside its own dispatch (which would race `dispatch_one`'s
     /// `agent_opts.pause` wiring for a LOCAL unit and risk flagging unit 0
     /// itself as paused-mid-turn instead of completed). Lifted from
-    /// `tests/pause_resume_e2e.rs`'s `CancelFirstUnitDispatcher` — the
+    /// `tests/it/pause_resume_e2e.rs`'s `CancelFirstUnitDispatcher` — the
     /// proven-correct way to land a mid-fan-out pause deterministically.
     struct CancelFirstUnitDispatcher {
         token: CancellationToken,

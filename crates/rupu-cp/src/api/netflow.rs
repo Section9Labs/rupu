@@ -236,7 +236,7 @@ pub struct IncompleteSource {
 /// [`run_scoped_flows_and_dropped`]), so attribution comes from which file
 /// a flow landed in, not from this field — see the module doc. Kept as a
 /// pure, still-exported function because
-/// `crates/rupu-cp/tests/netflow_api.rs`'s `run_scope_filters_to_that_run_only`
+/// `crates/rupu-cp/tests/it/netflow_api.rs`'s `run_scope_filters_to_that_run_only`
 /// exercises it directly against a hand-mixed fixture; there is no other
 /// caller.
 pub fn filter_by_run(flows: &[FlowRecord], run_id: &str) -> Vec<FlowRecord> {

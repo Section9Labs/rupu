@@ -40,7 +40,7 @@ impl GitlabRepoConnector {
 }
 
 /// Pure translation function — fixture-tested in
-/// `crates/rupu-scm/tests/gitlab_translation.rs`.
+/// `crates/rupu-scm/tests/it/gitlab_translation.rs`.
 ///
 /// Handles GitLab's nested-namespace quirk:
 /// `group/subgroup/project` → owner=`group/subgroup`, repo=`project`.

@@ -115,7 +115,7 @@ mod tests {
         // path) that regressed to building one sink before its turn/
         // request loop would still pass THIS test, since it never touches
         // `run_turn` at all.
-        // `crates/rupu-cli/tests/netflow_run.rs`'s
+        // `crates/rupu-cli/tests/serial/netflow_run.rs`'s
         // `two_sequential_rupu_run_invocations_in_one_process_get_separate_ledgers`
         // is the one that drives a real entry point (`rupu_cli::run`)
         // twice in one process and is the actual regression guard for
