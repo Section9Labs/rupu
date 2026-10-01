@@ -1,0 +1,8 @@
+---
+source: crates/rupu-cli/src/output/live_view/layout.rs
+expression: s
+---
+▸ ◐ hunt · for_each · 86 units · failed
+    ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26
+  ▸ ┣━ ✗ otter#8 · svc-7 · anthropic/claude-opus-5-5 ···· ✗ failed
+    ┗━ ✗ otter#32 · svc-31 · anthropic/claude-opus-5-5 ···· ✗ failed

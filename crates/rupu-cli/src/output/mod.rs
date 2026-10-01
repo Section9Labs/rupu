@@ -12,6 +12,7 @@ pub mod formats;
 pub mod ids;
 pub mod jsonl_reader;
 pub mod live_run;
+pub mod live_view;
 pub mod palette;
 pub mod printer;
 pub mod report;
