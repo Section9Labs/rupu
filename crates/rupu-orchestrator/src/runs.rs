@@ -28,6 +28,7 @@ use crate::runner::{ItemResult, StepResult};
 use crate::workflow::TimeoutAction;
 use chrono::{DateTime, Utc};
 use rupu_providers::types::Message;
+use rupu_runtime::file_cache::{FileCache, FileCacheError};
 use rupu_runtime::{ArtifactManifest, RunEnvelope};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -952,7 +953,9 @@ pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscrip
 /// Filesystem-backed run store. One root directory; one
 /// sub-directory per run. The store is stateless — every method
 /// reads/writes from disk, so concurrent CLIs sharing the same
-/// `<global>/runs/` see each other's updates.
+/// `<global>/runs/` see each other's updates. (`run.json` parses are
+/// reused across calls only while a fresh `stat` shows the file
+/// unchanged — see [`read_record`].)
 pub struct RunStore {
     pub root: PathBuf,
 }
@@ -1457,12 +1460,12 @@ impl RunStore {
 
     /// Load a run by id.
     pub fn load(&self, run_id: &str) -> Result<RunRecord, RunStoreError> {
-        let path = self.run_json(run_id);
-        if !path.is_file() {
-            return Err(RunStoreError::NotFound(run_id.to_string()));
+        match read_record(&self.run_json(run_id)) {
+            Ok(Some(rec)) => Ok(RunRecord::clone(&rec)),
+            Ok(None) => Err(RunStoreError::NotFound(run_id.to_string())),
+            Err(FileCacheError::Io(e)) => Err(e.into()),
+            Err(FileCacheError::Parse(e)) => Err(e.into()),
         }
-        let body = std::fs::read(&path)?;
-        Ok(serde_json::from_slice(&body)?)
     }
 
     /// Update the top-level `run.json`. Used when status flips
@@ -1647,7 +1650,8 @@ impl RunStore {
     }
 
     /// Read run records from an arbitrary runs root (active or archive),
-    /// newest first. Shared by `list` / `list_archived`.
+    /// newest first. Shared by `list` / `list_archived`. Each `run.json` is
+    /// statted, and only re-read when it changed (see [`read_record`]).
     fn list_in(root: &std::path::Path) -> Result<Vec<RunRecord>, RunStoreError> {
         let mut out: Vec<RunRecord> = Vec::new();
         let rd = match std::fs::read_dir(root) {
@@ -1655,17 +1659,16 @@ impl RunStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e.into()),
         };
+        let mut seen = std::collections::HashSet::new();
         for entry in rd.flatten() {
             let p = entry.path().join("run.json");
-            if !p.is_file() {
-                continue;
-            }
-            if let Ok(body) = std::fs::read(&p) {
-                if let Ok(rec) = serde_json::from_slice::<RunRecord>(&body) {
-                    out.push(rec);
-                }
+            if let Ok(Some(rec)) = read_record(&p) {
+                out.push(RunRecord::clone(&rec));
+                seen.insert(p);
             }
         }
+        // Forget records this root no longer holds (deleted / archived runs).
+        record_cache().retain(|p| !p.starts_with(root) || seen.contains(p));
         out.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(out)
     }
@@ -3191,6 +3194,24 @@ fn rustix_pid(pid: u32) -> Option<rustix::process::Pid> {
     rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)
 }
 
+/// Every `run.json` parse, process-wide (CP endpoints, the resume worker and
+/// the gate sweep all list the same store over and over), reused while the
+/// file is unchanged on disk.
+fn record_cache() -> &'static FileCache<RunRecord> {
+    static CACHE: std::sync::OnceLock<FileCache<RunRecord>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(FileCache::default)
+}
+
+/// The run record at `path`: `Ok(None)` when there is no `run.json` there.
+/// Statted on every call; read and parsed only when it changed since the
+/// last read, so listing thousands of finished runs costs a `stat` each, not
+/// an `open`.
+fn read_record(
+    path: &Path,
+) -> Result<Option<std::sync::Arc<RunRecord>>, FileCacheError<serde_json::Error>> {
+    record_cache().read(path, |body| serde_json::from_slice::<RunRecord>(body))
+}
+
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
 /// atomic within a directory, so a crash mid-write leaves either the
 /// previous coherent file or no `.tmp` (which a future write
@@ -3843,6 +3864,41 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1, "broken run dir should be skipped");
         assert_eq!(listed[0].id, "run_ok");
+    }
+
+    /// `run.json` parses are reused across calls, so every write path must
+    /// still show through `list` and `load`: an update, a hand overwrite, a
+    /// file turned garbage, and a deleted run.
+    #[test]
+    fn list_and_load_see_every_rewrite_and_removal() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_rw");
+        store.create(rec.clone(), "x").unwrap();
+        for _ in 0..2 {
+            assert_eq!(store.list().unwrap()[0].status, RunStatus::Pending);
+        }
+
+        rec.status = RunStatus::Running;
+        store.update(&rec).unwrap();
+        assert_eq!(store.list().unwrap()[0].status, RunStatus::Running);
+        assert_eq!(store.load("run_rw").unwrap().status, RunStatus::Running);
+
+        rec.status = RunStatus::Failed;
+        let json = tmp.path().join("run_rw").join("run.json");
+        std::fs::write(&json, serde_json::to_vec_pretty(&rec).unwrap()).unwrap();
+        assert_eq!(store.load("run_rw").unwrap().status, RunStatus::Failed);
+
+        std::fs::write(&json, "not json").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(matches!(store.load("run_rw"), Err(RunStoreError::Json(_))));
+
+        std::fs::remove_dir_all(tmp.path().join("run_rw")).unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(matches!(
+            store.load("run_rw"),
+            Err(RunStoreError::NotFound(_))
+        ));
     }
 
     #[test]

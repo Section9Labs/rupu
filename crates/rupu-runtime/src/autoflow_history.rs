@@ -1,6 +1,10 @@
+use crate::file_cache::{FileCache, FileCacheError};
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -230,62 +234,37 @@ impl AutoflowHistoryStore {
         Ok(None)
     }
 
+    /// The newest `limit` cycles, newest first (see [`newest_records`]).
     pub fn list_recent(
         &self,
         limit: usize,
     ) -> Result<Vec<AutoflowCycleRecord>, AutoflowHistoryStoreError> {
         self.ensure_dirs()?;
-        let mut out = Vec::new();
-        for day in self.day_dirs()? {
-            for entry in std::fs::read_dir(day)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let body = std::fs::read(entry.path())?;
-                let record: AutoflowCycleRecord = serde_json::from_slice(&body)?;
-                out.push(record);
-            }
-        }
-        out.sort_by(|left, right| {
-            right
-                .started_at
-                .cmp(&left.started_at)
-                .then_with(|| right.cycle_id.cmp(&left.cycle_id))
-        });
-        if out.len() > limit {
-            out.truncate(limit);
-        }
-        Ok(out)
+        static CACHE: OnceLock<FileCache<AutoflowCycleRecord>> = OnceLock::new();
+        newest_records(
+            &self.cycles_dir(),
+            self.day_dirs()?,
+            limit,
+            CACHE.get_or_init(FileCache::default),
+            |r| (&r.started_at, &r.cycle_id),
+        )
     }
 
+    /// The newest `limit` history events, newest first (see
+    /// [`newest_records`]).
     pub fn list_recent_events(
         &self,
         limit: usize,
     ) -> Result<Vec<AutoflowHistoryEventRecord>, AutoflowHistoryStoreError> {
         self.ensure_dirs()?;
-        let mut out = Vec::new();
-        for day in self.event_day_dirs()? {
-            for entry in std::fs::read_dir(day)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let body = std::fs::read(entry.path())?;
-                let record: AutoflowHistoryEventRecord = serde_json::from_slice(&body)?;
-                out.push(record);
-            }
-        }
-        out.sort_by(|left, right| {
-            right
-                .at
-                .cmp(&left.at)
-                .then_with(|| right.event_id.cmp(&left.event_id))
-        });
-        if out.len() > limit {
-            out.truncate(limit);
-        }
-        Ok(out)
+        static CACHE: OnceLock<FileCache<AutoflowHistoryEventRecord>> = OnceLock::new();
+        newest_records(
+            &self.events_dir(),
+            self.event_day_dirs()?,
+            limit,
+            CACHE.get_or_init(FileCache::default),
+            |r| (&r.at, &r.event_id),
+        )
     }
 
     fn ensure_dirs(&self) -> Result<(), AutoflowHistoryStoreError> {
@@ -327,6 +306,61 @@ impl AutoflowHistoryStore {
         out.reverse();
         Ok(out)
     }
+}
+
+/// The newest `limit` records under `day_dirs` (given newest day first),
+/// ordered by their timestamp, then id, both descending. `key` yields a
+/// record's `(rfc3339 timestamp, id)`; an unparsable timestamp sorts last.
+///
+/// [`AutoflowHistoryStore::save`] / [`AutoflowHistoryStore::append_event`]
+/// file every record under the UTC day of its own timestamp, so every record
+/// in an older day sorts after every record in a newer one. Once whole days
+/// have yielded `limit` records nothing older can place, and the walk stops
+/// there instead of reading the store's entire history (tens of thousands of
+/// files for a long-lived tick loop). Only `*.json` files are records — an
+/// in-flight atomic write's `.tmp` is not. Parses come from `cache` while a
+/// file is unchanged on disk; a file deleted mid-walk is skipped.
+fn newest_records<T: DeserializeOwned + Clone>(
+    root: &Path,
+    day_dirs: Vec<PathBuf>,
+    limit: usize,
+    cache: &FileCache<T>,
+    key: impl Fn(&T) -> (&String, &String),
+) -> Result<Vec<T>, AutoflowHistoryStoreError> {
+    let mut out: Vec<Arc<T>> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for day in day_dirs {
+        if out.len() >= limit {
+            break;
+        }
+        for entry in std::fs::read_dir(day)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file()
+                || path.extension().and_then(|e| e.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let record = match cache.read(&path, |body| serde_json::from_slice::<T>(body)) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(FileCacheError::Io(e)) => return Err(e.into()),
+                Err(FileCacheError::Parse(e)) => return Err(e.into()),
+            };
+            seen.insert(path);
+            out.push(record);
+        }
+    }
+    cache.retain(|p| !p.starts_with(root) || seen.contains(p));
+
+    let sort_key = |r: &T| {
+        let (at, id) = key(r);
+        (DateTime::parse_from_rfc3339(at).ok(), id.clone())
+    };
+    let mut keyed: Vec<_> = out.into_iter().map(|r| (sort_key(&r), r)).collect();
+    keyed.sort_by(|(left, _), (right, _)| right.cmp(left));
+    keyed.truncate(limit);
+    Ok(keyed.into_iter().map(|(_, r)| (*r).clone()).collect())
 }
 
 fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, AutoflowHistoryStoreError> {
@@ -435,5 +469,127 @@ mod tests {
         assert_eq!(recent[1].event_id, first.event_id);
         assert_eq!(recent[0].cycle_id, cycle.cycle_id);
         assert_eq!(recent[0].event.kind, AutoflowCycleEventKind::IssueCommented);
+    }
+
+    fn cycle_at(store: &AutoflowHistoryStore, at: &str) -> AutoflowCycleRecord {
+        let record = AutoflowCycleRecord::new(
+            AutoflowCycleMode::Tick,
+            chrono::DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        store.save(&record).unwrap();
+        record
+    }
+
+    #[test]
+    fn list_recent_spans_days_newest_first_and_stops_at_a_whole_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(tmp.path().to_path_buf());
+        let d1_a = cycle_at(&store, "2026-05-01T09:00:00Z");
+        let d2_a = cycle_at(&store, "2026-05-02T08:00:00Z");
+        let d2_b = cycle_at(&store, "2026-05-02T23:59:59.5Z");
+        let d3_a = cycle_at(&store, "2026-05-03T00:00:00Z");
+        // A garbled record in the oldest day: a full scan of history would
+        // fail on it, so listing the newest records proves the walk never
+        // opened that day.
+        let oldest = tmp.path().join("cycles").join("2026-04-30");
+        std::fs::create_dir_all(&oldest).unwrap();
+        std::fs::write(oldest.join("afc_garbled.json"), "not json").unwrap();
+
+        let ids = |v: Vec<AutoflowCycleRecord>| -> Vec<String> {
+            v.into_iter().map(|r| r.cycle_id).collect()
+        };
+        assert_eq!(
+            ids(store.list_recent(1).unwrap()),
+            vec![d3_a.cycle_id.clone()]
+        );
+        assert_eq!(
+            ids(store.list_recent(2).unwrap()),
+            vec![d3_a.cycle_id.clone(), d2_b.cycle_id.clone()]
+        );
+        assert_eq!(
+            ids(store.list_recent(4).unwrap()),
+            vec![
+                d3_a.cycle_id.clone(),
+                d2_b.cycle_id.clone(),
+                d2_a.cycle_id.clone(),
+                d1_a.cycle_id.clone()
+            ]
+        );
+        assert!(store.list_recent(0).unwrap().is_empty());
+        // Asking for more than the clean days hold must reach the bad day,
+        // and a bad record is an error, as before.
+        assert!(store.list_recent(5).is_err());
+    }
+
+    #[test]
+    fn list_recent_ignores_in_flight_tmp_files_and_ties_break_on_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(tmp.path().to_path_buf());
+        let a = cycle_at(&store, "2026-05-02T08:00:00Z");
+        let b = cycle_at(&store, "2026-05-02T08:00:00Z");
+        // A concurrent `save` caught between its write and its rename.
+        let day = tmp.path().join("cycles").join("2026-05-02");
+        std::fs::write(day.join("afc_inflight.tmp"), "{\"half\":").unwrap();
+
+        let got: Vec<String> = store
+            .list_recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.cycle_id)
+            .collect();
+        let mut want = vec![a.cycle_id, b.cycle_id];
+        want.sort();
+        want.reverse();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_rewritten_cycle_lists_its_new_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(tmp.path().to_path_buf());
+        let mut record = cycle_at(&store, "2026-05-02T08:00:00Z");
+        assert_eq!(store.list_recent(1).unwrap()[0].ran_cycles, 0);
+        record.ran_cycles = 7;
+        store.save(&record).unwrap();
+        assert_eq!(store.list_recent(1).unwrap()[0].ran_cycles, 7);
+    }
+
+    #[test]
+    fn list_recent_events_stops_at_a_whole_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(tmp.path().to_path_buf());
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, Utc::now());
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let old = store
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent::default(),
+                at("2026-05-01T10:00:00Z"),
+            )
+            .unwrap();
+        let new = store
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent::default(),
+                at("2026-05-02T10:00:00Z"),
+            )
+            .unwrap();
+        let oldest = tmp.path().join("events").join("2026-04-30");
+        std::fs::create_dir_all(&oldest).unwrap();
+        std::fs::write(oldest.join("afe_garbled.json"), "not json").unwrap();
+
+        let got: Vec<String> = store
+            .list_recent_events(2)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event_id)
+            .collect();
+        assert_eq!(got, vec![new.event_id, old.event_id]);
     }
 }

@@ -207,6 +207,26 @@ pub async fn run_metrics_blocking(
     .await
 }
 
+/// Fold every local spend source once, so the first request that shows
+/// spend after `cp serve` starts (projects, agents, usage, a project's
+/// detail) answers from a warm [`UsageIndex`] instead of reading every
+/// transcript itself. Walks what those aggregates walk: every active and
+/// archived run (claiming its transcripts folds it) and every standalone /
+/// session source; then the newest autoflow cycles the dashboard and the
+/// autoflow run list read, when that history exists. Creates nothing,
+/// never fails; a request racing it just shares the per-run locks.
+/// Blocking IO — run it on the blocking pool.
+pub fn prewarm(global: &std::path::Path, run_store: &RunStore) {
+    for src in crate::usage_sources::unclaimed_extra_sources(global, run_store) {
+        transcripts_usage(&src.paths);
+    }
+    let history = global.join("autoflows").join("history");
+    if history.is_dir() {
+        // Errors surface on the request that needs the history, not here.
+        let _ = rupu_runtime::AutoflowHistoryStore::new(history).list_recent(100);
+    }
+}
+
 /// Price a [`RunUsage`]; carries its `partial` flag through.
 pub fn summarize_run_usage(u: &RunUsage, pricing: &PricingConfig) -> UsageSummary {
     let mut s = summarize(&u.rows, pricing);
@@ -656,6 +676,36 @@ pub(crate) mod tests {
         assert!(s.priced);
         assert!(!s.partial);
         assert!((s.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prewarm_creates_nothing_and_folds_what_requests_read() {
+        use std::io::Write;
+        let empty = tempfile::tempdir().unwrap();
+        prewarm(empty.path(), &RunStore::new(empty.path().join("runs")));
+        assert_eq!(
+            std::fs::read_dir(empty.path()).unwrap().count(),
+            0,
+            "warming an empty home must not create its directories"
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let tdir = home.path().join("transcripts");
+        std::fs::create_dir_all(&tdir).unwrap();
+        let tpath = tdir.join("run_W.jsonl");
+        let mut f = std::fs::File::create(&tpath).unwrap();
+        writeln!(f, r#"{{"type":"run_start","data":{{"run_id":"run_W","workspace_id":"w","agent":"a","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":7,"output_tokens":0,"cached_tokens":0}}}}"#).unwrap();
+        drop(f);
+        std::fs::create_dir_all(home.path().join("autoflows/history")).unwrap();
+        let store = RunStore::new(home.path().join("runs"));
+
+        prewarm(home.path(), &store);
+        let u = transcripts_usage(&[("run_W".into(), tpath)]);
+        assert_eq!(
+            summarize_run_usage(&u, &PricingConfig::default()).input_tokens,
+            7
+        );
     }
 
     #[test]

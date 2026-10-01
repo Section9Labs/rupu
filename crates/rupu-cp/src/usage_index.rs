@@ -660,6 +660,9 @@ struct RunState {
     seal: Option<Seal>,
     last: Option<Arc<RunUsage>>,
     epoch: u64,
+    /// [`UsageIndex::claimed_paths`] of a sealed run; cleared whenever the
+    /// seal breaks.
+    claimed: Option<Arc<Vec<PathBuf>>>,
 }
 
 impl RunState {
@@ -884,6 +887,7 @@ impl UsageIndex {
             }
         }
         st.seal = None;
+        st.claimed = None;
 
         let rec = store.load(run_id).ok();
         st.wall_clock_ms = rec.as_ref().and_then(wall_clock_ms);
@@ -1138,6 +1142,40 @@ impl UsageIndex {
         let state = self.run_state(store, run_id);
         let mut st = self.lock_run(&state);
         self.refresh(&mut st, store, run_id);
+        Self::resolved_in(&st, store, run_id)
+    }
+
+    /// Every path a workflow run claims for the aggregate usage surfaces
+    /// (`crate::usage_sources::claimed_transcripts`): each
+    /// [`Self::resolved_transcripts`] path, preceded by its canonical form
+    /// when it exists. Memoized on a sealed run and dropped whenever the seal
+    /// breaks, so a finished run costs the seal's `stat`s, not a resolve and a
+    /// `canonicalize` per transcript, on every aggregate request.
+    pub fn claimed_paths(&self, store: &RunStore, run_id: &str) -> Arc<Vec<PathBuf>> {
+        let state = self.run_state(store, run_id);
+        let mut st = self.lock_run(&state);
+        self.refresh(&mut st, store, run_id);
+        if st.seal.is_some() {
+            if let Some(claimed) = &st.claimed {
+                return Arc::clone(claimed);
+            }
+        }
+        let mut claimed = Vec::new();
+        for p in Self::resolved_in(&st, store, run_id) {
+            if p.exists() {
+                claimed.push(std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone()));
+            }
+            claimed.push(p);
+        }
+        let claimed = Arc::new(claimed);
+        if st.seal.is_some() {
+            st.claimed = Some(Arc::clone(&claimed));
+        }
+        claimed
+    }
+
+    /// [`Self::resolved_transcripts`] over an already-refreshed state.
+    fn resolved_in(st: &RunState, store: &RunStore, run_id: &str) -> Vec<PathBuf> {
         let worker = store.load(run_id).ok().and_then(|r| r.worker_id);
         let global = global_dir_of(store);
         let mut out: Vec<PathBuf> = st
@@ -2608,6 +2646,42 @@ mod tests {
             vec![s, l],
             "known first, then ledger transcripts that exist"
         );
+    }
+
+    #[test]
+    fn claimed_paths_are_memoized_while_sealed_and_follow_a_broken_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_CLAIM", RunStatus::Completed);
+        let a = tmp.path().join("transcripts/run_A.jsonl");
+        append(&a, &transcript_lines("a", PROVIDER, MODEL, &[(1, 1)]));
+        store
+            .append_step_result("run_CLAIM", &step_result("a", &a))
+            .unwrap();
+        let idx = UsageIndex::default();
+
+        let first = idx.claimed_paths(&store, "run_CLAIM");
+        assert!(is_sealed(&idx, &store, "run_CLAIM"));
+        assert!(first.contains(&a));
+        assert!(first.contains(&std::fs::canonicalize(&a).unwrap()));
+        assert!(
+            Arc::ptr_eq(&first, &idx.claimed_paths(&store, "run_CLAIM")),
+            "a sealed run's claim is not recomputed"
+        );
+
+        // A late step result breaks the seal; its transcript is claimed.
+        let b = tmp.path().join("transcripts/run_B.jsonl");
+        append(&b, &transcript_lines("b", PROVIDER, MODEL, &[(1, 1)]));
+        store
+            .append_step_result("run_CLAIM", &step_result("b", &b))
+            .unwrap();
+        let after = idx.claimed_paths(&store, "run_CLAIM");
+        assert!(after.contains(&a) && after.contains(&b));
+
+        // A live run is never memoized: what it claims is re-resolved.
+        create_run(&store, "run_LIVE", RunStatus::Running);
+        let live = idx.claimed_paths(&store, "run_LIVE");
+        assert!(!Arc::ptr_eq(&live, &idx.claimed_paths(&store, "run_LIVE")));
     }
 
     #[test]
