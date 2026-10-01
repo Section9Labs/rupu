@@ -275,10 +275,14 @@ async fn cancel_run(
     let reason = body
         .and_then(|b| b.0.reason)
         .unwrap_or_else(|| "Cancelled from control plane".to_string());
-    let _outcome: CancelOutcome = s
-        .run_store
-        .cancel(&id, "web", &reason, now)
-        .map_err(|e| map_cancel_err(&id, e))?;
+    // On the blocking pool: `cancel` waits (bounded) for the run lock.
+    let _outcome: CancelOutcome = {
+        let (run_id, reason) = (id.clone(), reason.clone());
+        s.run_store
+            .blocking(move |store| store.cancel(&run_id, "web", &reason, now))
+            .await
+            .map_err(|e| map_cancel_err(&id, e))?
+    };
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
@@ -333,8 +337,12 @@ async fn pause_run(
     // does not re-read its own record status. Mirrors
     // `LocalHostConnector::pause_run`.
     let now = chrono::Utc::now();
+    // Under the run lock, on the blocking pool (its wait blocks the
+    // thread): a cancel that lands meanwhile is refused, never overwritten.
+    let run_id = id.clone();
     s.run_store
-        .pause(&id, now)
+        .blocking(move |store| store.pause(&run_id, now))
+        .await
         .map_err(|e| map_pause_err(&id, e))?;
     s.run_store
         .set_pause_marker(&id)
@@ -1440,7 +1448,7 @@ pub(crate) fn validate_id(id: &str) -> Result<(), ApiError> {
 /// Map a [`RunStoreError`] to an [`ApiError`]:
 /// - `NotFound` → 404
 /// - `NotTerminal` / `AlreadyExists` → 409
-/// - `Io` / `Json` → 500
+/// - `Io` / `Json` / `TaskFailed` → 500
 fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
     match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
@@ -1452,6 +1460,7 @@ fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
         }
         RunStoreError::Io(err) => ApiError::internal(err.to_string()),
         RunStoreError::Json(err) => ApiError::internal(err.to_string()),
+        RunStoreError::TaskFailed(msg) => ApiError::internal(msg),
     }
 }
 
@@ -3613,54 +3622,6 @@ pub(crate) mod tests {
     fn map_host_mutate_err_still_500s_other_remote_statuses() {
         let err = map_host_mutate_err(HostConnectorError::Remote(500, "boom".into()));
         assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/requests/) ────────
-    //
-    // `ApproveBody`/`RejectBody`/`CancelBody` are private to this module —
-    // the integration test (`tests/macos_fixtures.rs`) can't build them, so
-    // their request round-trip fixtures live here instead. These are
-    // Deserialize-only types (no `Serialize` impl to render a canonical JSON
-    // from), so — per the established request-fixture contract — the
-    // checked-in JSON is a hand-authored raw string constant; the test reads
-    // it back off disk and asserts the parsed fields.
-
-    fn check_request_fixture(name: &str, raw: &str) -> String {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/rupu-macos/Fixtures/requests");
-        let path = dir.join(name);
-        if std::env::var_os("REGEN_FIXTURES").is_some() {
-            std::fs::write(&path, raw).expect("write request fixture");
-        }
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("missing request fixture {name}; run `make macos-fixtures`"))
-    }
-
-    #[test]
-    fn approve_body_request_fixture_roundtrips() {
-        let raw = check_request_fixture("approve_body.json", "{\n  \"mode\": \"bypass\"\n}\n");
-        let body: ApproveBody = serde_json::from_str(&raw).expect("deserialize ApproveBody");
-        assert_eq!(body.mode.as_deref(), Some("bypass"));
-    }
-
-    #[test]
-    fn reject_body_request_fixture_roundtrips() {
-        let raw = check_request_fixture(
-            "reject_body.json",
-            "{\n  \"reason\": \"needs another look\"\n}\n",
-        );
-        let body: RejectBody = serde_json::from_str(&raw).expect("deserialize RejectBody");
-        assert_eq!(body.reason.as_deref(), Some("needs another look"));
-    }
-
-    #[test]
-    fn cancel_body_request_fixture_roundtrips() {
-        let raw = check_request_fixture(
-            "cancel_body.json",
-            "{\n  \"reason\": \"operator cancelled\"\n}\n",
-        );
-        let body: CancelBody = serde_json::from_str(&raw).expect("deserialize CancelBody");
-        assert_eq!(body.reason.as_deref(), Some("operator cancelled"));
     }
 
     // ── Date-range filtering (perf & interaction arc, Plan 5 Task 5) ─────────

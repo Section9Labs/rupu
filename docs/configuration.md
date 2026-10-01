@@ -59,7 +59,7 @@ user-declared `openai-compatible` name such as `oracle`). Full narrative referen
 | `max_concurrency` | integer                  | anthropic `4`, openai `8`, gemini `4`, copilot `4`; `0` treated as unset |
 | `prompt_cache`    | bool                     | `true` (Anthropic only; `false` for gateways that reject `cache_control` — gateway routing is process-wide today, see [providers.md](providers.md#field-reference); agent `anthropicPromptCache` overrides) |
 | `default_model`   | string                   | none — the agent must set `model:` or rely on this      |
-| `models`          | array\<table\>           | `[]` — each entry: `id` (required), `context_window` (default `32768`), `max_output` (default `8192`) |
+| `models`          | array\<table\>           | `[]` — each entry: `id` (required), `context_window` (input-token limit) and `max_output` (both optional; when omitted, or `0`, the limit is discovered from the provider's model list, else unknown — see [providers.md](providers.md#model-limits)) |
 
 An `openai-compatible` entry additionally requires `base_url` and `default_model`
 (validated at load time), and may not reuse a reserved built-in provider name
@@ -76,7 +76,7 @@ Full narrative reference: [scm.md](scm.md#configuration).
 |----------------------|--------|---------|-------|
 | `[scm.default]`      | table  | none    | `platform`, `owner`, `repo` — fallback repo when a tool call omits `platform?` |
 | `[issues.default]`   | table  | none    | `tracker`, `project` — fallback tracker when a tool call omits `tracker?` |
-| `[scm.<platform>]`   | table  | none    | Per-platform override for `github` / `gitlab` (`base_url`, `timeout_ms` default `30000`, `max_concurrency` default github `8` / gitlab `6`, `clone_protocol` default `https`) |
+| `[scm.<platform>]`   | table  | none    | Per-platform override for `github` / `gitlab` (`base_url`, `timeout_ms` default `30000`, `max_concurrency` default github `8` / gitlab `6`, `clone_protocol` default `https`; GitLab only: `oauth_client_id`, the OAuth application SSO logs in as — default glab's on gitlab.com, required for self-managed) |
 
 ---
 

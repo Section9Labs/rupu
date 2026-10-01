@@ -146,7 +146,9 @@ pub struct StartArgs {
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
-    /// Skip token streaming provider mode for every turn in this session.
+    /// Don't render tokens as they arrive, for every turn in this session. The
+    /// request still streams on the wire, so long responses can't hit the
+    /// request timeout.
     #[arg(long)]
     pub no_stream: bool,
     /// For repo targets: clone into this directory instead of `./<repo>/`.
@@ -441,17 +443,28 @@ struct SessionRecord {
     /// harness active (target_id derived from `(workspace, session_id)`).
     #[serde(default)]
     concerns: Option<rupu_coverage::ConcernsBlock>,
-    /// Per-request output-token budget captured from `spec.max_tokens` at
-    /// session start. `None` falls back to `runner::DEFAULT_MAX_TOKENS` (8192)
-    /// on each turn.
+    /// Optional agent pin for the per-request output-token cap, captured from
+    /// `spec.max_tokens` at session start. When set it overrides the cap
+    /// discovered from the provider's model list; when neither is known,
+    /// Anthropic gets 8192 and other providers get no cap.
     #[serde(default)]
     max_tokens: Option<u32>,
-    /// Model context-window size in tokens for compaction. Captured from spec at session start.
+    /// Agent pin for the input limit (`contextWindowTokens`), captured from
+    /// the spec at session start. Overrides the discovered limit (`resolve`
+    /// applies pins first); compaction and the gauge read
+    /// `effective_context_window()`.
     #[serde(default)]
     context_window_tokens: Option<u32>,
-    /// Compact-at percentage. Captured from spec at session start.
+    /// Agent pin for the compaction percentage (`compactAtPercent`), captured
+    /// from the spec at session start; read through
+    /// `effective_compact_at_percent()`.
     #[serde(default)]
     compact_at_percent: Option<u8>,
+    /// Limits resolved on the session's first turn (spec 2026-09-30 §6.5),
+    /// including any limit learned from an overflow error. Reused on every
+    /// later turn; never refetched mid-session.
+    #[serde(default)]
+    model_limits: Option<rupu_providers::model_limits::ModelLimits>,
     /// Path of a transcript whose replay-reconstruction equals
     /// `message_history` byte-exact — the ONLY legitimate source for
     /// `seed_source` when starting the next turn (spec §3 seed dedup
@@ -469,6 +482,58 @@ struct SessionRecord {
 
 impl SessionRecord {
     const VERSION: u32 = 1;
+
+    /// The input limit compaction and the gauge use: the stored resolved value
+    /// (which already reflects the agent pin — `resolve` applies pins first —
+    /// and any limit learned from an overflow error), else the agent pin.
+    fn effective_context_window(&self) -> Option<u32> {
+        self.model_limits
+            .as_ref()
+            .and_then(|l| l.input.tokens)
+            // A 0 pin is no limit (`resolve` ignores it too).
+            .or(self.context_window_tokens.filter(|n| *n > 0))
+    }
+
+    /// The compact-at percentage compaction uses: the stored value when the
+    /// stored limits actually resolved something (it already reflects the
+    /// pin — `resolve` applies pins first), else the agent pin, else the
+    /// default. Unresolved stored limits (`ModelLimits::unknown()`, a
+    /// transient first-turn failure) carry only the default percentage, which
+    /// must not outrank a pin.
+    fn effective_compact_at_percent(&self) -> u8 {
+        self.model_limits
+            .as_ref()
+            .filter(|l| !l.is_unresolved())
+            .map(|l| l.compact_at_percent)
+            .or(self.compact_at_percent)
+            .unwrap_or(rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT)
+    }
+
+    /// The input-token threshold manual compaction keeps the history under:
+    /// the same `ModelLimits::compact_threshold` a run compacts at (spec
+    /// 2026-09-30 §6.4, headroom rule included), built from the session's
+    /// effective limits — the stored resolved limits, else the agent pins —
+    /// with `window_override` (`session compact --window`) replacing the input
+    /// side. `None` when no input limit is known or pinned.
+    fn compaction_threshold(&self, window_override: Option<u32>) -> Option<u64> {
+        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+        let input = window_override.or(self.effective_context_window())?;
+        let mut limits = match &self.model_limits {
+            Some(l) if !l.is_unresolved() => l.clone(),
+            stored => {
+                let mut l = ModelLimits::from_pins(None, self.max_tokens.filter(|n| *n > 0), None);
+                if let Some(stored) = stored {
+                    l.output_shares_context = stored.output_shares_context;
+                }
+                l
+            }
+        };
+        if limits.input.tokens != Some(input) {
+            limits.input = Limit::new(input, LimitSource::Agent);
+        }
+        limits.compact_at_percent = self.effective_compact_at_percent();
+        limits.compact_threshold()
+    }
 }
 
 #[derive(Serialize)]
@@ -1644,6 +1709,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         max_tokens: spec.max_tokens,
         context_window_tokens: spec.context_window_tokens,
         compact_at_percent: spec.compact_at_percent,
+        model_limits: None,
         history_source_transcript: None,
     };
     write_session(&global, SessionScope::Active, &session)?;
@@ -2346,7 +2412,9 @@ struct SessionInteractiveState {
     coverage_checked_at: Option<std::time::SystemTime>,
     /// Input-token count from the most recent completed turn (a single-turn
     /// prompt size, not a cumulative total). Used to render the context gauge
-    /// against `session.context_window_tokens`. Updated each time a
+    /// against the session's effective input limit
+    /// (`SessionRecord::effective_context_window`: the resolved, possibly
+    /// learned, limit, else the agent pin). Updated each time a
     /// `TranscriptEvent::Usage` event is received; reset to 0 on `RunStart`.
     last_turn_input_tokens: u64,
 }
@@ -3601,11 +3669,11 @@ fn execute_session_live_command(
                     crate::output::palette::Status::Failed,
                     "compact unavailable  ·  cancel the active run first (/cancel)",
                 );
-            } else if session.context_window_tokens.is_none() {
+            } else if session.effective_context_window().is_none() {
                 state.push_line(
                     crate::output::palette::Status::Failed,
-                    "compact unavailable  ·  session has no contextWindowTokens; \
-                     set it on the agent for new sessions, or use \
+                    "compact unavailable  ·  this session's model limits are unknown and it has \
+                     no contextWindowTokens; set it on the agent for new sessions, or use \
                      `rupu session compact <id> --window <n>`",
                 );
             } else {
@@ -3738,10 +3806,10 @@ fn render_session_header_line(
     // Context gauge: `  ·  ctx 52K/200K 26%` — only when window is known and
     // we have at least one completed turn's input-token count.
     if let Some(gauge) = session_context_gauge(session, state) {
-        let window = session.context_window_tokens.unwrap_or(1) as u64;
+        let window = session.effective_context_window().unwrap_or(1) as u64;
         let last_input = state.last_turn_input_tokens;
         let pct = (last_input * 100).saturating_div(window.max(1));
-        let compact_at = session.compact_at_percent.unwrap_or(80);
+        let compact_at = session.effective_compact_at_percent();
         let color = context_gauge_color(pct, compact_at);
         let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
         let _ = palette::write_colored(&mut buf, &gauge, color);
@@ -6106,11 +6174,11 @@ fn execute_attach_command(
         AttachCommand::Runs => render_session_runs(printer, session),
         AttachCommand::Cancel => cancel_active_turn(global, &session.session_id, printer)?,
         AttachCommand::Compact => {
-            if session.context_window_tokens.is_none() {
+            if session.effective_context_window().is_none() {
                 printer.sideband_event(
                     crate::output::palette::Status::Failed,
                     "compact unavailable",
-                    Some("session has no contextWindowTokens; use `rupu session compact <id> --window <n>`"),
+                    Some("this session's model limits are unknown and it has no contextWindowTokens; use `rupu session compact <id> --window <n>`"),
                 );
             } else {
                 match enqueue_compact_request(global, &session.session_id) {
@@ -6496,12 +6564,15 @@ fn format_token_count(n: u64) -> String {
 use crate::output::fmt::format_token_compact;
 
 /// Build the context gauge segment for the status header, e.g. `ctx 52K/200K 26%`.
-/// Returns `None` when `context_window_tokens` is absent or `last_input` is 0.
+/// Measured against the session's effective input limit
+/// (`SessionRecord::effective_context_window`: the resolved, possibly learned,
+/// limit, else the agent pin). Returns `None` when no input limit is known or
+/// `last_input` is 0.
 fn session_context_gauge(
     session: &SessionRecord,
     state: &SessionInteractiveState,
 ) -> Option<String> {
-    let window = session.context_window_tokens? as u64;
+    let window = session.effective_context_window()? as u64;
     let last_input = state.last_turn_input_tokens;
     if last_input == 0 || window == 0 {
         return None;
@@ -6759,12 +6830,13 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         );
     }
 
-    let context_window_tokens = window_override
-        .or(session.context_window_tokens)
+    let compact_threshold = session
+        .compaction_threshold(window_override)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "session {} has no contextWindowTokens set; pass --window <tokens> \
-                 (e.g. --window 1000000) — sessions created before this field existed don't store it",
+                "session {} has no known input limit: its model limits are unknown \
+                 (never resolved, or the provider exposes none) and the agent pins no \
+                 contextWindowTokens; pass --window <tokens> (e.g. --window 1000000)",
                 session_id
             )
         })?;
@@ -6863,8 +6935,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         &session.message_history,
         provider.as_mut(),
         &session.model,
-        context_window_tokens,
-        session.compact_at_percent,
+        compact_threshold,
         last_input_tokens,
     )
     .await
@@ -7272,11 +7343,11 @@ async fn run_compact_request(
     })?;
     writer.flush()?;
 
-    // Guard: too few messages or no window configured — nothing to compact.
-    let context_window_tokens = match session.context_window_tokens {
-        Some(w) => w,
+    // Guard: too few messages or no input limit known — nothing to compact.
+    let compact_threshold = match session.compaction_threshold(None) {
+        Some(t) => t,
         None => {
-            let msg = "[compact skipped: session has no contextWindowTokens]".to_string();
+            let msg = "[compact skipped: this session's model limits are unknown and it has no contextWindowTokens]".to_string();
             writer.write(&TranscriptEvent::AssistantDelta {
                 content: msg.clone(),
             })?;
@@ -7371,8 +7442,7 @@ async fn run_compact_request(
         &session.message_history,
         provider.as_mut(),
         &session.model,
-        context_window_tokens,
-        session.compact_at_percent,
+        compact_threshold,
         last_input_tokens,
     )
     .await
@@ -7584,7 +7654,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             )),
             kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
         };
-        let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
+        let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
             &session.provider_name,
             &session.model,
             session.auth_mode,
@@ -7699,6 +7769,35 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             .clone()
             .filter(|p| p.exists());
 
+        // The session's limits: the value stored by an earlier turn (including
+        // any limit learned from an overflow error), else resolved now — the
+        // first turn — through this turn's provider (spec 2026-09-30 §6.5). A
+        // stored value with NO known side is a transient first-turn failure
+        // (timeout, network blip), not an answer: resolve again — a cache read
+        // unless stale — and persist the result below.
+        let limits = match session.model_limits.clone() {
+            // Without its note: a note describes the resolution that wrote
+            // it, often relative to that moment ("refresh failed 2m ago"),
+            // and would otherwise be repeated by every later turn.
+            Some(l) if !l.is_unresolved() => {
+                rupu_providers::model_limits::ModelLimits { note: None, ..l }
+            }
+            _ => {
+                rupu_runtime::model_limits::resolve(
+                    rupu_runtime::model_limits::LimitOverrides {
+                        context_window_tokens: session.context_window_tokens,
+                        max_tokens: session.max_tokens,
+                        compact_at_percent: session.compact_at_percent,
+                    },
+                    &session.provider_name,
+                    &session.model,
+                    provider.as_mut(),
+                    &rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global),
+                )
+                .await
+            }
+        };
+
         let opts = AgentRunOpts {
             agent_name: session.agent_name.clone(),
             agent_system_prompt: session.agent_system_prompt.clone(),
@@ -7735,11 +7834,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             on_stream_event: Some(on_stream_event),
             on_usage: None,
             concerns: session.concerns.clone(),
-            max_tokens: session
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
-            context_window_tokens: session.context_window_tokens,
-            compact_at_percent: session.compact_at_percent,
+            limits,
             // Sessions key their coverage ledger off the session_id so multiple
             // sessions against the same workspace stay distinct, and target_id
             // matches the spec's per-session derivation.
@@ -7750,7 +7845,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             codename: Some(codename.clone()),
         };
 
-        let outcome = rupu_agent::run_agent(opts).await;
+        // `run_agent_with_limits`, not `run_agent`: the run's final limits come
+        // back on an `Err` too, so a limit learned from an overflow (and the
+        // first turn's resolution) is persisted even when the turn then fails
+        // (spec 2026-09-30 §6.5).
+        let (outcome, final_limits) = rupu_agent::run_agent_with_limits(opts).await;
         // The turn's cached tokens: the provider-reported total summed over
         // every call (`RunResult.total_tokens_cached`), not the worker's
         // streaming snapshot, which only ever held the last call's figure
@@ -7767,6 +7866,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.active_pid = None;
         session.last_run_id = Some(args.run_id.clone());
         session.last_transcript_path = Some(transcript_path.clone());
+        // On success AND failure: the limits carry to every later turn
+        // without refetching. The note stays with this turn's notice: it
+        // describes this resolution, not the limits.
+        session.model_limits = Some(rupu_providers::model_limits::ModelLimits {
+            note: None,
+            ..final_limits
+        });
 
         let mut run_status = Some(RunStatus::Error);
         let mut duration_ms = 0;
@@ -10074,8 +10180,169 @@ mod tests {
             max_tokens: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            model_limits: None,
             history_source_transcript: None,
         }
+    }
+
+    /// Spec 2026-09-30 §6.5: compaction reads the limits the session's first
+    /// turn resolved (incl. a learned/observed one) first, else the agent pin,
+    /// else nothing / the default percentage. The stored value already reflects
+    /// the pin (`resolve` applies pins first), so it wins whenever it exists.
+    #[test]
+    fn effective_limits_prefer_the_resolved_value_then_the_pin() {
+        let mut s = test_session_record();
+        assert_eq!(s.effective_context_window(), None);
+        assert_eq!(
+            s.effective_compact_at_percent(),
+            rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT
+        );
+
+        s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        assert_eq!(
+            s.effective_context_window(),
+            None,
+            "resolved-but-unknown input stays unknown"
+        );
+
+        s.model_limits = Some(
+            rupu_providers::model_limits::ModelLimits::unknown()
+                .with_input(300_000)
+                .with_percent(70),
+        );
+        assert_eq!(s.effective_context_window(), Some(300_000));
+        assert_eq!(s.effective_compact_at_percent(), 70);
+
+        // A pin recorded at session start does not outrank the stored value.
+        s.context_window_tokens = Some(1_000);
+        s.compact_at_percent = Some(50);
+        assert_eq!(s.effective_context_window(), Some(300_000));
+        assert_eq!(s.effective_compact_at_percent(), 70);
+    }
+
+    /// Manual compaction (`session compact`, the worker's compact request)
+    /// sizes its recent-history budget from the same threshold a run compacts
+    /// at — the headroom rule included (spec 2026-09-30 §6.4) — built from the
+    /// session's effective limits.
+    #[test]
+    fn compaction_threshold_applies_the_headroom_rule_to_the_effective_limits() {
+        use rupu_providers::model_limits::ModelLimits;
+        let mut s = test_session_record();
+        assert_eq!(
+            s.compaction_threshold(None),
+            None,
+            "nothing known or pinned"
+        );
+
+        s.model_limits = Some(ModelLimits::fixed(200_000, 64_000));
+        assert_eq!(s.compaction_threshold(None), Some(136_000), "not 160,000");
+        // `--window` replaces the input side only: min(80,000, 100,000 − 64,000).
+        assert_eq!(s.compaction_threshold(Some(100_000)), Some(36_000));
+
+        let mut separate = ModelLimits::fixed(200_000, 64_000);
+        separate.output_shares_context = false;
+        s.model_limits = Some(separate);
+        assert_eq!(
+            s.compaction_threshold(None),
+            Some(160_000),
+            "no headroom rule when output has its own budget"
+        );
+
+        // Nothing stored: the agent pins.
+        s.model_limits = None;
+        s.context_window_tokens = Some(1_000_000);
+        s.max_tokens = Some(600_000);
+        s.compact_at_percent = Some(50);
+        assert_eq!(s.compaction_threshold(None), Some(400_000));
+    }
+
+    /// An overflow lowered the input limit mid-session and the run stored it
+    /// as `Observed`; the gauge and manual compaction must follow it, not the
+    /// larger agent pin the session started with.
+    #[test]
+    fn a_learned_input_limit_outranks_the_larger_agent_pin() {
+        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+        let mut s = test_session_record();
+        s.context_window_tokens = Some(1_000_000);
+        let mut limits = ModelLimits::unknown().with_input(1_000_000);
+        limits.input = Limit::new(200_000, LimitSource::Observed);
+        s.model_limits = Some(limits);
+        assert_eq!(s.effective_context_window(), Some(200_000));
+    }
+
+    /// Without stored limits (a record from before limits were stored, or a
+    /// turn that never completed) the agent pin still applies.
+    #[test]
+    fn the_agent_pin_applies_when_no_limits_are_stored() {
+        let mut s = test_session_record();
+        s.context_window_tokens = Some(1_000_000);
+        s.compact_at_percent = Some(60);
+        s.model_limits = None;
+        assert_eq!(s.effective_context_window(), Some(1_000_000));
+        assert_eq!(s.effective_compact_at_percent(), 60);
+
+        // Stored limits whose input is unknown fall back to the pin too.
+        s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        assert_eq!(s.effective_context_window(), Some(1_000_000));
+    }
+
+    /// A 0 pin is no limit (spec 2026-09-30 §5: `resolve` ignores it too):
+    /// it must not become a 0-token window for the gauge or manual compaction.
+    #[test]
+    fn a_zero_pin_is_not_an_input_limit() {
+        let mut s = test_session_record();
+        s.model_limits = None;
+        s.context_window_tokens = Some(0);
+        s.max_tokens = Some(0);
+        assert_eq!(s.effective_context_window(), None);
+        assert_eq!(s.compaction_threshold(None), None);
+        // With `--window`, a 0 output pin doesn't zero the headroom either.
+        assert_eq!(s.compaction_threshold(Some(100_000)), Some(80_000));
+    }
+
+    /// Stored limits that resolved nothing (`ModelLimits::unknown()`, from a
+    /// transient first-turn failure) carry only the DEFAULT percentage — not
+    /// a decision. The agent's `compactAtPercent` pin must win over it.
+    #[test]
+    fn an_unresolved_stored_percent_does_not_outrank_the_agent_pin() {
+        let mut s = test_session_record();
+        s.compact_at_percent = Some(60);
+        s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        assert_eq!(s.effective_compact_at_percent(), 60);
+        // No pin: the default.
+        s.compact_at_percent = None;
+        assert_eq!(
+            s.effective_compact_at_percent(),
+            rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT
+        );
+        // Resolved stored limits keep their own percentage (which already
+        // reflects the pin — `resolve` applies pins first).
+        s.compact_at_percent = Some(60);
+        s.model_limits =
+            Some(rupu_providers::model_limits::ModelLimits::fixed(1_000, 100).with_percent(70));
+        assert_eq!(s.effective_compact_at_percent(), 70);
+    }
+
+    /// An older session record on disk has no `model_limits`; it must still
+    /// load (and resolve on its next turn), and a stored value round-trips.
+    #[test]
+    fn session_record_without_model_limits_still_loads_and_roundtrips() {
+        let mut v = serde_json::to_value(test_session_record()).unwrap();
+        v.as_object_mut().unwrap().remove("model_limits");
+        let loaded: SessionRecord = serde_json::from_value(v).unwrap();
+        assert!(loaded.model_limits.is_none());
+
+        let mut with = test_session_record();
+        with.model_limits = Some(
+            rupu_providers::model_limits::ModelLimits::unknown()
+                .with_input(200_000)
+                .with_output(64_000),
+        );
+        let json = serde_json::to_string(&with).unwrap();
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        let l = back.model_limits.expect("stored limits survive a reload");
+        assert_eq!(l.input.tokens, Some(200_000));
+        assert_eq!(l.output.tokens, Some(64_000));
     }
 
     /// 3j (transcript fidelity plan 1): the session worker's send path
@@ -10164,6 +10431,10 @@ mod tests {
             after.status,
             SessionStatus::Idle,
             "both turns must succeed against the mock provider: {after:?}"
+        );
+        assert!(
+            after.model_limits.is_some(),
+            "a finished turn must persist the run's final limits on the session (spec §6.5)"
         );
         assert!(
             transcript_1.is_file(),
@@ -10654,6 +10925,297 @@ mod tests {
             compaction_usage(&request.transcript_path),
             vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
         );
+    }
+
+    /// The run-start `model_limits` notice message from a turn's transcript.
+    fn model_limits_notice(transcript: &Path) -> String {
+        let notices: Vec<String> = JsonlReader::iter(transcript)
+            .expect("open turn transcript")
+            .filter_map(Result::ok)
+            .filter_map(|e| match e {
+                TranscriptEvent::Notice { kind, message } if kind == "model_limits" => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "exactly one model_limits notice per run");
+        notices.into_iter().next().unwrap()
+    }
+
+    /// Spec 2026-09-30 §6.5: limits stored on the session record are REUSED by
+    /// later turns, never re-resolved mid-session. The stored value
+    /// (`fixed(123_456, 7_890)`, no pins) must reach the turn's run — visible in
+    /// its `model_limits` notice — even though re-resolving against the mock
+    /// provider would yield "input unknown … exposes no model limits". The
+    /// control session (no stored limits) proves the assertion discriminates:
+    /// it resolves on its first turn and persists the result.
+    #[tokio::test]
+    async fn stored_session_limits_are_reused_not_re_resolved() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+
+        let (global, mut stored) = idle_dense_session(&tmp, "ses_limits_reuse1");
+        let (_, mut control) = idle_dense_session(&tmp, "ses_limits_ctrl01");
+        for r in [&mut stored, &mut control] {
+            // No agent pins: only the stored/resolved limits can speak.
+            r.message_history = Vec::new();
+            r.compact_at_percent = None;
+            r.context_window_tokens = None;
+            r.max_tokens = None;
+        }
+        stored.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
+            123_456, 7_890,
+        ));
+        control.model_limits = None;
+        write_session(&global, SessionScope::Active, &stored).expect("write stored session");
+        write_session(&global, SessionScope::Active, &control).expect("write control session");
+
+        for (rec, run_id) in [(&stored, "run_limits_reuse"), (&control, "run_limits_ctrl")] {
+            with_mock_home(
+                &global,
+                r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+                run_turn(RunTurnArgs {
+                    session_id: rec.session_id.clone(),
+                    run_id: run_id.into(),
+                    prompt: "go".into(),
+                }),
+            )
+            .await
+            .expect("turn completes");
+        }
+
+        let stored_notice =
+            model_limits_notice(&stored.transcripts_dir.join("run_limits_reuse.jsonl"));
+        assert!(
+            stored_notice.contains("input 123,456 · output 7,890"),
+            "the stored limits must be reused verbatim: {stored_notice}"
+        );
+        assert!(
+            !stored_notice.contains("exposes no model limits"),
+            "a stored session must not re-resolve against the provider: {stored_notice}"
+        );
+        let (after, _) = read_session(&global, &stored.session_id).expect("read stored");
+        let kept = after.model_limits.expect("stored limits survive the turn");
+        assert_eq!(kept.input.tokens, Some(123_456));
+        assert_eq!(kept.output.tokens, Some(7_890));
+
+        let control_notice =
+            model_limits_notice(&control.transcripts_dir.join("run_limits_ctrl.jsonl"));
+        assert!(
+            control_notice.contains("input unknown")
+                && control_notice.contains("exposes no model limits"),
+            "a session with no stored limits resolves on its first turn: {control_notice}"
+        );
+        let (after, _) = read_session(&global, &control.session_id).expect("read control");
+        assert!(
+            after.model_limits.is_some(),
+            "the first turn's resolution is persisted for later turns"
+        );
+    }
+
+    /// Seed a fresh `anthropic` model-list cache (200K input / 64K output for
+    /// the test session's model) under `global`'s cache dir.
+    fn seed_fresh_anthropic_cache(global: &Path) {
+        let dir = global.join("cache/models");
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        let body = format!(
+            r#"{{"schema":2,"fetched_at":"{}","models":[{{"id":"claude-sonnet-4-6","context_window":200000,"max_output_tokens":64000}}]}}"#,
+            Utc::now().to_rfc3339()
+        );
+        std::fs::write(dir.join("anthropic.json"), body).expect("write cache");
+    }
+
+    /// A transient first-turn failure (fetch timeout, network blip) stores
+    /// all-`Unknown` limits. That must not lock the session to unknown for its
+    /// whole life: the next turn re-resolves (a cache read unless stale) and
+    /// persists what it finds. A stored value with ANY known side — notably
+    /// one learned from an overflow — is still reused verbatim.
+    #[tokio::test]
+    async fn all_unknown_stored_limits_are_re_resolved_on_the_next_turn() {
+        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+
+        let (global, mut unknown) = idle_dense_session(&tmp, "ses_limits_unkn01");
+        let (_, mut learned) = idle_dense_session(&tmp, "ses_limits_lrnd01");
+        for r in [&mut unknown, &mut learned] {
+            r.message_history = Vec::new();
+            r.compact_at_percent = None;
+            r.context_window_tokens = None;
+            r.max_tokens = None;
+        }
+        unknown.model_limits = Some(ModelLimits::unknown());
+        let mut partial = ModelLimits::unknown();
+        partial.input = Limit::new(150_000, LimitSource::Observed);
+        learned.model_limits = Some(partial);
+        write_session(&global, SessionScope::Active, &unknown).expect("write unknown session");
+        write_session(&global, SessionScope::Active, &learned).expect("write learned session");
+        seed_fresh_anthropic_cache(&global);
+
+        for (rec, run_id) in [(&unknown, "run_limits_unkn"), (&learned, "run_limits_lrnd")] {
+            with_mock_home(
+                &global,
+                r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+                run_turn(RunTurnArgs {
+                    session_id: rec.session_id.clone(),
+                    run_id: run_id.into(),
+                    prompt: "go".into(),
+                }),
+            )
+            .await
+            .expect("turn completes");
+        }
+
+        let notice = model_limits_notice(&unknown.transcripts_dir.join("run_limits_unkn.jsonl"));
+        assert!(
+            notice.contains("input 200,000 · output 64,000"),
+            "all-unknown stored limits must be re-resolved: {notice}"
+        );
+        let (after, _) = read_session(&global, &unknown.session_id).expect("read unknown");
+        let l = after.model_limits.expect("limits persisted");
+        assert_eq!(l.input.tokens, Some(200_000));
+        assert_eq!(l.output.tokens, Some(64_000));
+
+        let notice = model_limits_notice(&learned.transcripts_dir.join("run_limits_lrnd.jsonl"));
+        assert!(
+            notice.contains("input 150,000"),
+            "a partially known stored value is reused, not re-resolved: {notice}"
+        );
+        let (after, _) = read_session(&global, &learned.session_id).expect("read learned");
+        let l = after.model_limits.expect("limits kept");
+        assert_eq!(l.input, Limit::new(150_000, LimitSource::Observed));
+    }
+
+    /// A note is about the resolution that produced it — often relative to
+    /// that moment ("model list refresh failed 2m ago …"). Reused verbatim,
+    /// every later turn's notice would repeat the stale "2m ago" for hours.
+    /// Stored limits are persisted without their note, and a note on an older
+    /// stored value is not repeated.
+    #[tokio::test]
+    async fn a_stored_note_is_not_repeated_by_later_turns() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_limits_note01");
+        record.message_history = Vec::new();
+        record.compact_at_percent = None;
+        record.context_window_tokens = None;
+        record.max_tokens = None;
+        let mut stored = rupu_providers::model_limits::ModelLimits::fixed(123_456, 7_890);
+        stored.note =
+            Some("model list refresh failed 2m ago (connection refused); retrying after 5m".into());
+        record.model_limits = Some(stored);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        with_mock_home(
+            &global,
+            r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_limits_note".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("turn completes");
+
+        let notice = model_limits_notice(&record.transcripts_dir.join("run_limits_note.jsonl"));
+        assert!(notice.contains("input 123,456"), "reused: {notice}");
+        assert!(!notice.contains("2m ago"), "stale note repeated: {notice}");
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(
+            after.model_limits.expect("limits kept").note,
+            None,
+            "persisted without the note"
+        );
+    }
+
+    /// An all-unknown stored value re-resolves on every turn (above). While
+    /// the provider's model list is down that must not cost every turn the
+    /// full fetch timeout: the re-resolve honours the refresh-failure marker
+    /// like any launch, and says so in the notice.
+    #[tokio::test]
+    async fn re_resolving_an_unknown_session_honours_the_refresh_failure_marker() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_limits_neg01");
+        record.message_history = Vec::new();
+        record.compact_at_percent = None;
+        record.context_window_tokens = None;
+        record.max_tokens = None;
+        record.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let cache = global.join("cache/models");
+        std::fs::create_dir_all(&cache).expect("create cache dir");
+        std::fs::write(
+            cache.join("anthropic.failed"),
+            serde_json::json!({
+                "failed_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                "error": "connection refused",
+            })
+            .to_string(),
+        )
+        .expect("write marker");
+
+        with_mock_home(
+            &global,
+            r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_limits_neg".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("turn completes");
+
+        let notice = model_limits_notice(&record.transcripts_dir.join("run_limits_neg.jsonl"));
+        assert!(
+            notice.contains("model list refresh failed 1m ago (connection refused)")
+                && notice.contains("retrying after 5m"),
+            "the marker suppressed the refetch: {notice}"
+        );
+        assert!(
+            !notice.contains("exposes no model limits"),
+            "the provider was not asked: {notice}"
+        );
+    }
+
+    /// A turn that learns a limit from an overflow and then FAILS must still
+    /// persist it, or the next turn starts from the stale limit and overflows
+    /// the same way again. A one-message history can be neither compacted nor
+    /// trimmed, so the clamp here is followed by `ContextOverflow`.
+    #[tokio::test]
+    async fn a_failed_turn_still_persists_the_learned_limit() {
+        use rupu_providers::model_limits::{Limit, LimitSource};
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_limits_fail01");
+        record.message_history = Vec::new();
+        record.compact_at_percent = None;
+        record.context_window_tokens = Some(1_000_000);
+        record.max_tokens = None;
+        record.model_limits = None;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        with_mock_home(
+            &global,
+            r#"[{ "ProviderError": "prompt is too long: 250000 tokens > 200000 maximum" }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_limits_fail".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("a failed agent run is recorded, not propagated");
+
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(after.status, SessionStatus::Failed, "{after:?}");
+        let l = after
+            .model_limits
+            .expect("a failed turn still persists the run's limits");
+        assert_eq!(l.input, Limit::new(200_000, LimitSource::Observed));
     }
 
     /// A turn's cached tokens come from its `RunResult` — the summed

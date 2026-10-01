@@ -10,6 +10,19 @@ use rupu_providers::AuthMode;
 /// Buffer (seconds) before expiry at which we proactively refresh.
 pub const EXPIRY_REFRESH_BUFFER_SECS: i64 = 60;
 
+/// Bound on one SSO token refresh (the whole HTTP exchange). The refresh
+/// holds the account's refresh lock, so a stalled token endpoint must fail
+/// rather than block every later `get` for that account.
+pub const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound on waiting for the auth file's lock (`auth.json.lock`). A holder
+/// that never lets go — a SIGSTOPped process, a hung NFS lockd, a co-tenant
+/// flocking the file — must fail the operation with a clear error, not hang
+/// every refresh, login and logout (and, through them, the runtime's
+/// shutdown). The same bound every credential-file writer uses
+/// ([`rupu_providers::private_file::LOCK_TIMEOUT`]).
+pub const LOCK_TIMEOUT: std::time::Duration = rupu_providers::private_file::LOCK_TIMEOUT;
+
 #[async_trait]
 pub trait CredentialResolver: Send + Sync {
     /// Resolve credentials for `provider`. `hint` may force a specific
@@ -22,6 +35,22 @@ pub trait CredentialResolver: Send + Sync {
 
     /// Force-refresh credentials. Used when an adapter sees a 401 mid-request.
     async fn refresh(&self, provider: &str, mode: AuthMode) -> Result<AuthCredentials>;
+
+    /// The refresher a provider client built from `provider`'s OAuth
+    /// credentials should hand its token refreshes to, so the rotation is
+    /// persisted in this store (under its lock) instead of kept in memory.
+    /// `kind` is the vendor the caller resolved from config (`"anthropic"`,
+    /// `"openai"`, `"gemini"`, …), so a credential stored under a name this
+    /// resolver was never told about still gets a refresher. `None` — the
+    /// default — leaves the client refreshing on its own.
+    fn oauth_refresher(
+        &self,
+        provider: &str,
+        kind: &str,
+    ) -> Option<std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>> {
+        let _ = (provider, kind);
+        None
+    }
 }
 
 // ── KeychainResolver ─────────────────────────────────────────────────────────
@@ -52,6 +81,10 @@ pub struct KeychainResolver {
     /// Accounts declared in config. Empty means "built-in vendor names
     /// only", which is exactly the pre-multi-account behavior.
     accounts: Vec<crate::account::AccountSpec>,
+    /// [`REFRESH_TIMEOUT`]; tests shorten it.
+    refresh_timeout: std::time::Duration,
+    /// [`LOCK_TIMEOUT`]; tests shorten it.
+    lock_timeout: std::time::Duration,
 }
 
 /// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
@@ -95,7 +128,23 @@ impl KeychainResolver {
         Self {
             path,
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         }
+    }
+
+    /// Bound each SSO token refresh by `timeout` instead of
+    /// [`REFRESH_TIMEOUT`].
+    pub fn with_refresh_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.refresh_timeout = timeout;
+        self
+    }
+
+    /// Bound each wait for the auth file's lock by `timeout` instead of
+    /// [`LOCK_TIMEOUT`].
+    pub fn with_lock_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
     }
 
     /// Declare the config's accounts so `get` / `refresh` can resolve a
@@ -122,60 +171,92 @@ impl KeychainResolver {
         serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
     }
 
+    /// Write the whole map through a private temp file + rename
+    /// ([`rupu_providers::private_file::write_private_atomic`]): a reader (in any
+    /// process) never sees a half-written file, and no byte of it is ever
+    /// visible with a mode looser than 0600. Callers hold the
+    /// [`AuthFileLock`] around their read-modify-write.
     fn write_file_map(
         path: &std::path::Path,
         map: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("mkdir {}: {e}", parent.display()))?;
-        }
         let body =
             serde_json::to_string_pretty(map).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        std::fs::write(path, body).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-        // Enforce 0600 on every write so a previous loose-mode file
-        // gets tightened up next time the user logs in.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                if let Err(e) = std::fs::set_permissions(path, perms) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "could not enforce mode 0600 on auth.json"
-                    );
-                }
-            }
-        }
-        Ok(())
+        rupu_providers::private_file::write_private_atomic(path, body.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    fn write_account(&self, account: &str, payload: &str) -> Result<()> {
-        let mut map = Self::read_file_map(&self.path)?;
+    /// The file the credentials actually live in: `self.path` followed
+    /// through any symlink. Resolved per operation (the link can appear or
+    /// change between two calls), so a write replaces the link's target —
+    /// never the link — and the lock sits next to that target.
+    fn auth_file(&self) -> PathBuf {
+        rupu_providers::private_file::resolve_symlink(&self.path)
+    }
+
+    /// Run `f` on the auth file under its locks — the process-wide
+    /// [`file_mutex`] in front, then the [`AuthFileLock`] on the blocking
+    /// pool (it waits — bounded — while another process is mid-way through
+    /// its read-modify-write or refresh).
+    async fn with_file_lock<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
+    {
+        let path = self.auth_file();
+        let lock_timeout = self.lock_timeout;
+        let mutex = file_mutex(&path);
+        let _in_process = mutex.lock().await;
+        tokio::task::spawn_blocking(move || {
+            let _lock = AuthFileLock::acquire(&path, lock_timeout)?;
+            f(&path)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("auth file task failed: {e}"))?
+    }
+
+    /// Insert one entry. The caller holds the [`AuthFileLock`]. Rotations an
+    /// earlier write could not land ([`unpersisted`]) ride along, and leave
+    /// the overlay once the file holds them; this write supersedes any
+    /// pending one for its own account.
+    fn write_account_at(path: &std::path::Path, account: &str, payload: &str) -> Result<()> {
+        let mut map = Self::read_file_map(path)?;
+        let folded = unpersisted::fold_into(path, &mut map);
         map.insert(account.to_string(), payload.to_string());
-        Self::write_file_map(&self.path, &map)?;
+        Self::write_file_map(path, &map)?;
+        unpersisted::clear_folded(path, &folded);
+        unpersisted::remove(path, account);
         Ok(())
     }
 
-    fn delete_account(&self, account: &str) -> Result<()> {
-        let mut map = Self::read_file_map(&self.path)?;
-        if map.remove(account).is_some() {
-            Self::write_file_map(&self.path, &map)?;
-        }
-        Ok(())
+    /// Remove one entry, under the [`AuthFileLock`]. A pending rotation of
+    /// that account ([`unpersisted`]) is dropped with it — the logout
+    /// supersedes it — and the other accounts' pending ones ride along.
+    async fn delete_account(&self, account: &str) -> Result<()> {
+        let account = account.to_string();
+        self.with_file_lock(move |path| {
+            let mut map = Self::read_file_map(path)?;
+            let removed = map.remove(&account).is_some();
+            unpersisted::remove(path, &account);
+            let folded = unpersisted::fold_into(path, &mut map);
+            if removed || !folded.is_empty() {
+                Self::write_file_map(path, &map)?;
+                unpersisted::clear_folded(path, &folded);
+            }
+            Ok(())
+        })
+        .await
     }
 
     pub async fn store(&self, p: ProviderId, mode: AuthMode, sc: &StoredCredential) -> Result<()> {
         let account = account_for(p, mode);
         let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        self.write_account(&account, &payload)
+        self.with_file_lock(move |path| Self::write_account_at(path, &account, &payload))
+            .await
     }
 
     pub async fn forget(&self, p: ProviderId, mode: AuthMode) -> Result<()> {
-        self.delete_account(&account_for(p, mode))
+        self.delete_account(&account_for(p, mode)).await
     }
 
     /// Read a credential by its account *base* string (e.g. `"oracle"` or a
@@ -188,8 +269,17 @@ impl KeychainResolver {
         legacy_base: Option<&str>,
         mode: AuthMode,
     ) -> Result<Option<StoredCredential>> {
+        Self::read_account_at(&self.auth_file(), account_base, legacy_base, mode)
+    }
+
+    fn read_account_at(
+        path: &std::path::Path,
+        account_base: &str,
+        legacy_base: Option<&str>,
+        mode: AuthMode,
+    ) -> Result<Option<StoredCredential>> {
         let account = format!("{account_base}/{}", mode.as_str());
-        let map = Self::read_file_map(&self.path)?;
+        let map = Self::read_file_map(path)?;
         if let Some(s) = map.get(&account) {
             return Ok(Some(parse_stored_credential(s, mode)?));
         }
@@ -205,6 +295,12 @@ impl KeychainResolver {
 
     fn read(&self, p: ProviderId, mode: AuthMode) -> Result<Option<StoredCredential>> {
         self.read_account(p.as_str(), Some(&legacy_account_for(p)), mode)
+    }
+
+    /// The file's raw entry for `key` (`<account>/<mode>`), exactly as
+    /// stored — what [`unpersisted`] compares a rotation's base against.
+    fn file_entry_at(path: &std::path::Path, key: &str) -> Result<Option<String>> {
+        Ok(Self::read_file_map(path)?.remove(key))
     }
 
     fn parse_provider(name: &str) -> Result<ProviderId> {
@@ -247,15 +343,139 @@ impl KeychainResolver {
         mode: AuthMode,
         sc: &StoredCredential,
     ) -> Result<()> {
+        let (name, sc) = (name.to_string(), sc.clone());
+        self.with_file_lock(move |path| Self::store_named_at(path, &name, mode, &sc))
+            .await
+    }
+
+    /// The caller holds the [`AuthFileLock`].
+    fn store_named_at(
+        path: &std::path::Path,
+        name: &str,
+        mode: AuthMode,
+        sc: &StoredCredential,
+    ) -> Result<()> {
         let account = format!("{name}/{}", mode.as_str());
         let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        self.write_account(&account, &payload)
+        Self::write_account_at(path, &account, &payload)
+    }
+
+    /// Refresh `account`'s stored `mode` credential and persist it — as a
+    /// tracked task ([`rupu_providers::credential_writes`], which the binary
+    /// drains before exit), holding the auth file's [`AuthFileLock`] (and the
+    /// process-wide [`file_mutex`] in front of it) across re-read → token
+    /// request → write.
+    ///
+    /// Cancel-safe: the OAuth server rotates the refresh token, so a refresh
+    /// abandoned between its response and the write (the caller dropped — a
+    /// pause, a listing timeout) would leave only a dead token behind. Here
+    /// the caller only waits; the task finishes and persists.
+    ///
+    /// Single-flight across processes: the flock serializes every refresher
+    /// and writer of the file — other `rupu` processes, and other clients in
+    /// this one — and the stored credential is re-read under it, so a holder
+    /// that finds it already rotated by someone else adopts it and sends no
+    /// token request (one carrying the rotated-out refresh token would get
+    /// `invalid_grant`, and reuse detection can revoke the whole grant). See
+    /// [`RefreshWhen`] for when a request is still made.
+    ///
+    /// A rotation the file could not take (the write failed after the token
+    /// endpoint answered) is the live credential, kept in [`unpersisted`]
+    /// with the file's entry it started from: while the file still holds
+    /// that entry, it is what this re-read finds, ahead of the file, and the
+    /// persist is retried here first — so no later refresh in this process
+    /// posts the dead token the file still holds. Once the file's entry
+    /// differs (another process logged the account in or out, or rotated it
+    /// itself), the overlay entry is dropped and the file is the truth.
+    async fn refresh_and_store_at(
+        path: PathBuf,
+        account: String,
+        kind: ProviderId,
+        mode: AuthMode,
+        timeout: std::time::Duration,
+        lock_timeout: std::time::Duration,
+        when: RefreshWhen,
+    ) -> Result<StoredCredential> {
+        let legacy = Self::legacy_base(&account).map(str::to_string);
+        let job = rupu_providers::credential_writes::spawn(async move {
+            let mutex = file_mutex(&path);
+            let _in_process = mutex.lock().await;
+            let _file = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || AuthFileLock::acquire(&path, lock_timeout))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth file lock task failed: {e}"))??
+            };
+            let key = format!("{account}/{}", mode.as_str());
+            // The overlay's rotation is the live credential only while the
+            // file still holds the entry it started from; a login, logout
+            // or rotation by another process since supersedes it.
+            let file_entry = Self::file_entry_at(&path, &key)?;
+            let sc = match unpersisted::get_based_on(&path, &key, file_entry.as_deref()) {
+                Some(pending) => {
+                    let sc = parse_stored_credential(&pending, mode)?;
+                    // Land it now if the file will take it (the exact
+                    // pending payload, so the file then holds what the
+                    // overlay held); the entry goes with a successful write.
+                    if let Err(e) = Self::write_account_at(&path, &key, &pending) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            account,
+                            error = %e,
+                            "the refreshed OAuth token still could not be persisted"
+                        );
+                    }
+                    sc
+                }
+                None => Self::read_account_at(&path, &account, legacy.as_deref(), mode)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no stored credential for {account}/{mode:?}")
+                    })?,
+            };
+            if when.already_satisfied(&sc) {
+                return Ok(sc);
+            }
+            // The base this rotation starts from: the file's entry as it is
+            // now, under the lock (the retry above may just have landed
+            // the pending one). Read before the token request, so a read
+            // failure costs nothing.
+            let base = Self::file_entry_at(&path, &key)?;
+            let new = Self::refresh_inner(&account, kind, &sc, timeout).await?;
+            if let Err(e) = Self::store_named_at(&path, &account, mode, &new) {
+                let payload =
+                    serde_json::to_string(&new).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+                unpersisted::set(&path, &key, payload, base);
+                report_unpersisted_rotation(&path, &account, &e);
+            }
+            Ok(new)
+        });
+        job.await
+            .map_err(|e| anyhow::anyhow!("credential refresh task failed: {e}"))?
+    }
+
+    async fn refresh_and_store(
+        &self,
+        account: &str,
+        kind: ProviderId,
+        mode: AuthMode,
+        when: RefreshWhen,
+    ) -> Result<StoredCredential> {
+        Self::refresh_and_store_at(
+            self.auth_file(),
+            account.to_string(),
+            kind,
+            mode,
+            self.refresh_timeout,
+            self.lock_timeout,
+            when,
+        )
+        .await
     }
 
     /// Forget a named credential. No-op if absent.
     pub async fn forget_named(&self, name: &str, mode: AuthMode) -> Result<()> {
         let account = format!("{name}/{}", mode.as_str());
-        self.delete_account(&account)
+        self.delete_account(&account).await
     }
 
     /// Delete every stored credential, returning how many entries were
@@ -270,12 +490,18 @@ impl KeychainResolver {
     /// (returns `0`, writes nothing) when the store is empty or absent,
     /// so `--all` on a fresh install doesn't create an empty auth.json.
     pub async fn forget_all(&self) -> Result<usize> {
-        let map = Self::read_file_map(&self.path)?;
-        let count = map.len();
-        if count > 0 {
-            Self::write_file_map(&self.path, &Default::default())?;
-        }
-        Ok(count)
+        self.with_file_lock(|path| {
+            // Pending rotations of this file go too: nothing is left to
+            // persist them for.
+            unpersisted::clear_file(path);
+            let map = Self::read_file_map(path)?;
+            let count = map.len();
+            if count > 0 {
+                Self::write_file_map(path, &Default::default())?;
+            }
+            Ok(count)
+        })
+        .await
     }
 
     /// True if a named credential exists for `name`/`mode`.
@@ -401,10 +627,10 @@ impl KeychainResolver {
     /// `anthropic-work` and `anthropic-personal` to re-authenticate the
     /// wrong one.
     async fn refresh_inner(
-        &self,
         account: &str,
         kind: ProviderId,
         sc: &StoredCredential,
+        timeout: std::time::Duration,
     ) -> Result<StoredCredential> {
         let oauth = crate::oauth::providers::provider_oauth(kind)
             .ok_or_else(|| anyhow::anyhow!("no oauth config for {kind}"))?;
@@ -414,9 +640,55 @@ impl KeychainResolver {
                  Re-authenticate this account (mode: sso) to continue."
             )
         })?;
-        // Provider-agnostic refresh: standard OAuth refresh-token grant.
-        let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
-            .unwrap_or_else(|_| oauth.token_url.to_string());
+        // The standard OAuth refresh-token grant, in the shape the vendor's
+        // own client sends it (`ProviderOAuth::refresh_body_format`,
+        // `client_secret`). Gemini's client pair follows the credential's
+        // variant: a token issued to the Antigravity client must be
+        // refreshed as that client.
+        let (client_id, client_secret) = match kind {
+            ProviderId::Gemini => {
+                let hint = match &sc.credentials {
+                    AuthCredentials::OAuth { extra, .. } => {
+                        extra.get("variant").and_then(|v| v.as_str())
+                    }
+                    AuthCredentials::ApiKey { .. } => None,
+                };
+                let variant =
+                    rupu_providers::google_gemini::GeminiVariant::from_credential_hint(hint);
+                (variant.client_id(), Some(variant.client_secret()))
+            }
+            _ => (oauth.client_id, oauth.client_secret),
+        };
+        // A GitLab credential that recorded the application it was issued
+        // to (a login with a chosen application: the account's configured
+        // one, or its self-managed instance's — `oauth::callback::
+        // run_with_client`) refreshes as that public client, at that
+        // endpoint, which the built-in endpoints' test seam never
+        // redirects. Only GitLab logins record one; any other vendor's
+        // free-form `extra` is never read for an endpoint.
+        let recorded = |key: &str| match &sc.credentials {
+            AuthCredentials::OAuth { extra, .. } if kind == ProviderId::Gitlab => {
+                extra.get(key).and_then(|v| v.as_str())
+            }
+            _ => None,
+        };
+        let (client_id, client_secret) = match recorded(crate::oauth::providers::EXTRA_CLIENT_ID) {
+            Some(id) => (id, None),
+            None => (client_id, client_secret),
+        };
+        let mut params: Vec<(&str, &str)> = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ];
+        if let Some(secret) = client_secret {
+            params.push(("client_secret", secret));
+        }
+        let token_url = match recorded(crate::oauth::providers::EXTRA_TOKEN_URL) {
+            Some(url) => url.to_string(),
+            None => std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
+                .unwrap_or_else(|_| oauth.token_url.to_string()),
+        };
         // Deliberately `NullSink`, not a stopgap: matt's scope call for this
         // plan was explicit — "I do not care about update or login" — and a
         // token refresh is login traffic even when it fires mid-run (a
@@ -430,16 +702,18 @@ impl KeychainResolver {
         // not silent.
         let client = rupu_netflow::http::client_with(
             rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
-            reqwest::Client::builder(),
+            // Bounded: the caller holds the account's refresh lock.
+            reqwest::Client::builder().timeout(timeout),
             std::sync::Arc::new(rupu_netflow::NullSink),
         )?;
-        let resp = client
-            .post(&token_url)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", oauth.client_id),
-            ])
+        let request = match oauth.refresh_body_format {
+            crate::oauth::providers::TokenBodyFormat::Form => client.post(&token_url).form(&params),
+            crate::oauth::providers::TokenBodyFormat::Json => {
+                let json: std::collections::BTreeMap<&str, &str> = params.into_iter().collect();
+                client.post(&token_url).json(&json)
+            }
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("refresh request: {e}"))?;
@@ -456,6 +730,13 @@ impl KeychainResolver {
             refresh_token: Option<String>,
             #[serde(default)]
             expires_in: Option<i64>,
+            /// OpenAI's ChatGPT grant rotates the ID token with the access
+            /// token; it is persisted (`extra.id_token`) as codex-rs does,
+            /// since the Codex client takes its account id from it when
+            /// the access token carries no claim. OpenAI's only: any other
+            /// provider's (Gemini's carries the user's email) is dropped.
+            #[serde(default)]
+            id_token: Option<String>,
         }
         let r: R = resp
             .json()
@@ -466,10 +747,19 @@ impl KeychainResolver {
         // re-emit the account block, but those identifiers don't change
         // for the lifetime of the OAuth grant, so carrying them forward
         // keeps `metadata.user_id.account_uuid` populated post-refresh.
-        let prior_extra = match &sc.credentials {
+        let mut prior_extra = match &sc.credentials {
             rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => extra.clone(),
             _ => Default::default(),
         };
+        if kind == ProviderId::Openai {
+            if let Some(id_token) = r.id_token {
+                prior_extra.insert("id_token".into(), serde_json::Value::String(id_token));
+            }
+        } else {
+            // Not stored for any other provider — and one a login stored
+            // before this rule does not survive the refresh either.
+            prior_extra.remove("id_token");
+        }
         // `credentials.expires` is the SAME field the provider crates'
         // `is_token_expired(expires_ms)` checks, and they all interpret
         // it as ABSOLUTE milliseconds-since-Unix-epoch (see e.g.
@@ -505,6 +795,265 @@ impl KeychainResolver {
 impl Default for KeychainResolver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The token endpoint has already rotated the refresh token when the write
+/// of the new credential fails (a read-only directory, a full disk): the
+/// credential in hand is the only live one. It is handed back so the run
+/// continues and kept in [`unpersisted`] — every later refresh of the
+/// account and every later write of the file in this process retry the
+/// write — and the loss is reported loudly: the next process will find the
+/// dead refresh token in the file and need `rupu auth login` unless a later
+/// write in this one lands it first.
+fn report_unpersisted_rotation(path: &std::path::Path, account: &str, error: &anyhow::Error) {
+    tracing::error!(
+        path = %path.display(),
+        account,
+        error = %error,
+        "the refreshed OAuth token could not be persisted; this process keeps using it and \
+         retries the write on its next write of the credential file or refresh of this account, \
+         the next process will need `rupu auth login` unless one lands"
+    );
+    eprintln!(
+        "rupu: the '{account}' token was refreshed but could not be written to {}: {error}. This \
+         process keeps using the new token and retries the write on its next write of the \
+         credential file or refresh of this account; if the next rupu command cannot \
+         authenticate, run: rupu auth login --account {account} --mode sso",
+        path.display()
+    );
+}
+
+/// The process-wide lock serializing this process's holders of one auth
+/// file, keyed by the resolved file, taken in front of the [`AuthFileLock`]
+/// by every writer and refresher. Every `KeychainResolver` in the process
+/// shares it (the CLI builds a fresh resolver per command and per step), so
+/// in-process exclusion holds even where `flock` is per-process (an NFS
+/// mount on Linux). A holder keeps it only for bounded work — the lock
+/// wait, one token request, a write — so a wait on it is bounded too.
+fn file_mutex(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// Rotated credentials the auth file could not take: the token endpoint had
+/// already rotated the refresh token when the write failed (a read-only
+/// directory, a full disk), so the credential in hand is the only live one
+/// and the file keeps a dead refresh token. Keyed by the resolved auth file
+/// and the file-map key (`<account>/<mode>`); process-wide, like the file
+/// mutex, and only ever touched under the [`AuthFileLock`].
+///
+/// Each entry remembers its base: the file's entry for the key as it was
+/// when the rotation started (what the dead refresh token is stored in).
+/// The entry is the live credential only while the file still holds that
+/// base. Every later refresh of the account reads it ahead of the file, and
+/// every later write of the file folds it in — each after comparing the
+/// file's current entry with the base: a file that moved on (another
+/// process logged the account in or out, or rotated it itself) supersedes
+/// the entry, which is dropped, so a stale rotation is never written over
+/// a newer credential and never brings back a logged-out one. An entry also
+/// leaves once the file holds it, or when the account is forgotten.
+/// Without the overlay, every later refresh in the process re-read the
+/// file and posted the dead token — `invalid_grant`, and reuse detection
+/// can revoke the whole grant.
+mod unpersisted {
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// A rotation the file could not take, and the file's entry for its
+    /// key when it started (`None`: the file had none).
+    struct Entry {
+        payload: String,
+        base: Option<String>,
+    }
+
+    type Overlay = HashMap<(PathBuf, String), Entry>;
+
+    fn entries() -> MutexGuard<'static, Overlay> {
+        static ENTRIES: OnceLock<Mutex<Overlay>> = OnceLock::new();
+        ENTRIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn superseded(path: &Path, key: &str) {
+        tracing::info!(
+            path = %path.display(),
+            account = key,
+            "dropping an unpersisted token rotation: the stored credential was rewritten by \
+             another process since (a login, logout or its own refresh); using the file"
+        );
+    }
+
+    /// The pending payload for `key` in `path`, if its base is still what
+    /// the file holds (`file_entry`). An entry whose base the file no
+    /// longer holds is superseded: dropped, and `None`.
+    pub(super) fn get_based_on(path: &Path, key: &str, file_entry: Option<&str>) -> Option<String> {
+        let mut entries = entries();
+        let k = (path.to_path_buf(), key.to_string());
+        let entry = entries.get(&k)?;
+        if entry.base.as_deref() == file_entry {
+            return Some(entry.payload.clone());
+        }
+        entries.remove(&k);
+        drop(entries);
+        superseded(path, key);
+        None
+    }
+
+    /// Record a rotation the file could not take, started from `base` —
+    /// the file's entry for `key` at that moment (a newer rotation replaces
+    /// an older one for the same key).
+    pub(super) fn set(path: &Path, key: &str, payload: String, base: Option<String>) {
+        entries().insert(
+            (path.to_path_buf(), key.to_string()),
+            Entry { payload, base },
+        );
+    }
+
+    /// Drop the pending rotation for `key`, if any (superseded by a write
+    /// of that account, or by its logout).
+    pub(super) fn remove(path: &Path, key: &str) {
+        entries().remove(&(path.to_path_buf(), key.to_string()));
+    }
+
+    /// Put every pending rotation for `path` whose base `map` (the file,
+    /// just read under the lock) still holds into `map` — they are newer
+    /// than what the file holds. One whose base the file no longer holds is
+    /// superseded and dropped instead. Returns what was folded, for
+    /// [`clear_folded`] once the write succeeded.
+    pub(super) fn fold_into(
+        path: &Path,
+        map: &mut BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let mut folded = Vec::new();
+        let mut stale = Vec::new();
+        {
+            let entries = entries();
+            for ((p, key), entry) in entries.iter() {
+                if p != path {
+                    continue;
+                }
+                if map.get(key).map(String::as_str) == entry.base.as_deref() {
+                    folded.push((key.clone(), entry.payload.clone()));
+                } else {
+                    stale.push(key.clone());
+                }
+            }
+        }
+        for key in stale {
+            remove(path, &key);
+            superseded(path, &key);
+        }
+        for (key, payload) in &folded {
+            map.insert(key.clone(), payload.clone());
+        }
+        folded
+    }
+
+    /// Drop the entries `folded` that are still exactly what was folded —
+    /// the file holds them now. A rotation recorded since stays.
+    pub(super) fn clear_folded(path: &Path, folded: &[(String, String)]) {
+        let mut entries = entries();
+        for (key, payload) in folded {
+            let k = (path.to_path_buf(), key.clone());
+            if entries.get(&k).map(|e| &e.payload) == Some(payload) {
+                entries.remove(&k);
+            }
+        }
+    }
+
+    /// Drop every pending rotation for `path` (`forget_all`).
+    pub(super) fn clear_file(path: &Path) {
+        entries().retain(|(p, _), _| p != path);
+    }
+}
+
+/// The exclusive advisory lock (flock) on `<auth file>.lock` every writer
+/// of the auth file and every refresher holds across its whole
+/// read-modify-write — a refresher across re-read → token request → write
+/// — so concurrent `rupu` processes never clobber each other's writes or
+/// refresh the same token twice. The shared
+/// [`rupu_providers::private_file::SidecarLock`]: created private, never
+/// unlinked, and acquired with a bounded wait ([`LOCK_TIMEOUT`]).
+type AuthFileLock = rupu_providers::private_file::SidecarLock;
+
+/// When [`KeychainResolver::refresh_and_store_at`] still makes a token
+/// request after re-reading the stored credential under the lock.
+#[derive(Debug, Clone)]
+enum RefreshWhen {
+    /// `get`: only if the stored credential is near expiry (another holder's
+    /// rotation makes it fresh).
+    NearExpiry,
+    /// The forced `refresh` (a 401 mid-request): always, from the latest
+    /// stored refresh token.
+    Always,
+    /// A provider client's refresh: unless another holder already rotated
+    /// the stored credential away from `stale_refresh` (the refresh token
+    /// the client holds) and it is not near expiry.
+    RotatedFrom(Option<String>),
+}
+
+impl RefreshWhen {
+    fn already_satisfied(&self, stored: &StoredCredential) -> bool {
+        let fresh = !stored.is_near_expiry(chrono::Utc::now(), EXPIRY_REFRESH_BUFFER_SECS);
+        match self {
+            RefreshWhen::NearExpiry => fresh,
+            RefreshWhen::Always => false,
+            RefreshWhen::RotatedFrom(stale) => {
+                fresh && stored_refresh_token(stored) != stale.as_deref()
+            }
+        }
+    }
+}
+
+fn stored_refresh_token(sc: &StoredCredential) -> Option<&str> {
+    match &sc.credentials {
+        AuthCredentials::OAuth { refresh, .. } => Some(refresh.as_str()),
+        AuthCredentials::ApiKey { .. } => sc.refresh_token.as_deref(),
+    }
+}
+
+/// [`rupu_providers::credential_writes::OAuthRefresher`] over the
+/// `KeychainResolver` store: a provider client's refresh goes through the
+/// same lock, re-read and persisted write as the resolver's own.
+struct KeychainRefresher {
+    path: PathBuf,
+    account: String,
+    kind: ProviderId,
+    timeout: std::time::Duration,
+    lock_timeout: std::time::Duration,
+}
+
+#[async_trait]
+impl rupu_providers::credential_writes::OAuthRefresher for KeychainRefresher {
+    async fn refresh(
+        &self,
+        stale: AuthCredentials,
+    ) -> std::result::Result<AuthCredentials, rupu_providers::ProviderError> {
+        let stale_refresh = match &stale {
+            AuthCredentials::OAuth { refresh, .. } => Some(refresh.clone()),
+            AuthCredentials::ApiKey { .. } => None,
+        };
+        KeychainResolver::refresh_and_store_at(
+            self.path.clone(),
+            self.account.clone(),
+            self.kind,
+            AuthMode::Sso,
+            self.timeout,
+            self.lock_timeout,
+            RefreshWhen::RotatedFrom(stale_refresh),
+        )
+        .await
+        .map(|sc| sc.credentials)
+        .map_err(|e| rupu_providers::ProviderError::TokenRefreshFailed(e.to_string()))
     }
 }
 
@@ -550,9 +1099,9 @@ impl CredentialResolver for KeychainResolver {
                 if let Some(mut sc) = self.read_account(provider, legacy, mode)? {
                     let now = chrono::Utc::now();
                     if mode == AuthMode::Sso && sc.is_near_expiry(now, EXPIRY_REFRESH_BUFFER_SECS) {
-                        let new = self.refresh_inner(provider, kind, &sc).await?;
-                        self.store_named(provider, mode, &new).await?;
-                        sc = new;
+                        sc = self
+                            .refresh_and_store(provider, kind, mode, RefreshWhen::NearExpiry)
+                            .await?;
                     }
                     return Ok((mode, sc.credentials));
                 }
@@ -584,13 +1133,30 @@ impl CredentialResolver for KeychainResolver {
     async fn refresh(&self, provider: &str, mode: AuthMode) -> Result<AuthCredentials> {
         let kind = crate::account::resolve_provider_id(provider, &self.accounts)
             .ok_or_else(|| anyhow::anyhow!("unknown provider or account: {provider}"))?;
-        let legacy = Self::legacy_base(provider);
-        let sc = self
-            .read_account(provider, legacy, mode)?
-            .ok_or_else(|| anyhow::anyhow!("no stored credential for {provider}/{mode:?}"))?;
-        let new = self.refresh_inner(provider, kind, &sc).await?;
-        self.store_named(provider, mode, &new).await?;
+        let new = self
+            .refresh_and_store(provider, kind, mode, RefreshWhen::Always)
+            .await?;
         Ok(new.credentials)
+    }
+
+    fn oauth_refresher(
+        &self,
+        provider: &str,
+        kind: &str,
+    ) -> Option<std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>> {
+        // A declared account (or a vendor name) knows its own kind; an
+        // undeclared name takes the kind the caller resolved from config.
+        // Either way the kind must have an OAuth config to refresh against.
+        let kind = crate::account::resolve_provider_id(provider, &self.accounts)
+            .or_else(|| ProviderId::from_vendor_str(kind))?;
+        crate::oauth::providers::provider_oauth(kind)?;
+        Some(std::sync::Arc::new(KeychainRefresher {
+            path: self.auth_file(),
+            account: provider.to_string(),
+            kind,
+            timeout: self.refresh_timeout,
+            lock_timeout: self.lock_timeout,
+        }))
     }
 }
 
@@ -829,6 +1395,8 @@ mod tests {
                 crate::account::AccountSpec::new("anthropic-work", "anthropic"),
                 crate::account::AccountSpec::new("anthropic-personal", "anthropic"),
             ],
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         resolver
@@ -868,6 +1436,8 @@ mod tests {
                 "anthropic-work",
                 "anthropic",
             )],
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         resolver
@@ -913,6 +1483,8 @@ mod tests {
         let resolver = KeychainResolver {
             path: path.clone(),
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
         resolver
             .store(
@@ -941,6 +1513,8 @@ mod tests {
         let resolver = KeychainResolver {
             path: path.clone(),
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
@@ -955,6 +1529,8 @@ mod tests {
         let resolver = KeychainResolver {
             path: dir.path().join("auth.json"),
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
         let err = resolver.get("anthropic-typo", None).await.unwrap_err();
         assert!(
@@ -976,6 +1552,8 @@ mod tests {
             path: path.clone(),
             // Deliberately NOT declared, so `get` routes into `get_named`.
             accounts: Vec::new(),
+            refresh_timeout: REFRESH_TIMEOUT,
+            lock_timeout: LOCK_TIMEOUT,
         };
 
         let sso = StoredCredential {

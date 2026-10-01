@@ -748,7 +748,7 @@ impl Live {
     }
 
     /// Drain pending key presses. `Some` when one asks to leave.
-    fn poll_keys(&mut self) -> Option<Exit> {
+    async fn poll_keys(&mut self) -> Option<Exit> {
         while event::poll(Duration::ZERO).unwrap_or(false) {
             let key = match event::read() {
                 Ok(TermEvent::Key(key)) => key,
@@ -764,18 +764,18 @@ impl Live {
             let Some(action) = decode_key(key.code, key.modifiers, gate_focused) else {
                 continue;
             };
-            if let Some(exit) = self.apply_action(action) {
+            if let Some(exit) = self.apply_action(action).await {
                 return Some(exit);
             }
         }
         None
     }
 
-    fn apply_action(&mut self, action: KeyAction) -> Option<Exit> {
+    async fn apply_action(&mut self, action: KeyAction) -> Option<Exit> {
         match action {
             KeyAction::Nav(key) => match self.nav.apply(key, &self.view) {
                 NavAction::Quit => return Some(Exit::Quit),
-                NavAction::Pause => self.request_pause(),
+                NavAction::Pause => self.request_pause().await,
                 NavAction::None => {}
             },
             KeyAction::Approve => self.decide(GateVerb::Approve),
@@ -789,7 +789,7 @@ impl Live {
     /// `rupu workflow pause` uses, which writes to the store rather than
     /// stdout so it is safe on the alternate screen. The view stays up until
     /// the run actually stops (`RunPaused`), so the operator watches it land.
-    fn request_pause(&mut self) {
+    async fn request_pause(&mut self) {
         // A run resumed from this view runs without a pause channel
         // (`resume_run` wires none); flipping its record to `Paused` would
         // claim a pause nothing will honor.
@@ -801,7 +801,7 @@ impl Live {
             );
             return;
         }
-        match crate::cmd::workflow::pause_with_store(&self.store, &self.run_id) {
+        match crate::cmd::workflow::pause_with_store(&self.store, &self.run_id).await {
             Ok(()) => {
                 let msg = format!(
                     "pause requested — will stop at next safe boundary \
@@ -989,7 +989,7 @@ pub async fn run_live_view(
             live.renderer.invalidate();
         }
         live.ingest();
-        if let Some(exit) = live.poll_keys() {
+        if let Some(exit) = live.poll_keys().await {
             break exit;
         }
         live.draw(&mut out, size);
@@ -1862,8 +1862,8 @@ mod tests {
             .map(|n| render_plain(std::slice::from_ref(&n.line)))
     }
 
-    #[test]
-    fn a_parked_run_focuses_its_first_gate_and_a_wandering_operator_is_told_once() {
+    #[tokio::test]
+    async fn a_parked_run_focuses_its_first_gate_and_a_wandering_operator_is_told_once() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut live, store) = parked_live(tmp.path());
         live.ingest();
@@ -1879,7 +1879,7 @@ mod tests {
 
         // The operator moves off the gates (onto `build`): they keep their
         // selection, and are told once that the run is waiting.
-        live.apply_action(KeyAction::Nav(NavKey::Up));
+        live.apply_action(KeyAction::Nav(NavKey::Up)).await;
         live.ingest();
         assert_eq!(live.nav.focused_gate(&live.view).map(|_| ()), None);
         let hint = notice_text(&live).expect("a parked-run notice");
@@ -1899,7 +1899,7 @@ mod tests {
         live.parked_hint = None;
         live.ingest();
         assert!(notice_text(&live).is_some());
-        live.apply_action(KeyAction::Nav(NavKey::Follow));
+        live.apply_action(KeyAction::Nav(NavKey::Follow)).await;
         live.ingest();
         assert!(live.nav.focused_gate(&live.view).is_some());
         assert!(notice_text(&live).is_none());
@@ -1918,13 +1918,13 @@ mod tests {
         assert_eq!(live.parked_hint, None);
     }
 
-    #[test]
-    fn the_parked_hint_names_the_gate_the_follow_key_lands_on() {
+    #[tokio::test]
+    async fn the_parked_hint_names_the_gate_the_follow_key_lands_on() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut live, _store) = parked_live(tmp.path());
         live.ingest();
         // The operator wanders off the gates (onto `build`).
-        live.apply_action(KeyAction::Nav(NavKey::Up));
+        live.apply_action(KeyAction::Nav(NavKey::Up)).await;
         // run.json's awaiting set lists `gate_b` first, but step order — what
         // `a` (follow) focuses — puts `gate_a` first: the hint must agree
         // with the key, not with the set's order.
@@ -1937,7 +1937,7 @@ mod tests {
             hint.contains("gate_a") && !hint.contains("gate_b"),
             "{hint}"
         );
-        live.apply_action(KeyAction::Nav(NavKey::Follow));
+        live.apply_action(KeyAction::Nav(NavKey::Follow)).await;
         assert_eq!(
             live.nav
                 .focused_gate(&live.view)
@@ -1946,15 +1946,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn quit_leaves_pause_only_asks_and_a_stale_gate_key_is_a_notice_not_an_action() {
+    #[tokio::test]
+    async fn quit_leaves_pause_only_asks_and_a_stale_gate_key_is_a_notice_not_an_action() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut live, store) = parked_live(tmp.path());
         live.ingest();
 
         // `q` / Ctrl-C leave; neither touches the run.
         assert_eq!(
-            live.apply_action(KeyAction::Nav(NavKey::Quit)),
+            live.apply_action(KeyAction::Nav(NavKey::Quit)).await,
             Some(Exit::Quit)
         );
         assert_eq!(
@@ -1964,7 +1964,7 @@ mod tests {
 
         // `Esc` on a parked run cannot pause it: a one-line notice says why,
         // and the record is untouched.
-        assert_eq!(live.apply_action(KeyAction::Nav(NavKey::Pause)), None);
+        assert_eq!(live.apply_action(KeyAction::Nav(NavKey::Pause)).await, None);
         let note = notice_text(&live).expect("a notice");
         assert!(note.contains("only a running run can be paused"), "{note}");
         assert_eq!(
@@ -1977,7 +1977,7 @@ mod tests {
         store
             .approve_gate("run_t", "other", Utc::now(), Some("gate_a"))
             .unwrap();
-        live.apply_action(KeyAction::Approve);
+        live.apply_action(KeyAction::Approve).await;
         let note = notice_text(&live).expect("a notice");
         assert!(note.starts_with("» approve failed:"), "{note}");
         assert!(
@@ -1993,8 +1993,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_gate_panel_replaces_the_feed_while_v_is_on_and_the_notice_stays_last() {
+    #[tokio::test]
+    async fn the_gate_panel_replaces_the_feed_while_v_is_on_and_the_notice_stays_last() {
         use crate::output::live_view::row::render_plain;
         let tmp = tempfile::tempdir().unwrap();
         let (mut live, _store) = parked_live(tmp.path());
@@ -2002,7 +2002,7 @@ mod tests {
         let plain = |lines: &[Line]| render_plain(lines);
 
         assert!(plain(&live.build_feed()).is_empty());
-        live.apply_action(KeyAction::ToggleDetails);
+        live.apply_action(KeyAction::ToggleDetails).await;
         live.set_notice("approved nothing", false);
         let feed = plain(&live.build_feed());
         assert!(feed.contains("⏸ gate_a · parked"), "{feed}");
@@ -2010,10 +2010,10 @@ mod tests {
         assert!(feed.ends_with("» approved nothing"), "{feed}");
 
         // Toggling off — or losing the gate's focus — restores the feed.
-        live.apply_action(KeyAction::ToggleDetails);
+        live.apply_action(KeyAction::ToggleDetails).await;
         assert!(!plain(&live.build_feed()).contains("gate_a"));
-        live.apply_action(KeyAction::ToggleDetails);
-        live.apply_action(KeyAction::Nav(NavKey::Up)); // off the gates
+        live.apply_action(KeyAction::ToggleDetails).await;
+        live.apply_action(KeyAction::Nav(NavKey::Up)).await; // off the gates
         live.ingest();
         assert!(!live.show_details);
     }

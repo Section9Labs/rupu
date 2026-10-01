@@ -26,6 +26,10 @@ pub struct AppState {
     /// Optional repo-lister port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs the registry-backed adapter via [`AppState::with_repos`].
     pub repos: Option<Arc<dyn crate::repos::RepoLister>>,
+    /// Optional model-catalog port (discovered model limits + manual
+    /// refetch). Defaults to `None`; rupu-cli's `cp serve` installs the
+    /// runtime-backed adapter via [`AppState::with_model_catalog`].
+    pub model_catalog: Option<Arc<dyn crate::model_catalog::ModelCatalog>>,
     /// Optional agent-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_agent_launcher`].
     pub agent_launcher: Option<Arc<dyn crate::agent_launcher::AgentLauncher>>,
@@ -84,6 +88,10 @@ pub struct AppState {
     /// contract that lets it skip re-walking every run store on every
     /// `/api/netflow` + `/api/netflow/explorer` request.
     pub run_meta_cache: Arc<crate::api::netflow::RunMetaCache>,
+    /// Each remote host's last health probe, so `GET /api/hosts` (polled by
+    /// the shell from every page) answers without waiting on SSH — see
+    /// [`crate::host::probe_cache`].
+    pub host_probes: Arc<crate::host::probe_cache::HostProbeCache<crate::api::hosts::RemoteProbe>>,
 }
 
 impl AppState {
@@ -130,6 +138,7 @@ impl AppState {
             launcher: None,
             session_sender: None,
             repos: None,
+            model_catalog: None,
             agent_launcher: None,
             session_starter: None,
             generator: None,
@@ -143,6 +152,7 @@ impl AppState {
             token_set: false,
             asn_cache: Arc::new(crate::api::netflow::AsnCache::default()),
             run_meta_cache: Arc::new(crate::api::netflow::RunMetaCache::default()),
+            host_probes: Arc::default(),
         }
     }
 
@@ -167,6 +177,15 @@ impl AppState {
     /// Install a repo-lister adapter (or clear it with `None`).
     pub fn with_repos(mut self, repos: Option<Arc<dyn crate::repos::RepoLister>>) -> Self {
         self.repos = repos;
+        self
+    }
+
+    /// Install a model-catalog adapter (or clear it with `None`).
+    pub fn with_model_catalog(
+        mut self,
+        catalog: Option<Arc<dyn crate::model_catalog::ModelCatalog>>,
+    ) -> Self {
+        self.model_catalog = catalog;
         self
     }
 

@@ -28,6 +28,7 @@ use crate::runner::{ItemResult, StepResult};
 use crate::workflow::TimeoutAction;
 use chrono::{DateTime, Utc};
 use rupu_providers::types::Message;
+use rupu_runtime::file_cache::{FileCache, FileCacheError};
 use rupu_runtime::{ArtifactManifest, RunEnvelope};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -836,6 +837,10 @@ pub enum RunStoreError {
     AlreadyExists(String),
     #[error("run `{0}` is not in a terminal state (cancel it first)")]
     NotTerminal(String),
+    /// A [`RunStore::blocking`] task did not complete: it panicked, or the
+    /// runtime cancelled it at shutdown.
+    #[error("run store task failed: {0}")]
+    TaskFailed(String),
 }
 
 /// A transcript some part of a run wrote to (live usage ledger discovery,
@@ -952,7 +957,9 @@ pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscrip
 /// Filesystem-backed run store. One root directory; one
 /// sub-directory per run. The store is stateless — every method
 /// reads/writes from disk, so concurrent CLIs sharing the same
-/// `<global>/runs/` see each other's updates.
+/// `<global>/runs/` see each other's updates. (`run.json` parses are
+/// reused across calls only while a fresh `stat` shows the file
+/// unchanged — see [`read_record`].)
 pub struct RunStore {
     pub root: PathBuf,
 }
@@ -966,6 +973,9 @@ pub struct RunStore {
 /// recurse without bound; it is deliberately far more generous than any
 /// real dispatch tree should ever reach.
 const MAX_SUB_RUN_RECURSION_DEPTH: u32 = 64;
+
+/// How long [`RunStore::lock_run_json`] waits for `run.json.lock`.
+const RUN_JSON_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RunStore {
     pub fn new(root: PathBuf) -> Self {
@@ -1457,12 +1467,12 @@ impl RunStore {
 
     /// Load a run by id.
     pub fn load(&self, run_id: &str) -> Result<RunRecord, RunStoreError> {
-        let path = self.run_json(run_id);
-        if !path.is_file() {
-            return Err(RunStoreError::NotFound(run_id.to_string()));
+        match read_record(&self.run_json(run_id)) {
+            Ok(Some(rec)) => Ok(RunRecord::clone(&rec)),
+            Ok(None) => Err(RunStoreError::NotFound(run_id.to_string())),
+            Err(FileCacheError::Io(e)) => Err(e.into()),
+            Err(FileCacheError::Parse(e)) => Err(e.into()),
         }
-        let body = std::fs::read(&path)?;
-        Ok(serde_json::from_slice(&body)?)
     }
 
     /// Update the top-level `run.json`. Used when status flips
@@ -1475,6 +1485,147 @@ impl RunStore {
         }
         write_atomic(&path, &serde_json::to_vec_pretty(record)?)?;
         Ok(())
+    }
+
+    /// Serialize a read-modify-write of `run.json` against another
+    /// process's (a `cancel` from the CLI or `cp serve` racing the runner's
+    /// own terminal flip) with an exclusive flock on `run.json.lock` next
+    /// to it. Both critical sections are a few local file operations, so
+    /// the wait is bounded by [`RUN_JSON_LOCK_WAIT`]: a holder stuck longer
+    /// than that is wedged, and the caller then proceeds unlocked (the
+    /// pre-lock behavior) rather than hanging — logged. The lock is held
+    /// while the returned file is alive.
+    ///
+    /// The wait blocks the calling thread (a polled non-blocking flock with
+    /// a short sleep), so the methods that take it (`cancel`, `pause`,
+    /// `reap_if_orphaned`, `update_unless_cancelled`,
+    /// `modify_unless_cancelled`, `modify_if_status`) are called from an
+    /// async context through [`RunStore::blocking`], never directly on a
+    /// runtime worker.
+    fn lock_run_json(&self, run_id: &str) -> Option<File> {
+        if !self.run_dir(run_id).is_dir() {
+            return None;
+        }
+        let path = self.run_dir(run_id).join("run.json.lock");
+        let file = match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not open the run lock");
+                return None;
+            }
+        };
+        let deadline = std::time::Instant::now() + RUN_JSON_LOCK_WAIT;
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Some(file),
+                Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "the run lock was held for more than {RUN_JSON_LOCK_WAIT:?}; proceeding without it"
+                        );
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not lock the run lock");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Write `record` unless the run was cancelled on disk in the meantime
+    /// — the runner's terminal flip (and its pause write), which must never
+    /// overwrite a `Cancelled` another process landed while the run was
+    /// finishing. Under the run lock the current record is re-read first.
+    /// Returns `Ok(true)` when `record` was written, `Ok(false)` when the
+    /// on-disk `Cancelled` was preserved and nothing was written.
+    pub fn update_unless_cancelled(&self, record: &RunRecord) -> Result<bool, RunStoreError> {
+        let _lock = self.lock_run_json(&record.id);
+        if let Ok(current) = self.load(&record.id) {
+            if current.status == RunStatus::Cancelled {
+                return Ok(false);
+            }
+        }
+        self.update(record)?;
+        Ok(true)
+    }
+
+    /// Load → `modify` → write `run.json`, under the run lock, unless the run
+    /// is `Cancelled` on disk: the writers that touch the record mid-run (the
+    /// active step, loop progress, a resumed run's pid) must never turn a
+    /// cancel that landed since their last look back into `Running`.
+    /// `modify` returns whether the record is to be written. Returns the
+    /// record after `modify` (written when it asked), or `None` when the
+    /// on-disk `Cancelled` was preserved — `modify` did not run and nothing
+    /// was written.
+    pub fn modify_unless_cancelled(
+        &self,
+        run_id: &str,
+        modify: impl FnOnce(&mut RunRecord) -> bool,
+    ) -> Result<Option<RunRecord>, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if record.status == RunStatus::Cancelled {
+            return Ok(None);
+        }
+        if modify(&mut record) {
+            self.update(&record)?;
+        }
+        Ok(Some(record))
+    }
+
+    /// Compare-and-swap on `run.json`: load → `modify` → write under the
+    /// run lock, only while the run's on-disk status is still `expected` —
+    /// the status the caller decided on. The CLI resume's flip to
+    /// `Running` uses it: a cancel (or another resume) that landed since
+    /// the caller looked must not be overwritten and must not let the run
+    /// start, while a run the caller loaded as `Cancelled` and resumes on
+    /// purpose still flips. Returns `Ok(Ok(record))` with what was written,
+    /// or `Ok(Err(current))` with the on-disk record when its status is no
+    /// longer `expected` — nothing written, `modify` not run. The wait
+    /// blocks its thread: async callers go through [`RunStore::blocking`].
+    pub fn modify_if_status(
+        &self,
+        run_id: &str,
+        expected: RunStatus,
+        modify: impl FnOnce(&mut RunRecord),
+    ) -> Result<Result<RunRecord, RunRecord>, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut record = self.load(run_id)?;
+        if record.status != expected {
+            return Ok(Err(record));
+        }
+        modify(&mut record);
+        self.update(&record)?;
+        Ok(Ok(record))
+    }
+
+    /// Run `f` with a handle to this store on the blocking pool — for the
+    /// async callers of the methods that take the run lock, whose bounded
+    /// wait would otherwise stall a runtime worker thread. A task that did
+    /// not complete (it panicked, or the runtime cancelled it at shutdown)
+    /// comes back as the closure's own error type, through
+    /// [`RunStoreError::TaskFailed`] — never as a panic on the caller's
+    /// thread.
+    pub async fn blocking<U, E, F>(&self, f: F) -> Result<U, E>
+    where
+        U: Send + 'static,
+        E: From<RunStoreError> + Send + 'static,
+        F: FnOnce(RunStore) -> Result<U, E> + Send + 'static,
+    {
+        let store = RunStore::new(self.root.clone());
+        match tokio::task::spawn_blocking(move || f(store)).await {
+            Ok(result) => result,
+            Err(join) => Err(E::from(RunStoreError::TaskFailed(join.to_string()))),
+        }
     }
 
     /// Append one completed step's record to `step_results.jsonl`.
@@ -1647,7 +1798,8 @@ impl RunStore {
     }
 
     /// Read run records from an arbitrary runs root (active or archive),
-    /// newest first. Shared by `list` / `list_archived`.
+    /// newest first. Shared by `list` / `list_archived`. Each `run.json` is
+    /// statted, and only re-read when it changed (see [`read_record`]).
     fn list_in(root: &std::path::Path) -> Result<Vec<RunRecord>, RunStoreError> {
         let mut out: Vec<RunRecord> = Vec::new();
         let rd = match std::fs::read_dir(root) {
@@ -1655,17 +1807,16 @@ impl RunStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e.into()),
         };
+        let mut seen = std::collections::HashSet::new();
         for entry in rd.flatten() {
             let p = entry.path().join("run.json");
-            if !p.is_file() {
-                continue;
-            }
-            if let Ok(body) = std::fs::read(&p) {
-                if let Ok(rec) = serde_json::from_slice::<RunRecord>(&body) {
-                    out.push(rec);
-                }
+            if let Ok(Some(rec)) = read_record(&p) {
+                out.push(RunRecord::clone(&rec));
+                seen.insert(p);
             }
         }
+        // Forget records this root no longer holds (deleted / archived runs).
+        record_cache().retain(|p| !p.starts_with(root) || seen.contains(p));
         out.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(out)
     }
@@ -2161,6 +2312,18 @@ pub enum CancelError {
     NotFound(String),
     #[error("store: {0}")]
     Store(String),
+}
+
+/// A store failure inside a locked cancel (including a
+/// [`RunStore::blocking`] task that did not complete) is reported as this
+/// error, a missing run as `NotFound`.
+impl From<RunStoreError> for CancelError {
+    fn from(e: RunStoreError) -> Self {
+        match e {
+            RunStoreError::NotFound(id) => CancelError::NotFound(id),
+            other => CancelError::Store(other.to_string()),
+        }
+    }
 }
 
 impl RunStore {
@@ -2803,6 +2966,9 @@ impl RunStore {
         reason: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<CancelOutcome, CancelError> {
+        // Held across load → write, against the runner's own terminal flip
+        // (`update_unless_cancelled`) in its process.
+        let _lock = self.lock_run_json(run_id);
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => CancelError::NotFound(s),
             other => CancelError::Store(other.to_string()),
@@ -2883,6 +3049,13 @@ impl RunStore {
     /// Returns `Ok(true)` when it reaped the run, `Ok(false)` as a
     /// no-op otherwise (including for `Paused` and any terminal
     /// status).
+    ///
+    /// `record` is what the caller listed earlier; the decision is made
+    /// again from what the disk holds, under the run lock, so a cancel (or
+    /// a pid hand-off) that landed since is preserved — never overwritten
+    /// with `Failed`. `record` is brought up to date with the disk either
+    /// way. The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
     pub fn reap_if_orphaned(
         &self,
         record: &mut RunRecord,
@@ -2891,31 +3064,41 @@ impl RunStore {
         if !matches!(record.status, RunStatus::Pending | RunStatus::Running) {
             return Ok(false);
         }
-        let Some(pid) = record.runner_pid else {
-            return Ok(false);
-        };
-        if pid_is_running(pid) {
+        if record.runner_pid.is_none_or(pid_is_running) {
             return Ok(false);
         }
+        let _lock = self.lock_run_json(&record.id);
+        let mut current = self.load(&record.id)?;
+        let orphaned_pid = match current.status {
+            RunStatus::Pending | RunStatus::Running => {
+                current.runner_pid.filter(|pid| !pid_is_running(*pid))
+            }
+            _ => None,
+        };
+        let Some(pid) = orphaned_pid else {
+            *record = current;
+            return Ok(false);
+        };
         let error =
             format!("runner process {pid} is no longer alive; run marked failed by the gate sweep");
-        record.status = RunStatus::Failed;
-        record.finished_at = Some(now);
-        record.error_message = Some(error.clone());
-        record.runner_pid = None;
-        record.active_step_id = None;
-        record.active_step_kind = None;
-        record.active_step_agent = None;
-        record.active_step_transcript_path = None;
-        self.update(record)?;
+        current.status = RunStatus::Failed;
+        current.finished_at = Some(now);
+        current.error_message = Some(error.clone());
+        current.runner_pid = None;
+        current.active_step_id = None;
+        current.active_step_kind = None;
+        current.active_step_agent = None;
+        current.active_step_transcript_path = None;
+        self.update(&current)?;
         self.append_terminal_event(
-            &record.id,
+            &current.id,
             &crate::executor::Event::RunFailed {
-                run_id: record.id.clone(),
+                run_id: current.id.clone(),
                 error,
                 finished_at: now,
             },
         );
+        *record = current;
         Ok(true)
     }
 
@@ -2927,7 +3110,7 @@ impl RunStore {
     /// later continue it. `awaiting_step_id` is best-effort copied from
     /// `active_step_id` (if any) purely for observability — the actual
     /// resume-with-seed decision is driven by
-    /// [`read_paused_seed`](Self::read_paused_seed), not this field.
+    /// [`read_paused_seeds`](Self::read_paused_seeds), not this field.
     ///
     /// # Delivery
     ///
@@ -2950,11 +3133,17 @@ impl RunStore {
     ///   token is threaded into `run_workflow` (no marker needed).
     ///
     /// Both paths genuinely interrupt at the next safe boundary.
+    ///
+    /// The load → write runs under the run lock, so a cancel that lands
+    /// while the pause is deciding is seen (refused as already terminal)
+    /// and never overwritten with `Paused`. The wait blocks its thread:
+    /// async callers go through [`RunStore::blocking`].
     pub fn pause(
         &self,
         run_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), PauseError> {
+        let _lock = self.lock_run_json(run_id);
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => PauseError::NotFound(s),
             other => PauseError::Store(other.to_string()),
@@ -3006,14 +3195,64 @@ impl RunStore {
         Ok(serde_json::from_slice(&body)?)
     }
 
-    /// Best-effort remove the paused-step seed sidecar (idempotent — a
-    /// missing file is not an error). Called once the seed has been
-    /// consumed by a resume, and defensively when a run reaches a terminal
-    /// state, so a later unrelated pause never sees a stale seed.
-    pub fn clear_paused_seed(&self, run_id: &str) -> Result<(), RunStoreError> {
-        let path = self.paused_seed_path(run_id);
+    fn paused_seeds_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("paused_seeds.json")
+    }
+
+    /// Persist the seed transcript of EVERY step that paused mid-turn
+    /// (keyed by step id) — a DAG run's manual-pause drain can catch
+    /// several concurrent steps pausing at once, which the single
+    /// [`write_paused_seed`](Self::write_paused_seed) sidecar (paired with
+    /// `RunRecord.awaiting_step_id`) can't hold. `run_workflow` writes
+    /// both: this one for [`read_paused_seeds`](Self::read_paused_seeds),
+    /// the single primary seed for a binary that predates it.
+    pub fn write_paused_seeds(
+        &self,
+        run_id: &str,
+        seeds: &std::collections::BTreeMap<String, Vec<Message>>,
+    ) -> Result<(), RunStoreError> {
+        write_atomic(&self.paused_seeds_path(run_id), &serde_json::to_vec(seeds)?)?;
+        Ok(())
+    }
+
+    /// Every persisted mid-turn seed, keyed by step id. Prefers the
+    /// multi-step `paused_seeds.json`; when absent (a run paused by a
+    /// binary that predates it), falls back to the legacy single
+    /// `paused_seed.json`, attributed to `legacy_step_id` (the record's
+    /// `awaiting_step_id`). Empty — not an error — when neither exists, the
+    /// common case for a step-boundary pause.
+    pub fn read_paused_seeds(
+        &self,
+        run_id: &str,
+        legacy_step_id: Option<&str>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<Message>>, RunStoreError> {
+        let path = self.paused_seeds_path(run_id);
         if path.is_file() {
-            std::fs::remove_file(&path)?;
+            let body = std::fs::read(&path)?;
+            return Ok(serde_json::from_slice(&body)?);
+        }
+        let seed = self.read_paused_seed(run_id)?;
+        Ok(match legacy_step_id {
+            Some(step_id) if !seed.is_empty() => {
+                std::collections::BTreeMap::from([(step_id.to_string(), seed)])
+            }
+            _ => std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Best-effort remove the paused-step seed sidecars — both the legacy
+    /// single seed and the multi-step map (idempotent — a missing file is
+    /// not an error). Called once the seeds have been consumed by a resume,
+    /// and defensively when a run reaches a terminal state, so a later
+    /// unrelated pause never sees a stale seed.
+    pub fn clear_paused_seed(&self, run_id: &str) -> Result<(), RunStoreError> {
+        for path in [
+            self.paused_seed_path(run_id),
+            self.paused_seeds_path(run_id),
+        ] {
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
         }
         Ok(())
     }
@@ -3079,6 +3318,18 @@ pub enum PauseError {
     Store(String),
 }
 
+/// A store failure inside a locked pause (including a
+/// [`RunStore::blocking`] task that did not complete) is reported as this
+/// error, a missing run as `NotFound`.
+impl From<RunStoreError> for PauseError {
+    fn from(e: RunStoreError) -> Self {
+        match e {
+            RunStoreError::NotFound(id) => PauseError::NotFound(id),
+            other => PauseError::Store(other.to_string()),
+        }
+    }
+}
+
 /// True when `pid` names a live process on this machine.
 ///
 /// A `kill(pid, 0)` syscall (rustix's safe `test_kill_process` wrapper —
@@ -3139,6 +3390,24 @@ pub fn terminate_pid(pid: u32) -> bool {
 /// as the canonical never-alive pid and land here.
 fn rustix_pid(pid: u32) -> Option<rustix::process::Pid> {
     rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)
+}
+
+/// Every `run.json` parse, process-wide (CP endpoints, the resume worker and
+/// the gate sweep all list the same store over and over), reused while the
+/// file is unchanged on disk.
+fn record_cache() -> &'static FileCache<RunRecord> {
+    static CACHE: std::sync::OnceLock<FileCache<RunRecord>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(FileCache::default)
+}
+
+/// The run record at `path`: `Ok(None)` when there is no `run.json` there.
+/// Statted on every call; read and parsed only when it changed since the
+/// last read, so listing thousands of finished runs costs a `stat` each, not
+/// an `open`.
+fn read_record(
+    path: &Path,
+) -> Result<Option<std::sync::Arc<RunRecord>>, FileCacheError<serde_json::Error>> {
+    record_cache().read(path, |body| serde_json::from_slice::<RunRecord>(body))
 }
 
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
@@ -3793,6 +4062,41 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1, "broken run dir should be skipped");
         assert_eq!(listed[0].id, "run_ok");
+    }
+
+    /// `run.json` parses are reused across calls, so every write path must
+    /// still show through `list` and `load`: an update, a hand overwrite, a
+    /// file turned garbage, and a deleted run.
+    #[test]
+    fn list_and_load_see_every_rewrite_and_removal() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_rw");
+        store.create(rec.clone(), "x").unwrap();
+        for _ in 0..2 {
+            assert_eq!(store.list().unwrap()[0].status, RunStatus::Pending);
+        }
+
+        rec.status = RunStatus::Running;
+        store.update(&rec).unwrap();
+        assert_eq!(store.list().unwrap()[0].status, RunStatus::Running);
+        assert_eq!(store.load("run_rw").unwrap().status, RunStatus::Running);
+
+        rec.status = RunStatus::Failed;
+        let json = tmp.path().join("run_rw").join("run.json");
+        std::fs::write(&json, serde_json::to_vec_pretty(&rec).unwrap()).unwrap();
+        assert_eq!(store.load("run_rw").unwrap().status, RunStatus::Failed);
+
+        std::fs::write(&json, "not json").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(matches!(store.load("run_rw"), Err(RunStoreError::Json(_))));
+
+        std::fs::remove_dir_all(tmp.path().join("run_rw")).unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(matches!(
+            store.load("run_rw"),
+            Err(RunStoreError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -5174,7 +5478,7 @@ mod tests {
         // The crux of T4: a mid-step manual pause's seed transcript must
         // survive a process restart (the CP-driven resume worker spawns a
         // FRESH `rupu workflow resume` subprocess) so the resume can
-        // reconstruct `ResumeState::paused_step` from disk, not memory.
+        // reconstruct `ResumeState::paused_steps` from disk, not memory.
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = sample_record("run_seed");
@@ -5199,6 +5503,47 @@ mod tests {
         // Clearing an already-cleared (or never-written) seed is a no-op,
         // not an error.
         store.clear_paused_seed(&rec.id).unwrap();
+    }
+
+    #[test]
+    fn paused_seeds_round_trip_and_fall_back_to_the_legacy_single_seed() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_seeds");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store
+            .read_paused_seeds(&rec.id, Some("a"))
+            .unwrap()
+            .is_empty());
+
+        // A run paused by a binary that only wrote the legacy single seed:
+        // attributed to the record's `awaiting_step_id`.
+        let legacy = vec![Message::user("legacy")];
+        store.write_paused_seed(&rec.id, &legacy).unwrap();
+        let read = store.read_paused_seeds(&rec.id, Some("a")).unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["a"]);
+        assert!(store.read_paused_seeds(&rec.id, None).unwrap().is_empty());
+
+        // The multi-step map wins over the legacy file once present.
+        let seeds = BTreeMap::from([
+            ("a".to_string(), vec![Message::user("a")]),
+            (
+                "b".to_string(),
+                vec![Message::user("b"), Message::assistant("b1")],
+            ),
+        ]);
+        store.write_paused_seeds(&rec.id, &seeds).unwrap();
+        let read = store.read_paused_seeds(&rec.id, Some("a")).unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(read["b"].len(), 2);
+
+        // Clearing removes BOTH sidecars.
+        store.clear_paused_seed(&rec.id).unwrap();
+        assert!(store
+            .read_paused_seeds(&rec.id, Some("a"))
+            .unwrap()
+            .is_empty());
+        assert!(store.read_paused_seed(&rec.id).unwrap().is_empty());
     }
 
     #[test]
@@ -5431,6 +5776,351 @@ mod tests {
         assert!(reloaded.active_step_agent.is_none());
         assert!(reloaded.awaiting_step_id.is_none());
         assert!(reloaded.approval_prompt.is_none());
+    }
+
+    /// The runner's terminal flip must not overwrite a cancel that landed
+    /// on disk (from another process) while the run was finishing.
+    #[test]
+    fn a_terminal_update_preserves_an_on_disk_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_vs_done");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = None;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        store
+            .cancel(&rec.id, "matt", "stop it", Utc::now())
+            .unwrap();
+
+        // The runner's stale in-memory record, about to be flipped.
+        let mut done = rec.clone();
+        done.status = RunStatus::Completed;
+        done.finished_at = Some(Utc::now());
+        assert!(
+            !store.update_unless_cancelled(&done).unwrap(),
+            "the cancel is preserved, nothing written"
+        );
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+
+        // Not cancelled: the write goes through as before.
+        let mut plain = sample_record("run_done_plain");
+        plain.status = RunStatus::Running;
+        store.create(plain.clone(), SAMPLE_YAML).unwrap();
+        plain.status = RunStatus::Completed;
+        assert!(store.update_unless_cancelled(&plain).unwrap());
+        assert_eq!(store.load(&plain.id).unwrap().status, RunStatus::Completed);
+    }
+
+    /// The mid-run writers (active step, loop progress, a resumed run's
+    /// pid) load → modify → write under the run lock, and a `Cancelled`
+    /// that landed on disk is preserved: the closure never runs and
+    /// nothing is written — a cancel is not reset to `Running`.
+    #[test]
+    fn a_mid_run_modify_preserves_an_on_disk_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_modify_vs_cancel");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = None;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        // Running: the modification lands, and the written record comes back.
+        let written = store
+            .modify_unless_cancelled(&rec.id, |r| {
+                r.active_step_id = Some("step-a".into());
+                true
+            })
+            .unwrap()
+            .expect("not cancelled");
+        assert_eq!(written.active_step_id.as_deref(), Some("step-a"));
+        assert_eq!(
+            store.load(&rec.id).unwrap().active_step_id.as_deref(),
+            Some("step-a")
+        );
+
+        // The closure can decline the write (nothing changed on disk).
+        let unchanged = store
+            .modify_unless_cancelled(&rec.id, |r| {
+                r.active_step_id = None;
+                false
+            })
+            .unwrap()
+            .expect("not cancelled");
+        assert_eq!(unchanged.active_step_id, None, "the closure's view");
+        assert_eq!(
+            store.load(&rec.id).unwrap().active_step_id.as_deref(),
+            Some("step-a"),
+            "declined: not written"
+        );
+
+        // Cancelled on disk since the writer's last look: preserved.
+        store
+            .cancel(&rec.id, "matt", "stop it", Utc::now())
+            .unwrap();
+        let ran = std::cell::Cell::new(false);
+        let preserved = store
+            .modify_unless_cancelled(&rec.id, |r| {
+                ran.set(true);
+                r.status = RunStatus::Running;
+                true
+            })
+            .unwrap();
+        assert!(preserved.is_none(), "the cancel wins");
+        assert!(!ran.get(), "the closure never ran");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+        assert_eq!(reloaded.active_step_id, None, "the cancel cleared it");
+
+        // A missing run is an error, not a silent no-op.
+        assert!(matches!(
+            store.modify_unless_cancelled("run_missing", |_| true),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// The flip and a concurrent cancel serialize on `run.json.lock`: a
+    /// cancel holding the lock lands first, and the flip — which waited for
+    /// it — then sees it and preserves it.
+    #[test]
+    fn a_terminal_update_waits_for_a_cancel_holding_the_run_lock() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_lock_wait");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let lock_path = store.run_dir(&rec.id).join("run.json.lock");
+        let other_store = RunStore::new(tmp.path().to_path_buf());
+        let mut cancelled = rec.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        // Another process: holds the lock, writes its cancel 300ms later,
+        // then releases.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other_store.update(&cancelled).unwrap();
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+        let mut done = rec.clone();
+        done.status = RunStatus::Completed;
+        let started = std::time::Instant::now();
+        let written = store.update_unless_cancelled(&done).unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the holder ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert!(!written, "the cancel that landed under the lock wins");
+        assert_eq!(store.load(&rec.id).unwrap().status, RunStatus::Cancelled);
+    }
+
+    /// The wait for the run lock is bounded: a wedged holder delays the flip
+    /// by [`RUN_JSON_LOCK_WAIT`], after which it proceeds unlocked.
+    #[test]
+    fn a_wedged_run_lock_holder_does_not_block_the_flip_forever() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_lock_wedged");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(store.run_dir(&rec.id).join("run.json.lock"))
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let mut done = rec.clone();
+        done.status = RunStatus::Completed;
+        let started = std::time::Instant::now();
+        assert!(store.update_unless_cancelled(&done).unwrap());
+        let waited = started.elapsed();
+        assert!(
+            waited >= RUN_JSON_LOCK_WAIT && waited < RUN_JSON_LOCK_WAIT * 3,
+            "bounded by the lock wait: {waited:?}"
+        );
+        assert_eq!(store.load(&rec.id).unwrap().status, RunStatus::Completed);
+    }
+
+    /// `pause` and a concurrent cancel serialize on `run.json.lock`: a
+    /// cancel holding the lock lands first, and the pause — which waited
+    /// for it — then finds the run terminal, refuses, and writes nothing.
+    #[test]
+    fn a_pause_waits_for_a_cancel_holding_the_run_lock_and_never_overwrites_it() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_pause_vs_cancel");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let lock_path = store.run_dir(&rec.id).join("run.json.lock");
+        let other_store = RunStore::new(tmp.path().to_path_buf());
+        let mut cancelled = rec.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        // Another process: holds the lock, writes its cancel 300ms later,
+        // then releases.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other_store.update(&cancelled).unwrap();
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let err = store.pause(&rec.id, Utc::now()).unwrap_err();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the holder ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert!(
+            matches!(err, PauseError::AlreadyTerminal(RunStatus::Cancelled)),
+            "the cancel that landed under the lock wins: {err:?}"
+        );
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+        assert!(
+            !store.pause_marker_exists(&rec.id),
+            "nothing of the pause landed"
+        );
+    }
+
+    /// The gate sweep reaps from a record it listed earlier. A cancel that
+    /// landed since is what the disk holds: re-read under the run lock, it
+    /// is preserved — no `Failed`, no second terminal event — and the
+    /// caller's copy is brought up to date.
+    #[test]
+    fn a_reap_preserves_an_on_disk_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let dead_pid = u32::MAX;
+        assert!(!pid_is_running(dead_pid));
+        let mut rec = sample_record("run_reap_vs_cancel");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = Some(dead_pid);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        // What the sweep holds; the cancel lands after it listed the run.
+        let mut listed = store.load(&rec.id).unwrap();
+        store
+            .cancel(&rec.id, "operator", "stop it", Utc::now())
+            .unwrap();
+
+        let reaped = store.reap_if_orphaned(&mut listed, Utc::now()).unwrap();
+        assert!(!reaped, "a cancelled run is not an orphan");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+        assert!(
+            matches!(
+                last_event(&store, &rec.id),
+                crate::executor::Event::RunCompleted {
+                    status: RunStatus::Cancelled,
+                    ..
+                }
+            ),
+            "the cancel's terminal event stays the last one"
+        );
+        assert_eq!(
+            listed.status,
+            RunStatus::Cancelled,
+            "the caller's copy follows the disk"
+        );
+    }
+
+    /// A blocking-pool task that did not complete — it panicked, or the
+    /// runtime cancelled it at shutdown — is an error to the caller, never
+    /// a panic on the runtime thread.
+    #[tokio::test]
+    async fn blocking_maps_a_task_that_did_not_complete_to_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let out: Result<(), RunStoreError> = store
+            .blocking(|_| -> Result<(), RunStoreError> { panic!("boom") })
+            .await;
+        match out {
+            Err(e) => assert!(
+                e.to_string().contains("run store task failed") && e.to_string().contains("panic"),
+                "says what happened: {e}"
+            ),
+            Ok(()) => panic!("the task never completed; expected an error"),
+        }
+    }
+
+    /// The resume's flip is a compare-and-swap: it writes only while the
+    /// run still has the status it was loaded with. A `Paused` run flips
+    /// to `Running`; one that was cancelled since is handed back as it is
+    /// on disk, untouched, and a run loaded as `Cancelled` and resumed on
+    /// purpose flips too.
+    #[test]
+    fn modify_if_status_writes_only_while_the_status_is_as_expected() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cas_flip");
+        rec.status = RunStatus::Paused;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let flipped = store
+            .modify_if_status(&rec.id, RunStatus::Paused, |r| {
+                r.status = RunStatus::Running;
+                r.runner_pid = Some(4242);
+            })
+            .unwrap()
+            .expect("still paused: written");
+        assert_eq!(flipped.status, RunStatus::Running);
+        assert_eq!(store.load(&rec.id).unwrap().runner_pid, Some(4242));
+
+        // A cancel landed since the caller loaded it as `Paused`.
+        store
+            .cancel(&rec.id, "operator", "stop it", Utc::now())
+            .unwrap();
+        let ran = std::cell::Cell::new(false);
+        let current = store
+            .modify_if_status(&rec.id, RunStatus::Paused, |_| ran.set(true))
+            .unwrap()
+            .expect_err("cancelled since: not written");
+        assert!(!ran.get(), "the closure never ran");
+        assert_eq!(current.status, RunStatus::Cancelled);
+        assert_eq!(current.error_message.as_deref(), Some("stop it"));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.runner_pid, None, "untouched");
+
+        // Resumed on purpose: loaded as `Cancelled`, expected `Cancelled`.
+        let flipped = store
+            .modify_if_status(&rec.id, RunStatus::Cancelled, |r| {
+                r.status = RunStatus::Running;
+            })
+            .unwrap()
+            .expect("an explicit resume of a cancelled run flips");
+        assert_eq!(flipped.status, RunStatus::Running);
+
+        assert!(matches!(
+            store.modify_if_status("run_missing", RunStatus::Paused, |_| {}),
+            Err(RunStoreError::NotFound(_))
+        ));
     }
 
     #[test]

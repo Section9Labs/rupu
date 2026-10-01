@@ -12,7 +12,7 @@
 
 `rupu auth login --provider github --mode sso` prints a verification URL +
 user-code, opens https://github.com/login/device, prompts for the code, stores
-the access token in keychain.
+the access token in `~/.rupu/auth.json`.
 
 ## Sample agent
 
@@ -38,7 +38,11 @@ Run: `rupu run review-pr github:section9labs/rupu#42`
 - **GraphQL**: rupu uses REST only in v0; some queries (e.g. cross-org search)
   aren't reachable. Filed as out-of-scope.
 - **GHES**: set `[scm.github].base_url = "https://ghes.example.com/api/v3"`.
-  No code changes required.
+  API calls (issues, PRs, file reads, workflow dispatch) need nothing else, but
+  rupu can't clone from a GHES host yet: its GitHub clone URLs always point at
+  github.com (see `TODO.md`), which would receive the account's token, so
+  `clone_to` (`rupu run` / session repo targets) refuses with an error for such
+  an account. Clone the repository with `git` directly.
 - **Workflow dispatch**: requires `workflow` scope on the PAT *and* the workflow
   file must contain `on: workflow_dispatch:`. rupu surfaces 422 as
   `BadRequest { message: "workflow not configured for dispatch" }`.
@@ -46,4 +50,4 @@ Run: `rupu run review-pr github:section9labs/rupu#42`
 ## See also
 
 - `docs/scm.md` — canonical reference
-- `docs/providers/github.md` — Copilot LLM provider (separate keychain entry)
+- `docs/providers/github.md` — Copilot LLM provider (separate credential entry)

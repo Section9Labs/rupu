@@ -20,21 +20,41 @@ use tracing::debug;
 use crate::error::{classify_scm_error, ScmError};
 use crate::event_connector::{EventConnector, EventPollResult, PolledEvent};
 use crate::platform::Platform;
+use crate::token::TokenSource;
 use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 
 pub struct GitlabEventConnector {
     http: reqwest_middleware::ClientWithMiddleware,
-    token: String,
+    /// Asked before every poll: an OAuth token is refreshed through the
+    /// credential store when it nears expiry (see [`TokenSource`]).
+    token: std::sync::Arc<TokenSource>,
+    /// API root, default `https://gitlab.com/api/v4` — the same
+    /// interpretation of `[scm.gitlab].base_url` as `GitlabClient`.
     base_url: String,
 }
 
 impl GitlabEventConnector {
+    /// A connector polling with `token` as-is.
     pub fn new(
         token: String,
         base_url: Option<String>,
         sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
-        let base_url = base_url.unwrap_or_else(|| "https://gitlab.com".to_string());
+        Self::with_token_source(
+            std::sync::Arc::new(TokenSource::fixed(Platform::Gitlab, token)),
+            base_url,
+            sink,
+        )
+    }
+
+    /// [`Self::new`] with the credential behind `token`, which keeps an
+    /// OAuth token current.
+    pub fn with_token_source(
+        token: std::sync::Arc<TokenSource>,
+        base_url: Option<String>,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        let base_url = base_url.unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
         Self {
             // Infallible constructor (`-> Self`); `.expect()` preserves the
             // deleted `http::client()` fallback's panic-on-failure behaviour.
@@ -48,6 +68,41 @@ impl GitlabEventConnector {
             token,
             base_url,
         }
+    }
+}
+
+impl GitlabEventConnector {
+    /// GET `url` with the current token. A 401 for an OAuth token is
+    /// retried once with its replacement from the store — a
+    /// `rupu auth login` or another process's refresh since this poller
+    /// last read it.
+    async fn get_authed(&self, url: &str) -> Result<reqwest::Response, ScmError> {
+        let token = self.token.token().await?;
+        let resp = self.get_with(url, &token).await?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        match self.token.replacement_for(&token).await? {
+            Some(fresh) => self.get_with(url, &fresh).await,
+            None => Ok(resp),
+        }
+    }
+
+    async fn get_with(&self, url: &str, token: &str) -> Result<reqwest::Response, ScmError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("rupu/0"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| ScmError::Transient(anyhow::anyhow!("invalid token: {e}")))?,
+        );
+        self.http
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ScmError::Network(anyhow::anyhow!("gitlab events GET {url}: {e}")))
     }
 }
 
@@ -90,28 +145,13 @@ impl EventConnector for GitlabEventConnector {
             .format("%Y-%m-%d")
             .to_string();
         let url = format!(
-            "{}/api/v4/projects/{}/events?after={}&per_page=100&sort=asc",
+            "{}/projects/{}/events?after={}&per_page=100&sort=asc",
             self.base_url.trim_end_matches('/'),
             project_id_enc,
             after_date,
         );
 
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("rupu/0"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token))
-                .map_err(|e| ScmError::Transient(anyhow::anyhow!("invalid token: {e}")))?,
-        );
-
-        let resp = self
-            .http
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| ScmError::Network(anyhow::anyhow!("gitlab events GET {url}: {e}")))?;
+        let resp = self.get_authed(&url).await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -330,17 +370,20 @@ pub async fn try_build(
         Ok((_mode, creds)) => creds,
         Err(_) => return Ok(None),
     };
-    let token = match creds {
-        rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
-        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
-    };
+    let token = std::sync::Arc::new(TokenSource::resolved(
+        resolver,
+        Platform::Gitlab,
+        account,
+        creds,
+    ));
     let base_url = cfg
         .scm
         .platforms
         .get(account)
         .and_then(|p| p.base_url.clone());
-    let connector: std::sync::Arc<dyn EventConnector> =
-        std::sync::Arc::new(GitlabEventConnector::new(token, base_url, sink));
+    let connector: std::sync::Arc<dyn EventConnector> = std::sync::Arc::new(
+        GitlabEventConnector::with_token_source(token, base_url, sink),
+    );
     Ok(Some(connector))
 }
 
@@ -397,6 +440,18 @@ mod tests {
         let r = c.poll_events(&source, None, 50).await.unwrap();
         assert_eq!(r.events.len(), 0);
         assert!(r.next_cursor.contains("since:"));
+    }
+
+    /// Default must match `GitlabClient`'s API-root default, so a user
+    /// with no `base_url` polls the same `https://gitlab.com/api/v4/...`.
+    #[test]
+    fn default_base_url_is_the_api_root() {
+        let c = GitlabEventConnector::new(
+            "fake".into(),
+            None,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
+        assert_eq!(c.base_url, "https://gitlab.com/api/v4");
     }
 
     #[test]

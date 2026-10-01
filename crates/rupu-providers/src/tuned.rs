@@ -62,12 +62,10 @@ impl ThrottledProvider {
 #[async_trait]
 impl LlmProvider for ThrottledProvider {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-        let _permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}")))?;
+        let _permit =
+            self.semaphore.clone().acquire_owned().await.map_err(|e| {
+                ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}"))
+            })?;
         self.inner.send(request).await
     }
 
@@ -76,12 +74,10 @@ impl LlmProvider for ThrottledProvider {
         request: &LlmRequest,
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<LlmResponse, ProviderError> {
-        let _permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}")))?;
+        let _permit =
+            self.semaphore.clone().acquire_owned().await.map_err(|e| {
+                ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}"))
+            })?;
         self.inner.stream(request, on_event).await
     }
 
@@ -100,6 +96,14 @@ impl LlmProvider for ThrottledProvider {
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
         self.inner.list_models().await
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.inner.fetch_models().await
+    }
+
+    fn output_shares_context(&self) -> bool {
+        self.inner.output_shares_context()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -111,10 +115,17 @@ impl LlmProvider for ThrottledProvider {
 /// auth failure, or a malformed request is permanent — retrying it just burns
 /// the user's time.
 pub fn is_retryable(e: &ProviderError) -> bool {
+    // Anthropic's extra-usage 429 is triggered by the 1M-context beta header,
+    // not by load: the same request is refused on every attempt. Surface it
+    // at once (the Anthropic client turns a beta-carrying one into
+    // `LongContextUnavailable`, which the agent runner falls back on).
+    if e.is_long_context_refusal() {
+        return false;
+    }
     match e {
-        ProviderError::RateLimited { .. } | ProviderError::Transient(_) | ProviderError::Http(_) => {
-            true
-        }
+        ProviderError::RateLimited { .. }
+        | ProviderError::Transient(_)
+        | ProviderError::Http(_) => true,
         ProviderError::Api { status, .. } => *status == 429 || *status == 529 || *status >= 500,
         _ => false,
     }
@@ -252,6 +263,14 @@ impl LlmProvider for RetryingProvider {
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
         self.inner.list_models().await
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.inner.fetch_models().await
+    }
+
+    fn output_shares_context(&self) -> bool {
+        self.inner.output_shares_context()
+    }
 }
 
 #[cfg(test)]
@@ -266,7 +285,7 @@ mod tests {
             model: "m".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -318,7 +337,8 @@ mod tests {
     impl LlmProvider for Probe {
         async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
             if let Some(s) = &self.semaphore {
-                self.permits_seen.store(s.available_permits(), Ordering::SeqCst);
+                self.permits_seen
+                    .store(s.available_permits(), Ordering::SeqCst);
             }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
@@ -594,10 +614,30 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// Anthropic's long-context entitlement 429 is not a rate limit: the same
+    /// request is refused the same way every time, so it surfaces at once for
+    /// the agent runner to treat as an overflow. Other 429s still retry.
+    #[test]
+    fn long_context_entitlement_429_is_not_retryable() {
+        assert!(!is_retryable(&ProviderError::Api {
+            status: 429,
+            message: r#"{"error":{"message":"Extra usage is required for long context requests"}}"#
+                .into(),
+        }));
+        assert!(is_retryable(&ProviderError::Api {
+            status: 429,
+            message: r#"{"error":{"type":"rate_limit_error"}}"#.into(),
+        }));
+    }
+
     #[test]
     fn retryability_matches_the_documented_error_classes() {
-        assert!(is_retryable(&ProviderError::RateLimited { retry_after: None }));
-        assert!(is_retryable(&ProviderError::Transient(anyhow::anyhow!("x"))));
+        assert!(is_retryable(&ProviderError::RateLimited {
+            retry_after: None
+        }));
+        assert!(is_retryable(&ProviderError::Transient(anyhow::anyhow!(
+            "x"
+        ))));
         assert!(is_retryable(&ProviderError::Api {
             status: 503,
             message: String::new()
@@ -797,5 +837,52 @@ mod tests {
         let models = stacked.list_models().await;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "probe-model");
+    }
+
+    // ── decorators forward fetch_models and output_shares_context ─────────
+
+    #[tokio::test]
+    async fn decorators_forward_fetch_models_and_output_shares_context() {
+        struct Independent;
+        #[async_trait]
+        impl LlmProvider for Independent {
+            async fn send(
+                &mut self,
+                _: &crate::types::LlmRequest,
+            ) -> Result<crate::types::LlmResponse, ProviderError> {
+                unreachable!()
+            }
+            async fn stream(
+                &mut self,
+                _: &crate::types::LlmRequest,
+                _: &mut (dyn FnMut(crate::types::StreamEvent) + Send),
+            ) -> Result<crate::types::LlmResponse, ProviderError> {
+                unreachable!()
+            }
+            fn default_model(&self) -> &str {
+                "m"
+            }
+            fn provider_id(&self) -> ProviderId {
+                ProviderId::GithubCopilot
+            }
+            async fn fetch_models(
+                &mut self,
+            ) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+                Ok(vec![])
+            }
+            fn output_shares_context(&self) -> bool {
+                false
+            }
+        }
+        let mut t =
+            RetryingProvider::new(Box::new(Independent), 0).with_backoff(|_| Duration::ZERO);
+        assert!(!t.output_shares_context());
+        assert!(t.fetch_models().await.unwrap().is_empty());
+
+        let tuning = ProviderTuning::for_provider("decorator-forward-test");
+        let mut th =
+            ThrottledProvider::wrap(Box::new(Independent), "decorator-forward-test", &tuning);
+        assert!(!th.output_shares_context());
+        assert!(th.fetch_models().await.unwrap().is_empty());
     }
 }

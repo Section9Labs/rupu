@@ -438,6 +438,19 @@ impl RepoConnector for GithubRepoConnector {
     }
 
     async fn clone_to(&self, r: &RepoRef, dir: &std::path::Path) -> Result<(), ScmError> {
+        // Clone URLs always name github.com: for a GitHub Enterprise account
+        // that would send its token to github.com (HTTPS), or clone whatever
+        // github.com has at the same path (SSH).
+        if let Some(instance) = self.client.enterprise_host() {
+            return Err(ScmError::BadRequest {
+                message: format!(
+                    "can't clone {}/{} from {instance}: rupu's GitHub clone URLs always \
+                     point at github.com (GitHub Enterprise clone hosts aren't supported yet), \
+                     which would receive this account's token; clone it with git directly",
+                    r.owner, r.repo
+                ),
+            });
+        }
         let protocol = self.client.clone_protocol();
         let url = crate::client_options::clone_url(
             GITHUB_CLONE_HOST,
@@ -452,7 +465,8 @@ impl RepoConnector for GithubRepoConnector {
 }
 
 /// Clone host for github.com. Self-hosted GHES clone URLs are a separate gap
-/// (clone paths ignore `[scm.github].base_url`) tracked in `TODO.md`.
+/// (clone paths ignore `[scm.github].base_url`) tracked in `TODO.md`; until
+/// then `clone_to` refuses an account whose `base_url` is off github.com.
 const GITHUB_CLONE_HOST: &str = "github.com";
 
 fn repo_from_octocrab(r: octocrab::models::Repository) -> Option<Repo> {

@@ -7,7 +7,7 @@
 //!
 //! ## Honest acknowledgements
 //!
-//! We currently impersonate two existing first-party CLI clients:
+//! We impersonate existing first-party CLI clients:
 //!
 //! - Anthropic: Claude Code's `9d1c250a-...` client_id; consent
 //!   screen reads "Claude Code wants access ...". Endpoints and
@@ -19,10 +19,16 @@
 //!   range (1455 / 1457) and `/auth/callback` path are pinned because
 //!   they're allowlisted on OpenAI's Hydra registration for that
 //!   client.
+//! - GitLab: glab's gitlab.com application (`oauth::gitlab`); port
+//!   7171, `/auth/redirect` and the scope set are its registration. A
+//!   self-managed instance uses its own application, configured per
+//!   account.
 //!
-//! Long-term we should register our own OAuth clients for rupu (see
-//! `TODO.md`). Until then, mirroring the upstream CLI's request shape
-//! is necessary for the flow to succeed.
+//! The LLM vendors don't approve third-party rupu-branded clients for
+//! subscriber inference, so mirroring the upstream CLI's request shape
+//! is the durable answer there, not a stopgap (TODO.md's Re-MITM
+//! section). Anyone can register a gitlab.com application; glab's is
+//! used for zero setup, as `gh`'s is for GitHub.
 
 use crate::backend::ProviderId;
 
@@ -47,6 +53,12 @@ pub enum TokenBodyFormat {
 pub struct ProviderOAuth {
     pub flow: OAuthFlow,
     pub client_id: &'static str,
+    /// The installed application's client secret, sent on the token
+    /// exchange and the refresh grant when the IdP wants one (Google does:
+    /// gemini-cli constructs its `OAuth2Client` with both). `None` for
+    /// public PKCE clients. Not a secret in any meaningful sense — it ships
+    /// in every copy of the vendor's own CLI.
+    pub client_secret: Option<&'static str>,
     pub authorize_url: &'static str,
     pub token_url: &'static str,
     pub device_url: Option<&'static str>, // device-code only
@@ -66,6 +78,11 @@ pub struct ProviderOAuth {
     pub extra_authorize_params: &'static [(&'static str, &'static str)],
     /// Format for the token-exchange request body.
     pub token_body_format: TokenBodyFormat,
+    /// Format for the refresh-grant request body. Can differ from the
+    /// exchange: Codex sends the authorization-code grant form-encoded and
+    /// the refresh grant as JSON (openai/codex
+    /// `codex-rs/login/src/oauth/client.rs`).
+    pub refresh_body_format: TokenBodyFormat,
     /// Use the PKCE verifier as the state value rather than a fresh
     /// random nonce. Anthropic's server appears to require this; pi.dev's
     /// known-working impl does this.
@@ -75,6 +92,23 @@ pub struct ProviderOAuth {
     /// server seems to want it.
     pub include_state_in_token_body: bool,
 }
+
+/// An OAuth application chosen at login rather than built in: a GitLab
+/// account's configured application, or its self-managed instance's
+/// endpoints ([`crate::oauth::gitlab::oauth_client`]). The login records
+/// `client_id` and `token_url` on the credential, so its refreshes go to
+/// the application and endpoint that issued it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthClient {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+}
+
+/// The `extra` key a credential records its [`OAuthClient::client_id`] under.
+pub const EXTRA_CLIENT_ID: &str = "oauth_client_id";
+/// The `extra` key a credential records its [`OAuthClient::token_url`] under.
+pub const EXTRA_TOKEN_URL: &str = "oauth_token_url";
 
 pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
     match p {
@@ -87,6 +121,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // request matt's "Pi Coding Agent" sends and we know it
             // succeeds against the consent screen.
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            client_secret: None,
             // claude.ai/oauth/authorize directly — NOT
             // claude.com/cai/oauth/authorize (that was a v0.1.3
             // misread of the prod config; pi.dev hits claude.ai).
@@ -114,6 +149,16 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // anthropic.ts: JSON body, state == verifier, state
             // included in token-exchange body.
             token_body_format: TokenBodyFormat::Json,
+            // The refresh grant is JSON too — what Claude Code's own
+            // `refreshOAuthToken` sends (oboard/claude-code-rev,
+            // `src/services/oauth/client.ts`: `axios.post(TOKEN_URL,
+            // { grant_type: 'refresh_token', refresh_token, client_id,
+            // scope }, { headers: { 'Content-Type': 'application/json' } })`),
+            // and what rupu's own Anthropic client sends
+            // (`refresh_anthropic_token_at`). The client's `scope`
+            // restatement is not sent: optional (RFC 6749 §6), and it would
+            // refuse a grant whose scopes predate the login's current list.
+            refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: true,
             include_state_in_token_body: true,
         }),
@@ -122,6 +167,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // Codex CLI's public client_id. Mirrored from
             // openai/codex codex-rs/login/src/auth/manager.rs.
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+            client_secret: None,
             authorize_url: "https://auth.openai.com/oauth/authorize",
             // NOTE: this is auth.openai.com, NOT api.openai.com. The
             // earlier rupu config pointed at console.anthropic.com/...
@@ -152,12 +198,23 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
                 ("originator", "codex_cli_rs"),
             ],
             token_body_format: TokenBodyFormat::Form,
+            // "ChatGPT refresh uses JSON; authorization-code and gateway
+            // grants use form encoding" — openai/codex
+            // codex-rs/login/src/oauth/client.rs.
+            refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
         ProviderId::Gemini => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
-            client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
+            // The Gemini CLI installed-app client, id and secret both: the
+            // same pair rupu's Gemini client refreshes with, and the pair
+            // gemini-cli's `OAuth2Client` is constructed with
+            // (packages/core/src/code_assist/oauth2.ts). Google's token
+            // endpoint wants the secret on the code exchange and on the
+            // refresh grant for this client type.
+            client_id: rupu_providers::google_gemini::GEMINI_CLI_CLIENT_ID,
+            client_secret: Some(rupu_providers::google_gemini::GEMINI_CLI_CLIENT_SECRET),
             authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
             device_url: None,
@@ -171,13 +228,15 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
         ProviderId::Copilot => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
             client_id: "Iv1.b507a08c87ecfe98", // GitHub Copilot's public client_id
-            authorize_url: "",                 // unused for device flow
+            client_secret: None,
+            authorize_url: "", // unused for device flow
             token_url: "https://github.com/login/oauth/access_token",
             device_url: Some("https://github.com/login/device/code"),
             scopes: &["read:user"],
@@ -186,6 +245,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
@@ -202,9 +262,9 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             // non-Copilot-installed orgs were silently invisible.
             // Switching to gh's classic OAuth client_id restores the
             // scope-based authorization model users expect from
-            // `gh auth login`. See TODO.md "Register rupu-specific
-            // OAuth clients" for the proper long-term cure.
+            // `gh auth login`.
             client_id: "178c6fc778ccc68e1d6a",
+            client_secret: None,
             authorize_url: "",
             token_url: "https://github.com/login/oauth/access_token",
             device_url: Some("https://github.com/login/device/code"),
@@ -219,24 +279,30 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             fixed_ports: None,
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
         ProviderId::Gitlab => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
-            // TODO(rupu-specific OAuth client): register a real gitlab.com
-            // OAuth app and replace this placeholder. See TODO.md "Register
-            // rupu-specific OAuth clients".
-            client_id: "rupu-gitlab-pkce-placeholder",
+            // GitLab's own CLI's gitlab.com application (a public PKCE
+            // client, no secret) — the same call GitHub makes with `gh`'s.
+            // Its redirect URI, port and scope set are glab's registration:
+            // GitLab checks the redirect URI exactly and refuses a scope the
+            // application wasn't registered for. A self-managed instance has
+            // its own application: `crate::oauth::gitlab::oauth_client`.
+            client_id: crate::oauth::gitlab::GITLAB_COM_CLIENT_ID,
+            client_secret: None,
             authorize_url: "https://gitlab.com/oauth/authorize",
             token_url: "https://gitlab.com/oauth/token",
             device_url: None,
-            scopes: &["api", "read_user", "read_repository", "write_repository"],
-            redirect_path: "/callback",
+            scopes: crate::oauth::gitlab::SCOPES,
+            redirect_path: crate::oauth::gitlab::REDIRECT_PATH,
             redirect_host: "localhost",
-            fixed_ports: None,
+            fixed_ports: Some(&[crate::oauth::gitlab::REDIRECT_PORT]),
             extra_authorize_params: &[],
             token_body_format: TokenBodyFormat::Form,
+            refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
@@ -362,18 +428,45 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_metadata_is_browser_callback_with_full_scope_set() {
+    fn gitlab_metadata_is_browser_callback_against_gitlab_com() {
         let p = provider_oauth(crate::backend::ProviderId::Gitlab)
             .expect("gitlab oauth config present");
         assert_eq!(p.authorize_url, "https://gitlab.com/oauth/authorize");
         assert_eq!(p.token_url, "https://gitlab.com/oauth/token");
         assert_eq!(p.flow, OAuthFlow::Callback);
-        assert!(p.scopes.contains(&"api"));
-        assert!(p.scopes.contains(&"read_repository"));
-        assert!(p.scopes.contains(&"write_repository"));
-        assert!(p.scopes.contains(&"read_user"));
+        assert_eq!(p.client_secret, None, "a public PKCE client");
         assert_eq!(p.token_body_format, TokenBodyFormat::Form);
+        assert_eq!(p.refresh_body_format, TokenBodyFormat::Form);
         assert!(!p.state_is_verifier);
         assert!(!p.include_state_in_token_body);
+    }
+
+    /// GitLab's own CLI's gitlab.com application (gitlab-org/cli
+    /// `internal/glinstance/host.go` `DefaultClientID`,
+    /// `internal/oauth2/config.go`). GitLab checks the redirect URI exactly
+    /// against the application's registration, and a scope outside its
+    /// registered set fails the authorize request with `invalid_scope`, so
+    /// all three must match what glab registered.
+    #[test]
+    fn gitlab_uses_glab_s_registered_gitlab_com_application() {
+        let p = provider_oauth(crate::backend::ProviderId::Gitlab)
+            .expect("gitlab oauth config present");
+        assert_eq!(
+            p.client_id,
+            "41d48f9422ebd655dd9cf2947d6979681dfaddc6d0c56f7628f6ada59559af1e"
+        );
+        assert_eq!(p.redirect_host, "localhost");
+        assert_eq!(p.fixed_ports, Some(&[7171u16][..]));
+        assert_eq!(p.redirect_path, "/auth/redirect");
+        let registered = ["openid", "profile", "read_user", "write_repository", "api"];
+        for scope in p.scopes {
+            assert!(
+                registered.contains(scope),
+                "{scope} is outside glab's registered scopes"
+            );
+        }
+        for needed in ["api", "read_user", "write_repository"] {
+            assert!(p.scopes.contains(&needed), "{needed} missing");
+        }
     }
 }

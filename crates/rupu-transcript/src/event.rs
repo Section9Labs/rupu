@@ -12,7 +12,7 @@ use serde_json::Value;
 /// to recognize a known `type` before handing off to the derive-generated
 /// logic — see that impl's doc comment for why this indirection exists.
 /// Kept in sync by construction: every variant has a roundtrip test
-/// (`event::tests` / `tests/roundtrip.rs`) that would start failing (parsing
+/// (`event::tests` / `tests/it/roundtrip.rs`) that would start failing (parsing
 /// as `Unknown` instead of the real variant) if its tag were missing here.
 const KNOWN_EVENT_TAGS: &[&str] = &[
     "run_start",
@@ -266,7 +266,8 @@ pub enum Event {
         messages: Value,
     },
     /// A runtime intervention worth showing but not part of the
-    /// conversation: `kind` ∈ {"context_trim", "provider_retry"} today.
+    /// conversation: `kind` ∈ {"context_trim", "provider_retry",
+    /// "model_limits", "model_limits_clamped"} today.
     Notice {
         kind: String,
         message: String,

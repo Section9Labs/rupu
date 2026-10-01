@@ -36,6 +36,7 @@ import {
   DollarSign,
   FileCode,
   GitBranch,
+  Layers,
   Lock as LockIcon,
   Server,
   SlidersHorizontal,
@@ -59,10 +60,12 @@ import {
   RawTab,
 } from '../components/ConfigEditor';
 import { FieldGroup, toggleInputCls } from '../components/settings/ConfigField';
+import { ModelsTab } from '../components/settings/ModelsTab';
 
 type SettingsTab =
   | 'general'
   | 'providers'
+  | 'models'
   | 'autoflow'
   | 'scm'
   | 'pricing'
@@ -469,6 +472,7 @@ export default function Settings() {
         <TabBar>
           <TabButton active={tab === 'general'} onClick={() => setTab('general')} icon={SlidersHorizontal} label="General" />
           <TabButton active={tab === 'providers'} onClick={() => setTab('providers')} icon={Cpu} label="Providers" />
+          <TabButton active={tab === 'models'} onClick={() => setTab('models')} icon={Layers} label="Models" />
           <TabButton active={tab === 'autoflow'} onClick={() => setTab('autoflow')} icon={Workflow} label="Autoflow" />
           <TabButton active={tab === 'scm'} onClick={() => setTab('scm')} icon={GitBranch} label="SCM / Issues" />
           <TabButton active={tab === 'pricing'} onClick={() => setTab('pricing')} icon={DollarSign} label="Pricing" />
@@ -506,6 +510,7 @@ export default function Settings() {
             onToggleLock={handleToggleLock}
           />
         )}
+        {tab === 'models' && <ModelsTab />}
         {tab === 'autoflow' && (
           <AutoflowTab
             eff={eff}

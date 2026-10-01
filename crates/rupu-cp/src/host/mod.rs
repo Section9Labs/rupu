@@ -14,6 +14,7 @@ pub mod fleet_counts;
 pub mod http;
 pub mod lazy_tail;
 pub mod local;
+pub mod probe_cache;
 pub mod registry;
 pub mod ssh;
 pub mod summary_build;

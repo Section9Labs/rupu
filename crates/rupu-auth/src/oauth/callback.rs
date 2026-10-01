@@ -1,4 +1,4 @@
-//! PKCE browser-callback OAuth flow. Anthropic, OpenAI, Gemini.
+//! PKCE browser-callback OAuth flow. Anthropic, OpenAI, Gemini, GitLab.
 //!
 //! 1. Generate PKCE pair + state nonce.
 //! 2. Bind localhost listener (port 0 -> OS picks).
@@ -19,7 +19,9 @@ use tracing::{debug, info};
 
 use crate::backend::ProviderId;
 use crate::oauth::pkce::PkcePair;
-use crate::oauth::providers::{provider_oauth, OAuthFlow, TokenBodyFormat};
+use crate::oauth::providers::{
+    provider_oauth, OAuthClient, OAuthFlow, TokenBodyFormat, EXTRA_CLIENT_ID, EXTRA_TOKEN_URL,
+};
 use crate::stored::StoredCredential;
 
 const CALLBACK_TIMEOUT_SECS: u64 = 300;
@@ -35,6 +37,13 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+    /// OpenAI's ChatGPT grant returns an ID token next to the access token;
+    /// stored (`extra.id_token`) as codex-rs stores it, so the Codex client
+    /// can take its account id from it when the access token has no claim.
+    /// Stored for OpenAI only ([`stored_credential_for`]): Gemini's
+    /// (`openid` + `email` scopes) carries the user's email and is dropped.
+    #[serde(default)]
+    id_token: Option<String>,
     /// Anthropic-shaped account block (uuid, email, …). Optional — other
     /// OAuth providers don't return this. We capture the uuid only; other
     /// fields are intentionally ignored to avoid storing extra PII.
@@ -64,11 +73,33 @@ fn random_state() -> String {
 }
 
 pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
+    run_with_client(provider, None).await
+}
+
+/// [`run`] as `client` — an application chosen at login (a GitLab account's
+/// configured one, or a self-managed instance's) — instead of the
+/// provider's built-in one. The credential records the chosen application's
+/// id and token endpoint ([`EXTRA_CLIENT_ID`], [`EXTRA_TOKEN_URL`]) so its
+/// refreshes go there; a chosen application is a public client, sent no
+/// secret, and its endpoint is never redirected by
+/// `RUPU_OAUTH_TOKEN_URL_OVERRIDE` (the built-in endpoints' test seam).
+pub async fn run_with_client(
+    provider: ProviderId,
+    client: Option<OAuthClient>,
+) -> Result<StoredCredential> {
     let oauth =
         provider_oauth(provider).ok_or_else(|| anyhow!("no oauth config for {provider}"))?;
     if oauth.flow != OAuthFlow::Callback {
         anyhow::bail!("provider {provider} does not use the callback flow");
     }
+    let chosen = client.is_some();
+    let app = client.unwrap_or_else(|| OAuthClient {
+        client_id: oauth.client_id.to_string(),
+        authorize_url: oauth.authorize_url.to_string(),
+        token_url: std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
+            .unwrap_or_else(|_| oauth.token_url.to_string()),
+    });
+    let client_secret = if chosen { None } else { oauth.client_secret };
 
     // Headless detection: error early on Linux without DISPLAY/BROWSER.
     if cfg!(target_os = "linux")
@@ -126,7 +157,7 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     }
 
     // Build authorize URL.
-    let authorize = build_authorize_url(&oauth, &pkce.challenge, &state, &redirect_uri)?;
+    let authorize = build_authorize_url(&oauth, &app, &pkce.challenge, &state, &redirect_uri)?;
     if std::env::var_os("RUPU_OAUTH_SKIP_BROWSER").is_none() {
         info!("opening browser to {}", authorize);
         if webbrowser::open(&authorize).is_err() {
@@ -194,8 +225,7 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     }
 
     // Exchange the code.
-    let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
-        .unwrap_or_else(|_| oauth.token_url.to_string());
+    let token_url = app.token_url.clone();
 
     // `Arc::new(NullSink)`, deliberately: auth/OAuth traffic is out of
     // netflow's scope by matt's explicit ruling — "I do not care about
@@ -210,10 +240,13 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let mut params: Vec<(&str, String)> = vec![
         ("grant_type", "authorization_code".into()),
         ("code", code.clone()),
-        ("client_id", oauth.client_id.into()),
+        ("client_id", app.client_id.clone()),
         ("redirect_uri", redirect_uri.clone()),
         ("code_verifier", pkce.verifier.clone()),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret.into()));
+    }
     if oauth.include_state_in_token_body {
         params.push(("state", state.clone()));
     }
@@ -236,15 +269,29 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         .await
         .context("token exchange json")?;
 
+    let mut stored = stored_credential_for(provider, token);
+    if chosen {
+        if let AuthCredentials::OAuth { extra, .. } = &mut stored.credentials {
+            extra.insert(EXTRA_CLIENT_ID.into(), app.client_id.into());
+            extra.insert(EXTRA_TOKEN_URL.into(), app.token_url.into());
+        }
+    }
+    Ok(stored)
+}
+
+/// What of a token response is stored for `provider`: the tokens and their
+/// expiry, plus the Anthropic account/organization UUIDs (so the Anthropic
+/// adapter can send `metadata.user_id.account_uuid`, binding traffic to
+/// the user's Pro/Max quota pool) and — for OpenAI only — the ID token the
+/// Codex client takes its account id from. Any other provider's ID token
+/// (Gemini's carries the user's email) is not stored.
+fn stored_credential_for(provider: ProviderId, token: TokenResponse) -> StoredCredential {
     let expires_at = token
         .expires_in
         .map(|s| Utc::now() + chrono::Duration::seconds(s));
 
     let expires_ms = expires_at.map(|d| d.timestamp_millis() as u64).unwrap_or(0);
 
-    // Persist account/organization UUIDs in `extra` so the Anthropic
-    // adapter can include `metadata.user_id.account_uuid` on each
-    // request, binding traffic to the user's Pro/Max quota pool.
     let mut extra: std::collections::HashMap<String, serde_json::Value> = Default::default();
     if let Some(uuid) = token.account.as_ref().and_then(|a| a.uuid.clone()) {
         extra.insert("account_uuid".into(), serde_json::Value::String(uuid));
@@ -252,8 +299,13 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     if let Some(uuid) = token.organization.as_ref().and_then(|o| o.uuid.clone()) {
         extra.insert("organization_uuid".into(), serde_json::Value::String(uuid));
     }
+    if provider == ProviderId::Openai {
+        if let Some(id_token) = token.id_token {
+            extra.insert("id_token".into(), serde_json::Value::String(id_token));
+        }
+    }
 
-    Ok(StoredCredential {
+    StoredCredential {
         credentials: AuthCredentials::OAuth {
             access: token.access_token,
             refresh: token.refresh_token.clone().unwrap_or_default(),
@@ -262,20 +314,21 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         },
         refresh_token: token.refresh_token,
         expires_at,
-    })
+    }
 }
 
 fn build_authorize_url(
     oauth: &crate::oauth::providers::ProviderOAuth,
+    app: &OAuthClient,
     challenge: &str,
     state: &str,
     redirect_uri: &str,
 ) -> Result<String> {
-    let mut url = url::Url::parse(oauth.authorize_url)?;
+    let mut url = url::Url::parse(&app.authorize_url)?;
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("response_type", "code")
-            .append_pair("client_id", oauth.client_id)
+            .append_pair("client_id", &app.client_id)
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("scope", &oauth.scopes.join(" "))
             .append_pair("state", state)
@@ -316,5 +369,76 @@ fn bind_listener(fixed_ports: Option<&'static [u16]>) -> Result<tiny_http::Serve
         None => {
             tiny_http::Server::http("127.0.0.1:0").map_err(|e| anyhow!("bind 127.0.0.1:0: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_with_id_token() -> TokenResponse {
+        serde_json::from_value(serde_json::json!({
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 3600,
+            "id_token": "eyJ.id-token"
+        }))
+        .unwrap()
+    }
+
+    fn extra_of(sc: &StoredCredential) -> &std::collections::HashMap<String, serde_json::Value> {
+        match &sc.credentials {
+            AuthCredentials::OAuth { extra, .. } => extra,
+            other => panic!("expected OAuth, got {other:?}"),
+        }
+    }
+
+    /// OpenAI's ID token is stored (the Codex client takes its account id
+    /// from it); no other provider's is.
+    #[test]
+    fn only_openai_s_id_token_is_stored() {
+        let openai = stored_credential_for(ProviderId::Openai, token_with_id_token());
+        assert_eq!(
+            extra_of(&openai).get("id_token").and_then(|v| v.as_str()),
+            Some("eyJ.id-token")
+        );
+        for provider in [ProviderId::Gemini, ProviderId::Anthropic] {
+            let sc = stored_credential_for(provider, token_with_id_token());
+            assert!(
+                !extra_of(&sc).contains_key("id_token"),
+                "{provider}: {:?}",
+                extra_of(&sc)
+            );
+            assert_eq!(sc.refresh_token.as_deref(), Some("refresh"));
+        }
+    }
+
+    /// A login with a chosen application (a GitLab account's configured
+    /// one, or a self-managed instance's) sends the user to that
+    /// application's consent screen, on that instance.
+    #[test]
+    fn the_authorize_url_names_the_chosen_application_on_its_instance() {
+        let oauth = provider_oauth(ProviderId::Gitlab).unwrap();
+        let client = OAuthClient {
+            client_id: "corp-app".into(),
+            authorize_url: "https://gitlab.example.com/oauth/authorize".into(),
+            token_url: "https://gitlab.example.com/oauth/token".into(),
+        };
+        let url = build_authorize_url(
+            &oauth,
+            &client,
+            "challenge",
+            "state",
+            "http://localhost:7171/auth/redirect",
+        )
+        .unwrap();
+        let url = url::Url::parse(&url).unwrap();
+        assert_eq!(url.host_str(), Some("gitlab.example.com"));
+        assert_eq!(url.path(), "/oauth/authorize");
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "corp-app");
+        assert_eq!(q["redirect_uri"], "http://localhost:7171/auth/redirect");
+        assert_eq!(q["scope"], "openid profile read_user write_repository api");
+        assert_eq!(q["code_challenge_method"], "S256");
     }
 }

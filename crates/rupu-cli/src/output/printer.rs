@@ -1123,6 +1123,22 @@ impl LineStreamPrinter {
         self.out(&buf);
     }
 
+    /// `✗ <workflow_name> cancelled  <run_id>  <reason>` — a run cancelled on
+    /// disk (the CLI's `cancel`, `cp serve`) while the printer was attached.
+    pub fn workflow_cancelled(&mut self, workflow_name: &str, run_id: &str, reason: &str) {
+        self.stop_ticker();
+        self.out("");
+        let mut buf = String::new();
+        let _ = palette::write_bold_colored(&mut buf, "✗", FAILED);
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, workflow_name, FAILED);
+        buf.push_str(" cancelled  ");
+        let _ = palette::write_colored(&mut buf, run_id, DIM);
+        buf.push_str("  ");
+        let _ = palette::write_colored(&mut buf, reason, FAILED);
+        self.out(&buf);
+    }
+
     /// Bump indent depth — for nested panel step runs.
     pub fn push_indent(&mut self) {
         self.indent += 1;

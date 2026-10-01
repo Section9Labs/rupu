@@ -18,7 +18,7 @@ rupu auth status
 rupu auth login --provider anthropic --mode sso
 ```
 
-A browser opens to `claude.ai/oauth/authorize`. Sign in with your Claude account; the page redirects to a localhost URL that rupu intercepts. The browser shows "Authentication complete" and rupu writes the credential to `rupu/anthropic/sso` in the OS keychain.
+A browser opens to `claude.ai/oauth/authorize`. Sign in with your Claude account; the page redirects to a localhost URL that rupu intercepts. The browser shows "Authentication complete" and rupu writes the credential to `~/.rupu/auth.json` (mode 0600).
 
 The access token expires in ~1 hour. rupu auto-refreshes ~60 seconds before expiry using the stored refresh token. Refresh failures surface a clear error pointing at this same command.
 

@@ -11,7 +11,7 @@ issue-tracker events, gated by human approvals when you want them, with a JSONL
 transcript on every run. A single Rust binary that:
 
 - Drives any of four LLM providers (Anthropic, OpenAI, Gemini, GitHub Copilot)
-  via API key OR SSO, with credentials kept in the OS keychain or a chmod-600 file.
+  via API key OR SSO, with credentials kept in a chmod-600 file (`~/.rupu/auth.json`).
 - Loads agent + workflow definitions from `.rupu/` in your project (or globally
   from `~/.rupu/`); ships a curated starter set via `rupu init --with-samples`.
 - Talks to GitHub and GitLab through a single embedded MCP server (so the same
@@ -310,9 +310,9 @@ rupu auth login --provider anthropic --mode sso
 rupu auth status
 ```
 
-Credentials are stored at `~/.rupu/auth.json` (chmod-600 file, the default —
-matches `gh`, `aws`, `gcloud`). To use the OS keychain instead:
-`rupu auth backend --use keychain`. SSO entries auto-refresh near expiry;
+Credentials are stored at `~/.rupu/auth.json` (a chmod-600 file, the only
+store — matches `gh`, `aws`, `gcloud`; `rupu auth backend` reports where it is).
+SSO entries auto-refresh near expiry;
 failure surfaces an actionable error pointing at `rupu auth login --mode sso`.
 
 `--provider` above is an alias for `--account` — one credential per
@@ -725,6 +725,42 @@ cargo test --workspace
 ```
 
 MSRV: **1.95**. Set `RUPU_LOG=debug` for verbose tracing output.
+
+### Tests
+
+Each crate's integration tests are modules of **one** test binary,
+`crates/<crate>/tests/it/main.rs`. Every top-level `tests/*.rs` file would be a
+separate binary that links the whole dependency graph; building, linking and
+(on macOS) first-launching ~200 of them was most of what `cargo test
+--workspace` spent its time on. Add a test file as
+`tests/it/<name>.rs` plus a `mod <name>;` line in `main.rs`;
+`crates/rupu-cli/tests/it/test_layout.rs` fails on a new top-level file. Run one
+file's tests with `cargo test -p rupu-cp --test it host_reads::`.
+
+Those tests share a process, so a test that changes env vars or the working
+directory must not overlap the others. Mark it `#[serial]` (`serial_test`); in
+`rupu-cli`, put it in `tests/serial/` instead, holding `ENV_LOCK` for the whole
+test. That binary runs one test at a time and restores env and cwd after each.
+
+Pass `</dev/null` when running the suite from an interactive shell: two CLI
+approval-prompt tests block on an open stdin.
+
+### Faster local builds
+
+- **Linux:** `.cargo/config.toml` links through `scripts/fast-link.sh`, which
+  uses [mold](https://github.com/rui314/mold) when both `mold` and `clang` are
+  installed (CI's test job links with mold too) and the toolchain default
+  otherwise. Set `RUPU_NO_FAST_LINKER=1` to turn it off.
+- **macOS:** no override; Apple's default linker (ld-prime) stays. rust-lld
+  (LLD 22) can't link against the macOS 27 SDK at all, because it rejects the
+  SDK's `arm64e.x1` TBD entries. Pointed at the 26.5 SDK it rebuilt only ~2 s
+  faster (median 18 s vs 20.5 s after touching `rupu-providers`), with no gain
+  on a full `cargo test` run.
+- **macOS first-run scan:** macOS security-scans every newly linked executable
+  the first time it runs, about 3–4 s for each of the large test binaries here,
+  after every rebuild. Adding your terminal app under System Settings → Privacy
+  & Security → Developer Tools exempts programs it launches from that scan. That
+  is a security trade-off; weigh it before you make it.
 
 ---
 

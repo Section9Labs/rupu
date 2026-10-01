@@ -17,6 +17,7 @@ pub mod event_connector;
 pub mod platform;
 pub mod registry;
 pub mod rules;
+pub mod token;
 pub mod types;
 pub mod weburl;
 

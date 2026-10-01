@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::credential_store::resolve_provider_auth;
 use crate::auth::{is_token_expired, AuthCredentials, AuthFile, AuthMethod};
@@ -338,6 +338,14 @@ fn apply_cache_breakpoints(body: &mut serde_json::Value) {
 
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Page size for the `GET /v1/models` catalog listing (spec 2026-09-30 §3).
+/// The API's maximum, so the whole catalog is normally one request.
+const MODELS_PAGE_LIMIT: u32 = 1000;
+
+/// Page size `probe` asks `GET /v1/models` for: the status is the whole
+/// answer, so one entry is enough and the catalog is never downloaded.
+const PROBE_PAGE_LIMIT: u32 = 1;
 // ─────────────────────────────────────────────────────────────────────
 // Claude Code OAuth wire-shape pins
 //
@@ -756,20 +764,36 @@ pub(crate) fn load_claude_code_keychain() -> Option<AuthMethod> {
 }
 
 /// Refresh an Anthropic OAuth token. Returns updated AuthMethod.
-/// Uses application/x-www-form-urlencoded as required by the token endpoint.
+///
+/// The grant goes as JSON — what Claude Code's own `refreshOAuthToken`
+/// sends (oboard/claude-code-rev, `src/services/oauth/client.ts`:
+/// `axios.post(TOKEN_URL, { grant_type: 'refresh_token', refresh_token,
+/// client_id, scope }, { headers: { 'Content-Type': 'application/json' } })`).
+/// The client's `scope` restatement is not sent: optional (RFC 6749 §6),
+/// and it would refuse a grant whose scopes predate the login's current
+/// list.
 pub async fn refresh_anthropic_token(
     client: &ClientWithMiddleware,
+    refresh_token: &str,
+) -> Result<AuthMethod, ProviderError> {
+    refresh_anthropic_token_at(client, ANTHROPIC_TOKEN_URL, refresh_token).await
+}
+
+/// [`refresh_anthropic_token`] against `token_url`.
+async fn refresh_anthropic_token_at(
+    client: &ClientWithMiddleware,
+    token_url: &str,
     refresh_token: &str,
 ) -> Result<AuthMethod, ProviderError> {
     info!("refreshing Anthropic OAuth token");
 
     let response = client
-        .post(ANTHROPIC_TOKEN_URL)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", ANTHROPIC_CLIENT_ID),
-            ("refresh_token", refresh_token),
-        ])
+        .post(token_url)
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": ANTHROPIC_CLIENT_ID,
+            "refresh_token": refresh_token,
+        }))
         .send()
         .await
         .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
@@ -813,23 +837,67 @@ pub async fn refresh_anthropic_token(
     })
 }
 
-/// Write updated credentials back to auth.json (preserving other providers).
-/// Uses atomic write (temp + rename) with 0o600 permissions set on temp BEFORE rename.
-pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), ProviderError> {
-    use fs2::FileExt;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot create dir: {e}")))?;
+/// Refresh the Anthropic OAuth token and persist the rotated credentials via
+/// the CredentialStore (preferred) or auth.json (legacy). Owns everything it
+/// needs so it can run as its own task (see `ensure_valid_token`).
+async fn refresh_and_persist_anthropic_token(
+    client: ClientWithMiddleware,
+    token_url: String,
+    refresh_token: String,
+    credential_store: Option<Arc<dyn crate::credential_source::CredentialSource>>,
+    auth_json_path: Option<PathBuf>,
+) -> Result<AuthMethod, ProviderError> {
+    let new_auth = refresh_anthropic_token_at(&client, &token_url, &refresh_token).await?;
+    // Persist via CredentialStore (file-locked, preserves other providers)
+    if let Some(store) = &credential_store {
+        let creds = match &new_auth {
+            AuthMethod::OAuth {
+                access_token,
+                refresh_token,
+                expires_ms,
+            } => AuthCredentials::OAuth {
+                access: access_token.clone(),
+                refresh: refresh_token.clone(),
+                expires: *expires_ms,
+                extra: std::collections::HashMap::new(),
+            },
+            AuthMethod::ApiKey(key) => AuthCredentials::ApiKey { key: key.clone() },
+        };
+        if let Err(e) = store.update(crate::provider_id::ProviderId::Anthropic, creds) {
+            error!(error = %e, "the refreshed Anthropic token could not be persisted via the credential store; this process keeps using it, the next one will need to log in again");
+        }
+    } else if let Some(path) = &auth_json_path {
+        // Legacy fallback
+        if let Err(e) = save_auth_json(path, &new_auth) {
+            error!(path = %path.display(), error = %e, "the refreshed Anthropic token could not be written; this process keeps using it, the next one will need to log in again");
+        }
     }
+    Ok(new_auth)
+}
 
-    // File-locked read-modify-write to prevent race with CredentialStore
-    let lock_path = path.with_extension("lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot create lock: {e}")))?;
-    lock_file
-        .lock_exclusive()
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot acquire lock: {e}")))?;
+/// Write updated credentials back to auth.json (preserving other providers).
+/// The read-modify-write runs under the file's bounded
+/// [`crate::private_file::SidecarLock`] (`<path>.lock`, shared with every
+/// other writer of the file, never unlinked) and the file is replaced
+/// through a private temp file + rename
+/// ([`crate::private_file::write_private_atomic`]): 0600 from the moment
+/// it exists.
+pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), ProviderError> {
+    save_auth_json_with_lock_timeout(path, crate::private_file::LOCK_TIMEOUT, auth_method)
+}
+
+/// [`save_auth_json`] with the wait for the sidecar lock bounded by
+/// `lock_timeout` instead of [`crate::private_file::LOCK_TIMEOUT`]; a held
+/// lock fails the write after that long (`credential store is locked by
+/// another process (…)`) with nothing written. Tests exercise the bound
+/// through it.
+pub fn save_auth_json_with_lock_timeout(
+    path: &Path,
+    lock_timeout: std::time::Duration,
+    auth_method: &AuthMethod,
+) -> Result<(), ProviderError> {
+    let _lock = crate::private_file::SidecarLock::acquire(path, lock_timeout)
+        .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
 
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
     let mut auth: serde_json::Value =
@@ -858,23 +926,8 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
 
     let updated = serde_json::to_string_pretty(&auth)
         .map_err(|e| ProviderError::AuthConfig(e.to_string()))?;
-
-    let temp = path.with_extension(format!("tmp.{:?}", std::thread::current().id()));
-    std::fs::write(&temp, updated.as_bytes())
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot write {}: {e}", temp.display())))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| ProviderError::AuthConfig(format!("cannot set permissions: {e}")))?;
-    }
-
-    std::fs::rename(&temp, path)
-        .map_err(|e| ProviderError::AuthConfig(format!("cannot rename: {e}")))?;
-
-    drop(lock_file);
-    let _ = std::fs::remove_file(&lock_path);
+    crate::private_file::write_private_atomic(path, updated.as_bytes())
+        .map_err(|e| ProviderError::AuthConfig(format!("cannot write auth.json: {e}")))?;
 
     info!(path = %path.display(), "auth.json updated");
     Ok(())
@@ -927,6 +980,22 @@ pub struct AnthropicClient {
     /// client's own 429 backoff sleep instead of starving every other
     /// concurrent Anthropic call for the whole ladder.
     semaphore: Option<Arc<Semaphore>>,
+    /// Set once a request carrying the 1M-context beta was refused with the
+    /// extra-usage 429: the account has no entitlement, so the beta is never
+    /// sent again by this client (the run falls back to the standard window).
+    long_context_disabled: bool,
+    /// The OAuth token endpoint ([`ANTHROPIC_TOKEN_URL`]; tests point it at
+    /// a mock).
+    token_url: String,
+    /// A token refresh this client started and is (or was) waiting for. Kept
+    /// across a dropped call so the next call adopts it instead of starting
+    /// a second refresh with the rotated-out refresh token.
+    pending_refresh: Option<tokio::task::JoinHandle<Result<AuthMethod, ProviderError>>>,
+    /// The credential store's refresher (rupu-auth's `KeychainResolver`):
+    /// when set, token refreshes go through it — under the store's
+    /// cross-process lock, persisted — instead of this client's own token
+    /// request, whose rotation would otherwise live only in memory.
+    oauth_refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
 }
 
 impl AnthropicClient {
@@ -948,6 +1017,10 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -993,6 +1066,16 @@ impl AnthropicClient {
             }
             None => Ok(None),
         }
+    }
+
+    /// Hand token refreshes to the credential store's refresher (see the
+    /// `oauth_refresher` field). `None` keeps the client's own refresh.
+    pub fn with_oauth_refresher(
+        mut self,
+        refresher: Option<Arc<dyn crate::credential_writes::OAuthRefresher>>,
+    ) -> Self {
+        self.oauth_refresher = refresher;
+        self
     }
 
     /// Set the OAuth account UUID. Used by the factory after reading it
@@ -1043,6 +1126,10 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1068,6 +1155,10 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1107,6 +1198,10 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
@@ -1134,51 +1229,126 @@ impl AnthropicClient {
             prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
+            long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
+            oauth_refresher: None,
         }
     }
 
     /// Ensure the OAuth token is still valid, refreshing if expired.
     /// Persists refreshed tokens via CredentialStore (preferred) or save_auth_json (legacy).
+    ///
+    /// Cancel-safe. The token endpoint rotates the refresh token, so the
+    /// refresh and its persistence run as their own task (tracked by
+    /// [`crate::credential_writes`], which the binary drains before exit —
+    /// once per refresh: through a refresher, the refresher's own task is
+    /// the tracked one): a caller dropped mid-flight (a pause, a listing
+    /// timeout) only stops waiting. The task's handle stays on the client, so the next call
+    /// adopts the refresh in flight (or its finished result) instead of
+    /// starting a second one with the rotated-out refresh token.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        if let AuthMethod::OAuth {
-            refresh_token,
-            expires_ms,
-            ..
-        } = &self.auth
-        {
-            if !refresh_token.is_empty() && is_token_expired(*expires_ms) {
+        // Two rounds at most: an adopted refresh is checked like any other
+        // token — one that finished long ago on an idle client can itself
+        // be expired already, and is then refreshed once more.
+        for _ in 0..2 {
+            if self.pending_refresh.is_none() {
+                let AuthMethod::OAuth {
+                    access_token,
+                    refresh_token,
+                    expires_ms,
+                } = &self.auth
+                else {
+                    return Ok(());
+                };
+                if refresh_token.is_empty() || !is_token_expired(*expires_ms) {
+                    return Ok(());
+                }
                 info!("OAuth token expired, refreshing");
-                let new_auth = refresh_anthropic_token(&self.client, refresh_token).await?;
-
-                // Persist via CredentialStore (file-locked, preserves other providers)
-                if let Some(store) = &self.credential_store {
-                    let creds = match &new_auth {
-                        AuthMethod::OAuth {
-                            access_token,
-                            refresh_token,
-                            expires_ms,
-                        } => AuthCredentials::OAuth {
+                self.pending_refresh = Some(match self.oauth_refresher.clone() {
+                    Some(refresher) => {
+                        let stale = AuthCredentials::OAuth {
                             access: access_token.clone(),
                             refresh: refresh_token.clone(),
                             expires: *expires_ms,
-                            extra: std::collections::HashMap::new(),
-                        },
-                        AuthMethod::ApiKey(key) => AuthCredentials::ApiKey { key: key.clone() },
-                    };
-                    if let Err(e) = store.update(crate::provider_id::ProviderId::Anthropic, creds) {
-                        warn!(error = %e, "failed to persist refreshed token via credential store");
+                            extra: HashMap::new(),
+                        };
+                        // Not tracked here: the refresher's own
+                        // refresh-and-persist task is the tracked write
+                        // (one refresh, one count); this task only waits
+                        // on it and reshapes the result.
+                        tokio::spawn(async move {
+                            refresher
+                                .refresh(stale)
+                                .await
+                                .map(AuthCredentials::into_anthropic_auth_method)
+                        })
                     }
-                } else if let Some(path) = &self.auth_json_path {
-                    // Legacy fallback
-                    if let Err(e) = save_auth_json(path, &new_auth) {
-                        warn!(error = %e, "failed to save refreshed token to auth.json");
-                    }
-                }
-
-                self.auth = new_auth;
+                    None => crate::credential_writes::spawn(refresh_and_persist_anthropic_token(
+                        self.client.clone(),
+                        self.token_url.clone(),
+                        refresh_token.clone(),
+                        self.credential_store.clone(),
+                        self.auth_json_path.clone(),
+                    )),
+                });
             }
+            let Some(job) = self.pending_refresh.as_mut() else {
+                return Ok(());
+            };
+            // A cancellation point: dropped here, the handle stays on `self`.
+            let finished = job.await;
+            self.pending_refresh = None;
+            self.auth = finished.map_err(|e| {
+                ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+            })??;
         }
         Ok(())
+    }
+
+    /// Whether a request for `model` / `context_window` goes out with the
+    /// 1M-context beta: the `[1m]` suffix on the OAuth path,
+    /// `context_window: OneMillion` on the api-key path — and never once an
+    /// extra-usage refusal disabled it.
+    fn sends_1m_beta(
+        &self,
+        model: &str,
+        context_window: Option<crate::model_tier::ContextWindow>,
+    ) -> bool {
+        if self.long_context_disabled {
+            return false;
+        }
+        match &self.auth {
+            AuthMethod::ApiKey(_) => matches!(
+                context_window,
+                Some(crate::model_tier::ContextWindow::OneMillion)
+            ),
+            AuthMethod::OAuth { .. } => model_has_1m_suffix(model),
+        }
+    }
+
+    /// The error for a 429 that refuses long context ("Extra usage is
+    /// required for long context requests"). It is triggered by the 1M beta,
+    /// not by the request's size, so when this request carried the beta the
+    /// account has no extra-usage entitlement for it: stop sending the beta
+    /// for the rest of this client's life and report
+    /// [`ProviderError::LongContextUnavailable`] for the runner to fall back
+    /// on. Without the beta it is surfaced as the plain 429 it is. Either way
+    /// it is not retried — the same request is refused every time.
+    fn long_context_refusal(&mut self, request: &LlmRequest, body: String) -> ProviderError {
+        if self.sends_1m_beta(&request.model, request.context_window) {
+            warn!(
+                model = request.model.as_str(),
+                "no extra-usage entitlement for 1M context; disabling the context-1m beta"
+            );
+            self.long_context_disabled = true;
+            ProviderError::LongContextUnavailable { message: body }
+        } else {
+            ProviderError::Api {
+                status: 429,
+                message: body,
+            }
+        }
     }
 
     /// Apply auth headers to a request builder based on auth method.
@@ -1233,10 +1403,7 @@ impl AnthropicClient {
                 // `context-1m-2025-08-07` beta. OAuth path always sends
                 // it via the static beta CSV; the api-key path opts in
                 // per-request based on `LlmRequest.context_window`.
-                if matches!(
-                    context_window,
-                    Some(crate::model_tier::ContextWindow::OneMillion)
-                ) {
+                if self.sends_1m_beta(model, context_window) {
                     b = b.header("anthropic-beta", "context-1m-2025-08-07");
                 }
                 b
@@ -1248,7 +1415,12 @@ impl AnthropicClient {
                 // an api-key-path-only opt-in (the OAuth path uses the
                 // suffix because that's what claude-cli does and what the
                 // server gates on).
-                let _ = context_window;
+                // After an extra-usage refusal the suffix no longer opts in.
+                let model = if self.long_context_disabled {
+                    crate::model_registry::strip_1m(model)
+                } else {
+                    model
+                };
                 let beta_csv = build_oauth_beta_csv(model, wants_context_management);
                 b.header("Authorization", format!("Bearer {access_token}"))
                     .header("anthropic-beta", beta_csv)
@@ -1393,18 +1565,26 @@ impl Drop for FlowCompletionGuard {
 }
 
 impl AnthropicClient {
-    /// Build and send the authenticated `GET /v1/models` request.
+    /// Build and send the authenticated `GET /v1/models` request, asking for
+    /// `limit` entries per page (`after_id` continues a listing).
     ///
-    /// Shared by [`LlmProvider::list_models`] (which swallows failures into an
-    /// empty vec) and [`LlmProvider::probe`] (which propagates them). Kept as
-    /// one function so the two can never drift apart in auth handling — a
-    /// probe that authenticated differently from the real call would be
+    /// Shared by the catalog listing ([`LlmProvider::list_models`] /
+    /// [`LlmProvider::fetch_models`], via `fetch_all_models`, `limit` =
+    /// [`MODELS_PAGE_LIMIT`]) and [`LlmProvider::probe`] (`limit` =
+    /// [`PROBE_PAGE_LIMIT`]: the status is the whole answer, so it must not
+    /// download the catalog).
+    /// Kept as one function so the two can never drift apart in auth handling
+    /// — a probe that authenticated differently from the real call would be
     /// testing the wrong thing.
     ///
     /// Deliberately does NOT go through `apply_auth_headers`: that injects
     /// `X-Stainless-*` + `X-Claude-Code-Session-Id` plus a per-request beta
     /// CSV, some of which get this endpoint to reject the request.
-    async fn models_request(&self) -> Result<reqwest::Response, ProviderError> {
+    async fn models_request(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<reqwest::Response, ProviderError> {
         // Strip the `/v1/messages` (and optional `?beta=true`) suffix off
         // `api_url` to get the API root, then append `/v1/models`.
         let base = self
@@ -1415,10 +1595,16 @@ impl AnthropicClient {
             .trim_end_matches("/v1/messages")
             .trim_end_matches('/');
         let url = format!("{base}/v1/models");
+        let limit = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("limit", limit.as_str())];
+        if let Some(a) = after_id {
+            query.push(("after_id", a));
+        }
 
         let mut req = self
             .client
             .get(&url)
+            .query(&query)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Accept", "application/json");
         match &self.auth {
@@ -1558,6 +1744,10 @@ impl AnthropicClient {
                     body = text.as_str(),
                     "429 response from Anthropic API"
                 );
+                // Not a rate limit: the same request is refused every time.
+                if crate::error::is_long_context_refusal(&text) {
+                    return Err(self.long_context_refusal(request, text));
+                }
                 last_err = Some(ProviderError::Api {
                     status: 429,
                     message: text,
@@ -1721,6 +1911,11 @@ impl AnthropicClient {
                         let text = resp.text().await.unwrap_or_default();
                         flow_guard.add_bytes(text.len() as u64);
                         flow_guard.complete().await;
+                        // Not a rate limit: the same request is refused
+                        // every time.
+                        if crate::error::is_long_context_refusal(&text) {
+                            return Err(self.long_context_refusal(request, text));
+                        }
                         last_err = Some(ProviderError::Api {
                             status: 429,
                             message: text,
@@ -1849,9 +2044,15 @@ impl AnthropicClient {
         // touched by the tool-name sanitizer's block-rewriting pass.
         restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
 
+        let max_tokens = request
+            .max_tokens
+            .unwrap_or(crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS);
         let mut body = serde_json::json!({
-            "model": request.model,
-            "max_tokens": request.max_tokens,
+            // `[1m]` is a client-side opt-in marker (it decides the 1M beta,
+            // see `sends_1m_beta`), never part of the model id: claude-cli
+            // strips it too (`normalizeModelStringForAPI`).
+            "model": crate::model_registry::strip_1m(&request.model),
+            "max_tokens": max_tokens,
             "messages": messages_value,
             "stream": stream,
         });
@@ -1942,8 +2143,11 @@ impl AnthropicClient {
         //   * `thinking.type: "adaptive"` — server picks the budget
         //     (Opus/Sonnet 4 OAuth path).
         //   * `thinking.type: "enabled"` + `budget_tokens: <n>` — fixed
-        //     budget. Must be >= 1024 (API minimum); we silently skip
-        //     thinking when the clamped budget falls below that.
+        //     budget. Must be >= 1024 (API minimum) and < max_tokens
+        //     (thinking counts toward the cap; platform.claude.com/docs/en/
+        //     build-with-claude/extended-thinking, "Budget rules"). Clamped
+        //     to leave 1024 for the visible answer; thinking is skipped when
+        //     the clamped budget falls below the minimum.
         //   * `display: "summarized"` — opt in to readable thinking text.
         //     Only ever set alongside "adaptive": `display` accepts exactly
         //     "summarized" | "omitted" (there is no raw/full — the raw chain of
@@ -1964,11 +2168,11 @@ impl AnthropicClient {
                         ThinkingLevel::Low => 2000,
                         ThinkingLevel::Medium => 5000,
                         ThinkingLevel::High => 10000,
-                        ThinkingLevel::Max => request.max_tokens.saturating_sub(2000),
+                        ThinkingLevel::Max => max_tokens.saturating_sub(2000),
                         ThinkingLevel::Auto => unreachable!(),
                     };
                     if raw_budget > 0 {
-                        let clamped = raw_budget.min(request.max_tokens);
+                        let clamped = raw_budget.min(max_tokens.saturating_sub(1024));
                         if clamped >= 1024 {
                             body["thinking"] = serde_json::json!({
                                 "type": "enabled",
@@ -2307,6 +2511,112 @@ impl AnthropicClient {
         }
         Ok(())
     }
+
+    /// Every page of `GET /v1/models`, with limits (spec 2026-09-30 §3).
+    async fn fetch_all_models(&self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        #[derive(serde::Deserialize)]
+        struct Page {
+            data: Vec<Entry>,
+            #[serde(default)]
+            has_more: bool,
+            #[serde(default)]
+            last_id: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            id: String,
+            #[serde(default)]
+            max_input_tokens: Option<u32>,
+            #[serde(default)]
+            max_tokens: Option<u32>,
+        }
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        // Every cursor already requested: a server that cycles (A -> B -> A)
+        // would otherwise re-collect the same models until the page cap.
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every model id already collected: a server that ignores `after_id`
+        // and re-sends a page must not leave its models in the result twice
+        // (the first occurrence wins).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Bounded as well: a server that never repeats a cursor must not loop
+        // forever either.
+        for page_num in 0..50 {
+            let resp = self
+                .models_request(after.as_deref(), MODELS_PAGE_LIMIT)
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let message: String = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(500)
+                    .collect();
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message,
+                });
+            }
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let page: Page = crate::error::parse_listing_json("anthropic", &body)?;
+            out.extend(
+                page.data
+                    .into_iter()
+                    .filter(|e| seen_ids.insert(e.id.clone()))
+                    .map(|e| crate::model_pool::ModelInfo {
+                        id: e.id,
+                        provider: ProviderId::Anthropic,
+                        context_window: e.max_input_tokens.unwrap_or(0),
+                        max_output_tokens: e.max_tokens.unwrap_or(0),
+                        capabilities: Vec::new(),
+                        cost: crate::model_pool::ModelCost::default(),
+                        status: crate::model_pool::ModelStatus::default(),
+                    }),
+            );
+            match (page.has_more, page.last_id) {
+                (false, _) => break, // Normal end: has_more is false
+                (true, None) => {
+                    // Edge case (b): has_more but no last_id
+                    warn!(
+                        "anthropic models pagination stopped: has_more=true but no last_id; \
+                         returning {} models collected so far",
+                        out.len()
+                    );
+                    break;
+                }
+                (true, Some(ref new_last)) => {
+                    // Check for a repeated cursor (edge case a): the one just
+                    // requested, or any earlier one (a cycle).
+                    if !seen_cursors.insert(new_last.clone()) {
+                        warn!(
+                            provider = "anthropic",
+                            cursor = %new_last,
+                            collected = out.len(),
+                            "models pagination stopped: cursor already seen; \
+                             returning the models collected so far"
+                        );
+                        break;
+                    }
+                    // Check if we're about to hit the cap (edge case c)
+                    if page_num == 49 {
+                        warn!(
+                            "anthropic models pagination stopped: reached 50-page limit with has_more=true; \
+                             returning {} models collected so far",
+                            out.len()
+                        );
+                        break;
+                    }
+                    after = Some(new_last.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Anthropic's wire usage. Its `input_tokens` EXCLUDES cache reads and cache
@@ -2525,64 +2835,22 @@ impl crate::provider::LlmProvider for AnthropicClient {
     /// rather than propagating, so the CLI's "show what we got"
     /// fallback still renders the baked-in list.
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
-        let resp = match self.models_request().await {
-            Ok(r) => r,
+        match self.fetch_all_models().await {
+            Ok(m) => m,
             Err(e) => {
-                tracing::warn!(error = %e, "anthropic list_models: HTTP error");
-                return Vec::new();
-            }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            let body_preview = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect::<String>();
-            tracing::warn!(
-                status = status.as_u16(),
-                body = %body_preview,
-                "anthropic list_models: non-2xx response",
-            );
-            return Vec::new();
-        }
-
-        #[derive(serde::Deserialize)]
-        struct ListResp {
-            data: Vec<ModelEntry>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ModelEntry {
-            id: String,
-        }
-        match resp.json::<ListResp>().await {
-            Ok(body) => body
-                .data
-                .into_iter()
-                .map(|e| crate::model_pool::ModelInfo {
-                    id: e.id,
-                    provider: ProviderId::Anthropic,
-                    context_window: 0,
-                    max_output_tokens: 0,
-                    capabilities: Vec::new(),
-                    cost: crate::model_pool::ModelCost::default(),
-                    status: crate::model_pool::ModelStatus::default(),
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "anthropic list_models: JSON parse failed");
+                tracing::warn!(error = %e, "anthropic list_models failed");
                 Vec::new()
             }
         }
     }
 
-    /// Probe via the same authenticated `GET /v1/models` call `list_models`
-    /// makes — but here the status IS the answer, so nothing is swallowed. A
-    /// 2xx means the credential works, even if the account lists no models.
+    /// Probe via the same authenticated `GET /v1/models` request builder the
+    /// catalog listing uses (`models_request`), but for a single entry
+    /// ([`PROBE_PAGE_LIMIT`]) — here the status IS the answer, so nothing is
+    /// swallowed and nothing is paginated. A 2xx means the credential works,
+    /// even if the account lists no models.
     async fn probe(&self) -> Result<(), ProviderError> {
-        let resp = self.models_request().await?;
+        let resp = self.models_request(None, PROBE_PAGE_LIMIT).await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -2600,6 +2868,11 @@ impl crate::provider::LlmProvider for AnthropicClient {
             status: status.as_u16(),
             message,
         })
+    }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.ensure_valid_token().await?;
+        self.fetch_all_models().await
     }
 }
 
@@ -2691,7 +2964,7 @@ mod tests {
                 description: "list repos".into(),
                 input_schema: serde_json::json!({"type": "object"}),
             }],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             cell_id: None,
             trace_id: None,
             thinking: None,
@@ -2732,6 +3005,27 @@ mod tests {
             csv.contains("context-1m-2025-08-07"),
             "context-1m must be sent when [1m] suffix is present; got: {csv}"
         );
+    }
+
+    /// `[1m]` is a client-side opt-in marker, not part of the model id:
+    /// claude-cli strips it before the API call (`normalizeModelStringForAPI`
+    /// removes `[1m]`/`[2m]`). It must never reach the wire `model` field —
+    /// on either auth path — while still deciding the 1M beta.
+    #[test]
+    fn the_1m_suffix_is_stripped_from_the_wire_model() {
+        let mut request = make_request(None);
+        request.model = "claude-sonnet-4-6[1m]".into();
+        for client in [
+            oauth_client(),
+            AnthropicClient::new("sk".into(), Arc::new(rupu_netflow::NullSink)),
+        ] {
+            let body = client.build_request_body(&request, false);
+            assert_eq!(body["model"], "claude-sonnet-4-6");
+            let body = client.build_request_body(&request, true);
+            assert_eq!(body["model"], "claude-sonnet-4-6", "stream body too");
+        }
+        // The suffix still opts the OAuth path into the beta.
+        assert!(oauth_client().sends_1m_beta(&request.model, None));
     }
 
     #[test]
@@ -2778,7 +3072,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -2803,7 +3097,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hello")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -2826,13 +3120,32 @@ mod tests {
     }
 
     #[test]
+    fn unset_max_tokens_sends_the_anthropic_fallback() {
+        let client = AnthropicClient::with_url(
+            "k".into(),
+            "http://x/v1/messages".into(),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let mut req = make_request(None);
+        req.max_tokens = None;
+        let body = client.build_request_body(&req, false);
+        assert_eq!(
+            body["max_tokens"],
+            crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS
+        );
+        req.max_tokens = Some(64_000);
+        let body = client.build_request_body(&req, false);
+        assert_eq!(body["max_tokens"], 64_000);
+    }
+
+    #[test]
     fn test_build_request_body_with_system_and_tools() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: Some("You are helpful.".into()),
             messages: vec![Message::user("hello")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![ToolDefinition {
                 name: "test".into(),
                 description: "A test tool".into(),
@@ -2887,7 +3200,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: Some("cell-abc".into()),
             trace_id: None,
@@ -2923,7 +3236,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: Some("cell-abc".into()),
             trace_id: None,
@@ -2955,7 +3268,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: Some("cell-xyz".into()),
             trace_id: None,
@@ -2986,7 +3299,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3016,7 +3329,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: system.map(str::to_string),
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3086,7 +3399,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("low effort")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3115,7 +3428,7 @@ mod tests {
             model: "claude-opus-4-7".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3145,7 +3458,7 @@ mod tests {
             model: "claude-opus-4-7".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3175,7 +3488,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3214,7 +3527,7 @@ mod tests {
                     content: blocks,
                 },
             ],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3416,7 +3729,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("medium effort")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3442,7 +3755,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("think hard")],
-            max_tokens: 16000,
+            max_tokens: Some(16000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3468,7 +3781,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("quick")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3493,7 +3806,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("classify")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3518,7 +3831,7 @@ mod tests {
             model: "claude-opus-4-6".into(),
             system: None,
             messages: vec![Message::user("deep analysis")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3544,7 +3857,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("think")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3561,10 +3874,58 @@ mod tests {
         let body = client.build_request_body(&request, false);
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
         assert!(
-            budget <= 4096,
-            "budget {budget} should be <= max_tokens 4096"
+            budget < 4096,
+            "budget {budget} must be < max_tokens 4096 (an API requirement)"
         );
         assert!(budget >= 1024, "budget {budget} should be >= minimum 1024");
+    }
+
+    /// With no cap pinned, the thinking budget is computed against the
+    /// effective cap — the 8192 fallback that actually goes on the wire — not
+    /// against a missing value.
+    #[test]
+    fn thinking_budget_uses_the_fallback_cap_when_max_tokens_is_unset() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let fallback = crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS;
+        let mut request = make_request(None);
+        request.max_tokens = None;
+
+        request.thinking = Some(crate::model_tier::ThinkingLevel::Max);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["max_tokens"], fallback);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], fallback - 2000);
+        assert_eq!(body["thinking"]["budget_tokens"], 8192 - 2000);
+
+        // High asks for 10_000, more than the effective cap allows: clamped
+        // to leave 1024 for the answer (`budget_tokens < max_tokens`).
+        request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["thinking"]["budget_tokens"], fallback - 1024);
+    }
+
+    /// The API requires `budget_tokens < max_tokens` ("Less than
+    /// `max_tokens`" — platform.claude.com/docs/en/build-with-claude/
+    /// extended-thinking, Budget rules): thinking counts toward the cap, so
+    /// the budget must leave room for the answer. The clamp keeps 1024 for
+    /// it, and drops thinking when what is left is under the 1024 minimum.
+    #[test]
+    fn thinking_budget_stays_below_the_output_cap() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let budget = |level, cap| {
+            let mut request = make_request(None);
+            request.max_tokens = Some(cap);
+            request.thinking = Some(level);
+            client.build_request_body(&request, false)["thinking"].clone()
+        };
+        use crate::model_tier::ThinkingLevel::{High, Low, Max};
+        assert_eq!(budget(High, 8192)["budget_tokens"], 7168);
+        assert_eq!(budget(Max, 8192)["budget_tokens"], 6192);
+        assert!(
+            budget(Low, 1500).is_null(),
+            "1500 − 1024 leaves less than the 1024 minimum: no thinking"
+        );
+        assert!(budget(High, 1500).is_null());
     }
 
     #[test]
@@ -3574,7 +3935,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("tiny")],
-            max_tokens: 500,
+            max_tokens: Some(500),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -4147,7 +4508,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             ..Default::default()
         };
@@ -4173,7 +4534,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             output_schema: Some(schema.clone()),
             ..Default::default()
@@ -4220,7 +4581,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_schema: Some(schema),
             ..Default::default()
         };
@@ -4296,7 +4657,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             output_schema: None,
             ..Default::default()
@@ -4316,7 +4677,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_schema: Some(schema.clone()),
             anthropic_task_budget: Some(1500),
             ..Default::default()
@@ -4335,7 +4696,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             anthropic_task_budget: Some(2048),
             ..Default::default()
         };
@@ -4349,7 +4710,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             anthropic_context_management: Some(crate::types::ContextManagement::ToolClearing),
             ..Default::default()
         };
@@ -4363,7 +4724,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             anthropic_speed: Some(crate::types::Speed::Fast),
             ..Default::default()
         };
@@ -4377,7 +4738,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
         };
         let body = client.build_request_body(&request, false);
@@ -4399,7 +4760,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             anthropic_task_budget: Some(1500),
             ..Default::default()
@@ -4479,7 +4840,7 @@ mod tests {
                 Message::user("second"),
             ],
             tools: vec![cache_tool("read_file")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             ..Default::default()
         };
         let b = body_for(&client, &req);
@@ -4801,7 +5162,7 @@ mod tests {
                 },
                 Message::tool_result("toolu_r2", "", false),
             ],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             ..Default::default()
         };
         let on = body_for(&client, &req);
@@ -5007,7 +5368,7 @@ mod tests {
                 },
                 Message::tool_result("toolu_1", "ok", false),
             ],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             ..Default::default()
         };
         let on = body_for(&cached, &req);
@@ -5196,6 +5557,413 @@ mod tests {
         });
         let _ = client.send(&make_request(None)).await;
         m.assert_hits(2);
+    }
+
+    /// The long-context entitlement 429 ("Extra usage is required for long
+    /// context requests", see the `anthropic-beta` comment above) is
+    /// deterministic for that request, not a rate limit: retrying it only
+    /// delays the overflow handling in the agent runner. Both paths surface it
+    /// on the first response, even with a retry budget to spend.
+    #[tokio::test]
+    async fn long_context_entitlement_429_is_not_retried() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"error":{"message":"Extra usage is required for long context requests"}}"#,
+                );
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        for streamed in [false, true] {
+            let err = if streamed {
+                client.stream(&make_request(None), |_ev| {}).await
+            } else {
+                client.send(&make_request(None)).await
+            }
+            .unwrap_err();
+            assert!(
+                matches!(&err, ProviderError::Api { status: 429, message }
+                    if message.contains("Extra usage is required for long context")),
+                "streamed={streamed}: {err:?}"
+            );
+        }
+        m.assert_hits(2);
+    }
+
+    /// The refresh grant is posted as JSON — the shape Claude Code's own
+    /// `refreshOAuthToken` sends (see `refresh_anthropic_token`).
+    #[tokio::test]
+    async fn the_token_refresh_posts_a_json_grant() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                .header("content-type", "application/json")
+                .json_body_partial(format!(
+                    r#"{{"grant_type":"refresh_token","refresh_token":"refresh-1","client_id":"{ANTHROPIC_CLIENT_ID}"}}"#
+                ));
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600
+            }));
+        });
+        let (client, _sink) = build_http_client(Arc::new(rupu_netflow::NullSink));
+        let refreshed =
+            refresh_anthropic_token_at(&client, &server.url("/v1/oauth/token"), "refresh-1")
+                .await
+                .unwrap();
+        token.assert_hits(1);
+        assert!(
+            matches!(refreshed, AuthMethod::OAuth { ref access_token, .. } if access_token == "access-2")
+        );
+    }
+
+    /// A token refresh started by a request that is then dropped (a pause, a
+    /// listing timeout) must still persist the rotated token: the provider
+    /// has already invalidated the old refresh token, so losing the new one
+    /// logs the user out. The refresh runs as its own task, so it finishes
+    /// and persists after the caller is gone.
+    #[tokio::test]
+    async fn an_abandoned_token_refresh_still_persists_the_rotated_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = AnthropicClient::from_auth_with_path(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1, // long expired (0 means "no expiry info")
+            },
+            path.clone(),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        client.token_url = server.url("/v1/oauth/token");
+        client.api_url = format!("{}/v1/messages", server.url(""));
+        let request = make_request(None);
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(
+            dropped.is_err(),
+            "the caller gave up mid-refresh: {dropped:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|s| s.contains("refresh-2"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        token.assert_hits(1);
+        let saved = std::fs::read_to_string(&path).expect("the refresh persisted");
+        assert!(
+            saved.contains("refresh-2") && saved.contains("access-2"),
+            "{saved}"
+        );
+    }
+
+    /// The client a dropped call leaves behind still holds the expired
+    /// token. Its next call (e.g. the run's first turn, after `resolve`'s
+    /// listing timed out mid-refresh) must adopt the refresh already in
+    /// flight, not start a second one with the rotated-out refresh token —
+    /// which the endpoint answers `invalid_grant`, and repeated reuse can get
+    /// the whole grant revoked.
+    #[tokio::test]
+    async fn a_reused_client_adopts_the_refresh_in_flight() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1, // long expired
+            },
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        client.token_url = server.url("/v1/oauth/token");
+        let request = make_request(None);
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        // The next call: the messages endpoint has no mock (404), which is
+        // fine — what matters is the token endpoint saw ONE refresh.
+        let _ = client.send(&request).await;
+        token.assert_hits(1);
+        assert!(
+            matches!(&client.auth, AuthMethod::OAuth { access_token, refresh_token, .. }
+                if access_token == "access-2" && refresh_token == "refresh-2"),
+            "the client adopted the rotated token"
+        );
+    }
+
+    /// An adopted refresh is checked like any other token: one that
+    /// finished long ago on an idle client (or was issued short-lived) may
+    /// already be expired, and must be refreshed again rather than sent.
+    #[tokio::test]
+    async fn an_adopted_refresh_that_is_already_expired_is_refreshed_again() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                .body_contains("refresh-1");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                // Already inside the 5-minute expiry buffer when it lands.
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 1
+                }));
+        });
+        let second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/oauth/token")
+                .body_contains("refresh-2");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "access-3",
+                "refresh_token": "refresh-3",
+                "expires_in": 3600
+            }));
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1,
+            },
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        client.token_url = server.url("/v1/oauth/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.ensure_valid_token(),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        client.ensure_valid_token().await.unwrap();
+        first.assert_hits(1);
+        second.assert_hits(1);
+        assert!(
+            matches!(&client.auth, AuthMethod::OAuth { access_token, .. } if access_token == "access-3"),
+            "the expired adopted token was refreshed again"
+        );
+    }
+
+    /// An OAuthRefresher that records the stale refresh token it was handed
+    /// and returns a fixed fresh credential.
+    struct FakeRefresher {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credential_writes::OAuthRefresher for FakeRefresher {
+        async fn refresh(&self, stale: AuthCredentials) -> Result<AuthCredentials, ProviderError> {
+            if let AuthCredentials::OAuth { refresh, .. } = &stale {
+                self.seen.lock().unwrap().push(refresh.clone());
+            }
+            Ok(AuthCredentials::OAuth {
+                access: "access-9".into(),
+                refresh: "refresh-9".into(),
+                expires: u64::MAX / 2,
+                extra: Default::default(),
+            })
+        }
+    }
+
+    /// With a refresher (the store that owns the credential), the client
+    /// hands its refresh over — so the rotation is persisted under the
+    /// store's lock — and never calls the token endpoint itself.
+    #[tokio::test]
+    async fn a_client_with_a_refresher_hands_it_the_refresh() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let own = server.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "own" }));
+        });
+        let refresher = std::sync::Arc::new(FakeRefresher {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1,
+            },
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_oauth_refresher(Some(refresher.clone()));
+        client.token_url = server.url("/v1/oauth/token");
+        client.ensure_valid_token().await.unwrap();
+        own.assert_hits(0);
+        assert_eq!(
+            *refresher.seen.lock().unwrap(),
+            vec!["refresh-1".to_string()]
+        );
+        assert!(
+            matches!(&client.auth, AuthMethod::OAuth { access_token, .. } if access_token == "access-9")
+        );
+    }
+
+    fn no_beta_header(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        !req.headers.as_ref().is_some_and(|h| {
+            h.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+        })
+    }
+
+    const EXTRA_USAGE_429: &str =
+        r#"{"error":{"message":"Extra usage is required for long context requests"}}"#;
+
+    /// The extra-usage 429 on a request that carried the 1M beta means the
+    /// account has no extra-usage entitlement for 1M context — every request
+    /// with the beta is refused the same way. The client reports
+    /// `LongContextUnavailable` and stops sending the beta for the rest of its
+    /// life, so the next request goes out without it. OAuth: the beta comes
+    /// from the `[1m]` suffix (send and stream paths).
+    #[tokio::test]
+    async fn oauth_long_context_refusal_disables_the_1m_beta() {
+        use httpmock::prelude::*;
+        let model = "claude-sonnet-4-6[1m]";
+        let with_1m = build_oauth_beta_csv(model, false);
+        let without_1m = build_oauth_beta_csv("claude-sonnet-4-6", false);
+        assert!(with_1m.contains("context-1m-2025-08-07"));
+        for streamed in [false, true] {
+            let server = MockServer::start();
+            let refused = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .header("anthropic-beta", with_1m.clone());
+                then.status(429).body(EXTRA_USAGE_429);
+            });
+            let without = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .header("anthropic-beta", without_1m.clone());
+                then.status(400).body("served without the beta");
+            });
+            let mut client = AnthropicClient::from_auth_with_url(
+                AuthMethod::OAuth {
+                    access_token: "tok".into(),
+                    refresh_token: "r".into(),
+                    expires_ms: u64::MAX,
+                },
+                format!("{}/v1/messages", server.url("")),
+                Arc::new(rupu_netflow::NullSink),
+            );
+            let mut request = make_request(None);
+            request.model = model.into();
+            async fn call(
+                client: &mut AnthropicClient,
+                request: &LlmRequest,
+                streamed: bool,
+            ) -> Result<LlmResponse, ProviderError> {
+                if streamed {
+                    client.stream(request, |_ev| {}).await
+                } else {
+                    client.send(request).await
+                }
+            }
+            let first = call(&mut client, &request, streamed).await.unwrap_err();
+            assert!(
+                matches!(&first, ProviderError::LongContextUnavailable { .. }),
+                "streamed={streamed}: {first:?}"
+            );
+            let second = call(&mut client, &request, streamed).await.unwrap_err();
+            assert!(
+                matches!(&second, ProviderError::Api { status: 400, .. }),
+                "streamed={streamed}: the retry goes out without the beta: {second:?}"
+            );
+            refused.assert_hits(1);
+            without.assert_hits(1);
+        }
+    }
+
+    /// Same on the api-key path, where the beta comes from
+    /// `context_window: OneMillion`.
+    #[tokio::test]
+    async fn api_key_long_context_refusal_disables_the_1m_beta() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let refused = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("anthropic-beta", "context-1m-2025-08-07");
+            then.status(429).body(EXTRA_USAGE_429);
+        });
+        let without = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .matches(no_beta_header);
+            then.status(400).body("served without the beta");
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let mut request = make_request(None);
+        request.context_window = Some(crate::model_tier::ContextWindow::OneMillion);
+        let first = client.send(&request).await.unwrap_err();
+        assert!(
+            matches!(first, ProviderError::LongContextUnavailable { .. }),
+            "{first:?}"
+        );
+        let second = client.send(&request).await.unwrap_err();
+        assert!(
+            matches!(second, ProviderError::Api { status: 400, .. }),
+            "{second:?}"
+        );
+        refused.assert_hits(1);
+        without.assert_hits(1);
+    }
+
+    /// `LongContextUnavailable` is not retried by the retry layers either.
+    #[test]
+    fn long_context_unavailable_is_not_retryable() {
+        assert!(!crate::tuned::is_retryable(
+            &ProviderError::LongContextUnavailable {
+                message: EXTRA_USAGE_429.into()
+            }
+        ));
     }
 
     // ── I-84: stream()'s idle-restart / 429-retry loops share one budget ──
@@ -5401,10 +6169,42 @@ mod tests {
             .await
             .expect_err("a 401 must never be reported as healthy");
 
-        assert!(
-            matches!(err, ProviderError::Api { status: 401, .. }),
-            "expected Api{{status:401}}, got {err:?}"
+        match err {
+            ProviderError::Api {
+                status: 401,
+                message,
+            } => assert!(
+                message.contains("authentication_error"),
+                "the response body must land in the message, got {message:?}"
+            ),
+            other => panic!("expected Api{{status:401}}, got {other:?}"),
+        }
+    }
+
+    /// `probe` only needs the status, so it must not download the whole
+    /// catalog: it asks for a single model.
+    #[tokio::test]
+    async fn probe_requests_a_single_model() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("limit", "1")
+                .matches(no_after_id);
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [], "has_more": false }));
+        });
+        let client = AnthropicClient::with_url(
+            "good-key".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         );
+
+        <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
+            .await
+            .expect("probe must succeed against a limit=1 listing");
+        m.assert_hits(1);
     }
 
     /// A 2xx means the credential works — even when the account lists no
@@ -5450,6 +6250,262 @@ mod tests {
             matches!(err, ProviderError::Http(_)),
             "a transport failure must be Http, not an auth error; got {err:?}"
         );
+    }
+
+    // ── fetch_models (Task 3: limits, paging, token refresh) ──────────
+
+    fn no_after_id(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        !req.query_params
+            .as_ref()
+            .is_some_and(|q| q.iter().any(|(k, _)| k == "after_id"))
+    }
+
+    #[tokio::test]
+    async fn fetch_models_reads_limits_and_follows_pages() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("limit", "1000")
+                .matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "claude-alpha-9", "type": "model", "max_input_tokens": 1000000, "max_tokens": 128000 }],
+                "has_more": true, "first_id": "claude-alpha-9", "last_id": "claude-alpha-9"
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "claude-alpha-9");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "claude-beta-2-20260101", "type": "model", "max_input_tokens": null, "max_tokens": null }],
+                "has_more": false, "first_id": "claude-beta-2-20260101", "last_id": "claude-beta-2-20260101"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert();
+        page2.assert();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            (models[0].context_window, models[0].max_output_tokens),
+            (1_000_000, 128_000)
+        );
+        assert_eq!(
+            (models[1].context_window, models[1].max_output_tokens),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_oauth_sends_bearer_and_beta() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .header("authorization", "Bearer tok-live")
+                .header("anthropic-beta", "oauth-2025-04-20");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [], "has_more": false }));
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "tok-live".into(),
+                refresh_token: "r".into(),
+                expires_ms: u64::MAX,
+            },
+            format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        m.assert();
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_models_surfaces_non_2xx_as_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(401).body("{\"error\":\"nope\"}");
+        });
+        let mut client = AnthropicClient::with_url(
+            "k".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Api { status: 401, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_stops_on_repeated_cursor_edge_case_a() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("limit", "1000")
+                .matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "type": "model", "max_input_tokens": 100, "max_tokens": 10 }],
+                "has_more": true, "first_id": "model-1", "last_id": "model-1"
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "model-1");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-2", "type": "model", "max_input_tokens": 200, "max_tokens": 20 }],
+                "has_more": true, "first_id": "model-2", "last_id": "model-1"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert();
+        page2.assert_hits(1); // Cursor repeated: after_id=model-1 page fetched exactly once
+        assert_eq!(models.len(), 2); // Two models: one from page1, one from page2
+        assert_eq!(models[0].id, "model-1");
+        assert_eq!(models[1].id, "model-2");
+    }
+
+    /// An A -> B -> A cursor cycle (not just an immediate repeat) must stop
+    /// before re-requesting a page — otherwise the same models are collected
+    /// again until the 50-page cap.
+    #[tokio::test]
+    async fn fetch_models_stops_on_an_a_b_a_cursor_cycle() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET).path("/v1/models").matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "max_input_tokens": 100, "max_tokens": 10 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "cursor-a");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-2", "max_input_tokens": 200, "max_tokens": 20 }],
+                "has_more": true, "last_id": "cursor-b"
+            }));
+        });
+        let page3 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "cursor-b");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-3", "max_input_tokens": 300, "max_tokens": 30 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert_hits(1);
+        page2.assert_hits(1);
+        page3.assert_hits(1);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["model-1", "model-2", "model-3"], "no duplicates");
+    }
+
+    /// A server that ignores `after_id` and answers every request with the
+    /// same page: the repeated cursor stops the loop, but the repeated page
+    /// must not leave its models in the result twice.
+    #[tokio::test]
+    async fn fetch_models_dedupes_ids_when_the_server_ignores_the_cursor() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET).path("/v1/models").matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "max_input_tokens": 100, "max_tokens": 10 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        // Same page again, same cursor again.
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "cursor-a");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "max_input_tokens": 999, "max_tokens": 99 }],
+                "has_more": true, "last_id": "cursor-a"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert_hits(1);
+        page2.assert_hits(1);
+        assert_eq!(
+            models.len(),
+            1,
+            "ids: {:?}",
+            models.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        assert_eq!(models[0].id, "model-1");
+        // The first occurrence wins.
+        assert_eq!(
+            (models[0].context_window, models[0].max_output_tokens),
+            (100, 10)
+        );
+    }
+
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure: it must surface as `Json`, not `Http`.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200).body("not json");
+        });
+        let mut client = AnthropicClient::with_url(
+            "k".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
     }
 
     // ── Reasoning capture (Task 2) ───────────────────────────────────

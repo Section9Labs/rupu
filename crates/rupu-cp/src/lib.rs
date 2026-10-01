@@ -14,6 +14,7 @@ pub mod error;
 pub mod fleet_inventory;
 pub mod host;
 pub mod launcher;
+pub mod model_catalog;
 pub mod net;
 pub mod node;
 pub mod pagination;
@@ -55,6 +56,10 @@ pub struct ServeOpts {
     /// Optional repo-lister adapter. rupu-cli's `cp serve` provides the
     /// registry-backed impl; `None` → `/api/repos` returns 501.
     pub repos: Option<std::sync::Arc<dyn crate::repos::RepoLister>>,
+    /// Optional model-catalog adapter (discovered model limits + manual
+    /// refetch). rupu-cli's `cp serve` provides the runtime-backed impl;
+    /// `None` → `/api/models*` return 501.
+    pub model_catalog: Option<std::sync::Arc<dyn crate::model_catalog::ModelCatalog>>,
     /// Optional agent-launcher adapter. rupu-cli's `cp serve` provides the
     /// subprocess-spawning impl; `None` disables agent launching from the web UI.
     pub agent_launcher: Option<std::sync::Arc<dyn crate::agent_launcher::AgentLauncher>>,
@@ -240,6 +245,7 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
         .with_launcher(opts.launcher.clone())
         .with_session_sender(opts.session_sender.clone())
         .with_repos(opts.repos)
+        .with_model_catalog(opts.model_catalog.clone())
         .with_agent_launcher(opts.agent_launcher.clone())
         .with_session_starter(opts.session_starter.clone())
         .with_generator(opts.generator)
@@ -271,6 +277,21 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             app_state.pricing.clone(),
         );
     let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
+
+    // Fold spend into the usage index in the background, so the first page
+    // that shows it doesn't pay for reading every transcript.
+    {
+        let global = app_state.global_dir.clone();
+        let run_store = std::sync::Arc::clone(&app_state.run_store);
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            usage::prewarm(&global, &run_store);
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "usage index warmed"
+            );
+        });
+    }
 
     let app = server::router(app_state, opts.token);
 

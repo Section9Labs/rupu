@@ -360,6 +360,13 @@ pub async fn handle(action: Action) -> ExitCode {
                     },
                 ));
 
+            // Adapter for rupu-cp's ModelCatalog port: the discovered
+            // model-limits catalog + manual refetch behind `/api/models*`.
+            let model_catalog: Option<Arc<dyn rupu_cp::model_catalog::ModelCatalog>> =
+                Some(Arc::new(crate::cp_model_catalog::RuntimeModelCatalog {
+                    global_dir: global_dir.clone(),
+                }));
+
             // Repo lister for the web Run target picker. The same SCM registry
             // and repo lister feed the fleet strip's SCM half below — one
             // credential resolution, not two.
@@ -447,6 +454,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     launcher: Some(launcher),
                     session_sender: Some(session_sender),
                     repos,
+                    model_catalog,
                     agent_launcher,
                     session_starter,
                     generator,
@@ -794,7 +802,7 @@ async fn run_resume_worker(
             // `AwaitingApproval` → `workflow approve` (approval-gate resume,
             // unchanged); `Paused` → `workflow resume` (cooperative-pause
             // resume, T4 — that command now also accepts `Paused` and reads
-            // the persisted mid-step seed via `RunStore::read_paused_seed`).
+            // the persisted mid-step seeds via `RunStore::read_paused_seeds`).
             let subcommand = match run.status {
                 rupu_orchestrator::RunStatus::Paused => "resume",
                 _ => "approve",
@@ -1197,15 +1205,24 @@ async fn run_gate_sweep(
                 let pid_alive = rec.runner_pid.map(rupu_orchestrator::runs::pid_is_running);
                 let decision = sweep_decision(rec.status, None, false, pid_alive, is_remote);
                 match decision {
-                    SweepAction::Reap => match store.reap_if_orphaned(&mut rec, now) {
-                        Ok(true) => {
-                            tracing::warn!(run_id = %run_id, "gate sweep: reaped orphaned run (runner pid dead)");
+                    SweepAction::Reap => {
+                        // Re-decided under the run lock, on the blocking
+                        // pool (the lock wait blocks its thread): a cancel
+                        // that landed since the list was taken is preserved.
+                        let mut listed = rec.clone();
+                        let reaped = store
+                            .blocking(move |s| s.reap_if_orphaned(&mut listed, now))
+                            .await;
+                        match reaped {
+                            Ok(true) => {
+                                tracing::warn!(run_id = %run_id, "gate sweep: reaped orphaned run (runner pid dead)");
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!(run_id = %run_id, error = %e, "gate sweep: reap_if_orphaned failed");
+                            }
                         }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::warn!(run_id = %run_id, error = %e, "gate sweep: reap_if_orphaned failed");
-                        }
-                    },
+                    }
                     _ => {
                         if is_remote {
                             tracing::debug!(run_id = %run_id, "gate sweep: skipping remote-host in-flight run");
@@ -2232,7 +2249,7 @@ mod tests {
     // the REAL `build_reject_cleanup_opts`/`run_reject_cleanup` path (not
     // a test-double factory) via the `RUPU_MOCK_PROVIDER_SCRIPT` seam
     // (`crates/rupu-runtime/src/provider_factory.rs`), mirroring
-    // `crates/rupu-cli/tests/workflow_runs_no_side_effects.rs`'s fixture
+    // `crates/rupu-cli/tests/serial/workflow_runs_no_side_effects.rs`'s fixture
     // shape: a real `write_file` tool call is the only reliable proof the
     // chain genuinely executed, as opposed to merely flipping a flag.
 

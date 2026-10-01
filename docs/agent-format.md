@@ -73,9 +73,9 @@ Everything after the closing `---` is the system prompt.
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
-| `maxTokens` | integer | no | `8192` | Per-request output-token budget (`max_tokens` in the LLM request); extended thinking (`effort`) draws from this same budget |
-| `contextWindowTokens` | integer | no | none (compaction disabled) | Model context-window size in tokens; when set, enables proactive LLM context compaction |
-| `compactAtPercent` | integer | no | `80` when `contextWindowTokens` is set | Percentage of `contextWindowTokens` at which compaction triggers; clamped to `[10, 95]` |
+| `maxTokens` | integer | no | discovered output cap | Per-request output-token cap. Overrides the cap discovered from the provider's model list; when neither is known, Anthropic gets `8192` and other providers get no cap (model max). `0` is ignored. Extended thinking (`effort`) draws from this budget |
+| `contextWindowTokens` | integer | no | discovered input limit | Input-token limit used for proactive compaction. Overrides the discovered limit; compaction is off only when neither is known. `0` is ignored |
+| `compactAtPercent` | integer | no | `80` | Percentage of the input limit at which compaction triggers; clamped to `[10, 95]`. When the output cap is known and shares the input window, compaction also triggers early enough that a full-length reply still fits |
 
 ---
 
@@ -240,6 +240,8 @@ Accepted values:
 
 Use this sparingly. Most agents should let the model use its normal context window.
 
+On Anthropic, `1m` opts an API-key account into the 1M-token context beta; an SSO account opts in with a `[1m]` suffix on `model:` instead, and the suffix is stripped from the model id sent to the API. Neither changes the input limit rupu discovers (`contextWindowTokens`, below). If the account has no extra-usage billing, Anthropic refuses such a request with a 429: rupu then stops sending the beta for the rest of that run, falls back to the standard 200,000-token window, writes a `model_limits_clamped` notice and retries once. Every new run starts with the beta again, so remove `contextWindow: 1m` (or `[1m]`) to skip the refused request. See [providers.md](providers.md#when-the-provider-rejects-a-request).
+
 ### `outputFormat`
 
 Accepted values:
@@ -287,11 +289,30 @@ See `docs/coverage.md` for what a complete report requires. Every field is requi
 
 ### `maxTokens`
 
-Per-request output-token budget (the LLM request's `max_tokens`). Defaults to `8192` when omitted. Extended thinking (`effort`) draws from this same budget, so raise it for agents that both reason heavily and produce long output.
+Per-request output-token cap (the LLM request's `max_tokens`). You rarely need to set it: rupu discovers each model's real output cap from the provider's model list, where the provider reports one (Codex/OpenAI and OpenAI-compatible servers report none), and sends that on every turn. A `maxTokens` value overrides the discovered cap. When neither is known, Anthropic requests carry `8192` (the API requires a cap) and every other provider gets no cap, so the model's own maximum applies. Extended thinking (`effort`) draws from this same budget, so a low `maxTokens` can starve an agent that both reasons heavily and produces long output.
+
+On Anthropic, the `max` effort level's thinking budget scales with the output cap (cap − 2,000 tokens), so a discovered 64K cap raises both the budget and its cost; pin a smaller `maxTokens` to bound it. A fixed thinking budget is always kept at least 1,024 tokens below the cap (the API requires the budget to be smaller), and thinking is skipped when the cap leaves no room for the 1,024-token minimum. A `maxTokens` of `0` is ignored. `--no-stream` only changes display — requests still stream on the wire, so the full discovered output cap applies. Only a `stream = false` OpenAI-compatible server (one that genuinely cannot stream) carries `max_tokens: 8192` when no cap is known, instead of omitting the field.
 
 ### `contextWindowTokens` and `compactAtPercent`
 
-`contextWindowTokens` sets the model's context-window size in tokens and enables proactive LLM context compaction: when the previous turn's input exceeded `compactAtPercent` of this value, the runner summarizes older turns before the next turn. `compactAtPercent` defaults to `80` when `contextWindowTokens` is set and is otherwise omitted; values are clamped to `[10, 95]`. Leaving `contextWindowTokens` unset disables compaction entirely.
+`contextWindowTokens` is the model's input-token limit, used for proactive context compaction. rupu discovers it from the provider's model list; set it only to override the discovered value (for example to compact earlier than the model requires, or on a provider that reports no limits). Compaction is off only when neither a pin nor a discovered value is available.
+
+`compactAtPercent` (default `80`, clamped to `[10, 95]`) is the share of the input limit at which the runner summarizes older turns before the next turn. When the output cap is known and the model's output counts against the same window as its input (Anthropic, Codex, OpenAI-compatible), the threshold is the lower of that percentage and the input limit minus the output cap, so a full-length reply still fits. Otherwise the threshold is simply `input × compactAtPercent / 100`: Copilot and Gemini budget input and output independently, and an unknown output cap (including the Anthropic `8192` wire fallback, which is not a discovered limit) gives no headroom to subtract.
+
+Where the limits come from, per field, in precedence order:
+
+1. the agent's `contextWindowTokens` / `maxTokens`;
+2. a `[[providers.<name>.models]]` entry in `config.toml` (value greater than zero);
+3. the provider's live model list, cached for 1 hour in `~/.rupu/cache/models/` (see [providers.md](providers.md#model-resolution) for each provider's source);
+4. unknown.
+
+A pin of `0` is ignored (the notice says `ignored contextWindowTokens: 0`), and so is a `0` in a config entry.
+
+Every run writes a `model_limits` notice to its transcript stating the input limit, output cap and compaction threshold it will use and where each came from, including an explicit "unknown" and the reason when a limit could not be discovered. If the model-list fetch failed or timed out, runs don't retry it for 5 minutes (the notice says so; `rupu models refresh` ignores the pause).
+
+If the provider later rejects a request as too long and reports the real maximum, rupu lowers the input limit to that value for the rest of the run (a `model_limits_clamped` notice), compacts with a summary, and retries. It recognizes the rejection formats of Anthropic, OpenAI, Copilot, vLLM and Gemini. When the input limit is known, rupu compacts once per turn this way even if the error carries no number; dropping the oldest turns is the last resort. Anthropic's older "input length and `max_tokens` exceed context limit" error means the output reservation, not the input, is too big: rupu retries once with a lower `max_tokens` for that request and leaves the input limit alone. See [providers.md](providers.md#when-the-provider-rejects-a-request).
+
+A session resolves its limits on its first turn and keeps them, including a lowered limit, for later turns, even when the turn that learned it failed (a first turn that found no limit at all is resolved again on the next turn).
 
 ### Anthropic-specific fields
 

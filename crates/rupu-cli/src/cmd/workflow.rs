@@ -94,7 +94,7 @@ const PAUSE_MARKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// [`PAUSE_MARKER_POLL_INTERVAL`] until the marker is seen; the caller
 /// aborts the returned handle once the run finishes so the poller never
 /// outlives its run.
-fn spawn_pause_marker_poller(
+pub(crate) fn spawn_pause_marker_poller(
     store: Arc<rupu_orchestrator::RunStore>,
     run_id: String,
     token: tokio_util::sync::CancellationToken,
@@ -3125,13 +3125,41 @@ async fn approve(
 /// partially-completed fan-out step re-runs but its already-succeeded units
 /// are replayed from the `unit_checkpoints.jsonl` instead of re-dispatched.
 ///
-/// A `Paused` run additionally carries a persisted mid-step seed transcript
-/// (`RunStore::read_paused_seed`) when the pause landed inside a linear
-/// step's agent turn (see `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`
-/// Task 4) — when present it seeds `ResumeState::paused_step` so the exact
-/// paused step re-runs from where the agent left off instead of from
+/// A `Paused` run additionally carries persisted mid-step seed transcripts
+/// (`RunStore::read_paused_seeds`) when the pause landed inside linear
+/// steps' agent turns (see `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`
+/// Task 4) — when present they seed `ResumeState::paused_steps` so each
+/// paused step re-runs from where its agent left off instead of from
 /// scratch. A step-boundary pause (no seed) just replays like a terminal
 /// resume.
+/// The resume's flip to `Running` found the run's status changed since it
+/// was loaded as `original`: a cancel that landed in between must not be
+/// resumed over (the run stays cancelled and does not start), and a run
+/// another process resumed meanwhile must not run twice. Either way the
+/// resume fails — a non-zero exit — naming what the run is now.
+fn resume_refused_by_status_change(
+    run_id: &str,
+    original: rupu_orchestrator::RunStatus,
+    current: &rupu_orchestrator::RunRecord,
+) -> anyhow::Error {
+    match current.status {
+        rupu_orchestrator::RunStatus::Cancelled => anyhow::anyhow!(
+            "run {run_id} was cancelled before it could resume{} (it was `{}` when loaded); not starting it",
+            current
+                .error_message
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default(),
+            original.as_str()
+        ),
+        other => anyhow::anyhow!(
+            "run {run_id} is now `{}` (it was `{}` when loaded); not resuming it",
+            other.as_str(),
+            original.as_str()
+        ),
+    }
+}
+
 pub(crate) async fn resume_run(
     run_id: &str,
     mode: Option<&str>,
@@ -3144,7 +3172,7 @@ pub(crate) async fn resume_run(
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
 
-    let mut record = store.load(run_id).map_err(|e| match e {
+    let record = store.load(run_id).map_err(|e| match e {
         rupu_orchestrator::RunStoreError::NotFound(id) => {
             anyhow::anyhow!("run not found: {id}\n  hint: list runs with `rupu workflow runs`")
         }
@@ -3269,14 +3297,35 @@ pub(crate) async fn resume_run(
 
     // Flip the persisted record back to Running and clear the prior
     // terminal markers so the runner's terminal-flip block at the end
-    // updates it coherently.
-    record.status = RunStatus::Running;
-    record.finished_at = None;
-    record.error_message = None;
-    record.runner_pid = Some(std::process::id());
-    store
-        .update(&record)
-        .map_err(|e| anyhow::anyhow!("flip run to running: {e}"))?;
+    // updates it coherently. A compare-and-swap under the run lock, on the
+    // blocking pool: it writes only while the record still has the status
+    // it was loaded with, so a cancel (or another resume) that landed
+    // since is not overwritten — and the run does not start.
+    let flipped = {
+        let run_id = run_id.to_string();
+        let pid = std::process::id();
+        store
+            .blocking(move |s| {
+                s.modify_if_status(&run_id, original_status, |record| {
+                    record.status = RunStatus::Running;
+                    record.finished_at = None;
+                    record.error_message = None;
+                    record.runner_pid = Some(pid);
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("flip run to running: {e}"))?
+    };
+    let record = match flipped {
+        Ok(record) => record,
+        Err(current) => {
+            return Err(resume_refused_by_status_change(
+                run_id,
+                original_status,
+                &current,
+            ))
+        }
+    };
 
     // Resolve project_root from the persisted workspace path so
     // agent/config discovery picks up the same `.rupu/` dir the
@@ -3328,6 +3377,7 @@ pub(crate) async fn resume_run(
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
+    let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -3348,6 +3398,7 @@ pub(crate) async fn resume_run(
         Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
             &store, run_id,
         )),
+        limits_ctx.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -3398,6 +3449,7 @@ pub(crate) async fn resume_run(
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
         findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
+        limits_ctx,
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -3407,40 +3459,40 @@ pub(crate) async fn resume_run(
     // fresh one. `None`/empty for a step-boundary pause or a terminal
     // (Failed/Rejected/Cancelled) resume — those replay from
     // `step_results.jsonl` alone, same as today.
-    let (reason, paused_step) = if original_status == RunStatus::Paused {
+    let (reason, paused_steps) = if original_status == RunStatus::Paused {
         // Distinguish "no sidecar" (a step-boundary pause — expected empty)
-        // from a real read/parse failure of an existing seed. `read_paused_seed`
-        // returns an empty `Vec` for a missing file and an `Err` only for an
-        // IO/JSON failure; surface the latter loudly rather than silently
-        // resuming from scratch and dropping a mid-step transcript.
-        let seed = match store.read_paused_seed(run_id) {
-            Ok(seed) => seed,
+        // from a real read/parse failure of an existing seed.
+        // `read_paused_seeds` returns an empty map for missing files and an
+        // `Err` only for an IO/JSON failure; surface the latter loudly rather
+        // than silently resuming from scratch and dropping mid-step
+        // transcripts. Several seeds when a DAG run's manual-pause drain
+        // caught concurrent steps pausing together; a run paused by an
+        // older binary falls back to its single seed + `awaiting_step_id`.
+        let seeds = match store.read_paused_seeds(run_id, record.awaiting_step_id.as_deref()) {
+            Ok(seeds) => seeds,
             Err(e) => {
                 tracing::warn!(
                     run_id,
                     error = %e,
-                    "failed to read persisted paused-step seed; resuming from the step boundary without the mid-step transcript (the paused step will re-run from its prompt)"
+                    "failed to read persisted paused-step seeds; resuming from the step boundary without the mid-step transcripts (the paused steps will re-run from their prompts)"
                 );
-                Vec::new()
+                Default::default()
             }
         };
         if let Err(e) = store.clear_paused_seed(run_id) {
             tracing::warn!(run_id, error = %e, "failed to clear persisted paused-step seed");
         }
-        let paused_step = if seed.is_empty() {
-            None
-        } else {
-            record
-                .awaiting_step_id
-                .clone()
-                .map(|step_id| rupu_orchestrator::PausedStep {
-                    step_id,
-                    seed_messages: seed,
-                })
-        };
-        (rupu_orchestrator::PauseReason::Manual, paused_step)
+        let paused_steps = seeds
+            .into_iter()
+            .filter(|(_, seed)| !seed.is_empty())
+            .map(|(step_id, seed_messages)| rupu_orchestrator::PausedStep {
+                step_id,
+                seed_messages,
+            })
+            .collect();
+        (rupu_orchestrator::PauseReason::Manual, paused_steps)
     } else {
-        (rupu_orchestrator::PauseReason::Approval, None)
+        (rupu_orchestrator::PauseReason::Approval, Vec::new())
     };
 
     let already_done_steps: Vec<String> = done_step_ids.iter().cloned().collect();
@@ -3450,7 +3502,7 @@ pub(crate) async fn resume_run(
         approved_step_id: String::new(),
         completed_units,
         reason,
-        paused_step,
+        paused_steps,
         rejected_reason: None,
         ..Default::default()
     };
@@ -3776,7 +3828,7 @@ async fn cancel(run_id: &str) -> anyhow::Result<()> {
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
-    let outcome = cancel_with_store(&store, run_id, "cancelled by operator")?;
+    let outcome = cancel_with_store(&store, run_id, "cancelled by operator").await?;
     match outcome {
         CancelOutcome::RejectedAwaitingApproval => {
             println!("rupu: cancelled paused run {run_id}");
@@ -3801,13 +3853,17 @@ async fn cancel(run_id: &str) -> anyhow::Result<()> {
 /// AwaitingApproval → reject; terminal → error). Maps the library's
 /// [`CancelError`] onto an `anyhow::Error` with the same user-facing
 /// message shape the CLI printed before.
-fn cancel_with_store(
+/// `RunStore::cancel` on the blocking pool (it waits, bounded, for the run
+/// lock), with its errors mapped for the operator.
+async fn cancel_with_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
     reason: &str,
 ) -> anyhow::Result<CancelOutcome> {
+    let (id, reason, approver) = (run_id.to_string(), reason.to_string(), whoami::username());
     store
-        .cancel(run_id, &whoami::username(), reason, chrono::Utc::now())
+        .blocking(move |s| s.cancel(&id, &approver, &reason, chrono::Utc::now()))
+        .await
         .map_err(|e| match e {
             CancelError::AlreadyTerminal(status) => {
                 anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
@@ -3837,7 +3893,7 @@ pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
-    pause_with_store(&store, run_id)?;
+    pause_with_store(&store, run_id).await?;
     println!(
         "rupu: pause requested for run {run_id} (resume with `rupu workflow resume {run_id}`)"
     );
@@ -3855,24 +3911,32 @@ pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
 /// ([`crate::output::live_run`], Task 7) can request a pause for the run
 /// it is tailing using the exact same primitive, without going through
 /// `pause`'s stdout `println!` (which would corrupt the alt-screen).
-pub(crate) fn pause_with_store(
+///
+/// The store pauses under the run lock (a cancel that lands meanwhile is
+/// refused, never overwritten), whose bounded wait blocks its thread — so
+/// the pause runs on the blocking pool.
+pub(crate) async fn pause_with_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
-    store.pause(run_id, now).map_err(|e| match e {
-        PauseError::AlreadyTerminal(status) => {
-            anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
-        }
-        PauseError::NotRunning(status) => {
-            anyhow::anyhow!(
-                "run {run_id} is `{}` — only a running run can be paused",
-                status.as_str()
-            )
-        }
-        PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
-        PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
-    })?;
+    let id = run_id.to_string();
+    store
+        .blocking(move |s| s.pause(&id, now))
+        .await
+        .map_err(|e| match e {
+            PauseError::AlreadyTerminal(status) => {
+                anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
+            }
+            PauseError::NotRunning(status) => {
+                anyhow::anyhow!(
+                    "run {run_id} is `{}` — only a running run can be paused",
+                    status.as_str()
+                )
+            }
+            PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
+            PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
+        })?;
     // Deliver the pause to the detached runner process via the marker.
     store
         .set_pause_marker(run_id)
@@ -4927,6 +4991,7 @@ async fn execute_workflow_invocation(
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
+    let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         ctx.project_root.clone(),
@@ -4949,6 +5014,7 @@ async fn execute_workflow_invocation(
         Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
             &run_store, &run_id,
         )),
+        limits_ctx.clone(),
     );
     // One codename namer for the whole run — shared by the orchestrator
     // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
@@ -5005,6 +5071,7 @@ async fn execute_workflow_invocation(
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
         findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
+        limits_ctx,
     });
 
     let workflow_for_resume = workflow.clone();
@@ -5083,8 +5150,12 @@ async fn execute_workflow_invocation(
     // own terse completion line.
     let print_summary = summary_enabled(ctx.attach_ui, ctx.shared_printer.is_some());
 
-    let workflow_result = if use_live_view {
-        match run_workflow_with_live_view(
+    // The run's outcome, `Err` included: a runner `Err` (agent / render /
+    // action failure, or a cancel that landed on disk while the run was
+    // finishing) still leaves a terminal run on disk, so the shared summary
+    // and the issue notification below see it before it propagates.
+    let run_outcome: anyhow::Result<OrchestratorRunResult> = if use_live_view {
+        run_workflow_with_live_view(
             opts,
             workflow_for_resume.clone(),
             runs_dir.clone(),
@@ -5092,20 +5163,7 @@ async fn execute_workflow_invocation(
             cfg.pricing.clone(),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                // A runner `Err` (agent / render / action failure) still
-                // leaves a Failed run on disk, and the view is already torn
-                // down: print the summary before the error propagates so the
-                // operator keeps the run id + final state (the retired bare
-                // `failed · run_…` line used to provide it).
-                if print_summary {
-                    print_completion_summary(&runs_dir, &run_id, &cfg.pricing);
-                }
-                return Err(to_anyhow_with_input_snippet(e, &path, &body));
-            }
-        }
+        .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
     } else if ctx.attach_ui {
         let runner_task = tokio::spawn(run_workflow(opts));
         let rid = run_id.clone();
@@ -5187,7 +5245,8 @@ async fn execute_workflow_invocation(
                     run_store_for_resume.as_ref(),
                     &current_run_id,
                     "cancelled by operator",
-                )?;
+                )
+                .await?;
                 // The retained view is already torn down; this early return
                 // skips the shared summary print below, so print it here.
                 if print_summary {
@@ -5207,21 +5266,15 @@ async fn execute_workflow_invocation(
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
             {
                 Ok(result) => result,
-                Err(e) => {
-                    // Same as the live-view branch: the printer has finished,
-                    // so print the summary before the runner's error
-                    // propagates (the printer's own failure line above keeps
-                    // the `error:` text).
-                    if print_summary {
-                        print_completion_summary(&runs_dir, &current_run_id, &cfg.pricing);
-                    }
-                    return Err(to_anyhow_with_input_snippet(e, &path, &body));
-                }
+                // The printer has finished; the shared summary below still
+                // prints before the runner's error propagates (the printer's
+                // own failure line above keeps the `error:` text).
+                Err(e) => break Err(to_anyhow_with_input_snippet(e, &path, &body)),
             };
 
             match outcome {
                 AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
-                    break result;
+                    break Ok(result);
                 }
                 AttachOutcome::Cancelled => {
                     unreachable!("cancelled outcome is handled before join")
@@ -5309,7 +5362,7 @@ async fn execute_workflow_invocation(
     } else {
         run_workflow(opts)
             .await
-            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
+            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
     };
 
     // The run has finished (terminal or paused); the marker poller has no
@@ -5322,11 +5375,34 @@ async fn execute_workflow_invocation(
     // and the retained / line-printer attach (which suppress their terse
     // success line via `AttachOpts::suppress_done_line`). Not printed for the
     // no-UI path or shared-printer callers (see `print_summary` above). Also
-    // covers a run that parked at a gate: the formatter branches on
-    // `AwaitingApproval` and prints the gate + approve/reject block.
+    // covers a run that parked at a gate (the formatter branches on
+    // `AwaitingApproval` and prints the gate + approve/reject block) and a
+    // run that failed or was cancelled, so the operator keeps the run id +
+    // final state before the error propagates.
     if print_summary {
         print_completion_summary(&runs_dir, &run_id, &cfg.pricing);
     }
+
+    if notify_issue_enabled {
+        if let (Some(ref_text), Some(payload), Some(outcome)) = (
+            &issue_ref_text_for_notify,
+            &issue_payload_for_notify,
+            run_summary_outcome(&run_outcome),
+        ) {
+            post_run_summary_to_issue(
+                &registry_for_notify,
+                ref_text,
+                payload,
+                &workflow_name_for_notify,
+                &run_id,
+                &outcome,
+                notify_cwd_for_notify.as_deref(),
+            )
+            .await;
+        }
+    }
+
+    let workflow_result = run_outcome?;
 
     let artifact_manifest_path = persist_portable_run_metadata(
         run_store_for_resume.as_ref(),
@@ -5334,22 +5410,6 @@ async fn execute_workflow_invocation(
         run_envelope.trigger.wake_id.as_deref(),
     )?
     .map(|(path, _)| path);
-
-    if notify_issue_enabled {
-        if let (Some(ref_text), Some(payload)) =
-            (&issue_ref_text_for_notify, &issue_payload_for_notify)
-        {
-            post_run_summary_to_issue(
-                &registry_for_notify,
-                ref_text,
-                payload,
-                &workflow_name_for_notify,
-                &workflow_result,
-                notify_cwd_for_notify.as_deref(),
-            )
-            .await;
-        }
-    }
 
     Ok(RunOutcomeSummary {
         run_id: workflow_result.run_id,
@@ -5360,16 +5420,44 @@ async fn execute_workflow_invocation(
     })
 }
 
+/// Whether `err` is the orchestrator reporting the run as cancelled —
+/// `RunWorkflowError::RunCancelled`, the outcome of a whole-run cancel and
+/// of a cancel that landed on disk while the run was finishing.
+pub(crate) fn run_was_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        matches!(
+            e.downcast_ref::<RunWorkflowError>(),
+            Some(RunWorkflowError::RunCancelled { .. })
+        )
+    })
+}
+
+/// The outcome clause of the issue summary comment, or `None` when the run
+/// ended in an error that is not reported there (a hard failure).
+fn run_summary_outcome(result: &anyhow::Result<OrchestratorRunResult>) -> Option<String> {
+    match result {
+        Ok(result) => Some(match &result.awaiting {
+            Some(info) => format!("paused at step `{}` awaiting approval", info.step_id),
+            // Every step in the result succeeded: the orchestrator returns
+            // `Err` on a hard failure, so reaching here means a clean run.
+            None => format!("completed ({} steps)", result.step_results.len()),
+        }),
+        Err(e) if run_was_cancelled(e) => Some("cancelled".to_string()),
+        Err(_) => None,
+    }
+}
+
 /// Post a one-line summary comment to the targeted issue describing
-/// the run's outcome. Best-effort — surfaces a `tracing::warn!` on
-/// failure rather than propagating, so a slow / down issue tracker
-/// doesn't fail an otherwise-successful run.
+/// the run's `outcome` (see [`run_summary_outcome`]). Best-effort —
+/// surfaces a `tracing::warn!` on failure rather than propagating, so a
+/// slow / down issue tracker doesn't fail an otherwise-successful run.
 async fn post_run_summary_to_issue(
     registry: &rupu_scm::Registry,
     ref_text: &str,
     payload: &serde_json::Value,
     workflow_name: &str,
-    result: &rupu_orchestrator::OrchestratorRunResult,
+    run_id: &str,
+    outcome: &str,
     cwd: Option<&std::path::Path>,
 ) {
     // Reconstruct an `IssueRef` from the persisted text + payload.
@@ -5437,23 +5525,11 @@ async fn post_run_summary_to_issue(
         }
     };
 
-    let outcome = match &result.awaiting {
-        Some(info) => format!("paused at step `{}` awaiting approval", info.step_id),
-        None => {
-            // Distinguish failure from success by checking that
-            // every step in the result succeeded. The orchestrator
-            // would have returned Err earlier if there was a hard
-            // failure, so reaching here means a clean run.
-            let step_count = result.step_results.len();
-            format!("completed ({step_count} steps)")
-        }
-    };
-
     let body = format!(
         "🤖 rupu workflow `{}` (run `{}`) {}.\n\n\
          Inspect: `rupu workflow show-run {}`\n\
          Live: `rupu watch {}`",
-        workflow_name, result.run_id, outcome, result.run_id, result.run_id,
+        workflow_name, run_id, outcome, run_id, run_id,
     );
 
     if let Err(e) = conn.comment_issue(&r, &body).await {
@@ -5500,7 +5576,7 @@ async fn post_run_summary_to_issue(
 ///
 /// The real protection is `[workflow].run_step_enabled`, which defaults
 /// to false and which `bypass` cannot override.
-fn run_step_policy_for(
+pub(crate) fn run_step_policy_for(
     mode_str: &str,
     cfg: &rupu_config::Config,
     workspace_path: PathBuf,
@@ -5648,6 +5724,51 @@ mod tests {
         }
     }
 
+    /// The issue summary's outcome clause: paused / completed / cancelled,
+    /// and nothing for a hard failure (not posted).
+    #[test]
+    fn run_summary_outcome_reports_paused_completed_and_cancelled() {
+        let completed = OrchestratorRunResult {
+            step_results: vec![Default::default(), Default::default()],
+            run_id: "run_x".into(),
+            awaiting: None,
+        };
+        assert_eq!(
+            run_summary_outcome(&Ok(completed.clone())).as_deref(),
+            Some("completed (2 steps)")
+        );
+        let paused = OrchestratorRunResult {
+            awaiting: Some(rupu_orchestrator::runner::AwaitingInfo {
+                step_id: "review".into(),
+                prompt: "ok?".into(),
+                expires_at: None,
+                reason: rupu_orchestrator::runner::PauseReason::Approval,
+                resume_seed: Vec::new(),
+                fanout_completed_units: BTreeMap::new(),
+                gates: Vec::new(),
+                paused_steps: Vec::new(),
+            }),
+            ..completed
+        };
+        assert_eq!(
+            run_summary_outcome(&Ok(paused)).as_deref(),
+            Some("paused at step `review` awaiting approval")
+        );
+        let cancelled: anyhow::Error = RunWorkflowError::RunCancelled { aborted: 0 }.into();
+        assert!(run_was_cancelled(&cancelled));
+        assert_eq!(
+            run_summary_outcome(&Err(cancelled)).as_deref(),
+            Some("cancelled")
+        );
+        // Through a context layer too (the CLI wraps errors on the way up).
+        let wrapped = anyhow::Error::from(RunWorkflowError::RunCancelled { aborted: 2 })
+            .context("resume run_x");
+        assert!(run_was_cancelled(&wrapped));
+        let failed: anyhow::Error = RunWorkflowError::Io(std::io::Error::other("disk")).into();
+        assert!(!run_was_cancelled(&failed));
+        assert_eq!(run_summary_outcome(&Err(failed)), None);
+    }
+
     fn sample_run_record(status: RunStatus, runner_pid: Option<u32>) -> RunRecord {
         RunRecord {
             id: "run_test_cancel".into(),
@@ -5751,15 +5872,16 @@ mod tests {
         handle.abort();
     }
 
-    #[test]
-    fn cancel_with_store_marks_running_run_failed() {
+    #[tokio::test]
+    async fn cancel_with_store_marks_running_run_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Running, Some(999_999));
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let outcome =
-            cancel_with_store(&store, "run_test_cancel", "cancelled by operator").unwrap();
+        let outcome = cancel_with_store(&store, "run_test_cancel", "cancelled by operator")
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             CancelOutcome::MarkedCancelled {
@@ -5823,15 +5945,16 @@ mod tests {
         assert!(store.load("run_test_cancel").is_err());
     }
 
-    #[test]
-    fn cancel_with_store_rejects_awaiting_run() {
+    #[tokio::test]
+    async fn cancel_with_store_rejects_awaiting_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::AwaitingApproval, None);
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let outcome =
-            cancel_with_store(&store, "run_test_cancel", "cancelled by operator").unwrap();
+        let outcome = cancel_with_store(&store, "run_test_cancel", "cancelled by operator")
+            .await
+            .unwrap();
         assert_eq!(outcome, CancelOutcome::RejectedAwaitingApproval);
 
         let persisted = store.load("run_test_cancel").unwrap();
@@ -5842,14 +5965,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pause_with_store_marks_running_run_paused_and_writes_marker() {
+    #[tokio::test]
+    async fn pause_with_store_marks_running_run_paused_and_writes_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Running, Some(999_999));
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        pause_with_store(&store, "run_test_cancel").unwrap();
+        pause_with_store(&store, "run_test_cancel").await.unwrap();
 
         let persisted = store.load("run_test_cancel").unwrap();
         assert_eq!(persisted.status, RunStatus::Paused);
@@ -5859,14 +5982,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pause_with_store_rejects_terminal_run() {
+    #[tokio::test]
+    async fn pause_with_store_rejects_terminal_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Completed, None);
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        let err = pause_with_store(&store, "run_test_cancel")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already terminal"));
         assert!(
             !store.pause_marker_exists("run_test_cancel"),
@@ -5874,14 +5999,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pause_with_store_rejects_already_paused_run() {
+    #[tokio::test]
+    async fn pause_with_store_rejects_already_paused_run() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let record = sample_run_record(RunStatus::Paused, None);
         store.create(record, "name: sample\nsteps: []\n").unwrap();
 
-        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        let err = pause_with_store(&store, "run_test_cancel")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("only a running run can be paused"));
     }
 
@@ -5897,6 +6024,7 @@ mod tests {
                 expires_at: None,
                 reason,
                 resume_seed: Vec::new(),
+                paused_steps: Vec::new(),
                 fanout_completed_units: Default::default(),
                 gates: Vec::new(),
             }),
@@ -5943,6 +6071,109 @@ mod tests {
         let mut other = gate_result("run_missing", PauseReason::Approval);
         settle_awaiting(&mut other, &runs);
         assert!(other.awaiting.is_some());
+    }
+
+    /// The refusal names what the run is now: a cancel, with its reason,
+    /// or another status.
+    #[test]
+    fn resume_refused_by_status_change_names_the_cancel() {
+        let mut cancelled = sample_run_record(RunStatus::Cancelled, None);
+        cancelled.error_message = Some("stop it".into());
+        let err = resume_refused_by_status_change("run_x", RunStatus::Paused, &cancelled);
+        assert_eq!(
+            err.to_string(),
+            "run run_x was cancelled before it could resume: stop it (it was `paused` when loaded); not starting it"
+        );
+        let running = sample_run_record(RunStatus::Running, Some(1));
+        let err = resume_refused_by_status_change("run_x", RunStatus::Paused, &running);
+        assert_eq!(
+            err.to_string(),
+            "run run_x is now `running` (it was `paused` when loaded); not resuming it"
+        );
+    }
+
+    /// A cancel that lands between the resume's load and its flip to
+    /// `Running` wins: the flip (a compare-and-swap under the run lock)
+    /// finds `Cancelled`, the run does not start, and the resume fails
+    /// saying so. Driven exactly: the test holds `run.json.lock` while the
+    /// resume loads and passes its guards (observable: it clears the pause
+    /// marker), writes the cancel, then releases the lock the flip is
+    /// waiting on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_refuses_a_run_cancelled_since_it_was_loaded() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", tmp.path());
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let mut record = sample_run_record(RunStatus::Paused, None);
+        record.workspace_path = tmp.path().join("workspace");
+        record.transcript_dir = tmp.path().join("transcripts");
+        std::fs::create_dir_all(&record.workspace_path).unwrap();
+        store
+            .create(
+                record.clone(),
+                "name: sample\nsteps:\n  - id: only\n    agent: writer\n    prompt: hi\n",
+            )
+            .unwrap();
+        store.set_pause_marker(&record.id).unwrap();
+
+        // Another process holds the run lock — the cancel it is about to
+        // write.
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(
+                tmp.path()
+                    .join("runs")
+                    .join(&record.id)
+                    .join("run.json.lock"),
+            )
+            .unwrap();
+        rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let run_id = record.id.clone();
+        let resume = tokio::spawn(async move { resume_run(&run_id, None, true).await });
+
+        // Once the marker is gone, the resume has loaded the run as
+        // `Paused` and passed its guards; its flip is next, and waits on
+        // the lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.pause_marker_exists(&record.id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resume never got past its guards"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !resume.is_finished(),
+            "the resume is still in flight (its flip waits on the lock)"
+        );
+        let mut cancelled = record.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        store.update(&cancelled).unwrap();
+        drop(lock_file);
+
+        let err = resume
+            .await
+            .unwrap()
+            .expect_err("the resume must not start a cancelled run");
+        assert!(
+            err.to_string()
+                .contains("was cancelled before it could resume")
+                && err.to_string().contains("stop it"),
+            "{err}"
+        );
+        let reloaded = store.load(&record.id).unwrap();
+        assert_eq!(
+            reloaded.status,
+            RunStatus::Cancelled,
+            "the cancel is preserved"
+        );
+        assert_eq!(reloaded.runner_pid, None, "the run never started");
+        std::env::remove_var("RUPU_HOME");
     }
 
     // ── Task 5b-2a: CLI `--gate` wiring (approve/reject phase 1) ────────

@@ -290,7 +290,7 @@ and are not repeated here.
 - [ ] **PR review threads** — line-level comments, suggestions, resolution. `scm.prs.comment` is repo-level only; a code-review agent cannot leave an inline comment, which is the primary review affordance. No `review_thread`/`line_comment` symbols exist.
 - [ ] **`merge_pr` / `enable_auto_merge`** — an autoflow can open a PR but never land it.
 - [ ] **`rupu mcp serve --transport http`** — the flag exists in `--help` and always errors (`cmd/mcp.rs:41`); rupu's MCP server is stdio-only, so it cannot be consumed over the network.
-- [ ] **Self-hosted GitLab / GitHub Enterprise clone + deep-links** — API `base_url` is configurable, but clone URLs hardcode `gitlab.com` / `github.com` (`connectors/gitlab/repo.rs:477`, `github/repo.rs:442`) and `weburl.rs:14-18` returns `None` for any other host. Related to ISSUES.md **I-16**.
+- [ ] **Self-hosted GitLab / GitHub Enterprise clone + deep-links** — API `base_url` is configurable, but clone URLs hardcode `gitlab.com` / `github.com` (`connectors/gitlab/repo.rs` `GITLAB_CLONE_HOST`, `github/repo.rs` `GITHUB_CLONE_HOST`) and `weburl.rs:14-18` returns `None` for any other host. Related to ISSUES.md **I-16**. Until then both `clone_to`s refuse an account whose `base_url` is off their public host (gitlab.com; `api.github.com` / `github.com`), because the HTTPS URL would hand that self-managed / GHES account's token to the public host (SSH would clone whatever the public host has at the same path).
 - [ ] `rupu repos search` / cross-platform repo search.
 - [ ] Bitbucket / Codeberg / Forgejo adapters.
 

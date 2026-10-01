@@ -195,8 +195,15 @@ impl WorkflowExecutor for InProcessExecutor {
 
         // 8. Spawn the runner task.
         let join: JoinHandle<()> = tokio::spawn(async move {
-            if let Err(e) = run_workflow(orchestrator_opts).await {
-                tracing::error!(error = %e, "InProcessExecutor: run_workflow failed");
+            match run_workflow(orchestrator_opts).await {
+                Ok(_) => {}
+                // A cancel is the outcome that was asked for, not a failure.
+                Err(e @ crate::runner::RunWorkflowError::RunCancelled { .. }) => {
+                    tracing::info!(reason = %e, "InProcessExecutor: run cancelled");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "InProcessExecutor: run_workflow failed");
+                }
             }
         });
         *state.join.lock().unwrap() = Some(join);
@@ -409,7 +416,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Minimal `StepFactory` test double — mirrors the `FakeFactory` used
-    /// by `tests/executor_in_process.rs`, kept local here so this
+    /// by `tests/it/executor_in_process.rs`, kept local here so this
     /// module-internal unit test can reach `InProcessExecutor`'s private
     /// `runs` map and `RunState`'s private `cancel`/`pause` tokens
     /// directly (an external integration test cannot).
@@ -471,11 +478,9 @@ mod tests {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }

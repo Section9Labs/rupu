@@ -91,6 +91,10 @@ pub struct CliAgentDispatcher {
     /// `rupu run` (no workflow run to charge; those children are counted by
     /// the CP's fallback over sub-run transcripts).
     usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
+    /// Model-limit discovery context (cache dir + `[providers.*].models`
+    /// overrides). Every dispatched child resolves its OWN provider/model's
+    /// limits through it (spec 2026-09-30 §6.1), not the parent's.
+    limits_ctx: rupu_runtime::model_limits::LimitsContext,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -127,6 +131,7 @@ impl CliAgentDispatcher {
         kinds: std::collections::HashMap<String, String>,
         findings_base: rupu_coverage::FindingWriteOptions,
         usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
+        limits_ctx: rupu_runtime::model_limits::LimitsContext,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -147,6 +152,7 @@ impl CliAgentDispatcher {
             findings_base,
             namer: std::sync::Mutex::new(None),
             usage_ledger,
+            limits_ctx,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -351,7 +357,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             );
         }
 
-        let provider = match built {
+        let mut provider = match built {
             Ok((_resolved, p)) => p,
             Err(e) => {
                 self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
@@ -361,6 +367,17 @@ impl AgentDispatcher for CliAgentDispatcher {
                 return Err(DispatchError::ProviderBuild(e.to_string()));
             }
         };
+
+        // Resolve the child's own limits: its provider and model, its agent's
+        // pins (spec 2026-09-30 §6.1).
+        let limits = rupu_runtime::model_limits::resolve(
+            rupu_runtime::model_limits::LimitOverrides::from_spec(&spec),
+            &provider_name,
+            &model,
+            provider.as_mut(),
+            &self.limits_ctx,
+        )
+        .await;
 
         let child_mode_str = spec
             .permission_mode
@@ -441,13 +458,9 @@ impl AgentDispatcher for CliAgentDispatcher {
                 )
             }),
             concerns: spec.concerns.clone(),
-            max_tokens: spec
-                .max_tokens
-                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            limits,
             scope_name: None,
             surface_tag: None,
-            context_window_tokens: spec.context_window_tokens,
-            compact_at_percent: spec.compact_at_percent,
             pause: None,
             codename: codename.clone(),
         };
@@ -702,7 +715,7 @@ mod tests {
     /// Exercises `CliAgentDispatcher::dispatch()` end to end against the
     /// `RUPU_MOCK_PROVIDER_SCRIPT` seam (the same test-only provider
     /// factory hook `rupu-cli`'s own CLI integration tests use — see
-    /// `tests/cli_run.rs`) so the child's agent loop runs for real
+    /// `tests/serial/cli_run.rs`) so the child's agent loop runs for real
     /// without any network access. Asserts `DispatchStarted` lands
     /// before `DispatchCompleted`, both carrying the same `sub_run_id`
     /// as the returned `DispatchOutcome`, and that token counts flow
@@ -753,6 +766,9 @@ mod tests {
             Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
                 ledger_path.clone(),
             )),
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(
@@ -831,6 +847,70 @@ mod tests {
         }
     }
 
+    /// Spec 2026-09-30 §6.1: a dispatched child resolves limits for ITS OWN
+    /// agent (pins, provider, model), through the dispatcher's limits context.
+    /// Observable on the child's transcript: the run-start `model_limits`
+    /// notice states what the child resolved.
+    #[tokio::test]
+    async fn dispatched_child_resolves_its_own_agents_limits() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/pinnedchild.md"),
+            "---\nname: pinnedchild\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n\
+             contextWindowTokens: 7000\nmaxTokens: 900\n---\nyou are a child agent.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+            None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("pinnedchild", "go".into(), "parent_run_1", 0, None)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let transcript = std::fs::read_to_string(&outcome.transcript_path).unwrap();
+        assert!(
+            transcript.contains("\"kind\":\"model_limits\""),
+            "child transcript has no model_limits notice: {transcript}"
+        );
+        assert!(
+            transcript.contains("input 7,000 · output 900"),
+            "the notice must state the child's own pinned limits: {transcript}"
+        );
+    }
+
     #[test]
     fn child_codename_numbers_per_parent_and_role() {
         let namer =
@@ -886,6 +966,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -990,6 +1073,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -1053,6 +1139,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(
@@ -1122,6 +1211,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(
@@ -1201,6 +1293,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(
@@ -1287,6 +1382,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(
@@ -1378,6 +1476,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(
@@ -1454,6 +1555,9 @@ mod tests {
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
             None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
         );
 
         std::env::set_var(

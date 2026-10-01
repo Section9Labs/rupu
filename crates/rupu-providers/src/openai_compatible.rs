@@ -17,6 +17,48 @@ use crate::provider_id::ProviderId;
 use crate::sse::SseParser;
 use crate::types::{ContentBlock, LlmRequest, LlmResponse, StreamEvent};
 
+/// vLLM-style `GET /v1/models` → `ModelInfo`s (spec §3). `max_model_len` is the
+/// input limit; a LoRA entry with a null value inherits its `parent`'s (a
+/// parent absent from the listing leaves the limit unknown, 0).
+///
+/// A body without a `data` array is an `Err` — never an empty catalog, which
+/// would read as "this server serves no models".
+pub(crate) fn vllm_models_from_listing(
+    v: &serde_json::Value,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let Some(data) = v.get("data").and_then(|d| d.as_array()) else {
+        return Err(crate::error::listing_shape_error(
+            "openai_compatible",
+            "a `data` array",
+            v,
+        ));
+    };
+    let entries: Vec<&serde_json::Value> = data.iter().collect();
+    let own = |e: &serde_json::Value| e.get("max_model_len").and_then(|x| x.as_u64());
+    Ok(entries
+        .iter()
+        .filter_map(|e| {
+            let id = e.get("id")?.as_str()?.to_string();
+            let len = own(e).or_else(|| {
+                let parent = e.get("parent")?.as_str()?;
+                entries
+                    .iter()
+                    .find(|p| p.get("id").and_then(|x| x.as_str()) == Some(parent))
+                    .and_then(|p| own(p))
+            });
+            Some(ModelInfo {
+                id,
+                provider: ProviderId::OpenaiCompatible,
+                context_window: len.map_or(0, |n| n.min(u32::MAX as u64) as u32),
+                max_output_tokens: 0,
+                capabilities: Vec::new(),
+                cost: crate::model_pool::ModelCost::default(),
+                status: crate::model_pool::ModelStatus::default(),
+            })
+        })
+        .collect())
+}
+
 /// A model offered by an OpenAI-compatible endpoint, declared in config.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleModel {
@@ -24,6 +66,10 @@ pub struct OpenAiCompatibleModel {
     pub context_window: u32,
     pub max_output: u32,
 }
+
+/// `max_tokens` sent to a `stream = false` server when no cap is known (the
+/// pre-discovery default).
+const NO_SSE_FALLBACK_MAX_TOKENS: u32 = 8192;
 
 /// Client for an OpenAI-compatible `/v1/chat/completions` endpoint.
 pub struct OpenAiCompatibleClient {
@@ -97,7 +143,17 @@ impl OpenAiCompatibleClient {
     }
 
     fn request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
-        crate::openai_wire::build_chat_request_body(request, stream)
+        let mut body = crate::openai_wire::build_chat_request_body(request, stream);
+        // A server configured `stream = false` genuinely cannot stream, so
+        // every response is one HTTP exchange and an unbounded generation
+        // (servers default `max_tokens` to the whole remaining context) could
+        // outlive the read timeout: keep the pre-discovery default of 8192
+        // when no cap is known. Servers that stream keep an unknown cap
+        // omitted, as the runner sends `None` for it.
+        if request.max_tokens.is_none() && !self.stream {
+            body["max_tokens"] = serde_json::json!(NO_SSE_FALLBACK_MAX_TOKENS);
+        }
+        body
     }
 
     fn headers(&self, stream: bool) -> Result<reqwest::header::HeaderMap, ProviderError> {
@@ -265,6 +321,36 @@ impl LlmProvider for OpenAiCompatibleClient {
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models.iter().map(|m| self.model_info(m)).collect()
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .headers(self.headers(false)?)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let v: serde_json::Value = crate::error::parse_listing_json("openai_compatible", &body)?;
+        vllm_models_from_listing(&v)
+    }
 }
 
 #[cfg(test)]
@@ -315,7 +401,7 @@ mod tests {
         let req = LlmRequest {
             model: "/raid/models/zai-org/GLM-5.2-FP8".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 2048,
+            max_tokens: Some(2048),
             tools: vec![ToolDefinition {
                 name: "read_file".into(),
                 description: "read".into(),
@@ -332,6 +418,56 @@ mod tests {
         assert!(body.get("stream_options").is_none());
     }
 
+    fn client_with_stream(stream: bool) -> OpenAiCompatibleClient {
+        OpenAiCompatibleClient::new(
+            "http://host:8080",
+            "sk-test",
+            "m",
+            vec![],
+            stream,
+            Arc::new(rupu_netflow::NullSink),
+        )
+    }
+
+    fn uncapped_request() -> LlmRequest {
+        LlmRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stream_false_client_defaults_an_unset_cap_to_8192() {
+        let body = client_with_stream(false).request_body(&uncapped_request(), false);
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn streaming_client_omits_an_unset_cap() {
+        let body = client_with_stream(true).request_body(&uncapped_request(), true);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn streaming_capable_client_omits_an_unset_cap_even_for_a_blocking_request() {
+        // Only a server configured `stream = false` gets the 8192 default; one
+        // that can stream is never capped just because this call is blocking.
+        let body = client_with_stream(true).request_body(&uncapped_request(), false);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn an_explicit_cap_is_never_replaced() {
+        let mut req = uncapped_request();
+        req.max_tokens = Some(4096);
+        for (cfg, call) in [(false, false), (true, false), (true, true)] {
+            let body = client_with_stream(cfg).request_body(&req, call);
+            assert_eq!(body["max_tokens"], 4096, "cfg={cfg} call={call}");
+        }
+    }
+
     #[test]
     fn streaming_request_asks_server_to_include_usage() {
         // OpenAI-compatible servers (vLLM, OpenAI, …) only emit the final
@@ -342,7 +478,7 @@ mod tests {
         let req = LlmRequest {
             model: "/raid/models/zai-org/GLM-5.2-FP8".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 2048,
+            max_tokens: Some(2048),
             ..Default::default()
         };
         let body = c.request_body(&req, true);
@@ -417,5 +553,139 @@ mod tests {
         let models = c.list_models().await;
         assert!(!models[0].capabilities.contains(&ModelCapability::Streaming));
         assert!(models[0].capabilities.contains(&ModelCapability::ToolUse));
+    }
+
+    #[test]
+    fn vllm_listing_reads_max_model_len_and_inherits_for_lora() {
+        let v = serde_json::json!({ "object": "list", "data": [
+            { "id": "base-model", "object": "model", "max_model_len": 131072, "parent": null },
+            { "id": "my-lora", "object": "model", "max_model_len": null, "parent": "base-model" },
+            { "id": "mystery", "object": "model" }
+        ]});
+        let ms = vllm_models_from_listing(&v).unwrap();
+        let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap().context_window;
+        assert_eq!(get("base-model"), 131_072);
+        assert_eq!(get("my-lora"), 131_072);
+        assert_eq!(get("mystery"), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_calls_v1_models() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models").header("authorization", "Bearer k");
+            then.status(200).json_body(serde_json::json!({ "data": [{ "id": "base-model", "max_model_len": 4096 }] }));
+        });
+        let mut c = OpenAiCompatibleClient::new(&format!("{}/v1", server.url("")), "k", "base-model", vec![], true, Arc::new(rupu_netflow::NullSink));
+        let ms = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c).await.unwrap();
+        m.assert();
+        assert_eq!(ms[0].context_window, 4096);
+        assert_eq!(ms[0].provider, crate::provider_id::ProviderId::OpenaiCompatible);
+    }
+
+    #[test]
+    fn vllm_listing_edge_cases() {
+        let v = serde_json::json!({ "object": "list", "data": [
+            { "id": "base-model", "object": "model", "max_model_len": 8192, "parent": null },
+            // Parent is not in the listing: nothing to inherit.
+            { "id": "orphan-lora", "object": "model", "max_model_len": null, "parent": "missing-base" },
+            // Own value wins over the parent's.
+            { "id": "tuned-lora", "object": "model", "max_model_len": 4096, "parent": "base-model" },
+            // Beyond u32: clamps rather than wrapping.
+            { "id": "huge", "object": "model", "max_model_len": 99999999999u64 },
+            // Not an object with an id: skipped.
+            { "object": "model", "max_model_len": 1 }
+        ]});
+        let ms = vllm_models_from_listing(&v).unwrap();
+        assert_eq!(ms.len(), 4);
+        let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(get("base-model").context_window, 8192);
+        assert_eq!(get("orphan-lora").context_window, 0);
+        assert_eq!(get("tuned-lora").context_window, 4096);
+        assert_eq!(get("huge").context_window, u32::MAX);
+        // /v1/models never reports an output cap.
+        assert!(ms.iter().all(|m| m.max_output_tokens == 0));
+    }
+
+    /// No `data` array: an error, not an empty catalog ("this server has no
+    /// models"). An empty `data` array is genuinely empty.
+    #[test]
+    fn vllm_listing_without_data_is_a_shape_error() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({ "object": "list" }),
+            serde_json::json!({ "data": "nope" }),
+            serde_json::json!([{ "id": "x" }]),
+        ] {
+            assert!(
+                matches!(vllm_models_from_listing(&v), Err(ProviderError::Json(_))),
+                "{v}"
+            );
+        }
+        assert!(vllm_models_from_listing(&serde_json::json!({ "data": [] }))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_models_without_a_data_array_is_an_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "object": "list" }));
+        });
+        let mut c = OpenAiCompatibleClient::new(
+            &format!("{}/v1", server.url("")),
+            "k",
+            "base-model",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    /// A 200 whose body is not JSON is a decode failure, not a transport
+    /// failure.
+    #[tokio::test]
+    async fn fetch_models_non_json_body_is_a_json_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200).body("not json");
+        });
+        let mut c = OpenAiCompatibleClient::new(
+            &format!("{}/v1", server.url("")),
+            "k",
+            "base-model",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Json(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_surfaces_non_2xx_as_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(401);
+        });
+        let mut c = OpenAiCompatibleClient::new(&format!("{}/v1", server.url("")), "k", "base-model", vec![], true, Arc::new(rupu_netflow::NullSink));
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c).await.unwrap_err();
+        m.assert();
+        assert!(matches!(err, ProviderError::Api { status: 401, .. }));
     }
 }

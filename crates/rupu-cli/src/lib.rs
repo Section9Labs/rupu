@@ -12,12 +12,14 @@ pub mod cp_agent_launcher;
 pub mod cp_definition_generator;
 pub mod cp_inventory;
 pub mod cp_launcher;
+pub mod cp_model_catalog;
 pub mod cp_repos;
 pub mod cp_session_mutator;
 pub mod cp_session_sender;
 pub mod cp_session_starter;
 pub mod cp_transcript_mutator;
 pub mod crash;
+pub mod exit;
 pub mod findings_opts;
 pub mod fleet_unit_dispatcher;
 pub mod logging;
@@ -262,6 +264,21 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         }
     }
 
+    // SIGTERM — what a workflow-run cancel sends the run's `runner_pid` —
+    // would otherwise kill the process mid-way through persisting an OAuth
+    // token refresh. The handler (its own thread) drains those, bounded,
+    // then lets the signal kill the process. `autoflow serve` shuts down
+    // gracefully on SIGTERM itself (and `main` drains after it returns).
+    if !matches!(
+        cli.command,
+        Cmd::Autoflow {
+            action: cmd::autoflow::Action::Serve { .. }
+        }
+    ) {
+        exit::install_sigterm_handler();
+    }
+    exit::hold_test_credential_write();
+
     // Run / Workflow Run / Watch / Session Attach own a live stdout view.
     // Tracing on stderr would bleed through and corrupt that output.
     // Route logs to the rupu log file for those commands; everything
@@ -499,7 +516,7 @@ fn ensure_output_format_supported(
 /// `rupu workflow pause|resume <id>` parse to the expected typed
 /// variants. These are pure clap-derive + `cmd::run::classify` checks —
 /// no I/O, no run-store — so they stay fast and independent of the
-/// heavier end-to-end tests in `tests/cli_run.rs` / `tests/cli_workflow.rs`.
+/// heavier end-to-end tests in `tests/serial/cli_run.rs` / `tests/serial/cli_workflow.rs`.
 ///
 /// The `run_*` tests here cover the T7 regression directly: `Cmd::Run`
 /// captures raw argv (not a clap subcommand — see `cmd::run`'s module

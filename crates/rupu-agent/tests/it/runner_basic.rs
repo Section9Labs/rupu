@@ -1,0 +1,68 @@
+use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::{run_agent, AgentRunOpts};
+use rupu_providers::types::StopReason;
+use rupu_tools::ToolContext;
+use rupu_transcript::JsonlReader;
+use std::sync::Arc;
+
+#[tokio::test]
+async fn happy_path_one_turn_no_tools() {
+    let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+        text: "Hello! I have nothing to do.".into(),
+        stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }]);
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let transcript_path = tmp.path().join("run.jsonl");
+
+    let opts = AgentRunOpts {
+        seed_source: None,
+        agent_name: "noop".into(),
+        agent_system_prompt: "You are a noop agent.".into(),
+        agent_tools: None,
+        provider: Box::new(provider),
+        provider_name: "mock".into(),
+        model: "mock-1".into(),
+        run_id: "run_test1".into(),
+        workspace_id: "ws_test1".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_path: transcript_path.clone(),
+        max_turns: 5,
+        decider: Arc::new(BypassDecider),
+        tool_context: ToolContext::default(),
+        user_message: "say hi".into(),
+        initial_messages: Vec::new(),
+        turn_index_offset: 0,
+        mode_str: "bypass".into(),
+        no_stream: false,
+        suppress_stream_stdout: false,
+        mcp_registry: None,
+        effort: None,
+        context_window: None,
+        output_format: None,
+        output_schema: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
+        step_id: String::new(),
+        on_tool_call: None,
+        on_stream_event: None,
+        on_usage: None,
+        concerns: None,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
+        scope_name: None,
+        surface_tag: None,
+        pause: None,
+        codename: None,
+    };
+
+    let res = run_agent(opts).await.unwrap();
+    assert_eq!(res.turns, 1);
+    let summary = JsonlReader::summary(&transcript_path).unwrap();
+    assert_eq!(summary.run_id, "run_test1");
+    assert_eq!(summary.status, rupu_transcript::RunStatus::Ok);
+}
