@@ -62,6 +62,12 @@ release, against the exact commit being tagged.
 3. **push the tag** — only if every CI job succeeded, on `github.sha`
    explicitly, so what was tested is what is tagged even if `main` moved.
 
+**Amended 2026-10-01 (after #711 merged):** "shipped" was widened to exclude
+everything outside the product — `.github/**`, `scripts/**`,
+`crates/<crate>/tests/**` and all of `docs/` (the keyring check runs on the
+PR that touches it, and Pages deploys on merge). matt: a change to CI itself
+does not need a beta. Re-publishing after a release-workflow fix is `force`.
+
 A `dry_run` input runs decide + full CI and never tags; it is the only mode
 allowed off `main`, which makes the whole gate testable on a branch.
 

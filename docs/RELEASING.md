@@ -97,10 +97,12 @@ Decide skips — logging which condition fired on the run page and exiting
 **0**, because a skipped day is a normal day — when either of:
 
 1. **Nothing shipped changed** since the nearest beta tag in `main`'s
-   history: either `main` has not moved, or every changed path is
-   documentation (`docs/` other than `docs/pages/`, and root-level `*.md` —
-   `scripts/shipped-paths.sh`). Bypassable with the `force` input, for
-   re-cutting after a botched upload.
+   history: either `main` has not moved, or every changed path is outside
+   the product — `docs/`, root-level `*.md`, `.github/`, `scripts/`, or a
+   crate's `tests/` (`scripts/shipped-paths.sh`). A CI-only or tests-only
+   batch therefore never cuts a beta. Bypassable with the `force` input, for
+   re-cutting after a botched upload or re-publishing after a release-workflow
+   fix.
 2. **`Cargo.toml`'s version is not newer than the newest stable tag.** A
    `v0.71.0-beta.N` sorts below the shipped `v0.71.0` and would walk
    `rupu update` backwards on the beta channel. Not bypassable; the cure is
