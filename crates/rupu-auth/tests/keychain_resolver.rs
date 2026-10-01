@@ -400,6 +400,14 @@ fn sidecar(auth_path: &std::path::Path) -> std::path::PathBuf {
     s.into()
 }
 
+/// What another `rupu` process does to the file: temp + rename, so a reader
+/// sees the old content or the new, never a half-written file.
+fn write_atomic(path: &std::path::Path, body: &str) {
+    let tmp = path.with_extension("other.tmp");
+    std::fs::write(&tmp, body).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
 /// A StoredCredential JSON for the raw file map.
 fn sso_payload(access: &str, refresh: &str, expires_in: chrono::Duration) -> String {
     serde_json::to_string(&StoredCredential {
@@ -420,6 +428,14 @@ fn sso_payload(access: &str, refresh: &str, expires_in: chrono::Duration) -> Str
 /// must wait for it, re-read under the lock, and adopt the rotation — with
 /// no token request of its own (that request would carry the rotated-out
 /// refresh token).
+///
+/// Ordering matters: the `get` reads the file once *before* taking the lock
+/// (that read is what finds the credential near expiry), so the holder
+/// rotates the file only after the `get` is under way plus a generous
+/// margin for that one small read — a rotation visible to the unlocked
+/// read would let the `get` return fresh without ever waiting, which is a
+/// different (and here untested) path. The rotation is written temp +
+/// rename, as a real process writes it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_refresh_waits_for_another_process_and_adopts_its_rotation() {
@@ -438,7 +454,9 @@ async fn a_refresh_waits_for_another_process_and_adopts_its_rotation() {
     let r = KeychainResolver::new();
     store_near_expiry_sso(&r).await;
 
+    const MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (get_started_tx, get_started_rx) = std::sync::mpsc::channel::<()>();
     let other = {
         let auth_path = auth_path.clone();
         std::thread::spawn(move || {
@@ -450,28 +468,38 @@ async fn a_refresh_waits_for_another_process_and_adopts_its_rotation() {
                 .unwrap();
             lock.lock_exclusive().unwrap();
             locked_tx.send(()).unwrap();
-            // The other process's rotation.
+            get_started_rx.recv().unwrap();
+            std::thread::sleep(MARGIN);
+            // The other process's rotation, under its lock.
             let map = serde_json::json!({
                 "anthropic/sso": sso_payload("theirs", "refresh-theirs", chrono::Duration::hours(1)),
             });
-            std::fs::write(&auth_path, serde_json::to_string(&map).unwrap()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            write_atomic(&auth_path, &serde_json::to_string(&map).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(100));
             lock.unlock().unwrap();
+            std::time::Instant::now()
         })
     };
     locked_rx.recv().unwrap();
 
     let started = std::time::Instant::now();
+    get_started_tx.send(()).unwrap();
     let (_, creds) = r
         .get("anthropic", Some(AuthMode::Sso))
         .await
         .expect("get succeeds");
+    let finished = std::time::Instant::now();
+    let unlocked_at = other.join().unwrap();
     assert!(
-        started.elapsed() >= std::time::Duration::from_millis(200),
+        finished >= unlocked_at,
+        "the get finished only once the other holder released the lock (early by {:?})",
+        unlocked_at.saturating_duration_since(finished)
+    );
+    assert!(
+        started.elapsed() >= MARGIN,
         "waited for the other holder ({:?})",
         started.elapsed()
     );
-    other.join().unwrap();
     match creds {
         rupu_providers::auth::AuthCredentials::OAuth {
             access, refresh, ..
@@ -508,7 +536,7 @@ async fn a_store_waits_for_another_process_holding_the_lock() {
             lock.lock_exclusive().unwrap();
             locked_tx.send(()).unwrap();
             let map = serde_json::json!({ "openai/api-key": "{\"credentials\":{\"type\":\"api_key\",\"key\":\"sk-theirs\"}}" });
-            std::fs::write(&auth_path, serde_json::to_string(&map).unwrap()).unwrap();
+            write_atomic(&auth_path, &serde_json::to_string(&map).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(300));
             lock.unlock().unwrap();
         })
