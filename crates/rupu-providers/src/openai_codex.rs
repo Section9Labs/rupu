@@ -179,6 +179,9 @@ pub struct OpenAiCodexClient {
     chatgpt_models_url: String,
     /// [`CODEX_CATALOG_ATTEMPT_TIMEOUT`]; tests shorten it.
     catalog_attempt_timeout: std::time::Duration,
+    /// The OAuth token endpoint ([`OPENAI_TOKEN_URL`]; tests point it at a
+    /// mock).
+    token_url: String,
 }
 
 /// The `OpenAI-Organization` header value for a request to `api_url`, if any.
@@ -255,6 +258,7 @@ impl OpenAiCodexClient {
                     org_id: None,
                     chatgpt_models_url: CODEX_MODELS_URL.to_string(),
                     catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
+                    token_url: OPENAI_TOKEN_URL.to_string(),
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
@@ -270,6 +274,7 @@ impl OpenAiCodexClient {
                 org_id: None,
                 chatgpt_models_url: CODEX_MODELS_URL.to_string(),
                 catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
+                token_url: OPENAI_TOKEN_URL.to_string(),
             }),
         }
     }
@@ -745,91 +750,31 @@ impl OpenAiCodexClient {
         Ok(())
     }
 
+    /// Cancel-safe: the refresh and its persistence run as their own task.
+    /// OpenAI rotates the refresh token, so a refresh abandoned between the
+    /// token response and the write (the caller dropped mid-flight — a
+    /// pause, a listing timeout) would leave only an invalidated token
+    /// behind. Dropping this future only stops waiting; the task still
+    /// finishes and persists.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
         if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
             return Ok(());
         }
-
-        info!("refreshing OpenAI OAuth token");
-
-        // OpenAI token endpoint accepts JSON, not form-urlencoded
-        // (matches the Codex CLI's request_chatgpt_token_refresh implementation)
-        let response = self
-            .client
-            .post(OPENAI_TOKEN_URL)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "client_id": OPENAI_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": &self.refresh_token,
-            }))
-            .send()
-            .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::TokenRefreshFailed(format!(
-                "HTTP {status}: {}",
-                truncate_error(&body, 500)
-            )));
-        }
-
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        self.access_token = body["access_token"]
-            .as_str()
-            .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
-            .to_string();
-
-        if let Some(rt) = body["refresh_token"].as_str() {
-            self.refresh_token = rt.to_string();
-        }
-
-        let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.expires_ms = now_ms + (expires_in_secs * 1000);
-
-        // Update account_id from new token
-        if let Some(id) = extract_account_id(&self.access_token) {
-            self.account_id = id;
-        }
-
-        info!("OpenAI token refreshed, expires in {expires_in_secs}s");
-
-        // Persist refreshed credentials via CredentialStore or legacy path
-        let mut extra = HashMap::new();
-        if !self.account_id.is_empty() {
-            extra.insert(
-                "account_id".to_string(),
-                serde_json::Value::String(self.account_id.clone()),
-            );
-        }
-        let creds = AuthCredentials::OAuth {
-            access: self.access_token.clone(),
-            refresh: self.refresh_token.clone(),
-            expires: self.expires_ms,
-            extra,
-        };
-        if let Some(ref store) = self.credential_store {
-            if let Err(e) = store.update(crate::provider_id::ProviderId::OpenaiCodex, creds) {
-                warn!(error = %e, "failed to persist refreshed OpenAI credentials via store");
-            }
-        } else if let Some(ref path) = self.auth_json_path {
-            if let Err(e) =
-                save_provider_auth(path, crate::provider_id::ProviderId::OpenaiCodex, &creds)
-            {
-                warn!(error = %e, "failed to persist refreshed OpenAI credentials");
-            }
-        }
-
+        let job = tokio::spawn(refresh_and_persist_openai_token(
+            self.client.clone(),
+            self.token_url.clone(),
+            self.refresh_token.clone(),
+            self.account_id.clone(),
+            self.credential_store.clone(),
+            self.auth_json_path.clone(),
+        ));
+        let refreshed = job.await.map_err(|e| {
+            ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+        })??;
+        self.access_token = refreshed.access_token;
+        self.refresh_token = refreshed.refresh_token;
+        self.expires_ms = refreshed.expires_ms;
+        self.account_id = refreshed.account_id;
         Ok(())
     }
 
@@ -1051,6 +996,110 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
         let v = self.get_models_json(&format!("{base}/v1/models")).await?;
         models_from_listing(&v, false, pid)
     }
+}
+
+/// The token state an OpenAI OAuth refresh produced.
+struct RefreshedOpenAiToken {
+    access_token: String,
+    refresh_token: String,
+    expires_ms: u64,
+    account_id: String,
+}
+
+/// Refresh the OpenAI OAuth token and persist the rotated credentials via the
+/// CredentialStore or auth.json. Owns everything it needs so it can run as its
+/// own task (see `OpenAiCodexClient::ensure_valid_token`).
+async fn refresh_and_persist_openai_token(
+    client: ClientWithMiddleware,
+    token_url: String,
+    refresh_token: String,
+    account_id: String,
+    credential_store: Option<Arc<dyn crate::credential_source::CredentialSource>>,
+    auth_json_path: Option<PathBuf>,
+) -> Result<RefreshedOpenAiToken, ProviderError> {
+    info!("refreshing OpenAI OAuth token");
+
+    // OpenAI token endpoint accepts JSON, not form-urlencoded
+    // (matches the Codex CLI's request_chatgpt_token_refresh implementation)
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "client_id": OPENAI_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": &refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::TokenRefreshFailed(format!(
+            "HTTP {status}: {}",
+            truncate_error(&body, 500)
+        )));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    let access_token = body["access_token"]
+        .as_str()
+        .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
+        .to_string();
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(refresh_token);
+
+    let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let expires_ms = now_ms + (expires_in_secs * 1000);
+
+    // Update account_id from new token
+    let account_id = extract_account_id(&access_token).unwrap_or(account_id);
+
+    info!("OpenAI token refreshed, expires in {expires_in_secs}s");
+
+    // Persist refreshed credentials via CredentialStore or legacy path
+    let mut extra = HashMap::new();
+    if !account_id.is_empty() {
+        extra.insert(
+            "account_id".to_string(),
+            serde_json::Value::String(account_id.clone()),
+        );
+    }
+    let creds = AuthCredentials::OAuth {
+        access: access_token.clone(),
+        refresh: refresh_token.clone(),
+        expires: expires_ms,
+        extra,
+    };
+    if let Some(ref store) = credential_store {
+        if let Err(e) = store.update(crate::provider_id::ProviderId::OpenaiCodex, creds) {
+            warn!(error = %e, "failed to persist refreshed OpenAI credentials via store");
+        }
+    } else if let Some(ref path) = auth_json_path {
+        if let Err(e) =
+            save_provider_auth(path, crate::provider_id::ProviderId::OpenaiCodex, &creds)
+        {
+            warn!(error = %e, "failed to persist refreshed OpenAI credentials");
+        }
+    }
+
+    Ok(RefreshedOpenAiToken {
+        access_token,
+        refresh_token,
+        expires_ms,
+        account_id,
+    })
 }
 
 /// Lenient model-id extractor for the assorted shapes OpenAI's
@@ -3501,6 +3550,61 @@ mod fetch_models_tests {
         );
         public.assert();
         assert_eq!(models[0].id, "gpt-plain");
+    }
+
+    /// A token refresh started by a call that is then dropped (a listing
+    /// timeout, a pause) must still persist the rotated token — the old
+    /// refresh token is already invalidated. The refresh runs as its own
+    /// task, so it finishes and persists after the caller is gone.
+    #[tokio::test]
+    async fn an_abandoned_token_refresh_still_persists_the_rotated_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1, // long expired (0 means "no expiry info")
+                extra: std::collections::HashMap::new(),
+            },
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the caller gave up mid-refresh: {dropped:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|s| s.contains("refresh-2"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        token.assert_hits(1);
+        let saved = std::fs::read_to_string(&path).expect("the refresh persisted");
+        assert!(
+            saved.contains("refresh-2") && saved.contains("access-2"),
+            "{saved}"
+        );
     }
 
     #[test]

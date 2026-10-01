@@ -769,10 +769,19 @@ pub async fn refresh_anthropic_token(
     client: &ClientWithMiddleware,
     refresh_token: &str,
 ) -> Result<AuthMethod, ProviderError> {
+    refresh_anthropic_token_at(client, ANTHROPIC_TOKEN_URL, refresh_token).await
+}
+
+/// [`refresh_anthropic_token`] against `token_url`.
+async fn refresh_anthropic_token_at(
+    client: &ClientWithMiddleware,
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<AuthMethod, ProviderError> {
     info!("refreshing Anthropic OAuth token");
 
     let response = client
-        .post(ANTHROPIC_TOKEN_URL)
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", ANTHROPIC_CLIENT_ID),
@@ -819,6 +828,44 @@ pub async fn refresh_anthropic_token(
         refresh_token: new_refresh,
         expires_ms,
     })
+}
+
+/// Refresh the Anthropic OAuth token and persist the rotated credentials via
+/// the CredentialStore (preferred) or auth.json (legacy). Owns everything it
+/// needs so it can run as its own task (see `ensure_valid_token`).
+async fn refresh_and_persist_anthropic_token(
+    client: ClientWithMiddleware,
+    token_url: String,
+    refresh_token: String,
+    credential_store: Option<Arc<dyn crate::credential_source::CredentialSource>>,
+    auth_json_path: Option<PathBuf>,
+) -> Result<AuthMethod, ProviderError> {
+    let new_auth = refresh_anthropic_token_at(&client, &token_url, &refresh_token).await?;
+    // Persist via CredentialStore (file-locked, preserves other providers)
+    if let Some(store) = &credential_store {
+        let creds = match &new_auth {
+            AuthMethod::OAuth {
+                access_token,
+                refresh_token,
+                expires_ms,
+            } => AuthCredentials::OAuth {
+                access: access_token.clone(),
+                refresh: refresh_token.clone(),
+                expires: *expires_ms,
+                extra: std::collections::HashMap::new(),
+            },
+            AuthMethod::ApiKey(key) => AuthCredentials::ApiKey { key: key.clone() },
+        };
+        if let Err(e) = store.update(crate::provider_id::ProviderId::Anthropic, creds) {
+            warn!(error = %e, "failed to persist refreshed token via credential store");
+        }
+    } else if let Some(path) = &auth_json_path {
+        // Legacy fallback
+        if let Err(e) = save_auth_json(path, &new_auth) {
+            warn!(error = %e, "failed to save refreshed token to auth.json");
+        }
+    }
+    Ok(new_auth)
 }
 
 /// Write updated credentials back to auth.json (preserving other providers).
@@ -939,6 +986,9 @@ pub struct AnthropicClient {
     /// extra-usage 429: the account has no entitlement, so the beta is never
     /// sent again by this client (the run falls back to the standard window).
     long_context_disabled: bool,
+    /// The OAuth token endpoint ([`ANTHROPIC_TOKEN_URL`]; tests point it at
+    /// a mock).
+    token_url: String,
 }
 
 impl AnthropicClient {
@@ -961,6 +1011,7 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -1057,6 +1108,7 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -1083,6 +1135,7 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -1123,6 +1176,7 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -1151,11 +1205,19 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
     /// Ensure the OAuth token is still valid, refreshing if expired.
     /// Persists refreshed tokens via CredentialStore (preferred) or save_auth_json (legacy).
+    ///
+    /// Cancel-safe: the refresh and its persistence run as their own task.
+    /// The token endpoint rotates the refresh token, so a refresh abandoned
+    /// between its response and the write (the caller dropped mid-flight — a
+    /// pause, a listing timeout) would leave only an invalidated token
+    /// behind. Dropping this future only stops waiting; the task still
+    /// finishes and persists.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
         if let AuthMethod::OAuth {
             refresh_token,
@@ -1165,34 +1227,16 @@ impl AnthropicClient {
         {
             if !refresh_token.is_empty() && is_token_expired(*expires_ms) {
                 info!("OAuth token expired, refreshing");
-                let new_auth = refresh_anthropic_token(&self.client, refresh_token).await?;
-
-                // Persist via CredentialStore (file-locked, preserves other providers)
-                if let Some(store) = &self.credential_store {
-                    let creds = match &new_auth {
-                        AuthMethod::OAuth {
-                            access_token,
-                            refresh_token,
-                            expires_ms,
-                        } => AuthCredentials::OAuth {
-                            access: access_token.clone(),
-                            refresh: refresh_token.clone(),
-                            expires: *expires_ms,
-                            extra: std::collections::HashMap::new(),
-                        },
-                        AuthMethod::ApiKey(key) => AuthCredentials::ApiKey { key: key.clone() },
-                    };
-                    if let Err(e) = store.update(crate::provider_id::ProviderId::Anthropic, creds) {
-                        warn!(error = %e, "failed to persist refreshed token via credential store");
-                    }
-                } else if let Some(path) = &self.auth_json_path {
-                    // Legacy fallback
-                    if let Err(e) = save_auth_json(path, &new_auth) {
-                        warn!(error = %e, "failed to save refreshed token to auth.json");
-                    }
-                }
-
-                self.auth = new_auth;
+                let job = tokio::spawn(refresh_and_persist_anthropic_token(
+                    self.client.clone(),
+                    self.token_url.clone(),
+                    refresh_token.clone(),
+                    self.credential_store.clone(),
+                    self.auth_json_path.clone(),
+                ));
+                self.auth = job.await.map_err(|e| {
+                    ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+                })??;
             }
         }
         Ok(())
@@ -5467,6 +5511,59 @@ mod tests {
             );
         }
         m.assert_hits(2);
+    }
+
+    /// A token refresh started by a request that is then dropped (a pause, a
+    /// listing timeout) must still persist the rotated token: the provider
+    /// has already invalidated the old refresh token, so losing the new one
+    /// logs the user out. The refresh runs as its own task, so it finishes
+    /// and persists after the caller is gone.
+    #[tokio::test]
+    async fn an_abandoned_token_refresh_still_persists_the_rotated_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = AnthropicClient::from_auth_with_path(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1, // long expired (0 means "no expiry info")
+            },
+            path.clone(),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        client.token_url = server.url("/v1/oauth/token");
+        client.api_url = format!("{}/v1/messages", server.url(""));
+        let request = make_request(None);
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(
+            dropped.is_err(),
+            "the caller gave up mid-refresh: {dropped:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|s| s.contains("refresh-2"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        token.assert_hits(1);
+        let saved = std::fs::read_to_string(&path).expect("the refresh persisted");
+        assert!(
+            saved.contains("refresh-2") && saved.contains("access-2"),
+            "{saved}"
+        );
     }
 
     fn no_beta_header(req: &httpmock::prelude::HttpMockRequest) -> bool {

@@ -141,6 +141,9 @@ pub struct GoogleGeminiClient {
     auth_json_path: Option<PathBuf>,
     /// Test seam: replaces variant.endpoint() for model listing only.
     pub(crate) api_base_override: Option<String>,
+    /// The OAuth token endpoint ([`GOOGLE_TOKEN_URL`]; tests point it at a
+    /// mock).
+    token_url: String,
 }
 
 impl GoogleGeminiClient {
@@ -203,6 +206,7 @@ impl GoogleGeminiClient {
                     project_id,
                     auth_json_path,
                     api_base_override: None,
+                    token_url: GOOGLE_TOKEN_URL.to_string(),
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
@@ -215,6 +219,7 @@ impl GoogleGeminiClient {
                 project_id: String::new(),
                 auth_json_path: None,
                 api_base_override: None,
+                token_url: GOOGLE_TOKEN_URL.to_string(),
             }),
             (AuthCredentials::ApiKey { .. }, _) => Err(ProviderError::AuthConfig(
                 "Google Cloud Code Assist (gemini-cli / antigravity) requires OAuth, \
@@ -472,6 +477,10 @@ impl GoogleGeminiClient {
         })
     }
 
+    /// Cancel-safe: the refresh and its persistence run as their own task,
+    /// so a refresh abandoned mid-flight (the caller dropped — a pause, a
+    /// timeout) still persists what the token endpoint returned, including a
+    /// rotated refresh token. Dropping this future only stops waiting.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
         // AI Studio uses a stable api-key — no refresh path.
         if self.variant.is_api_key() {
@@ -480,73 +489,99 @@ impl GoogleGeminiClient {
         if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
             return Ok(());
         }
-
-        info!(variant = ?self.variant, "refreshing Google OAuth token");
-
-        let response = self
-            .client
-            .post(GOOGLE_TOKEN_URL)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", self.variant.client_id()),
-                ("client_secret", self.variant.client_secret()),
-                ("refresh_token", &self.refresh_token),
-            ])
-            .send()
-            .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::TokenRefreshFailed(format!(
-                "HTTP {status}: {}",
-                truncate(&body, 500)
-            )));
-        }
-
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
-
-        self.access_token = body["access_token"]
-            .as_str()
-            .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
-            .to_string();
-
-        if let Some(rt) = body["refresh_token"].as_str() {
-            self.refresh_token = rt.to_string();
-        }
-
-        let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
-        let now = now_ms();
-        self.expires_ms = now + (expires_in_secs * 1000);
-
-        info!("Google token refreshed, expires in {expires_in_secs}s");
-
-        // Persist refreshed credentials
-        if let Some(ref path) = self.auth_json_path {
-            let mut extra = HashMap::new();
-            if !self.project_id.is_empty() {
-                extra.insert(
-                    "project_id".to_string(),
-                    serde_json::Value::String(self.project_id.clone()),
-                );
-            }
-            let creds = AuthCredentials::OAuth {
-                access: self.access_token.clone(),
-                refresh: self.refresh_token.clone(),
-                expires: self.expires_ms,
-                extra,
-            };
-            if let Err(e) = save_provider_auth(path, self.variant.provider_id(), &creds) {
-                warn!(error = %e, "failed to persist refreshed Google credentials");
-            }
-        }
-
+        let job = tokio::spawn(refresh_and_persist_google_token(
+            self.client.clone(),
+            self.token_url.clone(),
+            self.variant,
+            self.refresh_token.clone(),
+            self.project_id.clone(),
+            self.auth_json_path.clone(),
+        ));
+        let (access_token, refresh_token, expires_ms) = job.await.map_err(|e| {
+            ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+        })??;
+        self.access_token = access_token;
+        self.refresh_token = refresh_token;
+        self.expires_ms = expires_ms;
         Ok(())
     }
+}
+
+/// Refresh a Google OAuth token and persist the refreshed credentials to
+/// auth.json. Owns everything it needs so it can run as its own task (see
+/// `GoogleGeminiClient::ensure_valid_token`). Returns
+/// `(access_token, refresh_token, expires_ms)`.
+async fn refresh_and_persist_google_token(
+    client: ClientWithMiddleware,
+    token_url: String,
+    variant: GeminiVariant,
+    refresh_token: String,
+    project_id: String,
+    auth_json_path: Option<PathBuf>,
+) -> Result<(String, String, u64), ProviderError> {
+    info!(variant = ?variant, "refreshing Google OAuth token");
+
+    let response = client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", variant.client_id()),
+            ("client_secret", variant.client_secret()),
+            ("refresh_token", &refresh_token),
+        ])
+        .send()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::TokenRefreshFailed(format!(
+            "HTTP {status}: {}",
+            truncate(&body, 500)
+        )));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ProviderError::TokenRefreshFailed(e.to_string()))?;
+
+    let access_token = body["access_token"]
+        .as_str()
+        .ok_or_else(|| ProviderError::TokenRefreshFailed("missing access_token".into()))?
+        .to_string();
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(refresh_token);
+
+    let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+    let expires_ms = now_ms() + (expires_in_secs * 1000);
+
+    info!("Google token refreshed, expires in {expires_in_secs}s");
+
+    // Persist refreshed credentials
+    if let Some(ref path) = auth_json_path {
+        let mut extra = HashMap::new();
+        if !project_id.is_empty() {
+            extra.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(project_id.clone()),
+            );
+        }
+        let creds = AuthCredentials::OAuth {
+            access: access_token.clone(),
+            refresh: refresh_token.clone(),
+            expires: expires_ms,
+            extra,
+        };
+        if let Err(e) = save_provider_auth(path, variant.provider_id(), &creds) {
+            warn!(error = %e, "failed to persist refreshed Google credentials");
+        }
+    }
+
+    Ok((access_token, refresh_token, expires_ms))
 }
 
 #[async_trait::async_trait]
@@ -1156,6 +1191,80 @@ fn extract_google_error(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token refresh started by a call that is then dropped (a pause, a
+    /// timeout) must still persist the refreshed credentials. The refresh
+    /// runs as its own task, so it finishes and persists after the caller is
+    /// gone.
+    #[tokio::test]
+    async fn an_abandoned_token_refresh_still_persists_the_rotated_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1; // long expired (0 means "no expiry info")
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/token");
+        let request = LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            system: None,
+            messages: vec![Message::user("Hello")],
+            max_tokens: Some(16),
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            disable_prompt_cache: false,
+        };
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(
+            dropped.is_err(),
+            "the caller gave up mid-refresh: {dropped:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|s| s.contains("refresh-2"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        token.assert_hits(1);
+        let saved = std::fs::read_to_string(&path).expect("the refresh persisted");
+        assert!(
+            saved.contains("refresh-2") && saved.contains("access-2"),
+            "{saved}"
+        );
+    }
 
     fn test_creds(project_id: &str) -> AuthCredentials {
         let mut extra = HashMap::new();
