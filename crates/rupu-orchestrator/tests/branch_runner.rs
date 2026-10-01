@@ -305,7 +305,7 @@ async fn resume_after_branch_keeps_not_taken_arm_skipped() {
         approved_step_id: String::new(),
         completed_units: std::collections::BTreeMap::new(),
         reason: PauseReason::Manual,
-        paused_step: None,
+        paused_steps: Vec::new(),
         rejected_reason: None,
         ..Default::default()
     });
