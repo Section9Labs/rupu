@@ -264,8 +264,13 @@ impl HostConnector for LocalHostConnector {
         let mode_opt = if mode.is_empty() { None } else { Some(mode) };
         let now = chrono::Utc::now();
         // TODO(task-5): replace hardcoded "connector" actor with identity from AppState
+        // On the blocking pool: the gate methods take the run lock.
+        let (id, mode_opt) = (run_id.to_string(), mode_opt.map(str::to_string));
         self.run_store
-            .request_resume_approval(run_id, "connector", mode_opt, now, None)
+            .blocking(move |store| {
+                store.request_resume_approval(&id, "connector", mode_opt.as_deref(), now, None)
+            })
+            .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
@@ -276,8 +281,11 @@ impl HostConnector for LocalHostConnector {
         reason: Option<&str>,
     ) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
+        // On the blocking pool: the gate methods take the run lock.
+        let (id, reason) = (run_id.to_string(), reason.unwrap_or("").to_string());
         self.run_store
-            .reject(run_id, "connector", reason.unwrap_or(""), now)
+            .blocking(move |store| store.reject(&id, "connector", &reason, now))
+            .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
@@ -333,8 +341,11 @@ impl HostConnector for LocalHostConnector {
         // AFTER its duplicate-execution guard confirms the original process
         // has exited (`runner_pid` no longer live), so clearing the marker
         // can't un-pause an original that hasn't yet honored the pause.
+        // On the blocking pool: the gate methods take the run lock.
+        let id = run_id.to_string();
         self.run_store
-            .request_resume_approval(run_id, "connector", None, now, None)
+            .blocking(move |store| store.request_resume_approval(&id, "connector", None, now, None))
+            .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }

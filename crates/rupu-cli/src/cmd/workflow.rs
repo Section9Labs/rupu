@@ -2387,7 +2387,21 @@ async fn runs(
             continue;
         }
 
-        match store.expire_if_overdue(r, now, on_timeout) {
+        // On the blocking pool: the expiry re-decides under the run lock.
+        let expired = {
+            let mut rec = r.clone();
+            store
+                .blocking(move |s| {
+                    let outcome = s.expire_if_overdue(&mut rec, now, on_timeout)?;
+                    Ok::<_, rupu_orchestrator::RunStoreError>((outcome, rec))
+                })
+                .await
+                .map(|(outcome, rec)| {
+                    *r = rec;
+                    outcome
+                })
+        };
+        match expired {
             Ok(Some(rupu_orchestrator::TimeoutAction::Approve)) => {
                 println!(
                     "rupu: gate timed out with on_timeout: approve — \
@@ -2963,57 +2977,65 @@ async fn approve(
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
 
-    let (awaited_step_id, approver, via_timeout) =
-        match resolve_approve_gate(&store, run_id, gate, approver_override)? {
-            ApproveGateOutcome::Approved {
-                step_id,
-                approver,
-                via_timeout,
-            } => (step_id, approver, via_timeout),
-            ApproveGateOutcome::ExpiredRejected {
-                step_id,
-                reason,
-                approver,
-            } => {
-                // I-36: run the cleanup chain unconditionally, not only when
-                // `cheap_on_reject_chain_len` reports a non-empty chain — an
-                // empty chain must still record the gate's rejected decision
-                // (`run_reject_cleanup` itself already handles a zero-length
-                // chain fine; `chain_len` is only used below to decide whether
-                // to print "cleanup: N step(s) executed").
-                match crate::resume::build_reject_cleanup_opts(
-                    &store, run_id, &step_id, &reason, mode,
-                )
+    // On the blocking pool: the gate methods take the run lock.
+    let gate_outcome = {
+        let (rid, g, a) = (
+            run_id.to_string(),
+            gate.map(str::to_string),
+            approver_override.map(str::to_string),
+        );
+        store
+            .blocking(move |s| resolve_approve_gate(&s, &rid, g.as_deref(), a.as_deref()))
+            .await?
+    };
+    let (awaited_step_id, approver, via_timeout) = match gate_outcome {
+        ApproveGateOutcome::Approved {
+            step_id,
+            approver,
+            via_timeout,
+        } => (step_id, approver, via_timeout),
+        ApproveGateOutcome::ExpiredRejected {
+            step_id,
+            reason,
+            approver,
+        } => {
+            // I-36: run the cleanup chain unconditionally, not only when
+            // `cheap_on_reject_chain_len` reports a non-empty chain — an
+            // empty chain must still record the gate's rejected decision
+            // (`run_reject_cleanup` itself already handles a zero-length
+            // chain fine; `chain_len` is only used below to decide whether
+            // to print "cleanup: N step(s) executed").
+            match crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, mode)
                 .await
-                {
-                    Ok((opts, chain_len)) => {
-                        match rupu_orchestrator::runner::run_reject_cleanup(
-                            opts,
-                            &step_id,
-                            &reason,
-                            "timeout",
-                            Some(&approver),
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if chain_len > 0 {
-                                    println!("cleanup: {chain_len} step(s) executed");
-                                }
+            {
+                Ok((opts, chain_len)) => {
+                    match rupu_orchestrator::runner::run_reject_cleanup(
+                        opts,
+                        &step_id,
+                        &reason,
+                        "timeout",
+                        Some(&approver),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if chain_len > 0 {
+                                println!("cleanup: {chain_len} step(s) executed");
                             }
-                            Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                         }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "warning: could not load workflow for on_reject cleanup: {e} \
-                         (run is already correctly rejected)"
-                        );
+                        Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                     }
                 }
-                return Ok(());
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not load workflow for on_reject cleanup: {e} \
+                         (run is already correctly rejected)"
+                    );
+                }
             }
-        };
+            return Ok(());
+        }
+    };
     // Phase 2 — the resume — lives in `crate::resume::resume_run` so the
     // background session worker can resume an approved gate identically.
     // `awaited_step_id` is threaded in because `approve` clears the
@@ -3710,7 +3732,17 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
         reason: rejected_reason,
         via,
         approver,
-    } = resolve_reject_gate(&store, run_id, reason, gate)?;
+    } = {
+        // On the blocking pool: the gate methods take the run lock.
+        let (rid, re, g) = (
+            run_id.to_string(),
+            reason.map(str::to_string),
+            gate.map(str::to_string),
+        );
+        store
+            .blocking(move |s| resolve_reject_gate(&s, &rid, re.as_deref(), g.as_deref()))
+            .await?
+    };
     // Task 5b-2a: rejecting one gate of a still-parked multi-gate set
     // leaves the run `AwaitingApproval` (the other gates stay parked) —
     // "marked rejected" only holds once the set is empty and the run
@@ -3765,7 +3797,11 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
                     // run it again on its next tick. Best-effort: a
                     // clear failure is warned, not fatal (the run is
                     // already correctly rejected either way).
-                    if let Err(e) = store.clear_reject_cleanup(run_id) {
+                    let cleared = {
+                        let id = run_id.to_string();
+                        store.blocking(move |s| s.clear_reject_cleanup(&id)).await
+                    };
+                    if let Err(e) = cleared {
                         eprintln!("warning: could not clear on_reject cleanup marker: {e}");
                     }
                 }
@@ -4797,22 +4833,43 @@ fn run_result_status(status: rupu_orchestrator::RunStatus) -> RunResultStatus {
     }
 }
 
-fn persist_portable_run_metadata(
+async fn persist_portable_run_metadata(
     run_store: &rupu_orchestrator::RunStore,
     prepared: &PreparedRun,
     source_wake_id: Option<&str>,
 ) -> anyhow::Result<Option<(PathBuf, RunResult)>> {
-    let Ok(mut run) = run_store.load(&prepared.run_id) else {
+    let Ok(run) = run_store.load(&prepared.run_id) else {
         return Ok(None);
     };
-    run.backend_id = Some(prepared.backend_id.clone());
-    run.worker_id = prepared.worker_id.clone();
-    run.source_wake_id = source_wake_id.map(ToOwned::to_owned);
-
     let manifest = build_artifact_manifest(run_store, &run, prepared)?;
     let manifest_path = run_store.write_artifact_manifest(&prepared.run_id, &manifest)?;
-    run.artifact_manifest_path = Some(manifest_path.clone());
-    run_store.update(&run)?;
+    // Under the run lock, on the blocking pool, touching only these fields
+    // on the record as it is now: a cancel that landed since the load is
+    // left alone, and the result then reports the status the disk holds.
+    let written = {
+        let (id, backend_id, worker_id, wake, path) = (
+            prepared.run_id.clone(),
+            prepared.backend_id.clone(),
+            prepared.worker_id.clone(),
+            source_wake_id.map(ToOwned::to_owned),
+            manifest_path.clone(),
+        );
+        run_store
+            .blocking(move |s| {
+                s.modify_unless_cancelled(&id, |run| {
+                    run.backend_id = Some(backend_id);
+                    run.worker_id = worker_id;
+                    run.source_wake_id = wake;
+                    run.artifact_manifest_path = Some(path);
+                    true
+                })
+            })
+            .await?
+    };
+    let run = match written {
+        Some(run) => run,
+        None => run_store.load(&prepared.run_id)?,
+    };
 
     let result = RunResult {
         version: RunResult::VERSION,
@@ -5368,7 +5425,8 @@ async fn execute_workflow_invocation(
         run_store_for_resume.as_ref(),
         &prepared_run,
         run_envelope.trigger.wake_id.as_deref(),
-    )?
+    )
+    .await?
     .map(|(path, _)| path);
 
     Ok(RunOutcomeSummary {

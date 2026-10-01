@@ -166,8 +166,13 @@ async fn approve_run(
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.0.mode);
+    // On the blocking pool: the gate methods take the run lock.
+    let (rid, gate) = (id.clone(), q.gate.clone());
     s.run_store
-        .request_resume_approval(&id, "web", mode.as_deref(), now, q.gate.as_deref())
+        .blocking(move |store| {
+            store.request_resume_approval(&rid, "web", mode.as_deref(), now, gate.as_deref())
+        })
+        .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -219,8 +224,11 @@ async fn reject_run(
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let reason = body.reason.unwrap_or_default();
+    // On the blocking pool: the gate methods take the run lock.
+    let (rid, gate) = (id.clone(), q.gate.clone());
     s.run_store
-        .reject_gate(&id, "web", &reason, now, q.gate.as_deref())
+        .blocking(move |store| store.reject_gate(&rid, "web", &reason, now, gate.as_deref()))
+        .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -400,8 +408,11 @@ async fn resume_run(
         )));
     }
     let now = chrono::Utc::now();
+    // On the blocking pool: the gate methods take the run lock.
+    let rid = id.clone();
     s.run_store
-        .request_resume_approval(&id, "web", None, now, None)
+        .blocking(move |store| store.request_resume_approval(&rid, "web", None, now, None))
+        .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
