@@ -491,3 +491,106 @@ async fn run_agent_with_limits_returns_the_final_limits_on_success() {
     assert_eq!(limits, result.final_limits);
     assert_eq!(limits, ModelLimits::fixed(300_000, 4_000));
 }
+
+/// Sum of the text lengths across `messages` (the runner's `message_chars`
+/// for text-only messages).
+fn text_chars(messages: &[Message]) -> usize {
+    messages.iter().map(|m| message_text(m).len()).sum()
+}
+
+/// A 15-message conversation for proactive-compaction sizing: a 19,998-char
+/// task, 13 alternating 10,000-char messages, and the 2-char "go" prompt the
+/// run appends — 150,000 chars, so a turn billed at 150,000 input tokens
+/// calibrates to exactly one token per char.
+fn sizing_seed() -> Vec<Message> {
+    let mut seed = vec![Message::user(&"t".repeat(19_998))];
+    for i in 0..13 {
+        let role = if i % 2 == 0 {
+            Role::Assistant
+        } else {
+            Role::User
+        };
+        seed.push(Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: "x".repeat(10_000),
+            }],
+        });
+    }
+    seed
+}
+
+/// Run one proactively-compacting turn over [`sizing_seed`] with `limits`;
+/// returns the captured requests and the run's final messages.
+async fn run_sizing_turn(limits: ModelLimits) -> (Vec<LlmRequest>, Vec<Message>) {
+    let provider = CapturingMockProvider::new(vec![
+        final_text_turn(usage(150_000, 8, 0)),
+        summary_turn(usage(100, 10, 0)),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = build_opts(Box::new(provider), &tmp, tmp.path().join("run.jsonl"));
+    opts.initial_messages = sizing_seed();
+    opts.user_message = "go".into();
+    opts.limits = limits;
+    let result = run_agent(opts).await.expect("run completes");
+    let reqs = captured.lock().unwrap().clone();
+    assert_eq!(text_chars(&reqs[0].messages), 150_000, "fixture calibration");
+    (reqs, result.final_messages)
+}
+
+/// Spec §6.4: compaction sizes the verbatim recent history from the SAME
+/// threshold that triggered it — `min(input × pct, input − output)` — not
+/// from `input × pct` alone. 200,000 input / 64,000 output → threshold
+/// 136,000, so the recent budget is 68,000 tokens (= chars here): the last
+/// seven messages (60,002 chars) stay verbatim and eight are summarised. A
+/// 160,000-based budget (80,000) would keep eight and summarise seven.
+#[tokio::test]
+async fn compaction_budget_follows_the_headroom_threshold() {
+    let limits = discovered(
+        200_000,
+        64_000,
+        LimitSource::Live {
+            fetched_at: chrono::Utc::now(),
+            stale: false,
+        },
+    );
+    assert_eq!(limits.compact_threshold(), Some(136_000));
+    let (reqs, _) = run_sizing_turn(limits).await;
+    assert_eq!(reqs.len(), 2, "the turn, then the summariser call");
+    assert_eq!(
+        reqs[1].messages.len(),
+        8,
+        "task + seven messages summarised; seven recent kept verbatim"
+    );
+}
+
+/// The point of sizing from the threshold: the compacted history must land
+/// under it, or the next turn compacts again (and again). 200,000 input /
+/// 150,000 output → threshold 50,000. A budget from `input × pct` (80,000)
+/// would keep ~70,000 tokens of recent history verbatim — over the threshold
+/// before the next turn even starts.
+#[tokio::test]
+async fn compacted_history_lands_under_the_threshold() {
+    let limits = discovered(
+        200_000,
+        150_000,
+        LimitSource::Live {
+            fetched_at: chrono::Utc::now(),
+            stale: false,
+        },
+    );
+    let threshold = limits.compact_threshold().unwrap();
+    assert_eq!(threshold, 50_000);
+    let (_, final_messages) = run_sizing_turn(limits).await;
+    assert!(
+        message_text(&final_messages[0]).contains(SUMMARY),
+        "the history was compacted"
+    );
+    // One token per char (the fixture's calibration).
+    let estimated = text_chars(&final_messages) as u64;
+    assert!(
+        estimated < threshold,
+        "post-compaction history ({estimated} tokens) must stay under the {threshold} threshold"
+    );
+}

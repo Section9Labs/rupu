@@ -310,17 +310,6 @@ fn message_chars(m: &Message) -> usize {
         .sum()
 }
 
-/// Compute the token count at which compaction triggers.
-/// Returns `None` if `context_window_tokens` is `None` (compaction disabled).
-pub(crate) fn effective_compact_threshold(
-    context_window_tokens: Option<u32>,
-    compact_at_percent: Option<u8>,
-) -> Option<u64> {
-    let window = context_window_tokens?;
-    let pct = compact_at_percent.unwrap_or(80).clamp(10, 95) as u64;
-    Some(window as u64 * pct / 100)
-}
-
 /// Partition `messages` into `(middle_start, recent_start)` for compaction.
 ///
 /// - `messages[0..middle_start]` = task (always index 0, so `middle_start = 1`)
@@ -352,12 +341,9 @@ pub(crate) fn partition_for_compaction(
 
     for i in (middle_start..messages.len()).rev() {
         let msg_chars = message_chars(&messages[i]);
-        if recent_start <= min_recent_start {
-            // We've reached the minimum we must keep — stop.
-            break;
-        }
-        if accumulated + msg_chars > recent_budget_chars && recent_start <= messages.len() - 2 {
-            // Adding this message would exceed the budget and we already have ≥2.
+        if recent_start <= min_recent_start && accumulated + msg_chars > recent_budget_chars {
+            // We already keep the minimum two, and this message would exceed
+            // the budget — stop.
             break;
         }
         accumulated += msg_chars;
@@ -417,6 +403,13 @@ pub struct CompactionOutcome {
 /// `Ok(Some(outcome))` when compaction was performed, `Ok(None)` when the
 /// history is too short or there is nothing to summarise.
 ///
+/// `compact_threshold` is the input-token count compaction keeps the history
+/// under — [`ModelLimits::compact_threshold`](rupu_providers::model_limits::ModelLimits::compact_threshold),
+/// the same value that triggers proactive compaction (spec 2026-09-30 §6.4,
+/// headroom rule included). Half of it is kept verbatim as recent history, so
+/// the compacted conversation lands under the threshold instead of
+/// re-triggering compaction on the next turn.
+///
 /// `last_input_tokens` is the provider's real input token count from the most
 /// recent turn. It is used to calibrate a char→token ratio so the recent-message
 /// budget is expressed in raw chars that correspond to the correct token count,
@@ -426,17 +419,14 @@ pub async fn compact_messages(
     messages: &[Message],
     provider: &mut dyn LlmProvider,
     model: &str,
-    context_window_tokens: u32,
-    compact_at_percent: Option<u8>,
+    compact_threshold: u64,
     last_input_tokens: u32,
 ) -> Result<Option<CompactionOutcome>, rupu_providers::ProviderError> {
     // Calibrate: derive tokens-per-char from what the provider actually charged.
     let total_chars: usize = messages.iter().map(message_chars).sum();
     let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
 
-    let threshold = effective_compact_threshold(Some(context_window_tokens), compact_at_percent)
-        .unwrap_or(context_window_tokens as u64 / 2);
-    let target_recent_tokens = (threshold / 2) as f64;
+    let target_recent_tokens = (compact_threshold / 2) as f64;
     let recent_budget_chars = (target_recent_tokens / tokens_per_char) as usize;
 
     let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget_chars)
@@ -543,9 +533,10 @@ async fn compact_context(
     writer: &mut JsonlWriter,
     last_input_tokens: u32,
 ) -> bool {
-    let context_window_tokens = match opts.limits.input.tokens {
-        Some(w) => w,
-        None => return false,
+    // The same threshold that triggers proactive compaction (headroom rule
+    // included); `None` = input limit unknown, so nothing to size against.
+    let Some(threshold) = opts.limits.compact_threshold() else {
+        return false;
     };
 
     // Best-effort dump of the full pre-compaction messages as JSON before
@@ -576,8 +567,7 @@ async fn compact_context(
         messages,
         opts.provider.as_mut(),
         &opts.model,
-        context_window_tokens,
-        Some(opts.limits.compact_at_percent),
+        threshold,
         last_input_tokens,
     )
     .await
@@ -3254,44 +3244,6 @@ mod compaction_tests {
     }
 
     #[test]
-    fn effective_compact_threshold_none_when_window_none() {
-        assert_eq!(effective_compact_threshold(None, None), None);
-        assert_eq!(effective_compact_threshold(None, Some(75)), None);
-    }
-
-    #[test]
-    fn effective_compact_threshold_1m_at_75_pct() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), Some(75)),
-            Some(750_000)
-        );
-    }
-
-    #[test]
-    fn effective_compact_threshold_default_80_when_percent_none() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), None),
-            Some(800_000)
-        );
-    }
-
-    #[test]
-    fn effective_compact_threshold_clamps_high_to_95() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), Some(99)),
-            Some(950_000)
-        );
-    }
-
-    #[test]
-    fn effective_compact_threshold_clamps_low_to_10() {
-        assert_eq!(
-            effective_compact_threshold(Some(1_000_000), Some(5)),
-            Some(100_000)
-        );
-    }
-
-    #[test]
     fn partition_keeps_last_2_and_returns_middle() {
         // 10-message alternating convo
         let mut msgs = vec![text_msg(Role::User, "task")];
@@ -3367,6 +3319,32 @@ mod compaction_tests {
     /// ~500k budget — and the entire history was treated as "recent", leaving nothing
     /// to summarize. This test asserts that a char budget well below the total chars
     /// of a dense conversation correctly identifies a non-empty middle section.
+    /// The recent-history budget is honoured: beyond the two messages always
+    /// kept, older messages stay verbatim while they fit. (It used to stop at
+    /// exactly two whatever the budget, so the budget — and every threshold
+    /// it was derived from — had no effect.)
+    #[test]
+    fn partition_keeps_recent_messages_while_they_fit_the_budget() {
+        let chunk = "x".repeat(1000);
+        let mut msgs = vec![text_msg(Role::User, &chunk)];
+        for _ in 0..4 {
+            msgs.push(text_msg(Role::Assistant, &chunk));
+            msgs.push(text_msg(Role::User, &chunk));
+        }
+        // 9 messages of 1000 chars: a 3500-char budget keeps the last three.
+        assert_eq!(
+            partition_for_compaction(&msgs, 3_500),
+            Some((1, msgs.len() - 3))
+        );
+        // A budget smaller than two messages still keeps the minimum two.
+        assert_eq!(
+            partition_for_compaction(&msgs, 10),
+            Some((1, msgs.len() - 2))
+        );
+        // A budget covering everything after the task leaves no middle.
+        assert_eq!(partition_for_compaction(&msgs, 1_000_000), None);
+    }
+
     #[test]
     fn partition_budget_in_chars_reclaims_middle_for_dense_content() {
         // Build 8 messages with large char payloads (simulating JSON/code content).
@@ -3578,14 +3556,13 @@ mod compaction_tests {
             output_tokens: 10,
         }]);
 
-        // With a 1000-token window and ~11k chars at high token density, compaction
-        // should find a non-empty middle.
+        // With an 800-token threshold (a 1000-token window at 80%) and ~11k
+        // chars at high token density, compaction should find a non-empty middle.
         let result = compact_messages(
             &msgs,
             &mut provider,
             "mock-1",
-            1000,
-            Some(80),
+            800,
             900, // simulate near-threshold input tokens
         )
         .await;
@@ -3640,7 +3617,7 @@ mod compaction_tests {
             output_tokens: 10,
         }]);
 
-        let result = compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900).await;
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 800, 900).await;
         result.expect("no provider error").expect("should compact");
 
         let captured = provider.captured_requests();
@@ -3676,7 +3653,7 @@ mod compaction_tests {
             output_tokens: 8,
         }]);
 
-        compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900)
+        compact_messages(&msgs, &mut provider, "mock-1", 800, 900)
             .await
             .expect("no provider error")
             .expect("should compact");
@@ -3698,7 +3675,7 @@ mod compaction_tests {
 
         let mut provider = MockProvider::new(vec![]);
 
-        let result = compact_messages(&msgs, &mut provider, "mock-1", 1_000_000, None, 100).await;
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 800_000, 100).await;
 
         assert!(
             result.expect("no error").is_none(),

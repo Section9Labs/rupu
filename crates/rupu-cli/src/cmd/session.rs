@@ -497,6 +497,32 @@ impl SessionRecord {
             .or(self.compact_at_percent)
             .unwrap_or(rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT)
     }
+
+    /// The input-token threshold manual compaction keeps the history under:
+    /// the same `ModelLimits::compact_threshold` a run compacts at (spec
+    /// 2026-09-30 §6.4, headroom rule included), built from the session's
+    /// effective limits — the stored resolved limits, else the agent pins —
+    /// with `window_override` (`session compact --window`) replacing the input
+    /// side. `None` when no input limit is known or pinned.
+    fn compaction_threshold(&self, window_override: Option<u32>) -> Option<u64> {
+        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+        let input = window_override.or(self.effective_context_window())?;
+        let mut limits = match &self.model_limits {
+            Some(l) if !l.is_unresolved() => l.clone(),
+            stored => {
+                let mut l = ModelLimits::from_pins(None, self.max_tokens, None);
+                if let Some(stored) = stored {
+                    l.output_shares_context = stored.output_shares_context;
+                }
+                l
+            }
+        };
+        if limits.input.tokens != Some(input) {
+            limits.input = Limit::new(input, LimitSource::Agent);
+        }
+        limits.compact_at_percent = self.effective_compact_at_percent();
+        limits.compact_threshold()
+    }
 }
 
 #[derive(Serialize)]
@@ -6788,12 +6814,13 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         );
     }
 
-    let context_window_tokens = window_override
-        .or(session.effective_context_window())
+    let compact_threshold = session
+        .compaction_threshold(window_override)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "session {} has no contextWindowTokens set; pass --window <tokens> \
-                 (e.g. --window 1000000) — sessions created before this field existed don't store it",
+                "session {} has no known input limit: its model limits are unknown \
+                 (never resolved, or the provider exposes none) and the agent pins no \
+                 contextWindowTokens; pass --window <tokens> (e.g. --window 1000000)",
                 session_id
             )
         })?;
@@ -6892,8 +6919,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         &session.message_history,
         provider.as_mut(),
         &session.model,
-        context_window_tokens,
-        Some(session.effective_compact_at_percent()),
+        compact_threshold,
         last_input_tokens,
     )
     .await
@@ -7301,9 +7327,9 @@ async fn run_compact_request(
     })?;
     writer.flush()?;
 
-    // Guard: too few messages or no window configured — nothing to compact.
-    let context_window_tokens = match session.effective_context_window() {
-        Some(w) => w,
+    // Guard: too few messages or no input limit known — nothing to compact.
+    let compact_threshold = match session.compaction_threshold(None) {
+        Some(t) => t,
         None => {
             let msg = "[compact skipped: this session's model limits are unknown and it has no contextWindowTokens]".to_string();
             writer.write(&TranscriptEvent::AssistantDelta {
@@ -7400,8 +7426,7 @@ async fn run_compact_request(
         &session.message_history,
         provider.as_mut(),
         &session.model,
-        context_window_tokens,
-        Some(session.effective_compact_at_percent()),
+        compact_threshold,
         last_input_tokens,
     )
     .await
@@ -10168,6 +10193,42 @@ mod tests {
         s.compact_at_percent = Some(50);
         assert_eq!(s.effective_context_window(), Some(300_000));
         assert_eq!(s.effective_compact_at_percent(), 70);
+    }
+
+    /// Manual compaction (`session compact`, the worker's compact request)
+    /// sizes its recent-history budget from the same threshold a run compacts
+    /// at — the headroom rule included (spec 2026-09-30 §6.4) — built from the
+    /// session's effective limits.
+    #[test]
+    fn compaction_threshold_applies_the_headroom_rule_to_the_effective_limits() {
+        use rupu_providers::model_limits::ModelLimits;
+        let mut s = test_session_record();
+        assert_eq!(
+            s.compaction_threshold(None),
+            None,
+            "nothing known or pinned"
+        );
+
+        s.model_limits = Some(ModelLimits::fixed(200_000, 64_000));
+        assert_eq!(s.compaction_threshold(None), Some(136_000), "not 160,000");
+        // `--window` replaces the input side only: min(80,000, 100,000 − 64,000).
+        assert_eq!(s.compaction_threshold(Some(100_000)), Some(36_000));
+
+        let mut separate = ModelLimits::fixed(200_000, 64_000);
+        separate.output_shares_context = false;
+        s.model_limits = Some(separate);
+        assert_eq!(
+            s.compaction_threshold(None),
+            Some(160_000),
+            "no headroom rule when output has its own budget"
+        );
+
+        // Nothing stored: the agent pins.
+        s.model_limits = None;
+        s.context_window_tokens = Some(1_000_000);
+        s.max_tokens = Some(600_000);
+        s.compact_at_percent = Some(50);
+        assert_eq!(s.compaction_threshold(None), Some(400_000));
     }
 
     /// An overflow lowered the input limit mid-session and the run stored it

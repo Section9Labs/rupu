@@ -145,6 +145,8 @@ The `input − output` headroom rule compacts early enough that a full-length re
 - **Haiku 4.5 (200K / 64K):** the threshold is 136K, not 160K. Without the rule, raising `max_tokens` to 64K would let a reply hit the window before the response-outcomes spec exists to handle `model_context_window_exceeded`.
 - **1M models (1M / 128K):** the percentage wins (800K). The rule never triggers.
 
+Compaction also sizes what it keeps from this threshold: half of it stays verbatim as recent history (beyond the last two messages, which are always kept), and the rest is summarised. Sizing from `input × pct` instead would keep more recent history than the headroom threshold allows, and the next turn would compact again. Manual compaction (`rupu session compact`, the session worker's compact request) uses the same threshold, built from the session's effective limits (`--window` replaces the input side only).
+
 ### 6.5 Sessions
 
 The resolved `ModelLimits`, including sources, is stored on the session record on the session's **first turn**. `session start` builds no provider, so the first `_run-turn` resolves and writes it. This is an additive serde field: an older record without it resolves on its next turn. Later turns reuse the stored value; it never refetches in the middle of a session. After each turn, the run's final limits are written back, so a limit learned from an overflow error (§7) persists. That holds when the turn fails too: `run_agent_with_limits` returns the run's final limits on every exit path, `Err` included (`RunResult.final_limits` exists only on `Ok`), and the session writes them on success and on failure.
