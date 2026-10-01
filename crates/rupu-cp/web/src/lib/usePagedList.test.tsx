@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { usePagedList } from './usePagedList';
 
 afterEach(() => {
@@ -51,17 +51,6 @@ function ResetHarness({
       <div data-testid="error">{error ?? ''}</div>
     </div>
   );
-}
-
-function PollHarness({
-  fetch,
-  poll,
-}: {
-  fetch: (p: { offset: number; limit: number }) => Promise<string[]>;
-  poll?: boolean;
-}) {
-  const { rows } = usePagedList({ fetch, deps: [], poll });
-  return <div data-testid="rows">{rows.join(',')}</div>;
 }
 
 describe('usePagedList', () => {
@@ -133,52 +122,6 @@ describe('usePagedList', () => {
     };
     render(<ResetHarness2Wrapper fetch={fetchFn} />);
     await waitFor(() => expect(screen.getByTestId('err').textContent).toBe('boom'));
-  });
-
-  it('polls page 0 every 5s and splices it back in when poll is true', async () => {
-    vi.useFakeTimers();
-    const fetchSpy = vi.fn(async () => ['a']);
-
-    render(<PollHarness fetch={fetchSpy} poll />);
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId('rows').textContent).toBe('a');
-
-    await act(async () => {
-      vi.advanceTimersByTime(5000);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      vi.advanceTimersByTime(10000);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
-  });
-
-  it('never polls when poll is false (the default)', async () => {
-    vi.useFakeTimers();
-    const fetchSpy = vi.fn(async () => ['a']);
-
-    render(<PollHarness fetch={fetchSpy} />);
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      vi.advanceTimersByTime(20000);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });
 

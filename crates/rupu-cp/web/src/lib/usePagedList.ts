@@ -1,9 +1,9 @@
-// usePagedList — the shared fetch/paginate/poll state machine, replacing the
-// ~60 lines of it duplicated per list page (WorkflowRuns, AgentRuns,
-// AutoflowRuns, Sessions, ProjectRunsTab, ProjectSessionsTab). Page size 20,
-// infinite-scroll sentinel via the existing `useInfiniteScroll`, an `ended`
-// flag for the "— end of N —" footer, and an opt-in 5s poll that refreshes
-// ONLY the first page (so an already-scrolled-down list doesn't jump).
+// usePagedList — the shared fetch/paginate state machine for single-source lists
+// (ProjectRunsTab, ProjectSessionsTab, autoflow Claims). Page size 20,
+// infinite-scroll sentinel via useInfiniteScroll, and an `ended` flag for the
+// "— end of N —" footer. Polling, multi-host lists live in lib/perHost/usePerHostPagedList.ts;
+// its poll splice was removed with them (spec 2026-10-01 §6.3: it dropped a row when a run
+// arrived and duplicated one when a run left).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useInfiniteScroll } from './useInfiniteScroll';
@@ -15,9 +15,6 @@ export interface UsePagedListOptions<T> {
   /** Reactive trigger for "start over" (filters, host, tab, …). Compared by
    *  INDEX below, not by array identity — see the note on `gen` below. */
   deps: unknown[];
-  /** When true, a 5s interval silently re-fetches page 0 and splices it back
-   *  in over the existing head of `rows`. Off by default. */
-  poll?: boolean;
 }
 
 export interface UsePagedListResult<T> {
@@ -33,7 +30,6 @@ export interface UsePagedListResult<T> {
 export function usePagedList<T>({
   fetch,
   deps,
-  poll = false,
 }: UsePagedListOptions<T>): UsePagedListResult<T> {
   const [rows, setRows] = useState<T[]>([]);
   const [loading, setLoading] = useState(true);
@@ -118,29 +114,6 @@ export function usePagedList<T>({
   // consumers MAY mount the sentinel unconditionally (even before the first
   // page resolves) — the hook is safe either way.
   const { sentinelRef } = useInfiniteScroll({ hasMore: hasMore && !loading, loadMore });
-
-  // Opt-in 5s poll of page 0 only. Splices the fresh head back over
-  // `rowsRef.current` without touching anything the user has already
-  // scrolled to load beyond it. Poll failures are swallowed — a background
-  // refresh going stale for one tick shouldn't blank the list or throw up an
-  // error banner over data the operator is actively looking at.
-  useEffect(() => {
-    if (!poll) return;
-    const id = setInterval(() => {
-      fetchRef
-        .current({ offset: 0, limit: PAGE })
-        .then((page0) => {
-          rowsRef.current = [...page0, ...rowsRef.current.slice(page0.length)];
-          setRows(rowsRef.current);
-        })
-        .catch(() => {
-          /* swallow — keep showing the last good page */
-        });
-    }, 5000);
-    return () => clearInterval(id);
-    // `gen` restarts the poll cadence in sync with a filter reset (harmless
-    // either way, but avoids a poll tick racing the reset fetch above).
-  }, [poll, gen]);
 
   const refresh = useCallback(() => {
     void loadFirstPage();
