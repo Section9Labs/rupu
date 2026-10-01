@@ -76,10 +76,8 @@ fn opts_for(
         // The whole point: no coverage harness.
         concerns: None,
         scope_name: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         surface_tag: Some("autoflow".into()),
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     }

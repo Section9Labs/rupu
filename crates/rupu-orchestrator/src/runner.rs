@@ -10108,9 +10108,7 @@ steps:
     // T3 — pause / resume (run + workflow)
     // -----------------------------------------------------------------------
 
-    use rupu_agent::runner::{
-        CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
-    };
+    use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
     use rupu_agent::{AgentRunOpts, BypassDecider};
     use rupu_providers::types::{
         ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent,
@@ -10205,9 +10203,7 @@ steps:
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
-            context_window_tokens: None,
-            compact_at_percent: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
             pause: None,
@@ -11369,7 +11365,7 @@ loops:
 #[cfg(test)]
 mod dag_scheduler_golden {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_mcp::{McpPermission, ToolDispatcher};
     use rupu_providers::types::StopReason;
     use rupu_scm::{
@@ -11446,11 +11442,9 @@ mod dag_scheduler_golden {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -11845,7 +11839,7 @@ steps:
 #[cfg(test)]
 mod scheduler_concurrency {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11993,11 +11987,9 @@ steps:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -12380,7 +12372,7 @@ steps:
 #[cfg(test)]
 mod bounded_loops {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12515,11 +12507,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -12711,11 +12701,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -13002,11 +12990,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -13199,11 +13185,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -13262,7 +13246,7 @@ loops:
 #[cfg(test)]
 mod loop_resume {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13428,11 +13412,9 @@ loops:
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -13732,11 +13714,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -13884,11 +13864,9 @@ loops:
                     on_stream_event: None,
                     on_usage: None,
                     concerns: None,
-                    max_tokens: DEFAULT_MAX_TOKENS,
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
                     scope_name: None,
                     surface_tag: None,
-                    context_window_tokens: None,
-                    compact_at_percent: None,
                     pause: None,
                     codename: None,
                 }
@@ -14219,7 +14197,7 @@ loops:
 #[cfg(test)]
 mod join_and_prune {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::Mutex;
@@ -14317,11 +14295,9 @@ mod join_and_prune {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -15855,7 +15831,7 @@ steps:
 #[cfg(test)]
 mod resume_and_cancel {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::Mutex;
@@ -15950,11 +15926,9 @@ mod resume_and_cancel {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 pause: None,
                 codename: None,
             }
@@ -16631,7 +16605,7 @@ fn scan_for_json_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod agent_terminal_status {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
     use rupu_agent::AgentRunOpts;
     use rupu_providers::types::StopReason;
     use rupu_providers::LlmProvider;
@@ -16713,9 +16687,7 @@ mod agent_terminal_status {
                 on_stream_event: None,
                 on_usage: None,
                 concerns: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
-                context_window_tokens: None,
-                compact_at_percent: None,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
                 scope_name: None,
                 surface_tag: None,
                 pause: None,

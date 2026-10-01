@@ -76,10 +76,8 @@ fn opts(
         on_stream_event: None,
         concerns: None,
         scope_name: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         surface_tag: Some("agent".into()),
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     }

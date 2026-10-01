@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::MockProvider;
-use rupu_agent::runner::{BypassDecider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+use rupu_agent::runner::{BypassDecider, ScriptedTurn};
 use rupu_agent::AgentRunOpts;
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
@@ -113,9 +113,7 @@ impl StepFactory for EchoFactory {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
-            context_window_tokens: None,
-            compact_at_percent: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
             pause: None,
@@ -181,9 +179,7 @@ impl StepFactory for FailFactory {
             on_stream_event: None,
             on_usage: None,
             concerns: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
-            context_window_tokens: None,
-            compact_at_percent: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             surface_tag: None,
             pause: None,

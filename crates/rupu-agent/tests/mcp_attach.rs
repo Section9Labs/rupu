@@ -60,11 +60,9 @@ async fn mcp_registry_attaches_tools_to_run() {
         on_stream_event: None,
         on_usage: None,
         concerns: None,
-        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+        limits: rupu_providers::model_limits::ModelLimits::unknown(),
         scope_name: None,
         surface_tag: None,
-        context_window_tokens: None,
-        compact_at_percent: None,
         pause: None,
         codename: None,
     };
