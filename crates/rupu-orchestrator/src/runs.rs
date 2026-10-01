@@ -3064,7 +3064,7 @@ impl RunStore {
         if !matches!(record.status, RunStatus::Pending | RunStatus::Running) {
             return Ok(false);
         }
-        if !record.runner_pid.is_some_and(|pid| !pid_is_running(pid)) {
+        if record.runner_pid.is_none_or(pid_is_running) {
             return Ok(false);
         }
         let _lock = self.lock_run_json(&record.id);
