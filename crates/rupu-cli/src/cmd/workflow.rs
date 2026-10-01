@@ -5317,10 +5317,11 @@ async fn execute_workflow_invocation(
             if matches!(outcome, AttachOutcome::Cancelled) {
                 current_runner.abort();
                 let _ = current_runner.await;
-                cancel_with_store(
+                let summary = finish_operator_cancel(
                     run_store_for_resume.as_ref(),
+                    &prepared_run,
+                    run_envelope.trigger.wake_id.as_deref(),
                     &current_run_id,
-                    "cancelled by operator",
                 )
                 .await?;
                 // The retained view is already torn down; this early return
@@ -5328,13 +5329,7 @@ async fn execute_workflow_invocation(
                 if print_summary {
                     print_completion_summary(&runs_dir, &current_run_id, &cfg.pricing);
                 }
-                return Ok(RunOutcomeSummary {
-                    run_id: current_run_id,
-                    awaiting_step_id: None,
-                    artifact_manifest_path: None,
-                    backend_id: Some(prepared_run.backend_id.clone()),
-                    worker_id: prepared_run.worker_id.clone(),
-                });
+                return Ok(summary);
             }
 
             let result = match current_runner
@@ -5485,6 +5480,30 @@ async fn execute_workflow_invocation(
         run_outcome,
     )
     .await
+}
+
+/// The operator's `x` from the attached live view: the run is cancelled
+/// on disk ([`cancel_with_store`]) and, the run being over, its portable
+/// metadata (backend, worker, wake, manifest path) is persisted like any
+/// other ending's — a cancelled run carries it too — before the summary is
+/// returned, with the manifest path it got.
+async fn finish_operator_cancel(
+    run_store: &rupu_orchestrator::RunStore,
+    prepared: &PreparedRun,
+    source_wake_id: Option<&str>,
+    run_id: &str,
+) -> anyhow::Result<RunOutcomeSummary> {
+    cancel_with_store(run_store, run_id, "cancelled by operator").await?;
+    let artifact_manifest_path = persist_portable_run_metadata(run_store, prepared, source_wake_id)
+        .await?
+        .map(|(path, _)| path);
+    Ok(RunOutcomeSummary {
+        run_id: run_id.to_string(),
+        awaiting_step_id: None,
+        artifact_manifest_path,
+        backend_id: Some(prepared.backend_id.clone()),
+        worker_id: prepared.worker_id.clone(),
+    })
 }
 
 /// `execute_workflow_invocation`'s last step, run whatever the run
@@ -5974,6 +5993,38 @@ mod tests {
             on_disk.artifact_manifest_path.as_deref(),
             Some(path.as_path())
         );
+    }
+
+    /// The operator's cancel from the attached live view ends the run
+    /// `Cancelled` on disk and persists its portable metadata like any
+    /// other ending: the four fields and the manifest are there, and the
+    /// summary names the manifest.
+    #[tokio::test]
+    async fn the_operator_s_cancel_persists_the_metadata_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = sample_run_record(RunStatus::Running, None);
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
+        let summary = finish_operator_cancel(&store, &prepared_for(&rec), Some("wake_42"), &rec.id)
+            .await
+            .unwrap();
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Cancelled);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_42"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+        assert_eq!(on_disk.worker_id.as_deref(), Some("worker-1"));
+        let manifest = on_disk
+            .artifact_manifest_path
+            .expect("the manifest path is recorded");
+        assert!(manifest.is_file(), "the manifest was written");
+        assert_eq!(
+            summary.artifact_manifest_path.as_deref(),
+            Some(manifest.as_path())
+        );
+        assert_eq!(summary.run_id, rec.id);
+        assert_eq!(summary.awaiting_step_id, None);
     }
 
     /// A run that ended in an error — here cancelled mid-run — still gets
