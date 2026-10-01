@@ -182,6 +182,10 @@ pub struct OpenAiCodexClient {
     /// The OAuth token endpoint ([`OPENAI_TOKEN_URL`]; tests point it at a
     /// mock).
     token_url: String,
+    /// A token refresh this client started and is (or was) waiting for. Kept
+    /// across a dropped call so the next call adopts it instead of starting
+    /// a second refresh with the rotated-out refresh token.
+    pending_refresh: Option<tokio::task::JoinHandle<Result<RefreshedOpenAiToken, ProviderError>>>,
 }
 
 /// The `OpenAI-Organization` header value for a request to `api_url`, if any.
@@ -259,6 +263,7 @@ impl OpenAiCodexClient {
                     chatgpt_models_url: CODEX_MODELS_URL.to_string(),
                     catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
                     token_url: OPENAI_TOKEN_URL.to_string(),
+                    pending_refresh: None,
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
@@ -275,6 +280,7 @@ impl OpenAiCodexClient {
                 chatgpt_models_url: CODEX_MODELS_URL.to_string(),
                 catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
                 token_url: OPENAI_TOKEN_URL.to_string(),
+                pending_refresh: None,
             }),
         }
     }
@@ -750,25 +756,36 @@ impl OpenAiCodexClient {
         Ok(())
     }
 
-    /// Cancel-safe: the refresh and its persistence run as their own task.
-    /// OpenAI rotates the refresh token, so a refresh abandoned between the
-    /// token response and the write (the caller dropped mid-flight — a
-    /// pause, a listing timeout) would leave only an invalidated token
-    /// behind. Dropping this future only stops waiting; the task still
-    /// finishes and persists.
+    /// Cancel-safe. OpenAI rotates the refresh token, so the refresh and its
+    /// persistence run as their own task (tracked by
+    /// [`crate::credential_writes`], which the binary drains before exit): a
+    /// caller dropped mid-flight (a pause, a listing timeout) only stops
+    /// waiting. The task's handle stays on the client, so the next call
+    /// adopts the refresh in flight (or its finished result) instead of
+    /// starting a second one with the rotated-out refresh token.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
-            return Ok(());
+        if self.pending_refresh.is_none() {
+            if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
+                return Ok(());
+            }
+            self.pending_refresh = Some(crate::credential_writes::spawn(
+                refresh_and_persist_openai_token(
+                    self.client.clone(),
+                    self.token_url.clone(),
+                    self.refresh_token.clone(),
+                    self.account_id.clone(),
+                    self.credential_store.clone(),
+                    self.auth_json_path.clone(),
+                ),
+            ));
         }
-        let job = tokio::spawn(refresh_and_persist_openai_token(
-            self.client.clone(),
-            self.token_url.clone(),
-            self.refresh_token.clone(),
-            self.account_id.clone(),
-            self.credential_store.clone(),
-            self.auth_json_path.clone(),
-        ));
-        let refreshed = job.await.map_err(|e| {
+        let Some(job) = self.pending_refresh.as_mut() else {
+            return Ok(());
+        };
+        // A cancellation point: dropped here, the handle stays on `self`.
+        let finished = job.await;
+        self.pending_refresh = None;
+        let refreshed = finished.map_err(|e| {
             ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
         })??;
         self.access_token = refreshed.access_token;
@@ -3605,6 +3622,51 @@ mod fetch_models_tests {
             saved.contains("refresh-2") && saved.contains("access-2"),
             "{saved}"
         );
+    }
+
+    /// A client left behind by a dropped call adopts the refresh still in
+    /// flight on its next call instead of starting a second one with the
+    /// rotated-out refresh token (`invalid_grant`; reuse can revoke the
+    /// grant).
+    #[tokio::test]
+    async fn a_reused_client_adopts_the_refresh_in_flight() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1, // long expired
+                extra: std::collections::HashMap::new(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/oauth/token");
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models");
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        let _ =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client).await;
+        token.assert_hits(1);
+        assert_eq!(client.access_token, "access-2");
+        assert_eq!(client.refresh_token, "refresh-2");
     }
 
     #[test]

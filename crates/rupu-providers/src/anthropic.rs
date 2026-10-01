@@ -989,6 +989,10 @@ pub struct AnthropicClient {
     /// The OAuth token endpoint ([`ANTHROPIC_TOKEN_URL`]; tests point it at
     /// a mock).
     token_url: String,
+    /// A token refresh this client started and is (or was) waiting for. Kept
+    /// across a dropped call so the next call adopts it instead of starting
+    /// a second refresh with the rotated-out refresh token.
+    pending_refresh: Option<tokio::task::JoinHandle<Result<AuthMethod, ProviderError>>>,
 }
 
 impl AnthropicClient {
@@ -1012,6 +1016,7 @@ impl AnthropicClient {
             semaphore: None,
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
         }
     }
 
@@ -1109,6 +1114,7 @@ impl AnthropicClient {
             semaphore: None,
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
         }
     }
 
@@ -1136,6 +1142,7 @@ impl AnthropicClient {
             semaphore: None,
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
         }
     }
 
@@ -1177,6 +1184,7 @@ impl AnthropicClient {
             semaphore: None,
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
         }
     }
 
@@ -1206,39 +1214,53 @@ impl AnthropicClient {
             semaphore: None,
             long_context_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            pending_refresh: None,
         }
     }
 
     /// Ensure the OAuth token is still valid, refreshing if expired.
     /// Persists refreshed tokens via CredentialStore (preferred) or save_auth_json (legacy).
     ///
-    /// Cancel-safe: the refresh and its persistence run as their own task.
-    /// The token endpoint rotates the refresh token, so a refresh abandoned
-    /// between its response and the write (the caller dropped mid-flight — a
-    /// pause, a listing timeout) would leave only an invalidated token
-    /// behind. Dropping this future only stops waiting; the task still
-    /// finishes and persists.
+    /// Cancel-safe. The token endpoint rotates the refresh token, so the
+    /// refresh and its persistence run as their own task (tracked by
+    /// [`crate::credential_writes`], which the binary drains before exit):
+    /// a caller dropped mid-flight (a pause, a listing timeout) only stops
+    /// waiting. The task's handle stays on the client, so the next call
+    /// adopts the refresh in flight (or its finished result) instead of
+    /// starting a second one with the rotated-out refresh token.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        if let AuthMethod::OAuth {
-            refresh_token,
-            expires_ms,
-            ..
-        } = &self.auth
-        {
-            if !refresh_token.is_empty() && is_token_expired(*expires_ms) {
-                info!("OAuth token expired, refreshing");
-                let job = tokio::spawn(refresh_and_persist_anthropic_token(
+        if self.pending_refresh.is_none() {
+            let AuthMethod::OAuth {
+                refresh_token,
+                expires_ms,
+                ..
+            } = &self.auth
+            else {
+                return Ok(());
+            };
+            if refresh_token.is_empty() || !is_token_expired(*expires_ms) {
+                return Ok(());
+            }
+            info!("OAuth token expired, refreshing");
+            self.pending_refresh = Some(crate::credential_writes::spawn(
+                refresh_and_persist_anthropic_token(
                     self.client.clone(),
                     self.token_url.clone(),
                     refresh_token.clone(),
                     self.credential_store.clone(),
                     self.auth_json_path.clone(),
-                ));
-                self.auth = job.await.map_err(|e| {
-                    ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
-                })??;
-            }
+                ),
+            ));
         }
+        let Some(job) = self.pending_refresh.as_mut() else {
+            return Ok(());
+        };
+        // A cancellation point: dropped here, the handle stays on `self`.
+        let finished = job.await;
+        self.pending_refresh = None;
+        self.auth = finished.map_err(|e| {
+            ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
+        })??;
         Ok(())
     }
 
@@ -5563,6 +5585,51 @@ mod tests {
         assert!(
             saved.contains("refresh-2") && saved.contains("access-2"),
             "{saved}"
+        );
+    }
+
+    /// The client a dropped call leaves behind still holds the expired
+    /// token. Its next call (e.g. the run's first turn, after `resolve`'s
+    /// listing timed out mid-refresh) must adopt the refresh already in
+    /// flight, not start a second one with the rotated-out refresh token —
+    /// which the endpoint answers `invalid_grant`, and repeated reuse can get
+    /// the whole grant revoked.
+    #[tokio::test]
+    async fn a_reused_client_adopts_the_refresh_in_flight() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/v1/oauth/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let mut client = AnthropicClient::from_auth_with_url(
+            AuthMethod::OAuth {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_ms: 1, // long expired
+            },
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        client.token_url = server.url("/v1/oauth/token");
+        let request = make_request(None);
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        // The next call: the messages endpoint has no mock (404), which is
+        // fine — what matters is the token endpoint saw ONE refresh.
+        let _ = client.send(&request).await;
+        token.assert_hits(1);
+        assert!(
+            matches!(&client.auth, AuthMethod::OAuth { access_token, refresh_token, .. }
+                if access_token == "access-2" && refresh_token == "refresh-2"),
+            "the client adopted the rotated token"
         );
     }
 

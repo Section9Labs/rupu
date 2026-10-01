@@ -144,7 +144,14 @@ pub struct GoogleGeminiClient {
     /// The OAuth token endpoint ([`GOOGLE_TOKEN_URL`]; tests point it at a
     /// mock).
     token_url: String,
+    /// A token refresh this client started and is (or was) waiting for. Kept
+    /// across a dropped call so the next call adopts it instead of starting
+    /// a second refresh.
+    pending_refresh: Option<PendingGoogleRefresh>,
 }
+
+/// A spawned Google token refresh: `(access_token, refresh_token, expires_ms)`.
+type PendingGoogleRefresh = tokio::task::JoinHandle<Result<(String, String, u64), ProviderError>>;
 
 impl GoogleGeminiClient {
     /// Apply `[providers.<name>]` tuning — currently the `timeout_ms`
@@ -207,6 +214,7 @@ impl GoogleGeminiClient {
                     auth_json_path,
                     api_base_override: None,
                     token_url: GOOGLE_TOKEN_URL.to_string(),
+                    pending_refresh: None,
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
@@ -220,6 +228,7 @@ impl GoogleGeminiClient {
                 auth_json_path: None,
                 api_base_override: None,
                 token_url: GOOGLE_TOKEN_URL.to_string(),
+                pending_refresh: None,
             }),
             (AuthCredentials::ApiKey { .. }, _) => Err(ProviderError::AuthConfig(
                 "Google Cloud Code Assist (gemini-cli / antigravity) requires OAuth, \
@@ -477,27 +486,39 @@ impl GoogleGeminiClient {
         })
     }
 
-    /// Cancel-safe: the refresh and its persistence run as their own task,
-    /// so a refresh abandoned mid-flight (the caller dropped — a pause, a
-    /// timeout) still persists what the token endpoint returned, including a
-    /// rotated refresh token. Dropping this future only stops waiting.
+    /// Cancel-safe: the refresh and its persistence run as their own task
+    /// (tracked by [`crate::credential_writes`], which the binary drains
+    /// before exit), so a caller dropped mid-flight (a pause, a timeout) only
+    /// stops waiting. The task's handle stays on the client, so the next
+    /// call adopts the refresh in flight (or its finished result) instead of
+    /// starting a second one.
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
-        // AI Studio uses a stable api-key — no refresh path.
-        if self.variant.is_api_key() {
-            return Ok(());
+        if self.pending_refresh.is_none() {
+            // AI Studio uses a stable api-key — no refresh path.
+            if self.variant.is_api_key() {
+                return Ok(());
+            }
+            if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
+                return Ok(());
+            }
+            self.pending_refresh = Some(crate::credential_writes::spawn(
+                refresh_and_persist_google_token(
+                    self.client.clone(),
+                    self.token_url.clone(),
+                    self.variant,
+                    self.refresh_token.clone(),
+                    self.project_id.clone(),
+                    self.auth_json_path.clone(),
+                ),
+            ));
         }
-        if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
+        let Some(job) = self.pending_refresh.as_mut() else {
             return Ok(());
-        }
-        let job = tokio::spawn(refresh_and_persist_google_token(
-            self.client.clone(),
-            self.token_url.clone(),
-            self.variant,
-            self.refresh_token.clone(),
-            self.project_id.clone(),
-            self.auth_json_path.clone(),
-        ));
-        let (access_token, refresh_token, expires_ms) = job.await.map_err(|e| {
+        };
+        // A cancellation point: dropped here, the handle stays on `self`.
+        let finished = job.await;
+        self.pending_refresh = None;
+        let (access_token, refresh_token, expires_ms) = finished.map_err(|e| {
             ProviderError::TokenRefreshFailed(format!("token refresh task failed: {e}"))
         })??;
         self.access_token = access_token;
@@ -1191,6 +1212,68 @@ fn extract_google_error(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client left behind by a dropped call adopts the refresh still in
+    /// flight on its next call instead of starting a second one with a
+    /// possibly rotated-out refresh token.
+    #[tokio::test]
+    async fn a_reused_client_adopts_the_refresh_in_flight() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .json_body(serde_json::json!({
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 3600
+                }));
+        });
+        let mut creds = test_creds("proj");
+        if let AuthCredentials::OAuth {
+            refresh, expires, ..
+        } = &mut creds
+        {
+            *refresh = "refresh-1".into();
+            *expires = 1; // long expired
+        }
+        let mut client = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.token_url = server.url("/token");
+        let request = LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            system: None,
+            messages: vec![Message::user("Hello")],
+            max_tokens: Some(16),
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            disable_prompt_cache: false,
+        };
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
+        assert!(dropped.is_err(), "dropped mid-refresh");
+        // The next call's token step (what `send` runs first) — calling it
+        // directly keeps the test off the real Code Assist endpoint.
+        client.ensure_valid_token().await.unwrap();
+        token.assert_hits(1);
+        assert_eq!(client.access_token, "access-2");
+        assert_eq!(client.refresh_token, "refresh-2");
+    }
 
     /// A token refresh started by a call that is then dropped (a pause, a
     /// timeout) must still persist the refreshed credentials. The refresh

@@ -17,6 +17,7 @@ pub mod broker_types;
 pub mod concurrency;
 pub mod credential_source;
 pub mod credential_store;
+pub mod credential_writes;
 pub mod error;
 pub mod github_copilot;
 pub mod google_gemini;
