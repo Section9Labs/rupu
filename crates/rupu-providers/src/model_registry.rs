@@ -17,6 +17,8 @@ use tokio::sync::RwLock;
 use crate::model_pool::ModelInfo;
 
 const CACHE_TTL_SECS: i64 = 60 * 60; // 1h
+/// Cache file schema. v1 had no `schema` field and stored ids only; any other
+/// schema (older or newer) is treated as stale.
 const CACHE_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,8 +196,12 @@ impl ModelRegistry {
                 std::process::id(),
                 SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
-            std::fs::write(&tmp, body)?;
-            std::fs::rename(&tmp, &path)?;
+            // Atomic replace: write a sibling temp file, then rename over the
+            // target. If either step fails, don't strand the temp file.
+            if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -207,7 +213,14 @@ impl ModelRegistry {
         }
         let body = std::fs::read_to_string(&path)?;
         let cache: CacheFile = serde_json::from_str(&body)?;
-        if cache.schema < CACHE_SCHEMA {
+        if cache.schema != CACHE_SCHEMA {
+            tracing::debug!(
+                provider,
+                path = %path.display(),
+                found = cache.schema,
+                expected = CACHE_SCHEMA,
+                "ignoring model cache with an unsupported schema"
+            );
             return Ok(());
         }
         let entries: Vec<ModelInfo> = cache
@@ -322,6 +335,97 @@ mod tests {
         r.load_cache("anthropic").await.unwrap();
         assert!(r.cache_is_stale("anthropic").await);
         assert!(r.find_live("anthropic", "claude-a").await.is_none());
+    }
+
+    /// Any schema other than the current one is stale — a file written by a
+    /// NEWER rupu (`schema: 3`) has a shape this build cannot vouch for, so it
+    /// is ignored just like an older one.
+    #[tokio::test]
+    async fn a_newer_schema_cache_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("anthropic.json"),
+            r#"{"schema":3,"fetched_at":"2026-09-30T00:00:00Z","models":[{"id":"claude-a","context_window":1000,"max_output_tokens":10}]}"#,
+        )
+        .unwrap();
+        let r = ModelRegistry::with_cache_dir(tmp.path());
+        r.load_cache("anthropic").await.unwrap();
+        assert!(r.cache_is_stale("anthropic").await);
+        assert!(r.find_live("anthropic", "claude-a").await.is_none());
+    }
+
+    /// The current schema is honoured (guards the `!=` comparison against an
+    /// over-eager "ignore everything").
+    #[tokio::test]
+    async fn a_current_schema_cache_is_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("anthropic.json"),
+            format!(
+                r#"{{"schema":{CACHE_SCHEMA},"fetched_at":"2026-09-30T00:00:00Z","models":[{{"id":"claude-a","context_window":1000,"max_output_tokens":10}}]}}"#
+            ),
+        )
+        .unwrap();
+        let r = ModelRegistry::with_cache_dir(tmp.path());
+        r.load_cache("anthropic").await.unwrap();
+        let m = r.find_live("anthropic", "claude-a").await.unwrap();
+        assert_eq!((m.context_window, m.max_output_tokens), (1000, 10));
+    }
+
+    /// A failed write/rename must not strand its temp file in the cache dir.
+    #[tokio::test]
+    async fn save_cache_failure_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory where the cache file belongs: the final rename fails.
+        std::fs::create_dir(tmp.path().join("anthropic.json")).unwrap();
+        let r = ModelRegistry::with_cache_dir(tmp.path());
+        r.set_live_cache("anthropic", vec![mi("claude-a", 1000, 10)])
+            .await;
+        assert!(r.save_cache("anthropic").await.is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stranded temp files: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn find_live_strips_the_1m_suffix() {
+        let r = ModelRegistry::with_cache_dir("unused");
+        r.set_live_cache(
+            "anthropic",
+            vec![mi("claude-sonnet-4-6", 1_000_000, 64_000)],
+        )
+        .await;
+        for model in ["claude-sonnet-4-6[1m]", "claude-sonnet-4-6[1M]"] {
+            let m = r.find_live("anthropic", model).await.unwrap();
+            assert_eq!(m.id, "claude-sonnet-4-6", "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_live_falls_back_to_the_newest_dated_snapshot() {
+        let r = ModelRegistry::with_cache_dir("unused");
+        r.set_live_cache(
+            "anthropic",
+            vec![
+                mi("claude-haiku-4-5-20250101", 100, 10),
+                mi("claude-haiku-4-5-20251001", 200, 20),
+                mi("claude-haiku-4-5-extra", 300, 30),
+            ],
+        )
+        .await;
+        let m = r.find_live("anthropic", "claude-haiku-4-5").await.unwrap();
+        assert_eq!(m.id, "claude-haiku-4-5-20251001");
+        // The suffix and the snapshot fallback compose.
+        let m = r
+            .find_live("anthropic", "claude-haiku-4-5[1m]")
+            .await
+            .unwrap();
+        assert_eq!(m.id, "claude-haiku-4-5-20251001");
+        assert!(r.find_live("anthropic", "claude-missing").await.is_none());
     }
 
     #[test]
