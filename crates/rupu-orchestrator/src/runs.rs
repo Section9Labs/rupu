@@ -1675,14 +1675,18 @@ impl RunStore {
     /// Append-mode + a single `write_all`, so a crash mid-write leaves
     /// the line either fully present or absent. Called by the runner as
     /// each `for_each` unit finishes (success or failure) so resume can
-    /// replay the finished units.
+    /// replay the finished units. Concurrent units (and concurrent fan-out
+    /// steps of one DAG run) finish at the same instant, so appends are
+    /// serialized: a multi-KB line is not guaranteed to land in one write.
     pub fn append_unit_checkpoint(
         &self,
         run_id: &str,
         checkpoint: &UnitCheckpoint,
     ) -> Result<(), RunStoreError> {
+        static APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let mut line = serde_json::to_vec(checkpoint)?;
         line.push(b'\n');
+        let _serialized = APPEND.lock().unwrap_or_else(|p| p.into_inner());
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
