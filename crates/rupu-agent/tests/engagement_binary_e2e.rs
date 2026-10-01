@@ -30,10 +30,13 @@ fn sample_agent() -> AgentSpec {
     AgentSpec::parse_file(&path).expect("the binary-analyst sample agent parses")
 }
 
+/// The engagement the sample agent itself declares (`engagementProfiles`),
+/// resolved against the built-in registry — so a sample that stopped selecting
+/// `binary` would stop activating it here too.
 fn binary_engagement() -> Option<Arc<rupu_coverage::profile::ActiveSet>> {
     let set = rupu_coverage::profile::builtin_registry()
         .unwrap()
-        .active_set(&["binary".to_string()])
+        .active_set(&sample_agent().engagement_profiles)
         .unwrap();
     Some(Arc::new(set))
 }
@@ -259,7 +262,13 @@ async fn a_binary_finding_with_a_listing_is_routed_gated_and_persisted() {
         transcript.contains("## Engagement profiles"),
         "{transcript}"
     );
-    assert!(transcript.contains("binary:function"), "{transcript}");
+    // The depth ladder is guidance-only text (the scripted calls never send
+    // it), so its presence shows the profile's own declarations reached the
+    // prompt.
+    assert!(
+        transcript.contains("located -> disassembled -> analyzed"),
+        "{transcript}"
+    );
 }
 
 #[tokio::test]
@@ -299,7 +308,7 @@ async fn a_binary_finding_without_a_listing_is_rejected_and_writes_nothing() {
 #[tokio::test]
 async fn a_rejected_report_can_be_fixed_and_resent() {
     let ws = tempfile::TempDir::new().unwrap();
-    run(
+    let transcript = run(
         ws.path(),
         FindingWriteOptions::default().with_engagement(binary_engagement()),
         None,
@@ -310,6 +319,13 @@ async fn a_rejected_report_can_be_fixed_and_resent() {
         ],
     )
     .await;
+    // The first attempt really was refused by the gate (so the single record
+    // below is the retry, not a deduplicated pair)...
+    assert!(
+        transcript.contains("requires `evidence_has_listing`"),
+        "{transcript}"
+    );
+    // ...and the fixed resend is the only thing recorded.
     assert_eq!(
         findings(ws.path()).len(),
         1,
@@ -321,14 +337,16 @@ async fn a_rejected_report_can_be_fixed_and_resent() {
 #[tokio::test]
 async fn asset_mark_sets_depth_and_a_later_finding_does_not_reset_it() {
     let ws = tempfile::TempDir::new().unwrap();
+    // mark, THEN report on the same function with no depth, and nothing after:
+    // the stored depth can only still be `analyzed` if `report_finding`'s
+    // asset upsert preserved it.
     run(
         ws.path(),
         FindingWriteOptions::default().with_engagement(binary_engagement()),
         None,
         vec![
-            asset_mark_call("t1", "disassembled"),
+            asset_mark_call("t1", "analyzed"),
             report_call("t2", report_with_listing()),
-            asset_mark_call("t3", "analyzed"),
             done(),
         ],
     )
