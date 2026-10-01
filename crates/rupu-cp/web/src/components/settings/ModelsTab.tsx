@@ -1,6 +1,6 @@
 // Settings → Models: the discovered model-limits catalog plus a manual
 // refetch (spec docs/superpowers/specs/2026-09-30-rupu-model-limits-discovery-design.md §8.3).
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, apiErrorMessage, type CatalogModel, type CatalogProvider } from '../../lib/api';
 import { relativeTime } from '../../lib/time';
 import { Badge } from '../ui/Badge';
@@ -40,11 +40,18 @@ export function ModelsTab() {
   const [busy, setBusy] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  // Latest-wins: every load takes a sequence number, and only the newest one
+  // may write state, so a slow earlier response can't clobber a later one.
+  const loadSeq = useRef(0);
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     try {
-      setCatalog(await api.getModelCatalog());
+      const next = await api.getModelCatalog();
+      if (seq !== loadSeq.current) return;
+      setCatalog(next);
       setLoadError(null);
     } catch (e) {
+      if (seq !== loadSeq.current) return;
       if (e instanceof ApiError && e.status === 501) setUnavailable(true);
       else setLoadError(apiErrorMessage(e));
     }
@@ -89,13 +96,17 @@ export function ModelsTab() {
   };
 
   if (unavailable) return <EmptyTabState text="The model catalog requires `rupu cp serve`." />;
-  // The load-failure banner, with a Retry that is blocked while its own load is
-  // in flight so a second click can't stack requests.
+  // The tab is single-flight: a catalog load (Retry) and a refresh (Refetch)
+  // never overlap, so each Retry/Refetch control is blocked while the other
+  // kind of work, or its own, is in flight.
+  const working = retrying || busy !== null;
+
+  // The load-failure banner, with a Retry that is blocked while anything is in flight.
   const loadErrorBanner = loadError ? (
     <ErrorBanner>
       <div className="flex items-center justify-between gap-3">
         <span>{loadError}</span>
-        <Button variant="secondary" size="sm" disabled={retrying} aria-busy={retrying} onClick={() => void retry()}>
+        <Button variant="secondary" size="sm" disabled={working} aria-busy={retrying} onClick={() => void retry()}>
           Retry
         </Button>
       </div>
@@ -116,7 +127,7 @@ export function ModelsTab() {
           <code className="mx-1">[[providers.&lt;name&gt;.models]]</code>
           override them.
         </p>
-        <Button variant="secondary" size="sm" disabled={busy !== null} aria-busy={busy === '*'} onClick={() => void refetch()}>
+        <Button variant="secondary" size="sm" disabled={working} aria-busy={busy === '*'} onClick={() => void refetch()}>
           Refetch all
         </Button>
       </div>
@@ -135,7 +146,7 @@ export function ModelsTab() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  disabled={busy !== null}
+                  disabled={working}
                   onClick={() => void refetch(p.provider)}
                   // The explicit label keeps the name stable ("Refetch <provider>")
                   // while the visible text flips to "Refetching…"; aria-busy is what

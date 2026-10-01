@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
+import { StrictMode } from 'react';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { api, ApiError, type CatalogProvider, type RefreshOutcome } from '../../lib/api';
@@ -139,6 +140,138 @@ describe('ModelsTab', () => {
     expect(screen.queryByText('catalog exploded')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
     expect(screen.queryByText('claude-demo-1')).not.toBeInTheDocument();
+  });
+
+  // The tab is single-flight (Retry and Refetch never overlap), and a newer load
+  // always wins over an older one (see the StrictMode block below).
+  const FRESH: CatalogProvider[] = [
+    {
+      ...CATALOG[0],
+      models: [{ id: 'claude-demo-2', input_tokens: 200_000, output_tokens: 64_000, source: 'live' }],
+    },
+    CATALOG[1],
+  ];
+
+  /** Drive the tab to the reload-failure banner, then click Retry (load A, left pending). */
+  async function startPendingRetryLoad() {
+    let resolveA: (c: CatalogProvider[]) => void = () => {};
+    const list = vi
+      .spyOn(api, 'getModelCatalog')
+      .mockResolvedValueOnce(CATALOG) // initial load
+      .mockRejectedValueOnce(new ApiError(500, 'boom', '{"error":"catalog exploded"}')) // reload after the first refetch
+      .mockReturnValueOnce(
+        // load A: Retry, left pending
+        new Promise<CatalogProvider[]>((resolve) => {
+          resolveA = resolve;
+        }),
+      );
+    const refresh = vi
+      .spyOn(api, 'refreshModels')
+      .mockResolvedValue([{ provider: 'anthropic', ok: true, count: 1 }]);
+    render(<ModelsTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Refetch anthropic' }));
+    expect(await screen.findByText('catalog exploded')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch anthropic' })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' })); // load A, pending
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+    return { list, refresh, resolveA };
+  }
+
+  it('blocks every Refetch button while a Retry load is in flight', async () => {
+    const { list, refresh, resolveA } = await startPendingRetryLoad();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled();
+    for (const name of ['Refetch all', 'Refetch anthropic', 'Refetch gemini']) {
+      expect(screen.getByRole('button', { name: name })).toBeDisabled();
+    }
+    // A click on a blocked button starts nothing.
+    fireEvent.click(screen.getByRole('button', { name: 'Refetch anthropic' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refetch all' }));
+    expect(refresh).toHaveBeenCalledTimes(1); // only the refetch that preceded the Retry
+    expect(list).toHaveBeenCalledTimes(3);
+
+    resolveA(FRESH);
+    expect(await screen.findByText('claude-demo-2')).toBeInTheDocument();
+    for (const name of ['Refetch all', 'Refetch anthropic', 'Refetch gemini']) {
+      expect(screen.getByRole('button', { name: name })).toBeEnabled();
+    }
+  });
+
+  it('blocks Retry while a refetch is in flight', async () => {
+    const list = vi
+      .spyOn(api, 'getModelCatalog')
+      .mockResolvedValueOnce(CATALOG)
+      .mockRejectedValueOnce(new ApiError(500, 'boom', '{"error":"catalog exploded"}'))
+      .mockResolvedValueOnce(FRESH);
+    let resolveRefresh: (o: RefreshOutcome[]) => void = () => {};
+    vi.spyOn(api, 'refreshModels')
+      .mockResolvedValueOnce([{ provider: 'anthropic', ok: true, count: 1 }])
+      .mockReturnValueOnce(
+        new Promise<RefreshOutcome[]>((resolve) => {
+          resolveRefresh = resolve;
+        }),
+      );
+    render(<ModelsTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Refetch anthropic' }));
+    expect(await screen.findByText('catalog exploded')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refetch anthropic' })).toBeEnabled());
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refetch anthropic' })); // deferred refresh
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled());
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(list).toHaveBeenCalledTimes(2); // the blocked click loaded nothing
+
+    resolveRefresh([{ provider: 'anthropic', ok: true, count: 1 }]);
+    expect(await screen.findByText('claude-demo-2')).toBeInTheDocument();
+    expect(screen.queryByText('catalog exploded')).not.toBeInTheDocument();
+  });
+
+  // The latest-wins guard stays reachable through the real app: <StrictMode>
+  // (src/main.tsx) runs the mount effect twice in dev, so two loads overlap.
+  describe('under StrictMode (overlapping mount loads)', () => {
+    function deferredLoads() {
+      const settle: Array<{ resolve: (c: CatalogProvider[]) => void; reject: (e: unknown) => void }> = [];
+      const list = vi.spyOn(api, 'getModelCatalog').mockImplementation(
+        () =>
+          new Promise<CatalogProvider[]>((resolve, reject) => {
+            settle.push({ resolve, reject });
+          }),
+      );
+      return { list, settle };
+    }
+
+    it('keeps the newest load when an older one resolves late', async () => {
+      const { list, settle } = deferredLoads();
+      render(
+        <StrictMode>
+          <ModelsTab />
+        </StrictMode>,
+      );
+      await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+      settle[1].resolve(FRESH); // newest
+      expect(await screen.findByText('claude-demo-2')).toBeInTheDocument();
+      settle[0].resolve(CATALOG); // older, late
+      await new Promise((r) => setTimeout(r, 20));
+      expect(screen.getByText('claude-demo-2')).toBeInTheDocument();
+      expect(screen.queryByText('claude-demo-1')).not.toBeInTheDocument();
+    });
+
+    it('ignores an older load that fails late', async () => {
+      const { list, settle } = deferredLoads();
+      render(
+        <StrictMode>
+          <ModelsTab />
+        </StrictMode>,
+      );
+      await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+      settle[1].resolve(FRESH);
+      expect(await screen.findByText('claude-demo-2')).toBeInTheDocument();
+      settle[0].reject(new ApiError(500, 'boom', '{"error":"stale failure"}'));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(screen.queryByText('stale failure')).not.toBeInTheDocument();
+      expect(screen.getByText('claude-demo-2')).toBeInTheDocument();
+    });
   });
 
   it('does not offer a catalog-reload Retry on a failed Refetch all banner', async () => {
