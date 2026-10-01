@@ -38,12 +38,16 @@ pub trait CredentialResolver: Send + Sync {
     /// The refresher a provider client built from `provider`'s OAuth
     /// credentials should hand its token refreshes to, so the rotation is
     /// persisted in this store (under its lock) instead of kept in memory.
-    /// `None` — the default — leaves the client refreshing on its own.
+    /// `kind` is the vendor the caller resolved from config (`"anthropic"`,
+    /// `"openai"`, `"gemini"`, …), so a credential stored under a name this
+    /// resolver was never told about still gets a refresher. `None` — the
+    /// default — leaves the client refreshing on its own.
     fn oauth_refresher(
         &self,
         provider: &str,
+        kind: &str,
     ) -> Option<std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>> {
-        let _ = provider;
+        let _ = (provider, kind);
         None
     }
 }
@@ -571,7 +575,33 @@ impl KeychainResolver {
                  Re-authenticate this account (mode: sso) to continue."
             )
         })?;
-        // Provider-agnostic refresh: standard OAuth refresh-token grant.
+        // The standard OAuth refresh-token grant, in the shape the vendor's
+        // own client sends it (`ProviderOAuth::refresh_body_format`,
+        // `client_secret`). Gemini's client pair follows the credential's
+        // variant: a token issued to the Antigravity client must be
+        // refreshed as that client.
+        let (client_id, client_secret) = match kind {
+            ProviderId::Gemini => {
+                let hint = match &sc.credentials {
+                    AuthCredentials::OAuth { extra, .. } => {
+                        extra.get("variant").and_then(|v| v.as_str())
+                    }
+                    AuthCredentials::ApiKey { .. } => None,
+                };
+                let variant =
+                    rupu_providers::google_gemini::GeminiVariant::from_credential_hint(hint);
+                (variant.client_id(), Some(variant.client_secret()))
+            }
+            _ => (oauth.client_id, oauth.client_secret),
+        };
+        let mut params: Vec<(&str, &str)> = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ];
+        if let Some(secret) = client_secret {
+            params.push(("client_secret", secret));
+        }
         let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
             .unwrap_or_else(|_| oauth.token_url.to_string());
         // Deliberately `NullSink`, not a stopgap: matt's scope call for this
@@ -591,13 +621,14 @@ impl KeychainResolver {
             reqwest::Client::builder().timeout(timeout),
             std::sync::Arc::new(rupu_netflow::NullSink),
         )?;
-        let resp = client
-            .post(&token_url)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", oauth.client_id),
-            ])
+        let request = match oauth.refresh_body_format {
+            crate::oauth::providers::TokenBodyFormat::Form => client.post(&token_url).form(&params),
+            crate::oauth::providers::TokenBodyFormat::Json => {
+                let json: std::collections::BTreeMap<&str, &str> = params.into_iter().collect();
+                client.post(&token_url).json(&json)
+            }
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("refresh request: {e}"))?;
@@ -917,8 +948,14 @@ impl CredentialResolver for KeychainResolver {
     fn oauth_refresher(
         &self,
         provider: &str,
+        kind: &str,
     ) -> Option<std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>> {
-        let kind = crate::account::resolve_provider_id(provider, &self.accounts)?;
+        // A declared account (or a vendor name) knows its own kind; an
+        // undeclared name takes the kind the caller resolved from config.
+        // Either way the kind must have an OAuth config to refresh against.
+        let kind = crate::account::resolve_provider_id(provider, &self.accounts)
+            .or_else(|| ProviderId::from_vendor_str(kind))?;
+        crate::oauth::providers::provider_oauth(kind)?;
         Some(std::sync::Arc::new(KeychainRefresher {
             path: self.auth_file(),
             account: provider.to_string(),

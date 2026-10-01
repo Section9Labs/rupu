@@ -47,15 +47,18 @@ fn gemini_http_client(
 /// Canonical provider tag stamped on Reasoning blocks; gates the replay.
 pub(crate) const PROVIDER_TAG: &str = "google_gemini";
 
-// Google's public CLI OAuth client IDs and secrets (same as Pi).
-// These are embedded in all CLI tools that use Google OAuth (safe to embed).
-const GEMINI_CLI_CLIENT_ID: &str =
+// Google's public CLI OAuth client IDs and secrets (same as Pi, and as
+// google-gemini/gemini-cli's `packages/core/src/code_assist/oauth2.ts`).
+// These are embedded in all CLI tools that use Google OAuth (safe to embed:
+// an installed application's "secret" is not treated as one). Public so
+// `rupu-auth`'s login and refresh send the same pair this client does.
+pub const GEMINI_CLI_CLIENT_ID: &str =
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
-const GEMINI_CLI_CLIENT_SECRET: &str = "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";
+pub const GEMINI_CLI_CLIENT_SECRET: &str = "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";
 
-const ANTIGRAVITY_CLIENT_ID: &str =
+pub const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
 
 /// Which Google Gemini variant to use. The first two are Cloud Code
 /// Assist (OAuth, paid Gemini-CLI / Antigravity quotas); `AiStudio`
@@ -72,6 +75,19 @@ pub enum GeminiVariant {
 }
 
 impl GeminiVariant {
+    /// The OAuth variant a stored credential's `extra.variant` hint names:
+    /// `"antigravity"` → [`GeminiVariant::Antigravity`], anything else (or
+    /// no hint) → the production [`GeminiVariant::GeminiCli`]. The one
+    /// mapping the factory and the credential store's refresh share, so a
+    /// refresh always carries the client id/secret pair the credential was
+    /// issued to.
+    pub fn from_credential_hint(hint: Option<&str>) -> Self {
+        match hint {
+            Some("antigravity") => GeminiVariant::Antigravity,
+            _ => GeminiVariant::GeminiCli,
+        }
+    }
+
     /// `true` when this variant uses an AI Studio api-key (no OAuth
     /// refresh, different URL pattern, different request body shape).
     fn is_api_key(&self) -> bool {
@@ -86,7 +102,8 @@ impl GeminiVariant {
         }
     }
 
-    fn client_id(&self) -> &'static str {
+    /// The OAuth client id this variant's tokens were issued to.
+    pub fn client_id(&self) -> &'static str {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_CLIENT_ID,
             GeminiVariant::Antigravity => ANTIGRAVITY_CLIENT_ID,
@@ -97,7 +114,8 @@ impl GeminiVariant {
         }
     }
 
-    fn client_secret(&self) -> &'static str {
+    /// The matching client secret (empty for AI Studio, which has none).
+    pub fn client_secret(&self) -> &'static str {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_CLIENT_SECRET,
             GeminiVariant::Antigravity => ANTIGRAVITY_CLIENT_SECRET,

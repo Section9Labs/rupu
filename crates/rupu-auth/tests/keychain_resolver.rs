@@ -594,7 +594,7 @@ async fn the_refresher_adopts_another_holder_s_rotation() {
     )
     .unwrap();
     let refresher = r
-        .oauth_refresher("anthropic")
+        .oauth_refresher("anthropic", "anthropic")
         .expect("a vendor account has a refresher");
     let fresh = refresher
         .refresh(rupu_providers::auth::AuthCredentials::OAuth {
@@ -645,7 +645,7 @@ async fn the_refresher_refreshes_and_persists_the_token_its_client_holds() {
     )
     .unwrap();
     let fresh = r
-        .oauth_refresher("anthropic")
+        .oauth_refresher("anthropic", "anthropic")
         .unwrap()
         .refresh(rupu_providers::auth::AuthCredentials::OAuth {
             access: "access-1".into(),
@@ -953,5 +953,223 @@ async fn a_persist_failure_after_the_token_post_still_returns_the_new_token() {
         std::fs::read_to_string(&auth_path).unwrap(),
         before,
         "the file is untouched — nothing half-written"
+    );
+}
+
+// ---- refresh request formats (per provider, as the vendor's own client) ------
+
+/// Store a near-expiry SSO credential for `kind` with the given `extra`.
+async fn store_near_expiry_sso_for(
+    r: &KeychainResolver,
+    kind: ProviderId,
+    extra: std::collections::HashMap<String, serde_json::Value>,
+) {
+    r.store(
+        kind,
+        AuthMode::Sso,
+        &StoredCredential {
+            credentials: rupu_providers::auth::AuthCredentials::OAuth {
+                access: "access-1".into(),
+                refresh: "refresh-1".into(),
+                expires: 1,
+                extra,
+            },
+            refresh_token: Some("refresh-1".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
+        },
+    )
+    .await
+    .expect("store");
+}
+
+fn expect_rotated(creds: rupu_providers::auth::AuthCredentials) {
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => {
+            assert_eq!(access, "access-2")
+        }
+        other => panic!("expected OAuth creds, got {other:?}"),
+    }
+}
+
+/// OpenAI's token endpoint takes the refresh grant as JSON — what Codex
+/// sends (openai/codex `codex-rs/login/src/oauth/client.rs`: "ChatGPT
+/// refresh uses JSON; authorization-code and gateway grants use form
+/// encoding"), and what rupu's own Codex client sends.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_openai_refresh_posts_a_json_body() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST)
+            .path("/token")
+            .header("content-type", "application/json")
+            .json_body_partial(
+                r#"{"grant_type":"refresh_token","refresh_token":"refresh-1","client_id":"app_EMoamEEZ73f0CkXaXp7hrann"}"#,
+            );
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "expires_in": 3600
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    store_near_expiry_sso_for(&r, ProviderId::Openai, Default::default()).await;
+    let (_, creds) = r
+        .get("openai", Some(AuthMode::Sso))
+        .await
+        .expect("refresh as Codex does");
+    token.assert_hits(1);
+    expect_rotated(creds);
+}
+
+/// Anthropic's endpoint takes the refresh grant form-encoded — what rupu's
+/// own Anthropic client sends (`refresh_anthropic_token_at`).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_anthropic_refresh_posts_a_form_body() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST)
+            .path("/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body_contains("grant_type=refresh_token")
+            .body_contains("refresh_token=refresh-1")
+            .body_contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        then.status(200)
+            .json_body(serde_json::json!({ "access_token": "access-2" }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    let r = KeychainResolver::new();
+    store_near_expiry_sso(&r).await;
+    let (_, creds) = r
+        .get("anthropic", Some(AuthMode::Sso))
+        .await
+        .expect("refresh");
+    token.assert_hits(1);
+    expect_rotated(creds);
+}
+
+/// Google's endpoint wants the installed app's `client_id` AND
+/// `client_secret` on the refresh grant (form-encoded) — what gemini-cli's
+/// `OAuth2Client` sends (`packages/core/src/code_assist/oauth2.ts`
+/// constructs it with both; google-auth-library's `refreshTokenNoCache`
+/// posts `refresh_token`, `client_id`, `client_secret`, `grant_type` as
+/// `URLSearchParams`), and what rupu's own Gemini client sends. The pair
+/// follows the credential's variant: Gemini CLI by default, Antigravity
+/// when `extra.variant` says so.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_gemini_refresh_sends_the_variant_s_client_id_and_secret() {
+    use httpmock::prelude::*;
+    for (variant, client_id, client_secret) in [
+        (
+            None,
+            "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
+            "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",
+        ),
+        (
+            Some("antigravity"),
+            "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+            "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",
+        ),
+    ] {
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST)
+                .path("/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body_contains("grant_type=refresh_token")
+                .body_contains("refresh_token=refresh-1")
+                .body_contains(format!("client_id={client_id}"))
+                .body_contains(format!("client_secret={client_secret}"));
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "access-2" }));
+        });
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let auth_path = tmp.path().join("auth.json");
+        let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+        let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+        let r = KeychainResolver::new();
+        let mut extra = std::collections::HashMap::new();
+        if let Some(v) = variant {
+            extra.insert("variant".to_string(), serde_json::Value::String(v.into()));
+        }
+        store_near_expiry_sso_for(&r, ProviderId::Gemini, extra).await;
+        let (_, creds) = r
+            .get("gemini", Some(AuthMode::Sso))
+            .await
+            .unwrap_or_else(|e| panic!("variant {variant:?}: {e}"));
+        token.assert_hits(1);
+        expect_rotated(creds);
+    }
+}
+
+// ---- every OAuth credential gets a refresher ---------------------------------
+
+/// A credential stored under a name the resolver was not given as an
+/// account (a bare `KeychainResolver::new()`, as `rupu dispatch` builds)
+/// still gets a refresher: the factory knows the vendor kind from config
+/// and passes it, so the client's refresh goes through the store and the
+/// rotation is persisted — instead of rotating in memory only and leaving
+/// a dead refresh token behind for the next process.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_undeclared_oauth_credential_gets_a_refresher_from_its_kind() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token").body_contains("refresh-1");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "expires_in": 3600
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str().unwrap());
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", &server.url("/token"));
+    // No accounts declared: `oracle-personal` is undeclared here.
+    let r = KeychainResolver::new();
+    std::fs::write(
+        &auth_path,
+        serde_json::to_string(&serde_json::json!({
+            "oracle-personal/sso": sso_payload("access-1", "refresh-1", chrono::Duration::minutes(3)),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        r.oauth_refresher("oracle-personal", "no-such-vendor")
+            .is_none(),
+        "an unknown kind has no OAuth config to refresh against"
+    );
+    let refresher = r
+        .oauth_refresher("oracle-personal", "anthropic")
+        .expect("the kind from config is enough");
+    let fresh = refresher
+        .refresh(rupu_providers::auth::AuthCredentials::OAuth {
+            access: "access-1".into(),
+            refresh: "refresh-1".into(),
+            expires: 1,
+            extra: Default::default(),
+        })
+        .await
+        .expect("refresh");
+    token.assert_hits(1);
+    expect_rotated(fresh);
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(
+        saved.contains("\"oracle-personal/sso\"") && saved.contains("refresh-2"),
+        "persisted under the undeclared name: {saved}"
     );
 }

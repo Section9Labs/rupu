@@ -214,6 +214,9 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         ("redirect_uri", redirect_uri.clone()),
         ("code_verifier", pkce.verifier.clone()),
     ];
+    if let Some(secret) = oauth.client_secret {
+        params.push(("client_secret", secret.into()));
+    }
     if oauth.include_state_in_token_body {
         params.push(("state", state.clone()));
     }

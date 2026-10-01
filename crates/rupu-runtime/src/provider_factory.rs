@@ -419,7 +419,7 @@ pub async fn build_for_provider_with_config(
     // under its cross-process lock, persisted. Refreshing alone it would keep
     // the rotated refresh token in memory and leave a dead one stored.
     let refresher = match &creds {
-        rupu_providers::auth::AuthCredentials::OAuth { .. } => resolver.oauth_refresher(name),
+        rupu_providers::auth::AuthCredentials::OAuth { .. } => resolver.oauth_refresher(name, kind),
         rupu_providers::auth::AuthCredentials::ApiKey { .. } => None,
     };
     let client = match kind {
@@ -646,14 +646,9 @@ async fn build_gemini(
     use rupu_providers::google_gemini::{GeminiVariant, GoogleGeminiClient};
     let variant = match &creds {
         AuthCredentials::ApiKey { .. } => GeminiVariant::AiStudio,
-        AuthCredentials::OAuth { extra, .. } => extra
-            .get("variant")
-            .and_then(|v| v.as_str())
-            .map(|s| match s {
-                "antigravity" => GeminiVariant::Antigravity,
-                _ => GeminiVariant::GeminiCli,
-            })
-            .unwrap_or(GeminiVariant::GeminiCli),
+        AuthCredentials::OAuth { extra, .. } => {
+            GeminiVariant::from_credential_hint(extra.get("variant").and_then(|v| v.as_str()))
+        }
     };
     let client = GoogleGeminiClient::new(creds, variant, None, sink)
         .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?
