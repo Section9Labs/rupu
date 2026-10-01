@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitDispatch,
+    UnitDispatcher, UnitOutcome,
 };
 use rupu_orchestrator::{RunStore, RunWorkflowError, Step, Workflow};
 use rupu_scm::Registry;
@@ -69,10 +70,12 @@ impl StepFactory for ActionEngagementFactory {
     }
 }
 
-/// `(step_id, index, host)` of every unit that actually reached the dispatcher.
+/// `(step_id, index, host)` of every unit that actually reached the dispatcher,
+/// and how many times the coordinator workspace was packed for staging.
 #[derive(Default)]
 struct Recorder {
     calls: Mutex<Vec<(String, usize, String)>>,
+    packs: Mutex<usize>,
 }
 
 impl Recorder {
@@ -81,10 +84,22 @@ impl Recorder {
         c.sort();
         c
     }
+
+    fn packs(&self) -> usize {
+        *self.packs.lock().unwrap()
+    }
 }
 
 #[async_trait]
 impl UnitDispatcher for Recorder {
+    async fn prepare_workspace(
+        &self,
+        _workspace_path: &std::path::Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        *self.packs.lock().unwrap() += 1;
+        Ok(PreparedWorkspace::new(b"packed".to_vec()))
+    }
+
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
         self.calls
             .lock()
@@ -298,6 +313,69 @@ steps:
     let (o, _tmp) = remote_run(plain, &d);
     run_workflow(o).await.expect("no engagement at all");
     assert_eq!(d.calls(), vec![("placed".into(), 0, "worker-1".into())]);
+}
+
+#[tokio::test]
+async fn a_refused_sync_fanout_packs_nothing() {
+    // A `workspace: sync` fan-out packs the whole tree once, up front. A
+    // fan-out that is going to be refused must not pay for that (~51 MB on a
+    // real campaign) just to throw it away.
+    let refused = r#"
+name: sync-fanout-refused
+defaults:
+  engagement_profiles: [binary]
+steps:
+  - id: fan
+    agent: sec
+    actions: []
+    for_each: "a\nb\nc"
+    prompt: "check {{ item }}"
+    workspace: sync
+    distribute:
+      hosts: [h1, h2]
+"#;
+    let d = Arc::new(Recorder::default());
+    let (o, _tmp) = remote_run(refused, &d);
+    let err = run_workflow(o).await.expect_err("refused");
+    assert!(err.to_string().contains("engagement"), "{err}");
+    assert_eq!(
+        d.packs(),
+        0,
+        "a refused fan-out must not pack the workspace"
+    );
+    assert!(d.calls().is_empty());
+
+    // Control: the same fan-out narrowed to `code` is the default, so it
+    // packs once and dispatches every unit.
+    let allowed = refused.replace(
+        "    workspace: sync\n",
+        "    workspace: sync\n    engagement_profiles: [code]\n",
+    );
+    let d = Arc::new(Recorder::default());
+    let (o, _tmp) = remote_run(&allowed, &d);
+    run_workflow(o).await.expect("default engagement runs");
+    assert_eq!(d.packs(), 1, "the control must exercise the pack path");
+    assert_eq!(d.calls().len(), 3);
+}
+
+#[tokio::test]
+async fn a_refused_sync_placed_step_packs_nothing() {
+    let yaml = r#"
+name: sync-placed-refused
+defaults:
+  engagement_profiles: [binary]
+steps:
+  - id: placed
+    agent: sec
+    prompt: p
+    host: worker-1
+    workspace: sync
+"#;
+    let d = Arc::new(Recorder::default());
+    let (o, _tmp) = remote_run(yaml, &d);
+    run_workflow(o).await.expect_err("refused");
+    assert_eq!(d.packs(), 0, "a refused placed step must not pack either");
+    assert!(d.calls().is_empty());
 }
 
 // ── action steps ────────────────────────────────────────────────────────

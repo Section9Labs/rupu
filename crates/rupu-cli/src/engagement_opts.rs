@@ -1,7 +1,7 @@
 //! Resolve the engagement profiles a CLI entry point hands to the findings
 //! write path (`FindingWriteOptions::engagement`).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rupu_coverage::profile::{
     registry_with_overlay, ActiveSet, EngagementProfile, DEFAULT_PROFILE,
 };
@@ -47,6 +47,42 @@ pub fn active_set(
         .unwrap_or_else(|| global_profiles.clone());
     let registry = registry_with_overlay(&global_profiles, &project_profiles)?;
     Ok(Some(Arc::new(registry.active_set(&ids)?)))
+}
+
+/// The findings base a WORKFLOW run's sub-agent dispatcher hands every agent
+/// it dispatches (`dispatch_agent` from inside a step): `base` plus the
+/// workflow-default engagement (`defaults.engagement_profiles`).
+///
+/// Without this a sub-agent under a `binary` workflow would record under the
+/// native `code` rules while its parent step records under `binary` — a
+/// silent downgrade. A workflow that selects nothing (or only `code`) returns
+/// `base` untouched, and never builds the profile registry, so default
+/// workflows stay byte-identical. An unknown id or a bad profile file is an
+/// error, never a fall back to `code`.
+///
+/// Known limitation: this is the WORKFLOW-level set only. A step's own
+/// `engagement_profiles` narrowing (and an agent's `engagementProfiles`
+/// frontmatter) apply to that step's own agent but are not carried to the
+/// sub-agents it dispatches — they inherit the broader workflow set.
+pub fn workflow_dispatch_base(
+    global: &Path,
+    project_root: Option<&Path>,
+    workflow: &rupu_orchestrator::Workflow,
+    base: rupu_coverage::FindingWriteOptions,
+) -> Result<rupu_coverage::FindingWriteOptions> {
+    let engagement = active_set(
+        global,
+        project_root,
+        &workflow.defaults.engagement_profiles,
+        &[],
+    )
+    .with_context(|| {
+        format!(
+            "workflow `{}`: cannot resolve `defaults.engagement_profiles`",
+            workflow.name
+        )
+    })?;
+    Ok(base.with_engagement(engagement))
 }
 
 #[cfg(test)]
@@ -152,5 +188,58 @@ mod tests {
             set.profile_for_kind("firmware:image").unwrap().id,
             "firmware"
         );
+    }
+
+    fn workflow_with(defaults: &str) -> rupu_orchestrator::Workflow {
+        let yaml = format!("name: wf\n{defaults}steps:\n  - id: s\n    agent: a\n    prompt: p\n");
+        rupu_orchestrator::Workflow::parse(&yaml).unwrap()
+    }
+
+    fn base() -> rupu_coverage::FindingWriteOptions {
+        rupu_coverage::FindingWriteOptions {
+            artifact_max_bytes: 7,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_workflow_without_engagement_leaves_the_dispatch_base_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let project = project_with_broken_profile();
+        for defaults in [
+            "",
+            "defaults:\n  engagement_profiles: [code]\n",
+            "defaults:\n  engagement_profiles: []\n",
+        ] {
+            let wf = workflow_with(defaults);
+            // The broken project profile proves the overlay was never built.
+            let got =
+                workflow_dispatch_base(home.path(), Some(project.path()), &wf, base()).unwrap();
+            assert!(got.engagement.is_none(), "{defaults:?}");
+            assert_eq!(got.artifact_max_bytes, 7, "the rest of the base is kept");
+        }
+    }
+
+    #[test]
+    fn a_workflow_engagement_reaches_the_dispatch_base() {
+        let home = tempfile::tempdir().unwrap();
+        let wf = workflow_with("defaults:\n  engagement_profiles: [binary]\n");
+        let got = workflow_dispatch_base(home.path(), None, &wf, base()).unwrap();
+        let set = got.engagement.expect("binary is a real engagement");
+        assert_eq!(set.ids(), vec!["binary"]);
+        assert_eq!(got.artifact_max_bytes, 7);
+    }
+
+    #[test]
+    fn an_unresolvable_workflow_engagement_is_an_error_not_a_downgrade() {
+        let home = tempfile::tempdir().unwrap();
+        let wf = workflow_with("defaults:\n  engagement_profiles: [nope]\n");
+        let err = format!(
+            "{:#}",
+            workflow_dispatch_base(home.path(), None, &wf, base()).unwrap_err()
+        );
+        assert!(err.contains("defaults.engagement_profiles"), "{err}");
+        assert!(err.contains("wf"), "{err}");
+        assert!(err.contains("nope"), "the cause is kept: {err}");
     }
 }

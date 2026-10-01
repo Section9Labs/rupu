@@ -578,6 +578,14 @@ impl StepFactory for DefaultStepFactory {
         &self,
         step: &Step,
     ) -> Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String> {
+        // Engagement governs how findings are validated, so it only means
+        // something to `findings.record`. Every other action — a connector
+        // call, a gate `notify:` hook, an `on_reject` cleanup — is
+        // unaffected by the workflow's selection and must neither be refused
+        // for it nor pay for resolving it.
+        if step.action.as_deref() != Some("findings.record") {
+            return Ok(None);
+        }
         // An action step runs no agent, so there is no frontmatter to fall
         // back on: `defaults.engagement_profiles` narrowed by the step.
         self.step_engagement(step, &[])
@@ -1739,6 +1747,23 @@ steps:
             set.profile_for_kind("firmware:image").unwrap().id,
             "firmware"
         );
+    }
+
+    #[tokio::test]
+    async fn only_findings_record_resolves_an_engagement() {
+        // `defaults` selects an id that does not exist: anything that tried
+        // to resolve it would fail. A connector call (or a gate hook's
+        // synthetic step) must not even look.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let wf = "name: e\ndefaults:\n  engagement_profiles: [nope]\nsteps:\n  - id: c\n    action: issues.comment\n    with: { project: o/r, number: 1, body: hi }\n";
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(wf).expect("parses");
+        assert!(f.action_engagement(&f.workflow.steps[0]).unwrap().is_none());
+        // ...whereas `findings.record` does resolve it, and refuses.
+        let record = "name: e\ndefaults:\n  engagement_profiles: [nope]\nsteps:\n  - id: r\n    action: findings.record\n    findings_profile: summary\n    with: { scope: host, target_ref: h, summary: s, severity: high, rationale: r }\n";
+        f.workflow = Workflow::parse(record).expect("parses");
+        let err = f.action_engagement(&f.workflow.steps[0]).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[tokio::test]

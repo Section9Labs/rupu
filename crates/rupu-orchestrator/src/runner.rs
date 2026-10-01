@@ -5471,6 +5471,14 @@ async fn execute_action_step(
     // Narrowing here makes it structural: even if a future caller reuses
     // this dispatcher, an action step can still only invoke the tool named
     // in the workflow source.
+    // Engagement only governs `findings.record`; any other tool ignores it —
+    // whatever the factory answered (a connector call or a gate `notify:`
+    // hook must not be refused for a selection that is not about it).
+    let engagement = if tool == "findings.record" {
+        engagement
+    } else {
+        Ok(None)
+    };
     let call_result = match engagement {
         // Native `code` path: exactly today's call.
         Ok(None) => {
@@ -6903,6 +6911,14 @@ async fn run_fanout_step(
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
 
+    // Fail-closed (remote engagement delivery is deferred): why every PLACED
+    // unit of this step must be refused, if it must. A fan-out without
+    // `distribute:` runs locally through the step factory and is unaffected.
+    // Decided BEFORE the workspace pack below, which a refused step skips.
+    let unit_engagement_refusal: Option<String> = distribute_hosts
+        .as_ref()
+        .and_then(|_| crate::engagement::remote_unit_refusal(&opts.workflow, step));
+
     // ── Pack the coordinator workspace ONCE for the whole step ───────────────
     //
     // Every unit of a fan-out step stages from the SAME coordinator workspace
@@ -6921,17 +6937,25 @@ async fn run_fanout_step(
     // each unit individually (it happened inside `dispatch_unit`), which is
     // what `continue_on_error` was applied to; keeping it per-unit keeps that
     // semantics and the "k of N units failed" reporting exactly as it was.
-    let prepared_workspace: Option<Result<PreparedWorkspace, String>> =
-        match (sync, distribute_hosts.is_some(), unit_dispatcher.as_ref()) {
-            (true, true, Some(d)) => Some(
-                d.prepare_workspace(&opts.workspace_path)
-                    .await
-                    .map_err(|e| e.to_string()),
-            ),
-            // No dispatcher ⇒ every placed unit already fails with
-            // "distribute requires fleet access"; nothing to pack for.
-            _ => None,
-        };
+    //
+    // Also skipped when the step's units are going to be refused for an
+    // engagement (below): a refused fan-out must not pack — on a real
+    // campaign that is ~51 MB — just to discard the result.
+    let prepared_workspace: Option<Result<PreparedWorkspace, String>> = match (
+        sync,
+        distribute_hosts.is_some(),
+        unit_engagement_refusal.is_none(),
+        unit_dispatcher.as_ref(),
+    ) {
+        (true, true, true, Some(d)) => Some(
+            d.prepare_workspace(&opts.workspace_path)
+                .await
+                .map_err(|e| e.to_string()),
+        ),
+        // No dispatcher ⇒ every placed unit already fails with
+        // "distribute requires fleet access"; nothing to pack for.
+        _ => None,
+    };
     // Cooperative pause token, cloned once; each spawned task gets its own
     // handle. Threaded into the LOCAL agent dispatch below so an in-flight
     // unit honors it mid-turn (same mechanism as a linear step's agent —
@@ -6942,12 +6966,6 @@ async fn run_fanout_step(
     // Same for every unit of the step (and its retry); `Copy`, so each
     // spawned task gets its own.
     let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
-    // Fail-closed (remote engagement delivery is deferred): why every PLACED
-    // unit of this step must be refused, if it must. A fan-out without
-    // `distribute:` runs locally through the step factory and is unaffected.
-    let unit_engagement_refusal: Option<String> = distribute_hosts
-        .as_ref()
-        .and_then(|_| crate::engagement::remote_unit_refusal(&opts.workflow, step));
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path

@@ -310,7 +310,15 @@ async fn rebuild_opts_from_disk(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
-        crate::findings_opts::base_options(&global, &cfg.findings),
+        // Dispatched children inherit the workflow-default engagement (they
+        // would otherwise record under native `code` beneath a `binary`
+        // parent). A step's own narrowing is not carried down.
+        crate::engagement_opts::workflow_dispatch_base(
+            &global,
+            project_root.as_deref(),
+            &workflow,
+            crate::findings_opts::base_options(&global, &cfg.findings),
+        )?,
         // Dispatched children append the resumed run's own ledger.
         Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
             &store_arc, run_id,

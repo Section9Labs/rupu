@@ -1299,3 +1299,271 @@ async fn step_level_findings_profile_reaches_findings_record() {
         "Admin console reachable without authentication"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Engagement is only meaningful on `findings.record`. A workflow that selects
+// an engagement must not touch any OTHER action step — a plain connector
+// call, a gate `notify:` hook, an `on_reject` cleanup action.
+// ---------------------------------------------------------------------------
+
+/// The real factory over a workflow that selects `binary`. These workflows
+/// have no agent step, so nothing is ever built from it except the action
+/// engagement resolution under test.
+fn default_factory(wf: &Workflow, global: &Path) -> Arc<rupu_orchestrator::DefaultStepFactory> {
+    Arc::new(rupu_orchestrator::DefaultStepFactory {
+        workflow: wf.clone(),
+        global: global.to_path_buf(),
+        project_root: None,
+        resolver: Arc::new(rupu_auth::KeychainResolver::new()),
+        mode_str: "bypass".to_string(),
+        mcp_registry: Arc::new(Registry::empty()),
+        system_prompt_suffix: None,
+        dispatcher: None,
+        openai_compatible: std::collections::HashMap::new(),
+        provider_tuning: std::collections::HashMap::new(),
+        kinds: std::collections::HashMap::new(),
+        default_provider: None,
+        default_model: None,
+        bash_timeout_secs: 120,
+        bash_env_allowlist: Vec::new(),
+        findings_base: rupu_coverage::FindingWriteOptions::default(),
+    })
+}
+
+const WF_ENGAGEMENT_NON_FINDINGS: &str = r#"
+name: engagement-non-findings
+defaults:
+  engagement_profiles: [binary]
+steps:
+  - id: comment
+    action: scm.prs.comment
+    with:
+      platform: github
+      owner: acme
+      repo: widget
+      number: 7
+      body: "plain connector call"
+  - id: gate
+    approval:
+      prompt: "Approve?"
+      notify:
+        - action: scm.prs.comment
+          with:
+            platform: github
+            owner: acme
+            repo: widget
+            number: 8
+            body: "gate parking"
+      on_reject:
+        - id: cleanup
+          action: scm.prs.comment
+          with:
+            platform: github
+            owner: acme
+            repo: widget
+            number: 9
+            body: "cleanup"
+"#;
+
+#[tokio::test]
+async fn a_workflow_engagement_leaves_non_findings_action_steps_and_hooks_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_ENGAGEMENT_NON_FINDINGS).unwrap();
+    let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
+    let factory = default_factory(&wf, tmp.path());
+
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_engagement_non_findings".into(),
+        naming: None,
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory,
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_ENGAGEMENT_NON_FINDINGS.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+    let res = run_workflow(opts)
+        .await
+        .expect("a pause at the gate is Ok, not Err");
+    assert_eq!(
+        res.awaiting.as_ref().map(|a| a.step_id.as_str()),
+        Some("gate")
+    );
+
+    // The plain action ran, and the gate's notify hook fired as it parked:
+    // neither was refused for want of a `findings.record` engagement.
+    let calls = connector.calls.lock().unwrap();
+    let delivered: Vec<(u32, &str)> = calls.iter().map(|(p, b)| (p.number, b.as_str())).collect();
+    assert_eq!(
+        delivered,
+        vec![(7, "plain connector call"), (8, "gate parking")],
+        "action step + notify hook must both be delivered"
+    );
+    drop(calls);
+    let comment = res.step_results.iter().find(|r| r.step_id == "comment");
+    assert!(comment.is_some_and(|r| r.success), "{:?}", res.step_results);
+}
+
+#[tokio::test]
+async fn a_workflow_engagement_leaves_an_on_reject_action_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_ENGAGEMENT_NON_FINDINGS).unwrap();
+    let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
+    let mk = |resume_from, dispatcher| OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_engagement_on_reject".into(),
+        naming: None,
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: default_factory(&wf, tmp.path()),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_ENGAGEMENT_NON_FINDINGS.to_string()),
+        resume_from,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: dispatcher,
+        pause: None,
+    };
+    let res = run_workflow(mk(None, Some(Arc::clone(&dispatcher))))
+        .await
+        .expect("pauses at the gate");
+    let run_id = res.run_id.clone();
+    let decision = store
+        .reject(&run_id, "operator", "no", chrono::Utc::now())
+        .unwrap();
+    let (rejected_step_id, reason) = match decision {
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => (step_id, reason),
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+    let prior: Vec<rupu_orchestrator::StepResult> = store
+        .read_step_results(&run_id)
+        .unwrap()
+        .iter()
+        .map(rupu_orchestrator::StepResult::from)
+        .collect();
+    let resume = ResumeState::from_rejection(
+        run_id.clone(),
+        prior,
+        rejected_step_id.clone(),
+        reason.clone(),
+    );
+    run_reject_cleanup(
+        mk(Some(resume), Some(dispatcher)),
+        &rejected_step_id,
+        &reason,
+        "human",
+        None,
+    )
+    .await
+    .expect("cleanup never errors");
+    let calls = connector.calls.lock().unwrap();
+    assert!(
+        calls.iter().any(|(p, b)| p.number == 9 && b == "cleanup"),
+        "the on_reject action must be delivered: {:?}",
+        calls.iter().map(|(p, b)| (p.number, b)).collect::<Vec<_>>()
+    );
+}
+
+/// A factory that answers EVERY action step's engagement with `answer` — what
+/// a misbehaving or future factory could do. The runner must still ignore it
+/// for any tool other than `findings.record`.
+struct AnswerEveryActionFactory {
+    answer: Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String>,
+}
+
+#[async_trait]
+impl StepFactory for AnswerEveryActionFactory {
+    async fn build_opts_for_step(
+        &self,
+        _step_id: &str,
+        _agent_name: &str,
+        _rendered_prompt: String,
+        _run_id: String,
+        _workspace_id: String,
+        _workspace_path: PathBuf,
+        _transcript_path: PathBuf,
+        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> AgentRunOpts {
+        panic!("no agent step in this workflow")
+    }
+
+    fn action_engagement(
+        &self,
+        _step: &rupu_orchestrator::Step,
+    ) -> Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String> {
+        self.answer.clone()
+    }
+}
+
+#[tokio::test]
+async fn the_runner_ignores_an_engagement_answer_for_a_non_findings_tool() {
+    let set = rupu_coverage::profile::builtin_registry()
+        .unwrap()
+        .active_set(&["binary".to_string()])
+        .unwrap();
+    for answer in [Ok(Some(Arc::new(set))), Err("boom".to_string())] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
+        let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
+            workflow: Workflow::parse(WF_ACTION_HAPPY_NO_AGENT).unwrap(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_answer_every_action".into(),
+            naming: None,
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().join("transcripts"),
+            factory: Arc::new(AnswerEveryActionFactory { answer }),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::new(RunStore::new(tmp.path().join("runs")))),
+            workflow_yaml: Some(WF_ACTION_HAPPY_NO_AGENT.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: Some(dispatcher),
+            pause: None,
+        };
+        let res = run_workflow(opts).await.expect("non-findings action runs");
+        assert!(res.step_results[0].success);
+        assert_eq!(connector.calls.lock().unwrap().len(), 1);
+    }
+}
+
+const WF_ACTION_HAPPY_NO_AGENT: &str = r#"
+name: action-no-agent
+steps:
+  - id: comment
+    action: scm.prs.comment
+    with:
+      platform: github
+      owner: acme
+      repo: widget
+      number: 7
+      body: "plain"
+"#;
