@@ -704,8 +704,10 @@ const MIN_LABEL: usize = 8;
 ///    into `✓ first … last  (+N done)` summary rows, oldest first, only as
 ///    far as needed;
 /// 2. pending steps then fold the same way, latest first;
-/// 3. fan-out blocks (the drilled one included) are trimmed to their header +
-///    density row plus a window around the unit cursor, largest first;
+/// 3. fan-out blocks are trimmed largest first: a drilled block keeps its
+///    header + density row plus a window around the unit cursor; a collapsed
+///    block trims to header + density row only (the density row already
+///    carries the exact counts, so no misleading hidden-row marker is shown);
 /// 4. as a last resort the rows are windowed around the first frontier row.
 ///
 /// The feed gets `min(feed.len(), FEED_MIN)` rows guaranteed and every row
