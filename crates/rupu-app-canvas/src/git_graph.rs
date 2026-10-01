@@ -90,6 +90,15 @@ impl BranchGlyph {
     }
 }
 
+/// Label prefix of a loop frame's header row (`↻ loop:<name>`). A loop is
+/// not a step, so the header carries no anchor; a consumer that overlays
+/// live state on it recognises the row by this prefix. Exported so the
+/// emitter and its consumers share one spelling and cannot drift.
+pub const LOOP_HEADER_PREFIX: &str = "↻ loop:";
+
+/// Label prefix of a loop frame's loop-back footer row (`↺ loop:<name>`).
+pub const LOOP_FOOTER_PREFIX: &str = "↺ loop:";
+
 /// Render workflow as graph rows, using `status_lookup` to pick the
 /// `NodeStatus` for each step. Pass `|_| NodeStatus::Waiting` for the
 /// static (no live run) case.
@@ -221,7 +230,7 @@ fn loop_header(name: &str, def: &LoopDef, continued: bool) -> GraphRow {
             GraphCell::Branch(BranchGlyph::Mid, NodeStatus::Waiting),
             GraphCell::Branch(BranchGlyph::Top, NodeStatus::Waiting),
             GraphCell::Space(1),
-            GraphCell::Label(format!("↻ loop:{name}")),
+            GraphCell::Label(format!("{LOOP_HEADER_PREFIX}{name}")),
             GraphCell::Space(2),
             GraphCell::Meta(meta),
         ],
@@ -237,7 +246,7 @@ fn loop_footer(name: &str) -> GraphRow {
             GraphCell::Space(1),
             GraphCell::Branch(BranchGlyph::Merge, NodeStatus::Waiting),
             GraphCell::Space(1),
-            GraphCell::Label(format!("↺ loop:{name}")),
+            GraphCell::Label(format!("{LOOP_FOOTER_PREFIX}{name}")),
             GraphCell::Space(2),
             GraphCell::Meta("loop-back".into()),
         ],

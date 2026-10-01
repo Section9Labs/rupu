@@ -146,6 +146,20 @@ impl NavState {
         view.steps.get(clamp_idx(self.step_idx, view.steps.len()))
     }
 
+    /// The step the operator has *chosen*, if any. While the view is
+    /// following the newest activity at `Run` depth the step cursor is just
+    /// parked on step 0 — that is not a selection, so nothing is chosen. Once
+    /// the operator has moved the cursor or drilled in, the cursor step is
+    /// the choice. While following, a parked run's first gate stands in for a
+    /// choice ([`NavState::gate_step`]), so what `a` / `r` would act on is
+    /// the thing marked. The one predicate behind every selection marker.
+    pub fn chosen_step<'a>(&self, view: &'a RunView) -> Option<&'a StepView> {
+        let chosen = !self.follow || self.depth != Depth::Run;
+        self.selected_step(view)
+            .filter(|_| chosen)
+            .or_else(|| self.gate_step(view))
+    }
+
     /// The unit under the cursor within the selected step's *filtered* list.
     pub fn selected_unit<'a>(&self, view: &'a RunView) -> Option<&'a UnitView> {
         let units = self.unit_list(view);
@@ -906,6 +920,27 @@ mod tests {
         // `a` (Follow) drops the manual selection and re-focuses the first gate.
         nav.apply(NavKey::Follow, &v);
         assert_eq!(gate_id(&nav, &v).as_deref(), Some("gate_a"));
+    }
+
+    #[test]
+    fn chosen_step_is_only_a_real_choice_or_the_parked_gate() {
+        let chosen = |nav: &NavState, v: &RunView| nav.chosen_step(v).map(|s| s.step_id.clone());
+
+        // Following with nothing parked: the cursor idles on step 0 — that is
+        // not a choice.
+        let mut v = parked_view(true);
+        v.status = RunStatus::Running;
+        v.gates.clear();
+        assert_eq!(chosen(&NavState::default(), &v), None);
+
+        // Following a parked run: the first gate stands in for a choice.
+        let v = parked_view(true);
+        assert_eq!(chosen(&NavState::default(), &v).as_deref(), Some("gate_a"));
+
+        // A manual move chooses the cursor step, parked or not.
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Up, &v); // stops following, cursor stays on `build`
+        assert_eq!(chosen(&nav, &v).as_deref(), Some("build"));
     }
 
     #[test]

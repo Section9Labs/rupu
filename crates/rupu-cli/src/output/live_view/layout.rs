@@ -222,10 +222,7 @@ fn focused_step_id<'a>(view: &'a RunView, nav: &NavState) -> Option<&'a str> {
 /// parked run's first gate stands in for a choice ([`NavState::gate_step`]),
 /// so the marker shows which gate `a` / `r` would act on.
 fn chosen_step<'a>(view: &'a RunView, nav: &NavState) -> Option<&'a StepView> {
-    let chosen = !nav.is_following() || nav.depth() != Depth::Run;
-    nav.selected_step(view)
-        .filter(|_| chosen)
-        .or_else(|| nav.gate_step(view))
+    nav.chosen_step(view)
 }
 
 fn step_row(step: &StepView, marked: bool) -> Line {
