@@ -606,3 +606,40 @@ async fn list_comments_none_limit_stops_after_one_full_page() {
     // page, full or not.
     page2_mock.assert_hits(0);
 }
+
+/// `[scm.github].base_url` is the API root (`https://api.github.com`, or
+/// `https://<host>/api/v3` on GHES), as `GithubClient` and `docs/scm.md`
+/// treat it. The events poller must append `/repos/...` to it directly —
+/// the same contract the GitLab poller follows for `/api/v4`.
+#[tokio::test]
+async fn events_poll_treats_ghes_base_url_as_api_root() {
+    use rupu_scm::connectors::github::GithubEventConnector;
+    use rupu_scm::event_connector::EventConnector;
+
+    let server = MockServer::start_async().await;
+    let m = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v3/repos/section9labs/rupu/events");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+    let conn = GithubEventConnector::new(
+        "fake-token".into(),
+        Some(format!("{}/api/v3", server.base_url())),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    );
+    let source = rupu_scm::EventSourceRef::Repo {
+        repo: rupu_scm::RepoRef {
+            platform: Platform::Github,
+            owner: "section9labs".into(),
+            repo: "rupu".into(),
+        },
+    };
+    // A `since:` cursor skips the warmup fast-path (no HTTP on first poll).
+    let result = conn
+        .poll_events(&source, Some("since:2026-05-01T00:00:00+00:00"), 10)
+        .await;
+    m.assert_hits(1);
+    assert!(result.expect("poll against the mock").events.is_empty());
+}
