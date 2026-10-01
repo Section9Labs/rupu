@@ -1,27 +1,126 @@
 name: ci
 
+# CI IS A RELEASE GATE, NOT A MERGE GATE
+# (docs/superpowers/specs/2026-10-01-rupu-release-gated-ci-design.md).
+#
+# The full suite runs once per release, not once per PR plus once per merge:
+#
+#   * release-beta.yml calls this workflow (`workflow_call`) against main's
+#     HEAD and pushes the beta tag only if every job here passed. That is the
+#     only place the suite runs on `main` — there is no `push` trigger.
+#   * Pull requests run nothing unless they touch a path below. Those paths
+#     are the ones that break CI or the release machinery itself, which a
+#     release-time run would otherwise discover too late to be cheap. The
+#     `scope` job narrows a PR run to the jobs its paths need.
+#   * Anyone can opt a branch into the full suite:
+#       gh workflow run ci.yml --ref <branch>
+#     The result is reported on the branch's head commit, so it shows on the
+#     PR like any other check.
+#
+# No check here is required for merging (.github/rulesets/main.json). A red
+# main between releases is fixed forward; the release refuses to tag it.
 on:
   pull_request:
-  push:
-    branches: [main]
-  # release-beta.yml refuses to cut a tag unless ci.yml is green for main's
-  # EXACT HEAD SHA, and that check is deliberately not force-bypassable. So a
-  # single dropped `push` event — GitHub does occasionally fail to create a
-  # run, with Actions itself reporting operational — strands the release: the
-  # commit has no run, the gate sees none, and every later beta skips.
-  #
-  # Without this trigger the only recovery is pushing a junk commit to main
-  # purely to re-fire the event, which is a bad thing to need at exactly the
-  # moment the release path is stuck. A dispatched run on main carries main's
-  # HEAD as its headSha, so it satisfies the gate's query the same way a push
-  # run does.
+    # Keep in lockstep with the `scope` job's patterns below.
+    paths:
+      - ".github/workflows/**"
+      - "docker/**"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "packaging/**"
+      - "flake.nix"
+      - "scripts/**"
+      - "docs/pages/rupu-archive-keyring.asc"
+  workflow_call:
   workflow_dispatch:
 
+# Pull requests cancel their own superseded runs. Every other run gets a
+# unique group: two release-gate runs (or a release and a manual dispatch)
+# must never cancel each other, and in a called run `github.run_id` is the
+# calling release-beta run's id.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
+  # Decides which jobs a run needs. Anything that is not a pull request — a
+  # release gate (`workflow_call`) or a manual dispatch — runs everything.
+  # A pull request only got here because it touched a path in `on.paths`;
+  # this maps those paths to the jobs that check them.
+  scope:
+    name: scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.s.outputs.rust }}
+      packaging: ${{ steps.s.outputs.packaging }}
+      scripts: ${{ steps.s.outputs.scripts }}
+      keyring: ${{ steps.s.outputs.keyring }}
+    steps:
+      - id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then
+            for k in rust packaging scripts keyring; do echo "$k=true" >> "$GITHUB_OUTPUT"; done
+            echo "not a pull request ($EVENT): running everything"
+            exit 0
+          fi
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
+          # A here-string, not `printf | grep -q`: under pipefail, grep -q
+          # exiting on the first match can SIGPIPE the printf and turn a
+          # match into a failure.
+          has() { grep -qE "$1" <<< "$files"; }
+          # A change to CI or the build image can break any job, so it runs
+          # all of them — including on itself, which is how a CI change gets
+          # tested before the release that would otherwise be the first run.
+          rust=false
+          if has '^(\.github/workflows/|docker/|\.cargo/)|^rust-toolchain\.toml$'; then rust=true; fi
+          packaging=$rust
+          if has '^packaging/|^flake\.nix$'; then packaging=true; fi
+          scripts=$rust
+          if has '^scripts/'; then scripts=true; fi
+          keyring=$rust
+          if has '^docs/pages/rupu-archive-keyring\.asc$'; then keyring=true; fi
+          {
+            echo "rust=$rust"
+            echo "packaging=$packaging"
+            echo "scripts=$scripts"
+            echo "keyring=$keyring"
+          } >> "$GITHUB_OUTPUT"
+          echo "rust=$rust packaging=$packaging scripts=$scripts keyring=$keyring"
+
+  # docs/pages/rupu-archive-keyring.asc is served at a stable URL that users
+  # pin trust to (https://rupu.sh/rupu-archive-keyring.asc), and GitHub Pages
+  # publishes it the moment it lands on main — before any release. So unlike
+  # everything else, this one has to be caught on the pull request.
+  keyring:
+    name: published keyring is public-only
+    needs: scope
+    if: needs.scope.outputs.keyring == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assert the published keyring is public-only
+        run: |
+          set -euo pipefail
+          f=docs/pages/rupu-archive-keyring.asc
+          grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$f" || { echo "::error::$f is not a public key block"; exit 1; }
+          if grep -q "PRIVATE KEY BLOCK" "$f"; then
+            echo "::error::$f contains private key material"; exit 1
+          fi
+
   # The three community package definitions (Nix flake, AUR PKGBUILD,
   # Homebrew formula) are generated at release time and pushed straight to the
   # AUR and the tap — without this, a typo in one of them is discovered by an
@@ -34,6 +133,8 @@ jobs:
   # the release workflow depends on it.
   community-packaging:
     name: community package definitions
+    needs: scope
+    if: needs.scope.outputs.packaging == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -133,12 +234,15 @@ jobs:
   # source of truth. Publishing it to ghcr would buy ~20s and is not worth
   # the moving parts.
   #
-  # The required status check is named `linux musl (build + test)`
-  # (.github/rulesets/main.json). That name is preserved by the aggregator
-  # job at the bottom — renaming or removing it would silently un-gate main.
+  # These used to be a required merge check behind an aggregator job named
+  # `linux musl (build + test)`. Since CI became a release gate nothing is
+  # required for merging, and release-beta.yml waits on this whole workflow
+  # (every job must succeed), so the aggregator is gone.
 
   linux-musl-build:
     name: linux musl · build (${{ matrix.platform }})
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     # Both architectures release.yml ships. arm64 used to be built for the
     # first time at release, so an arch-specific break surfaced only there —
     # and release.yml had no warm arm64 cache to restore.
@@ -171,6 +275,11 @@ jobs:
       # cache written on the default branch is readable from every branch —
       # and from every tag — but not vice versa. So PRs restore main's cache
       # and never thrash it, and release.yml's tag runs restore it too.
+      #
+      # The only run on main is the release gate: release-beta.yml calls this
+      # workflow from main (a called workflow inherits the caller's ref), so
+      # the cache is written from the exact commit the tag build restores it
+      # for, minutes later.
       #
       # This block is the RELEASE CACHE WARMER. release.yml's `linux` job has
       # the same rust-cache inputs (prefix-key, shared-key, workspaces,
@@ -243,6 +352,8 @@ jobs:
 
   linux-musl-test:
     name: linux musl · test
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Set here rather than only on `docker run` so rust-cache hashes them
@@ -287,8 +398,9 @@ jobs:
           cache-directories: ".cargo-musl"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Line tables only: panics and backtraces still name file:line, but
-      # the dozens of test binaries stop carrying full debug info.
+      # `--no-fail-fast`: this suite now runs once per release over a whole
+      # batch of PRs, so a red run must name EVERY failing test binary, not
+      # just the first — otherwise each fix-and-retry uncovers one more.
       - name: Test
         run: |
           mkdir -p .cargo-musl
@@ -296,7 +408,7 @@ jobs:
             -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
             -e RUSTFLAGS -e CARGO_PROFILE_DEV_DEBUG -e CARGO_INCREMENTAL \
             rupu-linux-build \
-            cargo test --workspace --locked
+            cargo test --workspace --locked --no-fail-fast
 
       - name: Hand the artifacts back to the runner user
         if: always()
@@ -304,6 +416,8 @@ jobs:
 
   linux-musl-lint:
     name: linux musl · lint
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Same reason as the test job: rust-cache exports this on the runner
@@ -312,20 +426,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
-
-      # docs/pages/rupu-archive-keyring.asc is served at a stable URL that
-      # users pin trust to (https://rupu.sh/rupu-archive-keyring.asc).
-      # This guards against a private key ever being committed there by
-      # accident. Costs milliseconds, so it rides along here rather than
-      # occupying a job of its own.
-      - name: Assert the published keyring is public-only
-        run: |
-          set -euo pipefail
-          f=docs/pages/rupu-archive-keyring.asc
-          grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$f" || { echo "::error::$f is not a public key block"; exit 1; }
-          if grep -q "PRIVATE KEY BLOCK" "$f"; then
-            echo "::error::$f contains private key material"; exit 1
-          fi
 
       - name: Build the pinned musl image
         run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
@@ -388,36 +488,6 @@ jobs:
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" target .cargo-musl 2>/dev/null || true
 
-  # Aggregator. Exists solely to preserve the required status check name
-  # `linux musl (build + test)` from .github/rulesets/main.json while the
-  # actual work runs in the three parallel jobs above. Renaming this job
-  # un-gates main without any other visible symptom.
-  #
-  # `if: always()` plus the explicit result check is deliberate: without it a
-  # skipped or cancelled dependency reports success and the gate passes on a
-  # build that never ran.
-  linux-musl:
-    name: linux musl (build + test)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [linux-musl-build, linux-musl-test, linux-musl-lint]
-    if: always()
-    steps:
-      - name: Require every musl job to have succeeded
-        run: |
-          set -euo pipefail
-          build='${{ needs.linux-musl-build.result }}'
-          test='${{ needs.linux-musl-test.result }}'
-          lint='${{ needs.linux-musl-lint.result }}'
-          echo "build=$build test=$test lint=$lint"
-          for r in "$build" "$test" "$lint"; do
-            if [ "$r" != "success" ]; then
-              echo "::error::a linux musl job did not succeed"
-              exit 1
-            fi
-          done
-          echo "All linux musl jobs succeeded."
-
   # ── darwin release-cache warmer ───────────────────────────────────────
   #
   # release.yml's darwin-arm64 build had no cache and compiled every
@@ -428,10 +498,11 @@ jobs:
   # since rust-cache hashes every installed toolchain and any CARGO*/RUST*
   # env var into its key.
   #
-  # Not run on pull requests: it would add a macOS runner (the scarce pool)
-  # to every PR to warm a cache PRs never write. On main it doubles as the
-  # first macOS compile of the Rust workspace, ahead of any release — and
-  # like every job here, a failure blocks release-beta.yml's green-CI gate.
+  # Not run on pull requests, even ones that touch CI: it would add a macOS
+  # runner (the scarce pool) to warm a cache PRs never write. In the release
+  # gate it runs on main, minutes before the tag build restores what it
+  # saved, and it is the first macOS compile of the batch — a failure here
+  # stops release-beta.yml from tagging.
   darwin-release-build:
     name: darwin-arm64 · release build
     if: github.event_name != 'pull_request'
@@ -451,11 +522,13 @@ jobs:
 
   release-scripts:
     name: release cadence scripts
+    needs: scope
+    if: needs.scope.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       # These scripts decide what gets published unattended every morning. A
-      # counter regression here silently republishes an old version, so they
-      # are gated on every PR rather than trusted.
+      # counter regression here silently republishes an old version, so a PR
+      # that touches scripts/ runs them before it merges.
       - run: scripts/tests/release-cadence-tests.sh

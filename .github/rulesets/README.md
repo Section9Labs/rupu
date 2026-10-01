@@ -21,9 +21,17 @@ repos/Section9Labs/rupu/rulesets` and `PUT` to
 | `deletion` | `main` cannot be deleted |
 | `non_fast_forward` | no force-push; history cannot be rewritten |
 | `pull_request` | every change reaches `main` through a PR |
-| `required_status_checks` | `linux musl (build + test)` and `community package definitions` must pass before merge |
 
-## Two deliberate choices
+## Three deliberate choices
+
+**No required status checks.** CI is a release gate, not a merge gate
+(`docs/superpowers/specs/2026-10-01-rupu-release-gated-ci-design.md`): the
+full suite runs once per release, inside `release-beta.yml`, against the exact
+commit it tags, and a red run means no tag. Requiring a check here would put
+CI back in front of every merge — and most PRs no longer run any (`ci.yml`
+only triggers on CI, packaging, script and keyring paths), so a required check
+would simply never report and block them forever. A PR can still opt into the
+full suite with `gh workflow run ci.yml --ref <branch>`.
 
 **`required_approving_review_count: 0`.** GitHub does not let you approve your
 own pull request, so requiring one approval would lock a solo maintainer out of
