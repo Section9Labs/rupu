@@ -407,7 +407,14 @@ pub struct RefreshReport {
     /// persisted. A long-lived caller (`cp serve`) drops them and they finish
     /// detached; a one-shot process must await them before it exits, or its
     /// runtime's shutdown cancels them.
-    pub unfinished: Vec<tokio::task::JoinHandle<RefreshOutcome>>,
+    pub unfinished: Vec<UnfinishedRefresh>,
+}
+
+/// A provider refresh job still running when its wait timed out.
+#[derive(Debug)]
+pub struct UnfinishedRefresh {
+    pub provider: String,
+    pub job: tokio::task::JoinHandle<RefreshOutcome>,
 }
 
 /// Refetch live model lists (spec §8). Providers run in parallel, each
@@ -447,7 +454,10 @@ pub async fn refresh(
                 // Still running: hand the job back, never abort it.
                 Err(_) => (
                     fail(format!("timed out after {}", fmt_timeout(fetch_timeout))),
-                    Some(job),
+                    Some(UnfinishedRefresh {
+                        provider: name.clone(),
+                        job,
+                    }),
                 ),
             }
         }

@@ -1027,12 +1027,9 @@ async fn a_timed_out_refresh_job_comes_back_unfinished_and_completes() {
         "not written yet when the call returns"
     );
     assert_eq!(report.unfinished.len(), 1, "the still-running job");
-    let late = report
-        .unfinished
-        .pop()
-        .unwrap()
-        .await
-        .expect("the job ran to completion");
+    let unfinished = report.unfinished.pop().unwrap();
+    assert_eq!(unfinished.provider, "oracle");
+    let late = unfinished.job.await.expect("the job ran to completion");
     assert!(late.ok, "{late:?}");
     assert_eq!(late.provider, "oracle");
     let body = std::fs::read_to_string(&cache_file).expect("the job wrote its cache");

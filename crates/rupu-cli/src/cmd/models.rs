@@ -290,32 +290,58 @@ async fn run_refresh(
     // process's runtime would cancel it on exit, so give it time to finish,
     // and report how it ended: a job that finishes here did refresh.
     if !report.unfinished.is_empty() {
-        emit(ReportLine::Err(format!(
-            "rupu: waiting for {} provider job(s) to finish…",
-            report.unfinished.len()
-        )));
-        let all = futures_util::future::join_all(report.unfinished);
-        match tokio::time::timeout(timings.unfinished_wait, all).await {
-            Ok(finished) => {
-                for late in finished {
-                    match late {
-                        Ok(outcome) => {
-                            any_refreshed |= outcome.ok;
-                            emit(late_report_line(outcome));
-                        }
-                        Err(e) => emit(ReportLine::Err(format!(
-                            "rupu: a provider job failed after the wait: {e}"
-                        ))),
-                    }
-                }
-            }
-            Err(_) => emit(ReportLine::Err(format!(
-                "rupu: gave up waiting after {}s",
-                timings.unfinished_wait.as_secs()
-            ))),
-        }
+        any_refreshed |= settle_unfinished(report.unfinished, timings.unfinished_wait, emit).await;
     }
     Ok(any_refreshed)
+}
+
+/// Wait (at most `wait`, one deadline for all) for the provider jobs that
+/// outlived the listing timeout, reporting each through `emit` as it lands;
+/// at the deadline, names the ones still running. `true` when one of them
+/// refreshed.
+async fn settle_unfinished(
+    unfinished: Vec<rupu_runtime::model_limits::UnfinishedRefresh>,
+    wait: std::time::Duration,
+    emit: &mut (dyn FnMut(ReportLine) + Send),
+) -> bool {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    emit(ReportLine::Err(format!(
+        "rupu: waiting for {} provider job(s) to finish…",
+        unfinished.len()
+    )));
+    let mut still_running: Vec<String> = unfinished.iter().map(|u| u.provider.clone()).collect();
+    let mut landing: FuturesUnordered<_> = unfinished
+        .into_iter()
+        .map(|u| async move { (u.provider, u.job.await) })
+        .collect();
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut any_refreshed = false;
+    loop {
+        match tokio::time::timeout_at(deadline, landing.next()).await {
+            Ok(Some((provider, finished))) => {
+                still_running.retain(|p| *p != provider);
+                match finished {
+                    Ok(outcome) => {
+                        any_refreshed |= outcome.ok;
+                        emit(late_report_line(outcome));
+                    }
+                    Err(e) => emit(ReportLine::Err(format!(
+                        "rupu: skip {provider}: the provider job failed after the wait: {e}"
+                    ))),
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                emit(ReportLine::Err(format!(
+                    "rupu: gave up waiting after {}s; still running: {}",
+                    wait.as_secs(),
+                    still_running.join(", ")
+                )));
+                break;
+            }
+        }
+    }
+    any_refreshed
 }
 
 /// The line for a provider job that finished during the exit wait.
@@ -432,6 +458,54 @@ mod tests {
         ) -> anyhow::Result<rupu_providers::auth::AuthCredentials> {
             unreachable!()
         }
+    }
+
+    fn late_job(
+        provider: &str,
+        after: std::time::Duration,
+    ) -> rupu_runtime::model_limits::UnfinishedRefresh {
+        let name = provider.to_string();
+        rupu_runtime::model_limits::UnfinishedRefresh {
+            provider: name.clone(),
+            job: tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                rupu_runtime::model_limits::RefreshOutcome {
+                    provider: name,
+                    ok: true,
+                    count: 3,
+                    error: None,
+                }
+            }),
+        }
+    }
+
+    /// The wait is per job under one deadline, not all-or-nothing: a job
+    /// that lands in time is reported (and counts toward success) even when
+    /// another is still running at the deadline, which is named.
+    #[tokio::test]
+    async fn the_wait_reports_each_job_as_it_lands_and_names_the_stragglers() {
+        let mut lines = Vec::new();
+        let refreshed = settle_unfinished(
+            vec![
+                late_job("fast", std::time::Duration::from_millis(300)),
+                late_job("stuck", std::time::Duration::from_secs(3600)),
+            ],
+            std::time::Duration::from_secs(1),
+            &mut |line| lines.push(line),
+        )
+        .await;
+        assert!(refreshed, "{lines:?}");
+        assert!(
+            lines.contains(&ReportLine::Out(
+                "rupu: refreshed fast (3 models) after the wait".into()
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| matches!(l, ReportLine::Err(m)
+                if m.contains("gave up waiting") && m.contains("still running: stuck"))),
+            "{lines:?}"
+        );
     }
 
     /// A provider job that misses the listing timeout but finishes within
