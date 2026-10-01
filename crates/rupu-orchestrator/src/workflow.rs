@@ -211,6 +211,14 @@ pub enum WorkflowParseError {
     FindingsProfileOnNonAgentStep { step: String },
     #[error("step `{step}`: `findings_profile` only applies to `action: findings.record` (this step calls `{tool}`); remove it")]
     FindingsProfileOnNonFindingsAction { step: String, tool: String },
+    #[error(
+        "step `{step}`: `engagement_profiles` has no effect on a step that runs no agent; remove it"
+    )]
+    EngagementProfilesOnNonAgentStep { step: String },
+    #[error("step `{step}`: `engagement_profiles` only applies to `action: findings.record` (this step calls `{tool}`); remove it")]
+    EngagementProfilesOnNonFindingsAction { step: String, tool: String },
+    #[error("{place}: `engagement_profiles` must not contain an empty id")]
+    EngagementProfilesBlankId { place: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -874,6 +882,16 @@ pub struct WorkflowDefaults {
     /// agent) resolves step → this → `full`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Engagement profiles (asset families such as `binary`) the whole run is
+    /// conducted under, e.g. `[binary]` or `[network, web]`. Absent/empty ⇒
+    /// the agent's `engagementProfiles` frontmatter, else the native `code`
+    /// path. A step's own `engagement_profiles` may only NARROW this set; ids
+    /// are validated at launch, not at parse (see
+    /// [`crate::step_factory::DefaultStepFactory`]). Remote (`host:` /
+    /// `distribute:`) steps refuse a non-`code` selection — see
+    /// [`crate::runner`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engagement_profiles: Vec<String>,
 }
 
 /// Whether a step's file workspace is synced to the remote host it runs on.
@@ -1138,6 +1156,13 @@ pub struct Step {
     /// profile `findings.record` records under (step → defaults → `full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Per-step engagement NARROWING: a subset of the run's active engagement
+    /// set (`defaults.engagement_profiles`, else the agent's
+    /// `engagementProfiles`). `[code]` drops the step back to the native
+    /// path. A step can never widen beyond the run's set — that is an error
+    /// at launch. On an `action:` step it applies to `findings.record` only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engagement_profiles: Vec<String>,
     /// Explicit successor edge(s). Empty in a legacy (edge-free) workflow,
     /// where flow follows list order. Non-empty makes this an explicit graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1258,6 +1283,25 @@ impl Workflow {
         )
     }
 
+    /// The engagement selection an `action: findings.record` step records
+    /// under: the step's own `engagement_profiles`, else
+    /// `defaults.engagement_profiles`; empty ⇒ the native `code` path. Like
+    /// [`Workflow::action_findings_profile`] there is no agent frontmatter to
+    /// consult — an action step runs no agent. The same step → defaults rule
+    /// is what a remote (`host:` / `distribute:`) unit's selection is judged
+    /// by (see [`crate::runner`]'s fail-closed guard).
+    ///
+    /// This is the raw selection (ids as authored, `defaults` untouched when
+    /// the step narrows); resolving it to an active set — and checking that
+    /// a step only narrows — happens at launch against the profile registry.
+    pub fn action_engagement(&self, step: &Step) -> Vec<String> {
+        if step.engagement_profiles.is_empty() {
+            self.defaults.engagement_profiles.clone()
+        } else {
+            step.engagement_profiles.clone()
+        }
+    }
+
     /// Parse a YAML string. Validates step-id uniqueness and input
     /// defaults / enum constraints; returns clear errors on failure.
     pub fn parse(s: &str) -> Result<Self, WorkflowParseError> {
@@ -1299,6 +1343,16 @@ impl Workflow {
             validate_step_actions(step)?;
         }
         validate_findings_record_actions(&wf)?;
+        if wf
+            .defaults
+            .engagement_profiles
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err(WorkflowParseError::EngagementProfilesBlankId {
+                place: "`defaults`".to_string(),
+            });
+        }
         for (name, def) in &wf.inputs {
             validate_input_def(name, def)?;
         }
@@ -1911,6 +1965,49 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         // the step → defaults profile on each `UnitDispatch`, and every host
         // connector delivers it as `rupu run --findings-profile` or refuses
         // the launch.
+    }
+
+    if !step.engagement_profiles.is_empty() {
+        // Same placement rules as `findings_profile`: the selection governs
+        // the findings an agent files, so it only means something on a step
+        // that runs an agent or an `action: findings.record` call.
+        if let Some(tool) = step.action.as_deref() {
+            if tool != "findings.record" {
+                return Err(WorkflowParseError::EngagementProfilesOnNonFindingsAction {
+                    step: step.id.clone(),
+                    tool: tool.to_string(),
+                });
+            }
+        }
+        let runs_no_agent = step.branch.is_some()
+            || is_approval_gate(step)
+            || step.run.is_some()
+            || ((step.split.is_some() || step.join.is_some())
+                && step.agent.is_none()
+                && step.prompt.is_none()
+                && step.for_each.is_none()
+                && step.parallel.is_none()
+                && step.panel.is_none());
+        if runs_no_agent {
+            return Err(WorkflowParseError::EngagementProfilesOnNonAgentStep {
+                step: step.id.clone(),
+            });
+        }
+        // An empty id is a typo, never "unset": ignoring it would silently
+        // run the step under a different (wider or default) selection.
+        if step
+            .engagement_profiles
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err(WorkflowParseError::EngagementProfilesBlankId {
+                place: format!("step `{}`", step.id),
+            });
+        }
+        // Whether the ids exist, whether the step only narrows the run's
+        // set, and whether a composite collides with its own member all
+        // depend on the profile registry, so they are checked at launch
+        // (`DefaultStepFactory`), not here: parsing stays pure.
     }
 
     Ok(())
@@ -3452,6 +3549,124 @@ steps:
         Workflow::parse(parallel).expect("parallel step");
         let panel = "name: w\nsteps:\n  - id: a\n    findings_profile: summary\n    panel:\n      panelists: [x]\n      subject: s\n";
         Workflow::parse(panel).expect("panel step");
+    }
+
+    // ── engagement_profiles placement + action_engagement ───────────────────
+
+    #[test]
+    fn parses_engagement_profiles_on_defaults_and_step() {
+        let wf = Workflow::parse(
+            "name: w\ndefaults:\n  engagement_profiles: [binary, network]\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    engagement_profiles: [binary]\n  - id: b\n    agent: x\n    prompt: p\n",
+        )
+        .expect("engagement_profiles parses");
+        assert_eq!(wf.defaults.engagement_profiles, vec!["binary", "network"]);
+        assert_eq!(wf.steps[0].engagement_profiles, vec!["binary"]);
+        assert!(wf.steps[1].engagement_profiles.is_empty());
+    }
+
+    #[test]
+    fn a_workflow_without_engagement_profiles_serializes_without_the_key() {
+        // The CP editor round-trips workflows through serde: the new fields
+        // must not appear unless authored.
+        let wf =
+            Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n").unwrap();
+        let yaml = serde_yaml::to_string(&wf).unwrap();
+        assert!(!yaml.contains("engagement_profiles"), "{yaml}");
+    }
+
+    #[test]
+    fn action_engagement_is_step_then_defaults() {
+        let wf = Workflow::parse(&format!(
+            "name: w\ndefaults:\n  engagement_profiles: [binary, network]\nsteps:\n  - id: inherits\n    action: findings.record\n    with: {SUMMARY_WITH}\n    findings_profile: summary\n  - id: narrows\n    action: findings.record\n    with: {SUMMARY_WITH}\n    findings_profile: summary\n    engagement_profiles: [binary]\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            wf.action_engagement(&wf.steps[0]),
+            vec!["binary", "network"]
+        );
+        assert_eq!(wf.action_engagement(&wf.steps[1]), vec!["binary"]);
+        let none = Workflow::parse(&format!(
+            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: {SUMMARY_WITH}\n    findings_profile: summary\n"
+        ))
+        .unwrap();
+        assert!(none.action_engagement(&none.steps[0]).is_empty());
+    }
+
+    #[test]
+    fn engagement_profiles_on_a_non_agent_step_is_rejected() {
+        let branch = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: g\n    engagement_profiles: [binary]\n    branch:\n      condition: \"{{ steps.a.output }}\"\n      then: [x]\n      else: [y]\n  - id: x\n    agent: a\n    prompt: p\n  - id: y\n    agent: a\n    prompt: p\n";
+        match Workflow::parse(branch).unwrap_err() {
+            WorkflowParseError::EngagementProfilesOnNonAgentStep { step } => {
+                assert_eq!(step, "g")
+            }
+            other => panic!("expected EngagementProfilesOnNonAgentStep, got {other:?}"),
+        }
+        let gate = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n    engagement_profiles: [binary]\n";
+        assert!(matches!(
+            Workflow::parse(gate).unwrap_err(),
+            WorkflowParseError::EngagementProfilesOnNonAgentStep { .. }
+        ));
+        let run = "name: w\nsteps:\n  - id: r\n    run: { cmd: echo }\n    engagement_profiles: [binary]\n";
+        assert!(matches!(
+            Workflow::parse(run).unwrap_err(),
+            WorkflowParseError::EngagementProfilesOnNonAgentStep { .. }
+        ));
+    }
+
+    #[test]
+    fn engagement_profiles_on_a_non_findings_action_step_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: c\n    action: issues.comment\n    with: { project: o/r, number: 1, body: hi }\n    engagement_profiles: [binary]\n";
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::EngagementProfilesOnNonFindingsAction { step, tool } => {
+                assert_eq!(step, "c");
+                assert_eq!(tool, "issues.comment");
+            }
+            other => panic!("expected EngagementProfilesOnNonFindingsAction, got {other:?}"),
+        }
+        // ...and inside a gate's on_reject cleanup chain.
+        let on_reject = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n      on_reject:\n        - id: cleanup\n          action: issues.comment\n          with: { project: o/r, number: 1, body: hi }\n          engagement_profiles: [binary]\n";
+        match Workflow::parse(on_reject).unwrap_err() {
+            WorkflowParseError::EngagementProfilesOnNonFindingsAction { step, .. } => {
+                assert_eq!(step, "cleanup")
+            }
+            other => panic!("expected EngagementProfilesOnNonFindingsAction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engagement_profiles_stays_legal_on_agent_shapes_findings_record_and_remote_steps() {
+        let linear = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    engagement_profiles: [binary]\n";
+        Workflow::parse(linear).expect("linear agent step");
+        let for_each = "name: w\nsteps:\n  - id: a\n    for_each: \"x\"\n    agent: x\n    prompt: p\n    engagement_profiles: [binary]\n";
+        Workflow::parse(for_each).expect("for_each agent step");
+        let parallel = "name: w\nsteps:\n  - id: a\n    engagement_profiles: [binary]\n    parallel:\n      - id: s1\n        agent: x\n        prompt: p\n";
+        Workflow::parse(parallel).expect("parallel step");
+        let panel = "name: w\nsteps:\n  - id: a\n    engagement_profiles: [binary]\n    panel:\n      panelists: [x]\n      subject: s\n";
+        Workflow::parse(panel).expect("panel step");
+        let record = format!(
+            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: {SUMMARY_WITH}\n    findings_profile: summary\n    engagement_profiles: [binary]\n"
+        );
+        Workflow::parse(&record).expect("findings.record may carry engagement_profiles");
+        // A remote step parses (the runner refuses a non-`code` selection at
+        // dispatch — parse stays registry- and topology-pure).
+        let remote = "name: w\ndefaults:\n  engagement_profiles: [binary]\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    host: h\n";
+        Workflow::parse(remote).expect("remote step parses");
+    }
+
+    #[test]
+    fn a_blank_engagement_profile_id_is_rejected() {
+        let step = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    engagement_profiles: [\"\"]\n";
+        match Workflow::parse(step).unwrap_err() {
+            WorkflowParseError::EngagementProfilesBlankId { place } => {
+                assert!(place.contains('a'), "{place}")
+            }
+            other => panic!("expected EngagementProfilesBlankId, got {other:?}"),
+        }
+        let defaults = "name: w\ndefaults:\n  engagement_profiles: [\" \"]\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n";
+        assert!(matches!(
+            Workflow::parse(defaults).unwrap_err(),
+            WorkflowParseError::EngagementProfilesBlankId { .. }
+        ));
     }
 
     // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────

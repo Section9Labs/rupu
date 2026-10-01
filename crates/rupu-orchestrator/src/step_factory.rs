@@ -8,8 +8,9 @@
 //! across all steps; this avoids redundant credential probes and
 //! ensures consistent SCM tool availability throughout the workflow.
 
+use crate::engagement::{narrow_to_step, resolve_run_set, EngagementError};
 use crate::runner::StepFactory;
-use crate::workflow::Workflow;
+use crate::workflow::{Step, Workflow};
 use async_trait::async_trait;
 use rupu_agent::{
     runner::BypassDecider, runner::PermissionDecider, runner::ReadonlyDecider, AgentRunOpts,
@@ -230,6 +231,55 @@ fn resolve_step_agent_spec(
     }
 }
 
+impl DefaultStepFactory {
+    /// The RUN-level engagement set: `defaults.engagement_profiles`, else the
+    /// agent's `engagementProfiles` (`agent_profiles`; empty for an action
+    /// step, which runs no agent), else the native `code` path. `None` is the
+    /// native path and is decided BEFORE the profile registry is built, so a
+    /// workflow that selects nothing never touches the overlay directories
+    /// (see [`crate::engagement`]). A native resolution keeps whatever
+    /// engagement the caller put on `findings_base` (nothing sets one for a
+    /// workflow run today, so this is `None` and byte-identical).
+    fn run_engagement(
+        &self,
+        agent_profiles: &[String],
+    ) -> Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, EngagementError> {
+        let selected = rupu_coverage::profile::EngagementProfile::resolve(
+            None,
+            &self.workflow.defaults.engagement_profiles,
+            agent_profiles,
+        );
+        Ok(
+            match resolve_run_set(&self.global, self.project_root.as_deref(), &selected)? {
+                Some(set) => Some(set),
+                None => self.findings_base.engagement.clone(),
+            },
+        )
+    }
+
+    /// `step`'s effective engagement set: the run set narrowed by the step's
+    /// own `engagement_profiles` (narrow-only — a widening is an error). The
+    /// `Err` text is the refusal a caller surfaces for the step.
+    fn step_engagement(
+        &self,
+        step: &Step,
+        agent_profiles: &[String],
+    ) -> Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String> {
+        let run = self.run_engagement(agent_profiles).map_err(|e| {
+            format!(
+                "step `{}`: the run's engagement profiles could not be resolved: {e}",
+                step.id
+            )
+        })?;
+        narrow_to_step(run.as_ref(), &step.engagement_profiles).map_err(|e| {
+            format!(
+                "step `{}`: `engagement_profiles` {:?} cannot narrow the run's engagement set: {e}",
+                step.id, step.engagement_profiles
+            )
+        })
+    }
+}
+
 #[async_trait]
 impl StepFactory for DefaultStepFactory {
     async fn build_opts_for_step(
@@ -288,6 +338,16 @@ impl StepFactory for DefaultStepFactory {
         .map_err(|e| e.to_string());
         let (spec, load_err) = resolve_step_agent_spec(load, agent_name, &rendered_prompt);
 
+        // The engagement this step files findings under. `build_opts_for_step`
+        // is infallible, so a launch-time refusal (unknown id, a step
+        // widening the run's set) rides out as an error-stub provider below —
+        // the step then fails on its first call instead of silently running
+        // on the native `code` path.
+        let (engagement, engagement_err) =
+            match self.step_engagement(step, &spec.engagement_profiles) {
+                Ok(set) => (set, None),
+                Err(msg) => (None, Some(msg)),
+            };
         let findings = rupu_coverage::FindingWriteOptions {
             profile: rupu_coverage::FindingProfile::resolve(
                 step.findings_profile,
@@ -295,7 +355,8 @@ impl StepFactory for DefaultStepFactory {
                 spec.findings_profile,
             ),
             ..self.findings_base.clone()
-        };
+        }
+        .with_engagement(engagement);
 
         // A missing or unparseable agent file is a hard error: fail loudly via
         // the error-stub provider instead of silently running on the default
@@ -315,11 +376,14 @@ impl StepFactory for DefaultStepFactory {
         // instead of failing with "unknown provider".
         let provider_name: String;
         let model: String;
-        let provider: Box<dyn rupu_providers::LlmProvider> = match load_err {
-            Some(msg) => {
+        let refusal = load_err
+            .map(agent_load_error_stub)
+            .or_else(|| engagement_err.map(engagement_error_stub));
+        let provider: Box<dyn rupu_providers::LlmProvider> = match refusal {
+            Some(stub) => {
                 provider_name = "unresolved".to_string();
                 model = "-".to_string();
-                Box::new(agent_load_error_stub(msg))
+                Box::new(stub)
             }
             None => {
                 provider_name = provider_factory::resolve_provider_name(
@@ -508,6 +572,15 @@ impl StepFactory for DefaultStepFactory {
 
     fn permission_mode(&self) -> Option<&str> {
         Some(self.mode_str.as_str())
+    }
+
+    fn action_engagement(
+        &self,
+        step: &Step,
+    ) -> Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String> {
+        // An action step runs no agent, so there is no frontmatter to fall
+        // back on: `defaults.engagement_profiles` narrowed by the step.
+        self.step_engagement(step, &[])
     }
 }
 
@@ -804,9 +877,25 @@ pub(crate) fn agent_load_error_stub(error: String) -> ProviderBuildErrorStub {
     }
 }
 
+/// The stub for a step whose engagement selection was refused at launch
+/// (unknown profile id, a step widening the run's set, a bad profile file).
+/// Like [`agent_load_error_stub`] it is not a credentials problem, and unlike
+/// it the agent file is not at fault — so the message goes out verbatim with
+/// no "checked the agents dir" hint.
+pub(crate) fn engagement_error_stub(error: String) -> ProviderBuildErrorStub {
+    ProviderBuildErrorStub {
+        kind: ErrorStubKind::Engagement,
+        provider_name: "unresolved".to_string(),
+        model: "-".to_string(),
+        error,
+    }
+}
+
 enum ErrorStubKind {
     ProviderBuild,
     AgentLoad,
+    /// A launch-time engagement refusal; the message goes out verbatim.
+    Engagement,
 }
 
 pub(crate) struct ProviderBuildErrorStub {
@@ -827,6 +916,9 @@ impl ProviderBuildErrorStub {
                 "{}\n  Checked the project agents dir (.rupu/agents/) and the global agents dir.",
                 self.error,
             )),
+            ErrorStubKind::Engagement => {
+                rupu_providers::ProviderError::Preflight(self.error.clone())
+            }
         }
     }
 }
@@ -1403,6 +1495,277 @@ steps:
         let fo = opts.tool_context.findings.unwrap();
         assert_eq!(fo.artifact_max_bytes, 7);
         assert_eq!(fo.artifact_root, Some(tmp.path().join("store")));
+    }
+
+    // ── Engagement profiles: workflow selection, step narrowing ──────────
+
+    fn write_engagement_agent(global: &std::path::Path, name: &str, frontmatter: &str) {
+        let agents_dir = global.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ntools: [report_finding]\n{frontmatter}---\nAssess.\n"),
+        )
+        .unwrap();
+    }
+
+    async fn opts_for(
+        wf: &str,
+        step: &str,
+        agent: &str,
+        global: &std::path::Path,
+        project_root: Option<&std::path::Path>,
+    ) -> rupu_agent::AgentRunOpts {
+        let mut f = factory(global.to_path_buf());
+        f.workflow = Workflow::parse(wf).expect("workflow must parse");
+        f.project_root = project_root.map(std::path::Path::to_path_buf);
+        f.build_opts_for_step(
+            step,
+            agent,
+            "prompt".to_string(),
+            "run1".to_string(),
+            "ws1".to_string(),
+            global.to_path_buf(),
+            global.join(format!("{step}.jsonl")),
+            None,
+        )
+        .await
+    }
+
+    async fn engagement_of(
+        wf: &str,
+        step: &str,
+        agent: &str,
+        global: &std::path::Path,
+    ) -> Option<Vec<String>> {
+        let opts = opts_for(wf, step, agent, global, None).await;
+        opts.tool_context
+            .findings
+            .expect("step factory must always set findings options")
+            .engagement
+            .map(|e| e.ids().iter().map(|s| s.to_string()).collect())
+    }
+
+    /// What the step's provider says when it is called: the error a launch
+    /// refusal is surfaced as, since `build_opts_for_step` is infallible.
+    async fn first_provider_error(opts: rupu_agent::AgentRunOpts) -> String {
+        use rupu_providers::LlmRequest;
+        let mut provider = opts.provider;
+        let req = LlmRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![],
+            max_tokens: 1,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            disable_prompt_cache: false,
+        };
+        provider
+            .send(&req)
+            .await
+            .expect_err("a refused launch must error on its first call")
+            .to_string()
+    }
+
+    const WF_BINARY: &str = r#"
+name: eng
+defaults:
+  engagement_profiles: [binary]
+steps:
+  - id: inherits
+    agent: ea
+    prompt: p
+  - id: native
+    agent: ea
+    prompt: p
+    engagement_profiles: [code]
+  - id: narrows
+    agent: ea
+    prompt: p
+    engagement_profiles: [binary]
+  - id: widens
+    agent: ea
+    prompt: p
+    engagement_profiles: [web]
+"#;
+
+    #[tokio::test]
+    async fn workflow_defaults_select_an_engagement_for_every_step() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        let opts = opts_for(WF_BINARY, "inherits", "ea", tmp.path(), None).await;
+        let set = opts
+            .tool_context
+            .findings
+            .unwrap()
+            .engagement
+            .expect("defaults.engagement_profiles: [binary] activates a binary set");
+        assert_eq!(set.ids(), vec!["binary"]);
+        assert_eq!(
+            set.profile_for_kind("binary:function").unwrap().id,
+            "binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_may_narrow_the_run_set_to_a_subset() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        // Narrowing to the same single member is the identity.
+        assert_eq!(
+            engagement_of(WF_BINARY, "narrows", "ea", tmp.path()).await,
+            Some(vec!["binary".to_string()])
+        );
+        // A real subset: `code` + `binary` narrowed to `binary` drops `code`.
+        let wf = "name: e\ndefaults:\n  engagement_profiles: [code, binary]\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n    engagement_profiles: [binary]\n  - id: all\n    agent: ea\n    prompt: p\n";
+        let narrowed = opts_for(wf, "s", "ea", tmp.path(), None).await;
+        let set = narrowed.tool_context.findings.unwrap().engagement.unwrap();
+        assert_eq!(set.ids(), vec!["binary"]);
+        assert!(set.profile_for_kind("code:file").is_none());
+        let wide = opts_for(wf, "all", "ea", tmp.path(), None).await;
+        let set = wide.tool_context.findings.unwrap().engagement.unwrap();
+        assert!(set.profile_for_kind("code:file").is_some());
+        assert!(set.profile_for_kind("binary:function").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_step_narrowing_to_code_drops_back_to_the_native_path() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        assert_eq!(
+            engagement_of(WF_BINARY, "native", "ea", tmp.path()).await,
+            None,
+            "[code] is the native default: engagement stays None (P2-C)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_widening_beyond_the_run_set_is_refused_at_launch() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        let opts = opts_for(WF_BINARY, "widens", "ea", tmp.path(), None).await;
+        let msg = first_provider_error(opts).await;
+        assert!(msg.contains("widens"), "names the step: {msg}");
+        assert!(msg.contains("web"), "names the offending id: {msg}");
+        assert!(
+            !msg.contains("agents dir"),
+            "an engagement refusal must not blame the agent file: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_cannot_introduce_an_engagement_the_run_does_not_have() {
+        // No workflow selection and a silent agent: the run is on the native
+        // path, so a step selecting `binary` would be a widening.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        let wf = "name: e\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n    engagement_profiles: [binary]\n";
+        let msg = first_provider_error(opts_for(wf, "s", "ea", tmp.path(), None).await).await;
+        assert!(msg.contains("binary"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workflow_engagement_is_refused_at_launch() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        let wf = "name: e\ndefaults:\n  engagement_profiles: [nope]\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n";
+        let msg = first_provider_error(opts_for(wf, "s", "ea", tmp.path(), None).await).await;
+        assert!(msg.contains("nope"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn the_agent_frontmatter_applies_when_the_workflow_is_silent() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "eb", "engagementProfiles: [binary]\n");
+        write_engagement_agent(tmp.path(), "ea", "");
+        let wf = "name: e\nsteps:\n  - id: s\n    agent: eb\n    prompt: p\n";
+        assert_eq!(
+            engagement_of(wf, "s", "eb", tmp.path()).await,
+            Some(vec!["binary".to_string()])
+        );
+        // The workflow's own selection beats the agent's.
+        let wf = "name: e\ndefaults:\n  engagement_profiles: [code]\nsteps:\n  - id: s\n    agent: eb\n    prompt: p\n";
+        assert_eq!(engagement_of(wf, "s", "eb", tmp.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_without_engagement_stays_on_the_native_path_without_the_overlay() {
+        // A project profile that cannot parse breaks any call that builds the
+        // overlay registry — so a clean `None` proves it was never built.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        let project = tempfile::tempdir().unwrap();
+        let profiles = project.path().join(".rupu/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("broken.toml"), "this is = not [valid").unwrap();
+        for wf in [
+            "name: e\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n",
+            "name: e\ndefaults:\n  engagement_profiles: [code]\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n",
+            "name: e\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n    engagement_profiles: [code]\n",
+        ] {
+            let opts = opts_for(wf, "s", "ea", tmp.path(), Some(project.path())).await;
+            assert!(
+                opts.tool_context.findings.unwrap().engagement.is_none(),
+                "{wf}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workflow_selection_uses_the_project_profile_overlay() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_engagement_agent(tmp.path(), "ea", "");
+        let project = tempfile::tempdir().unwrap();
+        let profiles = project.path().join(".rupu/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("firmware.toml"),
+            "id = \"firmware\"\nname = \"Firmware\"\n\n[[asset_kinds]]\nid = \"image\"\ncoordinates = [\"sha256\"]\nlabel = \"{sha256}\"\n",
+        )
+        .unwrap();
+        let wf = "name: e\ndefaults:\n  engagement_profiles: [firmware]\nsteps:\n  - id: s\n    agent: ea\n    prompt: p\n";
+        let opts = opts_for(wf, "s", "ea", tmp.path(), Some(project.path())).await;
+        let set = opts.tool_context.findings.unwrap().engagement.unwrap();
+        assert_eq!(
+            set.profile_for_kind("firmware:image").unwrap().id,
+            "firmware"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_factory_resolves_an_action_steps_engagement() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let with = "{ scope: host, target_ref: h, summary: s, severity: high, rationale: r }";
+        let wf = format!(
+            "name: e\ndefaults:\n  engagement_profiles: [binary]\nsteps:\n  - id: inherits\n    action: findings.record\n    with: {with}\n    findings_profile: summary\n  - id: native\n    action: findings.record\n    with: {with}\n    findings_profile: summary\n    engagement_profiles: [code]\n  - id: widens\n    action: findings.record\n    with: {with}\n    findings_profile: summary\n    engagement_profiles: [web]\n"
+        );
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(&wf).expect("parses");
+        let step = |id: &str| {
+            f.workflow
+                .steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .clone()
+        };
+        let set = f
+            .action_engagement(&step("inherits"))
+            .expect("resolves")
+            .expect("binary is a real engagement");
+        assert_eq!(set.ids(), vec!["binary"]);
+        assert!(f.action_engagement(&step("native")).unwrap().is_none());
+        let err = f.action_engagement(&step("widens")).unwrap_err();
+        assert!(err.contains("web") && err.contains("widens"), "{err}");
     }
 
     // ── Findings profile: the full precedence table, and the unit shapes

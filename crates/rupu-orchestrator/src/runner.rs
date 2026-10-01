@@ -354,6 +354,25 @@ pub trait StepFactory: Send + Sync {
     fn permission_mode(&self) -> Option<&str> {
         None
     }
+
+    /// The engagement set an `action: findings.record` step records under:
+    /// the workflow's selection (`defaults.engagement_profiles`) narrowed by
+    /// the step's own `engagement_profiles`, resolved against the profile
+    /// registry. `Ok(None)` is the native `code` path; `Err` is a launch-time
+    /// refusal (unknown id, a step widening the run's set, a bad profile
+    /// file) that fails the step instead of recording under the wrong rules.
+    ///
+    /// Default `Ok(None)` — a factory with no profile registry (a test
+    /// harness's fake) leaves action steps on the native path.
+    /// [`DefaultStepFactory`](crate::step_factory::DefaultStepFactory)
+    /// overrides it; an agent step reaches the same resolution inside
+    /// `build_opts_for_step`.
+    fn action_engagement(
+        &self,
+        _step: &Step,
+    ) -> Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String> {
+        Ok(None)
+    }
 }
 
 /// `Clone` exists solely so [`run_scheduler`] can wrap one `Arc`-shared copy
@@ -3057,6 +3076,7 @@ fn augment_workflow_with_loop_supernodes(wf: &Workflow) -> Workflow {
             host: None,
             workspace: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             next: Vec::new(),
             depends_on: Vec::new(),
             split: None,
@@ -4723,6 +4743,7 @@ async fn run_node(
                     effective_continue_on_error,
                     &opts.transcript_dir,
                     opts.workflow.action_findings_profile(step),
+                    opts.factory.action_engagement(step),
                 )
                 .await
             }
@@ -5412,6 +5433,7 @@ fn write_run_step_transcript(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_action_step(
     dispatcher: &rupu_mcp::ToolDispatcher,
     step: &Step,
@@ -5424,6 +5446,10 @@ async fn execute_action_step(
     // (`Workflow::action_findings_profile`). The dispatcher is built once
     // per run, so the per-step value travels with the call.
     findings_profile: rupu_coverage::FindingProfile,
+    // The engagement set this step records under, as resolved by
+    // [`StepFactory::action_engagement`]: `Ok(None)` is the native `code`
+    // path, `Err` a launch-time refusal.
+    engagement: Result<Option<Arc<rupu_coverage::profile::ActiveSet>>, String>,
 ) -> Result<StepResult, RunWorkflowError> {
     let tool = step
         .action
@@ -5445,10 +5471,30 @@ async fn execute_action_step(
     // Narrowing here makes it structural: even if a future caller reuses
     // this dispatcher, an action step can still only invoke the tool named
     // in the workflow source.
-    let call_result = dispatcher
-        .narrowed_to(tool)
-        .call_with_findings_profile(tool, args.clone(), findings_profile)
-        .await;
+    let call_result = match engagement {
+        // Native `code` path: exactly today's call.
+        Ok(None) => {
+            dispatcher
+                .narrowed_to(tool)
+                .call_with_findings_profile(tool, args.clone(), findings_profile)
+                .await
+        }
+        // A real engagement cannot reach `findings.record` yet: the
+        // dispatcher carries a per-call findings PROFILE but no engagement
+        // set (delivery is wired MCP-side in the next task). Recording
+        // anyway would file the finding under the native `code` rules —
+        // the wrong domain — so refuse instead of silently downgrading.
+        Ok(Some(set)) => Err(rupu_mcp::McpError::Tool(format!(
+            "step `{}`: engagement profile(s) [{}] cannot be delivered to `{tool}` yet; \
+             refusing rather than recording under the native `code` rules",
+            step.id,
+            set.ids().join(", "),
+        ))),
+        // The selection itself was refused at launch (unknown id, a step
+        // widening the run's set): the same failed-action shape as any other
+        // call failure, honoring `continue_on_error`.
+        Err(reason) => Err(rupu_mcp::McpError::Tool(reason)),
+    };
 
     let (allowed, applied, reason) = match &call_result {
         Ok(_) => (true, true, None),
@@ -5583,6 +5629,7 @@ async fn fire_notify_hooks(
             host: None,
             workspace: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             next: Vec::new(),
             depends_on: Vec::new(),
             split: None,
@@ -5592,6 +5639,9 @@ async fn fire_notify_hooks(
             run: None,
         };
         let findings_profile = opts.workflow.action_findings_profile(&synth);
+        // A notify hook has no step of its own to narrow with, so it records
+        // under the workflow's `defaults.engagement_profiles`.
+        let engagement = opts.factory.action_engagement(&synth);
         match execute_action_step(
             dispatcher,
             &synth,
@@ -5600,6 +5650,7 @@ async fn fire_notify_hooks(
             true,
             &opts.transcript_dir,
             findings_profile,
+            engagement,
         )
         .await
         {
@@ -5839,6 +5890,7 @@ pub async fn run_reject_cleanup(
                         false,
                         &opts.transcript_dir,
                         opts.workflow.action_findings_profile(step),
+                        opts.factory.action_engagement(step),
                     )
                     .await
                 }
@@ -6158,6 +6210,13 @@ async fn dispatch_placed_step(
     codename: Option<&rupu_codename::Codename>,
     transcript_path: &Path,
 ) -> Result<(String, bool), RunWorkflowError> {
+    // Fail-closed: remote engagement delivery is deferred, so a non-default
+    // selection is refused BEFORE anything is packed or dispatched. The
+    // failure honors `continue_on_error` like any other placement failure.
+    if let Some(reason) = crate::engagement::remote_unit_refusal(&opts.workflow, step) {
+        let source = RunError::Preflight(reason.clone());
+        return placed_failure(step, host, reason, source, continue_on_error);
+    }
     let Some(dispatcher) = opts.unit_dispatcher.as_ref() else {
         let source =
             RunError::Provider("host placement requires fleet access — run via the CP".into());
@@ -6883,6 +6942,12 @@ async fn run_fanout_step(
     // Same for every unit of the step (and its retry); `Copy`, so each
     // spawned task gets its own.
     let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
+    // Fail-closed (remote engagement delivery is deferred): why every PLACED
+    // unit of this step must be refused, if it must. A fan-out without
+    // `distribute:` runs locally through the step factory and is unaffected.
+    let unit_engagement_refusal: Option<String> = distribute_hosts
+        .as_ref()
+        .and_then(|_| crate::engagement::remote_unit_refusal(&opts.workflow, step));
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -6939,6 +7004,7 @@ async fn run_fanout_step(
             None
         };
         let dispatcher_for_task = unit_dispatcher.clone();
+        let engagement_refusal_for_task = unit_engagement_refusal.clone();
         let pause_for_task = unit_pause.clone();
         // The step's ONE packed workspace, shared with this unit when sync
         // mode is active. None ⇒ self-contained; Some ⇒ the unit stages this
@@ -7018,6 +7084,17 @@ async fn run_fanout_step(
                     // configuration error — the caller must supply one when running
                     // a workflow with `distribute:`.
                     match dispatcher_for_task {
+                        // A non-default engagement set cannot be delivered
+                        // to a host: refuse the unit outright (no dispatch,
+                        // and so no fallback-host retry either) rather than
+                        // run it under the native `code` rules.
+                        _ if engagement_refusal_for_task.is_some() => {
+                            let err = RunError::Preflight(
+                                engagement_refusal_for_task.unwrap_or_default(),
+                            );
+                            let msg = err.to_string();
+                            (msg.clone(), false, Some(msg), Some(err), None, false)
+                        }
                         None => {
                             let err = RunError::Provider(
                                 "distribute requires fleet access — run via the CP".into(),

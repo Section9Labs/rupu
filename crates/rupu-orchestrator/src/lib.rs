@@ -12,6 +12,7 @@
 
 pub mod codenames;
 pub mod cron_schedule;
+mod engagement;
 pub mod event_match;
 pub mod event_vocab;
 pub mod executor;
