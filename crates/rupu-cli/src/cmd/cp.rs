@@ -360,6 +360,13 @@ pub async fn handle(action: Action) -> ExitCode {
                     },
                 ));
 
+            // Adapter for rupu-cp's ModelCatalog port: the discovered
+            // model-limits catalog + manual refetch behind `/api/models*`.
+            let model_catalog: Option<Arc<dyn rupu_cp::model_catalog::ModelCatalog>> =
+                Some(Arc::new(crate::cp_model_catalog::RuntimeModelCatalog {
+                    global_dir: global_dir.clone(),
+                }));
+
             // Repo lister for the web Run target picker. The same SCM registry
             // and repo lister feed the fleet strip's SCM half below — one
             // credential resolution, not two.
@@ -447,6 +454,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     launcher: Some(launcher),
                     session_sender: Some(session_sender),
                     repos,
+                    model_catalog,
                     agent_launcher,
                     session_starter,
                     generator,

@@ -12,6 +12,7 @@ pub mod cp_agent_launcher;
 pub mod cp_definition_generator;
 pub mod cp_inventory;
 pub mod cp_launcher;
+pub mod cp_model_catalog;
 pub mod cp_repos;
 pub mod cp_session_mutator;
 pub mod cp_session_sender;
