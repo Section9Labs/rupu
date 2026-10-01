@@ -196,10 +196,35 @@ assert_out "source ships" "crates/rupu-cli/src/main.rs" \
 assert_out "markdown compiled into the binary ships" "crates/rupu-cli/templates/agents/fix-bug.md" \
   sh -c "printf 'crates/rupu-cli/templates/agents/fix-bug.md\n' | '$SHIP'"
 
-# docs/pages is the published site and keyring, guarded by CI's keyring
-# check — it is not "just docs".
-assert_out "docs/pages ships" "docs/pages/rupu-archive-keyring.asc" \
+# docs/pages is the site GitHub Pages deploys on merge, not something a
+# release publishes; its keyring check runs on the PR that touches it.
+assert_out "docs/pages ships nothing" "" \
   sh -c "printf 'docs/pages/rupu-archive-keyring.asc\n' | '$SHIP'"
+
+# Release mechanics, not product. Re-publishing after a fix there is what
+# release-beta.yml's `force` input is for.
+assert_out "CI and rulesets ship nothing" "" \
+  sh -c "printf '.github/workflows/ci.yml\n.github/rulesets/main.json\n' | '$SHIP'"
+
+assert_out "release scripts ship nothing" "" \
+  sh -c "printf 'scripts/next-beta-version.sh\nscripts/tests/release-cadence-tests.sh\n' | '$SHIP'"
+
+# A crate's integration tests are never linked into the binary.
+assert_out "crate integration tests ship nothing" "" \
+  sh -c "printf 'crates/rupu-cli/tests/it/main.rs\ncrates/rupu-app-canvas/tests/it/snapshots/a.snap\n' | '$SHIP'"
+
+# The regression the crate-segment check exists for: in a case pattern `*`
+# also matches `/`, so `crates/*/tests/*` alone would swallow a tests/
+# directory under src/, which is compiled into the crate.
+assert_out "a tests/ directory under src/ ships" "crates/rupu-cli/src/cmd/tests/helpers.rs" \
+  sh -c "printf 'crates/rupu-cli/src/cmd/tests/helpers.rs\n' | '$SHIP'"
+
+assert_out "a lookalike of tests/ ships" "crates/rupu-cli/testdata/x.json" \
+  sh -c "printf 'crates/rupu-cli/testdata/x.json\n' | '$SHIP'"
+
+# #711's own diff: a CI-only change must not cut a beta.
+assert_out "a CI-only batch ships nothing" "" \
+  sh -c "printf '.github/workflows/release-beta.yml\nCLAUDE.md\ndocs/RELEASING.md\nscripts/shipped-paths.sh\n' | '$SHIP'"
 
 assert_out "a lookalike of docs/ ships" "docsite/index.md" \
   sh -c "printf 'docsite/index.md\n' | '$SHIP'"

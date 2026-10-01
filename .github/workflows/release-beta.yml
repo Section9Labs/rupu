@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Release even if nothing shipped has changed since the last beta"
+        description: "Release even if nothing shipped has changed since the last beta (e.g. to re-publish after a release-workflow fix)"
         type: boolean
         default: false
       dry_run:
@@ -119,10 +119,11 @@ jobs:
           #
           # `prev` is the nearest beta tag in this commit's history,
           # whatever its base — after a stable promotion bumps the base, the
-          # bump commit itself is the change. Then: if the only paths that
-          # changed since `prev` are documentation (scripts/shipped-paths.sh),
-          # a release would rebuild an identical binary, so skip it rather
-          # than spend a full CI run on it.
+          # bump commit itself is the change. Then: if nothing that ships
+          # changed since `prev` — only docs, CI, release scripts or
+          # integration tests (scripts/shipped-paths.sh) — a release would
+          # publish a beta identical to the last one, so skip it rather than
+          # spend a full CI run on it.
           #
           # (Green CI used to be condition 3, checked by querying ci.yml runs
           # for this SHA. It is now the `ci` job below.)
@@ -136,7 +137,7 @@ jobs:
             else
               shipped=$(git diff --name-only "$prev" HEAD | scripts/shipped-paths.sh)
               if [ -z "$shipped" ]; then
-                skip "only documentation changed since $prev"
+                skip "nothing shipped changed since $prev (only docs, CI, scripts or tests)"
               fi
               # A here-string, not `printf | head`: under pipefail, head
               # closing the pipe early SIGPIPEs printf and aborts the step
