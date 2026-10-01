@@ -383,9 +383,14 @@ fn engage<'a>(engagement: &'a ActiveSet, input: &ReportFindingInput) -> Engaged<
 }
 
 /// What the owning profile requires of a full report beyond the universal
-/// validation: its completeness checks, the evidence block kinds it permits,
-/// and the classification systems it recognises. Every problem is returned
-/// (not just the first) so the agent fixes them all in one retry.
+/// validation: its REQUIRED completeness checks, and nothing else. A
+/// profile's `evidence_blocks` and `classification_systems` are declarations
+/// (they feed the agent guidance and the checklist predicates), not
+/// allow-lists: an extra block or system is harmless, and rejecting one would
+/// misfire (a `code` finding's CVSS score folds into its classifications, and
+/// `code` lists only CWE). A block or system a profile truly needs is
+/// enforced by naming it in a `completeness` check. Every unmet check is
+/// returned (not just the first) so the agent fixes them all in one retry.
 fn profile_problems(
     profile: &EngagementProfile,
     report: &crate::report::FindingReport,
@@ -418,52 +423,6 @@ fn profile_problems(
                 profile.id
             ),
         }),
-    }
-
-    for (i, claim) in report.evidence.iter().enumerate() {
-        for (j, block) in claim.blocks.iter().enumerate() {
-            let kind = block.kind();
-            if !profile.evidence_blocks.iter().any(|b| b == kind) {
-                problems.push(FieldError {
-                    path: format!("report.evidence[{i}].blocks[{j}]"),
-                    message: format!(
-                        "evidence block `{kind}` is not permitted by engagement profile `{}` (permitted: {})",
-                        profile.id,
-                        profile.evidence_blocks.join(", ")
-                    ),
-                });
-            }
-        }
-    }
-
-    // The systems the agent named: explicit classifications, plus CWE when
-    // `cwe` lists any. The rating's CVSS vector is how every finding is
-    // scored, not a weakness taxonomy a profile has to list.
-    let mut systems: Vec<&str> = report
-        .classifications
-        .iter()
-        .map(|c| c.system.as_str())
-        .collect();
-    if !report.cwe.is_empty() {
-        systems.push("CWE");
-    }
-    let mut seen: Vec<String> = Vec::new();
-    for system in systems {
-        let permitted = profile
-            .classification_systems
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(system));
-        if !permitted && !seen.iter().any(|s| s.eq_ignore_ascii_case(system)) {
-            seen.push(system.to_string());
-            problems.push(FieldError {
-                path: "report.classifications".into(),
-                message: format!(
-                    "classification system `{system}` is not recognised by engagement profile `{}` (recognised: {})",
-                    profile.id,
-                    profile.classification_systems.join(", ")
-                ),
-            });
-        }
     }
     problems
 }
@@ -1346,9 +1305,7 @@ mod tests {
         let store = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(ws.path(), "t");
         let opts = engaged_opts(store.path(), &["code", "binary"]);
-        let mut r = fixture_report();
-        r.classifications.clear(); // `code` permits CWE only
-        let mut i = full_input(r);
+        let mut i = full_input(fixture_report());
         i.scope = FindingScope::File;
         i.file_path = Some("src/routes/notes.rs".into());
         report_finding(&paths, attribution(), i, &opts).expect("code:file, empty completeness");
@@ -1376,9 +1333,7 @@ mod tests {
         let store = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(ws.path(), "t");
         let opts = engaged_opts(store.path(), &["code", "binary"]);
-        let mut r = fixture_report();
-        r.classifications.clear();
-        report_finding(&paths, attribution(), full_input(r), &opts).expect("passes");
+        report_finding(&paths, attribution(), full_input(fixture_report()), &opts).expect("passes");
         assert!(only_record(&paths).asset.is_none());
         assert!(!paths.assets.exists(), "no file, so no asset to register");
     }
@@ -1398,38 +1353,33 @@ mod tests {
     }
 
     #[test]
-    fn evidence_blocks_and_classification_systems_are_held_to_the_owner_profile() {
+    fn blocks_and_classification_systems_outside_the_declared_lists_are_not_rejected() {
+        // `evidence_blocks` / `classification_systems` are declarations, not
+        // allow-lists. A `code` finding (declares text/code_slice/diff and
+        // CWE only) that carries a disasm block, a CVE classification AND a
+        // CVSS score -- which folds into its classifications -- must record.
         let ws = tempfile::TempDir::new().unwrap();
         let store = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(ws.path(), "t");
-        let opts = engaged_opts(store.path(), &["code"]);
-        // `code` permits text/code_slice/diff and CWE: a disasm block and the
-        // fixture's CVE classification are both outside it.
+        let opts = engaged_opts(store.path(), &["code", "binary"]);
         let mut r = fixture_report();
         r.evidence[0].blocks = vec![disasm()];
+        r.rating.cvss_v3 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".into();
+        let systems: Vec<String> = r
+            .all_classifications()
+            .into_iter()
+            .map(|c| c.system)
+            .collect();
+        assert!(
+            systems.iter().any(|s| s == "CVE") && systems.iter().any(|s| s == "CVSS"),
+            "the fixture exercises both undeclared systems: {systems:?}"
+        );
         let mut i = full_input(r);
         i.scope = FindingScope::File;
         i.file_path = Some("src/a.rs".into());
-        let err = report_finding(&paths, attribution(), i, &opts)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("report.evidence[0].blocks[0]"), "{err}");
-        assert!(err.contains("`disasm`"), "{err}");
-        assert!(err.contains("CVE"), "{err}");
-        assert!(!paths.findings.exists());
-    }
-
-    #[test]
-    fn a_cvss_rating_is_not_a_classification_system() {
-        let ws = tempfile::TempDir::new().unwrap();
-        let store = tempfile::TempDir::new().unwrap();
-        let paths = CoveragePaths::new(ws.path(), "t");
-        let opts = engaged_opts(store.path(), &["binary"]);
-        let mut i = binary_input(true, "binary:function");
-        i.report.as_mut().unwrap().rating.cvss_v3 =
-            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".into();
         report_finding(&paths, attribution(), i, &opts)
-            .expect("the rating's CVSS vector is not a taxonomy the profile must list");
+            .expect("an undeclared block / classification system is not a rejection");
+        assert_eq!(only_record(&paths).asset.unwrap().kind, "code:file");
     }
 
     #[test]
