@@ -1,0 +1,21 @@
+name: binary-assessment
+description: >
+  Sample binary reverse-engineering assessment. The whole run is conducted
+  under the `binary` engagement profile, so findings are routed by asset kind
+  (`binary:function`), must carry a disassembly or hexdump, and the functions
+  the analyst marks land in the project's asset graph. Run with
+  `--mode bypass` to skip per-tool prompts.
+defaults:
+  engagement_profiles: [binary]
+inputs:
+  prompt:
+    type: string
+    required: true
+steps:
+  - id: analyse
+    agent: binary-analyst
+    actions: []
+    prompt: |
+      Analyse the following binary and record what you find:
+
+      {{ inputs.prompt }}
