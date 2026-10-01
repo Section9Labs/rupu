@@ -326,7 +326,7 @@ impl NavState {
 
     /// The unit under the cursor within `step`'s *filtered* list. Same answer
     /// as [`NavState::selected_unit`] when `step` is the selected step; for
-    /// renderers that hold only the step (`layout::fanout_block`).
+    /// renderers that hold only the step (the structure pane's fan-out block).
     pub fn selected_unit_in<'a>(&self, step: &'a StepView) -> Option<&'a UnitView> {
         let units = self.filtered_units(step);
         units.get(clamp_idx(self.unit_idx, units.len())).copied()
@@ -936,7 +936,8 @@ mod tests {
 
     #[test]
     fn step_scoped_accessors_agree_with_the_view_scoped_ones() {
-        // `fanout_block` only holds the step, so nav must answer from it.
+        // The structure pane's fan-out block only holds the step, so nav must
+        // answer from it.
         let mut v = fanout_view();
         complete_unit(&mut v, "hunt", 0, true); // svc-0 Done
         complete_unit(&mut v, "hunt", 1, false); // svc-1 Failed; svc-2 Running
@@ -1226,6 +1227,31 @@ mod tests {
         assert_eq!(nav.depth(), Depth::Step);
         nav.apply(NavKey::Filter, &v);
         assert_ne!(nav.filter(), UnitFilter::All);
+    }
+
+    #[test]
+    fn out_ascends_only_with_the_structure_pane_focused() {
+        // `Out` at `Run` is a no-op anyway, so the gate must be proven at a
+        // depth where `Out` really ascends: drill to `Unit`, then move focus
+        // off the structure pane. Removing the `structure` gate on `Out`
+        // makes this fail (the depth would drop to `Step`).
+        let v = fanout_view();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &v);
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Unit);
+
+        for pane in [Pane::Stream, Pane::Firehose] {
+            nav.pane = pane;
+            assert_eq!(nav.apply(NavKey::Out, &v), NavAction::None);
+            assert_eq!(nav.depth(), Depth::Unit, "Out in {pane:?} must not ascend");
+            assert_eq!(nav.breadcrumb(&v), vec!["mint-tundra", "hunt", "otter#1"]);
+        }
+
+        // Back on the structure pane the same key ascends.
+        nav.pane = Pane::Structure;
+        nav.apply(NavKey::Out, &v);
+        assert_eq!(nav.depth(), Depth::Step);
     }
 
     #[test]

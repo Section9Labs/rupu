@@ -6,7 +6,7 @@
 //! <header: layout::dashboard — title · progress · meters>
 //! ─ structure ───────────┬─ stream · <selection> ───────────
 //!  the workflow DAG      │  the selection's transcript
-//!  (structure::…)        ├─ live · N active ────────────────
+//!  (structure::…)        ├─ live · N active · H hosts ──────
 //!                        │  the run-wide firehose
 //! <footer: layout::footer_line — gate-aware key legend>
 //! ```
@@ -22,21 +22,28 @@
 //!   (which only moves focus) cycles what is on screen.
 //! * An empty stream or firehose is ONE dim `waiting for activity…` row,
 //!   never a fabricated line and never a zero-height region.
+//! * The firehose rule counts live agents (`N active`) and, only when the
+//!   running work names any, the distinct hosts it runs on (`H hosts`).
 //!
-//! The stream and firehose are windowed **tail-anchored**: the newest line is
-//! the region's last row, and [`NavState::scroll_offset`] holds it that many
-//! lines above the tail. [`dashboard_frame`] only *reads* the offset (it takes
+//! The stream and firehose are windowed **tail-anchored**: once a feed has at
+//! least as many lines as the region has rows, its newest line is the region's
+//! last row, and [`NavState::scroll_offset`] holds the window that many lines
+//! above the tail. A shorter feed is top-aligned instead (oldest line first,
+//! blank rows below). [`dashboard_frame`] only *reads* the offset (it takes
 //! `&NavState`); the driver clamps it each frame against the real buffer
 //! using [`scroll_rows`], which reports how many rows each pane really draws.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
+use rupu_orchestrator::runs::StepKind;
 use rupu_orchestrator::Workflow;
 
 use crate::output::live_view::layout::{dashboard, footer_line, printable};
 use crate::output::live_view::nav::{NavState, Pane};
 use crate::output::live_view::row::{truncate_to, Line};
 use crate::output::live_view::structure::structure_pane;
-use crate::output::run_model::{RunView, StepState, UnitStatus};
+use crate::output::run_model::{RunView, StepState, StepView, UnitStatus};
 
 /// Below this width the three-column split is unreadable: fall back to one
 /// stacked pane.
@@ -297,7 +304,12 @@ impl Panes<'_> {
     }
 
     fn firehose_title(&self) -> String {
-        format!("live · {} active", active_count(self.view))
+        let hosts = match active_hosts(self.view) {
+            0 => String::new(),
+            1 => " · 1 host".to_string(),
+            n => format!(" · {n} hosts"),
+        };
+        format!("live · {} active{hosts}", active_count(self.view))
     }
 
     /// Exactly `rows` rows (blank-padded) of the stream, windowed.
@@ -361,11 +373,12 @@ fn pad_to(line: Line, w: usize) -> Line {
     }
 }
 
-/// Exactly `rows` rows of `lines` (oldest → newest), tail-anchored and held
-/// `offset` lines above the tail, each clipped to `w`, blank-padded below.
-/// An empty feed is ONE dim [`WAITING`] row. An offset past the scrollback is
-/// bounded here too, so the window is always full of the oldest lines rather
-/// than blank.
+/// Exactly `rows` rows of `lines` (oldest → newest), each clipped to `w`:
+/// the window is anchored to the live tail and held `offset` lines above it,
+/// so with at least `rows` lines the newest is the last row. A feed shorter
+/// than `rows` fits whole: top-aligned, blank-padded below. An empty feed is
+/// ONE dim [`WAITING`] row. An offset past the scrollback is bounded here too,
+/// so the window is always full of the oldest lines rather than blank.
 fn feed_rows(lines: &[Line], offset: usize, rows: usize, w: usize) -> Vec<Line> {
     let mut out: Vec<Line> = if lines.is_empty() {
         vec![Line::new().dim(WAITING)]
@@ -399,15 +412,21 @@ fn selection_label(view: &RunView, nav: &NavState) -> String {
         .map_or_else(|| "run".to_string(), |s| printable(&s.step_id))
 }
 
+/// The running steps that are themselves work. A `loop:` step stays `Running`
+/// for the whole loop but only frames its members (which are steps of their
+/// own), so counting it too would report an agent that does not exist.
+fn running_work(view: &RunView) -> impl Iterator<Item = &StepView> {
+    view.steps
+        .iter()
+        .filter(|s| s.state == StepState::Running && s.kind != StepKind::Loop)
+}
+
 /// Agents running right now: a running leaf step counts as one, a running
 /// fan-out contributes its running units (never itself on top of them), and
 /// each running sub-agent dispatch is one more live transcript. A real count
 /// of live work — `0` for a finished or parked run.
 fn active_count(view: &RunView) -> usize {
-    let steps: usize = view
-        .steps
-        .iter()
-        .filter(|s| s.state == StepState::Running)
+    let steps: usize = running_work(view)
         .map(|s| {
             if s.units.is_empty() {
                 1
@@ -424,15 +443,41 @@ fn active_count(view: &RunView) -> usize {
     steps + dispatches
 }
 
+/// Distinct hosts the live work (the same work [`active_count`] counts) runs
+/// on: a running leaf step's own host, a running fan-out's running units'
+/// hosts. Work the run has not placed on a named host (`host: None` = the
+/// orchestrator's own machine) names no host, so a purely local run is `0` —
+/// the title then omits the figure instead of inventing one.
+fn active_hosts(view: &RunView) -> usize {
+    let mut hosts: BTreeSet<&str> = BTreeSet::new();
+    for step in running_work(view) {
+        if step.units.is_empty() {
+            hosts.extend(step.host.as_deref());
+        } else {
+            hosts.extend(
+                step.units
+                    .values()
+                    .filter(|u| u.status == UnitStatus::Running)
+                    .filter_map(|u| u.host.as_deref()),
+            );
+        }
+    }
+    hosts.retain(|h| !h.is_empty());
+    hosts.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::live_view::nav::{NavKey, Pane};
+    use crate::output::live_view::mux::project_event;
+    use crate::output::live_view::nav::{Depth, NavKey, Pane};
     use crate::output::live_view::row::{render_plain, Style};
-    use crate::output::run_model::GateView;
+    use crate::output::run_model::{GateView, UnitView};
     use chrono::{Duration, TimeZone};
     use rupu_orchestrator::executor::Event;
-    use rupu_orchestrator::runs::{RunStatus, StepKind};
+    use rupu_orchestrator::runs::RunStatus;
+    use rupu_transcript::Event as Tx;
+    use serde_json::json;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap()
@@ -464,6 +509,89 @@ steps:
   - id: deploy
     agent: deployer
     prompt: p
+"#;
+
+    /// One of every construct the structure pane draws, in one workflow: a
+    /// split into a `for_each`, a `parallel` and a plain step, a join, a
+    /// `branch` (then/else), an approval gate, a bounded loop, and a panel.
+    const COMPOSITE_WF: &str = r#"
+name: assess-fleet
+steps:
+  - id: preflight
+    agent: scanner
+    prompt: go
+    next: [recon]
+  - id: recon
+    split: [sweep, hunt, lanes]
+  - id: sweep
+    agent: sweeper
+    prompt: p
+    next: [gather]
+  - id: hunt
+    for_each: '["a", "b", "c", "d"]'
+    agent: worker
+    prompt: p
+    next: [gather]
+  - id: lanes
+    parallel:
+      - id: spec
+        agent: writer
+        prompt: a
+      - id: verify
+        agent: reviewer
+        prompt: b
+    next: [gather]
+  - id: gather
+    join: { wait: all }
+  - id: pick
+    branch:
+      condition: "{{ steps.sweep.output }}"
+      then: [ship]
+      else: [hold]
+  - id: ship
+    agent: shipper
+    prompt: p
+  - id: hold
+    agent: holder
+    prompt: p
+  - id: approve
+    approval:
+      prompt: "Ship it?"
+  - id: gen
+    agent: generator
+    prompt: p
+  - id: critique
+    agent: critic
+    prompt: p
+    depends_on: [gen]
+  - id: review
+    panel:
+      panelists: [security-reviewer, perf-reviewer]
+      subject: "{{ steps.critique.output }}"
+loops:
+  refine:
+    nodes: [gen, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+
+    /// A preflight, a `for_each` over a batch of services, and the report.
+    const DRILL_WF: &str = r#"
+name: breakers
+steps:
+  - id: preflight
+    agent: scanner
+    prompt: go
+    next: [hunt]
+  - id: hunt
+    for_each: '["auth", "billing", "search"]'
+    agent: breaker
+    prompt: p
+    next: [report]
+  - id: report
+    agent: reporter
+    prompt: p
+    depends_on: [hunt]
 "#;
 
     const FANOUT_WF: &str = r#"
@@ -577,6 +705,343 @@ steps:
             Line::new().plain("heron#1  ").dim("✓ done"),
             Line::new().plain("lynx#3   ").dim("▸ read_file Cargo.toml"),
         ]
+    }
+
+    // ---- whole-frame fixtures ---------------------------------------------------
+
+    /// `s01..s12` chained, then two split→join phases (`recon1`, then
+    /// `recon2` fanning a `for_each` `hunt` beside a `probe`) and a `report`.
+    fn large_wf() -> Workflow {
+        let mut yaml = String::from("name: sweep-fleet\nsteps:\n");
+        for i in 1..=12 {
+            let next = if i == 12 {
+                "recon1".to_string()
+            } else {
+                format!("s{:02}", i + 1)
+            };
+            yaml.push_str(&format!(
+                "  - id: s{i:02}\n    agent: scanner\n    prompt: p\n    next: [{next}]\n"
+            ));
+        }
+        yaml.push_str(
+            r#"  - id: recon1
+    split: [a, b]
+  - id: a
+    agent: ax
+    prompt: p
+    next: [join1]
+  - id: b
+    agent: bx
+    prompt: p
+    next: [join1]
+  - id: join1
+    join: { wait: all }
+    next: [recon2]
+  - id: recon2
+    split: [hunt, probe]
+  - id: hunt
+    for_each: '["a", "b"]'
+    agent: breaker
+    prompt: p
+    next: [join2]
+  - id: probe
+    agent: prober
+    prompt: p
+    next: [join2]
+  - id: join2
+    join: { wait: all }
+    next: [report]
+  - id: report
+    agent: reporter
+    prompt: p
+"#,
+        );
+        Workflow::parse(&yaml).expect("large workflow parses")
+    }
+
+    const ROLES: [&str; 5] = ["otter", "heron", "wren", "egret", "lynx"];
+    /// Started fan-out units alternate between these two placed hosts.
+    const HOSTS: [&str; 2] = ["mini", "kuki"];
+
+    /// A fan-out unit with the identity a started unit carries; queued units
+    /// know neither a codename nor a provider/model.
+    fn unit_of(i: usize, status: UnitStatus) -> UnitView {
+        let started = status != UnitStatus::Queued;
+        UnitView {
+            index: i,
+            unit_key: format!("svc-{i}"),
+            agent: Some("breaker".into()),
+            codename: started.then(|| format!("{}#{}", ROLES[i % ROLES.len()], i + 1)),
+            provider: started.then(|| "anthropic".to_string()),
+            model: started.then(|| "claude-opus-5-5".to_string()),
+            host: started.then(|| HOSTS[i % HOSTS.len()].to_string()),
+            status,
+        }
+    }
+
+    /// The large run: every `s*` step and the first phase settled, the second
+    /// phase open with `hunt` fanned over 86 units (52 done, 2 failed, 6
+    /// running, 26 queued) and `probe` done; the join and report to come.
+    fn large_view() -> RunView {
+        let mut v = RunView::default();
+        v.workflow_name = "sweep-fleet".into();
+        v.crew = Some("mint-tundra".into());
+        v.status = RunStatus::Running;
+        v.started_at = Some(now() - Duration::seconds(38 * 60 + 5));
+        for i in 1..=12 {
+            let id = format!("s{i:02}");
+            begin(&mut v, &id, StepKind::Linear, Some("scanner"), None, None);
+            complete(&mut v, &id, 1_000 + i as u64);
+        }
+        begin(&mut v, "recon1", StepKind::Split, None, None, None);
+        complete(&mut v, "recon1", 1_000);
+        begin(&mut v, "a", StepKind::Linear, Some("ax"), None, None);
+        complete(&mut v, "a", 4_000);
+        begin(&mut v, "b", StepKind::Linear, Some("bx"), None, None);
+        complete(&mut v, "b", 6_000);
+        begin(&mut v, "join1", StepKind::Join, None, None, None);
+        complete(&mut v, "join1", 100);
+        begin(&mut v, "recon2", StepKind::Split, None, None, None);
+        complete(&mut v, "recon2", 1_000);
+        begin(&mut v, "hunt", StepKind::ForEach, None, None, None);
+        for i in 0..86 {
+            let status = match i {
+                7 | 31 => UnitStatus::Failed,
+                0..=53 => UnitStatus::Done,
+                54..=59 => UnitStatus::Running,
+                _ => UnitStatus::Queued,
+            };
+            v.step_mut("hunt").units.insert(i, unit_of(i, status));
+        }
+        begin(
+            &mut v,
+            "probe",
+            StepKind::Linear,
+            Some("prober"),
+            None,
+            None,
+        );
+        complete(&mut v, "probe", 5_000);
+        v.step_mut("join2");
+        v.step_mut("report");
+        v.usage = Some(rupu_cp::usage::UsageSummary {
+            input_tokens: 41_000_000,
+            output_tokens: 2_300_000,
+            total_tokens: 43_300_000,
+            cost_usd: Some(112.60),
+            priced: true,
+            ..Default::default()
+        });
+        v.findings_by_severity.insert("high".into(), 4);
+        v
+    }
+
+    /// The pinned/merged activity of the six running units, as the mux
+    /// projects it.
+    fn running_units_firehose() -> Vec<Line> {
+        let at = |i: usize| format!("{}#{}", ROLES[i % ROLES.len()], i + 1);
+        let (a, b, c, d, e, f) = (at(54), at(55), at(56), at(57), at(58), at(59));
+        projected(&[
+            (
+                &a,
+                call("read_file", json!({"path": "svc/auth/handler.rs"})),
+            ),
+            (&b, call("grep", json!({"pattern": "unwrap()"}))),
+            (
+                &c,
+                call("read_file", json!({"path": "svc/billing/ledger.rs"})),
+            ),
+            (&a, finding("high", "token accepted after revoke")),
+            (
+                &d,
+                call("read_file", json!({"path": "svc/search/index.rs"})),
+            ),
+            (&e, call("grep", json!({"pattern": "TODO"}))),
+            (&f, call("read_file", json!({"path": "svc/export/csv.rs"}))),
+            (
+                &b,
+                call("read_file", json!({"path": "svc/auth/session.rs"})),
+            ),
+        ])
+    }
+
+    fn begin(
+        v: &mut RunView,
+        step: &str,
+        kind: StepKind,
+        agent: Option<&str>,
+        codename: Option<&str>,
+        host: Option<&str>,
+    ) {
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            kind,
+            agent: agent.map(Into::into),
+            host: host.map(Into::into),
+            codename: codename.map(Into::into),
+        });
+    }
+
+    fn agent_up(v: &mut RunView, step: &str, unit: Option<usize>, provider: &str, model: &str) {
+        v.apply(&Event::AgentStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            unit_index: unit,
+            codename: None,
+            agent: "a".into(),
+            provider: Some(provider.into()),
+            model: Some(model.into()),
+            agent_run_id: "ar".into(),
+            transcript_path: "t".into(),
+        });
+    }
+
+    fn unit_up(
+        v: &mut RunView,
+        step: &str,
+        index: usize,
+        agent: &str,
+        codename: &str,
+        host: Option<&str>,
+    ) {
+        v.apply(&Event::UnitStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            unit_key: format!("svc-{index}"),
+            agent: Some(agent.into()),
+            transcript_path: "t".into(),
+            host: host.map(Into::into),
+            codename: Some(codename.into()),
+        });
+    }
+
+    fn unit_down(v: &mut RunView, step: &str, index: usize, success: bool) {
+        v.apply(&Event::UnitCompleted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            unit_key: format!("svc-{index}"),
+            success,
+            tokens_in: 0,
+            tokens_out: 0,
+            host: None,
+        });
+    }
+
+    /// The nav a cursor on `step` gives (steps in first-seen order).
+    fn nav_on(view: &RunView, step: &str) -> NavState {
+        let at = view.steps.iter().position(|s| s.step_id == step).unwrap();
+        let mut nav = NavState::default();
+        for _ in 0..at {
+            nav.apply(NavKey::Down, view);
+        }
+        nav
+    }
+
+    fn call(tool: &str, input: serde_json::Value) -> Tx {
+        Tx::ToolCall {
+            call_id: "c".into(),
+            tool: tool.into(),
+            input,
+        }
+    }
+
+    /// Feed rows exactly as the mux would project them: each `(codename,
+    /// event)` through the real [`project_event`], in arrival order.
+    fn projected(events: &[(&str, Tx)]) -> Vec<Line> {
+        events
+            .iter()
+            .filter_map(|(codename, ev)| project_event(ev, Some(codename)))
+            .map(|f| f.line)
+            .collect()
+    }
+
+    /// A transcript from one agent (`codename`): what the stream pane shows
+    /// when it is pinned to it.
+    fn transcript(codename: &str, events: Vec<Tx>) -> Vec<Line> {
+        let tagged: Vec<(&str, Tx)> = events.into_iter().map(|e| (codename, e)).collect();
+        projected(&tagged)
+    }
+
+    fn finding(severity: &str, title: &str) -> Tx {
+        Tx::ActionEmitted {
+            kind: "finding".into(),
+            payload: json!({ "severity": severity, "title": title }),
+            allowed: true,
+            applied: true,
+            reason: None,
+        }
+    }
+
+    /// The composite workflow mid-run, inside its fan-out phase: the split
+    /// has fanned out, `sweep` is done, the `for_each` `hunt` is running over
+    /// four items (one done, two running, one queued) and the `parallel`
+    /// lanes have one sub-step done and one running — on two hosts. The join
+    /// and everything after it (branch, gate, loop, panel) have not started.
+    fn composite_view() -> RunView {
+        let mut v = RunView::default();
+        v.workflow_name = "assess-fleet".into();
+        v.crew = Some("mint-tundra".into());
+        v.status = RunStatus::Running;
+        v.started_at = Some(now() - Duration::seconds(3 * 60 + 40));
+
+        begin(
+            &mut v,
+            "preflight",
+            StepKind::Linear,
+            Some("scanner"),
+            Some("heron#1"),
+            Some("kuki"),
+        );
+        agent_up(&mut v, "preflight", None, "anthropic", "claude-opus-5-5");
+        complete(&mut v, "preflight", 18_000);
+        begin(&mut v, "recon", StepKind::Split, None, None, None);
+        complete(&mut v, "recon", 2_000);
+        begin(
+            &mut v,
+            "sweep",
+            StepKind::Linear,
+            Some("sweeper"),
+            Some("otter#2"),
+            Some("mini"),
+        );
+        agent_up(&mut v, "sweep", None, "openai", "gpt-5");
+        complete(&mut v, "sweep", 41_000);
+
+        begin(&mut v, "hunt", StepKind::ForEach, None, None, None);
+        unit_up(&mut v, "hunt", 0, "worker", "lynx#1", Some("mini"));
+        unit_down(&mut v, "hunt", 0, true);
+        unit_up(&mut v, "hunt", 1, "worker", "wren#1", Some("kuki"));
+        unit_up(&mut v, "hunt", 2, "worker", "egret#1", Some("mini"));
+        v.step_mut("hunt")
+            .units
+            .insert(3, unit_of(3, UnitStatus::Queued));
+
+        begin(&mut v, "lanes", StepKind::Parallel, None, None, None);
+        unit_up(&mut v, "lanes", 0, "writer", "otter#3", None);
+        unit_down(&mut v, "lanes", 0, true);
+        unit_up(&mut v, "lanes", 1, "reviewer", "heron#2", Some("kuki"));
+
+        // Not started: registered in workflow order, as the live seed does.
+        for id in [
+            "gather", "pick", "ship", "hold", "approve", "gen", "critique", "review",
+        ] {
+            v.step_mut(id);
+        }
+
+        v.usage = Some(rupu_cp::usage::UsageSummary {
+            input_tokens: 3_400_000,
+            output_tokens: 210_000,
+            total_tokens: 3_610_000,
+            cost_usd: Some(9.85),
+            priced: true,
+            ..Default::default()
+        });
+        v.findings_by_severity.insert("high".into(), 1);
+        v.findings_by_severity.insert("medium".into(), 2);
+        v
     }
 
     fn frame(
@@ -793,16 +1258,11 @@ steps:
     fn gate_parked_footer_shows_the_gate_legend() {
         let gate_wf = Workflow::parse(GATE_WF).expect("parses");
         let v = gate_parked();
-        let out = dashboard_frame(
-            &v,
-            &gate_wf,
-            &NavState::default(),
-            &stream_fixture(),
-            &firehose_fixture(),
-            now(),
-            100,
-            28,
-        );
+        // The parked gate has no transcript of its own (the stream follows the
+        // gate step, so it idles) and nothing is running (the firehose has
+        // nothing live to merge): both panes say so rather than showing
+        // activity that cannot exist.
+        let out = dashboard_frame(&v, &gate_wf, &NavState::default(), &[], &[], now(), 100, 28);
         let s = render_plain(&out);
         insta::assert_snapshot!(s);
         assert_eq!(
@@ -812,6 +1272,10 @@ steps:
         );
         // …and the gate is on screen in the structure column.
         assert!(s.contains("approve-deploy"), "{s}");
+        // The honest placeholders: one per feed pane, a real zero active.
+        assert_eq!(s.matches("waiting for activity…").count(), 2, "{s}");
+        assert!(s.contains("├─ live · 0 active ─"), "{s}");
+        assert!(!s.contains("read_file"), "{s}");
     }
 
     #[test]
@@ -1018,6 +1482,367 @@ steps:
         let fan = Workflow::parse(FANOUT_WF).expect("parses");
         let out = dashboard_frame(&v, &fan, &NavState::default(), &[], &[], now(), 100, 28);
         assert!(render_plain(&out).contains("├─ live · 3 active"));
+    }
+
+    #[test]
+    fn composite_dag_frame_shows_every_construct() {
+        let wf = Workflow::parse(COMPOSITE_WF).expect("parses");
+        let v = composite_view();
+        // The cursor is on the finished `sweep`, so the stream pane shows that
+        // step's own transcript; the firehose is the merged live activity.
+        let nav = nav_on(&v, "sweep");
+        let stream = transcript(
+            "otter#2",
+            vec![
+                call("list_files", json!({})),
+                call("read_file", json!({"path": "deploy/ingress.yaml"})),
+                Tx::Thinking {
+                    text: Some("the ingress exposes the admin port".into()),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    raw: json!({}),
+                },
+                finding("medium", "admin port reachable from the edge"),
+                Tx::AssistantMessage {
+                    content: "Swept 14 services; one exposure noted.".into(),
+                    thinking: None,
+                },
+            ],
+        );
+        let firehose = projected(&[
+            (
+                "lynx#1",
+                call("read_file", json!({"path": "svc/auth/handler.rs"})),
+            ),
+            ("heron#2", call("grep", json!({"pattern": "TODO"}))),
+            (
+                "wren#1",
+                call("read_file", json!({"path": "svc/billing/ledger.rs"})),
+            ),
+            (
+                "egret#1",
+                call("read_file", json!({"path": "svc/search/index.rs"})),
+            ),
+            ("wren#1", finding("high", "ledger totals lose cents")),
+            (
+                "heron#2",
+                call("read_file", json!({"path": "docs/runbook.md"})),
+            ),
+        ]);
+        let out = dashboard_frame(&v, &wf, &nav, &stream, &firehose, now(), 120, 53);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        assert!(out.len() <= 53, "{s}");
+        assert!(out.iter().all(|l| l.width() <= 120), "{s}");
+        // Every construct of the workflow is on screen, each with its glyph.
+        for construct in [
+            "◈  recon",      // split
+            "⊞ hunt",        // for_each
+            "⇉ lanes",       // parallel
+            "◈◄─ gather",    // join
+            "◇  pick",       // branch
+            "▶ then → ship", // …its arms
+            "⊘ else → hold",
+            "⏸  approve",    // gate
+            "↻ loop:refine", // loop frame
+            "↺ loop:refine",
+            "⟲ review", // panel
+        ] {
+            assert!(s.contains(construct), "{construct}:\n{s}");
+        }
+        // Nothing is folded: the frontier phase is open, the pane has room.
+        assert!(!s.contains('⋮') && !s.contains("(+"), "{s}");
+        assert!(!s.contains("⟦"), "{s}");
+        // The live fan-outs carry their density lines under their rails.
+        assert!(s.contains("1/4 ✓1 ◐2 ○1"), "{s}");
+        assert!(s.contains("1/2 ✓1 ◐1"), "{s}");
+        // Stream follows the cursor; the firehose rule counts live agents
+        // and the hosts they run on.
+        assert!(s.contains("─ stream · sweep ─"), "{s}");
+        assert!(s.contains("otter#2 ▸ read_file deploy/ingress.yaml"), "{s}");
+        assert!(s.contains("├─ live · 3 active · 2 hosts ─"), "{s}");
+        assert!(s.contains("wren#1 ⚑ HIGH ledger totals lose cents"), "{s}");
+    }
+
+    #[test]
+    fn large_run_frame_collapses_and_phases_at_a_tight_height() {
+        let (wf, v) = (large_wf(), large_view());
+        let firehose = running_units_firehose();
+        let out = dashboard_frame(
+            &v,
+            &wf,
+            &NavState::default(),
+            &[],
+            &firehose,
+            now(),
+            120,
+            30,
+        );
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        // Bounded: the whole run is 70+ structure rows, the frame is 30.
+        assert_eq!(out.len(), 30, "{s}");
+        assert!(out.iter().all(|l| l.width() <= 120), "{s}");
+        // Settled steps fold to one summary row; the settled phase folds to
+        // one phase row; the open phase keeps the frontier.
+        assert!(s.contains("✓ s01 … s11 (+11 done)"), "{s}");
+        assert!(s.contains("⟦ recon1 … join1 ⟧"), "{s}");
+        assert!(!s.contains("s05") && !s.contains("├─ a"), "{s}");
+        assert!(
+            s.contains("⊞ hunt") && s.contains("52/86 ✓52 ◐6 ✗2 ○26"),
+            "{s}"
+        );
+        assert!(s.contains("… +82 more"), "{s}");
+        // What is still to come stays visible.
+        assert!(s.contains("join2") && s.contains("report"), "{s}");
+        // Following with nothing chosen: the stream idles, the firehose is
+        // live and counts the six running units over two hosts.
+        assert!(s.contains("─ stream · run ─"), "{s}");
+        assert_eq!(s.matches("waiting for activity…").count(), 1, "{s}");
+        assert!(s.contains("├─ live · 6 active · 2 hosts ─"), "{s}");
+        assert!(
+            s.contains("lynx#55 ⚑ HIGH token accepted after revoke"),
+            "{s}"
+        );
+        assert!(rows_of(&out).last().unwrap().contains("Esc pause"), "{s}");
+    }
+
+    #[test]
+    fn drilled_unit_frame_fills_the_stream_from_the_pinned_feed() {
+        let wf = Workflow::parse(DRILL_WF).expect("parses");
+        let mut v = RunView::default();
+        v.workflow_name = "breakers".into();
+        v.crew = Some("mint-tundra".into());
+        v.status = RunStatus::Running;
+        v.started_at = Some(now() - Duration::seconds(6 * 60 + 2));
+        begin(
+            &mut v,
+            "preflight",
+            StepKind::Linear,
+            Some("scanner"),
+            Some("heron#1"),
+            None,
+        );
+        complete(&mut v, "preflight", 21_000);
+        begin(&mut v, "hunt", StepKind::ForEach, None, None, None);
+        for i in 0..8 {
+            let status = match i {
+                0..=3 => UnitStatus::Done,
+                4 => UnitStatus::Failed,
+                _ => UnitStatus::Running,
+            };
+            v.step_mut("hunt").units.insert(i, unit_of(i, status));
+        }
+        for i in 8..10 {
+            v.step_mut("hunt")
+                .units
+                .insert(i, unit_of(i, UnitStatus::Queued));
+        }
+        v.step_mut("report");
+
+        // hunt → its unit list → walk to unit 5 (otter#6, running) → drill.
+        let mut nav = nav_on(&v, "hunt");
+        nav.apply(NavKey::In, &v);
+        for _ in 0..5 {
+            nav.apply(NavKey::Down, &v);
+        }
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Unit);
+
+        let stream = transcript(
+            "otter#6",
+            vec![
+                call("read_file", json!({"path": "svc/billing/ledger.rs"})),
+                Tx::Thinking {
+                    text: Some("amounts are summed as f64 before rounding".into()),
+                    provider: "anthropic".into(),
+                    model: "claude-opus-5-5".into(),
+                    raw: json!({}),
+                },
+                call("grep", json!({"pattern": "as f64"})),
+                finding("medium", "ledger totals lose cents"),
+                call("read_file", json!({"path": "svc/billing/rounding.rs"})),
+                Tx::AssistantMessage {
+                    content: "Two call sites convert cents to f64 before summing.".into(),
+                    thinking: None,
+                },
+            ],
+        );
+        let firehose = projected(&[
+            ("heron#7", call("grep", json!({"pattern": "unwrap()"}))),
+            (
+                "otter#6",
+                call("read_file", json!({"path": "svc/billing/ledger.rs"})),
+            ),
+            (
+                "wren#8",
+                call("read_file", json!({"path": "svc/search/index.rs"})),
+            ),
+            ("otter#6", call("grep", json!({"pattern": "as f64"}))),
+            (
+                "heron#7",
+                call("read_file", json!({"path": "svc/auth/session.rs"})),
+            ),
+            ("otter#6", finding("medium", "ledger totals lose cents")),
+        ]);
+        let out = dashboard_frame(&v, &wf, &nav, &stream, &firehose, now(), 120, 34);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        assert!(out.len() <= 34, "{s}");
+        assert!(out.iter().all(|l| l.width() <= 120), "{s}");
+        assert_eq!(selection_label(&v, &nav), "hunt › otter#6");
+        // The stream names the drilled unit and shows ITS transcript, all of
+        // it, oldest first (the whole feed fits the pane).
+        assert!(s.contains("─ stream · hunt › otter#6 ─"), "{s}");
+        let rows = rows_of(&out);
+        let top = rows.iter().position(|r| r.contains("─ stream")).unwrap();
+        for (i, want) in [
+            "otter#6 ▸ read_file svc/billing/ledger.rs",
+            "otter#6 ◇ thinking amounts are summed as f64 before rounding",
+            "otter#6 ▸ grep as f64",
+            "otter#6 ⚑ MEDIUM ledger totals lose cents",
+            "otter#6 ▸ read_file svc/billing/rounding.rs",
+            "otter#6 ▪ Two call sites convert cents to f64 before summing.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(rows[top + 1 + i].contains(want), "row {i}:\n{s}");
+        }
+        // The structure pane marks the drilled unit under its step.
+        assert!(
+            plain(row_with(&out, "svc-5 ")).starts_with("▸ │ ◐├─ svc-5"),
+            "{s}"
+        );
+        // The firehose is the other units' merged feed, with its live count.
+        assert!(s.contains("├─ live · 3 active · 2 hosts ─"), "{s}");
+        assert!(s.contains("heron#7 ▸ grep unwrap()"), "{s}");
+    }
+
+    #[test]
+    fn the_stream_title_names_the_drilled_path() {
+        // hunt → unit 0 (otter#1): the breadcrumb below the run, joined.
+        let mut v = RunView::default();
+        v.crew = Some("mint-tundra".into());
+        begin(&mut v, "hunt", StepKind::ForEach, None, None, None);
+        for i in 0..3 {
+            v.step_mut("hunt")
+                .units
+                .insert(i, unit_of(i, UnitStatus::Running));
+        }
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &v);
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Unit);
+        assert_eq!(selection_label(&v, &nav), "hunt › otter#1");
+        // Without a crew crumb the path still starts at the step, not the unit.
+        v.crew = None;
+        assert_eq!(selection_label(&v, &nav), "hunt › otter#1");
+        // Wire text cannot reach the title.
+        v.step_mut("hunt").units.get_mut(&0).unwrap().codename = Some("ot\x1b[2Jter#1".into());
+        assert_eq!(selection_label(&v, &nav), "hunt › ot\u{FFFD}[2Jter#1");
+    }
+
+    #[test]
+    fn the_firehose_rule_counts_the_distinct_hosts_of_the_live_work() {
+        let rule = |v: &RunView, wf: &Workflow| {
+            let out = dashboard_frame(v, wf, &NavState::default(), &[], &[], now(), 100, 28);
+            plain(row_with(&out, "├─ live"))
+                .trim_start_matches(|c| c != '├')
+                .to_string()
+        };
+        let wf = wf();
+
+        // A local run (no step names a host): the figure is omitted, not 0.
+        let mut v = live();
+        assert_eq!(active_hosts(&v), 0);
+        assert!(
+            rule(&v, &wf).starts_with("├─ live · 1 active ─"),
+            "{}",
+            rule(&v, &wf)
+        );
+
+        // One placed step: singular.
+        v.step_mut("sweep").host = Some("mini".into());
+        assert_eq!(active_hosts(&v), 1);
+        assert!(
+            rule(&v, &wf).starts_with("├─ live · 1 active · 1 host ─"),
+            "{}",
+            rule(&v, &wf)
+        );
+
+        // A blank host names nothing.
+        v.step_mut("sweep").host = Some(String::new());
+        assert_eq!(active_hosts(&v), 0);
+
+        // A running fan-out counts the hosts of its RUNNING units only, each
+        // host once however many units run on it.
+        let fan = Workflow::parse(FANOUT_WF).expect("parses");
+        let mut v = RunView::default();
+        begin(
+            &mut v,
+            "hunt",
+            StepKind::ForEach,
+            None,
+            None,
+            Some("ignored"),
+        );
+        for (i, (status, host)) in [
+            (UnitStatus::Running, Some("mini")),
+            (UnitStatus::Running, Some("mini")),
+            (UnitStatus::Running, Some("kuki")),
+            (UnitStatus::Running, None),
+            (UnitStatus::Done, Some("far")),
+            (UnitStatus::Queued, Some("away")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut unit = unit_of(i, status);
+            unit.host = host.map(Into::into);
+            v.step_mut("hunt").units.insert(i, unit);
+        }
+        assert_eq!(active_count(&v), 4);
+        assert_eq!(active_hosts(&v), 2);
+        assert!(
+            rule(&v, &fan).starts_with("├─ live · 4 active · 2 hosts ─"),
+            "{}",
+            rule(&v, &fan)
+        );
+
+        // Settled work names no live host.
+        complete(&mut v, "hunt", 1_000);
+        assert_eq!((active_count(&v), active_hosts(&v)), (0, 0));
+    }
+
+    #[test]
+    fn a_running_loop_frame_is_not_an_extra_active_agent() {
+        // `loop:refine` stays Running for the whole loop but only frames its
+        // members: the one running member is the one active agent.
+        let mut v = RunView::default();
+        begin(&mut v, "loop:refine", StepKind::Loop, None, None, None);
+        begin(
+            &mut v,
+            "gen",
+            StepKind::Linear,
+            Some("generator"),
+            None,
+            Some("mini"),
+        );
+        complete(&mut v, "gen", 1_000);
+        begin(
+            &mut v,
+            "critique",
+            StepKind::Linear,
+            Some("critic"),
+            None,
+            Some("kuki"),
+        );
+        assert_eq!(active_count(&v), 1);
+        assert_eq!(active_hosts(&v), 1);
     }
 
     #[test]

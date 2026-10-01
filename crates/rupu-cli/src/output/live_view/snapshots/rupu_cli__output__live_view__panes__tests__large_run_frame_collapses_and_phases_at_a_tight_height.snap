@@ -1,0 +1,34 @@
+---
+source: crates/rupu-cli/src/output/live_view/panes.rs
+expression: s
+---
+sweep-fleet  ● mint-tundra  ◐ running · 38m 05s
+step 18/21  █████████████████████░░░  ◐ hunt
+⇡41000000 ⇣2300000 $112.60 · ⚑4
+─ structure ────────────────────────────────────┬─ stream · run ────────────────────────────────────────────────────────
+  ✓ s01 … s11 (+11 done)                        │ waiting for activity…
+  │                                             │
+  ✓  s12  scanner ···· ✓ 1s                     │
+  │                                             │
+  ⟦ recon1 … join1 ⟧  phase · 4 … ···· ✓ 4 done │
+  │                                             │
+  ◈  recon2  split ···· ✓ 1s                    │
+  ╭─ hunt                                       │
+  ╰─ probe                                      │
+  │                                             │
+  ├─╭─ ⊞ hunt  for_each · runti… ···· ◐ running │
+  │ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26  │
+  │ ◐├─ svc-56  heron#57 … ···· ◐ running @mini │
+  │ ◐├─ svc-57  wren#58 ·… ···· ◐ running @kuki │
+  │ ◐├─ svc-58  egret#59 … ···· ◐ running @mini ├─ live · 6 active · 2 hosts ───────────────────────────────────────────
+  │ ◐├─ svc-59  lynx#60 ·… ···· ◐ running @kuki │ lynx#55 ▸ read_file svc/auth/handler.rs
+  │ │ … +82 more · [enter] expand               │ otter#56 ▸ grep unwrap()
+  │ ◄─╰─                                        │ heron#57 ▸ read_file svc/billing/ledger.rs
+  │                                             │ lynx#55 ⚑ HIGH token accepted after revoke
+  ✓  probe  prober ···· ✓ 5s                    │ wren#58 ▸ read_file svc/search/index.rs
+  │                                             │ egret#59 ▸ grep TODO
+  ◈◄─ join2  join · wait:all                    │ lynx#60 ▸ read_file svc/export/csv.rs
+  │                                             │ otter#56 ▸ read_file svc/auth/session.rs
+  ○  report  reporter                           │
+                                                │
+↑↓ move · enter drill · ← back · / filter · tab pane · Esc pause · q quit
