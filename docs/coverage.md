@@ -34,6 +34,7 @@ as append-only JSONL plus a catalog snapshot:
 | `files.jsonl` | every file touch (read / grep / glob / edit / cmd), with attribution |
 | `concerns.jsonl` | every `(concern, file) → verdict` assertion |
 | `findings.jsonl` | every reported issue |
+| `assets.jsonl` | the asset graph (kind + typed locator + depth), written only under an [engagement profile](#engagement-profiles) |
 | `catalog.yaml` | the effective concern catalog, snapshotted at run start |
 | `runs.jsonl` | one manifest per run (its defining inputs, for replay) |
 
@@ -458,133 +459,406 @@ requests wait their turn, while Markdown and HTML are never held up.
 
 ## Engagement profiles
 
-An engagement profile is a named scope for evidence collection — e.g., `network`, `web`, `binary` — that organizes findings into domains and guides what a completeness checklist should verify. A profile is purely declarative; it declares asset kinds, evidence blocks, classification systems, and a completeness checklist. The agent is not restricted by a profile's declarations — a profile instead validates that findings recorded under it are thorough and well-classified per profile guidelines.
+By default a finding is about a source file, and the harness above is built
+around files and concerns. An **engagement profile** lets an assessment be about
+something else: the functions of a binary, the images in a firmware drop, the
+hosts of a network. A profile declares the kinds of *asset* that kind of
+engagement works with, the typed coordinates that identify them, what a
+complete finding must contain, and the depth ladder used to record how
+thoroughly each asset has been covered. Under an engagement a finding can name
+an `asset`; rupu routes the finding to the profile that owns that asset's kind
+and enforces that profile's rules. With no engagement (the default) nothing
+changes: findings are validated exactly as described in
+[Finding reports](#finding-reports).
 
-### Selecting an engagement profile
+Design: `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-asset-model-design.md`.
 
-Engagement profiles are selected at three levels (narrowing at each step):
+### Profiles that ship
 
-1. **CLI:** `rupu run --engagement-profile <id>` (singular, repeatable) or `--engagement-profiles a,b` (plural, comma-separated)
-2. **Workflow:** `defaults.engagement_profiles: [a, b]` at the workflow level; `engagement_profiles: [a]` per step (can only narrow)
-3. **Agent:** `engagementProfiles: [a, b]` in the agent frontmatter
+Only two profiles are built in:
 
-Precedence (most specific first): step → workflow defaults → agent frontmatter → `code` (native path, no engagement).
+| Id | Asset kinds | Depth ladder | Notes |
+|----|-------------|--------------|-------|
+| `code` | `code:file` | `unreviewed` → `reviewed` | The native path. Selecting only `code`, or nothing, means no engagement is active. |
+| `binary` | `binary:binary`, `binary:function` | `located` → `disassembled` → `analyzed` | Reverse engineering. A finding on a `binary:*` asset needs a `disasm` or `hexdump` evidence block, a `root_cause`, and a CWE classification. |
 
-A step's `engagement_profiles` can only **narrow** the set inherited from workflow defaults or the agent — naming a profile not present in the parent set has no effect, preventing silent scope elevation.
+There is no built-in `network` or `web` profile. A `network` profile is
+planned but does not ship yet; until then, anything else is a profile you
+author yourself ([Authoring a profile](#authoring-a-profile)). Selecting an id
+that no profile defines fails the launch with `unknown engagement profile`.
+
+A runnable sample ships in the repo: `.rupu/agents/binary-analyst.md` (an agent
+that declares `engagementProfiles: [binary]`, grants itself `asset_mark`, and
+records function-level findings) and `.rupu/workflows/binary-assessment.yaml`
+(a workflow that runs it under `defaults.engagement_profiles: [binary]`).
+
+### Selecting an engagement
+
+A run's engagement is a list of profile ids, chosen at the first level below
+that has a non-empty list. Lists are never merged across levels.
+
+1. **A flag**, for a standalone run or a session: `rupu run <agent> --engagement-profile binary`
+   (repeatable) or `--engagement-profiles code,binary` (comma-separated).
+   `rupu session start` takes the same flag; the selection is snapshotted when
+   the session starts and applies to every turn.
+2. **The workflow**, for a workflow run: `defaults.engagement_profiles: [binary]`.
+3. **The agent**: `engagementProfiles: [binary]` in its frontmatter.
+4. **`code`**: the native path, no engagement.
+
+What a list means:
+
+- Omitted or `[]` selects nothing, so resolution falls through to the next
+  level. On a workflow *step* it means "inherit the run's set".
+- `[code]` alone is the **explicit native path**: no engagement is active. On a
+  step it opts that one step out of the run's engagement. `[]` and `[code]` are
+  not the same thing: `[]` inherits, `[code]` opts out.
+- `[binary]` is an engagement with `binary`.
+- `[code, binary]` is an engagement with both profiles. Here `code` is an
+  ordinary id (it contributes the `code:file` kind, so findings that name no
+  `asset` are accepted).
+
+A workflow step can also set `engagement_profiles`, but a step never *selects*
+an engagement. It only **narrows** the run's set: naming an id the run set does
+not contain is an error at launch (the step fails, naming the step and the id),
+and so is selecting any profile on a step whose run is on the native `code`
+path. A composite counts as containing its members, so a step may narrow a
+composite to one of the profiles it includes. `[code]` is always allowed on a
+step.
 
 ```yaml
-# Agent
----
-name: security-scanner
-engagementProfiles: [binary, network]   # agent handles two scopes
----
-
-# Workflow
+name: assess-firmware
 defaults:
-  engagement_profiles: [binary, network]
+  engagement_profiles: [code, binary]    # the run's set
 steps:
-  - id: binary-audit
-    agent: security-scanner
-    engagement_profiles: [binary]        # narrowed to binary only
-  - id: full-audit
-    agent: security-scanner
-    # inherits [binary, network] from defaults
-
-# CLI
-rupu run security-scanner "audit the repo" --engagement-profiles binary,network
+  - id: triage
+    agent: binary-analyst
+    prompt: "Triage the sample"
+    engagement_profiles: [binary]        # narrowed: only binary kinds are valid here
+  - id: review-update-client
+    agent: code-reviewer
+    prompt: "Review the update client"
+    # inherits [code, binary]
+  - id: summarize
+    agent: writer
+    prompt: "Summarize the findings so far"
+    engagement_profiles: [code]          # native path: no engagement for this step
 ```
+
+```bash
+rupu run binary-analyst "Analyse ./sample.bin" --engagement-profiles binary
+```
+
+See [workflow-format.md](workflow-format.md#engagement_profiles) and
+[agent-format.md](agent-format.md#engagementprofiles) for the placement rules,
+and the remote-step restriction in [Known limits](#known-limits).
 
 ### Per-origin routing
 
-When a finding is recorded with an asset, that asset has a `kind` (e.g., `network:service`, `web:endpoint`, `binary:function`). The finding is validated against the engagement profile that **owns** the asset kind's namespace. For example, a `network:*` asset is owned by the `network` profile, even if the run is also under `web`.
+Every asset kind is namespaced by the profile that declares it: `code:file`,
+`binary:function`. A finding is validated against the profile that **owns** its
+asset kind, with that profile's own checks, never a merged union of everything
+active. A **composite** profile (one with `includes`) is only a selection
+shorthand: selecting it activates each included profile as its own routing
+target, so a `binary:function` finding is judged by `binary` whether `binary` or
+a composite containing it was selected.
 
-Composite profiles (e.g., `pentest = includes [network, web]`) route findings to the owning profile for validation, allowing one run to gather evidence across multiple domains:
+A composite and one of its own members cannot both be selected: the kinds
+collide and the launch fails (`kind "..." is declared by more than one active
+profile`). Listing the same id twice is harmless; it is collapsed.
+
+### Assets and depth
+
+Under an engagement, two things write to the project's asset store,
+`<workspace>/.rupu/coverage/<target_id>/assets.jsonl` (next to `findings.jsonl`,
+not in a run directory, so assets accumulate across runs):
+
+- **`report_finding` / `action: findings.record` with an `asset`** registers the
+  asset (an upsert: re-reporting the same asset adds no line) and stamps the
+  finding with the asset it is about. A finding never resets an asset's depth.
+- **`asset_mark`** registers an asset *and* records how deeply it has been
+  covered. It is the only way to set depth. Depth is a field of the asset itself
+  (`depth` on the record in `assets.jsonl`); there is no separate depth file.
+
+An asset names its **kind** and a **locator**: a list of single-key typed
+coordinates, never a string. The kind must be one an active profile declares.
+
+```json
+{
+  "kind": "binary:function",
+  "locator": [
+    { "sha256": "<64 hex chars>" },
+    { "address": 4198400 },
+    { "symbol": "parse_header" }
+  ],
+  "label": "parse_header"
+}
+```
+
+`parent` (the `asset_id` an earlier `asset_mark` returned) and `label` are
+optional; without a label rupu fills the kind's `label` template from the
+locator. The valid coordinate tags are:
+
+| Tag | Value |
+|-----|-------|
+| `path` | string |
+| `line_range` | `{ "start": 1, "end": 9 }` |
+| `symbol` | string |
+| `commit` | string |
+| `sha256` | hex string |
+| `offset` | number |
+| `address` | number (decimal: `4198400` is `0x401000`) |
+| `host` | string |
+| `port` | `{ "number": 443, "proto": "tcp" }` (`tcp` or `udp`) |
+| `url` | string |
+| `http_route` | `{ "method": "GET", "path": "/v1/things" }` |
+| `param` | string |
+| `resource_id` | `{ "scheme": "arn", "id": "aws:s3:::bucket" }` |
+
+An asset's id is a hash of its kind and its locator as an ordered list, so
+give the same coordinates, in the same order, every time you mean the same
+asset. A kind's `coordinates` list says which tags it uses (for its label and
+for the agent's guidance); rupu does not otherwise require a locator to match
+it. To require one, use a `locator_has_coordinate` completeness check.
+
+**Setting depth with `asset_mark`.** The tool is never ambient. The agent must
+list it in `tools:` (a `concerns:` block does not add it), and an engagement
+must be active: without one the call fails with `asset_mark needs an active
+engagement profile`. It takes `kind`, `locator` and `depth` (plus optional
+`parent` and `label`), and `depth` must be a rung of the owning profile's
+`depth_ladder`; the real ladder for `binary` is `located` → `disassembled` →
+`analyzed`. An unknown kind or an unknown rung is rejected, naming what is
+declared. Re-marking an asset updates its depth, and the last write wins: it
+is not monotonic, so marking `analyzed` and later `located` leaves `located`.
 
 ```yaml
-# Custom profile in ~/.rupu/profiles/pentest.toml
-[bundle]
-name = "pentest"
-includes = ["network", "web"]
+---
+name: binary-analyst
+tools: [report_finding, asset_mark]   # asset_mark is an explicit grant
+engagementProfiles: [binary]
+---
+```
 
-# Workflow
+When an engagement is active rupu appends an "Engagement profiles" section to
+the agent's system prompt listing the active profiles' asset kinds and their
+coordinates, evidence block kinds, classification systems and depth ladder. It
+does not list the completeness checks, so say in the agent's prompt what a
+finding must carry (the sample `binary-analyst` does), or the agent learns it
+from rejections. `asset` is advertised on `report_finding` only under an
+engagement, and `findings.record` refuses an `asset` outright when no
+engagement is active, rather than silently dropping it.
+
+In a workflow, `action: findings.record` takes the same `asset` object:
+
+```yaml
+name: record-one-function
 defaults:
-  engagement_profiles: [pentest]
+  engagement_profiles: [binary]
+inputs:
+  sha256:
+    type: string
+    required: true
 steps:
-  - id: assess
-    agent: pentester
-    # Records both network:service and web:endpoint assets;
-    # each finding is validated per the profile that owns its asset kind
+  - id: record
+    action: findings.record
+    findings_profile: summary
+    with:
+      scope: repo
+      summary: "parse_header copies an attacker-controlled length into a 64-byte buffer"
+      severity: high
+      rationale: "The length byte reaches memcpy unchecked at 0x401012."
+      asset:
+        kind: binary:function
+        locator:
+          - sha256: "{{ inputs.sha256 }}"
+          - address: 4198400
+          - symbol: parse_header
 ```
 
-### Assets
+String coordinates (`sha256`, `symbol`, `host`, `path`, `url`, ...) may be
+filled from templates. Numeric ones (`address`, `offset`, `port.number`,
+`line_range`) must be literals: a rendered template is a string, and these
+coordinates are numbers.
 
-When an agent calls `report_finding` or `action: findings.record` with an `asset`, the asset is recorded in `assets.jsonl` under `<workspace>/.rupu/coverage/<target_id>/` (not in the run directory). Assets persist across runs, forming a long-lived inventory tied to the target, not a single run.
+### What an engagement enforces
 
-An asset input carries:
+Under an engagement, `report_finding` and `findings.record` check:
 
-```yaml
-asset:
-  kind: "network:service"            # e.g., protocol:type, required
-  locator: "192.168.1.1:8080"       # asset identifier (address, endpoint, path, etc.)
-  parent: "asset_id_of_parent"      # optional: hierarchical parent
-  label: "Admin service"             # optional: human name
-```
+- **Always (both findings profiles): the asset kind.** The finding's kind must
+  be declared by an active profile. An unknown kind, a kind owned by a profile
+  that is not active, or an undeclared kind in an active profile (`binary:nope`)
+  is rejected, naming the active set.
+- **Always: the no-asset default.** A finding that names no `asset` is filed as
+  `code:file` (its `file_path` becomes the locator). That is accepted only when
+  `code` is active (for example `[code, binary]`); under `[binary]` alone it is
+  rejected with `names no asset, so its scope maps to code:file, which belongs
+  to no active engagement profile`.
+- **Under the `full` findings profile only: the completeness checks.** Every
+  `required` check of the owning profile must be satisfied, and every unmet
+  check is listed at once. Under the `summary` findings profile only the two
+  routing rules above are enforced, so a profile's completeness checks do not
+  apply to summary findings.
 
-The `locator` field cannot be filled from step-output templates (`{{ steps.x.output }}`); use literal values only in a workflow's `with:`.
+A profile's `evidence_blocks` and `classification_systems` are **guidance, not
+allow-lists**: they are shown to the agent, and an extra block or system is
+harmless. A profile that truly needs a block or a classification says so with
+a completeness check that references it (`has_block_kind`,
+`has_classification_system`); that check is then enforced like any other. So
+asset kinds and required completeness checks do reject findings, and the lists
+of blocks and systems do not.
 
-Asset coverage depth (`<RUPU_HOME>/coverage-depth.json`) tracks how thoroughly each asset has been examined (depths like `surface`, `shallow`, `thorough`). The depth is last-write-wins (not monotonic).
+`asset_mark` separately enforces the kind and the depth ladder, as above.
 
-### Built-in and custom profiles
+### Authoring a profile
 
-**Built-in `binary` profile:** ships with rupu. Covers binary-analysis scopes.
+Profiles are TOML files in:
 
-**Custom profiles:** author under:
+- `~/.rupu/profiles/*.toml` (global; `<RUPU_HOME>/profiles`)
+- `<project>/.rupu/profiles/*.toml` (project)
 
-- `~/.rupu/profiles/<id>.toml` (global)
-- `.rupu/profiles/<id>.toml` (project)
+Built-ins are overlaid first, then global, then project; a later source
+replaces an earlier one **by `id`**, so a project profile shadows a global
+profile of the same id, and either can replace a built-in. The profile's id is
+the `id` inside the file, not the file name; name the file after the id so the
+two cannot disagree.
 
-Project profiles shadow global profiles by name.
+Files are read only when a real engagement is selected (a run on the native
+`code` path never loads them), and they are read all-or-nothing: **any `*.toml`
+in those directories that fails to parse (TOML syntax, an unknown coordinate
+tag, an unreadable file) fails the whole selection**, whether or not you
+selected that profile. This is deliberate (fail-closed): a profile that silently
+failed to load would leave an engagement running under the wrong rules.
 
-Profile TOML shape:
+A profile has the same shape as the built-in `binary` profile
+(`crates/rupu-coverage/src/profile/builtin/binary.toml`):
 
 ```toml
-[bundle]
-name = "network"                        # canonical id
-includes = []                           # composite: include other profiles
+id = "firmware"
+name = "Firmware image review"
+# Top-level keys come first. After a `[[asset_kinds]]` header they would belong
+# to that kind and be silently ignored, leaving the profile with no permitted
+# evidence blocks or classification systems.
+evidence_blocks = ["text", "hexdump", "disasm"]
+classification_systems = ["CWE", "CVE"]
 
 [[asset_kinds]]
-kind = "network:service"
-label = "Network service"
+id = "image"                          # registered as `firmware:image`
+coordinates = ["sha256"]
+label = "{sha256}"
 
 [[asset_kinds]]
-kind = "network:endpoint"
-label = "Network endpoint"
+id = "partition"                      # registered as `firmware:partition`
+parent = "image"                      # a bare id in this same profile
+coordinates = ["sha256", "offset"]
+label = "{offset} in {sha256}"
 
-[[evidence_blocks]]
-name = "reachability"
-label = "Can the service be reached?"
+[[completeness]]
+id = "has_root_cause"
+label = "Root cause stated"
+required = true
+satisfied_when = { has_field = "root_cause" }
 
-[[classification_systems]]
-name = "iana-ports"
-label = "IANA registered port classification"
-
-[completeness]
-required_evidence = ["reachability"]
-required_classifications = ["iana-ports"]
+[[completeness]]
+id = "classified"
+label = "Weakness classified (CWE)"
+required = true
+satisfied_when = { has_classification_system = "CWE" }
 
 [coverage]
-depth_ladder = ["touched", "shallow", "thorough"]
+enumerates = ["image", "partition"]
+depth_ladder = ["located", "unpacked", "analyzed"]
 ```
 
-**Important:** profile-level keys (`evidence_blocks`, `classification_systems`, `completeness`, `coverage`) **must come BEFORE the first `[[asset_kinds]]` table in the TOML**, or they will be absorbed into the table and dropped. Group your metadata declarations first, then list asset kinds.
+Select it like any other id (`--engagement-profiles firmware`, or
+`engagementProfiles: [firmware]`); its kinds are `firmware:image` and
+`firmware:partition`.
+
+| Key | Meaning |
+|-----|---------|
+| `id`, `name` | Required. `id` is the id you select by and the namespace of its kinds. |
+| `includes` | Optional list of other profile ids; makes this a composite (below). |
+| `evidence_blocks` | Optional. Block kinds the agent is told to use: `text`, `code_slice`, `diff`, `table`, `image`, `hexdump`, `disasm`, `decompile`, `http_exchange`, `scan_output`, `pcap_ref`. Guidance only. |
+| `classification_systems` | Optional. Taxonomies the agent is told to use (`CWE`, `CVE`, ...). Guidance only. |
+| `[[asset_kinds]]` | `id` (bare; the registry prefixes `<profile id>:`), `label` (a template over coordinate tags, e.g. `"{symbol} @ {address}"`), optional `parent` (a bare kind id in the same profile), optional `coordinates` (tags from the table above). |
+| `[[completeness]]` | `id`, `label`, `required` (default `true`; an optional check never blocks), and `satisfied_when`, a predicate (below). |
+| `[coverage]` | `depth_ladder`: the ordered rungs, shallowest to deepest, that `asset_mark` accepts. `enumerates`: the kinds the profile expects to cover (parsed, but nothing in the run path reads it yet). |
+| `[bundle]` | `agents`, `tools`, `workflows`: names that travel with the profile (informational today). |
+
+Required: `id` and `name`; for each kind, `id` and `label`; for each
+completeness check, `id`, `label` and `satisfied_when`. Everything else may be
+omitted.
+
+**TOML ordering.** What must precede the first `[[asset_kinds]]` are the
+top-level keys: `id`, `name`, `includes`, `evidence_blocks`,
+`classification_systems`. `[[completeness]]`, `[coverage]` and `[bundle]` each
+have their own header, so where they sit does not matter.
+
+**Predicates.** `satisfied_when` is a single inline table:
+
+| Predicate | True when |
+|-----------|-----------|
+| `{ has_field = "root_cause" }` | the report field is present and non-empty; one of `root_cause`, `remediation`, `impact`, `description`, `attack_vector`, `category`, `replication_steps`, `evidence` |
+| `{ has_block_kind = "disasm" }` | an evidence claim carries a block of that kind |
+| `{ has_classification_system = "CWE" }` | the report is classified under that system (case-insensitive; entries in `cwe` count) |
+| `{ locator_has_coordinate = "address" }` | the asset's locator carries that coordinate tag |
+| `{ min_severity = "High" }` | the risk rating is at least `Low`, `Medium`, `High` or `Critical` |
+| `{ all = [ ... ] }`, `{ any = [ ... ] }` | every / at least one of the listed predicates |
+
+An unknown field or tag in a predicate makes every finding of that profile fail
+(`engagement profile ... has an invalid completeness check`), rather than
+letting findings through.
+
+**Composites.** A profile with `includes` is a selection shorthand. It may
+declare kinds of its own (namespaced by its own id) and a `[bundle]`:
+
+```toml
+id = "firmware-review"
+name = "Firmware review (source and binary)"
+includes = ["code", "binary"]        # members stay separate routing targets
+
+[bundle]
+agents = ["binary-analyst"]
+```
+
+Selecting `firmware-review` activates `code` and `binary`; a `code:file` finding
+is judged by `code` and a `binary:function` finding by `binary`. Includes may
+nest; a cycle or an include that names no profile fails the launch. Do not
+select a composite together with one of its own members (see
+[Per-origin routing](#per-origin-routing)).
 
 ### Known limits
 
-- **Manifest records:** a run `MANIFEST` (used by `rupu coverage rerun`) is only written when the agent has a `concerns:` block. A findings-only engaged run records findings and assets but no manifest; replay is not yet supported for such runs.
-- **Remote/placed runs:** launching an agent on a remote host with `host:` or `distribute:` and specifying `engagement_profiles` is refused with an error (fail-closed). Remote engagement delivery is not yet wired.
-- **Control-plane workflow editor:** the `engagement_profiles` field is not yet exposed in the CP's workflow editor UI (`rupu cp serve`). Author it directly in YAML.
-- **Numeric locators in workflows:** a step's `with.asset.locator` field cannot be filled from step-output templates (`{{ steps.x.output }}`); the same limitation applies to the `report_finding` tool's `asset.locator` parameter.
-- **Coverage depth:** depth is last-write-wins, not monotonic. Recording an asset with depth `thorough` and later with `shallow` leaves it at `shallow`.
+- **Remote and placed steps.** A workflow step with `host:` or `distribute:`
+  cannot be run under an engagement yet: the engagement set does not travel to
+  the host. Such a unit is **refused** (the step fails with an error) rather
+  than run under the native rules, when the step's `engagement_profiles`, else
+  `defaults.engagement_profiles`, selects anything other than `code`. To run
+  the step anyway, opt out explicitly with `engagement_profiles: [code]` on
+  that step; the unit then runs on the host under the native `code` rules with
+  no engagement. The refusal does not look
+  at an agent's own `engagementProfiles`. A fan-out without `distribute:` runs
+  locally and is unaffected.
+- **Dispatched sub-agents.** An agent started by `dispatch_agent` or
+  `dispatch_agents_parallel` does not consult its own `engagementProfiles`. It
+  inherits the engagement of the run that dispatched it: for `rupu run`, the
+  parent run's resolved set; for a workflow run, `defaults.engagement_profiles`
+  only. A step's narrowing, and the parent agent's own frontmatter, are not
+  carried down, so set `defaults.engagement_profiles` if dispatched children
+  must record under the engagement.
+- **Run manifest and `rerun`.** The run manifest (`runs.jsonl`) is written only
+  for agents with a `concerns:` block, and it records the engagement profiles
+  the run used. `rupu coverage rerun` replays agent runs and re-launches them with the
+  recorded profiles. A findings-only engaged
+  run (no `concerns:`) records findings and assets but no manifest, so it
+  cannot be replayed.
+- **Control-plane workflow editor.** The editor (`rupu cp serve`) does not
+  expose `engagement_profiles` yet; author it in the YAML.
+- **Numeric coordinates in workflows.** `address`, `offset`, `port.number` and
+  `line_range` cannot be filled from `{{ ... }}` templates in a `findings.record`
+  `with:`; use literals.
+- **Depth.** Depth is last-write-wins, not monotonic (see
+  [Assets and depth](#assets-and-depth)).
+- **Unused declarations.** `[coverage].enumerates` and `[bundle]` are parsed and
+  kept but nothing in the run path acts on them yet.
 
 ## CLI
 
@@ -649,6 +923,6 @@ deterministic; sampling is not.
 - `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:`, `findingsProfile`, `engagementProfiles`)
 - `docs/workflow-format.md` — workflow `findings_profile` and `engagement_profiles` (step and `defaults`)
 - `docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md` — the finding report design
-- `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-design.md` — the engagement profiles design
+- `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-asset-model-design.md` — the engagement profiles design
 - `docs/agent-authoring.md` — writing good agents
 - Slice specs/plans under `docs/superpowers/{specs,plans}/` (search `coverage-harness` or `engagement`)

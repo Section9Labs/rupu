@@ -73,7 +73,7 @@ Everything after the closing `---` is the system prompt.
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
-| `engagementProfiles` | array<string> | no | `[code]` | Engagement profile ids for evidence scoping; a workflow step's `engagement_profiles` or `defaults.engagement_profiles` overrides it |
+| `engagementProfiles` | array<string> | no | none (native `code` path) | Engagement profile ids this agent's findings are recorded under (`binary`, or one you author); a CLI flag or the workflow's `defaults.engagement_profiles` overrides it, and a workflow step can only narrow it |
 | `maxTokens` | integer | no | `8192` | Per-request output-token budget (`max_tokens` in the LLM request); extended thinking (`effort`) draws from this same budget |
 | `contextWindowTokens` | integer | no | none (compaction disabled) | Model context-window size in tokens; when set, enables proactive LLM context compaction |
 | `compactAtPercent` | integer | no | `80` when `contextWindowTokens` is set | Percentage of `contextWindowTokens` at which compaction triggers; clamped to `[10, 95]` |
@@ -288,30 +288,36 @@ See `docs/coverage.md` for what a complete report requires. Every field is requi
 
 ### `engagementProfiles`
 
-Selects engagement profiles for evidence collection. Profiles define named scopes — e.g., `network`, `web`, `binary` — that organize findings and guide evidence taxonomy. A profile itself is declarative (asset kinds, completeness checklist) and does not restrict what an agent can record; the completeness checker enforces findings are thorough *per profile*.
+Selects the engagement profiles an agent's findings are recorded under. An engagement profile (`binary`, or one you author) declares the kinds of asset an assessment works with, what a complete finding must contain, and the depth ladder for tracking coverage; see [coverage.md](coverage.md#engagement-profiles). Only `code` and `binary` ship; any other id must be a profile you authored, and an id no profile defines fails the launch with `unknown engagement profile`.
 
-- `[code]` or omit the field (default) — the native path with no engagement active. Backward-compatible with agents written before engagement profiles existed.
-- `[binary]` or other profile ids — enables those profiles for this agent. When a run records findings, each finding is validated per the profile that owns its asset kind.
-- `[]` (empty array) — equivalent to `[code]` (no engagement active).
+- Omitted or `[]` — the agent selects nothing. The run falls through to `code`, the native path with no engagement, which is exactly how agents written before engagement profiles behave.
+- `[code]` — the same native path, stated explicitly. As a CLI flag or a workflow default, `[code]` overrides the agent's own `engagementProfiles` and puts the run on the native path.
+- `[binary]` — an engagement with the built-in `binary` profile: findings name an `asset` (for example a `binary:function`), are routed to the profile that owns the asset's kind, and must satisfy that profile's completeness checks under the `full` findings profile.
+- `[code, binary]` — an engagement with both; `code` is an ordinary built-in here (asset kind `code:file`), so a finding that names no `asset` is still accepted.
 
-A workflow step's `engagement_profiles` or the workflow's `defaults.engagement_profiles` overrides this value. The order is step → workflow defaults → agent `engagementProfiles` → `code`; see [workflow-format.md](workflow-format.md#engagement_profiles). A standalone `rupu run <agent>` uses `--engagement-profile <id>` or `--engagement-profiles a,b` when given, then the agent's value, then `code`. The flag is how a remote workflow step's profile reaches the host that runs the agent. Sub-agents started through `dispatch_agent` resolve only from their own agent file.
+The run's set comes from the first non-empty of: `rupu run --engagement-profile <id>` (repeatable) or `--engagement-profiles a,b`, for a standalone run (`rupu session start` takes the same flag, snapshotted at start); the workflow's `defaults.engagement_profiles`, for a workflow run; this field; then `code`. A workflow step's own `engagement_profiles` does not replace the set, it only **narrows** it (naming an id outside the set fails the launch); see [workflow-format.md](workflow-format.md#engagement_profiles).
 
-**Authoring:** use agent's `engagementProfiles: [binary]` or leave it unset for the native path. Narrow further per step in a workflow if needed. See [coverage.md#engagement-profiles](coverage.md#engagement-profiles) for profile definitions and authoring.
+**Coverage depth.** An agent records how deeply it has examined an asset with the `asset_mark` tool. It is never granted automatically: list `asset_mark` in `tools:` (a `concerns:` block does not add it). It also needs an active engagement; without one the call fails. `depth` must be a rung of the owning profile's ladder (for `binary`: `located`, `disassembled`, `analyzed`).
 
-**Remote hosts:** like `findingsProfile`, agent frontmatter rejects unknown keys, so upgrade rupu on every remote host before adding `engagementProfiles` to agents they run.
+**Sub-agents.** An agent started by `dispatch_agent` / `dispatch_agents_parallel` does not read its own `engagementProfiles`, unlike `findingsProfile`. It inherits the engagement of the run that dispatched it: for `rupu run`, the parent run's resolved set; for a workflow run, the workflow's `defaults.engagement_profiles` only (the step's narrowing, and the dispatching agent's own frontmatter, are not carried down). An `engagementProfiles` set on an agent that is only ever dispatched therefore has no effect.
+
+**Remote hosts.** An engagement does not reach a remote host yet: a workflow step with `host:` / `distribute:` that selects an engagement is refused unless that step sets `engagement_profiles: [code]` (see [workflow-format.md](workflow-format.md#engagement_profiles)). Agent frontmatter also rejects unknown keys, so a rupu release that predates `engagementProfiles` refuses to load an agent file that sets it.
 
 ```yaml
 ---
-name: binary-auditor
+name: binary-analyst
 provider: anthropic
 model: claude-sonnet-4-6
-tools: [read_file, grep, report_finding]
-engagementProfiles: [binary]   # run this agent under the binary profile
+tools: [report_finding, asset_mark]   # asset_mark is an explicit grant; it sets coverage depth
+engagementProfiles: [binary]          # run this agent under the binary profile
 ---
 
-You audit binary executables for security issues.
-Record each finding via report_finding with proper asset references…
+You analyse a compiled binary. Register each function with asset_mark
+(a binary:function, located by sha256, address and symbol), and record each
+defect with report_finding, naming the same asset.
 ```
+
+The repo ships a complete sample: `.rupu/agents/binary-analyst.md`, run by `.rupu/workflows/binary-assessment.yaml`.
 
 ### `maxTokens`
 

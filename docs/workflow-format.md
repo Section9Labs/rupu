@@ -130,14 +130,14 @@ Currently supported:
 defaults:
   continue_on_error: true
   findings_profile: full                      # full | summary — see `findings_profile` below
-  engagement_profiles: [code]                 # ids, or omit for `code` (native path)
+  engagement_profiles: [binary]               # the run's engagement set — see `engagement_profiles` below
 ```
 
 If a step does not set `continue_on_error`, it inherits the workflow default.
 
 `defaults.findings_profile` sets the findings contract for every step that runs an agent, and for `action:` steps that call `findings.record`. A step's own `findings_profile` overrides it. See [`findings_profile`](#findings_profile).
 
-`defaults.engagement_profiles` sets the engagement profiles for steps that run an agent or call `action: findings.record`, allowing each run to record evidence within defined scopes (e.g., `network`, `web`, `binary`). A step's own `engagement_profiles` can only narrow this set. See [`engagement_profiles`](#engagement_profiles).
+`defaults.engagement_profiles` selects the engagement profiles (for example `[binary]`) the run records findings under, for steps that run an agent and for `action: findings.record` steps. Omit it to use the agent's `engagementProfiles`, else the native `code` path. A step's own `engagement_profiles` can only narrow this set. See [`engagement_profiles`](#engagement_profiles).
 
 ---
 
@@ -314,7 +314,7 @@ Common fields:
 | `approval` | object | all steps | Human pause before the step dispatches |
 | `contract` | object | linear steps | Optional documentation for a structured step output |
 | `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Findings contract for this step — see below |
-| `engagement_profiles` | array<string> | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Engagement profile ids for evidence scoping — see below |
+| `engagement_profiles` | array<string> | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Narrows the run's engagement set for this step (`[code]` opts out) — see below |
 
 ### `actions`
 
@@ -398,41 +398,47 @@ The control-plane workflow editor (`rupu cp serve`) authors both levels. Where t
 
 ### `engagement_profiles`
 
-Engagement profiles scope which evidence-collection frameworks (e.g., `network`, `web`, `binary`) are active for this step's run. See `docs/coverage.md` for profiles and authoring.
+An engagement profile (`binary`, or one you author) scopes a run's findings to a kind of asset and enforces that kind's rules; see [`docs/coverage.md`](coverage.md#engagement-profiles). Only `code` and `binary` ship; any other id must be a profile you authored, and an id no profile defines fails the launch with `unknown engagement profile`.
 
-Precedence, most specific first:
+`defaults.engagement_profiles` and a step's `engagement_profiles` are different things:
 
-1. the step's `engagement_profiles`
-2. the workflow's `defaults.engagement_profiles`
-3. the agent's `engagementProfiles` frontmatter (see [agent-format.md](agent-format.md#engagementprofiles))
-4. `code` (the native path; no engagement is active)
+- **`defaults.engagement_profiles` selects the run's set.** Resolution is the workflow `defaults`, else the agent's `engagementProfiles` frontmatter (see [agent-format.md](agent-format.md#engagementprofiles)), else the native `code` path. The first non-empty list wins whole; lists are never merged.
+- **A step's `engagement_profiles` only narrows that set.** It is not a precedence level that replaces the run's set.
 
 ```yaml
+name: assess-firmware
 defaults:
-  engagement_profiles: [network, web]    # every step uses network and web profiles
+  engagement_profiles: [code, binary]     # the run's set
 steps:
-  - id: network-scan
-    agent: scanner
-    prompt: "Scan the network"
-    engagement_profiles: [network]       # narrowed to network only for this step
-  - id: web-audit
-    agent: web-auditor
-    prompt: "Audit the web app"
-    # inherits [network, web] from defaults
+  - id: triage
+    agent: binary-analyst
+    prompt: "Triage the sample"
+    engagement_profiles: [binary]         # narrowed: only binary kinds are valid in this step
+  - id: review-update-client
+    agent: code-reviewer
+    prompt: "Review the update client"
+    # inherits [code, binary]
+  - id: summarize
+    agent: writer
+    prompt: "Summarize the findings so far"
+    engagement_profiles: [code]           # native path: no engagement for this step
 ```
 
 Rules:
 
-- A step's own `engagement_profiles` can **only narrow** the set inherited from `defaults` or the agent — naming a profile not present in the parent set has no effect. This prevents silent elevation of scope.
-- An empty `engagement_profiles: []` resets to the native `code` path (no engagement active for this step).
-- An `engagement_profiles: [code]` is equivalent to an empty array — `code` is a pseudo-profile representing the absence of engagement.
-- If you omit `engagement_profiles` entirely at the step and workflow level, the agent's `engagementProfiles` frontmatter is consulted; if that is also absent, the run uses the native `code` path.
-- `parallel:` sub-steps inherit their parent step's profiles; a sub-step has no `engagement_profiles` of its own.
-- An `action: findings.record` step resolves as: step's own `engagement_profiles` → `defaults.engagement_profiles` → `full` (no agent frontmatter to consult).
-- Remote steps (`host:` / `distribute:`) currently refuse engagement-profile selection (fail-closed) — remote/placed delivery of engagement-scoped runs is not yet wired. A step with a non-empty `engagement_profiles` on a remote run is rejected with an error message.
+- `[]` (or omitting the key) **inherits** the run's set. `[code]` is the **explicit native opt-out**: that step runs on the native `code` path with no engagement, even when the run has one. They are not equivalent. `code` is a real built-in (asset kind `code:file`), so `[code, binary]` is a valid run set that activates both; `code` mixed with other ids is an ordinary id, not an opt-out.
+- A step can only **narrow**. Naming an id that is not in the run's set is an error at launch: the step fails with a message naming the step and the id; it is never ignored and never falls back to `code`. A composite (a profile with `includes`) counts as containing its members, so a step may narrow a composite to one of its included profiles.
+- A step that selects profiles (other than `[code]`) when its run is on the native path (no `defaults.engagement_profiles`, and an agent without `engagementProfiles`) is also an error, because there is nothing to narrow. Put the profiles in `defaults.engagement_profiles` (or the agent) and narrow from there.
+- An unknown id, or a profile file that fails to parse, is also a launch error, not a parse error: parsing does not consult the profile registry, so the workflow parses and the step fails when it launches.
+- An `action: findings.record` step runs no agent, so its run set is `defaults.engagement_profiles` alone, else the native `code` path (not `full`, which is a *findings* profile). The step's own `engagement_profiles` narrows it by the same rules. Gate `notify:` hooks and other actions are unaffected.
+- `parallel:` sub-steps inherit their parent step's `engagement_profiles`; a sub-step has no `engagement_profiles` of its own.
+- An agent that this step dispatches (`dispatch_agent` / `dispatch_agents_parallel`) does not consult its own `engagementProfiles`. It inherits the workflow's `defaults.engagement_profiles` only: the step's narrowing, and the dispatching agent's own frontmatter, are not carried down.
+- Under an engagement a finding needs an asset kind an active profile declares, and a finding with no `asset` is filed as `code:file`, which is rejected unless `code` is in the set. Completeness checks apply under the `full` findings profile only. See [coverage.md](coverage.md#what-an-engagement-enforces).
+- **Remote steps (`host:` / `distribute:`) are refused under an engagement.** The engagement set does not travel to the remote host yet, so a placed unit whose step `engagement_profiles`, else `defaults.engagement_profiles`, selects anything other than `code` fails with an error instead of running under the native rules. To run such a step on a host anyway, opt out explicitly with `engagement_profiles: [code]` on that step: it then runs there on the native `code` path with no engagement. The refusal does not consider an agent's own `engagementProfiles`. A `for_each` fan-out without `distribute:` runs locally and is not affected.
 - The field must never be silently ignored, so these are parse errors:
   - `engagement_profiles` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
-  - `engagement_profiles` on an `action:` step that calls any tool other than `findings.record`.
+  - `engagement_profiles` on an `action:` step that calls any tool other than `findings.record`;
+  - an empty id (`""`) in `defaults.engagement_profiles` or a step's list.
 
 The control-plane workflow editor (`rupu cp serve`) does not yet expose an `engagement_profiles` field; author it directly in YAML.
 
