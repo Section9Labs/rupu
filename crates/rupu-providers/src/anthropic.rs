@@ -342,6 +342,10 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Page size for the `GET /v1/models` catalog listing (spec 2026-09-30 §3).
 /// The API's maximum, so the whole catalog is normally one request.
 const MODELS_PAGE_LIMIT: u32 = 1000;
+
+/// Page size `probe` asks `GET /v1/models` for: the status is the whole
+/// answer, so one entry is enough and the catalog is never downloaded.
+const PROBE_PAGE_LIMIT: u32 = 1;
 // ─────────────────────────────────────────────────────────────────────
 // Claude Code OAuth wire-shape pins
 //
@@ -1402,8 +1406,9 @@ impl AnthropicClient {
     ///
     /// Shared by the catalog listing ([`LlmProvider::list_models`] /
     /// [`LlmProvider::fetch_models`], via `fetch_all_models`, `limit` =
-    /// [`MODELS_PAGE_LIMIT`]) and [`LlmProvider::probe`] (`limit` = 1: the
-    /// status is the whole answer, so it must not download the catalog).
+    /// [`MODELS_PAGE_LIMIT`]) and [`LlmProvider::probe`] (`limit` =
+    /// [`PROBE_PAGE_LIMIT`]: the status is the whole answer, so it must not
+    /// download the catalog).
     /// Kept as one function so the two can never drift apart in auth handling
     /// — a probe that authenticated differently from the real call would be
     /// testing the wrong thing.
@@ -2660,11 +2665,13 @@ impl crate::provider::LlmProvider for AnthropicClient {
         }
     }
 
-    /// Probe via the same authenticated `GET /v1/models` call `list_models`
-    /// makes — but here the status IS the answer, so nothing is swallowed. A
-    /// 2xx means the credential works, even if the account lists no models.
+    /// Probe via the same authenticated `GET /v1/models` request builder the
+    /// catalog listing uses (`models_request`), but for a single entry
+    /// ([`PROBE_PAGE_LIMIT`]) — here the status IS the answer, so nothing is
+    /// swallowed and nothing is paginated. A 2xx means the credential works,
+    /// even if the account lists no models.
     async fn probe(&self) -> Result<(), ProviderError> {
-        let resp = self.models_request(None, 1).await?;
+        let resp = self.models_request(None, PROBE_PAGE_LIMIT).await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());

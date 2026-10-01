@@ -12,6 +12,14 @@ pub const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 8192;
 /// Compaction percentage when the agent doesn't set `compactAtPercent`.
 pub const DEFAULT_COMPACT_AT_PERCENT: u8 = 80;
 
+/// Clamp a compaction percentage to the supported `[10, 95]` range. The one
+/// place the bounds live: the setter, the threshold math and the run-start
+/// notice all go through it, so a stored out-of-range value (serde bypasses
+/// the setter) reads the same everywhere.
+pub fn clamp_compact_percent(pct: u8) -> u8 {
+    pct.clamp(10, 95)
+}
+
 /// Where a resolved limit came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -113,13 +121,18 @@ impl ModelLimits {
         self
     }
     pub fn with_percent(mut self, pct: u8) -> Self {
-        self.compact_at_percent = pct.clamp(10, 95);
+        self.compact_at_percent = clamp_compact_percent(pct);
         self
+    }
+
+    /// The compaction percentage actually applied: the stored field, clamped.
+    fn effective_percent(&self) -> u8 {
+        clamp_compact_percent(self.compact_at_percent)
     }
 
     fn by_percent(&self) -> Option<u64> {
         let input = self.input.tokens? as u64;
-        Some(input * self.compact_at_percent.clamp(10, 95) as u64 / 100)
+        Some(input * self.effective_percent() as u64 / 100)
     }
 
     /// Input-token count above which proactive compaction runs (spec §6.4):
@@ -173,7 +186,7 @@ impl ModelLimits {
             (Some(t), _) => format!(
                 "compact at {} ({}%)",
                 group_thousands(t),
-                self.compact_at_percent.clamp(10, 95)
+                self.effective_percent()
             ),
             (None, _) => "compaction off".to_string(),
         };
@@ -390,6 +403,41 @@ mod tests {
         let s = serde_json::to_string(&l).unwrap();
         let back: ModelLimits = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn clamp_compact_percent_bounds() {
+        assert_eq!(clamp_compact_percent(0), 10);
+        assert_eq!(clamp_compact_percent(9), 10);
+        assert_eq!(clamp_compact_percent(10), 10);
+        assert_eq!(clamp_compact_percent(80), 80);
+        assert_eq!(clamp_compact_percent(95), 95);
+        assert_eq!(clamp_compact_percent(96), 95);
+        assert_eq!(clamp_compact_percent(u8::MAX), 95);
+    }
+
+    /// The setter, the threshold math and the notice all go through the one
+    /// clamp, so an out-of-range stored value reads the same everywhere.
+    #[test]
+    fn setter_threshold_and_notice_agree_on_the_clamp() {
+        for (raw, clamped) in [(0u8, 10u8), (3, 10), (50, 50), (99, 95), (255, 95)] {
+            let set = ModelLimits::unknown().with_input(1000).with_percent(raw);
+            assert_eq!(set.compact_at_percent, clamped, "with_percent({raw})");
+
+            let mut stored = ModelLimits::unknown().with_input(1000);
+            stored.compact_at_percent = raw; // bypasses the setter, as serde does
+            assert_eq!(
+                stored.compact_threshold(),
+                Some(1000 * clamped as u64 / 100),
+                "threshold for stored {raw}"
+            );
+            assert!(
+                stored
+                    .describe("anthropic", at(12, 0))
+                    .contains(&format!("({clamped}%)")),
+                "notice for stored {raw}"
+            );
+        }
     }
 
     #[test]
