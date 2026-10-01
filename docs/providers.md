@@ -50,7 +50,7 @@ echo -n "$KEY" | rupu auth login --account <name> --mode api-key
 rupu auth login --account <name> --kind <vendor> --mode api-key --key <secret>
 ```
 
-Stored in the OS keychain at `rupu/<provider>/api-key`.
+Stored in `~/.rupu/auth.json` (mode 0600), the only credential store: `$RUPU_HOME/auth.json` when `RUPU_HOME` is set, or the path in `RUPU_AUTH_FILE`. rupu no longer uses the OS keychain.
 
 ### SSO browser callback (Anthropic, OpenAI, Gemini)
 
@@ -62,7 +62,7 @@ Steps:
 1. rupu binds a localhost listener on a free port (`127.0.0.1:0`).
 2. A browser opens to the provider's authorize URL with PKCE challenge.
 3. Complete login in the browser; the page redirects to `http://127.0.0.1:<port>/callback`.
-4. rupu validates the redirect's `state` (CSRF protection), exchanges the auth code for tokens, and stores them in the keychain at `rupu/<provider>/sso`.
+4. rupu validates the redirect's `state` (CSRF protection), exchanges the auth code for tokens, and stores them in `~/.rupu/auth.json`.
 5. The browser shows "Authentication complete — return to your terminal."
 
 **Headless (Linux without `DISPLAY`/`BROWSER`):** the browser-callback flow errors out with a message pointing at `--mode api-key`. There's no headless fallback for these three providers.
@@ -78,7 +78,7 @@ Steps:
 2. rupu prints `Visit https://github.com/login/device and enter code: ABCD-1234`.
 3. Open the URL in any browser, paste the code, authorize the rupu OAuth app.
 4. rupu polls `github.com/login/oauth/access_token` until the user grants access.
-5. The GitHub token is exchanged for a Copilot API token; both are stored at `rupu/copilot/sso`.
+5. The GitHub token is exchanged for a Copilot API token; both are stored in `~/.rupu/auth.json`.
 
 ### Default precedence
 
@@ -358,8 +358,8 @@ rupu sends the id as written (it never rejects an unknown one itself), so check 
 **Gemini API-key login fails.**
 Check that the key came from Google AI Studio (`AIzaSy…`) and re-login with `rupu auth login --provider gemini --mode api-key`. If the key is fine, `--mode sso` (Gemini CLI / Antigravity) is the alternative — but note that path exposes no model limits (see [Model limits](#model-limits)).
 
-**Cargo build prompts for keychain access on every `cargo run`.**
-macOS treats each freshly-built binary as a different code identity. Track the deferred signing/notarization work in `TODO.md`. Quick fix: click "Always Allow" once on the first prompt — the trust persists per binary path until the next rebuild.
+**I'm logged out after upgrading from an older rupu on macOS.**
+Older versions kept credentials in the macOS keychain; rupu now uses only `~/.rupu/auth.json`, so those entries are not read. `rupu auth login` tells you when it finds leftovers. Log in again, then remove the old entries with `security delete-generic-password -s rupu -a <account>` if you like. (`rupu auth backend --use keychain` is rejected: there is nothing to select.)
 
 **`rupu auth logout --all` removes credentials I didn't expect.**
 By design — `--all` iterates every stored account × mode. Use `--account <name>` (with optional `--mode <m>`) for surgical removals.

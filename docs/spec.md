@@ -52,7 +52,7 @@ SaaS control plane and remote sandboxing are still out of scope here; SCM and is
 - Workflow runner with sequential steps plus `for_each`, `parallel`, `panel`, `when`, approval gates, and trigger-aware context.
 - JSONL transcript schema with 11 event types.
 - Two-tier config: global `~/.rupu/config.toml` + project `<repo>/.rupu/config.toml`.
-- Credential storage: OS keychain via `keyring` crate, chmod-600 JSON fallback.
+- Credential storage: a chmod-600 JSON file, `~/.rupu/auth.json` (the OS keychain backend was retired).
 - `rupu agent list|show`, `rupu workflow list|show|run`, `rupu transcript list|show`,
   `rupu config get|set`, `rupu auth login|logout|status`.
 - Curated starter samples in `crates/rupu-cli/templates/` plus richer repo-local examples under `examples/`.
@@ -80,12 +80,12 @@ SaaS control plane and remote sandboxing are still out of scope here; SCM and is
 ```
 ~/.rupu/
   config.toml       # provider defaults, model defaults, permission mode, log level
-  auth.json         # API keys / tokens (chmod 600 fallback; keychain preferred)
+  auth.json         # API keys / tokens (chmod 600; the only credential store)
   agents/           # global agent library (*.md)
   workflows/        # global workflow library (*.yaml)
   workspaces/       # one <id>.toml per discovered workspace
   transcripts/      # default JSONL transcript archive
-  cache/            # model catalog cache, auth-backend probe cache, crash logs
+  cache/            # model catalog cache, crash logs
 ```
 
 ### Project (`<repo>/.rupu/`)
@@ -276,7 +276,7 @@ rupu run my-agent "fix the failing test"
         │
         ▼ rupu-agent: load agent file (project shadows global by name), parse frontmatter + body
         │
-        ▼ rupu-auth: resolve credential for provider (keychain → auth.json fallback)
+        ▼ rupu-auth: resolve credential for provider (auth.json)
         │
         ▼ rupu-transcript: open <transcripts>/<run_id>.jsonl, write run_start event
         │
@@ -295,15 +295,16 @@ rupu run my-agent "fix the failing test"
 
 ## Authentication
 
-- **Primary storage:** `keyring` crate — macOS Keychain on macOS, Linux Secret Service (D-Bus)
-  on Linux.
-- **Fallback:** `~/.rupu/auth.json` at mode 0600. Used when the keychain is unavailable (headless
-  server, no D-Bus). A one-time warning is printed. Mode bits checked on every read.
-- **Probe cache:** `~/.rupu/cache/auth-backend.json` records which backend was chosen so rupu
-  does not re-probe on every invocation. Invalidated on `rupu auth login` and `--probe-auth`.
-- **`rupu auth login`** — reads the API key from stdin or `--key <K>`. Stores via the chosen
-  backend. OAuth flows (Copilot, Gemini) are deferred.
-- **`rupu auth status`** — shows configured providers + storage backend. Never prints credentials.
+- **Storage:** `~/.rupu/auth.json` at mode 0600 (`$RUPU_HOME/auth.json` when `RUPU_HOME` is set, or
+  the path in `RUPU_AUTH_FILE`). It is the only backend: the OS keychain was retired because a bare
+  CLI binary's keychain access is bound to the binary's code identity, so every rebuild silently lost
+  the credentials. On macOS, `rupu auth login` says so when it finds entries an older rupu left in
+  the keychain.
+- **`rupu auth login`** — reads the API key from stdin or `--key <K>`, or runs the SSO flow
+  (browser callback for Anthropic, OpenAI and Gemini; device code for Copilot). See
+  [providers.md](providers.md).
+- **`rupu auth status`** — shows each account's kind and whether an API-key or SSO credential is present. Never prints credentials.
+  `rupu auth backend` reports where the credential file is.
 
 ---
 

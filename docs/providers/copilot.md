@@ -20,7 +20,7 @@ rupu auth login --provider copilot --mode api-key
 # (reads GITHUB_TOKEN from env when --key is omitted)
 ```
 
-Stored at `rupu/copilot/api-key`.
+Stored in `~/.rupu/auth.json` (mode 0600).
 
 ## SSO via GitHub device code
 
@@ -37,7 +37,7 @@ This is the same flow `gh auth login` uses:
    ```
 3. Open the URL in a browser (any browser, anywhere — this works headless / over SSH unlike the other providers' SSO).
 4. Paste the code, authorize the rupu Copilot OAuth app.
-5. rupu polls until you authorize, then exchanges the GitHub token for a Copilot API token. Both are stored at `rupu/copilot/sso`.
+5. rupu polls until you authorize, then exchanges the GitHub token for a Copilot API token. Both are stored in `~/.rupu/auth.json` (mode 0600).
 
 ## Example agent file
 

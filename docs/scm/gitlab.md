@@ -12,7 +12,7 @@
 
 `rupu auth login --provider gitlab --mode sso` opens gitlab.com's authorize
 endpoint in the default browser; rupu listens on a fixed loopback port for the
-redirect, completes the PKCE exchange, stores the access token in keychain.
+redirect, completes the PKCE exchange, stores the access token in `~/.rupu/auth.json`.
 
 > **Note**: gitlab.com OAuth currently uses a placeholder client_id pending
 > registration of a rupu-specific OAuth app (TODO.md item). Use the API-key path

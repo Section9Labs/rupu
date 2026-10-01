@@ -30,7 +30,7 @@ org_id = "org-abc123"
 rupu auth login --provider openai --mode sso
 ```
 
-A browser opens to `auth.openai.com/oauth/authorize`. Sign in with your ChatGPT account. The redirect lands on rupu's localhost listener; the credential is stored at `rupu/openai/sso`.
+A browser opens to `auth.openai.com/oauth/authorize`. Sign in with your ChatGPT account. The redirect lands on rupu's localhost listener; the credential is stored in `~/.rupu/auth.json` (mode 0600).
 
 The token includes a `chatgpt_account_id` JWT claim that tells the client to use the ChatGPT backend URL instead of the platform API. This is automatic — rupu detects the difference and routes accordingly.
 
