@@ -251,7 +251,7 @@ The observed value is **not** written to the model cache, because it reflects th
 ### 8.1 CLI
 
 - `rupu models list` gains `output` and `fetched` columns next to the existing `context` column. The CSV and JSON reports get matching fields.
-- `rupu models refresh` keeps its interface, now backed by `rupu_runtime::model_limits::refresh`. It prints one line per targeted provider and exits non-zero when every targeted provider failed; one success is enough for exit 0.
+- `rupu models refresh` keeps its interface, now backed by `rupu_runtime::model_limits::refresh` (with `FETCH_TIMEOUT`, and the cache dir from `model_limits::cache_dir`). It prints one line per targeted provider (`rupu: refreshed <p> (N models)` or `rupu: skip <p>: <reason>`) and exits non-zero when no targeted provider refreshed (`no provider was refreshed`); one success is enough for exit 0, and the failed providers are still printed. A `--provider` naming neither a built-in vendor nor a declared account is an error, not a silent no-op. It ignores the negative cache (§5).
 
 ### 8.2 CP backend
 
@@ -265,12 +265,12 @@ pub trait ModelCatalog: Send + Sync {
 }
 ```
 
-`rupu cp serve` (`crates/rupu-cli/src/cmd/cp.rs`) implements it by delegating to `rupu_runtime::model_limits`. Without the port, both endpoints return 501, the existing pattern.
+`rupu cp serve` (`crates/rupu-cli/src/cmd/cp.rs`, adapter in `cp_model_catalog.rs`) implements it by delegating to `rupu_runtime::model_limits`, computing the cache dir at that edge. Without the port, both endpoints return 501, the existing pattern. The adapter converts the runtime's `UnknownProvider` through an explicit `From<UnknownProvider> for ModelCatalogError` (a 400), so a future runtime error variant can't silently become one; a config that won't load is a `Backend` error (500).
 
 - **`GET /api/models`** returns `[{ provider, fetched_at, stale, models: [{ id, input_tokens, output_tokens, source }] }]`. Here `source` is `live | custom | baked-in`, and a limit is null when unknown.
 - **`POST /api/models/refresh`**, body `{ provider?: string }`, returns `[{ provider, ok, count, error? }]`.
   - It uses the same auth as the other CP mutation endpoints.
-  - It's synchronous: providers are fetched in parallel, each with the 10s timeout. So a 200 means refreshed, unlike run mutations, where a 200 only means recorded.
+  - It's synchronous: providers are fetched in parallel, each with the 10s timeout. So a 200 means refreshed, unlike run mutations, where a 200 only means recorded. Like the CLI, it ignores the negative cache (§5), and a success clears the marker.
   - Each provider's job is a spawned task and the timeout bounds only the wait: a job that outlives it is reported as `timed out after 10s` but is not cancelled, so an OAuth/SSO token refresh in flight still persists its rotated token. Its `JoinHandle` comes back in `RefreshReport.unfinished`: `cp serve` drops it (the task finishes detached), while the one-shot `rupu models refresh` prints `rupu: waiting for N provider job(s) to finish…` and awaits them under one 30s deadline, because its runtime's shutdown on exit would otherwise cancel them. Each job is reported as it lands (`rupu: refreshed <p> (N models) after the wait`) and counts toward the exit status like any other success; at the deadline the ones still running are named (`… still running: <p>`), without losing the ones that landed.
   - One provider failing doesn't fail the others.
 
@@ -322,7 +322,7 @@ These came up here and belong to the companion spec:
 ## 11. Docs
 
 - **`docs/agent-format.md`:** `contextWindowTokens` / `maxTokens` / `compactAtPercent` are now optional overrides of discovered limits.
-- **`docs/providers.md`, `docs/providers/gemini.md`:** which providers report limits, the Gemini CLI gap, and declaring limits in `[[providers.X.models]]`.
+- **`docs/providers.md`, `docs/providers/gemini.md`, `docs/providers/openai-compatible.md`, `docs/configuration.md`:** which providers report limits, the Gemini CLI gap (and that its SSO talks to Cloud Code Assist, not Vertex), declaring limits in `[[providers.X.models]]`, the refresh output and exit code, the 5-minute pause after a failed refetch, 0 pins, the recognized overflow formats and the 1M fallback.
 - **CLAUDE.md:** add a `rupu-runtime` crate entry (`provider_factory`, `model_limits`).
 
 ## 12. Plans
