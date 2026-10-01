@@ -1500,9 +1500,10 @@ impl RunStore {
     /// a short sleep), so the methods that take it (`cancel`, `pause`,
     /// `reap_if_orphaned`, `expire_if_overdue`, `expire_gate_if_overdue`,
     /// `approve_gate`, `reject_gate`, `request_resume_approval`,
-    /// `claim_resume`, `clear_resume`, `clear_reject_cleanup`,
-    /// `update_unless_cancelled`, `modify_unless_cancelled`,
-    /// `modify_if_status`, `modify_fields`) are called from an async
+    /// `claim_resume`, `release_resume_claim`, `clear_resume`,
+    /// `clear_reject_cleanup`, `update_unless_cancelled`,
+    /// `modify_unless_cancelled`, `modify_if_status`, `modify_fields`) are
+    /// called from an async
     /// context through [`RunStore::blocking`], never directly on a runtime
     /// worker. Not re-entrant: a holder calls the `_locked` variants, never
     /// a method that takes it again.
@@ -2985,6 +2986,24 @@ impl RunStore {
             true
         })?;
         Ok(claimed.get())
+    }
+
+    /// Release the resume claim ([`claim_resume`](Self::claim_resume))
+    /// and nothing else: the gate sweep's approve hand-off, once its
+    /// child is spawned, when the pending marker is not its gate's — a
+    /// web approve of a sibling gate the resume worker has yet to consume
+    /// — gives the lease back and leaves that marker
+    /// (`resume_requested_at`, gate, approver, mode) for the worker. Under
+    /// the run lock, on the record as it is now; a cancel is left alone.
+    /// The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn release_resume_claim(&self, run_id: &str) -> Result<(), RunStoreError> {
+        self.modify_unless_cancelled(run_id, |record| {
+            record.resume_claimed_at = None;
+            record.resume_claimed_by = None;
+            true
+        })?;
+        Ok(())
     }
 
     /// Clear the pending-resume marker + claim after a worker finishes
@@ -6255,6 +6274,42 @@ mod tests {
 
         assert!(matches!(
             store.modify_if_status("run_missing", RunStatus::Paused, |_| {}),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// `release_resume_claim` gives the lease back and touches nothing
+    /// else: the pending marker (request, gate, approver, mode) stays for
+    /// the resume worker, which can claim it again.
+    #[test]
+    fn release_resume_claim_gives_the_lease_back_and_keeps_the_marker() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_release_claim");
+        rec.resume_requested_at = Some(now);
+        rec.resume_gate_id = Some("gate_b".into());
+        rec.resume_approver = Some("web".into());
+        rec.resume_mode = Some("bypass".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store.claim_resume(&rec.id, "sweep", now).unwrap());
+        assert!(store.load(&rec.id).unwrap().resume_claimed_at.is_some());
+
+        store.release_resume_claim(&rec.id).unwrap();
+
+        let released = store.load(&rec.id).unwrap();
+        assert_eq!(released.resume_claimed_at, None);
+        assert_eq!(released.resume_claimed_by, None);
+        assert_eq!(released.resume_requested_at, Some(now), "the marker stays");
+        assert_eq!(released.resume_gate_id.as_deref(), Some("gate_b"));
+        assert_eq!(released.resume_approver.as_deref(), Some("web"));
+        assert_eq!(released.resume_mode.as_deref(), Some("bypass"));
+        assert!(
+            store.claim_resume(&rec.id, "worker", now).unwrap(),
+            "the resume worker claims it next"
+        );
+        assert!(matches!(
+            store.release_resume_claim("run_missing"),
             Err(RunStoreError::NotFound(_))
         ));
     }
