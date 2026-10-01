@@ -119,7 +119,13 @@ pub fn is_retryable(e: &ProviderError) -> bool {
         ProviderError::RateLimited { .. }
         | ProviderError::Transient(_)
         | ProviderError::Http(_) => true,
-        ProviderError::Api { status, .. } => *status == 429 || *status == 529 || *status >= 500,
+        // Anthropic's long-context entitlement 429 is refused the same way on
+        // every attempt; surface it for the runner's overflow handling.
+        ProviderError::Api {
+            status: 429,
+            message,
+        } => !crate::error::is_long_context_refusal(message),
+        ProviderError::Api { status, .. } => *status == 529 || *status >= 500,
         _ => false,
     }
 }
@@ -605,6 +611,22 @@ mod tests {
             .await;
         assert!(r.is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Anthropic's long-context entitlement 429 is not a rate limit: the same
+    /// request is refused the same way every time, so it surfaces at once for
+    /// the agent runner to treat as an overflow. Other 429s still retry.
+    #[test]
+    fn long_context_entitlement_429_is_not_retryable() {
+        assert!(!is_retryable(&ProviderError::Api {
+            status: 429,
+            message: r#"{"error":{"message":"Extra usage is required for long context requests"}}"#
+                .into(),
+        }));
+        assert!(is_retryable(&ProviderError::Api {
+            status: 429,
+            message: r#"{"error":{"type":"rate_limit_error"}}"#.into(),
+        }));
     }
 
     #[test]

@@ -535,7 +535,11 @@ async fn run_sizing_turn(limits: ModelLimits) -> (Vec<LlmRequest>, Vec<Message>)
     opts.limits = limits;
     let result = run_agent(opts).await.expect("run completes");
     let reqs = captured.lock().unwrap().clone();
-    assert_eq!(text_chars(&reqs[0].messages), 150_000, "fixture calibration");
+    assert_eq!(
+        text_chars(&reqs[0].messages),
+        150_000,
+        "fixture calibration"
+    );
     (reqs, result.final_messages)
 }
 
@@ -593,4 +597,227 @@ async fn compacted_history_lands_under_the_threshold() {
         estimated < threshold,
         "post-compaction history ({estimated} tokens) must stay under the {threshold} threshold"
     );
+}
+
+/// Anthropic pre-4.5 validation error (wording verified against real API
+/// responses quoted in anthropics/claude-code#42 and #228; numbers invented).
+const INPUT_PLUS_MAX_TOKENS: &str = "API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"input length and `max_tokens` exceed context limit: 187254 + 20000 > 204798, decrease input length or `max_tokens` and try again\"}}";
+
+/// `input + max_tokens > window`: the input fits, the output reservation does
+/// not. The turn is retried ONCE with `max_tokens = window − input − 1000`;
+/// the input limit is not clamped (it never overflowed), and nothing is
+/// compacted or trimmed.
+#[tokio::test]
+async fn input_plus_max_tokens_overflow_retries_with_a_lowered_output_cap() {
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::ProviderError(INPUT_PLUS_MAX_TOKENS.into()),
+        final_text_turn(usage(300, 6, 0)),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.limits = ModelLimits::fixed(1_000_000, 20_000);
+    let result = run_agent(opts).await.expect("the retry succeeds");
+
+    let reqs = captured.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "the failed turn and its one retry");
+    assert_eq!(reqs[0].max_tokens, Some(20_000));
+    assert_eq!(
+        reqs[1].max_tokens,
+        Some(204_798 - 187_254 - 1_000),
+        "the retried request carries the lowered cap"
+    );
+    assert_eq!(
+        serde_json::to_value(&reqs[1].messages).unwrap(),
+        serde_json::to_value(&reqs[0].messages).unwrap(),
+        "same history otherwise"
+    );
+    assert_eq!(
+        result.final_limits,
+        ModelLimits::fixed(1_000_000, 20_000),
+        "neither limit is clamped: the lowering is for this request only"
+    );
+    let n = notices(&transcript);
+    assert!(
+        n.iter().any(|(k, m)| k == "model_limits_clamped"
+            && m.contains("output 20,000 → 16,544")
+            && m.contains("this request")),
+        "{n:?}"
+    );
+    assert!(!n.iter().any(|(k, _)| k == "context_trim"), "{n:?}");
+    assert_eq!(compaction_count(&transcript), 0);
+}
+
+/// When `window − input − 1000` is under the 1024 floor there is no useful
+/// cap to lower to: the error falls through to compaction (the input is what
+/// has to shrink). The input limit is still not clamped — the window in this
+/// error counts output too.
+#[tokio::test]
+async fn input_plus_max_tokens_below_the_floor_compacts_instead() {
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::ProviderError(
+            "API error 400: input length and `max_tokens` exceed context limit: 200000 + 8192 > 201000"
+                .into(),
+        ),
+        summary_turn(usage(100, 10, 0)),
+        final_text_turn(usage(300, 6, 0)),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = dense_seed();
+    opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
+    let result = run_agent(opts).await.expect("compaction recovers");
+
+    assert_eq!(compaction_count(&transcript), 1);
+    let n = notices(&transcript);
+    assert!(
+        !n.iter().any(|(k, _)| k == "model_limits_clamped"),
+        "nothing lowered, nothing clamped: {n:?}"
+    );
+    assert_eq!(
+        result.final_limits.input,
+        Limit::new(1000, LimitSource::Agent)
+    );
+    assert_retried_turn_carries_compacted_history(&captured.lock().unwrap());
+}
+
+/// A provider that fails its first streamed call with `err`, then delegates.
+struct FailFirst {
+    err: Option<ProviderError>,
+    inner: CapturingMockProvider,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FailFirst {
+    async fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+        self.inner.send(req).await
+    }
+
+    async fn stream(
+        &mut self,
+        req: &LlmRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<LlmResponse, ProviderError> {
+        match self.err.take() {
+            Some(e) => Err(e),
+            None => self.inner.stream(req, on_event).await,
+        }
+    }
+
+    fn default_model(&self) -> &str {
+        "mock-1"
+    }
+
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Anthropic
+    }
+}
+
+/// Anthropic's 429 "Extra usage is required for long context requests" (an
+/// account without extra-usage billing that sent > 200K) is an overflow at
+/// the account's standard 200K window, not a rate limit: the run clamps to
+/// 200K and compacts instead of burning retries and failing. A real
+/// `Api { status: 429 }` proves the overflow check runs before the
+/// transient-error retry classifier.
+#[tokio::test]
+async fn long_context_entitlement_429_clamps_to_200k_and_compacts() {
+    let big = |role: Role, label: &str| Message {
+        role,
+        content: vec![ContentBlock::Text {
+            text: format!("{label}: {}", "x".repeat(100_000)),
+        }],
+    };
+    let inner = CapturingMockProvider::new(vec![
+        summary_turn(usage(100, 10, 0)),
+        final_text_turn(usage(300, 6, 0)),
+    ]);
+    let captured = inner.captured.clone();
+    let provider = FailFirst {
+        err: Some(ProviderError::Api {
+            status: 429,
+            message: "Extra usage is required for long context requests".into(),
+        }),
+        inner,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = vec![
+        big(Role::User, "task"),
+        big(Role::Assistant, "a0"),
+        big(Role::User, "u0"),
+        big(Role::Assistant, "a1"),
+    ];
+    opts.limits = discovered(
+        1_000_000,
+        128_000,
+        LimitSource::Live {
+            fetched_at: chrono::Utc::now(),
+            stale: false,
+        },
+    )
+    .with_percent(50);
+    let result = run_agent(opts).await.expect("compaction recovers");
+
+    assert_eq!(
+        result.final_limits.input,
+        Limit::new(200_000, LimitSource::Observed)
+    );
+    let n = notices(&transcript);
+    assert!(
+        n.iter()
+            .any(|(k, m)| k == "model_limits_clamped" && m.contains("1,000,000 → 200,000")),
+        "{n:?}"
+    );
+    assert!(
+        !n.iter().any(|(k, _)| k == "provider_retry"),
+        "not retried as a rate limit: {n:?}"
+    );
+    assert_eq!(compaction_count(&transcript), 1);
+    let reqs = captured.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "the summariser call, then the retried turn");
+    assert!(message_text(&reqs[1].messages[0]).contains(SUMMARY));
+}
+
+/// `Compaction.seq` numbers the compactions that actually ran, with no gaps:
+/// an attempt that does not compact (here the summariser call fails) must not
+/// consume a number.
+#[tokio::test]
+async fn compaction_seq_counts_only_compactions_that_ran() {
+    let provider = CapturingMockProvider::new(vec![
+        // Turn 1: over the 500-token threshold, and a tool call so the run
+        // continues.
+        ScriptedTurn::AssistantBlocksWithUsage {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "no_such_tool".into(),
+                input: serde_json::json!({}),
+            }],
+            stop: StopReason::ToolUse,
+            usage: usage(600, 5, 0),
+        },
+        // Its compaction attempt: the summariser fails, nothing compacts.
+        ScriptedTurn::ProviderError("summariser unavailable".into()),
+        // Turn 2: over the threshold again; this compaction runs.
+        final_text_turn(usage(600, 5, 0)),
+        summary_turn(usage(100, 10, 0)),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = dense_seed();
+    opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
+    run_agent(opts).await.expect("run completes");
+
+    let seqs: Vec<u32> = JsonlReader::iter(&transcript)
+        .unwrap()
+        .filter_map(|e| match e.ok()? {
+            Event::Compaction { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seqs, vec![1], "the first compaction that ran is #1");
 }

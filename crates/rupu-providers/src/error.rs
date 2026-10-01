@@ -89,6 +89,18 @@ impl From<serde_json::Error> for ProviderError {
     }
 }
 
+/// Anthropic's refusal of a long-context request on an account without
+/// extra-usage billing: a 429 whose body says "Extra usage is required for
+/// long context requests" (see the `anthropic-beta` comment in
+/// `anthropic.rs`). Deterministic for the request that drew it — not a rate
+/// limit — so the retry layers must not spend their budget on it; the agent
+/// runner treats it as a context overflow at the account's standard window.
+pub fn is_long_context_refusal(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("extra usage is required for long context")
+}
+
 /// Build the right `ProviderError` from a non-2xx HTTP response. 429s parse
 /// the server's `Retry-After` header into `RateLimited { retry_after }` so
 /// `tuned::RetryingProvider` can honor it (I-83); every other status keeps

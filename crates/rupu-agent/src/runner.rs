@@ -192,6 +192,11 @@ pub(crate) struct Overflow {
     pub max: Option<u32>,
 }
 
+/// The input limit to assume when Anthropic refuses a long-context request
+/// with a 429 "Extra usage is required for long context requests": the
+/// account's standard window.
+const LONG_CONTEXT_REFUSAL_WINDOW: u32 = 200_000;
+
 pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
     let e = err.to_ascii_lowercase();
     let after = |needle: &str| e.find(needle).map(|i| &e[i + needle.len()..]);
@@ -202,6 +207,39 @@ pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
             tokens: n.first().copied(),
             max: n.get(1).copied(),
         });
+    }
+    // Anthropic (pre-4.5 validation): "input length and `max_tokens` exceed
+    // context limit: A + B > C". The input alone (A) fits; it is the output
+    // reservation that does not, so C is no input limit — no max. The runner
+    // first lowers the request's cap (`parse_output_cap_overflow`); this arm
+    // is the fall-through when that is not possible.
+    if let Some(cap) = parse_output_cap_overflow(err) {
+        return Some(Overflow {
+            tokens: Some(cap.input),
+            max: None,
+        });
+    }
+    // Anthropic: a 429 "Extra usage is required for long context requests" on
+    // an account without extra-usage billing (see the `anthropic-beta`
+    // comment in rupu-providers/src/anthropic.rs). The account's window is
+    // the standard one, whatever the model's.
+    if rupu_providers::error::is_long_context_refusal(err) {
+        return Some(Overflow {
+            tokens: None,
+            max: Some(LONG_CONTEXT_REFUSAL_WINDOW),
+        });
+    }
+    // GitHub Copilot (CAPI `model_max_prompt_tokens_exceeded`): "prompt token
+    // count of N exceeds the limit of M" (microsoft/vscode
+    // extensions/copilot/test/inline/inlineEditCode.stest.ts).
+    if let Some(rest) = after("prompt token count of") {
+        if rest.contains("exceeds the limit of") {
+            let n = numbers(rest);
+            return Some(Overflow {
+                tokens: n.first().copied(),
+                max: n.get(1).copied(),
+            });
+        }
     }
     // OpenAI / Copilot: "maximum context length is M tokens … resulted in N tokens"
     if let Some(rest) = after("maximum context length is") {
@@ -223,11 +261,13 @@ pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
     }
     // Gemini: "input token count (N) exceeds the maximum number of tokens allowed (M)"
     if let Some(rest) = after("input token count") {
-        let n = numbers(rest);
-        return Some(Overflow {
-            tokens: n.first().copied(),
-            max: n.get(1).copied(),
-        });
+        if rest.contains("exceeds") {
+            let n = numbers(rest);
+            return Some(Overflow {
+                tokens: n.first().copied(),
+                max: n.get(1).copied(),
+            });
+        }
     }
     if e.contains("prompt is too long")
         || e.contains("too many tokens")
@@ -239,6 +279,46 @@ pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
         });
     }
     None
+}
+
+/// Anthropic's pre-4.5 validation error, "input length and `max_tokens`
+/// exceed context limit: A + B > C": the input (A) fits the window (C), the
+/// output reservation (B) does not. Wording verified against real API
+/// responses quoted in anthropics/claude-code#42 and #228.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputCapOverflow {
+    pub input: u32,
+    pub max_tokens: u32,
+    pub window: u32,
+}
+
+/// Room left between the input and the window when lowering the output cap
+/// after an [`OutputCapOverflow`] (token counts are estimates on both sides).
+const OUTPUT_CAP_MARGIN: u32 = 1000;
+/// The smallest output cap worth retrying with; below it, compact instead.
+const MIN_LOWERED_OUTPUT_CAP: u32 = 1024;
+
+impl OutputCapOverflow {
+    /// `window − input − 1000`, or `None` when that is under 1024 (the input
+    /// itself is what has to shrink).
+    pub(crate) fn lowered_max_tokens(&self) -> Option<u32> {
+        self.window
+            .checked_sub(self.input)?
+            .checked_sub(OUTPUT_CAP_MARGIN)
+            .filter(|n| *n >= MIN_LOWERED_OUTPUT_CAP)
+    }
+}
+
+pub(crate) fn parse_output_cap_overflow(err: &str) -> Option<OutputCapOverflow> {
+    let e = err.to_ascii_lowercase();
+    let needle = "input length and `max_tokens` exceed context limit";
+    let rest = &e[e.find(needle)? + needle.len()..];
+    let n = numbers(rest);
+    Some(OutputCapOverflow {
+        input: *n.first()?,
+        max_tokens: *n.get(1)?,
+        window: *n.get(2)?,
+    })
 }
 
 /// Every integer in `s`, in order. A `,` or `_` between digits is a thousands separator.
@@ -1347,6 +1427,9 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // Compact-on-overflow runs at most once per turn (spec §7); a
             // repeat overflow falls through to the trim loop.
             let mut overflow_compacted = false;
+            // An `input + max_tokens > window` error lowers this request's
+            // output cap and retries at most once per turn.
+            let mut output_cap_lowered = false;
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
                 let step: CallStep = if opts.no_stream {
@@ -1445,6 +1528,33 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     CallStep::Paused => break CallOutcome::Paused,
                     CallStep::Err(e) => {
                         let e_str = e.to_string();
+                        // `input + max_tokens > window`: the input fits, the
+                        // output reservation does not. Lower THIS request's
+                        // cap and retry once; the input limit is untouched.
+                        // When no useful cap is left, it falls through to the
+                        // overflow handling below (compaction).
+                        if !output_cap_lowered {
+                            if let Some((cap, lowered)) = parse_output_cap_overflow(&e_str)
+                                .and_then(|c| Some((c, c.lowered_max_tokens()?)))
+                            {
+                                use rupu_providers::model_limits::group_thousands;
+                                output_cap_lowered = true;
+                                req.max_tokens = Some(lowered);
+                                writer.write(&Event::Notice {
+                                    kind: "model_limits_clamped".into(),
+                                    message: format!(
+                                        "output {} → {} for this request (provider error: input {} + max_tokens {} > {}); the input limit is unchanged",
+                                        group_thousands(u64::from(cap.max_tokens)),
+                                        group_thousands(u64::from(lowered)),
+                                        group_thousands(u64::from(cap.input)),
+                                        group_thousands(u64::from(cap.max_tokens)),
+                                        group_thousands(u64::from(cap.window)),
+                                    ),
+                                })?;
+                                writer.flush()?;
+                                continue;
+                            }
+                        }
                         if let Some(overflow) = parse_context_overflow(&e_str) {
                             // Learn the real limit, then compact once per turn
                             // (spec §7).
@@ -1470,7 +1580,6 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                         writer.flush()?;
                                     }
                                 }
-                                compaction_seq += 1;
                                 let run_id_clone = opts.run_id.clone();
                                 let calibration =
                                     overflow.tokens.unwrap_or(last_turn_input_tokens).max(1);
@@ -1478,12 +1587,14 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                     &mut messages,
                                     opts,
                                     &run_id_clone,
-                                    compaction_seq,
+                                    compaction_seq + 1,
                                     &mut writer,
                                     calibration,
                                 )
                                 .await
                                 {
+                                    // Numbered only once it ran: no gaps.
+                                    compaction_seq += 1;
                                     req.messages = messages.clone();
                                     continue;
                                 }
@@ -1628,18 +1739,21 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // next request. Must run after usage accounting.
             if let Some(threshold) = opts.limits.compact_threshold() {
                 if resp.usage.input_tokens as u64 > threshold {
-                    compaction_seq += 1;
                     let run_id_clone = opts.run_id.clone();
                     let last_input_tokens = resp.usage.input_tokens;
-                    let _ = compact_context(
+                    if compact_context(
                         &mut messages,
                         opts,
                         &run_id_clone,
-                        compaction_seq,
+                        compaction_seq + 1,
                         &mut writer,
                         last_input_tokens,
                     )
-                    .await;
+                    .await
+                    {
+                        // Numbered only once it ran: no gaps.
+                        compaction_seq += 1;
+                    }
                 }
             }
 
@@ -2816,7 +2930,10 @@ mod retry_tests {
 
 #[cfg(test)]
 mod context_trim_tests {
-    use super::{parse_context_overflow, trim_oldest_exchange, Overflow};
+    use super::{
+        parse_context_overflow, parse_output_cap_overflow, trim_oldest_exchange, OutputCapOverflow,
+        Overflow,
+    };
     use rupu_providers::types::{ContentBlock, Message, Role};
 
     fn user_msg(text: &str) -> Message {
@@ -2934,6 +3051,127 @@ mod context_trim_tests {
                 "{msg}"
             );
         }
+    }
+
+    /// Anthropic's pre-4.5 validation error: `input + max_tokens > window`.
+    /// Verbatim wording from real API responses quoted in
+    /// anthropics/claude-code#42 and #228 (numbers invented).
+    const ANTHROPIC_INPUT_PLUS_MAX_TOKENS: &str = r#"API error 400: {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 187254 + 20000 > 204798, decrease input length or `max_tokens` and try again"}}"#;
+
+    #[test]
+    fn input_plus_max_tokens_format_parses_all_three_numbers() {
+        assert_eq!(
+            parse_output_cap_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
+            Some(OutputCapOverflow {
+                input: 187_254,
+                max_tokens: 20_000,
+                window: 204_798,
+            })
+        );
+        // Thousands separators, and case-insensitive.
+        assert_eq!(
+            parse_output_cap_overflow(
+                "INPUT LENGTH AND `MAX_TOKENS` EXCEED CONTEXT LIMIT: 1,000 + 2,000 > 2,500"
+            ),
+            Some(OutputCapOverflow {
+                input: 1_000,
+                max_tokens: 2_000,
+                window: 2_500,
+            })
+        );
+        // Not this format.
+        assert_eq!(
+            parse_output_cap_overflow("prompt is too long: 215000 tokens > 200000 maximum"),
+            None
+        );
+        // The format with its numbers missing is not usable for lowering.
+        assert_eq!(
+            parse_output_cap_overflow("input length and `max_tokens` exceed context limit"),
+            None
+        );
+    }
+
+    /// `input + max_tokens > window` lowers the output cap to
+    /// `window − input − 1000`, floor 1024; below the floor there is nothing
+    /// to lower to.
+    #[test]
+    fn input_plus_max_tokens_lowered_cap_keeps_a_margin_and_a_floor() {
+        let c = |input, window| OutputCapOverflow {
+            input,
+            max_tokens: 20_000,
+            window,
+        };
+        assert_eq!(c(187_254, 204_798).lowered_max_tokens(), Some(16_544));
+        assert_eq!(
+            c(100, 2_124).lowered_max_tokens(),
+            Some(1_024),
+            "exactly the floor"
+        );
+        assert_eq!(c(100, 2_123).lowered_max_tokens(), None, "below the floor");
+        assert_eq!(
+            c(205_000, 204_798).lowered_max_tokens(),
+            None,
+            "input alone overflows"
+        );
+    }
+
+    /// The same error, when the cap cannot be lowered, is still an overflow:
+    /// the input count is known, the input LIMIT is not (the window `C`
+    /// counts output too), so no max.
+    #[test]
+    fn input_plus_max_tokens_is_an_overflow_without_an_input_max() {
+        assert_eq!(
+            parse_context_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
+            Some(Overflow {
+                tokens: Some(187_254),
+                max: None
+            })
+        );
+    }
+
+    /// GitHub Copilot (CAPI) `model_max_prompt_tokens_exceeded`. Verbatim
+    /// wording from microsoft/vscode `extensions/copilot/test/inline/
+    /// inlineEditCode.stest.ts` (the vscode-copilot-chat sources).
+    #[test]
+    fn copilot_prompt_limit_format_parses_tokens_and_max() {
+        assert_eq!(
+            parse_context_overflow(
+                r#"API error 400: {"error":{"message":"prompt token count of 13613 exceeds the limit of 12288","code":"model_max_prompt_tokens_exceeded"}}"#
+            ),
+            Some(Overflow {
+                tokens: Some(13_613),
+                max: Some(12_288)
+            })
+        );
+    }
+
+    /// Anthropic's 429 for an account without extra-usage billing that sent a
+    /// long-context request (see the `anthropic-beta` comment in
+    /// rupu-providers/src/anthropic.rs). The account's window is the
+    /// standard 200K, so the run clamps there and compacts.
+    #[test]
+    fn long_context_entitlement_429_is_an_overflow_at_200k() {
+        assert_eq!(
+            parse_context_overflow(
+                "API error 429: Extra usage is required for long context requests"
+            ),
+            Some(Overflow {
+                tokens: None,
+                max: Some(200_000)
+            })
+        );
+    }
+
+    /// The Gemini arm needs the "exceeds" verb: a message that merely
+    /// mentions an input token count is not an overflow.
+    #[test]
+    fn gemini_arm_requires_exceeds() {
+        assert_eq!(
+            parse_context_overflow(
+                "API error 500: internal error (input token count 1200, output token count 30)"
+            ),
+            None
+        );
     }
 
     #[test]

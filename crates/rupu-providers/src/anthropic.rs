@@ -1580,6 +1580,13 @@ impl AnthropicClient {
                     body = text.as_str(),
                     "429 response from Anthropic API"
                 );
+                // Not a rate limit: the same request is refused every time.
+                if crate::error::is_long_context_refusal(&text) {
+                    return Err(ProviderError::Api {
+                        status: 429,
+                        message: text,
+                    });
+                }
                 last_err = Some(ProviderError::Api {
                     status: 429,
                     message: text,
@@ -1743,6 +1750,14 @@ impl AnthropicClient {
                         let text = resp.text().await.unwrap_or_default();
                         flow_guard.add_bytes(text.len() as u64);
                         flow_guard.complete().await;
+                        // Not a rate limit: the same request is refused
+                        // every time.
+                        if crate::error::is_long_context_refusal(&text) {
+                            return Err(ProviderError::Api {
+                                status: 429,
+                                message: text,
+                            });
+                        }
                         last_err = Some(ProviderError::Api {
                             status: 429,
                             message: text,
@@ -5331,6 +5346,48 @@ mod tests {
             ..crate::tuning::ProviderTuning::for_provider("anthropic")
         });
         let _ = client.send(&make_request(None)).await;
+        m.assert_hits(2);
+    }
+
+    /// The long-context entitlement 429 ("Extra usage is required for long
+    /// context requests", see the `anthropic-beta` comment above) is
+    /// deterministic for that request, not a rate limit: retrying it only
+    /// delays the overflow handling in the agent runner. Both paths surface it
+    /// on the first response, even with a retry budget to spend.
+    #[tokio::test]
+    async fn long_context_entitlement_429_is_not_retried() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"error":{"message":"Extra usage is required for long context requests"}}"#,
+                );
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        for streamed in [false, true] {
+            let err = if streamed {
+                client.stream(&make_request(None), |_ev| {}).await
+            } else {
+                client.send(&make_request(None)).await
+            }
+            .unwrap_err();
+            assert!(
+                matches!(&err, ProviderError::Api { status: 429, message }
+                    if message.contains("Extra usage is required for long context")),
+                "streamed={streamed}: {err:?}"
+            );
+        }
         m.assert_hits(2);
     }
 

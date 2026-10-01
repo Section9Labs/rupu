@@ -170,11 +170,20 @@ The live value describes the model, not the account's entitlement. For example, 
 | Provider | Observed format |
 |---|---|
 | Anthropic | `prompt is too long: N tokens > M maximum` |
+| Anthropic (pre-4.5 validation) | `` input length and `max_tokens` exceed context limit: A + B > C `` — see below; carries `tokens = A` and no max |
+| Anthropic (OAuth, no extra-usage billing) | 429 `Extra usage is required for long context requests` → `max = 200,000`, the account's standard window |
 | OpenAI / Copilot | `maximum context length is M tokens … resulted in N tokens` |
+| Copilot (CAPI `model_max_prompt_tokens_exceeded`) | `prompt token count of N exceeds the limit of M` |
 | vLLM | `Input length (N) exceeds model's maximum context length (M)` |
-| Gemini | `input token count (N) exceeds the maximum number of tokens allowed (M)` |
+| Gemini | `input token count (N) exceeds the maximum number of tokens allowed (M)` (the message must contain `exceeds`; a bare token count is not an overflow) |
 
 Plus today's three phrases, which match overflow but carry no max.
+
+Sources for the formats added after the first table: the Anthropic validation error is quoted verbatim from real API responses in anthropics/claude-code#42 and #228; the Copilot error from microsoft/vscode `extensions/copilot/test/inline/inlineEditCode.stest.ts`; the 429 from the `anthropic-beta` comment in `anthropic.rs`.
+
+**`input + max_tokens > window`.** Raising `max_tokens` to the model's real cap makes Anthropic's pre-4.5 validation error reachable. It means the input fits and the output reservation doesn't, so it never clamps the input limit. The runner retries the turn once with `max_tokens = C − A − 1000` for that request only and writes a `model_limits_clamped` notice saying the output cap was lowered for this request. If `C − A − 1000` is below 1024 (or the retry fails the same way), the error is handled as an overflow with no max: compact, then trim.
+
+**The 429 is not a rate limit.** It refuses the same request every time, so the retry layers (`tuned::is_retryable`, the Anthropic client's own 429 loop) surface it at once, and the runner checks for overflow before its transient-error retry.
 
 None of these formats are documented, so each is pinned by a fixture test. OpenAI's wording doesn't match any of today's three phrases (a gap the parsing audit found), and this table closes it.
 
@@ -185,6 +194,8 @@ When `max` is parsed and is below `limits.input` (or `limits.input` is unknown):
 4. The delete-oldest trim loop stays as the last resort: compaction impossible (input limit unknown), compaction failed, nothing to summarise (history too short), or the request still overflows.
 
 When no `max` is parsed, or the parsed max doesn't lower the limit, but the input limit is known, rupu still compacts with a summary once per turn before falling back to trimming: a summary preserves more than deleting the oldest exchange.
+
+`Compaction.seq` numbers only the compactions that actually ran (1, 2, 3, … with no gaps); an attempt that summarises nothing or whose summariser call fails doesn't use up a number.
 
 The observed value is **not** written to the model cache, because it reflects the account, not the model. If the clamp recurs, the notice suggests pinning `contextWindowTokens` on the agent.
 
