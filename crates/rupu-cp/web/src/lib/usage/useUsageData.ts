@@ -25,20 +25,20 @@
 //
 // A host that answered for window A and then fails its refetch for window B
 // keeps its old answer (stale-on-error) but is EXCLUDED from B's headline. The
-// failure is recorded against the window it failed FOR (`failedKey`); with no
-// request left in flight, a host whose `failedKey` is the current window counts
-// as failed for it: shown `offline` in the strip, labelled `(stale)` in
-// `excluded`, and counted toward `error` - otherwise a page whose every host
-// ended up that way would read `loading` forever. A failure for some other
-// window says nothing about this one, and while its refetch IS in flight a host
-// is `loading`.
+// failure is recorded against the window it failed FOR (`failedKey`); a host
+// whose `failedKey` is the current window counts as failed for it: shown
+// `offline` in the strip, labelled `(stale)` in `excluded`, and counted toward
+// `error` - otherwise a page whose every host ended up that way would read
+// `loading` forever. It stays failed while a retry for that same window (tick,
+// poll, focus) is in flight, until the retry answers; a failure for some OTHER
+// window says nothing about this one, so a window change reads `loading`.
 //
 // Abandoned requests are aborted: a host's newer request aborts its previous
 // one, and unmount aborts everything still in flight. A hung remote would
 // otherwise hold one of the browser's six connections per origin for as long as
 // it lives, and enough of them starve every other request the page makes.
 
-import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, apiErrorMessage, type UsageResponse, type UsageWindow } from '../api';
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSeed } from '../perHost/types';
@@ -95,12 +95,6 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
   const controllersRef = useRef(new Map<string, AbortController>());
   /** Set on unmount: a handler that runs after it must not touch state. */
   const disposedRef = useRef(false);
-  /**
-   * Whether a request is in flight is read from `controllersRef` while rendering, so a
-   * request STARTING (which changes no host state) bumps this to re-render. Settling
-   * needs no bump: the handlers' `setHosts` already re-renders.
-   */
-  const [inflightRev, bumpInflight] = useReducer((n: number) => n + 1, 0);
 
   const fetchHost = useRef((hostId: string) => {
     if (disposedRef.current) return;
@@ -110,7 +104,6 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     controllersRef.current.get(hostId)?.abort();
     const controller = new AbortController();
     controllersRef.current.set(hostId, controller);
-    bumpInflight();
     const key = keyRef.current;
     const update = (f: (h: HostUsage) => HostUsage) =>
       setHosts((prev) => prev.map((h) => (h.hostId === hostId ? f(h) : h)));
@@ -168,13 +161,19 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
   };
 
   // Unmount: stop waiting on everything still in flight. Declared before the effects that
-  // fetch, so a StrictMode remount re-arms `disposed` before they run again.
+  // fetch, so a StrictMode / Fast Refresh remount re-arms `disposed` before they run again.
   useEffect(() => {
     disposedRef.current = false;
     const controllers = controllersRef.current;
+    const seqs = seqRef.current;
     return () => {
       disposedRef.current = true;
-      for (const c of controllers.values()) c.abort();
+      for (const [hostId, c] of controllers) {
+        // Invalidate the request first, as `fetchHost` does: once a remount has reset `disposed`,
+        // its late (or aborted) answer must still be dropped, not mark the host offline.
+        seqs.set(hostId, (seqs.get(hostId) ?? 0) + 1);
+        c.abort();
+      }
       controllers.clear();
     };
   }, []);
@@ -239,12 +238,12 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
 
   const current = (h: HostUsage) => h.state === 'ok' && h.response !== null && h.windowKey === windowKey;
   /**
-   * Answered for another window, then failed its request for THIS one, with nothing left in
-   * flight: it has failed for the current window, whatever stale data it still holds. Keyed on
-   * the failing window, so a failure for some other window is never read as this one's.
+   * Answered for another window, then failed a request for THIS one: it has failed for the
+   * current window, whatever stale data it still holds. Keyed on the failing window, so a failure
+   * for some other window is never read as this one's, and a retry in flight for this window does
+   * not hide the failure (the error does not flicker back to a spinner every poll cycle).
    */
-  const staleFailed = (h: HostUsage) =>
-    h.state === 'ok' && h.windowKey !== windowKey && h.failedKey === windowKey && !controllersRef.current.has(h.hostId);
+  const staleFailed = (h: HostUsage) => h.state === 'ok' && h.windowKey !== windowKey && h.failedKey === windowKey;
 
   const data = useMemo(() => {
     const ok = hosts.filter(current);
@@ -253,8 +252,8 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
       .filter((h) => !current(h))
       .map((h) => `${h.name} (${h.state === 'ok' ? (staleFailed(h) ? 'stale' : 'loading') : h.state})`);
     return { ...mergeUsage(ok.map((h) => h.response as UsageResponse)), excluded };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `current`/`staleFailed` close over windowKey and the in-flight map (inflightRev)
-  }, [hosts, windowKey, inflightRev]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `current`/`staleFailed` close over windowKey
+  }, [hosts, windowKey]);
 
   const entries: HostFreshnessEntry[] = hosts.map((h) => ({
     host_id: h.hostId,

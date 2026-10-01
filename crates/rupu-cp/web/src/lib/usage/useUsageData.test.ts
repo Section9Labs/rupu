@@ -229,7 +229,7 @@ describe('useUsageData', () => {
       expect(result.current.error).toBeNull();
     });
 
-    it('reads loading, not stale, while its refetch is in flight', async () => {
+    it('reads loading, not stale, for a window it has not failed for', async () => {
       const mode = { current: answer };
       const { result, rerender } = setup(mode);
       await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
@@ -237,7 +237,7 @@ describe('useUsageData', () => {
       rerender({ key: 'preset:7d' });
       await waitFor(() => expect(result.current.hosts[1]?.state).toBe('offline'));
 
-      // Move again; nothing answers yet. Nothing failed for THIS window, so nothing reads failed.
+      // Move again; nothing answers yet. The failure was for 7d, not 90d, so nothing reads failed.
       const localC = deferred<UsageResponse>();
       mode.current = (host) => (host === 'local' ? localC.promise : new Promise(() => {}));
       rerender({ key: 'preset:90d' });
@@ -249,6 +249,73 @@ describe('useUsageData', () => {
       await waitFor(() => expect(result.current.data?.summary.runs).toBe(1));
       expect(result.current.data?.excluded).toEqual(['prod (loading)']);
       expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'loading']);
+    });
+  });
+
+  describe('a host that has failed for the current window', () => {
+    const answer = (host: string) => Promise.resolve(resp(host, host === 'local' ? 1 : 10));
+    const down = () => Promise.reject(new Error('down'));
+    const focus = async () => {
+      vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+    };
+
+    it('stays failed while a retry for the same window is in flight, and recovers when it answers', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      const mode = { current: (host: string): Promise<UsageResponse> => answer(host) };
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) => mode.current(host ?? 'local'));
+      const { result, rerender } = renderHook(({ key }) => useUsageData(WIN, key, 'user'), {
+        initialProps: { key: 'preset:30d' },
+      });
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      mode.current = down; // both fail FOR 7d
+      rerender({ key: 'preset:7d' });
+      await waitFor(() => expect(result.current.error).not.toBeNull());
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['offline', 'offline']);
+
+      // A focus retry for the same window is now in flight. It must not turn the error back into a spinner.
+      const retry = { local: deferred<UsageResponse>(), host_prod: deferred<UsageResponse>() };
+      mode.current = (host) => (host === 'local' ? retry.local.promise : retry.host_prod.promise);
+      const calls = usageCallsFor('host_prod').length;
+      await focus();
+      await waitFor(() => expect(usageCallsFor('host_prod')).toHaveLength(calls + 1));
+      await flush();
+      rerender({ key: 'preset:7d' }); // any render while the retry is pending (a tick, a re-render of the page)
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['offline', 'offline']);
+      expect(result.current.error).not.toBeNull();
+      expect(result.current.data).toBeNull();
+
+      retry.local.resolve(resp('local', 1));
+      retry.host_prod.resolve(resp('host_prod', 10));
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'ok']);
+      expect(result.current.error).toBeNull();
+    });
+
+    it('keeps its (stale) label while a retry for the same window is in flight', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      const mode = { current: (host: string): Promise<UsageResponse> => answer(host) };
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) => mode.current(host ?? 'local'));
+      const { result, rerender } = renderHook(({ key }) => useUsageData(WIN, key, 'user'), {
+        initialProps: { key: 'preset:30d' },
+      });
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      mode.current = (host) => (host === 'local' ? answer(host) : down());
+      rerender({ key: 'preset:7d' });
+      await waitFor(() => expect(result.current.hosts[1]?.state).toBe('offline'));
+      expect(result.current.data?.excluded).toEqual(['prod (stale)']);
+
+      mode.current = (host) => (host === 'local' ? answer(host) : new Promise(() => {}));
+      const calls = usageCallsFor('host_prod').length;
+      await focus();
+      await waitFor(() => expect(usageCallsFor('host_prod')).toHaveLength(calls + 1));
+      await flush();
+      expect(result.current.data?.excluded).toEqual(['prod (stale)']);
+      expect(result.current.hosts.map((h) => h.state)).toEqual(['ok', 'offline']);
     });
   });
 
