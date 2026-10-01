@@ -93,6 +93,12 @@ pub async fn resolve(
     let mut note: Option<String> = None;
     if registry.cache_is_stale(provider_name).await {
         match tokio::time::timeout(FETCH_TIMEOUT, provider.fetch_models()).await {
+            // A listing that parsed to zero models is a failed refresh, not an
+            // answer: caching it would replace a good entry (and make every
+            // model "missing from the list" for an hour).
+            Ok(Ok(models)) if models.is_empty() => {
+                note = Some("model list refresh returned no models".to_string());
+            }
             Ok(Ok(models)) => {
                 registry.set_live_cache(provider_name, models).await;
                 if let Err(e) = registry.save_cache(provider_name).await {
@@ -303,6 +309,8 @@ async fn refresh_one(
         Err(e) => return fail(e.to_string()),
     };
     match provider.fetch_models().await {
+        // An empty listing is a failed refresh: never replace a good cache.
+        Ok(models) if models.is_empty() => fail("provider returned no models".to_string()),
         Ok(models) => {
             let count = models.len();
             registry.set_live_cache(name, models).await;

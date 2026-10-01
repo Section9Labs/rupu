@@ -796,3 +796,102 @@ async fn catalog_merges_config_and_live_per_field() {
     );
     assert_eq!(m.source, "custom");
 }
+
+// ---- an empty listing is a failed refresh ----------------------------------
+
+const GOOD_CACHE: &str = r#"{"schema":2,"fetched_at":"2020-01-01T00:00:00Z","models":[{"id":"claude-a","context_window":200000,"max_output_tokens":64000}]}"#;
+
+/// A listing that parses to zero models must not replace a good cache: the
+/// resolve keeps the prior entry (marked stale) and says why the refresh
+/// didn't take.
+#[tokio::test]
+async fn resolve_treats_an_empty_listing_as_a_failed_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("cache/models");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache_file = dir.join("anthropic.json");
+    std::fs::write(&cache_file, GOOD_CACHE).unwrap();
+    let (mut p, calls) = fake(Ok(vec![]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the stale cache refetched");
+    assert_eq!(
+        std::fs::read_to_string(&cache_file).unwrap(),
+        GOOD_CACHE,
+        "an empty listing must not overwrite the cache file"
+    );
+    assert_eq!(l.input.tokens, Some(200_000));
+    assert_eq!(l.output.tokens, Some(64_000));
+    assert!(
+        matches!(l.input.source, LimitSource::Live { stale: true, .. }),
+        "{:?}",
+        l.input.source
+    );
+    assert!(
+        l.note
+            .as_deref()
+            .unwrap()
+            .contains("model list refresh returned no models"),
+        "{:?}",
+        l.note
+    );
+}
+
+/// With no prior cache an empty listing writes nothing either — there is no
+/// "empty but fresh" cache to read back and trust for an hour.
+#[tokio::test]
+async fn resolve_writes_no_cache_for_an_empty_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, _) = fake(Ok(vec![]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert!(!tmp.path().join("cache/models/anthropic.json").exists());
+    assert_eq!(l.input.tokens, None);
+    assert!(l
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("model list refresh returned no models"));
+}
+
+/// `refresh` reports an empty listing as a failure and leaves the cache file
+/// byte-identical.
+#[tokio::test]
+async fn refresh_reports_an_empty_listing_and_keeps_the_cache() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200)
+            .json_body(serde_json::json!({ "data": [] }));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("cache/models");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache_file = dir.join("oracle.json");
+    let good = r#"{"schema":2,"fetched_at":"2020-01-01T00:00:00Z","models":[{"id":"base-model","context_window":4096,"max_output_tokens":0}]}"#;
+    std::fs::write(&cache_file, good).unwrap();
+    let cfg = oracle_cfg(format!("{}/v1", server.url("")));
+    let cfg_path = tmp.path().join("config.toml");
+
+    let out =
+        rupu_runtime::model_limits::refresh(&cfg, tmp.path(), &cfg_path, &AnyKey, Some("oracle"))
+            .await
+            .unwrap();
+    assert!(!out[0].ok, "{:?}", out[0]);
+    assert_eq!(out[0].count, 0);
+    assert_eq!(out[0].error.as_deref(), Some("provider returned no models"));
+    assert_eq!(std::fs::read_to_string(&cache_file).unwrap(), good);
+}
