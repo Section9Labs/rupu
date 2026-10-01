@@ -476,17 +476,23 @@ struct SessionRecord {
 impl SessionRecord {
     const VERSION: u32 = 1;
 
-    /// The input limit compaction uses: the agent pin, else the resolved one.
+    /// The input limit compaction and the gauge use: the stored resolved value
+    /// (which already reflects the agent pin — `resolve` applies pins first —
+    /// and any limit learned from an overflow error), else the agent pin.
     fn effective_context_window(&self) -> Option<u32> {
-        self.context_window_tokens
-            .or_else(|| self.model_limits.as_ref().and_then(|l| l.input.tokens))
+        self.model_limits
+            .as_ref()
+            .and_then(|l| l.input.tokens)
+            .or(self.context_window_tokens)
     }
 
-    /// The compact-at percentage compaction uses: the agent pin, else the
-    /// resolved one, else the default.
+    /// The compact-at percentage compaction uses: the stored resolved value,
+    /// else the agent pin, else the default.
     fn effective_compact_at_percent(&self) -> u8 {
-        self.compact_at_percent
-            .or_else(|| self.model_limits.as_ref().map(|l| l.compact_at_percent))
+        self.model_limits
+            .as_ref()
+            .map(|l| l.compact_at_percent)
+            .or(self.compact_at_percent)
             .unwrap_or(rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT)
     }
 }
@@ -10121,11 +10127,12 @@ mod tests {
         }
     }
 
-    /// Spec 2026-09-30 §6.5: compaction reads the agent pin first, else the
-    /// limits the session's first turn resolved (incl. a learned/observed one),
-    /// else nothing / the default percentage.
+    /// Spec 2026-09-30 §6.5: compaction reads the limits the session's first
+    /// turn resolved (incl. a learned/observed one) first, else the agent pin,
+    /// else nothing / the default percentage. The stored value already reflects
+    /// the pin (`resolve` applies pins first), so it wins whenever it exists.
     #[test]
-    fn effective_limits_prefer_the_pin_then_the_resolved_value() {
+    fn effective_limits_prefer_the_resolved_value_then_the_pin() {
         let mut s = test_session_record();
         assert_eq!(s.effective_context_window(), None);
         assert_eq!(
@@ -10148,10 +10155,41 @@ mod tests {
         assert_eq!(s.effective_context_window(), Some(300_000));
         assert_eq!(s.effective_compact_at_percent(), 70);
 
+        // A pin recorded at session start does not outrank the stored value.
         s.context_window_tokens = Some(1_000);
         s.compact_at_percent = Some(50);
-        assert_eq!(s.effective_context_window(), Some(1_000));
-        assert_eq!(s.effective_compact_at_percent(), 50);
+        assert_eq!(s.effective_context_window(), Some(300_000));
+        assert_eq!(s.effective_compact_at_percent(), 70);
+    }
+
+    /// An overflow lowered the input limit mid-session and the run stored it
+    /// as `Observed`; the gauge and manual compaction must follow it, not the
+    /// larger agent pin the session started with.
+    #[test]
+    fn a_learned_input_limit_outranks_the_larger_agent_pin() {
+        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
+        let mut s = test_session_record();
+        s.context_window_tokens = Some(1_000_000);
+        let mut limits = ModelLimits::unknown().with_input(1_000_000);
+        limits.input = Limit::new(200_000, LimitSource::Observed);
+        s.model_limits = Some(limits);
+        assert_eq!(s.effective_context_window(), Some(200_000));
+    }
+
+    /// Without stored limits (a record from before limits were stored, or a
+    /// turn that never completed) the agent pin still applies.
+    #[test]
+    fn the_agent_pin_applies_when_no_limits_are_stored() {
+        let mut s = test_session_record();
+        s.context_window_tokens = Some(1_000_000);
+        s.compact_at_percent = Some(60);
+        s.model_limits = None;
+        assert_eq!(s.effective_context_window(), Some(1_000_000));
+        assert_eq!(s.effective_compact_at_percent(), 60);
+
+        // Stored limits whose input is unknown fall back to the pin too.
+        s.model_limits = Some(rupu_providers::model_limits::ModelLimits::unknown());
+        assert_eq!(s.effective_context_window(), Some(1_000_000));
     }
 
     /// An older session record on disk has no `model_limits`; it must still
