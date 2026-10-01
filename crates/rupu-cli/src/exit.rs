@@ -37,11 +37,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    /// The write registry is process-wide: these tests must not see each
+    /// other's writes.
+    static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// The exit path waits for a credential write whose caller is long
     /// gone (its handle dropped) instead of letting runtime shutdown cancel
     /// it.
     #[tokio::test]
     async fn the_exit_path_waits_for_an_in_flight_credential_write() {
+        let _registry = REGISTRY.lock().await;
         let persisted = Arc::new(AtomicBool::new(false));
         let flag = persisted.clone();
         drop(rupu_providers::credential_writes::spawn(async move {
@@ -52,12 +57,17 @@ mod tests {
         assert!(persisted.load(Ordering::SeqCst));
     }
 
+    /// With nothing in flight the exit path doesn't wait at all — the
+    /// (long) bound is never spent.
     #[tokio::test]
     async fn nothing_in_flight_returns_at_once() {
-        // Other tests in this binary may have writes in flight; this only
-        // checks the bound holds and the call completes.
+        let _registry = REGISTRY.lock().await;
         let started = std::time::Instant::now();
-        let _ = drain_credential_writes(Duration::from_millis(100)).await;
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(drain_credential_writes(Duration::from_secs(10)).await);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "returned after {:?}",
+            started.elapsed()
+        );
     }
 }
