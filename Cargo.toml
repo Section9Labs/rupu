@@ -193,7 +193,7 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 # Every crate is migrated onto rupu-netflow (Plan 2's job — see
-# PENDING_PLAN_2 in crates/rupu-netflow/tests/choke_point.rs, which is
+# PENDING_PLAN_2 in crates/rupu-netflow/tests/it/choke_point.rs, which is
 # empty). A raw reqwest client anywhere outside rupu-netflow's http module
 # or a /tests/ integration test is now a build failure.
 disallowed_methods = "deny"

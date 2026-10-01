@@ -38,3 +38,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }
 httpmock.workspace = true
+serial_test.workspace = true
