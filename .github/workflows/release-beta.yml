@@ -5,7 +5,7 @@ name: release-beta
 on:
   schedule:
     # 07:37 UTC. Off the :00 mark (every scheduled workflow on GitHub piles
-    # onto it) and clear of nightly-live-tests.yml's 08:00 slot.
+    # onto it).
     - cron: "37 7 * * *"
   workflow_dispatch:
     inputs:
