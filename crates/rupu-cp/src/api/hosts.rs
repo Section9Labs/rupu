@@ -1,9 +1,11 @@
 //! `GET /api/hosts` · `GET /api/hosts/registered` · `POST /api/hosts` ·
 //! `DELETE /api/hosts/:id`
 //!
-//! Exposes the `HostRegistry` over HTTP. `GET /api/hosts` probes every remote
-//! host concurrently and tolerates unreachable hosts: a failed `info()` call
-//! produces `status: "offline"` rather than failing the whole list.
+//! Exposes the `HostRegistry` over HTTP. `GET /api/hosts` reports every
+//! remote host's last health probe (refreshed in the background once stale —
+//! see [`crate::host::probe_cache`]) and tolerates unreachable hosts: a failed
+//! `info()` call produces `status: "offline"` rather than failing the whole
+//! list.
 //! `GET /api/hosts/registered` is the probe-free counterpart: a pure store
 //! read (`id` / `name` / `transport_kind` only) that returns promptly even
 //! when every registered remote is dead — used by pages that need to know
@@ -143,18 +145,62 @@ async fn list_registered_hosts(
     Ok(Json(views))
 }
 
-/// `GET /api/hosts` — list all known hosts with live health data.
+/// One health probe of a remote host — what [`list_hosts`] caches per host in
+/// [`AppState::host_probes`].
+#[derive(Debug, Clone)]
+pub struct RemoteProbe {
+    online: bool,
+    version: Option<String>,
+    capabilities: Option<HostCapabilities>,
+    active_run_count: usize,
+}
+
+impl RemoteProbe {
+    fn offline() -> Self {
+        Self {
+            online: false,
+            version: None,
+            capabilities: None,
+            active_run_count: 0,
+        }
+    }
+}
+
+/// Probe a remote host: `info()`, then — when it answers reachable — its
+/// active-run count. An unresolvable or unreachable host is offline.
+async fn probe_remote(
+    registry: Arc<crate::host::registry::HostRegistry>,
+    host_id: String,
+) -> RemoteProbe {
+    let Ok(connector) = registry.resolve(&host_id) else {
+        return RemoteProbe::offline();
+    };
+    match connector.info().await {
+        Ok(info) if info.reachable => RemoteProbe {
+            online: true,
+            version: info.version,
+            capabilities: Some(info.capabilities),
+            active_run_count: active_run_count(&connector).await,
+        },
+        _ => RemoteProbe::offline(),
+    }
+}
+
+/// `GET /api/hosts` — list all known hosts with health data.
 ///
-/// The local host is always first and always `status: "online"`. Every other
-/// host is probed concurrently via `connector.info()`; failure → `"offline"`.
+/// The local host is always first and always `status: "online"`, its
+/// active-run count read live. Every other host's health comes from its last
+/// probe ([`crate::host::probe_cache`]): served as is while fresh, served and
+/// refreshed in the background once stale, awaited only for a host never
+/// probed yet. A failed `info()` → `"offline"`.
 async fn list_hosts(State(s): State<AppState>) -> ApiResult<Json<Vec<HostView>>> {
     let hosts = s.hosts.list_hosts();
 
-    // Build one future per host; local gets a fast path, remotes call info().
     let futs: Vec<_> = hosts
         .into_iter()
         .map(|host| {
             let reg = Arc::clone(&s.hosts);
+            let probes = Arc::clone(&s.host_probes);
             async move {
                 let (transport_kind, base_url) = transport_fields(&host.transport);
 
@@ -178,52 +224,17 @@ async fn list_hosts(State(s): State<AppState>) -> ApiResult<Json<Vec<HostView>>>
                 }
 
                 // ── Remote host ───────────────────────────────────────────────
-                let connector = match reg.resolve(&host.id) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return HostView {
-                            id: host.id,
-                            name: host.name,
-                            transport_kind,
-                            base_url,
-                            status: "offline".to_string(),
-                            version: None,
-                            capabilities: None,
-                            active_run_count: 0,
-                            last_seen_at: host.last_seen_at,
-                        };
-                    }
-                };
-
-                let info = match connector.info().await {
-                    Ok(i) if i.reachable => i,
-                    _ => {
-                        return HostView {
-                            id: host.id,
-                            name: host.name,
-                            transport_kind,
-                            base_url,
-                            status: "offline".to_string(),
-                            version: None,
-                            capabilities: None,
-                            active_run_count: 0,
-                            last_seen_at: host.last_seen_at,
-                        };
-                    }
-                };
-
-                // Online: derive active-run count from the connector.
-                let count = active_run_count(&connector).await;
-
+                let id = host.id.clone();
+                let probe = probes.get(&host.id, move || probe_remote(reg, id)).await;
                 HostView {
                     id: host.id,
                     name: host.name,
                     transport_kind,
                     base_url,
-                    status: "online".to_string(),
-                    version: info.version,
-                    capabilities: Some(info.capabilities),
-                    active_run_count: count,
+                    status: if probe.online { "online" } else { "offline" }.to_string(),
+                    version: probe.version,
+                    capabilities: probe.capabilities,
+                    active_run_count: probe.active_run_count,
                     last_seen_at: host.last_seen_at,
                 }
             }
@@ -554,6 +565,7 @@ async fn remove_host(State(s): State<AppState>, Path(id): Path<String>) -> ApiRe
     s.hosts
         .remove_host(&id)
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    s.host_probes.forget(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 

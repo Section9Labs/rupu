@@ -1,6 +1,7 @@
 mod artifacts;
 mod autoflow_history;
 mod backend;
+pub mod file_cache;
 pub mod model_limits;
 pub mod provider_factory;
 mod run_envelope;

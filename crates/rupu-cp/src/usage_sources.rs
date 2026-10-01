@@ -138,12 +138,7 @@ pub fn claimed_transcripts(run_store: &RunStore, runs: &[RunRecord]) -> HashSet<
     let index = UsageIndex::global();
     let mut claimed = HashSet::new();
     let mut claim = |store: &RunStore, id: &str| {
-        for p in index.resolved_transcripts(store, id) {
-            if p.exists() {
-                claimed.insert(canon(&p));
-            }
-            claimed.insert(p);
-        }
+        claimed.extend(index.claimed_paths(store, id).iter().cloned());
     };
     for r in runs {
         claim(run_store, &r.id);
@@ -235,23 +230,39 @@ pub fn extra_sources(
 
     // 2. Standalone transcripts (and session turns not listed in any
     //    `session.json`), classified by their meta sidecar.
+    //    One listing gives both the transcripts and which meta sidecars
+    //    exist, by the entries' own file types (no `stat` per entry — the
+    //    directory holds every transcript ever written; a symlink is
+    //    followed), so only sidecars that exist are opened.
     let tdir = global.join("transcripts");
     let Ok(entries) = std::fs::read_dir(&tdir) else {
         return out;
     };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".jsonl") && !n.ends_with(".meta.json"))
-        })
-        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut metas: HashSet<String> = HashSet::new();
+    for entry in entries.flatten() {
+        let is_file = match entry.file_type() {
+            Ok(t) if t.is_symlink() => entry.path().is_file(),
+            Ok(t) => t.is_file(),
+            Err(_) => false,
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|_| is_file) else {
+            continue;
+        };
+        if name.ends_with(".meta.json") {
+            metas.insert(name.to_string());
+        } else if name.ends_with(".jsonl") {
+            files.push(entry.path());
+        }
+    }
     files.sort();
     for own in files {
-        if is_claimed(&own) || !seen.insert(canon(&own)) {
+        if claimed.contains(&own) {
+            continue;
+        }
+        let own_canon = canon(&own);
+        if claimed.contains(&own_canon) || !seen.insert(own_canon) {
             continue;
         }
         let stem = own
@@ -259,8 +270,11 @@ pub fn extra_sources(
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        let meta = std::fs::read_to_string(tdir.join(format!("{stem}.meta.json")))
-            .ok()
+        let meta_name = format!("{stem}.meta.json");
+        let meta = metas
+            .contains(&meta_name)
+            .then(|| std::fs::read_to_string(tdir.join(&meta_name)).ok())
+            .flatten()
             .and_then(|t| serde_json::from_str::<StandaloneMetaDto>(&t).ok());
         let (run_id, session_id, trigger) = match meta {
             Some(m) => (m.run_id, m.session_id, m.trigger_source),
@@ -354,6 +368,39 @@ mod tests {
                 ("run_A".to_string(), child),
             ]
         );
+    }
+
+    /// The standalone scan reads file types off the directory listing, so a
+    /// symlinked transcript (followed) and its symlinked sidecar must still
+    /// count, while a symlink to a directory or a dangling one must not.
+    #[cfg(unix)]
+    #[test]
+    fn scan_follows_symlinked_transcripts_and_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let store = RunStore::new(global.join("runs"));
+        let tdir = global.join("transcripts");
+        let elsewhere = tmp.path().join("elsewhere");
+        transcript(&elsewhere.join("run_L.jsonl"), "linked");
+        std::fs::write(
+            elsewhere.join("run_L.meta.json"),
+            r#"{"run_id":"run_L","trigger_source":"session_turn"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&tdir).unwrap();
+        let link = |name: &str, target: &Path| {
+            std::os::unix::fs::symlink(target, tdir.join(name)).unwrap();
+        };
+        link("run_L.jsonl", &elsewhere.join("run_L.jsonl"));
+        link("run_L.meta.json", &elsewhere.join("run_L.meta.json"));
+        link("run_D.jsonl", &elsewhere);
+        link("run_X.jsonl", &elsewhere.join("missing.jsonl"));
+
+        let got = extra_sources(&global, &store, &HashSet::new());
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].id, "run_L");
+        assert_eq!(got[0].agent, "linked");
+        assert_eq!(got[0].kind, SourceKind::Session, "the sidecar was read");
     }
 
     #[test]
