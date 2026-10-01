@@ -146,7 +146,7 @@ max_output = 16000
 
   *Gateways and proxies.* An **Anthropic-compatible gateway or proxy that rejects `cache_control`** fails every request until caching is turned off. Note that an anthropic-kind account's `base_url` is **not yet honored** ([I-92](../ISSUES.md)): today a gateway is reached only through the `RUPU_ANTHROPIC_BASE_URL_OVERRIDE` environment variable, which redirects **every** Anthropic account in the process, not just the one you meant. So while that override is set, put `prompt_cache = false` on every Anthropic account the process actually uses. A separate gateway account (for example `[providers.anthropic-oracle]`) does not isolate the gateway traffic, because the override applies to all of them.
 - **`default_model`** (`Option<String>`): model used when an agent file omits `model:`. No global default — the agent must either set `model:` or have one resolvable here.
-- **`[[providers.<name>.models]]`** (`Vec<CustomModel>`): register private/internal/fine-tuned models that aren't returned by `/v1/models`. Each entry takes `id` (required) plus optional `context_window` and `max_output`.
+- **`[[providers.<name>.models]]`** (`Vec<CustomModel>`): register private/internal/fine-tuned models that aren't returned by `/v1/models`. Each entry takes `id` (required) plus optional `context_window` (input-token limit) and `max_output`. A value greater than zero also overrides the limit discovered from the provider's model list for that model, field by field (see [Model limits](#model-limits)); an agent's `contextWindowTokens` / `maxTokens` still wins over both.
 
 ## OpenAI-compatible providers (Oracle GenAI, vLLM, …)
 
@@ -182,8 +182,9 @@ stream = true   # set false if the server has no SSE endpoint
 
 `base_url` may include or omit a trailing `/v1` — rupu normalises both.
 Each `[[providers.<name>.models]]` entry requires `id`; `context_window`
-and `max_output` are optional (defaults 32768 / 8192 when omitted). These
-surface in `rupu models list --provider oracle`.
+and `max_output` are optional. When omitted, rupu reads `max_model_len` from
+the server's `/v1/models`; if that's missing too, the limits are unknown and
+the run says so. These surface in `rupu models list --provider oracle`.
 
 ### Authentication
 
@@ -242,10 +243,10 @@ See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 
 ## Model resolution
 
-`rupu run <agent>` resolves the agent's `model:` field through three sources in order:
+`rupu models list`, and the limit lookup every run does for its `model:`, resolve a model id through three sources in order:
 1. **Custom** — `[[providers.<name>.models]]` entries from `~/.rupu/config.toml`.
-2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h). Populated by `rupu models refresh` or lazily on first `rupu models list`.
-3. **Baked-in** — Copilot and Gemini ship a curated v0 list since their public listing endpoints are limited.
+2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches.
+3. **Baked-in** — an offline fallback for Copilot and Gemini (ids only, limits unknown), used only when there is no live cache.
 
 ```sh
 rupu models list              # built-in vendors + every declared account
@@ -253,6 +254,8 @@ rupu models list --provider openai
 rupu models refresh           # re-fetch live caches
 rupu models refresh --provider anthropic
 ```
+
+`rupu models list` shows each model's input limit (`CONTEXT`), `OUTPUT` cap, `SOURCE` and — for live rows — how long ago they were `FETCHED`; an unknown limit or a non-live row's age shows `-`. The `--format json|csv` reports carry the same fields (`context`, `output`, `fetched_at`; the JSON report is version 2, with `null` for unknown values and the CSV cells left empty).
 
 `--provider` accepts a **declared account name** as well as a built-in vendor
 name — `rupu models refresh --provider anthropic-work` refreshes that account
@@ -262,12 +265,43 @@ name so two accounts of one vendor keep separate model lists. A name that is
 neither a built-in vendor nor a declared account is an error with a non-zero
 exit, not a silent no-op.
 
-An `openai-compatible` account has no live listing endpoint — its models are
-whatever `[[providers.<name>.models]]` declares — so `models refresh` reports
-that rather than pretending to fetch.
+An `openai-compatible` account is refreshed like any other: `rupu models
+refresh` fetches its `/v1/models` with the account's Bearer key. A server with
+no usable `/v1/models` reports the error for that account; its models are then
+whatever `[[providers.<name>.models]]` declares.
 
-If the agent's `model:` value isn't found in any source, rupu errors with:
-> `model 'xyz' not found for provider 'openai'. Run 'rupu models list --provider openai' to see available models, or add a custom entry to ~/.rupu/config.toml.`
+A `model:` id that appears in none of these sources is not rejected by rupu: the id is sent to the provider as written (a provider that doesn't serve it returns its own error), and the run's `model_limits` notice flags that the model isn't in the provider's list. Run `rupu models list --provider <name>` to see the ids rupu knows, or add a `[[providers.<name>.models]]` entry.
+
+### Model limits
+
+Every run also needs the model's real **input limit** (used for proactive compaction) and **output cap** (the per-request `max_tokens`). Per field, rupu takes the first of:
+
+1. the agent's `contextWindowTokens` / `maxTokens` frontmatter;
+2. the `[[providers.<name>.models]]` entry (value greater than zero);
+3. the provider's live model list, from the cache above;
+4. unknown.
+
+Each run writes a `model_limits` notice to its transcript with the values and where each came from, and says so explicitly when a limit is unknown. If the input limit is unknown, compaction is off; if the output cap is unknown, Anthropic requests carry `8192` and every other provider gets no cap (the model's max). Details: [agent-format.md](agent-format.md#contextwindowtokens-and-compactatpercent).
+
+Where each provider's limits come from:
+
+| Provider (auth) | Endpoint | Input limit | Output cap |
+| --- | --- | --- | --- |
+| anthropic (API key or SSO) | `GET /v1/models` | `max_input_tokens` | `max_tokens` |
+| openai (ChatGPT SSO) | `/backend-api/codex/models` | `context_window` × the model's effective-context percentage (95% when absent) | not reported |
+| openai (API key) | the same Codex catalog first, then ids-only `GET /v1/models` | as above; unknown on the ids-only fallback | not reported |
+| copilot | live `GET {api}/models` | `max_prompt_tokens` | `max_output_tokens` |
+| gemini (AI Studio API key) | `GET /v1beta/models` | `inputTokenLimit` | `outputTokenLimit` |
+| gemini (Gemini CLI / Antigravity SSO) | none — Code Assist has no listing | unknown | unknown |
+| openai-compatible (vLLM, …) | `GET {base_url}/v1/models` | `max_model_len` (fills only the values config left unset) | not reported |
+
+- **Gemini CLI / Code Assist login** exposes no model limits. Declare them yourself with `[[providers.gemini.models]]` (or pin `contextWindowTokens` / `maxTokens` on the agent); with that login, `rupu models refresh --provider gemini` reports that there is no listing rather than pretending to fetch one.
+- **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit. Its built-in model list is only an offline fallback, with unknown limits.
+- **OpenAI-compatible** limits are unknown unless config or the server provides them — there are no made-up defaults.
+
+A provider's "prompt too long" error that reports the real maximum lowers the input limit for the rest of the run (a `model_limits_clamped` notice) and triggers compaction; the observed value is never written to the model cache, because it reflects the account rather than the model. A session resolves its limits on its first turn and keeps them.
+
+**In the control plane:** Settings → Models lists every provider's cached models with input limit, output cap, source and fetch age, with a **Refetch** button per provider and a **Refetch all** button. It is backed by `GET /api/models` and `POST /api/models/refresh` (body `{}` for all providers, or `{"provider": "<name>"}` for one) and refreshes the control-plane machine's cache only — remote hosts keep their own caches and refresh them when a run launches there.
 
 ## Troubleshooting
 
@@ -281,7 +315,7 @@ The browser-callback flow can't reach a desktop. Use `--mode api-key`. Copilot's
 Add the model under `[[providers.<name>.models]]` in `~/.rupu/config.toml` with at least the `id` field, then retry. Custom entries always take precedence over live and baked-in.
 
 **Gemini API-key login fails.**
-Plan 1 didn't wire the AI Studio API-key endpoint (the lifted client only supports Vertex/CLI OAuth). Use `--mode sso` for now, or track the deferred work in `TODO.md`.
+Check that the key came from Google AI Studio (`AIzaSy…`) and re-login with `rupu auth login --provider gemini --mode api-key`. If the key is fine, `--mode sso` (Gemini CLI / Antigravity) is the alternative — but note that path exposes no model limits (see [Model limits](#model-limits)).
 
 **Cargo build prompts for keychain access on every `cargo run`.**
 macOS treats each freshly-built binary as a different code identity. Track the deferred signing/notarization work in `TODO.md`. Quick fix: click "Always Allow" once on the first prompt — the trust persists per binary path until the next rebuild.

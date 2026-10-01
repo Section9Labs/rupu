@@ -180,7 +180,7 @@ When `max` is parsed and is below `limits.input` (or `limits.input` is unknown):
 1. Set `limits.input = max` with source `Observed`, for the rest of the run. Sessions persist it (§6.5).
 2. Write `Notice { kind: "model_limits_clamped" }`, e.g. `input 1,000,000 → 200,000 (provider error)`.
 3. **Compact with a summary** at the recomputed threshold, then retry.
-4. The delete-oldest trim loop stays as the last resort: compaction impossible (input limit unknown), compaction failed, or the request still overflows.
+4. The delete-oldest trim loop stays as the last resort: compaction impossible (input limit unknown), compaction failed, nothing to summarise (history too short), or the request still overflows.
 
 When no `max` is parsed, or the parsed max doesn't lower the limit, but the input limit is known, rupu still compacts with a summary once per turn before falling back to trimming: a summary preserves more than deleting the oldest exchange.
 
@@ -250,7 +250,7 @@ These came up here and belong to the companion spec:
 - **Runner** (`MockProvider`):
   - threshold math for all three branches of §6.4, including the headroom rule;
   - each overflow fixture in §7 lowers the limit and compacts, rather than trimming;
-  - a string that doesn't parse still falls back to trimming;
+  - a string that doesn't parse still falls back to trimming when the input limit is unknown (with a known limit it compacts first, §7);
   - the `model_limits` and `model_limits_clamped` notices are written.
 - **Request bodies:** Anthropic `max_tokens` is the resolved value or the 8192 fallback; Codex, Copilot and Gemini omit the field when `None`.
 - **Sessions:** resolved limits persist, and resume doesn't refetch.

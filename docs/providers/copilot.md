@@ -53,16 +53,18 @@ model: claude-sonnet-4
 You review code changes for bugs, smells, and missing tests.
 ```
 
-## Available models (baked-in)
+## Available models
 
-Copilot doesn't expose a public `/models` endpoint, so rupu ships a curated v0 list:
+rupu fetches Copilot's live model list (`GET {api}/models`) and caches it for an hour; `rupu models refresh --provider copilot` forces a refetch, and a run refreshes a stale cache on its own. `rupu models list --provider copilot` shows the cached list with source `live`, including each model's input limit (`max_prompt_tokens`, often well below the full window) and output cap (`max_output_tokens`) — rupu uses the input limit for compaction and the output cap as the per-request cap.
+
+While there is no live cache (nothing has fetched yet, or every fetch failed), `rupu models list` falls back to a small built-in list (source `baked-in`, ids only — limits unknown):
 
 - `gpt-4o`
 - `gpt-4o-mini`
 - `claude-sonnet-4`
 - `o4-mini`
 
-`rupu models list --provider copilot` shows the list with source `baked-in`. If your Copilot subscription grants access to other models (e.g., enterprise-only), register them as custom entries:
+If your Copilot subscription grants access to other models that aren't listed (e.g., enterprise-only), register them as custom entries. A `context_window` / `max_output` set here overrides the discovered value for that model:
 
 ```toml
 [[providers.copilot.models]]
