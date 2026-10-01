@@ -6,7 +6,8 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, cleanup } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type SessionSummary, type HostView } from '../lib/api';
+import { api, type SessionSummary } from '../lib/api';
+import { REG_LOCAL } from '../lib/perHost/testUtils';
 import Sessions from './Sessions';
 
 afterEach(() => {
@@ -33,16 +34,8 @@ const ARCHIVED_SESSION: SessionSummary = {
   scope: 'archived',
 };
 
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
-
 function stubHosts() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
 }
 
 function renderPage() {

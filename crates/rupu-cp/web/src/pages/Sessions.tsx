@@ -1,10 +1,10 @@
 // Sessions list — agent sessions tracked by the control plane. Active /
 // Archived FilterPills group (Active is the default) + a host scope select;
-// fetch/paginate/poll is owned by the shared `usePagedList` hook — Active
-// polls every 5 s (page 0 only, spliced back over the head of the list, same
-// as WorkflowRuns/AgentRuns' "Running" tab — see `usePagedList`'s doc comment
-// for why that doesn't reset a scrolled view). Each row links to
-// /sessions/:id.
+// fetch/paginate/poll is owned by `usePerHostPagedList` (per-host progressive
+// loading, spec 2026-10-01): All hosts by default, local paints at once and
+// each remote merges in as it answers. Active polls (local every 5 s, remotes
+// every 60 s, page 0 only, spliced back over the head of the list, same as
+// WorkflowRuns/AgentRuns' "Running" tab). Each row links to /sessions/:id.
 //
 // Column order + status glyph now match the canonical run-table standard
 // (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
@@ -20,7 +20,7 @@
 // keystroke, over agent name / session id / host id — composing with (not
 // replacing) the Active/Archived pill above it.
 
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
@@ -37,7 +37,9 @@ import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
 import { SessionStatusPill } from '../components/StatusPill';
 import { AgentName } from '../components/codename/AgentName';
 import { memberLabel } from '../lib/codename';
-import { usePagedList } from '../lib/usePagedList';
+import { usePerHostPagedList, type PerHostFetchParams } from '../lib/perHost/usePerHostPagedList';
+import { PagingFailures, PerHostStrip, perHostFooterText } from '../components/lists/PerHostStatus';
+import { notIncluded, waitingLabel } from '../lib/perHost/status';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -64,21 +66,28 @@ function sessionHref(s: SessionSummary): string {
 export default function Sessions() {
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('active');
-  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
-  const [hostFilter, setHostFilter] = useState<string>('local');
+  // All hosts by default: local paints at once, each remote merges in as it
+  // answers (usePerHostPagedList). A picked host lists only that host.
+  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
-  const { rows, loading, error, hasMore, sentinelRef, refresh, ended } = usePagedList<SessionSummary>({
-    fetch: ({ offset, limit }) => {
-      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      return api.getSessions({ scope: tab, offset, limit, host });
-    },
-    deps: [tab, hostFilter],
-    poll: tab === 'active',
-  });
+  const fetchRows = useCallback(
+    ({ host, offset, limit, signal }: PerHostFetchParams) =>
+      api.getSessions({ scope: tab, offset, limit, host, signal }),
+    [tab],
+  );
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
+    usePerHostPagedList<SessionSummary>({
+      host: hostFilter === ALL_HOSTS ? null : hostFilter,
+      fetch: fetchRows,
+      timeField: 'updated_at',
+      idField: 'session_id',
+      deps: [tab],
+      poll: tab === 'active',
+    });
 
   // Find — case-insensitive substring across the fields this table actually
   // renders: agent name (subject), session id, and host id. Composes with
@@ -92,7 +101,8 @@ export default function Sessions() {
       )
     : rows;
 
-  // Row-level archive / restore / delete — each refetches after success.
+  // Row-level archive / restore / delete — each drops the row and re-syncs
+  // just its host after success.
   // `host` is the row's own `host_id` (undefined/`"local"` → local
   // mutator, any other id → proxied through that host's connector) so a
   // fanned-out remote-host row's action lands on the host that actually
@@ -101,7 +111,9 @@ export default function Sessions() {
     try {
       await api.archiveSession(id, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', id);
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
@@ -111,7 +123,9 @@ export default function Sessions() {
     try {
       await api.restoreSession(id, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', id);
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Restore failed');
     }
@@ -122,7 +136,9 @@ export default function Sessions() {
     try {
       await api.deleteSession(id, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', id);
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
@@ -166,6 +182,7 @@ export default function Sessions() {
           scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
         />
       </div>
+      <PerHostStrip slices={slices} />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -173,14 +190,25 @@ export default function Sessions() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading sessions…" />
         </div>
+      ) : rows.length === 0 && waitingLabel(slices) ? (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label={waitingLabel(slices) ?? ''} />
+        </div>
       ) : rows.length === 0 ? (
         <EmptyState
           icon={<MessageSquare size={20} />}
-          title={tab === 'active' ? 'No active sessions' : 'No archived sessions'}
+          title={
+            notIncluded(slices)
+              ? 'No sessions on the hosts that answered'
+              : tab === 'active'
+                ? 'No active sessions'
+                : 'No archived sessions'
+          }
           hint={
-            tab === 'active'
+            (tab === 'active'
               ? 'Active sessions appear here once an agent conversation is started against this control plane.'
-              : 'Archived sessions appear here once an active conversation is closed.'
+              : 'Archived sessions appear here once an active conversation is closed.') +
+            (notIncluded(slices) ? ` Not included: ${notIncluded(slices)}.` : '')
           }
         />
       ) : visible.length === 0 ? (
@@ -208,20 +236,15 @@ export default function Sessions() {
           <SortableTable<SessionSummary>
             columns={columns}
             rows={visible}
-            rowKey={(s) => s.session_id}
+            rowKey={(s) => `${s.host_id ?? 'local'}:${s.session_id}`}
             rowHref={sessionHref}
           />
-          {(loading || hasMore || ended) && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {q
-                ? `${visible.length} matches of ${rows.length} loaded`
-                : loading
-                  ? 'loading more…'
-                  : hasMore
-                    ? 'scroll for more'
-                    : `— end of ${rows.length} —`}
-            </div>
-          )}
+          <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+            {q
+              ? `${visible.length} matches of ${rows.length} loaded`
+              : perHostFooterText({ slices, loading, hasMore, ended, count: rows.length })}
+          </div>
+          <PagingFailures slices={slices} onRetry={retryPaging} />
         </div>
       )}
     </div>
