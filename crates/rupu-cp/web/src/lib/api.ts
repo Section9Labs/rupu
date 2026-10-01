@@ -1956,6 +1956,12 @@ export interface ListParams {
   limit?: number;
 }
 
+/** Params for a call whose request the caller may abandon (the per-host list engine does). */
+export interface Cancellable {
+  /** Aborts the request (closes the connection) when signalled. */
+  signal?: AbortSignal;
+}
+
 function listQuery(params?: ListParams): string {
   const q = new URLSearchParams();
   if (params?.offset != null) q.set('offset', String(params.offset));
@@ -2043,10 +2049,15 @@ export const api = {
    * to the 30-day preset (via `presetWindow`) so existing callers that don't
    * yet track a window keep working.
    */
-  getUsage(win: UsageWindow = presetWindow('30d'), pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
+  getUsage(
+    win: UsageWindow = presetWindow('30d'),
+    pivot: Pivot = 'model',
+    host?: string,
+    signal?: AbortSignal,
+  ): Promise<UsageResponse> {
     const q = new URLSearchParams({ since: win.since, until: win.until, group_by: pivot });
     if (host) q.set('host', host);
-    return request<UsageResponse>(`/api/usage?${q.toString()}`);
+    return request<UsageResponse>(`/api/usage?${q.toString()}`, { signal });
   },
   /** Per-bucket usage timeline (chronological). `bucket` defaults to `day`. */
   getUsageTimeline(opts?: { since?: string; until?: string; bucket?: 'day' | 'week' }): Promise<UsageTimelineBucket[]> {
@@ -2081,13 +2092,13 @@ export const api = {
   },
 
   // --- Runs ---
-  getRuns(params?: ListParams & { host?: string }): Promise<RunListRow[]> {
+  getRuns(params?: ListParams & Cancellable & { host?: string }): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
-    return request<RunListRow[]>(`/api/runs${qs ? `?${qs}` : ''}`);
+    return request<RunListRow[]>(`/api/runs${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
   getRun(id: string, opts?: { host?: string }): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
@@ -2275,30 +2286,32 @@ export const api = {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs${qs}`);
   },
-  getWorkflowRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string }): Promise<RunListRow[]> {
+  getWorkflowRuns(
+    params?: ListParams & Cancellable & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string },
+  ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
-    return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`);
+    return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
-  getAutoflowRuns(params?: ListParams & { host?: string }): Promise<AutoflowCycleRow[]> {
+  getAutoflowRuns(params?: ListParams & Cancellable & { host?: string }): Promise<AutoflowCycleRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
-    return request<AutoflowCycleRow[]>(`/api/runs/autoflows${qs ? `?${qs}` : ''}`);
+    return request<AutoflowCycleRow[]>(`/api/runs/autoflows${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
-  getAutoflowEvents(params?: ListParams & { host?: string }): Promise<AutoflowEventRow[]> {
+  getAutoflowEvents(params?: ListParams & Cancellable & { host?: string }): Promise<AutoflowEventRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
-    return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${qs ? `?${qs}` : ''}`);
+    return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
   /** Active autoflow claims — leased issues the worker is (or was) driving. */
   getAutoflowClaims(): Promise<AutoflowClaim[]> {
@@ -2318,14 +2331,16 @@ export const api = {
       body: JSON.stringify({ issue_ref: issueRef }),
     });
   },
-  getAgentRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string }): Promise<AgentRunRow[]> {
+  getAgentRuns(
+    params?: ListParams & Cancellable & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string },
+  ): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
-    return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`);
+    return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
@@ -2547,14 +2562,14 @@ export const api = {
   },
 
   // --- Sessions ---
-  getSessions(params?: ListParams & { scope?: 'active' | 'archived'; host?: string }): Promise<SessionSummary[]> {
+  getSessions(params?: ListParams & Cancellable & { scope?: 'active' | 'archived'; host?: string }): Promise<SessionSummary[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.scope) q.set('scope', params.scope);
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
-    return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`);
+    return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
   getSession(id: string, opts?: { host?: string }): Promise<SessionSummary> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
