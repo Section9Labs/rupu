@@ -57,7 +57,7 @@ You review code changes for bugs, smells, and missing tests.
 
 rupu fetches Copilot's live model list (`GET {api}/models`) and caches it for an hour; `rupu models refresh --provider copilot` forces a refetch, and a run refreshes a stale cache on its own. `rupu models list --provider copilot` shows the cached list with source `live`, including each model's input limit (`max_prompt_tokens`, often well below the full window) and output cap (`max_output_tokens`) — rupu uses the input limit for compaction and the output cap as the per-request cap.
 
-While there is no live cache (nothing has fetched yet, or every fetch failed), `rupu models list` falls back to a small built-in list (source `baked-in`, ids only — limits unknown):
+`rupu models list` also merges in a small built-in list (source `baked-in`, ids only). Baked-in entries sit beneath the live and custom rows and only fill ids the live list doesn't contain — so they are all you see until the first fetch succeeds — and they never supply limits:
 
 - `gpt-4o`
 - `gpt-4o-mini`

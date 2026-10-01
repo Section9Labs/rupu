@@ -75,7 +75,7 @@ Everything after the closing `---` is the system prompt.
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
 | `maxTokens` | integer | no | discovered output cap | Per-request output-token cap. Overrides the cap discovered from the provider's model list; when neither is known, Anthropic gets `8192` and other providers get no cap (model max). Extended thinking (`effort`) draws from this budget |
 | `contextWindowTokens` | integer | no | discovered input limit | Input-token limit used for proactive compaction. Overrides the discovered limit; compaction is off only when neither is known |
-| `compactAtPercent` | integer | no | `80` | Percentage of the input limit at which compaction triggers; clamped to `[10, 95]`. Compaction also triggers early enough that a full-length reply still fits |
+| `compactAtPercent` | integer | no | `80` | Percentage of the input limit at which compaction triggers; clamped to `[10, 95]`. When the output cap is known and shares the input window, compaction also triggers early enough that a full-length reply still fits |
 
 ---
 
@@ -287,13 +287,13 @@ See `docs/coverage.md` for what a complete report requires. Every field is requi
 
 ### `maxTokens`
 
-Per-request output-token cap (the LLM request's `max_tokens`). You rarely need to set it: rupu discovers each model's real output cap from the provider's model list and sends that on every turn. A `maxTokens` value overrides the discovered cap. When neither is known, Anthropic requests carry `8192` (the API requires a cap) and every other provider gets no cap, so the model's own maximum applies. Extended thinking (`effort`) draws from this same budget, so a low `maxTokens` can starve an agent that both reasons heavily and produces long output.
+Per-request output-token cap (the LLM request's `max_tokens`). You rarely need to set it: rupu discovers each model's real output cap from the provider's model list, where the provider reports one (Codex/OpenAI and OpenAI-compatible servers report none), and sends that on every turn. A `maxTokens` value overrides the discovered cap. When neither is known, Anthropic requests carry `8192` (the API requires a cap) and every other provider gets no cap, so the model's own maximum applies. Extended thinking (`effort`) draws from this same budget, so a low `maxTokens` can starve an agent that both reasons heavily and produces long output.
 
 ### `contextWindowTokens` and `compactAtPercent`
 
 `contextWindowTokens` is the model's input-token limit, used for proactive context compaction. rupu discovers it from the provider's model list; set it only to override the discovered value (for example to compact earlier than the model requires, or on a provider that reports no limits). Compaction is off only when neither a pin nor a discovered value is available.
 
-`compactAtPercent` (default `80`, clamped to `[10, 95]`) is the share of the input limit at which the runner summarizes older turns before the next turn. When the model's output counts against the same window as its input (Anthropic, Codex, OpenAI-compatible), the threshold is also capped at the input limit minus the output cap, so a full-length reply still fits. Copilot and Gemini budget input and output independently, so only the percentage applies.
+`compactAtPercent` (default `80`, clamped to `[10, 95]`) is the share of the input limit at which the runner summarizes older turns before the next turn. When the output cap is known and the model's output counts against the same window as its input (Anthropic, Codex, OpenAI-compatible), the threshold is the lower of that percentage and the input limit minus the output cap, so a full-length reply still fits. Otherwise the threshold is simply `input × compactAtPercent / 100`: Copilot and Gemini budget input and output independently, and an unknown output cap (including the Anthropic `8192` wire fallback, which is not a discovered limit) gives no headroom to subtract.
 
 Where the limits come from, per field, in precedence order:
 

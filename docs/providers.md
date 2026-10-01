@@ -246,7 +246,7 @@ See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 `rupu models list`, and the limit lookup every run does for its `model:`, resolve a model id through three sources in order:
 1. **Custom** — `[[providers.<name>.models]]` entries from `~/.rupu/config.toml`.
 2. **Live cache** — `~/.rupu/cache/models/<provider>.json` (TTL 1h; schema v2 records each model's id, input limit and output cap). `rupu models refresh` writes it, and a run refreshes it when it is stale or missing. `rupu models list` only reads the cache — it never fetches.
-3. **Baked-in** — an offline fallback for Copilot and Gemini (ids only, limits unknown), used only when there is no live cache.
+3. **Baked-in** — Copilot and Gemini ship a small built-in id list (limits unknown). Baked-in entries are merged beneath the live and custom rows and only fill ids the live list doesn't contain, so `rupu models list` can still show a few `baked-in` rows after a successful fetch; they never supply limits.
 
 ```sh
 rupu models list              # built-in vendors + every declared account
@@ -287,7 +287,7 @@ Where each provider's limits come from:
 
 | Provider (auth) | Endpoint | Input limit | Output cap |
 | --- | --- | --- | --- |
-| anthropic (API key or SSO) | `GET /v1/models` | `max_input_tokens` | `max_tokens` |
+| anthropic (API key; SSO uses the same endpoint, but SSO verification is pending) | `GET /v1/models` | `max_input_tokens` | `max_tokens` |
 | openai (ChatGPT SSO) | `/backend-api/codex/models` | `context_window` × the model's effective-context percentage (95% when absent) | not reported |
 | openai (API key) | the same Codex catalog first, then ids-only `GET /v1/models` | as above; unknown on the ids-only fallback | not reported |
 | copilot | live `GET {api}/models` | `max_prompt_tokens` | `max_output_tokens` |
@@ -296,7 +296,7 @@ Where each provider's limits come from:
 | openai-compatible (vLLM, …) | `GET {base_url}/v1/models` | `max_model_len` (fills only the values config left unset) | not reported |
 
 - **Gemini CLI / Code Assist login** exposes no model limits. Declare them yourself with `[[providers.gemini.models]]` (or pin `contextWindowTokens` / `maxTokens` on the agent); with that login, `rupu models refresh --provider gemini` reports that there is no listing rather than pretending to fetch one.
-- **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit. Its built-in model list is only an offline fallback, with unknown limits.
+- **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit. Its built-in ids only fill gaps beneath the live list and carry no limits.
 - **OpenAI-compatible** limits are unknown unless config or the server provides them — there are no made-up defaults.
 
 A provider's "prompt too long" error that reports the real maximum lowers the input limit for the rest of the run (a `model_limits_clamped` notice) and triggers compaction; the observed value is never written to the model cache, because it reflects the account rather than the model. A session resolves its limits on its first turn and keeps them.
@@ -311,8 +311,8 @@ The token may have expired faster than the refresh window expected. Re-login wit
 **SSO login fails on a server / over SSH.**
 The browser-callback flow can't reach a desktop. Use `--mode api-key`. Copilot's device-code SSO is the only flow that works headless — visit the URL from any browser anywhere and the polling completes.
 
-**Custom model rejected.**
-Add the model under `[[providers.<name>.models]]` in `~/.rupu/config.toml` with at least the `id` field, then retry. Custom entries always take precedence over live and baked-in.
+**Provider rejects the model id.**
+rupu sends the id as written (it never rejects an unknown one itself), so check it against `rupu models list --provider <name>`. For a private or fine-tuned model that list doesn't include, add the model under `[[providers.<name>.models]]` in `~/.rupu/config.toml` with at least the `id` field, then retry. Custom entries always take precedence over live and baked-in.
 
 **Gemini API-key login fails.**
 Check that the key came from Google AI Studio (`AIzaSy…`) and re-login with `rupu auth login --provider gemini --mode api-key`. If the key is fine, `--mode sso` (Gemini CLI / Antigravity) is the alternative — but note that path exposes no model limits (see [Model limits](#model-limits)).

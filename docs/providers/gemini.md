@@ -50,7 +50,7 @@ You search large codebases. Cite file paths and line numbers.
 
 ## Available models
 
-With an AI Studio API key, `rupu models refresh --provider gemini` (or any run, when the cache is stale) fetches the live list from `GET /v1beta/models`, following `nextPageToken`, and caches it for an hour in `~/.rupu/cache/models/gemini.json`; `rupu models list --provider gemini` reads that cache. While the cache is empty — and always on the Gemini CLI / Antigravity SSO path, which has no listing endpoint — `rupu models list` falls back to the curated baked-in ids (limits unknown):
+With an AI Studio API key, `rupu models refresh --provider gemini` (or any run, when the cache is stale) fetches the live list from `GET /v1beta/models`, following `nextPageToken`, and caches it for an hour in `~/.rupu/cache/models/gemini.json`; `rupu models list --provider gemini` reads that cache. `rupu models list` also merges in a curated built-in id list (source `baked-in`). Baked-in entries sit beneath the live and custom rows and only fill ids the live list doesn't contain — so they are all you see until the first fetch succeeds, and always on the Gemini CLI / Antigravity SSO path, which has no listing endpoint — and they never supply limits:
 - `gemini-2.5-pro`
 - `gemini-2.5-flash`
 - `gemini-1.5-pro`
