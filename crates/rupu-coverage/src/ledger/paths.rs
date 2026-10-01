@@ -7,6 +7,7 @@ pub struct CoveragePaths {
     /// evidence-claim files resolve against it).
     pub workspace: PathBuf,
     pub root: PathBuf,
+    pub assets: PathBuf,
     pub files: PathBuf,
     pub concerns: PathBuf,
     pub findings: PathBuf,
@@ -19,6 +20,7 @@ impl CoveragePaths {
         let root = workspace.join(".rupu").join("coverage").join(target_id);
         Self {
             workspace: workspace.to_path_buf(),
+            assets: root.join("assets.jsonl"),
             files: root.join("files.jsonl"),
             concerns: root.join("concerns.jsonl"),
             findings: root.join("findings.jsonl"),
@@ -42,6 +44,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(tmp.path(), "abc123");
         assert_eq!(paths.root, tmp.path().join(".rupu/coverage/abc123"));
+        assert_eq!(paths.assets, paths.root.join("assets.jsonl"));
         assert_eq!(paths.files, paths.root.join("files.jsonl"));
         assert_eq!(paths.concerns, paths.root.join("concerns.jsonl"));
         assert_eq!(paths.findings, paths.root.join("findings.jsonl"));

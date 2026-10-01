@@ -46,6 +46,20 @@ impl AssetGraph {
             None => false,
         }
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Asset> {
+        self.order
+            .iter()
+            .filter_map(|k| self.nodes.get(k))
+    }
+
+    pub fn from_assets(it: impl IntoIterator<Item = Asset>) -> Self {
+        let mut graph = AssetGraph::default();
+        for asset in it {
+            graph.insert(asset);
+        }
+        graph
+    }
 }
 
 #[cfg(test)]
