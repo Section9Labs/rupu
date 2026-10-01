@@ -40,8 +40,11 @@ Run: `rupu run review-mr gitlab:group/project!7`
   `scm.prs.*`. The `target` arg uses `!N` (GitLab convention) instead of `#N`.
 - **Nested groups**: `group/sub/project` parses with `owner = "group/sub"`,
   `repo = "project"`. URL-encoded as `group%2Fsub%2Fproject` in API calls.
-- **Self-hosted GitLab**: `[scm.gitlab].base_url` override works but is not
-  formally tested in nightly CI; report breakage if you depend on this.
+- **Self-hosted GitLab**: set `[scm.gitlab].base_url` to the API root,
+  including `/api/v4` (e.g. `https://gitlab.example.com/api/v4`) — the API
+  connectors and the event poller both append paths to it as-is. The override
+  works but is not formally tested in nightly CI; report breakage if you
+  depend on this.
 - **Trigger tokens**: `gitlab.pipeline_trigger` uses your PAT (with `api` scope),
   not a separate trigger token.
 - **`/changes` endpoint**: the diff endpoint is the legacy `/merge_requests/:iid/changes`;
