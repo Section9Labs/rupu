@@ -1121,6 +1121,10 @@ pub async fn run_workflow(
     // awaiting_step_id + approval_prompt; Done = `Completed`;
     // Error = `Failed`.
     let mut awaiting: Option<AwaitingInfo> = None;
+    // Set when a `Cancelled` another process landed on disk while this run
+    // was finishing was preserved instead of overwritten: the cancel
+    // already appended its terminal event, so this run emits none.
+    let mut cancel_preserved = false;
     if let (Some(store), Some(record)) = (opts.run_store.as_ref(), run_record_opt.as_mut()) {
         // Task 4, spec §3: `run_loop_node`'s own checkpoint writes
         // (`persist_loop_progress`) go straight to disk via their own
@@ -1274,8 +1278,19 @@ pub async fn run_workflow(
                 }
             }
         }
-        if let Err(persist_err) = store.update(record) {
-            warn!(error = %persist_err, "failed to persist terminal run state");
+        // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
+        // `RunStore::cancel` from the CLI or `cp serve` writes `Cancelled`
+        // while this run finishes). The store re-reads under the run lock.
+        match store.update_unless_cancelled(record) {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(run_id = %record.id, "the run was cancelled on disk while finishing; keeping that status");
+                record.status = crate::runs::RunStatus::Cancelled;
+                cancel_preserved = true;
+            }
+            Err(persist_err) => {
+                warn!(error = %persist_err, "failed to persist terminal run state");
+            }
         }
     } else if let Ok(InnerOutcome::Paused {
         step_id,
@@ -1317,8 +1332,9 @@ pub async fn run_workflow(
     }
 
     // Emit terminal run events (skip for Paused — StepAwaitingApproval
-    // was already emitted by run_steps_inner).
-    if let Some(sink) = opts.event_sink.as_ref() {
+    // was already emitted by run_steps_inner; skip entirely when an on-disk
+    // cancel was preserved — its own terminal event is already there).
+    if let Some(sink) = opts.event_sink.as_ref().filter(|_| !cancel_preserved) {
         match &outcome {
             Ok(InnerOutcome::Done) => {
                 sink.emit(

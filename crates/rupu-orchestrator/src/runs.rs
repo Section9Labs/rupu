@@ -967,6 +967,9 @@ pub struct RunStore {
 /// real dispatch tree should ever reach.
 const MAX_SUB_RUN_RECURSION_DEPTH: u32 = 64;
 
+/// How long [`RunStore::lock_run_json`] waits for `run.json.lock`.
+const RUN_JSON_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl RunStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -1475,6 +1478,67 @@ impl RunStore {
         }
         write_atomic(&path, &serde_json::to_vec_pretty(record)?)?;
         Ok(())
+    }
+
+    /// Serialize a read-modify-write of `run.json` against another
+    /// process's (a `cancel` from the CLI or `cp serve` racing the runner's
+    /// own terminal flip) with an exclusive flock on `run.json.lock` next
+    /// to it. Both critical sections are a few local file operations, so
+    /// the wait is bounded by [`RUN_JSON_LOCK_WAIT`]: a holder stuck longer
+    /// than that is wedged, and the caller then proceeds unlocked (the
+    /// pre-lock behavior) rather than hanging — logged. The lock is held
+    /// while the returned file is alive.
+    fn lock_run_json(&self, run_id: &str) -> Option<File> {
+        let path = self.run_dir(run_id).join("run.json.lock");
+        let file = match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not open the run lock");
+                return None;
+            }
+        };
+        let deadline = std::time::Instant::now() + RUN_JSON_LOCK_WAIT;
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Some(file),
+                Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "the run lock was held for more than {RUN_JSON_LOCK_WAIT:?}; proceeding without it"
+                        );
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not lock the run lock");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Write `record` unless the run was cancelled on disk in the meantime
+    /// — the runner's terminal flip (and its pause write), which must never
+    /// overwrite a `Cancelled` another process landed while the run was
+    /// finishing. Under the run lock the current record is re-read first.
+    /// Returns `Ok(true)` when `record` was written, `Ok(false)` when the
+    /// on-disk `Cancelled` was preserved and nothing was written.
+    pub fn update_unless_cancelled(&self, record: &RunRecord) -> Result<bool, RunStoreError> {
+        let _lock = self.lock_run_json(&record.id);
+        if let Ok(current) = self.load(&record.id) {
+            if current.status == RunStatus::Cancelled {
+                return Ok(false);
+            }
+        }
+        self.update(record)?;
+        Ok(true)
     }
 
     /// Append one completed step's record to `step_results.jsonl`.
@@ -2803,6 +2867,9 @@ impl RunStore {
         reason: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<CancelOutcome, CancelError> {
+        // Held across load → write, against the runner's own terminal flip
+        // (`update_unless_cancelled`) in its process.
+        let _lock = self.lock_run_json(run_id);
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => CancelError::NotFound(s),
             other => CancelError::Store(other.to_string()),
@@ -5431,6 +5498,114 @@ mod tests {
         assert!(reloaded.active_step_agent.is_none());
         assert!(reloaded.awaiting_step_id.is_none());
         assert!(reloaded.approval_prompt.is_none());
+    }
+
+    /// The runner's terminal flip must not overwrite a cancel that landed
+    /// on disk (from another process) while the run was finishing.
+    #[test]
+    fn a_terminal_update_preserves_an_on_disk_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_vs_done");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = None;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        store
+            .cancel(&rec.id, "matt", "stop it", Utc::now())
+            .unwrap();
+
+        // The runner's stale in-memory record, about to be flipped.
+        let mut done = rec.clone();
+        done.status = RunStatus::Completed;
+        done.finished_at = Some(Utc::now());
+        assert!(
+            !store.update_unless_cancelled(&done).unwrap(),
+            "the cancel is preserved, nothing written"
+        );
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+
+        // Not cancelled: the write goes through as before.
+        let mut plain = sample_record("run_done_plain");
+        plain.status = RunStatus::Running;
+        store.create(plain.clone(), SAMPLE_YAML).unwrap();
+        plain.status = RunStatus::Completed;
+        assert!(store.update_unless_cancelled(&plain).unwrap());
+        assert_eq!(store.load(&plain.id).unwrap().status, RunStatus::Completed);
+    }
+
+    /// The flip and a concurrent cancel serialize on `run.json.lock`: a
+    /// cancel holding the lock lands first, and the flip — which waited for
+    /// it — then sees it and preserves it.
+    #[test]
+    fn a_terminal_update_waits_for_a_cancel_holding_the_run_lock() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_lock_wait");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let lock_path = store.run_dir(&rec.id).join("run.json.lock");
+        let other_store = RunStore::new(tmp.path().to_path_buf());
+        let mut cancelled = rec.clone();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error_message = Some("stop it".into());
+        // Another process: holds the lock, writes its cancel 300ms later,
+        // then releases.
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other_store.update(&cancelled).unwrap();
+            drop(file);
+        });
+        // Give the holder time to take the lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut done = rec.clone();
+        done.status = RunStatus::Completed;
+        let started = std::time::Instant::now();
+        let written = store.update_unless_cancelled(&done).unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "waited for the holder ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert!(!written, "the cancel that landed under the lock wins");
+        assert_eq!(store.load(&rec.id).unwrap().status, RunStatus::Cancelled);
+    }
+
+    /// The wait for the run lock is bounded: a wedged holder delays the flip
+    /// by [`RUN_JSON_LOCK_WAIT`], after which it proceeds unlocked.
+    #[test]
+    fn a_wedged_run_lock_holder_does_not_block_the_flip_forever() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_lock_wedged");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(store.run_dir(&rec.id).join("run.json.lock"))
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let mut done = rec.clone();
+        done.status = RunStatus::Completed;
+        let started = std::time::Instant::now();
+        assert!(store.update_unless_cancelled(&done).unwrap());
+        let waited = started.elapsed();
+        assert!(
+            waited >= RUN_JSON_LOCK_WAIT && waited < RUN_JSON_LOCK_WAIT * 3,
+            "bounded by the lock wait: {waited:?}"
+        );
+        assert_eq!(store.load(&rec.id).unwrap().status, RunStatus::Completed);
     }
 
     #[test]
