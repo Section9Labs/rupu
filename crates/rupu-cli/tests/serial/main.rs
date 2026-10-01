@@ -87,6 +87,7 @@ mod cli_transcript;
 mod cli_watch;
 mod cli_workflow;
 mod coverage_audit_cli;
+mod multi_gate_approve;
 mod netflow_run;
 mod netflow_workflow;
 mod policy_lock;

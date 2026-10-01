@@ -140,6 +140,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
@@ -242,6 +243,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     };
     let transcript_path = dir.path().join("run_priced.jsonl");
@@ -619,6 +621,7 @@ fn seed_run_with_usage(
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: None,
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
@@ -1242,6 +1245,7 @@ fn create_workflow_run(
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
     };
     run_store.create(record, "name: wf-fold\n").unwrap();
     run_store

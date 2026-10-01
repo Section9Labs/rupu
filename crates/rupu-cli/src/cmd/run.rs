@@ -1144,6 +1144,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 // record consistent with the workflow-run creation site.
                 permission_mode: Some(mode_str.to_string()),
                 loop_progress: Default::default(),
+                gate_decisions: Vec::new(),
                 codename: Some(codename.crew.clone()),
             };
             match store.create(rec, "") {
@@ -1740,6 +1741,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         rupu_cp::api::runs::RunListRow::from(&rec)

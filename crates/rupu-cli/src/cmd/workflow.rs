@@ -2945,6 +2945,16 @@ fn resolve_approve_gate(
                  `rupu workflow show-run {run_id}` for the currently parked gate ids"
             );
         }
+        Err(rupu_orchestrator::ApprovalError::GateAlreadyDecided {
+            run_id,
+            step_id,
+            verdict,
+        }) => {
+            anyhow::bail!(
+                "gate `{step_id}` on run `{run_id}` was already {} — that decision stands",
+                verdict.as_str()
+            );
+        }
         Err(e) => Err(anyhow::anyhow!("approve: {e}")),
         Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
     }
@@ -2975,6 +2985,14 @@ async fn approve(
                 reason,
                 approver,
             } => {
+                // A path-scoped run recorded the timeout's rejection for a
+                // runner to apply (spec §7): prune its path, run its
+                // `on_reject` chain, carry on with every other path.
+                if pending_gate_decision(&store, run_id, &step_id) {
+                    let result = crate::resume::resume_decided(&store, run_id, mode).await?;
+                    report_resumed_run(&result, &format!("applied gate `{step_id}`'s rejection"));
+                    return Ok(());
+                }
                 // I-36: run the cleanup chain unconditionally, not only when
                 // `cheap_on_reject_chain_len` reports a non-empty chain — an
                 // empty chain must still record the gate's rejected decision
@@ -3016,8 +3034,10 @@ async fn approve(
         };
     // Phase 2 — the resume — lives in `crate::resume::resume_run` so the
     // background session worker can resume an approved gate identically.
-    // `awaited_step_id` is threaded in because `approve` clears the
-    // record's `awaiting_step_id`, so it can't be recovered post-flip.
+    // Only this gate's path is released: a sibling gate still parked stays
+    // parked and approvable (spec §7). A runner already executing the run
+    // (another gate's path) applies the approval itself — the resume then
+    // hands off instead of starting a second runner.
     let outcome = crate::resume::resume_run(
         &store,
         run_id,
@@ -3027,26 +3047,38 @@ async fn approve(
         via_timeout,
     )
     .await?;
-    let awaited_step_id = outcome.awaited_step_id;
-    let result = outcome.result;
-    println!(
-        "rupu: resumed run {} from step `{}`",
-        result.run_id, awaited_step_id
+    report_resumed_run(
+        &outcome.result,
+        &format!("from step `{}`", outcome.awaited_step_id),
     );
+    Ok(())
+}
+
+/// Whether run `run_id` holds a recorded, not-yet-applied decision on gate
+/// `step_id` — a path-scoped decision a runner applies, as opposed to a
+/// legacy reject that already finalized the run.
+fn pending_gate_decision(store: &rupu_orchestrator::RunStore, run_id: &str, step_id: &str) -> bool {
+    store
+        .load(run_id)
+        .is_ok_and(|r| r.pending_decision(step_id).is_some())
+}
+
+/// Print what a resume did — the steps it ran, then whether the run
+/// finished or parked at gates again (each still decided on its own) — or,
+/// when another runner was already executing the run, that it took the
+/// decision instead. `what` completes "resumed run <id> …".
+fn report_resumed_run(result: &rupu_orchestrator::OrchestratorRunResult, what: &str) {
+    if let Some(pid) = result.handed_off_to {
+        println!(
+            "rupu: run {} is already executing (pid {pid}); that runner applies the decision",
+            result.run_id
+        );
+        return;
+    }
+    println!("rupu: resumed run {} {what}", result.run_id);
     for sr in &result.step_results {
         if sr.run_id.is_empty() {
             continue;
-        }
-        // Only show the steps the resume actually dispatched —
-        // priors have run_id from a previous process and were
-        // already printed when the run originally started.
-        let was_prior = sr.transcript_path.exists() && sr.run_id.starts_with("run_");
-        if was_prior {
-            // Heuristic: the persisted prior steps will satisfy
-            // both conditions; `run_workflow` records the freshly
-            // dispatched ones too, but we don't have an easy way
-            // to distinguish from inside the result. Print both for
-            // now; future polish can dedupe via a stored boundary.
         }
         println!(
             "rupu: step {} run {} -> {}",
@@ -3056,6 +3088,25 @@ async fn approve(
         );
     }
     match &result.awaiting {
+        Some(info) if info.gates.len() > 1 => {
+            println!();
+            println!(
+                "rupu: workflow paused again at {} gates (run {})",
+                info.gates.len(),
+                result.run_id
+            );
+            for g in &info.gates {
+                println!(
+                    "      `{}`: {}",
+                    g.step_id,
+                    g.prompt.as_deref().unwrap_or_default()
+                );
+            }
+            println!(
+                "      approve one with: rupu workflow approve {} --gate <STEP_ID>",
+                result.run_id
+            );
+        }
         Some(info) => {
             println!();
             println!(
@@ -3075,7 +3126,6 @@ async fn approve(
             );
         }
     }
-    Ok(())
 }
 
 /// Resume a terminal (`failed` / `cancelled` / `rejected`) run, or a
@@ -3161,6 +3211,21 @@ pub(crate) async fn resume_run(
     // run that already completed.
     use rupu_orchestrator::RunStatus;
     let original_status = record.status;
+    // Gate decisions recorded on the run but not applied yet (spec §7) — a
+    // web approve/reject the cp-serve resume worker hands here, or a
+    // decision whose runner stopped before applying it. The runner applies
+    // them (an approval releases its gate's path, a rejection prunes it)
+    // and carries on with the rest of the run; a runner already executing
+    // the run takes them instead.
+    if matches!(
+        record.status,
+        RunStatus::AwaitingApproval | RunStatus::Running
+    ) && !record.gate_decisions.is_empty()
+    {
+        let result = crate::resume::resume_decided(&store, run_id, mode).await?;
+        report_resumed_run(&result, "to apply its recorded gate decisions");
+        return Ok(());
+    }
     match record.status {
         RunStatus::Running | RunStatus::Pending => {
             anyhow::bail!(
@@ -3711,6 +3776,16 @@ fn resolve_reject_gate(
                  `rupu workflow show-run {run_id}` for the currently parked gate ids"
             );
         }
+        Err(rupu_orchestrator::ApprovalError::GateAlreadyDecided {
+            run_id,
+            step_id,
+            verdict,
+        }) => {
+            anyhow::bail!(
+                "gate `{step_id}` on run `{run_id}` was already {} — that decision stands",
+                verdict.as_str()
+            );
+        }
         Err(e) => Err(anyhow::anyhow!("reject: {e}")),
         Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
     }
@@ -3728,6 +3803,20 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
         via,
         approver,
     } = resolve_reject_gate(&store, run_id, reason, gate)?;
+    // A path-scoped run (spec §7) recorded the rejection for a runner to
+    // apply: only the gate's own path is pruned and its `on_reject` chain
+    // runs, while every other path — a sibling's, or a join it shares —
+    // carries on, and other parked gates stay approvable. Resume it so the
+    // runner does that now (or hand it to the runner already executing it).
+    if pending_gate_decision(&store, run_id, &rejected_step_id) {
+        println!("rupu: gate `{rejected_step_id}` rejected on run {run_id}");
+        let result = crate::resume::resume_decided(&store, run_id, None).await?;
+        report_resumed_run(
+            &result,
+            &format!("to apply gate `{rejected_step_id}`'s rejection"),
+        );
+        return Ok(());
+    }
     // Task 5b-2a: rejecting one gate of a still-parked multi-gate set
     // leaves the run `AwaitingApproval` (the other gates stay parked) —
     // "marked rejected" only holds once the set is empty and the run
@@ -5250,13 +5339,28 @@ async fn execute_workflow_invocation(
             };
 
             match outcome {
-                AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
+                AttachOutcome::Done | AttachOutcome::Detached => {
+                    break Ok(result);
+                }
+                // A legacy reject finalized the run. A path-scoped run's
+                // (spec §7) is a decision a runner applies — pruning only the
+                // gate's own path — so it resumes inline below, like an
+                // approval.
+                AttachOutcome::Rejected
+                    if run_store_for_resume
+                        .load(&current_run_id)
+                        .map_or(true, |r| r.gate_decisions.is_empty()) =>
+                {
                     break Ok(result);
                 }
                 AttachOutcome::Cancelled => {
                     unreachable!("cancelled outcome is handled before join")
                 }
-                AttachOutcome::Approved { awaited_step_id } => {
+                outcome @ (AttachOutcome::Approved { .. } | AttachOutcome::Rejected) => {
+                    let awaited_step_id = match outcome {
+                        AttachOutcome::Approved { awaited_step_id } => awaited_step_id,
+                        _ => String::new(),
+                    };
                     let prior_records = run_store_for_resume
                         .read_step_results(&current_run_id)
                         .map_err(|e| anyhow::anyhow!("read step results for resume: {e}"))?;
@@ -5709,6 +5813,7 @@ mod tests {
             step_results: vec![Default::default(), Default::default()],
             run_id: "run_x".into(),
             awaiting: None,
+            handed_off_to: None,
         };
         assert_eq!(
             run_summary_outcome(&Ok(completed.clone())).as_deref(),
@@ -5786,6 +5891,7 @@ mod tests {
             active_step_transcript_path: Some(PathBuf::from("/tmp/transcripts/step.jsonl")),
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }

@@ -134,6 +134,7 @@ impl NodeMirror {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
 

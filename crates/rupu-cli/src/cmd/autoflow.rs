@@ -12523,6 +12523,7 @@ mod tests {
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    gate_decisions: Vec::new(),
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -13919,6 +13920,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -14076,6 +14078,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -14218,6 +14221,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -14375,6 +14379,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -14522,6 +14527,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -14661,6 +14667,7 @@ steps:
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    gate_decisions: Vec::new(),
                     codename: None,
                 },
                 "name: controller\nsteps: []\n",
@@ -14812,6 +14819,7 @@ steps:
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    gate_decisions: Vec::new(),
                     codename: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
@@ -14988,6 +14996,7 @@ steps:
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    gate_decisions: Vec::new(),
                     codename: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",

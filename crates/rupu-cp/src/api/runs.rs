@@ -57,7 +57,8 @@ fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
         | ApprovalError::ExpiredRejected { .. }
         | ApprovalError::NoAwaitingStep
         | ApprovalError::AmbiguousGate { .. }
-        | ApprovalError::GateNotFound { .. } => ApiError::conflict(e.to_string()),
+        | ApprovalError::GateNotFound { .. }
+        | ApprovalError::GateAlreadyDecided { .. } => ApiError::conflict(e.to_string()),
         ApprovalError::Store(other) => ApiError::internal(other.to_string()),
     }
 }
@@ -123,9 +124,14 @@ struct ApproveBody {
 /// `POST /api/runs/:id/approve[?host=<id>][&gate=<step_id>]` — record a web
 /// approval decision for a paused (awaiting-approval) run.
 ///
-/// Without `?host=` (or `?host=local`): sets the `resume_requested_at` marker
-/// (and the optional `resume_mode`) that a background worker picks up. The run
-/// stays `AwaitingApproval` until the worker resumes it.
+/// Without `?host=` (or `?host=local`): records the approval of the named
+/// gate and sets the `resume_requested_at` marker (and the optional
+/// `resume_mode`) asking `cp serve`'s resume worker for a runner
+/// ([`RunStore::request_resume_approval`]). Path-scoped (spec §7): only the
+/// gate's own path is released; sibling gates stay parked (the run stays
+/// `AwaitingApproval` while any is) and approvable, and two approvals in a
+/// row are both kept. A runner already executing the run applies it
+/// instead.
 ///
 /// `?gate=<step_id>` (Task 5b-2b, spec §7) targets a specific parked gate on
 /// a run that has batch-parked more than one (two concurrent DAG paths each
@@ -166,8 +172,14 @@ async fn approve_run(
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.0.mode);
+    // On the blocking pool: the decision is recorded under the run lock,
+    // whose (bounded) wait blocks its thread.
+    let (run_id, gate) = (id.clone(), q.gate.clone());
     s.run_store
-        .request_resume_approval(&id, "web", mode.as_deref(), now, q.gate.as_deref())
+        .blocking(move |store| {
+            store.request_resume_approval(&run_id, "web", mode.as_deref(), now, gate.as_deref())
+        })
+        .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -183,16 +195,18 @@ struct RejectBody {
 /// `POST /api/runs/:id/reject[?host=<id>][&gate=<step_id>]` — record a web
 /// rejection decision.
 ///
-/// Without `?host=` (or `?host=local`): rejects the named gate immediately
-/// (no marker/worker round-trip — unlike approve, a reject needs no
-/// execution runtime to finalize). `?gate=<step_id>` (Task 5b-2b, spec §7)
-/// targets a specific parked gate on a multi-gate run: that gate is removed
-/// from the awaiting set and the run stays `AwaitingApproval` while
-/// siblings remain parked, flipping to `Rejected` only once the set empties
-/// ([`RunStore::reject_gate`]). Omitted → the sole-gate back-compat
-/// behavior: identical to today for a run with at most one parked gate; a
-/// 409 listing every parked gate id for a genuine multi-gate run. A `gate`
-/// naming a step that isn't currently parked also 409s rather than a
+/// Without `?host=` (or `?host=local`): records the rejection of the named
+/// gate ([`RunStore::request_resume_rejection`]). On a DAG run the rejection
+/// is path-scoped (spec §7): only the gate's own path is pruned and its
+/// `on_reject` chain runs, every other path carries on, and sibling gates
+/// stay parked and approvable — applied by a runner, which the marker asks
+/// `cp serve`'s resume worker for (the CP itself has no execution runtime).
+/// A legacy single-cursor run's reject finalizes it `Rejected` here.
+/// `?gate=<step_id>` (Task 5b-2b) targets one parked gate on a multi-gate
+/// run. Omitted → the sole-gate back-compat behavior: identical to today
+/// for a run with at most one parked gate; a 409 listing every parked gate
+/// id for a genuine multi-gate run. A `gate` naming a step that isn't
+/// currently parked, or one already approved, also 409s rather than a
 /// silent no-op or a 500 (see [`map_approval_err`]).
 ///
 /// With `?host=<remote-id>`: proxies via [`HostConnector::reject_run`] and
@@ -219,8 +233,13 @@ async fn reject_run(
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let reason = body.reason.unwrap_or_default();
+    // On the blocking pool, as `approve_run`.
+    let (run_id, gate) = (id.clone(), q.gate.clone());
     s.run_store
-        .reject_gate(&id, "web", &reason, now, q.gate.as_deref())
+        .blocking(move |store| {
+            store.request_resume_rejection(&run_id, "web", &reason, now, gate.as_deref())
+        })
+        .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -990,6 +1009,7 @@ pub(crate) fn synthesize_unpersisted_run(
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
         codename: Some(rupu_codename::crew_for(id)),
     };
     let mut v = serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({ "id": id }));
@@ -1693,12 +1713,13 @@ pub(crate) mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }
 
     #[tokio::test]
-    async fn approve_awaiting_run_sets_resume_marker_and_stays_awaiting() {
+    async fn approve_awaiting_run_records_the_approval_and_requests_a_runner() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
@@ -1716,21 +1737,23 @@ pub(crate) mod tests {
         )
         .await
         .expect("approve should succeed");
-        // Marker-only: the endpoint records the approval but leaves the
-        // run AwaitingApproval for the background worker to approve+resume.
+        // The approval is recorded on the run (spec §7) and the marker asks
+        // the background worker for the runner that applies it; its only
+        // gate decided, the run is no longer parked.
         let body = resp.0;
-        assert_eq!(
-            body["run"]["status"],
-            serde_json::json!("awaiting_approval")
-        );
+        assert_eq!(body["run"]["status"], serde_json::json!("running"));
         assert_eq!(body["host_id"], "local");
 
         let loaded = s.run_store.load("run_app").unwrap();
-        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.status, RunStatus::Running);
         assert!(loaded.resume_requested_at.is_some());
-        // Awaited gate stays intact so the worker can recover which gate
-        // to resume.
-        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate"));
+        assert_eq!(loaded.awaiting_step_id, None);
+        let decided: Vec<(&str, Option<&str>)> = loaded
+            .gate_decisions
+            .iter()
+            .map(|d| (d.step_id.as_str(), d.approver.as_deref()))
+            .collect();
+        assert_eq!(decided, [("gate", Some("web"))]);
     }
 
     #[tokio::test]
@@ -1829,7 +1852,7 @@ pub(crate) mod tests {
         .expect("approve should succeed");
 
         let loaded = s.run_store.load("run_mode").unwrap();
-        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.status, RunStatus::Running);
         assert_eq!(loaded.resume_mode.as_deref(), Some("bypass"));
         assert!(loaded.resume_requested_at.is_some());
     }
@@ -1855,7 +1878,7 @@ pub(crate) mod tests {
         .expect("bodyless approve should succeed");
 
         let loaded = s.run_store.load("run_nobody").unwrap();
-        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.status, RunStatus::Running);
         assert_eq!(loaded.resume_mode, None);
         assert!(loaded.resume_requested_at.is_some());
     }
@@ -1908,8 +1931,9 @@ pub(crate) mod tests {
         )
         .await
         .expect("approving a named gate on a multi-gate run should succeed");
-        // Marker-only, same as the sole-gate case: the run stays
-        // AwaitingApproval for the background worker to actually resume.
+        // Path-scoped (spec §7): gate_a is still parked, so the run stays
+        // AwaitingApproval; gate_b's approval is recorded for the runner the
+        // marker asks the background worker for.
         assert_eq!(
             resp.0["run"]["status"],
             serde_json::json!("awaiting_approval")
@@ -1918,19 +1942,14 @@ pub(crate) mod tests {
         let loaded = s.run_store.load("run_multi_approve_b").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
         assert!(loaded.resume_requested_at.is_some());
-        // Both gates remain parked — targeting one for resume does not drop
-        // its sibling; gate_a is unaffected.
-        assert_eq!(loaded.awaiting.len(), 2);
-        assert!(loaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
-        assert!(loaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
-        // The derived-compat field now names the targeted gate too.
-        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_b"));
-        // T5b-2b-i correctness fix: the MARKER itself carries the target
-        // gate — this is what the `cp serve` resume worker actually reads
-        // (via `resume_gate_id`, not the mutable `awaiting_step_id`) to
-        // build its `--gate` argv. Without this, the worker's spawned
-        // `workflow approve` hits `AmbiguousGate` on a still-2-gate run and
-        // the run is permanently stranded `AwaitingApproval`.
+        // gate_a is unaffected — still parked and approvable.
+        assert_eq!(loaded.awaiting.len(), 1);
+        assert_eq!(loaded.awaiting[0].step_id, "gate_a");
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_a"));
+        // gate_b's approval is durable, per gate — a second web approval
+        // (of gate_a) can't overwrite it the way a single-slot marker could.
+        assert_eq!(loaded.gate_decisions.len(), 1);
+        assert_eq!(loaded.gate_decisions[0].step_id, "gate_b");
         assert_eq!(loaded.resume_gate_id.as_deref(), Some("gate_b"));
     }
 
@@ -2098,12 +2117,11 @@ pub(crate) mod tests {
         )
         .await
         .expect("naming the sole parked gate should behave like omitting it");
-        assert_eq!(
-            resp.0["run"]["status"],
-            serde_json::json!("awaiting_approval")
-        );
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("running"));
         let loaded = s.run_store.load("run_sole_named").unwrap();
-        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate"));
+        assert_eq!(loaded.awaiting_step_id, None);
+        assert_eq!(loaded.gate_decisions.len(), 1);
+        assert_eq!(loaded.gate_decisions[0].step_id, "gate");
         assert!(loaded.resume_requested_at.is_some());
     }
 
@@ -3315,6 +3333,7 @@ pub(crate) mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }

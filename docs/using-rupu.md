@@ -302,10 +302,17 @@ rupu workflow approve run_01J... --gate review-gate
 rupu workflow reject run_01J... --gate security-gate --reason "missing tests"
 ```
 
-Approving a gate lets that branch continue; rejecting one runs *that gate's* own
-`on_reject` cleanup chain and leaves the others parked. The run as a whole stays
-`awaiting_approval` until every parked gate has been resolved — it only flips to
-`rejected` once every gate is resolved.
+A gate decision affects only that gate's own path. Approving a gate runs its branch
+now; the other gates stay parked and approvable, and their branches wait for their own
+decisions. Rejecting a gate prunes only what is reachable solely through it and runs
+*that gate's* own `on_reject` cleanup chain; every other branch — including a join it
+shares with the rejected one — carries on. If a branch is still executing when you
+decide another gate, the process already running the workflow picks the decision up
+(it never starts a second copy of the run). The run stays `awaiting_approval` while any
+gate is parked; once everything is decided and finished it ends `completed` if any
+branch ran to its end, or `rejected` if every branch ended at a rejected gate. (A
+linear workflow parks one gate at a time; rejecting it ends the run `rejected`, as
+before.)
 
 ### Browse issues
 

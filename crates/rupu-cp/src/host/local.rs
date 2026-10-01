@@ -261,11 +261,17 @@ impl HostConnector for LocalHostConnector {
     // Deliberately out of scope here; a cross-host per-gate protocol is a
     // separate, larger design (T5b-2b handoff).
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
-        let mode_opt = if mode.is_empty() { None } else { Some(mode) };
+        let mode_opt = (!mode.is_empty()).then(|| mode.to_string());
         let now = chrono::Utc::now();
+        // On the blocking pool: recorded under the run lock, whose wait
+        // blocks its thread.
         // TODO(task-5): replace hardcoded "connector" actor with identity from AppState
+        let id = run_id.to_string();
         self.run_store
-            .request_resume_approval(run_id, "connector", mode_opt, now, None)
+            .blocking(move |store| {
+                store.request_resume_approval(&id, "connector", mode_opt.as_deref(), now, None)
+            })
+            .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
@@ -276,8 +282,15 @@ impl HostConnector for LocalHostConnector {
         reason: Option<&str>,
     ) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
+        // A path-scoped rejection is a decision a runner applies (spec §7);
+        // this asks the resume worker for one, as `approve_run` does. On the
+        // blocking pool, as there.
+        let (id, reason) = (run_id.to_string(), reason.unwrap_or("").to_string());
         self.run_store
-            .reject(run_id, "connector", reason.unwrap_or(""), now)
+            .blocking(move |store| {
+                store.request_resume_rejection(&id, "connector", &reason, now, None)
+            })
+            .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
@@ -333,8 +346,10 @@ impl HostConnector for LocalHostConnector {
         // AFTER its duplicate-execution guard confirms the original process
         // has exited (`runner_pid` no longer live), so clearing the marker
         // can't un-pause an original that hasn't yet honored the pause.
+        let id = run_id.to_string();
         self.run_store
-            .request_resume_approval(run_id, "connector", None, now, None)
+            .blocking(move |store| store.request_resume_approval(&id, "connector", None, now, None))
+            .await
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
@@ -671,6 +686,7 @@ mod pause_resume_tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
             codename: None,
         }
     }
