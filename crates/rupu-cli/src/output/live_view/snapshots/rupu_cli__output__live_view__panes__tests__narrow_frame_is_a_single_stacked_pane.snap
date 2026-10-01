@@ -1,0 +1,14 @@
+---
+source: crates/rupu-cli/src/output/live_view/panes.rs
+expression: s
+---
+assess-services  ● mint-tundra  ◐ running · 4m 12s
+step 1/3  ████████░░░░░░░░░░░░░░░░  ◐ sweep
+⇡6100000 ⇣420000 $18.40 · ⚑2
+─ structure · tab cycles panes ─────────────────────────────
+  ✓  preflight  scanner · heron#1 ···· ✓ 18s
+  │
+  ◐  sweep  sweeper · otter#2 ···· ◐ running
+  │
+  ○  report  reporter
+↑↓ move · enter drill · ← back · / filter · q quit

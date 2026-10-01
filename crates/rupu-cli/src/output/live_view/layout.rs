@@ -1145,7 +1145,7 @@ fn crumb_line(crumbs: &[String], w: usize) -> Option<Line> {
 /// modal approve / reject keys replace the navigation set. Hints carry a rank;
 /// a terminal too narrow for them all drops the highest-ranked (least
 /// important) first, `q quit` (rank 0) last.
-fn footer_line(view: &RunView, nav: &NavState, w: usize) -> Line {
+pub(crate) fn footer_line(view: &RunView, nav: &NavState, w: usize) -> Line {
     const NAVIGATE: &[(&str, u8)] = &[
         ("↑↓ move", 1),
         ("enter drill", 2),

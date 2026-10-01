@@ -1,0 +1,32 @@
+---
+source: crates/rupu-cli/src/output/live_view/panes.rs
+expression: s
+---
+release-train  ● mint-tundra  ⏸ awaiting_approval · 7m 41s
+step 1/3  ████████░░░░░░░░░░░░░░░░  ⏸ approve-deploy
+─ structure ────────────────────────────┬─ stream · approve-deploy ─────────────────────────────────
+  ✓  build  builder · he… ···· ✓ 1m 36s │ 11:42:31 ▸ read_file src/lib.rs
+  │                                     │ 11:42:33 ◇ thinking "check the auth path"
+▸ ⏸  approve-deploy  g… ···· ⏸ awaiting │ 11:42:39 ⚑ HIGH unchecked unwrap
+  │                                     │ 11:42:44 ▪ assistant wrote the report
+  ○  deploy  deployer                   │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        ├─ live · 0 active ─────────────────────────────────────────
+                                        │ otter#2  ▸ grep unwrap
+                                        │ heron#1  ✓ done
+                                        │ lynx#3   ▸ read_file Cargo.toml
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+                                        │
+a approve · r reject · v findings · Esc pause · q quit
