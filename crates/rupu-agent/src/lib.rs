@@ -34,8 +34,9 @@ pub use fd_budget::load_agent_admitted;
 pub use loader::{load_agent, load_agents, AgentLoadError};
 pub use permission::{parse_mode, resolve_mode, PermissionDecision, PermissionPrompt};
 pub use runner::{
-    compact_messages, run_agent, AgentRunOpts, BypassDecider, CompactionOutcome, MockProvider,
-    OnToolCallCallback, OnUsageCallback, RunError, RunResult, ScriptedTurn, UsageKind, UsageTurn,
+    compact_messages, run_agent, run_agent_with_limits, AgentRunOpts, BypassDecider,
+    CompactionOutcome, MockProvider, OnToolCallCallback, OnUsageCallback, RunError, RunResult,
+    ScriptedTurn, UsageKind, UsageTurn,
 };
 pub use rupu_providers::types::StopReason;
 pub use spec::{AgentSpec, AgentSpecParseError};

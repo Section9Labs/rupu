@@ -147,7 +147,7 @@ The `input − output` headroom rule compacts early enough that a full-length re
 
 ### 6.5 Sessions
 
-The resolved `ModelLimits`, including sources, is stored on the session record on the session's **first turn**. `session start` builds no provider, so the first `_run-turn` resolves and writes it. This is an additive serde field: an older record without it resolves on its next turn. Later turns reuse the stored value; it never refetches in the middle of a session. After each turn, the run's final limits are written back (`RunResult.final_limits`), so a limit learned from an overflow error (§7) persists.
+The resolved `ModelLimits`, including sources, is stored on the session record on the session's **first turn**. `session start` builds no provider, so the first `_run-turn` resolves and writes it. This is an additive serde field: an older record without it resolves on its next turn. Later turns reuse the stored value; it never refetches in the middle of a session. After each turn, the run's final limits are written back, so a limit learned from an overflow error (§7) persists. That holds when the turn fails too: `run_agent_with_limits` returns the run's final limits on every exit path, `Err` included (`RunResult.final_limits` exists only on `Ok`), and the session writes them on success and on failure.
 
 ### 6.6 Run-start notice
 

@@ -7799,7 +7799,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             codename: Some(codename.clone()),
         };
 
-        let outcome = rupu_agent::run_agent(opts).await;
+        // `run_agent_with_limits`, not `run_agent`: the run's final limits come
+        // back on an `Err` too, so a limit learned from an overflow (and the
+        // first turn's resolution) is persisted even when the turn then fails
+        // (spec 2026-09-30 §6.5).
+        let (outcome, final_limits) = rupu_agent::run_agent_with_limits(opts).await;
         // The turn's cached tokens: the provider-reported total summed over
         // every call (`RunResult.total_tokens_cached`), not the worker's
         // streaming snapshot, which only ever held the last call's figure
@@ -7816,6 +7820,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.active_pid = None;
         session.last_run_id = Some(args.run_id.clone());
         session.last_transcript_path = Some(transcript_path.clone());
+        // On success AND failure: the limits carry to every later turn
+        // without refetching.
+        session.model_limits = Some(final_limits);
 
         let mut run_status = Some(RunStatus::Error);
         let mut duration_ms = 0;
@@ -7859,10 +7866,6 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 session.total_tokens_out += result.total_tokens_out;
                 session.total_tokens_cached += cached_tokens;
                 session.message_history = result.final_messages;
-                // Persist the run's final limits so a limit learned from an
-                // overflow error (and the first turn's resolution) carries to
-                // every later turn without refetching (spec §6.5).
-                session.model_limits = Some(result.final_limits);
                 // This turn's own transcript always reconstructs to exactly
                 // `final_messages`: `run_agent` writes a `RunComplete` event
                 // at every `Ok(RunResult)` exit (success, max-turns, or a
@@ -10959,6 +10962,43 @@ mod tests {
         let (after, _) = read_session(&global, &learned.session_id).expect("read learned");
         let l = after.model_limits.expect("limits kept");
         assert_eq!(l.input, Limit::new(150_000, LimitSource::Observed));
+    }
+
+    /// A turn that learns a limit from an overflow and then FAILS must still
+    /// persist it, or the next turn starts from the stale limit and overflows
+    /// the same way again. A one-message history can be neither compacted nor
+    /// trimmed, so the clamp here is followed by `ContextOverflow`.
+    #[tokio::test]
+    async fn a_failed_turn_still_persists_the_learned_limit() {
+        use rupu_providers::model_limits::{Limit, LimitSource};
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_limits_fail01");
+        record.message_history = Vec::new();
+        record.compact_at_percent = None;
+        record.context_window_tokens = Some(1_000_000);
+        record.max_tokens = None;
+        record.model_limits = None;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        with_mock_home(
+            &global,
+            r#"[{ "ProviderError": "prompt is too long: 250000 tokens > 200000 maximum" }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_limits_fail".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("a failed agent run is recorded, not propagated");
+
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(after.status, SessionStatus::Failed, "{after:?}");
+        let l = after
+            .model_limits
+            .expect("a failed turn still persists the run's limits");
+        assert_eq!(l.input, Limit::new(200_000, LimitSource::Observed));
     }
 
     /// A turn's cached tokens come from its `RunResult` — the summed

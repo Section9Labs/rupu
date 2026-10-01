@@ -4,7 +4,7 @@
 //! §6.3, §6.6, §7).
 
 use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
-use rupu_agent::{run_agent, AgentRunOpts};
+use rupu_agent::{run_agent, run_agent_with_limits, AgentRunOpts, RunError};
 use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
 use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
@@ -457,4 +457,37 @@ async fn streaming_run_writes_assistant_deltas() {
     assert_eq!(reqs[0].max_tokens, Some(128_000));
     assert_eq!(assistant_delta_count(&transcript), 2, "\"hel\" + \"lo\"");
     assert_eq!(forwarded, 3);
+}
+
+/// Spec §6.5: a limit learned from an overflow must survive a run that ends
+/// in an error, or a session whose turn clamps and then fails never persists
+/// it. One message is too short to compact or trim, so the clamp is followed
+/// by `Err(ContextOverflow)`; the run's final limits still come back.
+#[tokio::test]
+async fn run_agent_with_limits_returns_the_learned_limit_on_an_error_exit() {
+    let provider = CapturingMockProvider::new(vec![ScriptedTurn::ProviderError(
+        "prompt is too long: 250000 tokens > 200000 maximum".into(),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = build_opts(Box::new(provider), &tmp, tmp.path().join("run.jsonl"));
+    opts.limits = ModelLimits::unknown().with_input(1_000_000);
+    let (result, limits) = run_agent_with_limits(opts).await;
+    assert!(
+        matches!(result, Err(RunError::ContextOverflow { .. })),
+        "the run must end in an error for this test to mean anything"
+    );
+    assert_eq!(limits.input, Limit::new(200_000, LimitSource::Observed));
+}
+
+/// The success path returns the same limits `RunResult.final_limits` carries.
+#[tokio::test]
+async fn run_agent_with_limits_returns_the_final_limits_on_success() {
+    let provider = CapturingMockProvider::new(vec![final_text_turn(usage(1, 1, 0))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = build_opts(Box::new(provider), &tmp, tmp.path().join("run.jsonl"));
+    opts.limits = ModelLimits::fixed(300_000, 4_000);
+    let (result, limits) = run_agent_with_limits(opts).await;
+    let result = result.expect("run completes");
+    assert_eq!(limits, result.final_limits);
+    assert_eq!(limits, ModelLimits::fixed(300_000, 4_000));
 }

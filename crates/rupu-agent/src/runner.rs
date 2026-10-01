@@ -1004,7 +1004,26 @@ enum LoopOutcome {
 
 /// Drive one agent run to completion. Writes a JSONL transcript at
 /// `opts.transcript_path` and returns turn/token counts on success.
-pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
+pub async fn run_agent(opts: AgentRunOpts) -> Result<RunResult, RunError> {
+    run_agent_with_limits(opts).await.0
+}
+
+/// [`run_agent`], plus the run's final `opts.limits` on EVERY exit path —
+/// `Err` included. A limit learned from an overflow error (spec 2026-09-30
+/// §7) is otherwise lost whenever the run then fails (trim exhaustion,
+/// retries exhausted, …), because [`RunResult::final_limits`] only exists on
+/// `Ok`. Sessions persist the returned value after every turn (§6.5).
+pub async fn run_agent_with_limits(
+    mut opts: AgentRunOpts,
+) -> (
+    Result<RunResult, RunError>,
+    rupu_providers::model_limits::ModelLimits,
+) {
+    let result = run_agent_inner(&mut opts).await;
+    (result, opts.limits)
+}
+
+async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError> {
     // Truncate/create a fresh, empty transcript, then hold an
     // APPEND-mode writer for the rest of the run. This is deliberate,
     // not equivalent-by-accident to `JsonlWriter::create`: the
@@ -1467,7 +1486,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                                     overflow.tokens.unwrap_or(last_turn_input_tokens).max(1);
                                 if compact_context(
                                     &mut messages,
-                                    &mut opts,
+                                    opts,
                                     &run_id_clone,
                                     compaction_seq,
                                     &mut writer,
@@ -1624,7 +1643,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     let last_input_tokens = resp.usage.input_tokens;
                     let _ = compact_context(
                         &mut messages,
-                        &mut opts,
+                        opts,
                         &run_id_clone,
                         compaction_seq,
                         &mut writer,
