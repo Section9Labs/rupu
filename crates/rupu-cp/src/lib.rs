@@ -272,6 +272,21 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
         );
     let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
 
+    // Fold spend into the usage index in the background, so the first page
+    // that shows it doesn't pay for reading every transcript.
+    {
+        let global = app_state.global_dir.clone();
+        let run_store = std::sync::Arc::clone(&app_state.run_store);
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            usage::prewarm(&global, &run_store);
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "usage index warmed"
+            );
+        });
+    }
+
     let app = server::router(app_state, opts.token);
 
     let addr = listener.local_addr()?;
