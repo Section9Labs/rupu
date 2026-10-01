@@ -97,7 +97,7 @@ describe('HostSelect', () => {
 
 describe('HostSelect — allowAll (fan-out variant)', () => {
   it('renders This host, registered hosts, and All hosts, in that order', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL, REMOTE]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
 
     render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
 
@@ -109,7 +109,7 @@ describe('HostSelect — allowAll (fan-out variant)', () => {
   });
 
   it('excludes the registered local host from the list (This host already covers it)', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL, REMOTE]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
 
     render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
 
@@ -120,7 +120,7 @@ describe('HostSelect — allowAll (fan-out variant)', () => {
   });
 
   it('emits ALL_HOSTS when "All hosts" is selected', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL, REMOTE]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
     const onChange = vi.fn();
 
     render(<HostSelect value="local" onChange={onChange} allowAll />);
@@ -132,7 +132,7 @@ describe('HostSelect — allowAll (fan-out variant)', () => {
   });
 
   it('shows only This host and All hosts while the hosts fetch is pending', () => {
-    vi.spyOn(api, 'getHosts').mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, 'getRegisteredHosts').mockReturnValue(new Promise(() => {}));
 
     render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
 
@@ -141,10 +141,18 @@ describe('HostSelect — allowAll (fan-out variant)', () => {
   });
 
   it('honors a custom ariaLabel override', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL, REMOTE]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
 
     render(<HostSelect value="local" onChange={vi.fn()} allowAll ariaLabel="Host filter" />);
 
     expect(screen.getByLabelText('Host filter')).toBeInTheDocument();
+  });
+
+  it('does not ask for host health (no probe) — only the registered list', async () => {
+    const reg = vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
+    const health = vi.spyOn(api, 'getHosts');
+    render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
+    await waitFor(() => expect(reg).toHaveBeenCalled());
+    expect(health).not.toHaveBeenCalled();
   });
 });

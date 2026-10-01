@@ -1,4 +1,4 @@
-// HostSelect — a small dropdown that lists registered hosts via api.getHosts()
+// HostSelect — a small dropdown of registered hosts. The allowAll (list-filter) variant reads the probe-free api.getRegisteredHosts(); the launcher variant reads api.getHosts() for status.
 // and emits the chosen host_id. Defaults to "local". Falls back to a single
 // "Local" option when the hosts fetch fails or has not resolved yet.
 //
@@ -13,7 +13,7 @@
 // unchanged.
 
 import { useEffect, useState } from 'react';
-import { api, type HostView } from '../lib/api';
+import { api, type HostView, type RegisteredHostView } from '../lib/api';
 import { Select } from './ui/Select';
 
 /** Sentinel host-id meaning "fetch all hosts" (fan-out / no `?host=` param).
@@ -42,22 +42,37 @@ export default function HostSelect({
   allowAll = false,
   ariaLabel = 'Host',
 }: Props) {
+  // The All-hosts filter only needs ids and names — the probe-free
+  // `/api/hosts/registered` (spec 2026-10-01 §6.4). The launcher variant keeps
+  // `/api/hosts`: its "(offline)" suffix matters when choosing where to launch.
   const [hosts, setHosts] = useState<HostView[] | null>(null);
+  const [registered, setRegistered] = useState<RegisteredHostView[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .getHosts()
-      .then((hs) => {
-        if (!cancelled) setHosts(hs);
-      })
-      .catch(() => {
-        if (!cancelled) setHosts([]);
-      });
+    if (allowAll) {
+      api
+        .getRegisteredHosts()
+        .then((hs) => {
+          if (!cancelled) setRegistered(hs);
+        })
+        .catch(() => {
+          if (!cancelled) setRegistered([]);
+        });
+    } else {
+      api
+        .getHosts()
+        .then((hs) => {
+          if (!cancelled) setHosts(hs);
+        })
+        .catch(() => {
+          if (!cancelled) setHosts([]);
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [allowAll]);
 
   if (allowAll) {
     return (
@@ -70,7 +85,7 @@ export default function HostSelect({
       >
         <option value="local">This host</option>
         <option value={ALL_HOSTS}>All hosts</option>
-        {(hosts ?? [])
+        {(registered ?? [])
           .filter((h) => h.transport_kind !== 'local')
           .map((h) => (
             <option key={h.id} value={h.id}>
