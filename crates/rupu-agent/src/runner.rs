@@ -3048,16 +3048,16 @@ mod context_trim_tests {
     /// Anthropic's pre-4.5 validation error: `input + max_tokens > window`.
     /// Verbatim wording from real API responses quoted in
     /// anthropics/claude-code#42 and #228 (numbers invented).
-    const ANTHROPIC_INPUT_PLUS_MAX_TOKENS: &str = r#"API error 400: {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 187254 + 20000 > 204798, decrease input length or `max_tokens` and try again"}}"#;
+    const ANTHROPIC_INPUT_PLUS_MAX_TOKENS: &str = r#"API error 400: {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 183500 + 20000 > 201000, decrease input length or `max_tokens` and try again"}}"#;
 
     #[test]
     fn input_plus_max_tokens_format_parses_all_three_numbers() {
         assert_eq!(
             parse_output_cap_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
             Some(OutputCapOverflow {
-                input: 187_254,
+                input: 183_500,
                 max_tokens: 20_000,
-                window: 204_798,
+                window: 201_000,
             })
         );
         // Thousands separators, and case-insensitive.
@@ -3093,7 +3093,7 @@ mod context_trim_tests {
             max_tokens: 20_000,
             window,
         };
-        assert_eq!(c(187_254, 204_798).lowered_max_tokens(), Some(16_544));
+        assert_eq!(c(183_500, 201_000).lowered_max_tokens(), Some(16_500));
         assert_eq!(
             c(100, 2_124).lowered_max_tokens(),
             Some(1_024),
@@ -3101,7 +3101,7 @@ mod context_trim_tests {
         );
         assert_eq!(c(100, 2_123).lowered_max_tokens(), None, "below the floor");
         assert_eq!(
-            c(205_000, 204_798).lowered_max_tokens(),
+            c(205_000, 201_000).lowered_max_tokens(),
             None,
             "input alone overflows"
         );
@@ -3115,7 +3115,7 @@ mod context_trim_tests {
         assert_eq!(
             parse_context_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
             Some(Overflow {
-                tokens: Some(187_254),
+                tokens: Some(183_500),
                 max: None
             })
         );

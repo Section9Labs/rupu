@@ -601,7 +601,7 @@ async fn compacted_history_lands_under_the_threshold() {
 
 /// Anthropic pre-4.5 validation error (wording verified against real API
 /// responses quoted in anthropics/claude-code#42 and #228; numbers invented).
-const INPUT_PLUS_MAX_TOKENS: &str = "API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"input length and `max_tokens` exceed context limit: 187254 + 20000 > 204798, decrease input length or `max_tokens` and try again\"}}";
+const INPUT_PLUS_MAX_TOKENS: &str = "API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"input length and `max_tokens` exceed context limit: 183500 + 20000 > 201000, decrease input length or `max_tokens` and try again\"}}";
 
 /// `input + max_tokens > window`: the input fits, the output reservation does
 /// not. The turn is retried ONCE with `max_tokens = window − input − 1000`;
@@ -625,7 +625,7 @@ async fn input_plus_max_tokens_overflow_retries_with_a_lowered_output_cap() {
     assert_eq!(reqs[0].max_tokens, Some(20_000));
     assert_eq!(
         reqs[1].max_tokens,
-        Some(204_798 - 187_254 - 1_000),
+        Some(201_000 - 183_500 - 1_000),
         "the retried request carries the lowered cap"
     );
     assert_eq!(
@@ -641,7 +641,7 @@ async fn input_plus_max_tokens_overflow_retries_with_a_lowered_output_cap() {
     let n = notices(&transcript);
     assert!(
         n.iter().any(|(k, m)| k == "model_limits_clamped"
-            && m.contains("output 20,000 → 16,544")
+            && m.contains("output 20,000 → 16,500")
             && m.contains("this request")),
         "{n:?}"
     );
