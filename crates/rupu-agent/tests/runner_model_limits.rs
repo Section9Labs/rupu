@@ -766,7 +766,8 @@ async fn long_context_unavailable_clamps_to_200k_and_retries_once() {
         n.iter().any(|(k, m)| k == "model_limits_clamped"
             && m.contains("no extra-usage entitlement for 1M context")
             && m.contains("1M beta disabled")
-            && m.contains("1,000,000 → 200,000")),
+            && m.contains("1,000,000 → 200,000")
+            && m.contains(LONG_CONTEXT_HINT)),
         "{n:?}"
     );
     assert!(
@@ -775,6 +776,43 @@ async fn long_context_unavailable_clamps_to_200k_and_retries_once() {
     );
     assert_eq!(compaction_count(&transcript), 0);
     assert_eq!(captured.lock().unwrap().len(), 1, "exactly one retry");
+}
+
+/// How to stop paying the refused request every run.
+const LONG_CONTEXT_HINT: &str =
+    "remove `[1m]` from the model / `contextWindow: 1m` from the agent to skip this";
+
+/// A session's later turns already carry the clamped 200K input limit (it
+/// was persisted), so their notice has no "input X → Y" part — but every
+/// run still sends one refused request, and the notice must still say how
+/// to stop it.
+#[tokio::test]
+async fn long_context_unavailable_notice_keeps_its_hint_when_already_clamped() {
+    let inner = CapturingMockProvider::new(vec![final_text_turn(usage(300, 6, 0))]);
+    let provider = FailFirst {
+        err: Some(long_context_unavailable()),
+        inner,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    let mut limits = live_1m_limits();
+    limits.input = Limit::new(200_000, LimitSource::Observed);
+    opts.limits = limits;
+    run_agent(opts).await.expect("the retry succeeds");
+    let n = notices(&transcript);
+    let clamped: Vec<&String> = n
+        .iter()
+        .filter(|(k, _)| k == "model_limits_clamped")
+        .map(|(_, m)| m)
+        .collect();
+    assert_eq!(clamped.len(), 1, "{n:?}");
+    assert!(
+        !clamped[0].contains(" → "),
+        "nothing newly clamped: {}",
+        clamped[0]
+    );
+    assert!(clamped[0].contains(LONG_CONTEXT_HINT), "{}", clamped[0]);
 }
 
 /// If the retried turn (now without the beta) still overflows the 200K

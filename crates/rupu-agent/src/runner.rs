@@ -1545,8 +1545,12 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                             let clamped = opts.limits.clamp_input(STANDARD_CONTEXT_WINDOW);
                             writer.write(&Event::Notice {
                                 kind: "model_limits_clamped".into(),
+                                // The hint matters most on a session's later
+                                // turns: the clamp is already persisted (no
+                                // "input X → Y"), yet every run still sends
+                                // one refused request first.
                                 message: format!(
-                                    "this account has no extra-usage entitlement for 1M context — using the {} window (1M beta disabled){}",
+                                    "this account has no extra-usage entitlement for 1M context — using the {} window (1M beta disabled){} — remove `[1m]` from the model / `contextWindow: 1m` from the agent to skip this refused request each run",
                                     group_thousands(u64::from(STANDARD_CONTEXT_WINDOW)),
                                     if clamped {
                                         format!(
