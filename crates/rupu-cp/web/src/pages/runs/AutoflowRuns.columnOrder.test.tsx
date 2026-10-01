@@ -3,8 +3,13 @@
 // (table-standardization follow-up, I1 + I4): Status leads, then Subject
 // (Workflow) → ID (Run) → the Source region (Event, Issue Ref, Worker — kept
 // contiguous immediately after ID, per-page columns) → Host → usage → the
-// newly-wired Turns/Duration (I4) → Started. Pure reorder plus the new
-// columns — see AutoflowRuns.test.tsx for behavioral coverage.
+// newly-wired Turns/Duration (I4). Pure reorder plus the new columns — see
+// AutoflowRuns.test.tsx for behavioral coverage.
+//
+// One deliberate deviation from the canonical order: Started sits second,
+// right after Status, not last (#642). This is the table a wall of CYCLE
+// FAILED rows is read on, and the first question about a failure is WHEN —
+// as the trailing column it sat past the horizontal scroll.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -51,7 +56,7 @@ const EVENT: AutoflowEventRow = {
 };
 
 describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => {
-  it('renders headers as Status, Workflow, Run, Event, Issue Ref, Worker, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
+  it('renders headers as Status, Started, Workflow, Run, Event, Issue Ref, Worker, Host, In, Out, Cached, Cost, Turns, Duration', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([EVENT]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
@@ -73,6 +78,7 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
       // unlabeled.
       '',
       'Status',
+      'Started', // second, not last — see the header comment (#642)
       'Workflow',
       'Run',
       'Event',
@@ -85,7 +91,6 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
       'Cost',
       'Turns',
       'Duration',
-      'Started',
       '', // trailing row-actions column (unlabeled) — Task 3
     ]);
   });
