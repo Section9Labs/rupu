@@ -224,13 +224,22 @@ pub(crate) fn finalize_stop(
 }
 
 /// Parse a tool call's argument string. An empty or whitespace-only string is
-/// a zero-parameter call (`{}`); anything else must parse. On failure the
+/// a zero-parameter call (`{}`); anything else must parse. A call with no
+/// function name cannot be dispatched, so it fails too. On failure the
 /// record the stop's `bad_tool` detail carries is returned.
 fn parse_tool_arguments(
     id: &str,
     name: &str,
     arguments: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
+    if name.is_empty() {
+        tracing::warn!(id = %id, "dropping tool call with no function name");
+        return Err(serde_json::json!({
+            "name": "",
+            "id": id,
+            "error": "tool call has no function name",
+        }));
+    }
     if arguments.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
@@ -475,7 +484,9 @@ impl CompletionAccumulator {
         let mut bad_tool: Option<serde_json::Value> = None;
         let mut has_tool_use = false;
         for tc in self.tool_calls {
-            if tc.name.is_empty() {
+            // A slot nothing was ever written to is padding from an index
+            // gap, not a call.
+            if tc.id.is_empty() && tc.name.is_empty() && tc.arguments.is_empty() {
                 continue;
             }
             match parse_tool_arguments(&tc.id, &tc.name, &tc.arguments) {
@@ -571,23 +582,28 @@ pub(crate) fn process_completion_sse(
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tool_calls {
                     let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                    while acc.tool_calls.len() <= idx {
+                        acc.tool_calls.push(ToolCallAcc::default());
+                    }
+                    // Only a non-empty id/name is recorded: some servers
+                    // repeat the keys empty on later deltas, which must not
+                    // erase the call.
+                    if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
+                        acc.tool_calls[idx].id = id.to_string();
+                    }
                     if let Some(func) = tc.get("function") {
-                        if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                            let tc_id = tc["id"].as_str().unwrap_or("").to_string();
-                            while acc.tool_calls.len() <= idx {
-                                acc.tool_calls.push(ToolCallAcc::default());
-                            }
-                            acc.tool_calls[idx].id = tc_id.clone();
+                        if let Some(name) = func
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
                             acc.tool_calls[idx].name = name.to_string();
                             on_event(StreamEvent::ToolUseStart {
-                                id: tc_id,
+                                id: acc.tool_calls[idx].id.clone(),
                                 name: name.to_string(),
                             });
                         }
                         if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                            while acc.tool_calls.len() <= idx {
-                                acc.tool_calls.push(ToolCallAcc::default());
-                            }
                             acc.tool_calls[idx].arguments.push_str(args);
                             on_event(StreamEvent::InputJsonDelta(args.to_string()));
                         }
@@ -1715,5 +1731,80 @@ mod tests {
         .unwrap();
         assert_eq!(resp.stop.reason, StopReason::Refusal);
         assert!(resp.stop.wire.details.as_ref().unwrap()["malformed_tool"].is_object());
+    }
+
+    fn assert_nameless_call_reported(resp: &LlmResponse, id: &str) {
+        assert_eq!(resp.stop.reason, StopReason::MalformedToolCall);
+        let bad = &resp.stop.wire.details.as_ref().unwrap()["malformed_tool"];
+        assert_eq!(bad["name"], "");
+        assert_eq!(bad["id"], id);
+        assert_eq!(bad["error"], "tool call has no function name");
+        assert!(!resp
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+    }
+
+    #[test]
+    fn streamed_call_without_a_name_is_a_malformed_tool_call() {
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","function":{"arguments":"{\"a\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_nameless_call_reported(&resp, "call_7");
+
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_8","function":{"name":"","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_nameless_call_reported(&resp, "call_8");
+    }
+
+    #[test]
+    fn sent_call_without_a_name_is_a_malformed_tool_call() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": null, "tool_calls": [
+                    {"id": "call_5", "function": {"name": "", "arguments": "{}"}}
+                ]},
+                "finish_reason": "tool_calls"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_nameless_call_reported(&resp, "call_5");
+    }
+
+    #[test]
+    fn a_later_empty_name_delta_does_not_erase_the_call() {
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::ToolUse);
+        assert!(resp.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolUse { id, name, input }
+                if id == "call_1" && name == "read_file" && input["path"] == "a"
+        )));
+    }
+
+    #[test]
+    fn an_index_gap_does_not_invent_a_bad_call() {
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::ToolUse);
+        assert!(resp.stop.wire.details.is_none());
     }
 }
