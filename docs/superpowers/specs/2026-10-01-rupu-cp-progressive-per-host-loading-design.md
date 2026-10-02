@@ -369,17 +369,19 @@ project tabs and Claims keep using it, without polling.
 
 ### 6.6 ⌘K palette
 
-The runs source becomes per host: `getRuns({ host, limit: 200, signal })` for each
-registered host, with that host's items appended as it answers. The palette's loading
-spinner tracks the non-run sources and local runs only, so a hung remote never holds the
-palette in a loading state. A failed host contributes no runs and no error.
+The runs and sessions sources become per host: `getRuns({ host, limit: 200, signal })` and
+`getSessions({ host, limit: 200, signal })` for each registered host, with that host's items
+appended as it answers. The palette's loading spinner tracks the other sources and local runs
+and sessions only, so a hung remote never holds the palette in a loading state. A failed host
+contributes no rows and no error.
 
 **One `AbortController` per open.** Closing the palette (or unmounting it) aborts every
-per-host run request, so a hung remote cannot pin a connection per open and exhaust the
-browser's 6-per-origin pool.
+per-host run and session request, so a hung remote cannot pin a connection per open and
+exhaust the browser's 6-per-origin pool.
 
-A remote run's entry links to `/runs/<id>?host=<host_id>` and is keyed `<host_id>:<id>`.
-Without the host, the CP would have to probe every host to find the run.
+A remote run's entry links to `/runs/<id>?host=<host_id>` and a remote session's to
+`/sessions/<id>?host=<host_id>`; both are keyed `<host_id>:<id>`. Without the host, the CP
+would have to probe every host to find the row.
 
 ## 7. Server
 
@@ -691,3 +693,6 @@ Rulings made while implementing; each is folded into the section named.
 - **§6.6: the palette aborts its per-host run requests when it closes, and a remote run
   links with `?host=`.** A hung remote would otherwise pin a connection per open, and a
   host-less link makes the CP probe every host to find the run.
+- **§6.6: the palette's sessions source is per host too, and a remote session links with
+  `?host=`.** The host-less `getSessions` fanned out on the server, so the palette's spinner
+  waited on a hung host (found in the live check).

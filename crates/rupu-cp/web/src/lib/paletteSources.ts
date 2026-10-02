@@ -199,12 +199,16 @@ export function autoflowItems(rows: AutoflowDefRow[]): PaletteItem[] {
 export function sessionItems(rows: SessionSummary[]): PaletteItem[] {
   return rows.map((s) => {
     const status = str(s.status);
+    const remote = s.host_id && s.host_id !== 'local' ? s.host_id : null;
     return {
       kind: 'session' as const,
-      id: s.session_id,
+      id: remote ? `${remote}:${s.session_id}` : s.session_id,
       title: s.agent_name,
-      subtitle: [shortId(s.session_id), status].filter(Boolean).join(' · '),
-      to: `/sessions/${s.session_id}`,
+      subtitle: [shortId(s.session_id), status, remote].filter(Boolean).join(' · '),
+      // As for runs: a remote session's detail must name its host.
+      to: remote
+        ? `/sessions/${encodeURIComponent(s.session_id)}?host=${encodeURIComponent(remote)}`
+        : `/sessions/${s.session_id}`,
       keywords: s.session_id,
     };
   });

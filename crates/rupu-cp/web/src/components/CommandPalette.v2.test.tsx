@@ -9,7 +9,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { api } from '../lib/api';
-import type { FindingOut, RunListRow } from '../lib/api';
+import type { FindingOut, RunListRow, SessionSummary } from '../lib/api';
 
 // Stub useNavigate — keep the rest of react-router-dom intact.
 const navigateMock = vi.fn();
@@ -49,6 +49,12 @@ function runRow(over: Partial<RunListRow> & { id: string; workflow_name: string 
     usage: {} as never,
     ...over,
   };
+}
+
+// A minimal session row for the per-host palette tests (the mapper reads
+// only id, agent name, status and host).
+function sessionRow(over: Partial<SessionSummary> & { session_id: string; agent_name: string }): SessionSummary {
+  return { status: 'active', ...over } as SessionSummary;
 }
 
 function stubHosts() {
@@ -211,6 +217,42 @@ describe('CommandPalette v2', () => {
     await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
     expect(getRuns).toHaveBeenCalledTimes(1);
     expect(getRuns).toHaveBeenCalledWith(expect.objectContaining({ host: 'local', limit: 200 }));
+  });
+
+  it('lists local sessions and drops its spinner without waiting on a hung remote host', async () => {
+    mockEmptyApi();
+    stubHosts();
+    const getSessions = vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([sessionRow({ session_id: 'sess_local_1', agent_name: 'local-agent', host_id: 'local' })])
+        : new Promise(() => {}),
+    );
+    await openPalette();
+    await waitFor(() => expect(screen.getByText('local-agent')).toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(getSessions).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod', limit: 200 }));
+    // The same per-open signal as the run requests.
+    expect(getSessions.mock.calls.every((c) => c[0]?.signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it('appends a remote host\'s sessions when it answers and opens them with ?host=', async () => {
+    mockEmptyApi();
+    stubHosts();
+    let answerRemote: (rows: SessionSummary[]) => void = () => {};
+    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([])
+        : new Promise<SessionSummary[]>((resolve) => { answerRemote = resolve; }),
+    );
+    await openPalette();
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+
+    answerRemote([sessionRow({ session_id: 'sess_remote_1', agent_name: 'remote-agent', host_id: 'host_prod' })]);
+    const remote = await screen.findByText('remote-agent');
+    fireEvent.click(remote.closest('[role="option"]') as HTMLElement);
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith('/sessions/sess_remote_1?host=host_prod'),
+    );
   });
 
   it('aborts every per-host run request when the palette closes', async () => {

@@ -229,9 +229,10 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const [items, setItems] = useState<PaletteItem[]>([]);
-  // Remote hosts' runs land one host at a time, after (or before) the batch
-  // below commits `items` — kept apart so that commit can't overwrite them.
-  const [remoteRunItems, setRemoteRunItems] = useState<PaletteItem[]>([]);
+  // Remote hosts' runs and sessions land one host at a time, after (or before)
+  // the batch below commits `items` — kept apart so that commit can't
+  // overwrite them.
+  const [remoteItems, setRemoteItems] = useState<PaletteItem[]>([]);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const navigate = useNavigate();
@@ -278,35 +279,37 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
 
     let cancelled = false;
     // One controller per open: closing (or unmounting) aborts every per-host
-    // run request, so a hung remote can't pin a connection per open and
-    // exhaust the browser's per-origin pool.
+    // run and session request, so a hung remote can't pin a connection per
+    // open and exhaust the browser's per-origin pool.
     const controller = new AbortController();
     const { signal } = controller;
-    setRemoteRunItems([]);
+    setRemoteItems([]);
     setLoading(true);
+    // Runs and sessions load per host (spec 2026-10-01 §6.6): local is part of
+    // the initial batch; each remote's rows append when that host answers, so
+    // a slow or dead host never holds the palette in a loading state. A host
+    // that fails contributes nothing, and no error.
+    const hosts = api
+      .getRegisteredHosts()
+      .catch(() => [{ id: 'local', name: 'Local', transport_kind: 'local' as const }]);
+    const perHost = (load: (host: string) => Promise<PaletteItem[]>) =>
+      hosts.then((hs) => {
+        for (const h of hs) {
+          if (h.id === 'local') continue;
+          load(h.id)
+            .then((rows) => {
+              if (!cancelled) setRemoteItems((prev) => [...prev, ...rows]);
+            })
+            .catch(() => {});
+        }
+        return load('local').catch(() => []);
+      });
     Promise.all([
-      // Runs load per host (spec 2026-10-01 §6.6): local is part of the
-      // initial batch; each remote's runs append when that host answers, so
-      // a slow or dead host never holds the palette in a loading state.
-      api.getRegisteredHosts()
-        .catch(() => [{ id: 'local', name: 'Local', transport_kind: 'local' as const }])
-        .then((hosts) => {
-          for (const h of hosts) {
-            if (h.id === 'local') continue;
-            api
-              .getRuns({ host: h.id, limit: 200, signal })
-              .then(runItems)
-              .then((rows) => {
-                if (!cancelled) setRemoteRunItems((prev) => [...prev, ...rows]);
-              })
-              .catch(() => {});
-          }
-          return api.getRuns({ host: 'local', limit: 200, signal }).then(runItems).catch(() => []);
-        }),
+      perHost((host) => api.getRuns({ host, limit: 200, signal }).then(runItems)),
       api.getAgents().then(agentItems).catch(() => []),
       api.getWorkflows().then(workflowItems).catch(() => []),
       api.getAutoflowDefs().then(autoflowItems).catch(() => []),
-      api.getSessions({ limit: 200 }).then(sessionItems).catch(() => []),
+      perHost((host) => api.getSessions({ host, limit: 200, signal }).then(sessionItems)),
       api.getProjects().then(projectItems).catch(() => []),
       api.getCoverage().then(coverageItems).catch(() => []),
       api.getFindings().then((r) => findingItems(r.findings)).catch(() => []),
@@ -328,8 +331,8 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
   }, [open]);
 
   const groups = useMemo(
-    () => rankPalette(query, [...items, ...remoteRunItems], shell === 'v2' ? NAV_PAGES_V2 : NAV_PAGES),
-    [query, items, remoteRunItems, shell],
+    () => rankPalette(query, [...items, ...remoteItems], shell === 'v2' ? NAV_PAGES_V2 : NAV_PAGES),
+    [query, items, remoteItems, shell],
   );
 
   // Flat ordered list for keyboard nav — mirrors the visual group order.
