@@ -655,6 +655,7 @@ fn terminated(
             total_tokens,
             duration_ms: started.elapsed().as_millis() as u64,
             error: Some("terminating (SIGTERM)".into()),
+            outcome: None,
         })
         .and_then(|_| writer.flush());
     match closed {
@@ -1695,6 +1696,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                 total_tokens: total_in + total_out,
                                 duration_ms: started.elapsed().as_millis() as u64,
                                 error: Some(format!("context overflow: {e_str}")),
+                                outcome: None,
                             })?;
                             writer.flush()?;
                             return Err(RunError::ContextOverflow { turn: turn_idx });
@@ -1742,6 +1744,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                     }
                                 )
                             }),
+                            outcome: None,
                         })?;
                         writer.flush()?;
                         return Err(if is_preflight {
@@ -1881,6 +1884,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                             total_tokens: total_in + total_out,
                             duration_ms: started.elapsed().as_millis() as u64,
                             error: Some("operator_stop".into()),
+                            outcome: None,
                         })?;
                         writer.flush()?;
                         return Err(RunError::OperatorStop { turn: turn_idx });
@@ -2012,6 +2016,8 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                         Some(id.to_string())
                     }
                 },
+                discarded: false,
+                stop: None,
             })?;
             writer.flush()?;
 
@@ -2083,6 +2089,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // Previously hard-coded to `Some("paused")` / `None`, which left a
             // max-turns bust writing `status: error` with no reason at all.
             error: terminal_error.clone(),
+            outcome: None,
         })?;
         writer.flush()?;
 

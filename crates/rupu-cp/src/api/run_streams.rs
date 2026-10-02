@@ -2267,6 +2267,7 @@ mod tests {
                 total_tokens: 180,
                 duration_ms: 4200,
                 error: None,
+                outcome: None,
             },
         ];
         let mut buf = Vec::new();

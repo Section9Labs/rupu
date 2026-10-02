@@ -43,6 +43,7 @@ fn write_transcript_started_at(
         total_tokens: 10,
         duration_ms: 100,
         error: None,
+        outcome: None,
     })
     .unwrap();
     w.flush().unwrap();
@@ -78,6 +79,7 @@ fn write_transcript(
         total_tokens,
         duration_ms: 100,
         error: None,
+        outcome: None,
     })
     .unwrap();
     w.flush().unwrap();
@@ -116,6 +118,7 @@ fn write_transcript_with_assistant(
         total_tokens: 123,
         duration_ms: 100,
         error: None,
+        outcome: None,
     })
     .unwrap();
     w.flush().unwrap();

@@ -37,12 +37,26 @@ const FRAGMENT_SEPARATOR: &str = "\n\n";
 pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String> {
     let mut saw_turn_start = false;
     let mut turn_fragments: Vec<String> = Vec::new();
+    // Fragments of earlier turns this answer continues (a truncation
+    // continuation's `Recovery { continues_output }`).
+    let mut carried: Vec<String> = Vec::new();
+    let mut carry_next = false;
     let mut last_non_empty: Option<String> = None;
+    // `last_non_empty` as it stood when the current turn began, so a
+    // discarded turn can be rolled back out of the fallback too.
+    let mut last_before_turn: Option<String> = None;
     for event in events {
         match event {
             Event::TurnStart { .. } => {
                 saw_turn_start = true;
-                turn_fragments.clear();
+                if carry_next {
+                    carried.append(&mut turn_fragments);
+                } else {
+                    carried.clear();
+                    turn_fragments.clear();
+                }
+                carry_next = false;
+                last_before_turn = last_non_empty.clone();
             }
             Event::AssistantMessage { content, .. } if !content.trim().is_empty() => {
                 if saw_turn_start {
@@ -50,13 +64,24 @@ pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String
                 }
                 last_non_empty = Some(content);
             }
+            Event::TurnEnd {
+                discarded: true, ..
+            } => {
+                turn_fragments.clear();
+                last_non_empty = last_before_turn.clone();
+            }
+            Event::Recovery {
+                continues_output: true,
+                ..
+            } => carry_next = true,
             _ => {}
         }
     }
-    if turn_fragments.is_empty() {
+    carried.append(&mut turn_fragments);
+    if carried.is_empty() {
         last_non_empty
     } else {
-        Some(turn_fragments.join(FRAGMENT_SEPARATOR))
+        Some(carried.join(FRAGMENT_SEPARATOR))
     }
 }
 

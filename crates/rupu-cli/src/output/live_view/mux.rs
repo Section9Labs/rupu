@@ -759,6 +759,8 @@ mod tests {
                 tokens_out: None,
                 stop_reason: None,
                 response_id: None,
+                discarded: false,
+                stop: None,
             },
             Some("otter#3")
         )
@@ -784,7 +786,14 @@ mod tests {
             None
         )
         .is_none());
-        assert!(project_event(&Event::Unknown, None).is_none());
+        assert!(project_event(
+            &Event::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null
+            },
+            None
+        )
+        .is_none());
         assert!(project_event(
             &Event::ToolResult {
                 call_id: "c1".into(),

@@ -2041,7 +2041,9 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
-        TxEvent::Unknown => vec![WorkflowViewLine {
+        // Task 2 renders these; until then they print nothing.
+        TxEvent::Outcome { .. } | TxEvent::Recovery { .. } => Vec::new(),
+        TxEvent::Unknown { .. } => vec![WorkflowViewLine {
             status: UiStatus::Active,
             text: retained_workflow_event_line_raw(
                 UiStatus::Active,
@@ -4667,6 +4669,7 @@ mod tests {
                     total_tokens: 321,
                     duration_ms: 1200,
                     error: None,
+                    outcome: None,
                 },
             ],
         );
@@ -4737,6 +4740,7 @@ mod tests {
                     total_tokens: 42,
                     duration_ms: 250,
                     error: None,
+                    outcome: None,
                 },
             ],
         );
@@ -4867,7 +4871,10 @@ mod tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
-            TxEvent::Unknown,
+            TxEvent::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null,
+            },
         ];
         for ev in &cases {
             assert!(
@@ -5028,6 +5035,7 @@ mod tests {
                 total_tokens: 42,
                 duration_ms: 1000,
                 error: None,
+                outcome: None,
             },
         ];
         let body = events
@@ -5161,6 +5169,7 @@ mod tests {
                 total_tokens: 21,
                 duration_ms: 800,
                 error: None,
+                outcome: None,
             },
         ];
         let mut body = String::new();

@@ -300,7 +300,10 @@ fn reconstruct_with(
             | Event::ToolAudit { .. }
             | Event::NetFlow { .. }
             | Event::Notice { .. }
-            | Event::Unknown => {}
+            // Task 7 gives these their replay semantics (discard / merge).
+            | Event::Outcome { .. }
+            | Event::Recovery { .. }
+            | Event::Unknown { .. } => {}
         }
     }
     // No trailing flush: a turn without TurnEnd was never committed by the

@@ -125,6 +125,8 @@ fn roundtrip_turn_end() {
         tokens_out: Some(567),
         stop_reason: Some("end_turn".into()),
         response_id: Some("msg_01".into()),
+        discarded: false,
+        stop: None,
     });
 }
 
@@ -136,6 +138,8 @@ fn roundtrip_turn_end_no_token_counts() {
         tokens_out: None,
         stop_reason: None,
         response_id: None,
+        discarded: false,
+        stop: None,
     });
 }
 
@@ -147,6 +151,7 @@ fn roundtrip_run_complete_ok() {
         total_tokens: 5000,
         duration_ms: 12345,
         error: None,
+        outcome: None,
     });
 }
 
@@ -158,5 +163,6 @@ fn roundtrip_run_complete_error_with_reason() {
         total_tokens: 5000,
         duration_ms: 12345,
         error: Some("context_overflow".into()),
+        outcome: None,
     });
 }

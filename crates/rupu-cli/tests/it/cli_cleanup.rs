@@ -162,6 +162,7 @@ fn write_archived_standalone_transcript(
         total_tokens: 12,
         duration_ms: 100,
         error: None,
+        outcome: None,
     })
     .unwrap();
     w.flush().unwrap();

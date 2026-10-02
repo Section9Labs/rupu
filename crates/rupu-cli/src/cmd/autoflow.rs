@@ -4678,7 +4678,7 @@ fn live_run_event_lines(
                 ),
             )]
         }
-        TranscriptEvent::Unknown => vec![serve_event_line(
+        TranscriptEvent::Unknown { .. } => vec![serve_event_line(
             UiStatus::Active,
             "event  ·  unrecognized event type (newer rupu wrote this transcript)".to_string(),
         )],
@@ -6126,7 +6126,10 @@ mod serve_heartbeat_tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
-            TranscriptEvent::Unknown,
+            TranscriptEvent::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null,
+            },
         ];
         for ev in &cases {
             assert!(

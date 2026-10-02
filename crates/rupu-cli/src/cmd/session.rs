@@ -2864,7 +2864,9 @@ impl SessionInteractiveState {
                     ),
                 );
             }
-            TranscriptEvent::Unknown => {
+            // Task 2 renders these; until then they print nothing.
+            TranscriptEvent::Outcome { .. } | TranscriptEvent::Recovery { .. } => {}
+            TranscriptEvent::Unknown { .. } => {
                 self.push_line(
                     crate::output::palette::Status::Active,
                     retained_session_event_line_raw(
@@ -5414,7 +5416,9 @@ fn transcript_event_lines(
                 continuation: false,
             }]
         }
-        TranscriptEvent::Unknown => vec![SessionViewLine {
+        // Task 2 renders these; until then they print nothing.
+        TranscriptEvent::Outcome { .. } | TranscriptEvent::Recovery { .. } => Vec::new(),
+        TranscriptEvent::Unknown { .. } => vec![SessionViewLine {
             status: Status::Active,
             text: retained_session_event_line_raw(
                 Status::Active,
@@ -7358,6 +7362,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: None,
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7386,6 +7391,7 @@ async fn run_compact_request(
             total_tokens: 0,
             duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
             error: None,
+            outcome: None,
         })?;
         writer.flush()?;
         finalize_compact_run(
@@ -7476,6 +7482,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: None,
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7499,6 +7506,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: None,
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7520,6 +7528,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: Some(err_str.clone()),
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -9708,7 +9717,10 @@ mod tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
-            TranscriptEvent::Unknown,
+            TranscriptEvent::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null,
+            },
         ];
         for ev in &cases {
             assert!(
@@ -10875,6 +10887,7 @@ mod tests {
                     total_tokens: 6_050,
                     duration_ms: 10,
                     error: None,
+                    outcome: None,
                 },
             ],
         );

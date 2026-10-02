@@ -709,6 +709,7 @@ mod tests {
                 total_tokens: (input_tokens + output_tokens) as u64,
                 duration_ms: 100,
                 error: None,
+                outcome: None,
             })
             .unwrap();
         writer.flush().unwrap();

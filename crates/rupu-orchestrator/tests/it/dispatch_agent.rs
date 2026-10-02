@@ -97,6 +97,7 @@ impl AgentDispatcher for FakeDispatcher {
                 total_tokens: 5,
                 duration_ms: 7,
                 error: None,
+                outcome: None,
             })
             .unwrap();
         writer.flush().unwrap();

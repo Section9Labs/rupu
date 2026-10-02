@@ -677,6 +677,7 @@ mod tests {
             total_tokens: 0,
             duration_ms: 0,
             error: None,
+            outcome: None,
         })
         .unwrap();
         w.flush().unwrap();

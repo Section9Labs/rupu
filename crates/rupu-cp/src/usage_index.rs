@@ -2697,6 +2697,7 @@ mod tests {
             total_tokens: 2,
             duration_ms: 4200,
             error: None,
+            outcome: None,
         });
         append(
             &f,

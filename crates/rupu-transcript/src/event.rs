@@ -36,6 +36,8 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "seed",
     "compaction",
     "notice",
+    "outcome",
+    "recovery",
 ];
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -132,13 +134,20 @@ pub enum Event {
         tokens_in: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         tokens_out: Option<u64>,
-        /// Provider-reported stop reason for the turn (snake_case of
-        /// `rupu_providers::StopReason`), when known.
+        /// The provider's wire stop value for the turn (e.g. `end_turn`,
+        /// `max_output_tokens`), when known.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         stop_reason: Option<String>,
         /// Provider response id for the turn, when non-empty.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         response_id: Option<String>,
+        /// The typed stop (spec §7.1). `None` on transcripts before 2026-10.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        stop: Option<crate::outcome::StopRecord>,
+        /// The turn's content was discarded (a refused / blocked / retried
+        /// turn): replay drops it, `final_turn_text` ignores it.
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        discarded: bool,
     },
     Usage {
         provider: String,
@@ -171,6 +180,8 @@ pub enum Event {
         duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        outcome: Option<crate::outcome::OutcomeRecord>,
     },
     /// Per-catalog-tool-call audit trail (step `actions:` enforcement,
     /// 2026-07-26 design). Emitted from two choke points: the agent
@@ -272,11 +283,45 @@ pub enum Event {
         kind: String,
         message: String,
     },
-    /// Forward-compatibility catch-all (mirrors
-    /// `rupu_providers::ContentBlock::Unknown`): an unrecognized `type` tag
-    /// lands here instead of failing the line. Never written.
-    #[serde(other)]
-    Unknown,
+    /// A classified non-normal reply or provider error (spec §7.1).
+    Outcome {
+        turn_idx: u32,
+        outcome: crate::outcome::OutcomeRecord,
+    },
+    /// One recovery action taken for an outcome (spec §5.2). Rendered in
+    /// order after its `Outcome`, the pair reads as a timeline.
+    Recovery {
+        outcome_id: String,
+        /// 0 = in place, 1 = same provider, 2 = other provider, 3 = operator.
+        rung: u8,
+        action: crate::outcome::RecoveryAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Replay appends the NEXT turn's assistant content to the previous
+        /// assistant message (a `pause_turn` continuation).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        merge_into_previous: bool,
+        /// The next turn's text continues this turn's answer (a truncation
+        /// continuation): `final_turn_text` joins across the boundary.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        continues_output: bool,
+    },
+    /// Forward-compatibility catch-all: a line whose `type` this binary
+    /// doesn't know. Keeps the payload so readers can render it and the CP
+    /// can pass it through verbatim. Never written by rupu itself.
+    #[serde(skip)]
+    Unknown {
+        tag: String,
+        data: Value,
+    },
 }
 
 // `#[serde(remote = "Self")]` above turns the derive output into inherent
@@ -311,7 +356,18 @@ impl Serialize for Event {
     where
         S: Serializer,
     {
-        Event::serialize(self, serializer)
+        match self {
+            Event::Unknown { tag, data } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_entry("type", tag)?;
+                if !data.is_null() {
+                    map.serialize_entry("data", data)?;
+                }
+                map.end()
+            }
+            other => Event::serialize(other, serializer),
+        }
     }
 }
 
@@ -332,7 +388,10 @@ impl<'de> Deserialize<'de> for Event {
             // Well-formed (object, string tag) but not one we know:
             // forward-compatible `Unknown`, never an error.
             Some(Value::String(tag)) if !KNOWN_EVENT_TAGS.contains(&tag.as_str()) => {
-                Ok(Event::Unknown)
+                Ok(Event::Unknown {
+                    tag: tag.clone(),
+                    data: obj.get("data").cloned().unwrap_or(Value::Null),
+                })
             }
             // Known tag, missing tag, or a non-string tag all fall through
             // to the derived parser: it accepts the known-tag shape, and
@@ -582,7 +641,13 @@ mod tests {
     #[test]
     fn unrecognized_event_type_parses_as_unknown_not_error() {
         let line = r#"{"type":"hologram_projection","data":{"x":1}}"#;
-        assert_eq!(serde_json::from_str::<Event>(line).unwrap(), Event::Unknown);
+        assert_eq!(
+            serde_json::from_str::<Event>(line).unwrap(),
+            Event::Unknown {
+                tag: "hologram_projection".into(),
+                data: serde_json::json!({"x":1}),
+            }
+        );
     }
 
     // The three malformed shapes below must all be real deserialize errors,
@@ -630,6 +695,8 @@ mod tests {
             tokens_out: Some(20),
             stop_reason: Some("tool_use".into()),
             response_id: Some("msg_01".into()),
+            stop: None,
+            discarded: false,
         };
         let s = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);

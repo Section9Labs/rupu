@@ -60,3 +60,72 @@ fn no_text_at_all_is_none() {
     assert_eq!(final_turn_text(vec![turn(0)]), None);
     assert_eq!(final_turn_text(Vec::new()), None);
 }
+
+#[test]
+fn a_continuation_chain_joins_across_turns() {
+    use rupu_transcript::{final_turn_text, Event, RecoveryAction};
+    let ev = vec![
+        Event::TurnStart { turn_idx: 0 },
+        Event::AssistantMessage {
+            content: "part one".into(),
+            thinking: None,
+        },
+        Event::Recovery {
+            outcome_id: "oc".into(),
+            rung: 0,
+            action: RecoveryAction::Continued,
+            attempt: Some(1),
+            budget: Some(3),
+            provider: None,
+            model: None,
+            reason: None,
+            merge_into_previous: false,
+            continues_output: true,
+        },
+        Event::UserMessage {
+            content: "continue".into(),
+        },
+        Event::TurnStart { turn_idx: 1 },
+        Event::AssistantMessage {
+            content: "part two".into(),
+            thinking: None,
+        },
+    ];
+    assert_eq!(final_turn_text(ev).as_deref(), Some("part one\n\npart two"));
+}
+
+#[test]
+fn a_discarded_turn_does_not_contribute() {
+    use rupu_transcript::{final_turn_text, Event};
+    let ev = vec![
+        Event::TurnStart { turn_idx: 0 },
+        Event::AssistantMessage {
+            content: "kept".into(),
+            thinking: None,
+        },
+        Event::TurnEnd {
+            turn_idx: 0,
+            tokens_in: None,
+            tokens_out: None,
+            stop_reason: None,
+            response_id: None,
+            stop: None,
+            discarded: false,
+        },
+        Event::TurnStart { turn_idx: 1 },
+        Event::AssistantMessage {
+            content: "refused partial".into(),
+            thinking: None,
+        },
+        Event::TurnEnd {
+            turn_idx: 1,
+            tokens_in: None,
+            tokens_out: None,
+            stop_reason: None,
+            response_id: None,
+            stop: None,
+            discarded: true,
+        },
+    ];
+    assert_eq!(final_turn_text(ev).as_deref(), Some("kept"));
+}

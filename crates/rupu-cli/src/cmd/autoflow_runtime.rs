@@ -1503,6 +1503,7 @@ mod tests {
                 total_tokens: 100,
                 duration_ms: 1000,
                 error: None,
+                outcome: None,
             })
             .unwrap();
         writer.flush().unwrap();

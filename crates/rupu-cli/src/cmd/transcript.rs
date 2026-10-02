@@ -1190,7 +1190,9 @@ fn transcript_event_lines(
                 ),
             )]
         }
-        TranscriptEvent::Unknown => vec![transcript_event_line(
+        // Task 2 renders these; until then they print nothing.
+        TranscriptEvent::Outcome { .. } | TranscriptEvent::Recovery { .. } => Vec::new(),
+        TranscriptEvent::Unknown { .. } => vec![transcript_event_line(
             Status::Active,
             0,
             false,
@@ -1662,7 +1664,9 @@ pub(crate) fn render_pretty_transcript_event(
                 )),
             );
         }
-        TranscriptEvent::Unknown => {
+        // Task 2 renders these; until then they print nothing.
+        TranscriptEvent::Outcome { .. } | TranscriptEvent::Recovery { .. } => {}
+        TranscriptEvent::Unknown { .. } => {
             printer.sideband_event(
                 Status::Active,
                 "event",
@@ -2721,7 +2725,10 @@ mod tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
-            TranscriptEvent::Unknown,
+            TranscriptEvent::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null,
+            },
         ];
         for ev in &cases {
             assert!(
