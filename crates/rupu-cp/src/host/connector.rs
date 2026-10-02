@@ -355,10 +355,11 @@ pub trait HostConnector: Send + Sync {
 
     /// The coverage stream (`runs/<run_id>/coverage.jsonl`) the executing
     /// host wrote for `run_id`, for the coordinator to merge (spec
-    /// 2026-09-30-rupu-remote-findings-transport-design.md §A2). `Ok(empty)`
-    /// ⇒ no stream arrived. Deliberately no default: every transport must say
-    /// how it delivers this, or refuse.
-    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError>;
+    /// 2026-09-30-rupu-remote-findings-transport-design.md §A2), and whether
+    /// the transport guarantees it is all of it (see [`CoverageRead`]).
+    /// Empty bytes ⇒ no stream arrived. Deliberately no default: every
+    /// transport must say how it delivers this, or refuse.
+    async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError>;
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -891,6 +892,23 @@ pub(crate) fn valid_run_id(id: &str) -> bool {
     id.starts_with("run_") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A unit's coverage stream as its host connector read it
+/// ([`HostConnector::unit_coverage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageRead {
+    /// The stream; empty ⇒ no stream arrived.
+    pub bytes: Vec<u8>,
+    /// Whether the transport guarantees these are every byte the run wrote,
+    /// PROVIDED the run was terminal when they were read: true for a local
+    /// run (its own file), a tunnel node (its coverage frames precede
+    /// `RunFinished` on one socket), a bucket worker (its finished marker
+    /// follows its uploads) and an HTTP remote (its own local file); for SSH
+    /// only once the tail pump's terminal pull replaced the mirrored copy
+    /// with the host's file. A read taken while the run may still be running
+    /// is a snapshot whatever this says — the caller knows which it took.
+    pub complete: bool,
+}
+
 /// A run's coverage stream read from the coordinator's own run store: the
 /// local host's file, or a mirror-backed transport's mirrored copy.
 ///
@@ -1094,8 +1112,11 @@ pub(crate) mod testing {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("StubConnector: get_transcript not configured")
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+        async fn unit_coverage(&self, _run_id: &str) -> Result<CoverageRead, HostConnectorError> {
+            Ok(CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,
@@ -1168,8 +1189,14 @@ pub(crate) mod testing {
             ) -> Result<serde_json::Value, HostConnectorError> {
                 unimplemented!()
             }
-            async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-                Ok(Vec::new())
+            async fn unit_coverage(
+                &self,
+                _run_id: &str,
+            ) -> Result<CoverageRead, HostConnectorError> {
+                Ok(CoverageRead {
+                    bytes: Vec::new(),
+                    complete: true,
+                })
             }
             async fn proxy_get_json(
                 &self,

@@ -514,7 +514,12 @@ impl HostConnector for HttpHostConnector {
             .await
     }
 
-    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+    /// GET the remote CP's own local file. Complete once the run is terminal:
+    /// the remote serves the file its `rupu run` wrote, not a copy in transit.
+    async fn unit_coverage(
+        &self,
+        run_id: &str,
+    ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
         if !crate::host::connector::valid_run_id(run_id) {
             return Err(HostConnectorError::Invalid(format!(
                 "{run_id:?} is not a valid run id"
@@ -537,7 +542,10 @@ impl HostConnector for HttpHostConnector {
             .bytes()
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
-        Ok(bytes.to_vec())
+        Ok(crate::host::connector::CoverageRead {
+            bytes: bytes.to_vec(),
+            complete: true,
+        })
     }
 
     async fn proxy_get_json(

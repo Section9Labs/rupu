@@ -157,11 +157,43 @@ fn host_err_to_run_err(e: HostConnectorError) -> RunError {
     RunError::Provider(e.to_string())
 }
 
+/// Why a read taken before the unit was seen terminal can be short: the unit
+/// may still be writing its stream on the host.
+const SNAPSHOT_REASON: &str =
+    "read while the unit may still be running on the host, so later lines are not included";
+
+/// Why a terminal read the transport could not confirm whole can be short.
+const UNCONFIRMED_REASON: &str =
+    "the host's final copy of the stream did not arrive; this is what was mirrored while the \
+     unit ran";
+
 /// The unit's coverage stream, or why it could not be collected.
-async fn collect_coverage(conn: &Arc<dyn HostConnector>, run_id: &str, host: &str) -> UnitCoverage {
+///
+/// `snapshot` names why this read was taken before the unit was seen terminal
+/// (a poll error after the run was observed, the wall timeout): the stream is
+/// then [`UnitCoverage::Partial`] whatever the transport says, since the unit
+/// may still be writing it. A terminal read is `Partial` too when the
+/// transport cannot confirm it holds the whole stream
+/// ([`rupu_cp::host::connector::CoverageRead::complete`]). The reasons never
+/// name the host — the runner's warning does.
+async fn collect_coverage(
+    conn: &Arc<dyn HostConnector>,
+    run_id: &str,
+    snapshot: Option<&str>,
+) -> UnitCoverage {
     match conn.unit_coverage(run_id).await {
-        Ok(bytes) => UnitCoverage::Stream(bytes),
-        Err(e) => UnitCoverage::Unavailable(format!("host {host}: {e}")),
+        Ok(read) => match snapshot {
+            Some(why) => UnitCoverage::Partial {
+                bytes: read.bytes,
+                reason: format!("{why}; {SNAPSHOT_REASON}"),
+            },
+            None if read.complete => UnitCoverage::Stream(read.bytes),
+            None => UnitCoverage::Partial {
+                bytes: read.bytes,
+                reason: UNCONFIRMED_REASON.to_string(),
+            },
+        },
+        Err(e) => UnitCoverage::Unavailable(e.to_string()),
     }
 }
 
@@ -423,8 +455,10 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     // the poll just failed after the run was seen, so the
                     // unit may well still be running on the host, and no
                     // `await_run_mirror` is done here. Whatever it writes to
-                    // its coverage stream after this read is not collected.
-                    let coverage = collect_coverage(&conn, &run_id, host).await;
+                    // its coverage stream after this read is not collected,
+                    // so the stream is Partial and the runner says so.
+                    let why = format!("the coordinator's poll of the run failed ({e})");
+                    let coverage = collect_coverage(&conn, &run_id, Some(&why)).await;
                     return Err(UnitFailure {
                         error: host_err_to_run_err(e),
                         coverage,
@@ -453,8 +487,9 @@ impl UnitDispatcher for FleetUnitDispatcher {
 
                 // The unit's coverage stream, on every terminal outcome: a
                 // failed unit's findings are still real. Collected before the
-                // delta so a delta error below still carries it.
-                let coverage = collect_coverage(&conn, &run_id, host).await;
+                // delta so a delta error below still carries it. Partial when
+                // the transport cannot confirm the copy is whole.
+                let coverage = collect_coverage(&conn, &run_id, None).await;
 
                 let output = run["final_output"].as_str().unwrap_or("").to_string();
                 let success = status == "completed";
@@ -535,11 +570,17 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // Otherwise this read is a best-effort snapshot, not a final one: on a
         // wall timeout the unit may still be running on the host (we only gave
         // up watching), and no `await_run_mirror` is done here, so lines it
-        // writes to its coverage stream after this read are not collected.
+        // writes to its coverage stream after this read are not collected —
+        // a Partial stream, which the runner merges and warns about.
         let coverage = if never_started {
             UnitCoverage::NotLaunched
         } else {
-            collect_coverage(&conn, &run_id, host).await
+            collect_coverage(
+                &conn,
+                &run_id,
+                Some("the coordinator stopped waiting at its wall-clock budget"),
+            )
+            .await
         };
 
         Err(UnitFailure {
@@ -747,6 +788,9 @@ mod tests {
         coverage: Vec<u8>,
         /// When set, `unit_coverage` fails as an unreachable host would.
         coverage_fails: bool,
+        /// When set, `unit_coverage` says the transport could not confirm the
+        /// bytes are the whole stream (SSH whose final pull did not land).
+        coverage_incomplete: bool,
         /// What `collect_workspace_delta` returns. `None` models a host that
         /// cannot be reached when the coordinator asks for the delta.
         delta: Option<Vec<u8>>,
@@ -774,6 +818,7 @@ mod tests {
                 launched: Default::default(),
                 coverage: Vec::new(),
                 coverage_fails: false,
+                coverage_incomplete: false,
                 delta: None,
                 poll_error_after_running: false,
             }
@@ -812,6 +857,7 @@ mod tests {
                 launched: Default::default(),
                 coverage: Vec::new(),
                 coverage_fails: false,
+                coverage_incomplete: false,
                 delta: None,
                 poll_error_after_running: false,
             }
@@ -948,12 +994,18 @@ mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
             self.calls.lock().unwrap().push("unit_coverage");
             if self.coverage_fails {
                 return Err(HostConnectorError::Unreachable("down".into()));
             }
-            Ok(self.coverage.clone())
+            Ok(rupu_cp::host::connector::CoverageRead {
+                bytes: self.coverage.clone(),
+                complete: !self.coverage_incomplete,
+            })
         }
         async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
             Ok("/stage/w".to_string())
@@ -1039,8 +1091,14 @@ mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
+            Ok(rupu_cp::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,
@@ -1189,6 +1247,8 @@ mod tests {
         assert_eq!(out.coverage, UnitCoverage::Stream(b"stream".to_vec()));
     }
 
+    /// The reason is the connector's alone: the runner's warning names the
+    /// host, so naming it here too printed it twice.
     #[tokio::test]
     async fn a_connector_that_cannot_deliver_is_unavailable() {
         let mut conn = FakeConnector::completed();
@@ -1196,7 +1256,24 @@ mod tests {
         let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
-            matches!(&out.coverage, UnitCoverage::Unavailable(m) if m.contains("h1")),
+            matches!(&out.coverage, UnitCoverage::Unavailable(m) if m.contains("down") && !m.contains("h1")),
+            "{:?}",
+            out.coverage
+        );
+    }
+
+    /// A terminal read the transport could not confirm whole (SSH whose final
+    /// pull did not land) is merged with a warning, never silently.
+    #[tokio::test]
+    async fn a_terminal_read_the_transport_cannot_confirm_is_partial() {
+        let mut conn = FakeConnector::completed();
+        conn.coverage = b"tailed".to_vec();
+        conn.coverage_incomplete = true;
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(
+            matches!(&out.coverage, UnitCoverage::Partial { bytes, reason }
+                if bytes == b"tailed" && reason.contains("final copy")),
             "{:?}",
             out.coverage
         );
@@ -1258,7 +1335,13 @@ mod tests {
 
         let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
         assert!(err.to_string().contains("host went away"), "{err}");
-        assert_eq!(err.coverage, UnitCoverage::Stream(b"partial".to_vec()));
+        assert!(
+            matches!(&err.coverage, UnitCoverage::Partial { bytes, reason }
+                if bytes == b"partial" && reason.contains("may still be running")),
+            "a snapshot of a unit that may still be running is Partial even when the \
+             transport calls its read complete: {:?}",
+            err.coverage
+        );
     }
 
     /// A wall-clock timeout on a run the host showed to be alive still
@@ -1271,7 +1354,12 @@ mod tests {
 
         let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
-        assert_eq!(err.coverage, UnitCoverage::Stream(b"partial".to_vec()));
+        assert!(
+            matches!(&err.coverage, UnitCoverage::Partial { bytes, reason }
+                if bytes == b"partial" && reason.contains("may still be running")),
+            "{:?}",
+            err.coverage
+        );
     }
 
     /// A run the host never showed has no stream: it is `NotLaunched`, and the
@@ -1505,8 +1593,14 @@ steps:
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
+            Ok(rupu_cp::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,
@@ -1817,8 +1911,14 @@ steps:
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
+            Ok(rupu_cp::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,
@@ -1948,8 +2048,14 @@ steps:
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
+            Ok(rupu_cp::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,

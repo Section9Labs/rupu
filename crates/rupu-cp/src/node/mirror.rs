@@ -346,9 +346,14 @@ impl NodeMirror {
         rupu_coverage::stream_path(&self.run_store.root, run_id)
     }
 
-    /// Replace the mirrored stream with `body` — the host's complete file,
-    /// read once the run is terminal (the tail may still have been behind).
-    /// Same ownership check as [`Self::append`].
+    /// Replace the mirrored stream with `body`, the host's file. `complete`
+    /// says the run was terminal when the host's file was read, so `body` is
+    /// every line it wrote (the tail may still have been behind): after the
+    /// rename lands, a `.complete` mark is written next to the stream — the
+    /// signal [`Self::coverage_complete`] reads. A replace that is not
+    /// complete (a snapshot of a run that may still be writing) removes any
+    /// mark FIRST, so a reader never pairs "complete" with a snapshot. Same
+    /// ownership check as [`Self::append`].
     ///
     /// Async because the stream can be large and the caller is the SSH tail
     /// pump on the async runtime: the whole-file write and the rename go
@@ -358,6 +363,7 @@ impl NodeMirror {
         run_id: &str,
         node_id: &str,
         body: &str,
+        complete: bool,
     ) -> Result<(), MirrorError> {
         validate_run_id(run_id)?;
         let existing = self.run_store.load(run_id)?;
@@ -365,6 +371,14 @@ impl NodeMirror {
             return Err(MirrorError::WrongNode(run_id.to_string()));
         }
         let path = self.coverage_path(run_id);
+        let mark = crate::host::transcript_paths::complete_marker(&path);
+        if !complete {
+            match tokio::fs::remove_file(&mark).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         // A per-call temp name (two replaces for one run can overlap) removed
         // on any failure, like `replace_usage_ledger`.
         let tmp = path.with_file_name(format!("coverage.jsonl.{}.tmp", ulid::Ulid::new()));
@@ -377,7 +391,18 @@ impl NodeMirror {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e.into());
         }
+        if complete {
+            tokio::fs::write(&mark, b"").await?;
+        }
         Ok(())
+    }
+
+    /// Whether the mirrored stream is the host's whole file — a
+    /// [`Self::replace_coverage`] with `complete` landed. `false` for an
+    /// invalid run id.
+    pub fn coverage_complete(&self, run_id: &str) -> bool {
+        validate_run_id(run_id).is_ok()
+            && crate::host::transcript_paths::is_complete(&self.coverage_path(run_id))
     }
 
     /// Transition `run_id` to `status` and set `finished_at = now()`.
@@ -547,7 +572,7 @@ mod tests {
             "line-1\n"
         );
         mirror
-            .replace_coverage("run_C1", "node-1", "a\nb\n")
+            .replace_coverage("run_C1", "node-1", "a\nb\n", false)
             .await
             .unwrap();
         assert_eq!(
@@ -555,9 +580,64 @@ mod tests {
             "a\nb\n"
         );
         assert!(matches!(
-            mirror.replace_coverage("run_C1", "node-2", "x").await,
+            mirror
+                .replace_coverage("run_C1", "node-2", "x", false)
+                .await,
             Err(MirrorError::WrongNode(_))
         ));
+    }
+
+    /// Only a replace with the host's file read once the run was terminal
+    /// marks the copy complete. A snapshot replace (the run may still be
+    /// writing) clears the mark rather than sit next to it, so a reader never
+    /// sees "complete" beside bytes that are not the authoritative copy.
+    #[tokio::test]
+    async fn replace_coverage_marks_only_an_authoritative_copy_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "a".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        mirror.create_run("run_C3", "node-1", &spec).unwrap();
+        assert!(!mirror.coverage_complete("run_C3"), "nothing pulled yet");
+
+        mirror
+            .replace_coverage("run_C3", "node-1", "snap\n", false)
+            .await
+            .unwrap();
+        assert!(
+            !mirror.coverage_complete("run_C3"),
+            "a snapshot is not complete"
+        );
+
+        mirror
+            .replace_coverage("run_C3", "node-1", "whole\n", true)
+            .await
+            .unwrap();
+        assert!(mirror.coverage_complete("run_C3"));
+        assert_eq!(
+            std::fs::read_to_string(mirror.coverage_path("run_C3")).unwrap(),
+            "whole\n"
+        );
+
+        mirror
+            .replace_coverage("run_C3", "node-1", "later-snap\n", false)
+            .await
+            .unwrap();
+        assert!(
+            !mirror.coverage_complete("run_C3"),
+            "a later snapshot must clear the mark"
+        );
+        assert!(!mirror.coverage_complete("../escape"));
     }
 
     #[tokio::test]
@@ -578,11 +658,11 @@ mod tests {
         };
         mirror.create_run("run_C2", "node-1", &spec).unwrap();
         mirror
-            .replace_coverage("run_C2", "node-1", "a\n")
+            .replace_coverage("run_C2", "node-1", "a\n", false)
             .await
             .unwrap();
         mirror
-            .replace_coverage("run_C2", "node-1", "b\n")
+            .replace_coverage("run_C2", "node-1", "b\n", false)
             .await
             .unwrap();
         let run_dir = mirror
@@ -601,11 +681,15 @@ mod tests {
         );
 
         assert!(matches!(
-            mirror.replace_coverage("../escape", "node-1", "x").await,
+            mirror
+                .replace_coverage("../escape", "node-1", "x", false)
+                .await,
             Err(MirrorError::InvalidRunId(_))
         ));
         assert!(matches!(
-            mirror.replace_coverage("not_a_run", "node-1", "x").await,
+            mirror
+                .replace_coverage("not_a_run", "node-1", "x", false)
+                .await,
             Err(MirrorError::InvalidRunId(_))
         ));
     }
@@ -633,9 +717,13 @@ mod tests {
         let dest = mirror.coverage_path("run_C3");
         std::fs::create_dir_all(dest.join("occupied")).unwrap();
         assert!(mirror
-            .replace_coverage("run_C3", "node-1", "a\n")
+            .replace_coverage("run_C3", "node-1", "a\n", true)
             .await
             .is_err());
+        assert!(
+            !mirror.coverage_complete("run_C3"),
+            "a replace that did not land must not be marked complete"
+        );
         let run_dir = dest.parent().unwrap().to_path_buf();
         let leftovers: Vec<_> = std::fs::read_dir(&run_dir)
             .unwrap()

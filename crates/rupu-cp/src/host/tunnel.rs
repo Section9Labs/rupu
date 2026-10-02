@@ -288,8 +288,18 @@ impl HostConnector for TunnelHostConnector {
         })
     }
 
-    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await
+    /// The mirrored stream. Complete once the run is terminal: the node sends
+    /// its coverage frames, final drain included, before `RunFinished` on the
+    /// same socket, so they are mirrored before the run turns terminal here.
+    async fn unit_coverage(
+        &self,
+        run_id: &str,
+    ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+        let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
+        Ok(crate::host::connector::CoverageRead {
+            bytes,
+            complete: true,
+        })
     }
 
     async fn stream_run_events(

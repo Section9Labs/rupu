@@ -18,7 +18,7 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_stream_run_events, read_transcript_file, EventByteStream, FeedGuard,
+        mirror_stream_run_events, read_transcript_file, CoverageRead, EventByteStream, FeedGuard,
         HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
         RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
@@ -895,10 +895,33 @@ async fn pump_catch_up_transcript(
     }
 }
 
-/// One-shot terminal usage-ledger pull for the tail pump: `cat` the remote
-/// `usage.jsonl` and atomically REPLACE the mirrored ledger with it.
+/// Section label (and file name) of the usage ledger in [`ledger_pull_command`].
+const LEDGER_USAGE: &str = "usage.jsonl";
+/// Section label (and file name) of the coverage stream in [`ledger_pull_command`].
+const LEDGER_COVERAGE: &str = "coverage.jsonl";
+/// How every [`ledger_pull_command`] starts (tests route on it).
+const LEDGER_PULL_PREFIX: &str = "for f in usage.jsonl coverage.jsonl;";
+
+/// The pump's terminal ledger pull: the run's `usage.jsonl` AND
+/// `coverage.jsonl` in ONE ssh invocation, framed like [`batch_cat_command`]
+/// (`==> <label> <==`, body, synthetic newline, `==> end <==`) so
+/// [`split_batched_cat`] reads it. The labels are the bare file names: the
+/// paths need `$HOME` expanded remotely, so they cannot go through
+/// `shell_escape`, and the label is all the split needs. Callers guarantee
+/// [`is_safe_run_id`].
+fn ledger_pull_command(run_id: &str) -> String {
+    format!(
+        "{LEDGER_PULL_PREFIX} do printf '==> %s <==\\n' \"$f\"; cat \"{}/$f\" 2>/dev/null; \
+         printf '\\n==> end <==\\n'; done",
+        remote_run_dir(run_id)
+    )
+}
+
+/// One-shot terminal pull of the run's two ledgers for the tail pump, in a
+/// single ssh round trip ([`ledger_pull_command`]), each atomically REPLACING
+/// its mirrored copy.
 ///
-/// The tailed copy is only as fresh as the last poll interval
+/// **Usage.** The tailed copy is only as fresh as the last poll interval
 /// ([`PUMP_POLL_INTERVAL`]) — rows the run wrote just before its terminal
 /// `run.json` can still be sitting in the tail stream, or never have reached
 /// it. Left alone that is a silent undercount (the usage fold's transcript
@@ -908,13 +931,28 @@ async fn pump_catch_up_transcript(
 /// rows by their ULID `id`, so rows the tail already delivered are not
 /// counted twice.
 ///
-/// A failed `cat`, an empty answer (no ledger — an older host, or a run that
-/// never billed anything) or an unsafe `run_id` leaves the mirror as-is.
-async fn pump_catch_up_usage_ledger(
+/// **Coverage.** Same reason: the tail can still be behind, and the last
+/// lines are often the unit's final findings. When `run_terminal` (the host's
+/// own `run.json` said terminal before this pull, so `rupu run` had finished
+/// writing its stream) the replace is marked complete — the signal
+/// [`HostConnector::unit_coverage`] reports, and the only one: a copy without
+/// it makes the coordinator warn that findings may be missing rather than
+/// merge a short stream silently. Riding the usage pull costs no ssh
+/// connection of its own (a fan-out finishing together already adds one per
+/// unit, and ssh hosts may throttle connection bursts), and it runs BEFORE the transcript
+/// catch-up, whose `cat` of a large transcript can outlast
+/// [`PUMP_FINALIZE_TIMEOUT`].
+///
+/// A section that did not arrive whole (the pull failed or was cut off), or
+/// that is empty (no file — an older host — or a race with a rotation),
+/// leaves that mirrored copy as the tail built it, unmarked. An unsafe
+/// `run_id` pulls nothing.
+async fn pump_catch_up_ledgers(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
     run_id: &str,
     host_id: &str,
+    run_terminal: bool,
 ) {
     // `$HOME` must expand remotely, so the path is interpolated unquoted —
     // `run_id` therefore has to be shell-safe (the pump's other commands rely
@@ -922,34 +960,35 @@ async fn pump_catch_up_usage_ledger(
     if !is_safe_run_id(run_id) {
         return;
     }
-    let cmd = format!("cat {}/usage.jsonl", remote_run_dir(run_id));
-    if let Ok(out) = exec.run(&cmd).await {
-        if out.success && !out.stdout.is_empty() {
-            let _ = mirror.replace_usage_ledger(run_id, host_id, &out.stdout);
+    let out = match exec.run(&ledger_pull_command(run_id)).await {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(host_id, run_id, error = %e, "terminal ledger pull failed");
+            return;
         }
+    };
+    // Sections are whole only when their end marker arrived, whatever the
+    // exit status says about the rest of the output.
+    let sections = split_batched_cat(&out.stdout);
+    if let Some(usage) = sections.get(LEDGER_USAGE).filter(|b| !b.is_empty()) {
+        let _ = mirror.replace_usage_ledger(run_id, host_id, usage);
     }
-}
-
-/// The tail can still be behind when the run turns terminal. Replace the
-/// mirrored coverage stream with the host's file, which is complete by then.
-/// An older host has no file: the `cat` fails and whatever the tail delivered
-/// (nothing) stays, so the coordinator reports that unit's coverage as not
-/// collected. An EMPTY successful answer is treated the same way — never a
-/// reason to truncate the tailed copy.
-async fn pump_catch_up_coverage(
-    exec: &dyn RemoteExec,
-    mirror: &NodeMirror,
-    run_id: &str,
-    host_id: &str,
-) {
-    let cmd = format!("cat $HOME/.rupu/runs/{run_id}/coverage.jsonl");
-    if let Ok(out) = exec.run(&cmd).await {
-        // Non-empty only, like the transcript catch-up: a `cat` that succeeds
-        // with nothing (the file vanished or raced) must not truncate what
-        // the tail already delivered.
-        if out.success && !out.stdout.is_empty() {
-            let _ = mirror.replace_coverage(run_id, host_id, &out.stdout).await;
+    match sections.get(LEDGER_COVERAGE).filter(|b| !b.is_empty()) {
+        Some(coverage) => {
+            if let Err(e) = mirror
+                .replace_coverage(run_id, host_id, coverage, run_terminal)
+                .await
+            {
+                tracing::warn!(host_id, run_id, error = %e, "terminal coverage replace failed");
+            }
         }
+        None => tracing::warn!(
+            host_id,
+            run_id,
+            stderr = %out.stderr.trim(),
+            "terminal ledger pull delivered no coverage stream; the mirrored copy is \
+             not known complete"
+        ),
     }
 }
 
@@ -1130,13 +1169,13 @@ async fn pump_finalize_if_terminal(
     // mirrored: the usage fold seals a terminal run on what it reads, so a
     // reader must never see "terminal" next to the tailed (possibly short)
     // ledger. The replace only needs the run to exist with this worker id,
-    // which `create_run` already guaranteed.
-    pump_catch_up_usage_ledger(exec, mirror, run_id, host_id).await;
+    // which `create_run` already guaranteed. The same round trip brings the
+    // complete coverage stream, ahead of the (possibly slow) transcript work.
+    pump_catch_up_ledgers(exec, mirror, run_id, host_id, true).await;
     let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
     // Before `finish`, so the synthesized step-result row sees the complete
     // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
-    pump_catch_up_coverage(exec, mirror, run_id, host_id).await;
     pump_pull_step_transcripts(exec, mirror, lazy, run_id, host_id).await;
     let _ = mirror.finish(run_id, host_id, &status);
     PumpProbe::Finalized
@@ -1749,7 +1788,7 @@ impl SshHostConnector {
                                                 // `id`. The one rewrite is the terminal
                                                 // pull, which REPLACES the whole file
                                                 // with the remote's (see
-                                                // `pump_catch_up_usage_ledger`).
+                                                // `pump_catch_up_ledgers`).
                                                 Some(ArtifactFile::Usage)
                                             } else if path.ends_with("coverage.jsonl") {
                                                 Some(ArtifactFile::Coverage)
@@ -1906,28 +1945,38 @@ impl SshHostConnector {
                     // persist as final since the executor may still be alive.
                     // Finish as "failed" in that case — and when the cat fails
                     // outright — so the run is never stuck in Running.
-                    let run_json = exec.run(&cat_cmd).await;
+                    let record = match exec.run(&cat_cmd).await {
+                        Ok(out) if out.success && !out.stdout.trim().is_empty() => {
+                            Some(out.stdout.trim().to_string())
+                        }
+                        _ => None,
+                    };
+                    let terminal_status = record
+                        .as_deref()
+                        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+                        .and_then(|rec| {
+                            rec.get("status")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .filter(|s| is_terminal_status(s));
                     // Same authoritative ledger pull as the terminal arm: rows
                     // still buffered in the dead stream are gone, so replace the
-                    // mirrored ledger with the remote's while we can reach it.
-                    pump_catch_up_usage_ledger(exec.as_ref(), &mirror, &run_id, &host_id).await;
-                    let finish_status = match run_json {
-                        Ok(out) if out.success && !out.stdout.trim().is_empty() => {
-                            let trimmed = out.stdout.trim().to_string();
-                            let _ =
-                                mirror.append(&run_id, &host_id, ArtifactFile::RunJson, &trimmed);
-                            serde_json::from_str::<serde_json::Value>(&trimmed)
-                                .ok()
-                                .and_then(|rec| {
-                                    rec.get("status")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_string)
-                                })
-                                .filter(|s| is_terminal_status(s))
-                                .unwrap_or_else(|| "failed".to_string())
-                        }
-                        _ => "failed".to_string(),
-                    };
+                    // mirrored ledgers with the remote's while we can reach it.
+                    // The coverage copy is complete only when the host's record
+                    // is terminal; otherwise the run may still be writing it.
+                    pump_catch_up_ledgers(
+                        exec.as_ref(),
+                        &mirror,
+                        &run_id,
+                        &host_id,
+                        terminal_status.is_some(),
+                    )
+                    .await;
+                    if let Some(trimmed) = &record {
+                        let _ = mirror.append(&run_id, &host_id, ArtifactFile::RunJson, trimmed);
+                    }
+                    let finish_status = terminal_status.unwrap_or_else(|| "failed".to_string());
                     // Same terminal transcript catch-up as the interval arm above:
                     // the stream ended without a clean terminal detection, so any
                     // buffered-but-undelivered transcript lines are gone. Replace
@@ -1941,7 +1990,6 @@ impl SshHostConnector {
                         &cat_transcript_cmd,
                     )
                     .await;
-                    pump_catch_up_coverage(exec.as_ref(), &mirror, &run_id, &host_id).await;
                     // The host is still reachable here too — pull every
                     // recorded step transcript before finishing the run.
                     pump_pull_step_transcripts(exec.as_ref(), &mirror, &lazy, &run_id, &host_id)
@@ -2647,8 +2695,18 @@ impl HostConnector for SshHostConnector {
             .await
     }
 
-    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await
+    /// The mirrored stream, complete only when the pump's terminal pull
+    /// replaced it with the host's file after the run was terminal (see
+    /// [`pump_catch_up_ledgers`]). Otherwise it is what the tail delivered,
+    /// which can miss the last lines.
+    async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError> {
+        // The mark BEFORE the bytes: it is written only after the
+        // authoritative replace landed, so bytes read after seeing it are that
+        // copy. Read the other way round, a replace landing in between would
+        // pair the tailed bytes with "complete".
+        let complete = self.mirror.coverage_complete(run_id);
+        let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
+        Ok(CoverageRead { bytes, complete })
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
@@ -3468,14 +3526,17 @@ mod tests {
         /// If set, the transcript `cat` sleeps this long before answering —
         /// a slow remote, so a teardown test can catch the pump mid-`cat`.
         cat_transcript_delay: Option<std::time::Duration>,
-        /// If set, returned as stdout for the pump's terminal
-        /// `cat …/runs/<id>/usage.jsonl` (the authoritative ledger pull).
-        /// `None` → empty stdout, which the pump treats as "no ledger".
+        /// The `usage.jsonl` section of the pump's terminal ledger pull
+        /// ([`ledger_pull_command`]). `None` → an empty section, which the
+        /// pump treats as "no ledger".
         cat_usage_stdout: Option<String>,
-        /// If set, returned as stdout for a `cat …/runs/<id>/coverage.jsonl`
-        /// command (the pump's terminal coverage catch-up). `None` → the `cat`
-        /// fails ("No such file"), i.e. an older host with no coverage stream.
+        /// The `coverage.jsonl` section of the same pull. `None` → an empty
+        /// section: the file is absent (an older host with no coverage
+        /// stream) or empty.
         cat_coverage_stdout: Option<String>,
+        /// When set, the ledger pull fails in the ssh transport (no stdout,
+        /// exit 255) — a throttled or dropped connection.
+        ledger_pull_fails: bool,
         /// If set, returned as stdout for the pump's batched terminal pull
         /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
         batch_cat_stdout: Option<String>,
@@ -3508,6 +3569,7 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                ledger_pull_fails: false,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3528,6 +3590,7 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                ledger_pull_fails: false,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3550,6 +3613,7 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                ledger_pull_fails: false,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3572,6 +3636,7 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                ledger_pull_fails: false,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3593,6 +3658,7 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                ledger_pull_fails: false,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3613,21 +3679,31 @@ mod tests {
                     stderr: self.fail_stderr.clone(),
                     success: false,
                 })
-            } else if remote.starts_with("cat ") && remote.contains("/coverage.jsonl") {
-                // Before the generic `cat ` arm below: the pump's terminal
-                // coverage catch-up. A host without the file fails the `cat`.
-                match &self.cat_coverage_stdout {
-                    Some(s) => Ok(RemoteOutput {
-                        stdout: s.clone(),
-                        stderr: String::new(),
-                        success: true,
-                    }),
-                    None => Ok(RemoteOutput {
+            } else if remote.starts_with(LEDGER_PULL_PREFIX) {
+                // The pump's terminal ledger pull: both sections, framed
+                // exactly as the real loop frames them.
+                if self.ledger_pull_fails {
+                    return Ok(RemoteOutput {
                         stdout: String::new(),
-                        stderr: "No such file".into(),
+                        stderr: "kex_exchange_identification: read: Connection reset by peer"
+                            .into(),
                         success: false,
-                    }),
+                    });
                 }
+                let mut stdout = String::new();
+                for (label, body) in [
+                    (LEDGER_USAGE, &self.cat_usage_stdout),
+                    (LEDGER_COVERAGE, &self.cat_coverage_stdout),
+                ] {
+                    stdout.push_str(&format!("==> {label} <==\n"));
+                    stdout.push_str(body.as_deref().unwrap_or(""));
+                    stdout.push_str("\n==> end <==\n");
+                }
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
             } else {
                 // Return the canned stdout for the two `cat` shapes the pump
                 // issues: `cat …/transcripts/<id>.jsonl` (terminal transcript
@@ -3641,8 +3717,6 @@ mod tests {
                 } else if remote.starts_with("cat ") {
                     if remote.contains("/launch.log") {
                         self.launch_log_stdout.clone().unwrap_or_default()
-                    } else if remote.contains("/usage.jsonl") {
-                        self.cat_usage_stdout.clone().unwrap_or_default()
                     } else if remote.contains("/transcripts/") {
                         if let Some(d) = self.cat_transcript_delay {
                             tokio::time::sleep(d).await;
@@ -6132,16 +6206,127 @@ mod tests {
             .await
             .unwrap();
             conn.await_run_mirror(run_id).await;
-            let body = conn.unit_coverage(run_id).await.unwrap();
+            let read = conn.unit_coverage(run_id).await.unwrap();
             assert_eq!(
-                String::from_utf8(body).unwrap(),
+                String::from_utf8(read.bytes).unwrap(),
                 "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPUMP\"}\n{\"late\":true}\n",
                 "terminal catch-up must replace the tailed copy with the host's file"
+            );
+            assert!(
+                read.complete,
+                "the authoritative replace landed, so the read is complete"
             );
         });
         let cmds = fake.commands.lock().unwrap();
         assert!(cmds.iter().any(|c| c.starts_with("tail ")
             && c.contains(&format!("$HOME/.rupu/runs/{run_id}/coverage.jsonl"))));
+        // The stream rides the usage ledger's terminal round trip: no ssh
+        // invocation of its own, and it lands BEFORE the transcript catch-up,
+        // whose `cat` of a large transcript can outlast `await_run_mirror`.
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.starts_with("cat ") && c.contains("/coverage.jsonl")),
+            "no separate coverage cat: {cmds:?}"
+        );
+        let pull = cmds
+            .iter()
+            .position(|c| c == &ledger_pull_command(run_id))
+            .expect("the terminal ledger pull ran");
+        let transcript = cmds
+            .iter()
+            .position(|c| c.starts_with("cat ") && c.contains("/transcripts/"))
+            .expect("the transcript catch-up ran");
+        assert!(pull < transcript, "{cmds:?}");
+    }
+
+    /// The terminal pull fails in the ssh transport (throttled or dropped
+    /// connection): the mirror keeps what the tail delivered, and the read
+    /// says it is NOT known complete, so the coordinator warns instead of
+    /// silently merging a short copy.
+    ///
+    /// The "tailed copy" is seeded before the pump is spawned (as in
+    /// `coverage_catch_up_never_truncates_the_tailed_copy_with_an_empty_cat`),
+    /// so the result does not depend on the pump's unbiased `select!`.
+    #[test]
+    fn a_failed_terminal_ledger_pull_leaves_the_coverage_read_partial() {
+        let run_id = "run_01COVPULLFAIL";
+        let tailed = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPULLFAIL\"}\n";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_coverage_stdout = Some(format!("{tailed}{{\"late\":true}}\n"));
+        fake.ledger_pull_fails = true;
+        let fake = std::sync::Arc::new(fake);
+        let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .unwrap();
+        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.spawn_tail_pump(run_id.to_string());
+            conn.await_run_mirror(run_id).await;
+            let read = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(String::from_utf8(read.bytes).unwrap(), tailed);
+            assert!(!read.complete, "a pull that never arrived is not complete");
+        });
+        assert!(fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == &ledger_pull_command(run_id)));
+    }
+
+    /// The tail stream ENDS (ssh dropped) while the host's record is not yet
+    /// terminal: the fallback still refreshes the mirrored stream from the
+    /// host, but the run may still be writing it, so the copy is a snapshot —
+    /// never marked complete.
+    #[tokio::test]
+    async fn the_stream_end_fallback_never_marks_a_non_terminal_runs_coverage_complete() {
+        /// A `FakeExec` whose tail stream is finite: it ends after its lines.
+        struct EndingTailExec(std::sync::Arc<FakeExec>);
+
+        #[async_trait::async_trait]
+        impl RemoteExec for EndingTailExec {
+            async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.0.run(c).await
+            }
+            fn spawn_lines(&self, c: &str) -> Result<LineStream, RemoteExecError> {
+                self.0.commands.lock().unwrap().push(c.to_string());
+                let lines: Vec<std::io::Result<String>> =
+                    self.0.tail_lines.iter().cloned().map(Ok).collect();
+                Ok(Box::pin(futures_util::stream::iter(lines)))
+            }
+            async fn run_bytes(
+                &self,
+                c: &str,
+                stdin: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                self.0.run_bytes(c, stdin).await
+            }
+        }
+
+        let run_id = "run_01COVSNAPSHOT";
+        let run_json = format!(r#"{{"run_id":"{run_id}","status":"running"}}"#);
+        let mut fake = FakeExec::with_cat_stdout(vec![], run_json);
+        let snapshot = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVSNAPSHOT\"}\n";
+        fake.cat_coverage_stdout = Some(snapshot.to_string());
+        let exec = std::sync::Arc::new(EndingTailExec(std::sync::Arc::new(fake)));
+        let (conn, run_store, _tmp) = make_conn(exec);
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .unwrap();
+        conn.spawn_tail_pump(run_id.to_string());
+        wait_until_finished(&run_store, run_id).await;
+
+        let read = conn.unit_coverage(run_id).await.unwrap();
+        assert_eq!(String::from_utf8(read.bytes).unwrap(), snapshot);
+        assert!(!read.complete, "a non-terminal run's copy is a snapshot");
     }
 
     /// A terminal catch-up whose `cat` SUCCEEDS with nothing (the file
@@ -6188,17 +6373,20 @@ mod tests {
         rt.block_on(async {
             conn.spawn_tail_pump(run_id.to_string());
             conn.await_run_mirror(run_id).await;
-            let body = conn.unit_coverage(run_id).await.unwrap();
+            let read = conn.unit_coverage(run_id).await.unwrap();
             assert_eq!(
-                String::from_utf8(body).unwrap(),
+                String::from_utf8(read.bytes).unwrap(),
                 tailed,
                 "an empty successful cat must leave the tailed copy intact"
+            );
+            assert!(
+                !read.complete,
+                "no authoritative replace landed, so the tailed copy is not known complete"
             );
         });
         let cmds = fake.commands.lock().unwrap();
         assert!(
-            cmds.iter()
-                .any(|c| c.starts_with("cat ") && c.contains("/coverage.jsonl")),
+            cmds.iter().any(|c| c == &ledger_pull_command(run_id)),
             "the catch-up must have run for this to prove anything: {cmds:?}"
         );
     }
@@ -6935,8 +7123,7 @@ mod tests {
         );
         let cmds = fake.commands.lock().unwrap();
         assert!(
-            cmds.iter()
-                .any(|c| c == &format!("cat $HOME/.rupu/runs/{run_id}/usage.jsonl")),
+            cmds.iter().any(|c| c == &ledger_pull_command(run_id)),
             "the terminal pull must cat the remote ledger: {cmds:?}"
         );
     }
@@ -7122,7 +7309,7 @@ mod tests {
     #[async_trait::async_trait]
     impl RemoteExec for LedgerOrderExec {
         async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
-            if c.starts_with("cat ") && c.contains("/usage.jsonl") {
+            if c.starts_with(LEDGER_PULL_PREFIX) {
                 if let Some(store) = self.store.get() {
                     let status = store.load(self.run_id).unwrap().status;
                     self.seen.lock().unwrap().push(status);
@@ -8012,6 +8199,26 @@ mod tests {
         let rec = run_store.load("run_01LIVE").unwrap();
         assert_eq!(rec.active_step_id, None);
         assert_eq!(rec.active_step_transcript_path, None);
+    }
+
+    /// The ledger pull expands `$HOME` remotely (unquoted run dir, quoted
+    /// `"…/$f"`) and frames each file the way `split_batched_cat` reads.
+    #[test]
+    fn ledger_pull_command_frames_both_ledgers_under_the_remote_run_dir() {
+        let cmd = ledger_pull_command("run_01LEDGER");
+        assert_eq!(
+            cmd,
+            "for f in usage.jsonl coverage.jsonl; do printf '==> %s <==\\n' \"$f\"; \
+             cat \"$HOME/.rupu/runs/run_01LEDGER/$f\" 2>/dev/null; printf '\\n==> end <==\\n'; done"
+        );
+        let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end <==\n\
+                      ==> coverage.jsonl <==\n\n==> end <==\n";
+        let sections = split_batched_cat(framed);
+        assert_eq!(
+            sections.get(LEDGER_USAGE).map(String::as_str),
+            Some("{\"u\":1}\n")
+        );
+        assert_eq!(sections.get(LEDGER_COVERAGE).map(String::as_str), Some(""));
     }
 
     #[test]

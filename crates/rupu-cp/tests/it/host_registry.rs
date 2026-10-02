@@ -75,8 +75,14 @@ impl HostConnector for StubLocal {
     async fn get_transcript(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
         unimplemented!()
     }
-    async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        Ok(Vec::new())
+    async fn unit_coverage(
+        &self,
+        _run_id: &str,
+    ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
+        Ok(rupu_cp::host::connector::CoverageRead {
+            bytes: Vec::new(),
+            complete: true,
+        })
     }
     async fn proxy_get_json(
         &self,

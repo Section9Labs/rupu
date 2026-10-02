@@ -1147,8 +1147,14 @@ mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }
-        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+            Ok(crate::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,

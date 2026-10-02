@@ -321,8 +321,19 @@ impl HostConnector for BucketHostConnector {
         .await
     }
 
-    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await
+    /// The mirrored stream. Complete once the run is terminal: the worker
+    /// writes its finished marker only after every coverage upload landed,
+    /// and the poller re-lists after seeing the marker before it finishes the
+    /// run here.
+    async fn unit_coverage(
+        &self,
+        run_id: &str,
+    ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+        let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
+        Ok(crate::host::connector::CoverageRead {
+            bytes,
+            complete: true,
+        })
     }
 
     async fn stream_run_events(
@@ -468,11 +479,9 @@ mod tests {
         let run_id = conn.launch_agent(profile_req(None)).await.unwrap();
         let p = rupu_coverage::stream_path(&run_store.root, &run_id);
         std::fs::write(&p, b"{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"x\"}\n").unwrap();
-        assert!(conn
-            .unit_coverage(&run_id)
-            .await
-            .unwrap()
-            .starts_with(b"{\"ledger\":\"begin\""));
+        let read = conn.unit_coverage(&run_id).await.unwrap();
+        assert!(read.bytes.starts_with(b"{\"ledger\":\"begin\""));
+        assert!(read.complete, "the marker follows the uploads: complete");
     }
 
     fn profile_req(profile: Option<rupu_coverage::FindingProfile>) -> AgentLaunchRequest {

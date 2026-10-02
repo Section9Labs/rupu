@@ -784,9 +784,10 @@ async fn unit_coverage_fetches_the_remote_runs_stream() {
     let addr = serve_cp(state).await;
 
     let c = HttpHostConnector::new(format!("http://{addr}"), None);
-    let bytes = c.unit_coverage("run_H1").await.unwrap();
-    assert!(bytes.starts_with(b"{\"ledger\":\"begin\""));
-    assert!(c.unit_coverage("run_NONE").await.unwrap().is_empty());
+    let read = c.unit_coverage("run_H1").await.unwrap();
+    assert!(read.bytes.starts_with(b"{\"ledger\":\"begin\""));
+    assert!(read.complete, "the remote serves its own file: complete");
+    assert!(c.unit_coverage("run_NONE").await.unwrap().bytes.is_empty());
 }
 
 /// An older remote answers unknown /api paths with the SPA (200 HTML), so the

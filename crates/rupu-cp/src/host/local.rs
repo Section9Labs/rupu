@@ -386,8 +386,16 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_store_err(run_id, e))
     }
 
-    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await
+    /// The run's own file: once the run is terminal, every line it wrote.
+    async fn unit_coverage(
+        &self,
+        run_id: &str,
+    ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+        let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
+        Ok(crate::host::connector::CoverageRead {
+            bytes,
+            complete: true,
+        })
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
