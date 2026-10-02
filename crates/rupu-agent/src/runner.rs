@@ -91,6 +91,7 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
         | E::NotImplemented { .. }
         | E::Preflight(_)
         | E::LongContextUnavailable { .. }
+        | E::FallbackUnavailable { .. }
         | E::Other(_) => false,
         // The process is exiting: nothing started now would finish.
         E::Terminating => false,

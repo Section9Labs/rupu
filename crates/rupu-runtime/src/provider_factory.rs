@@ -34,6 +34,11 @@ pub struct ProviderConfig {
     /// both absent means on. `Some(_)` wins over the provider config — see
     /// [`resolve_anthropic_prompt_cache`].
     pub anthropic_prompt_cache: Option<bool>,
+    /// Anthropic server-side fallback opt-in (`"fallbacks": "default"` on
+    /// API-key requests for supported models). `None` defers to the default,
+    /// which is on; `Some(false)` is the explicit opt-out. Launch sites set
+    /// it from `[recovery]` and the agent's frontmatter.
+    pub anthropic_server_side_fallback: Option<bool>,
     /// Present when the provider name resolves to a config-declared
     /// OpenAI-compatible endpoint. Populated by callers that have a
     /// loaded `rupu_config::Config` (e.g. `rupu run`).
@@ -226,6 +231,7 @@ pub fn provider_config_for(
     ProviderConfig {
         anthropic_oauth_system_prefix: None,
         anthropic_prompt_cache: None,
+        anthropic_server_side_fallback: None,
         openai_compatible: openai_compatible_params(name, providers),
         tuning: Some(provider_tuning(name, providers)),
         kind: resolve_kind(name, providers),
@@ -602,6 +608,7 @@ async fn build_anthropic(
     .with_tuning(tuning)
     .with_oauth_account_uuid(account_uuid)
     .with_prompt_cache(prompt_cache)
+    .with_server_side_fallback(config.anthropic_server_side_fallback.unwrap_or(true))
     .with_oauth_refresher(refresher);
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);

@@ -6908,6 +6908,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         anthropic_prompt_cache: session.anthropic_prompt_cache,
+        anthropic_server_side_fallback: None,
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7303,6 +7304,7 @@ async fn run_compact_request(
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         anthropic_prompt_cache: session.anthropic_prompt_cache,
+        anthropic_server_side_fallback: None,
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7653,6 +7655,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
             anthropic_prompt_cache: session.anthropic_prompt_cache,
+            anthropic_server_side_fallback: None,
             // `openai_compatible` stays `None` here — a separate,
             // pre-existing limitation (the session worker doesn't support
             // custom openai-compatible endpoints), unrelated to kind

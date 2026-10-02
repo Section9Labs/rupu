@@ -328,6 +328,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             anthropic_prompt_cache: spec.anthropic_prompt_cache,
+            anthropic_server_side_fallback: None,
             openai_compatible: oai_params,
             tuning: self.provider_tuning.get(&provider_name).cloned(),
             kind: self.kinds.get(&provider_name).cloned(),
