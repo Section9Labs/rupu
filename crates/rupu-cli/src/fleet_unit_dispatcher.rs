@@ -160,11 +160,11 @@ fn host_err_to_run_err(e: HostConnectorError) -> RunError {
 /// Why a read taken before the unit was seen terminal can be short: the unit
 /// may still be writing its stream on the host.
 const SNAPSHOT_REASON: &str =
-    "read while the unit may still be running on the host, so later lines are not included";
+    "so it was read while the unit may still have been running on the host";
 
 /// Why a terminal read the transport could not confirm whole can be short.
 const UNCONFIRMED_REASON: &str =
-    "the host's final copy of the stream did not arrive; this is what was mirrored while the \
+    "the host's final copy of the stream did not arrive, so this is what was mirrored while the \
      unit ran";
 
 /// The unit's coverage stream, or why it could not be collected.
@@ -185,7 +185,7 @@ async fn collect_coverage(
         Ok(read) => match snapshot {
             Some(why) => UnitCoverage::Partial {
                 bytes: read.bytes,
-                reason: format!("{why}; {SNAPSHOT_REASON}"),
+                reason: format!("{why}, {SNAPSHOT_REASON}"),
             },
             None if read.complete => UnitCoverage::Stream(read.bytes),
             None => UnitCoverage::Partial {
@@ -1350,7 +1350,7 @@ mod tests {
         assert!(err.to_string().contains("host went away"), "{err}");
         assert!(
             matches!(&err.coverage, UnitCoverage::Partial { bytes, reason }
-                if bytes == b"partial" && reason.contains("may still be running")),
+                if bytes == b"partial" && reason.contains("may still have been running")),
             "a snapshot of a unit that may still be running is Partial even when the \
              transport calls its read complete: {:?}",
             err.coverage
@@ -1369,7 +1369,7 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             matches!(&err.coverage, UnitCoverage::Partial { bytes, reason }
-                if bytes == b"partial" && reason.contains("may still be running")),
+                if bytes == b"partial" && reason.contains("may still have been running")),
             "{:?}",
             err.coverage
         );

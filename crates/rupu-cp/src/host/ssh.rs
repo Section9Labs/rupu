@@ -939,8 +939,8 @@ fn ledger_pull_command(run_id: &str) -> String {
 /// it makes the coordinator warn that findings may be missing rather than
 /// merge a short stream silently. Riding the usage pull costs no ssh
 /// connection of its own (a fan-out finishing together already adds one per
-/// unit, and ssh hosts may throttle connection bursts), and it runs BEFORE the transcript
-/// catch-up, whose `cat` of a large transcript can outlast
+/// unit, and ssh hosts may throttle connection bursts), and it runs BEFORE
+/// the transcript catch-up, whose `cat` of a large transcript can outlast
 /// [`PUMP_FINALIZE_TIMEOUT`].
 ///
 /// A section that did not arrive whole (the pull failed or was cut off), or
@@ -967,28 +967,32 @@ async fn pump_catch_up_ledgers(
             return;
         }
     };
+    if !out.success {
+        // The loop's own commands cannot fail it, so this is the transport
+        // (a throttled or dropped connection): whatever arrived whole below
+        // still counts, the rest stays as the tail delivered it.
+        tracing::warn!(
+            host_id,
+            run_id,
+            stderr = %out.stderr.trim(),
+            "terminal ledger pull failed; mirrored ledgers it did not deliver stay as tailed"
+        );
+    }
     // Sections are whole only when their end marker arrived, whatever the
     // exit status says about the rest of the output.
     let sections = split_batched_cat(&out.stdout);
     if let Some(usage) = sections.get(LEDGER_USAGE).filter(|b| !b.is_empty()) {
         let _ = mirror.replace_usage_ledger(run_id, host_id, usage);
     }
-    match sections.get(LEDGER_COVERAGE).filter(|b| !b.is_empty()) {
-        Some(coverage) => {
-            if let Err(e) = mirror
-                .replace_coverage(run_id, host_id, coverage, run_terminal)
-                .await
-            {
-                tracing::warn!(host_id, run_id, error = %e, "terminal coverage replace failed");
-            }
+    // No coverage section (or an empty one) is ordinary for a workflow run,
+    // which writes no stream; for a unit, the read reports it not complete.
+    if let Some(coverage) = sections.get(LEDGER_COVERAGE).filter(|b| !b.is_empty()) {
+        if let Err(e) = mirror
+            .replace_coverage(run_id, host_id, coverage, run_terminal)
+            .await
+        {
+            tracing::warn!(host_id, run_id, error = %e, "terminal coverage replace failed");
         }
-        None => tracing::warn!(
-            host_id,
-            run_id,
-            stderr = %out.stderr.trim(),
-            "terminal ledger pull delivered no coverage stream; the mirrored copy is \
-             not known complete"
-        ),
     }
 }
 

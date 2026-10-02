@@ -7356,7 +7356,7 @@ async fn ingest_remote_unit_coverage(
                  workspace-sync delta, when the step syncs"
             );
             if let Some(reason) = partial {
-                message.push_str(&format!(" ({reason})"));
+                message.push_str(&format!("; {reason}"));
             }
             warn(message);
             false
@@ -7364,7 +7364,7 @@ async fn ingest_remote_unit_coverage(
         Ok(Ok(r)) => {
             if let Some(reason) = partial {
                 let mut message = format!(
-                    "coverage from host {host} may be incomplete ({reason}): findings and \
+                    "coverage from host {host} may be incomplete: {reason}. Findings and \
                      coverage the unit recorded after it was collected may be missing \
                      ({} line(s) merged",
                     r.appended
