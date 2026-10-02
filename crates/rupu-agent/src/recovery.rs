@@ -42,6 +42,18 @@ pub fn recovery_retry_note(title: &str, provider: &str, model: &str) -> String {
         .replace("{model}", model)
 }
 
+/// Whether `text` is a [`RECOVERY_RETRY_NOTE`] (any title, provider and
+/// model): its fixed text before `{title}` and after `{model}`.
+pub fn is_recovery_retry_note(text: &str) -> bool {
+    let (head, _) = RECOVERY_RETRY_NOTE
+        .split_once("{title}")
+        .expect("the note has a title slot");
+    let (_, tail) = RECOVERY_RETRY_NOTE
+        .rsplit_once("{model}")
+        .expect("the note has a model slot");
+    text.len() > head.len() + tail.len() && text.starts_with(head) && text.ends_with(tail)
+}
+
 /// What the runner tries first, on the current model, for an outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rung0 {
@@ -558,6 +570,19 @@ mod tests {
             recovery_retry_note("Reply refused", "codex", "gpt"),
             "A previous attempt at this task stopped (Reply refused). You are continuing on codex/gpt; check the current state, then continue the task."
         );
+    }
+
+    #[test]
+    fn a_filled_recovery_retry_note_is_recognized() {
+        assert!(is_recovery_retry_note(&recovery_retry_note(
+            "refused · cyber",
+            "anthropic",
+            "mock-2"
+        )));
+        assert!(!is_recovery_retry_note("do the thing"));
+        assert!(!is_recovery_retry_note(
+            "A previous attempt at this task stopped (x). Carry on."
+        ));
     }
 
     #[test]

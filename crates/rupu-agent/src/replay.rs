@@ -112,6 +112,16 @@ pub fn reconstruct_messages(events: &[Event]) -> Result<Vec<Message>, ReplayErro
     })
 }
 
+/// Whether `path` replays to exactly `messages` — the condition for naming
+/// it as the seed source of a run seeded with `messages`
+/// (`AgentRunOpts::seed_source`), checked the way replay verifies a seed:
+/// by the seed hash.
+pub fn replays_to(path: &std::path::Path, messages: &[Message]) -> bool {
+    reconstruct_transcript(path).is_ok_and(|replayed| {
+        crate::runner::seed_sha256(&replayed) == crate::runner::seed_sha256(messages)
+    })
+}
+
 /// Read `path` and reconstruct its conversation, resolving any
 /// `Seed.source_transcript` reference chain ITERATIVELY — a bounded loop,
 /// never recursion — and verifying every resolved link against its recorded
@@ -347,6 +357,28 @@ mod tests {
     use super::*;
     use crate::runner::{run_agent, tests::opts_for, MockProvider, ScriptedTurn};
     use rupu_providers::types::{ContentBlock, Message, StopReason};
+
+    /// A failed run's transcript replays to exactly the conversation
+    /// `run_agent_full` hands back, so a session can seed from it; anything
+    /// else (another conversation, a missing file) does not.
+    #[tokio::test]
+    async fn a_failed_runs_transcript_replays_to_its_exit_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path().join("failed.jsonl");
+        let provider = MockProvider::new(vec![ScriptedTurn::ProviderError("boom".into())]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), t.clone());
+        opts.initial_messages = vec![Message::user("first"), Message::assistant("ack")];
+        opts.user_message = "second".into();
+        let exit = crate::runner::run_agent_full(opts).await;
+        assert!(exit.result.is_err());
+        assert_eq!(exit.messages.len(), 3, "{:?}", exit.messages);
+        assert!(replays_to(&t, &exit.messages));
+        assert!(!replays_to(&t, &exit.messages[..2]));
+        assert!(!replays_to(
+            &tmp.path().join("missing.jsonl"),
+            &exit.messages
+        ));
+    }
 
     fn reasoning(text: &str) -> ContentBlock {
         ContentBlock::Reasoning {
