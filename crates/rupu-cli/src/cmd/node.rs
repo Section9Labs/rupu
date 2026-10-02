@@ -140,22 +140,88 @@ struct FileOffsets {
     /// tunnel connection whose CP advertised [`CAP_USAGE_LEDGER`].
     usage: u64,
     /// `coverage.jsonl` — the run's coverage stream. Only ever advanced on a
-    /// tunnel connection whose CP advertised `mirror.coverage` (the bucket
-    /// worker always drains it).
+    /// tunnel connection whose CP advertised `mirror.coverage`.
     coverage: u64,
 }
 
-/// Per-run state for the bucket pull agent.  Extends [`FileOffsets`] with
-/// per-kind result sequence counters and a last-applied-control-seq tracker.
+/// One bucket result stream's cursor (events, step_results, ...): how far into
+/// the run file has been uploaded, and the next object number.
+///
+/// Both advance only when `put_result` returned `Ok` ([`upload_new_lines`]). A
+/// failed put also pins the exact end of the chunk it carried (`pending_end`),
+/// so the retry re-sends that chunk byte for byte under the same key. The CP
+/// poller skips keys it already consumed, and a put that errored AFTER
+/// landing (a timeout) may already have been consumed — a retry that grew
+/// would have its extra lines skipped for good.
+#[derive(Debug, Default)]
+struct BucketStream {
+    /// Bytes of the run file already uploaded.
+    offset: u64,
+    /// The next result object number for this stream.
+    seq: u64,
+    /// End offset of a chunk whose put failed and must be retried as-is.
+    pending_end: Option<u64>,
+}
+
+/// The cursors for every file the bucket worker ships for a run.
+#[derive(Debug, Default)]
+struct BucketStreams {
+    events: BucketStream,
+    step_results: BucketStream,
+    unit_checkpoints: BucketStream,
+    usage: BucketStream,
+    coverage: BucketStream,
+}
+
+impl BucketStreams {
+    /// Upload every stream's new lines. All five are attempted even when one
+    /// fails; returns `true` only when nothing is left unsent.
+    async fn upload_all(&mut self, bucket: &dyn Bucket, rid: &str, run_dir: &Path) -> bool {
+        let mut landed = true;
+        landed &= upload_new_lines(
+            bucket,
+            rid,
+            "events",
+            &run_dir.join("events.jsonl"),
+            &mut self.events,
+        )
+        .await;
+        landed &= upload_new_lines(
+            bucket,
+            rid,
+            "step_results",
+            &run_dir.join("step_results.jsonl"),
+            &mut self.step_results,
+        )
+        .await;
+        landed &= upload_new_lines(
+            bucket,
+            rid,
+            "unit_checkpoints",
+            &run_dir.join("unit_checkpoints.jsonl"),
+            &mut self.unit_checkpoints,
+        )
+        .await;
+        // No capability gate on usage / coverage: an older CP's poller skips
+        // the unknown `usage.*` / `coverage.*` keys.
+        landed &= upload_usage_ledger(bucket, rid, run_dir, &mut self.usage).await;
+        landed &= upload_new_lines(
+            bucket,
+            rid,
+            "coverage",
+            &coverage_path(run_dir),
+            &mut self.coverage,
+        )
+        .await;
+        landed
+    }
+}
+
+/// Per-run state for the bucket pull agent: the child and the upload cursors,
+/// plus a last-applied-control-seq tracker.
 struct BucketRunState {
     child: tokio::process::Child,
-    offsets: FileOffsets,
-    /// Monotonic counter: how many result objects we've written for each kind.
-    events_seq: u64,
-    step_results_seq: u64,
-    unit_checkpoints_seq: u64,
-    usage_seq: u64,
-    coverage_seq: u64,
+    streams: BucketStreams,
     /// Highest control seq we've already applied (`None` = none applied yet).
     last_ctrl_seq: Option<u64>,
 }
@@ -818,24 +884,15 @@ pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
 // Artifact tail helper  (unit-testable)
 // ---------------------------------------------------------------------------
 
-/// The complete lines appended to `path` since byte `offset`, WITHOUT
-/// consuming them: returns `(lines, next_offset)` where `next_offset` is just
-/// past the last newline read. The caller commits `next_offset` once it has
-/// done something durable with the lines — the bucket worker only after the
-/// upload landed, so a failed put re-reads the same lines next tick.
-///
-/// Partial lines (no trailing `\n` yet) are left for a later call. If the file
-/// does not exist or cannot be read, returns no lines and `offset` unchanged.
-pub(crate) fn peek_new_lines(path: &Path, offset: u64) -> (Vec<String>, u64) {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return (vec![], offset),
-    };
-    let file_len = bytes.len() as u64;
-    if file_len <= offset {
+/// The complete lines of `bytes[offset..limit]` (the whole tail when `limit`
+/// is `None`): `(lines, next_offset)`, `next_offset` being just past the last
+/// newline in that range. A trailing partial line is left out.
+fn complete_lines(bytes: &[u8], offset: u64, limit: Option<u64>) -> (Vec<String>, u64) {
+    let end = limit.map_or(bytes.len() as u64, |l| l.min(bytes.len() as u64));
+    if end <= offset {
         return (vec![], offset);
     }
-    let new = &bytes[offset as usize..];
+    let new = &bytes[offset as usize..end as usize];
     // Only consume up to and including the last `\n` so partial lines
     // are held back until the writer flushes them.
     let last_nl = match new.iter().rposition(|&b| b == b'\n') {
@@ -849,6 +906,31 @@ pub(crate) fn peek_new_lines(path: &Path, offset: u64) -> (Vec<String>, u64) {
         .map(|l| l.to_string())
         .collect();
     (lines, offset + complete.len() as u64)
+}
+
+/// The complete lines appended to `path` since byte `offset`, WITHOUT
+/// consuming them: returns `(lines, next_offset)` where `next_offset` is just
+/// past the last newline read. The caller commits `next_offset` once it has
+/// done something durable with the lines — the bucket worker only after the
+/// upload landed, so a failed put re-reads the same lines next tick.
+///
+/// Partial lines (no trailing `\n` yet) are left for a later call. If the file
+/// does not exist or cannot be read, returns no lines and `offset` unchanged.
+pub(crate) fn peek_new_lines(path: &Path, offset: u64) -> (Vec<String>, u64) {
+    match std::fs::read(path) {
+        Ok(bytes) => complete_lines(&bytes, offset, None),
+        Err(_) => (vec![], offset),
+    }
+}
+
+/// Like [`peek_new_lines`] but bounded: only the complete lines in
+/// `[offset, end)`. A retried upload re-reads exactly the chunk it first
+/// tried, however much the file has grown since.
+pub(crate) fn peek_lines_until(path: &Path, offset: u64, end: u64) -> (Vec<String>, u64) {
+    match std::fs::read(path) {
+        Ok(bytes) => complete_lines(&bytes, offset, Some(end)),
+        Err(_) => (vec![], offset),
+    }
 }
 
 /// Drain any new complete lines appended to `path` since `*offset` bytes.
@@ -868,6 +950,11 @@ pub fn drain_new_lines(path: &Path, offset: &mut u64) -> Vec<String> {
     lines
 }
 
+/// A run's usage ledger: `runs/<id>/usage.jsonl`.
+fn usage_path(run_dir: &Path) -> std::path::PathBuf {
+    run_dir.join("usage.jsonl")
+}
+
 /// Drain the run's usage ledger (`<run_dir>/usage.jsonl`) when `enabled`.
 ///
 /// `enabled` is the tunnel capability gate (the CP advertised
@@ -877,7 +964,7 @@ fn drain_usage_ledger(run_dir: &Path, offsets: &mut FileOffsets, enabled: bool) 
     if !enabled {
         return Vec::new();
     }
-    drain_new_lines(&run_dir.join("usage.jsonl"), &mut offsets.usage)
+    drain_new_lines(&usage_path(run_dir), &mut offsets.usage)
 }
 
 /// True when `frame` is a `Welcome` that lists `capability`.
@@ -1031,26 +1118,40 @@ async fn put_lines(
 /// Upload the new complete lines of the run file at `path` as the next
 /// `<kind>.<seq>.jsonl` result object — the one primitive every bucket result
 /// stream (events, step_results, unit_checkpoints, usage, coverage) goes
-/// through.
+/// through. Returns `true` when nothing is left unsent.
 ///
-/// The lines are PEEKED, not drained: `*offset` and `*seq` are committed only
-/// once `put_result` returned `Ok`. A failed put leaves both untouched, so the
-/// next tick re-reads the same lines (plus whatever the run wrote since) and
-/// uploads them under the same object key — a transient bucket error delays
-/// the lines instead of dropping them for good.
+/// The lines are PEEKED, not drained: `stream.offset` and `stream.seq` are
+/// committed only once `put_result` returned `Ok`. A failed put leaves both
+/// untouched and pins the chunk's end in `stream.pending_end`; the next call
+/// re-uploads exactly that chunk under the same key (byte-exact, so a put that
+/// errored after landing and was already consumed by the CP poller is
+/// harmlessly overwritten with identical bytes), and only then the lines
+/// written since go under the next key. A transient bucket error delays lines
+/// instead of dropping them.
 async fn upload_new_lines(
     bucket: &dyn Bucket,
     rid: &str,
     kind: &str,
     path: &Path,
-    offset: &mut u64,
-    seq: &mut u64,
-) {
-    let (lines, next) = peek_new_lines(path, *offset);
+    stream: &mut BucketStream,
+) -> bool {
+    if let Some(end) = stream.pending_end {
+        let (lines, next) = peek_lines_until(path, stream.offset, end);
+        if !put_lines(bucket, rid, kind, lines, &mut stream.seq).await {
+            return false;
+        }
+        stream.offset = next;
+        stream.pending_end = None;
+    }
+    let (lines, next) = peek_new_lines(path, stream.offset);
     // `put_lines` is `true` for no lines. (A chunk that was not UTF-8 reads as
     // no lines but still advances `next` — skipped, as `drain_new_lines` does.)
-    if put_lines(bucket, rid, kind, lines, seq).await {
-        *offset = next;
+    if put_lines(bucket, rid, kind, lines, &mut stream.seq).await {
+        stream.offset = next;
+        true
+    } else {
+        stream.pending_end = Some(next);
+        false
     }
 }
 
@@ -1066,47 +1167,71 @@ pub(crate) fn next_control_seq(existing: &[(u64, Vec<u8>)]) -> u64 {
 }
 
 /// Upload the run's new usage-ledger rows as the next `usage.<seq>` result
-/// object, bumping `usage_seq` (and consuming the rows) once the put lands.
-/// Nothing new → no object. No capability gate: an older CP's poller skips the
-/// unknown `usage.*` key.
+/// object, committing the cursor once the put lands. Nothing new → no object.
+/// No capability gate: an older CP's poller skips the unknown `usage.*` key.
 async fn upload_usage_ledger(
     bucket: &dyn Bucket,
     rid: &str,
     run_dir: &Path,
-    offsets: &mut FileOffsets,
-    usage_seq: &mut u64,
-) {
-    upload_new_lines(
-        bucket,
-        rid,
-        "usage",
-        &run_dir.join("usage.jsonl"),
-        &mut offsets.usage,
-        usage_seq,
-    )
-    .await;
+    usage: &mut BucketStream,
+) -> bool {
+    upload_new_lines(bucket, rid, "usage", &usage_path(run_dir), usage).await
 }
 
 /// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
-/// drain the usage ledger ONE more time, then write the `finished` marker.
+/// upload whatever every stream still holds, the terminal `run.json`, and only
+/// then write the `finished` marker. Returns `true` when the marker landed.
 ///
-/// The routine drain earlier in the same pass awaits a network `put_result`
-/// before `run.json` is read, so a row the runner appended in that window
-/// would otherwise never be uploaded — the run leaves `active` this pass — and
-/// the CP's total would stay short for good. Uploading it BEFORE `finished`
-/// also means a CP that sees the marker already has every row.
+/// A row the runner appended after the routine drain would otherwise never be
+/// uploaded — the run leaves `active` once this returns `true` — and the CP
+/// would finish the run short. The marker is the CP's "nothing more is coming"
+/// signal, so it is written ONLY after every upload landed: if any stream, the
+/// `run.json` or the marker itself fails, this returns `false` without a
+/// marker and the caller keeps the run active, retrying next tick (the
+/// failed chunks retry byte-exact under their own keys). Every stream is
+/// still attempted when one fails.
 async fn finish_bucket_run(
     bucket: &dyn Bucket,
     rid: &str,
     run_dir: &Path,
-    offsets: &mut FileOffsets,
-    usage_seq: &mut u64,
+    streams: &mut BucketStreams,
+    run_json: &[u8],
     status: &str,
-) {
-    upload_usage_ledger(bucket, rid, run_dir, offsets, usage_seq).await;
-    if let Err(e) = bucket.put_finished(rid, status).await {
-        warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
+) -> bool {
+    let mut landed = streams.upload_all(bucket, rid, run_dir).await;
+    // The routine pass uploaded run.json earlier in the tick; it can have
+    // changed since (that is how it came to read terminal), and a failure
+    // there is only a warning. The CP finishes the run from this body, so it
+    // must land before the marker.
+    if let Err(e) = bucket.put_result(rid, "run.json", run_json).await {
+        warn!(run_id = %rid, error = %e, "node pull: put terminal run.json failed");
+        landed = false;
     }
+    if !landed {
+        return false;
+    }
+    match bucket.put_finished(rid, status).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
+            false
+        }
+    }
+}
+
+/// Write the `failed` marker for every claimed job whose spawn failed and
+/// whose marker has not landed yet; the ones that still fail stay in `pending`
+/// for the next tick. A job nobody marked would stay claimed and unfinished
+/// forever.
+async fn flush_failed_markers(bucket: &dyn Bucket, pending: &mut Vec<String>) {
+    let mut still = Vec::new();
+    for rid in pending.drain(..) {
+        if let Err(e) = bucket.put_finished(&rid, "failed").await {
+            warn!(run_id = %rid, error = %e, "node pull: put_finished(failed) after a spawn failure did not land; will retry");
+            still.push(rid);
+        }
+    }
+    *pending = still;
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1274,8 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
         .context("advertise worker capabilities (nodes/<worker>.json)")?;
 
     let mut active: HashMap<String, BucketRunState> = HashMap::new();
+    // Claimed jobs whose spawn failed but whose `failed` marker has not landed.
+    let mut failed_unmarked: Vec<String> = Vec::new();
     let mut once_iters: u32 = 0;
 
     loop {
@@ -1173,18 +1300,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                         run_id.clone(),
                         BucketRunState {
                             child,
-                            offsets: FileOffsets {
-                                events: 0,
-                                step_results: 0,
-                                unit_checkpoints: 0,
-                                usage: 0,
-                                coverage: 0,
-                            },
-                            events_seq: 0,
-                            step_results_seq: 0,
-                            unit_checkpoints_seq: 0,
-                            usage_seq: 0,
-                            coverage_seq: 0,
+                            streams: BucketStreams::default(),
                             last_ctrl_seq: None,
                         },
                     );
@@ -1192,10 +1308,13 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     warn!(run_id = %run_id, error = %e, "node pull: spawn failed");
-                    let _ = bucket.put_finished(&run_id, "failed").await;
+                    failed_unmarked.push(run_id);
                 }
             }
         }
+        // First attempt right away; a marker that did not land is retried on
+        // every later tick until it does.
+        flush_failed_markers(&bucket, &mut failed_unmarked).await;
 
         // ── Step 2: drain active runs ─────────────────────────────────────────
         let run_ids: Vec<String> = active.keys().cloned().collect();
@@ -1206,55 +1325,9 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             let run_dir = runs_root.join(rid);
 
             // Each stream: peek the new lines, upload, and only then commit
-            // the offset + object number — a failed put retries the same
-            // lines under the same key next tick instead of losing them.
-            upload_new_lines(
-                &bucket,
-                rid,
-                "events",
-                &run_dir.join("events.jsonl"),
-                &mut state.offsets.events,
-                &mut state.events_seq,
-            )
-            .await;
-            upload_new_lines(
-                &bucket,
-                rid,
-                "step_results",
-                &run_dir.join("step_results.jsonl"),
-                &mut state.offsets.step_results,
-                &mut state.step_results_seq,
-            )
-            .await;
-            upload_new_lines(
-                &bucket,
-                rid,
-                "unit_checkpoints",
-                &run_dir.join("unit_checkpoints.jsonl"),
-                &mut state.offsets.unit_checkpoints,
-                &mut state.unit_checkpoints_seq,
-            )
-            .await;
-            // usage.jsonl (the run's usage ledger). No capability gate:
-            // an older CP's poller skips the unknown `usage.*` key.
-            upload_usage_ledger(
-                &bucket,
-                rid,
-                &run_dir,
-                &mut state.offsets,
-                &mut state.usage_seq,
-            )
-            .await;
-            // coverage.jsonl — an older CP's poller skips unknown keys.
-            upload_new_lines(
-                &bucket,
-                rid,
-                "coverage",
-                &coverage_path(&run_dir),
-                &mut state.offsets.coverage,
-                &mut state.coverage_seq,
-            )
-            .await;
+            // the cursor — a failed put retries the same chunk under the same
+            // key next tick instead of losing it.
+            state.streams.upload_all(&bucket, rid, &run_dir).await;
 
             // Upload run.json (always — reflects current in-progress status).
             let run_json_path = run_dir.join("run.json");
@@ -1350,31 +1423,30 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                 }
             }
 
-            // Check for terminal status → final ledger drain + put_finished +
-            // remove from active.
-            if let Some((status, _body)) = read_terminal_status(&run_json_path) {
-                info!(run_id = %rid, status = %status, "node pull: run finished");
-                // Final coverage drain: the run may have written its last lines
-                // after the drain above and before run.json turned terminal.
-                upload_new_lines(
-                    &bucket,
-                    rid,
-                    "coverage",
-                    &coverage_path(&run_dir),
-                    &mut state.offsets.coverage,
-                    &mut state.coverage_seq,
-                )
-                .await;
-                finish_bucket_run(
+            // Check for terminal status → the terminal pass (final drain of
+            // every stream, run.json, then the `finished` marker). The run
+            // leaves `active` only once the marker landed; otherwise it stays
+            // and the next tick re-reads run.json and retries.
+            if let Some((status, body)) = read_terminal_status(&run_json_path) {
+                if finish_bucket_run(
                     &bucket,
                     rid,
                     &run_dir,
-                    &mut state.offsets,
-                    &mut state.usage_seq,
+                    &mut state.streams,
+                    body.as_bytes(),
                     &status,
                 )
-                .await;
-                finished.push(rid.clone());
+                .await
+                {
+                    info!(run_id = %rid, status = %status, "node pull: run finished");
+                    finished.push(rid.clone());
+                } else {
+                    warn!(
+                        run_id = %rid,
+                        status = %status,
+                        "node pull: run is terminal but its final uploads or finished marker did not land; keeping it active to retry"
+                    );
+                }
             }
         }
 
@@ -1384,7 +1456,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
 
         // ── Loop control ──────────────────────────────────────────────────────
         if args.once {
-            if active.is_empty() {
+            if active.is_empty() && failed_unmarked.is_empty() {
                 info!("node pull: --once: all runs terminal, exiting");
                 break;
             }
@@ -1392,7 +1464,10 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             if once_iters >= ONCE_MAX_ITERS {
                 warn!(
                     active = active.len(),
-                    "node pull: --once: max-iterations reached, exiting with active runs"
+                    unmarked_failures = failed_unmarked.len(),
+                    "node pull: --once: max-iterations reached, exiting with active runs \
+                     (a terminal run whose final uploads or finished marker never landed is \
+                     left active, with no marker) or unmarked spawn failures"
                 );
                 break;
             }
@@ -1623,12 +1698,56 @@ mod tests {
 
     use rupu_cp::host::bucket::BucketError;
 
-    /// A [`Bucket`] that records the order of the writes the terminal pass
-    /// makes (`put_result` key / `put_finished` status + the body), so a test
-    /// can assert the late ledger row lands BEFORE the finished marker.
+    /// A [`Bucket`] that records the writes the terminal pass makes, in order,
+    /// and can be told to fail some of them:
+    /// - `ops`: the writes that LANDED — `put_result` as `(key, body)`,
+    ///   `put_finished` as `("finished", status)`.
+    /// - `attempts`: every `put_result` tried, failed ones included. A failed
+    ///   put is recorded as an attempt because a real one can have landed
+    ///   before it errored (a timeout).
+    /// - `fail_prefix`: a `put_result` whose key starts with it fails, and
+    ///   `"finished"` fails the marker.
     #[derive(Default)]
     struct RecordingBucket {
         ops: std::sync::Mutex<Vec<(String, String)>>,
+        attempts: std::sync::Mutex<Vec<(String, String)>>,
+        fail_prefix: std::sync::Mutex<Option<String>>,
+    }
+
+    impl RecordingBucket {
+        fn failing(prefix: &str) -> Self {
+            let b = Self::default();
+            b.set_failing(Some(prefix));
+            b
+        }
+
+        fn set_failing(&self, prefix: Option<&str>) {
+            *self.fail_prefix.lock().unwrap() = prefix.map(str::to_string);
+        }
+
+        fn fails(&self, key: &str) -> bool {
+            self.fail_prefix
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|p| key.starts_with(p))
+        }
+
+        fn landed(&self) -> Vec<(String, String)> {
+            self.ops.lock().unwrap().clone()
+        }
+
+        fn landed_keys(&self) -> Vec<String> {
+            self.landed().into_iter().map(|(k, _)| k).collect()
+        }
+
+        /// The body that landed under `key`.
+        fn landed_body(&self, key: &str) -> Option<String> {
+            self.landed()
+                .into_iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, b)| b)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1657,16 +1776,21 @@ mod tests {
             key: &str,
             body: &[u8],
         ) -> Result<(), BucketError> {
-            self.ops
-                .lock()
-                .unwrap()
-                .push((key.to_string(), String::from_utf8_lossy(body).into_owned()));
+            let entry = (key.to_string(), String::from_utf8_lossy(body).into_owned());
+            self.attempts.lock().unwrap().push(entry.clone());
+            if self.fails(key) {
+                return Err(BucketError::Io(format!("injected failure for {key}")));
+            }
+            self.ops.lock().unwrap().push(entry);
             Ok(())
         }
         async fn list_results(&self, _: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
             unreachable!()
         }
         async fn put_finished(&self, _run_id: &str, status: &str) -> Result<(), BucketError> {
+            if self.fails("finished") {
+                return Err(BucketError::Io("injected failure for finished".into()));
+            }
             self.ops
                 .lock()
                 .unwrap()
@@ -1687,74 +1811,300 @@ mod tests {
         }
     }
 
+    const RUN_JSON: &[u8] = b"{\"status\":\"completed\"}";
+
     /// The bucket loop's terminal pass (same race as the tunnel's, above): a
     /// row appended after the routine drain is uploaded as the next `usage.*`
-    /// object, exactly once and BEFORE the `finished` marker; with no late row
-    /// the pass writes no empty usage object.
+    /// object, exactly once and BEFORE the terminal `run.json` and the
+    /// `finished` marker; with no late row the pass writes no empty usage
+    /// object.
     #[tokio::test]
     async fn bucket_terminal_pass_uploads_the_late_row_before_finished() {
         let dir = tempdir().unwrap();
-        let ledger = dir.path().join("usage.jsonl");
+        let ledger = usage_path(dir.path());
         std::fs::write(&ledger, "{\"id\":\"USGA\"}\n{\"id\":\"USGB\"}\n").unwrap();
         let bucket = RecordingBucket::default();
-        let mut off = offsets();
-        let mut seq = 0u64;
+        let mut streams = BucketStreams::default();
 
         // Routine drain earlier in the pass.
-        upload_usage_ledger(&bucket, "run_BKT", dir.path(), &mut off, &mut seq).await;
+        assert!(upload_usage_ledger(&bucket, "run_BKT", dir.path(), &mut streams.usage).await);
         // The runner appends a final row, then writes the terminal run.json.
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&ledger)
-            .unwrap();
-        writeln!(f, r#"{{"id":"USGC"}}"#).unwrap();
-        drop(f);
-        finish_bucket_run(
-            &bucket,
-            "run_BKT",
-            dir.path(),
-            &mut off,
-            &mut seq,
-            "completed",
-        )
-        .await;
+        append(&ledger, "{\"id\":\"USGC\"}\n");
+        assert!(
+            finish_bucket_run(
+                &bucket,
+                "run_BKT",
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
 
-        let ops = bucket.ops.lock().unwrap().clone();
+        let ops = bucket.landed();
         let keys: Vec<&str> = ops.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
-            ["usage.0000.jsonl", "usage.0001.jsonl", "finished"],
+            [
+                "usage.0000.jsonl",
+                "usage.0001.jsonl",
+                "run.json",
+                "finished"
+            ],
             "{ops:?}"
         );
         assert!(ops[0].1.contains("USGA") && ops[0].1.contains("USGB"));
         assert!(!ops[0].1.contains("USGC"));
         assert_eq!(ops[1].1, "{\"id\":\"USGC\"}\n", "only the late row");
-        assert_eq!(ops[2].1, "completed");
-        assert_eq!(seq, 2);
+        assert_eq!(ops[2].1, String::from_utf8_lossy(RUN_JSON));
+        assert_eq!(ops[3].1, "completed");
+        assert_eq!(streams.usage.seq, 2);
 
-        // Nothing late: the terminal pass is just the marker.
+        // Nothing late: the terminal pass is just run.json and the marker.
         let quiet = RecordingBucket::default();
-        let mut off = offsets();
-        let mut seq = 0u64;
-        upload_usage_ledger(&quiet, "run_QUIET", dir.path(), &mut off, &mut seq).await;
-        finish_bucket_run(
-            &quiet,
-            "run_QUIET",
+        let mut streams = BucketStreams::default();
+        upload_usage_ledger(&quiet, "run_QUIET", dir.path(), &mut streams.usage).await;
+        assert!(
+            finish_bucket_run(
+                &quiet,
+                "run_QUIET",
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "failed",
+            )
+            .await
+        );
+        assert_eq!(
+            quiet.landed_keys(),
+            ["usage.0000.jsonl", "run.json", "finished"]
+        );
+        assert_eq!(streams.usage.seq, 1);
+    }
+
+    /// A stream whose last upload fails must NOT get the `finished` marker (the
+    /// CP stops reading a finished run, so the lines would be lost for good):
+    /// the pass reports `false` — the loop then keeps the run active — every
+    /// other stream still lands, and once the bucket recovers the next pass
+    /// retries the failed chunk byte for byte under its own key, then writes
+    /// the marker AFTER every object.
+    #[tokio::test]
+    async fn bucket_terminal_pass_withholds_the_marker_until_every_stream_landed() {
+        let dir = tempdir().unwrap();
+        append(&dir.path().join("events.jsonl"), "e1\ne2\n");
+        append(&coverage_path(dir.path()), "c1\n");
+        let bucket = RecordingBucket::failing("events");
+        let mut streams = BucketStreams::default();
+
+        let done = finish_bucket_run(
+            &bucket,
+            "run_T",
             dir.path(),
-            &mut off,
-            &mut seq,
-            "failed",
+            &mut streams,
+            RUN_JSON,
+            "completed",
         )
         .await;
-        let keys: Vec<String> = quiet
-            .ops
-            .lock()
-            .unwrap()
+        assert!(!done, "an unlanded stream means the run is not finished");
+        let keys = bucket.landed_keys();
+        assert!(!keys.contains(&"finished".to_string()), "{keys:?}");
+        assert!(
+            keys.contains(&"coverage.0000.jsonl".to_string()),
+            "the other streams are still attempted: {keys:?}"
+        );
+
+        // The run wrote one more event while the bucket was down; it recovers.
+        append(&dir.path().join("events.jsonl"), "e3\n");
+        bucket.set_failing(None);
+        let done = finish_bucket_run(
+            &bucket,
+            "run_T",
+            dir.path(),
+            &mut streams,
+            RUN_JSON,
+            "completed",
+        )
+        .await;
+        assert!(done);
+
+        // The retried chunk is exactly what the failed put carried — not grown
+        // by `e3` — and the later line is its own object.
+        assert_eq!(
+            bucket.landed_body("events.0000.jsonl").as_deref(),
+            Some("e1\ne2\n")
+        );
+        assert_eq!(
+            bucket.landed_body("events.0001.jsonl").as_deref(),
+            Some("e3\n")
+        );
+        // Coverage landed once, on the first pass, and is not re-sent.
+        assert_eq!(
+            bucket
+                .landed_keys()
+                .iter()
+                .filter(|k| k.starts_with("coverage"))
+                .count(),
+            1
+        );
+        // Everything landed before the marker; the marker is last.
+        let keys = bucket.landed_keys();
+        assert_eq!(
+            keys.last().map(String::as_str),
+            Some("finished"),
+            "{keys:?}"
+        );
+        assert_eq!(keys.iter().filter(|k| *k == "finished").count(), 1);
+    }
+
+    /// The marker is the last write and its own failure also holds the run:
+    /// the streams are already uploaded, so the retry is just the marker —
+    /// nothing is uploaded twice.
+    #[tokio::test]
+    async fn bucket_terminal_pass_retries_a_failed_marker_without_reuploading() {
+        let dir = tempdir().unwrap();
+        append(&coverage_path(dir.path()), "c1\n");
+        let bucket = RecordingBucket::failing("finished");
+        let mut streams = BucketStreams::default();
+
+        assert!(
+            !finish_bucket_run(
+                &bucket,
+                "run_M",
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        assert_eq!(bucket.landed_keys(), ["coverage.0000.jsonl", "run.json"]);
+
+        bucket.set_failing(None);
+        assert!(
+            finish_bucket_run(
+                &bucket,
+                "run_M",
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        assert_eq!(
+            bucket.landed_keys(),
+            // run.json is idempotent (same key, overwritten); the coverage
+            // object is not re-uploaded.
+            ["coverage.0000.jsonl", "run.json", "run.json", "finished"]
+        );
+    }
+
+    /// A failed terminal `run.json` upload holds the marker too: the CP
+    /// finishes the run from that body.
+    #[tokio::test]
+    async fn bucket_terminal_pass_withholds_the_marker_when_run_json_did_not_land() {
+        let dir = tempdir().unwrap();
+        let bucket = RecordingBucket::failing("run.json");
+        let mut streams = BucketStreams::default();
+        assert!(
+            !finish_bucket_run(
+                &bucket,
+                "run_J",
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        assert!(bucket.landed().is_empty());
+    }
+
+    /// The same pass against a REAL failing store: it reports `false` and
+    /// leaves no marker; after the store heals the next pass lands the lines
+    /// under their original keys and then the marker.
+    #[tokio::test]
+    async fn bucket_terminal_pass_over_a_failing_store_finishes_after_it_heals() {
+        let run_dir = tempdir().unwrap();
+        append(&run_dir.path().join("events.jsonl"), "e1\ne2\n");
+        append(&coverage_path(run_dir.path()), "begin\nfinding\n");
+        let fb = FailingBucket::new();
+        let mut streams = BucketStreams::default();
+
+        assert!(
+            !finish_bucket_run(
+                &fb.bucket,
+                "run_1",
+                run_dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        fb.heal();
+        assert_eq!(
+            fb.bucket.get_finished("run_1").await.unwrap(),
+            None,
+            "no marker while the uploads had not landed"
+        );
+
+        assert!(
+            finish_bucket_run(
+                &fb.bucket,
+                "run_1",
+                run_dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        let results = fb.bucket.list_results("run_1").await.unwrap();
+        let got: Vec<(&str, &str)> = results
             .iter()
-            .map(|(k, _)| k.clone())
+            .map(|(k, v)| (k.as_str(), std::str::from_utf8(v).unwrap()))
             .collect();
-        assert_eq!(keys, ["usage.0000.jsonl", "finished"]);
-        assert_eq!(seq, 1);
+        assert_eq!(
+            got,
+            vec![
+                ("coverage.0000.jsonl", "begin\nfinding\n"),
+                ("events.0000.jsonl", "e1\ne2\n"),
+                ("run.json", "{\"status\":\"completed\"}"),
+            ]
+        );
+        assert_eq!(
+            fb.bucket.get_finished("run_1").await.unwrap().as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// A claimed job whose spawn failed is marked `failed`; a marker that did
+    /// not land is retried on later ticks instead of being dropped.
+    #[tokio::test]
+    async fn a_failed_spawn_marker_that_did_not_land_is_retried() {
+        let fb = FailingBucket::new();
+        let mut pending = vec!["run_a".to_string(), "run_b".to_string()];
+
+        flush_failed_markers(&fb.bucket, &mut pending).await;
+        assert_eq!(
+            pending,
+            ["run_a", "run_b"],
+            "still unmarked: kept for the next tick"
+        );
+
+        fb.heal();
+        flush_failed_markers(&fb.bucket, &mut pending).await;
+        assert!(pending.is_empty());
+        for rid in ["run_a", "run_b"] {
+            assert_eq!(
+                fb.bucket.get_finished(rid).await.unwrap().as_deref(),
+                Some("failed")
+            );
+        }
+        // Nothing pending: nothing written, nothing to do.
+        flush_failed_markers(&fb.bucket, &mut pending).await;
     }
 
     /// A run with no usage ledger yet (or never) drains to nothing.
@@ -2350,72 +2700,27 @@ mod tests {
         }
     }
 
-    /// The scenario behind both bucket tests below: the put fails while the run
-    /// keeps writing, then the bucket recovers.
+    /// The put fails while the run keeps writing, then the bucket recovers: the
+    /// rows the failed put carried are retried under the same key, byte for
+    /// byte, and the row written meanwhile is the NEXT object.
     #[tokio::test]
     async fn upload_usage_ledger_failed_put_keeps_the_rows_for_the_next_tick() {
         let run_dir = tempdir().unwrap();
-        std::fs::write(
-            run_dir.path().join("usage.jsonl"),
-            "{\"id\":\"U1\"}\n{\"id\":\"U2\"}\n",
-        )
-        .unwrap();
+        let ledger = usage_path(run_dir.path());
+        std::fs::write(&ledger, "{\"id\":\"U1\"}\n{\"id\":\"U2\"}\n").unwrap();
         let fb = FailingBucket::new();
-        let mut off = offsets();
-        let mut seq = 0u64;
+        let mut usage = BucketStream::default();
 
-        upload_usage_ledger(&fb.bucket, "run_1", run_dir.path(), &mut off, &mut seq).await;
-        assert_eq!(seq, 0, "a failed put must not burn the object number");
-        assert_eq!(off.usage, 0, "a failed put must not consume the rows");
+        assert!(!upload_usage_ledger(&fb.bucket, "run_1", run_dir.path(), &mut usage).await);
+        assert_eq!(usage.seq, 0, "a failed put must not burn the object number");
+        assert_eq!(usage.offset, 0, "a failed put must not consume the rows");
 
         // The run appends a row while the bucket is down; then the bucket heals.
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(run_dir.path().join("usage.jsonl"))
-            .unwrap();
-        writeln!(f, r#"{{"id":"U3"}}"#).unwrap();
-        drop(f);
+        append(&ledger, "{\"id\":\"U3\"}\n");
         fb.heal();
 
-        upload_usage_ledger(&fb.bucket, "run_1", run_dir.path(), &mut off, &mut seq).await;
-        assert_eq!(seq, 1);
-        let results = fb.bucket.list_results("run_1").await.unwrap();
-        assert_eq!(results.len(), 1, "{results:?}");
-        assert_eq!(
-            results[0].0, "usage.0000.jsonl",
-            "same key as the failed try"
-        );
-        assert_eq!(
-            std::str::from_utf8(&results[0].1).unwrap(),
-            "{\"id\":\"U1\"}\n{\"id\":\"U2\"}\n{\"id\":\"U3\"}\n",
-            "the retry carries the rows the failed put lost, plus the new one"
-        );
-    }
-
-    /// The coverage stream (and every other kind) goes through the same
-    /// peek / put / commit helper: a failed put leaves the offset AND the seq
-    /// unchanged, and the retry uploads the same lines under the same key.
-    #[tokio::test]
-    async fn upload_new_lines_failed_put_leaves_offset_and_seq_and_the_retry_reuses_the_key() {
-        let run_dir = tempdir().unwrap();
-        let stream = run_dir.path().join(rupu_coverage::STREAM_FILE);
-        std::fs::write(&stream, "begin\nfinding\n").unwrap();
-        let fb = FailingBucket::new();
-        let mut off = 0u64;
-        let mut seq = 0u64;
-
-        upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut off, &mut seq).await;
-        assert_eq!((off, seq), (0, 0), "a failed put commits nothing");
-
-        // Still failing on the next tick, with more lines on disk: still nothing.
-        append(&stream, "end\n");
-        upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut off, &mut seq).await;
-        assert_eq!((off, seq), (0, 0));
-
-        fb.heal();
-        upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut off, &mut seq).await;
-        assert_eq!(seq, 1);
-        assert_eq!(off, std::fs::metadata(&stream).unwrap().len());
+        assert!(upload_usage_ledger(&fb.bucket, "run_1", run_dir.path(), &mut usage).await);
+        assert_eq!(usage.seq, 2);
         let results = fb.bucket.list_results("run_1").await.unwrap();
         let got: Vec<(&str, &str)> = results
             .iter()
@@ -2423,23 +2728,133 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![("coverage.0000.jsonl", "begin\nfinding\nend\n")],
-            "nothing lost, nothing duplicated, first object number"
+            vec![
+                ("usage.0000.jsonl", "{\"id\":\"U1\"}\n{\"id\":\"U2\"}\n"),
+                ("usage.0001.jsonl", "{\"id\":\"U3\"}\n"),
+            ],
+            "same key as the failed try, same bytes; the new row is its own object"
+        );
+    }
+
+    /// The coverage stream (and every other kind) goes through the same
+    /// peek / put / commit helper: a failed put leaves the offset AND the seq
+    /// unchanged and pins the chunk; the retry uploads exactly that chunk under
+    /// the same key, and lines written since follow under the next key.
+    #[tokio::test]
+    async fn upload_new_lines_failed_put_leaves_offset_and_seq_and_the_retry_reuses_the_key() {
+        let run_dir = tempdir().unwrap();
+        let stream = coverage_path(run_dir.path());
+        std::fs::write(&stream, "begin\nfinding\n").unwrap();
+        let first_chunk_end = std::fs::metadata(&stream).unwrap().len();
+        let fb = FailingBucket::new();
+        let mut cur = BucketStream::default();
+
+        assert!(!upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!(
+            (cur.offset, cur.seq),
+            (0, 0),
+            "a failed put commits nothing"
+        );
+        assert_eq!(cur.pending_end, Some(first_chunk_end));
+
+        // Still failing on the next tick, with more lines on disk: still nothing,
+        // and the pinned chunk does not grow.
+        append(&stream, "end\n");
+        assert!(!upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!((cur.offset, cur.seq), (0, 0));
+        assert_eq!(cur.pending_end, Some(first_chunk_end));
+
+        fb.heal();
+        assert!(upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!(cur.seq, 2);
+        assert_eq!(cur.offset, std::fs::metadata(&stream).unwrap().len());
+        assert_eq!(cur.pending_end, None);
+        let results = fb.bucket.list_results("run_1").await.unwrap();
+        let got: Vec<(&str, &str)> = results
+            .iter()
+            .map(|(k, v)| (k.as_str(), std::str::from_utf8(v).unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("coverage.0000.jsonl", "begin\nfinding\n"),
+                ("coverage.0001.jsonl", "end\n")
+            ],
+            "nothing lost, nothing duplicated; the retry is the original chunk"
         );
 
         // Healthy bucket: the next lines are the next numbered object.
         append(&stream, "late\n");
-        upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut off, &mut seq).await;
-        assert_eq!(seq, 2);
+        assert!(upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!(cur.seq, 3);
         let results = fb.bucket.list_results("run_1").await.unwrap();
-        assert_eq!(results[1].0, "coverage.0001.jsonl");
-        assert_eq!(std::str::from_utf8(&results[1].1).unwrap(), "late\n");
+        assert_eq!(results[2].0, "coverage.0002.jsonl");
+        assert_eq!(std::str::from_utf8(&results[2].1).unwrap(), "late\n");
 
         // Nothing new: no object, nothing moves.
-        let before = (off, seq);
-        upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut off, &mut seq).await;
-        assert_eq!((off, seq), before);
-        assert_eq!(fb.bucket.list_results("run_1").await.unwrap().len(), 2);
+        let (off, seq) = (cur.offset, cur.seq);
+        assert!(upload_new_lines(&fb.bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!((cur.offset, cur.seq), (off, seq));
+        assert_eq!(fb.bucket.list_results("run_1").await.unwrap().len(), 3);
+    }
+
+    /// A put that errors AFTER landing (a timeout) can already have been
+    /// consumed by the CP poller, which skips keys it has seen. The retry must
+    /// therefore carry the same bytes under the same key — a retry that had
+    /// grown would have its extra lines skipped for good — and the lines
+    /// written since go under the next key.
+    #[tokio::test]
+    async fn a_retried_chunk_is_byte_identical_even_when_the_run_wrote_more() {
+        let run_dir = tempdir().unwrap();
+        let stream = coverage_path(run_dir.path());
+        std::fs::write(&stream, "a\nb\n").unwrap();
+        let bucket = RecordingBucket::failing("coverage");
+        let mut cur = BucketStream::default();
+
+        assert!(!upload_new_lines(&bucket, "run_1", "coverage", &stream, &mut cur).await);
+        append(&stream, "c\n");
+        assert!(!upload_new_lines(&bucket, "run_1", "coverage", &stream, &mut cur).await);
+        append(&stream, "d\n");
+        bucket.set_failing(None);
+        assert!(upload_new_lines(&bucket, "run_1", "coverage", &stream, &mut cur).await);
+
+        let attempts = bucket.attempts.lock().unwrap().clone();
+        let a = |k: &str, b: &str| (k.to_string(), b.to_string());
+        assert_eq!(
+            attempts,
+            vec![
+                a("coverage.0000.jsonl", "a\nb\n"), // failed (may have landed)
+                a("coverage.0000.jsonl", "a\nb\n"), // failed again: identical
+                a("coverage.0000.jsonl", "a\nb\n"), // landed: identical
+                a("coverage.0001.jsonl", "c\nd\n"), // everything since
+            ]
+        );
+        assert_eq!(cur.seq, 2);
+        assert_eq!(cur.pending_end, None);
+    }
+
+    /// The bounded peek reads exactly `[offset, end)` however far the file grew.
+    #[test]
+    fn peek_lines_until_reads_only_the_pinned_chunk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.jsonl");
+        std::fs::write(&path, "a\nb\nc\npartial").unwrap();
+        assert_eq!(
+            peek_lines_until(&path, 0, 4),
+            (vec!["a".to_string(), "b".to_string()], 4)
+        );
+        assert_eq!(
+            peek_lines_until(&path, 2, 6),
+            (vec!["b".to_string(), "c".to_string()], 6)
+        );
+        // An end past the file is clamped to the complete lines there.
+        assert_eq!(peek_lines_until(&path, 0, 99).1, 6);
+        // Nothing complete in the range, or a missing file: unchanged offset.
+        assert_eq!(peek_lines_until(&path, 6, 99), (vec![], 6));
+        assert_eq!(
+            peek_lines_until(&dir.path().join("nope"), 3, 9),
+            (vec![], 3)
+        );
     }
 
     /// `put_lines` alone: a failed upload leaves `seq` where it was and reports
