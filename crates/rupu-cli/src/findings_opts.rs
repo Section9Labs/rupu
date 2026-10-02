@@ -1,7 +1,31 @@
 //! Build the findings write options every CLI entry point hands to tools.
 
-use rupu_coverage::FindingWriteOptions;
+use rupu_coverage::{ActiveSet, FindingWriteOptions};
 use std::path::Path;
+use std::sync::Arc;
+
+/// Resolve the selected engagement-profile ids into an active set, overlaying
+/// discovered profiles (`<global>/profiles`, `<workspace>/.rupu/profiles`) on
+/// the built-ins. An empty selection is the native code path (`None`). A bad
+/// id or an unloadable profile fails loudly — never a silent default.
+pub fn resolve_engagement(
+    global: &Path,
+    workspace: &Path,
+    ids: &[String],
+) -> anyhow::Result<Option<Arc<ActiveSet>>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let registry = rupu_coverage::registry_with_overlay(
+        &global.join("profiles"),
+        &workspace.join(".rupu").join("profiles"),
+    )
+    .map_err(|e| anyhow::anyhow!("engagement profiles: {e}"))?;
+    let set = registry
+        .active_set(ids)
+        .map_err(|e| anyhow::anyhow!("engagement profiles: {e}"))?;
+    Ok(Some(Arc::new(set)))
+}
 
 /// Artifact store under the global rupu dir plus the `[findings]` limits.
 /// Profile is `full`; callers set the resolved profile.

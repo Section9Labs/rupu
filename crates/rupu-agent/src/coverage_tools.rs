@@ -6,10 +6,10 @@
 
 use async_trait::async_trait;
 use rupu_coverage::{
-    coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
-    coverage_status, report_finding, Attribution, CoverageConcernsDetailInput,
-    CoverageConcernsSearchInput, CoverageMarkInput, CoveragePaths, CoverageRemainingInput,
-    CoverageStatusInput, FlatCatalog, ReportFindingInput, Surface,
+    asset_mark, coverage_concerns_detail, coverage_concerns_search, coverage_mark,
+    coverage_remaining, coverage_status, report_finding, AssetMarkInput, Attribution,
+    CoverageConcernsDetailInput, CoverageConcernsSearchInput, CoverageMarkInput, CoveragePaths,
+    CoverageRemainingInput, CoverageStatusInput, FlatCatalog, ReportFindingInput, Surface,
 };
 use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::Value;
@@ -373,6 +373,20 @@ fn summary_schema() -> Value {
                         "items": { "type": "string" }
                     }
                 }
+            },
+            "asset": {
+                "type": "object",
+                "required": ["kind"],
+                "description": "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run.",
+                "properties": {
+                    "kind": { "type": "string", "description": "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\"." },
+                    "coordinates": {
+                        "type": "array",
+                        "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
+                        "items": { "type": "object" }
+                    },
+                    "label": { "type": "string", "description": "Optional human label; defaults to the kind." }
+                }
             }
         }
     })
@@ -497,10 +511,70 @@ relevant concern and you need its full description, applicable_globs, or referen
 }
 
 // ---------------------------------------------------------------------------
+// asset_mark (only registered under an active engagement profile)
+// ---------------------------------------------------------------------------
+
+pub struct AssetMarkTool {
+    paths: CoveragePaths,
+    engagement: Arc<rupu_coverage::ActiveSet>,
+}
+
+#[async_trait]
+impl Tool for AssetMarkTool {
+    fn name(&self) -> &'static str {
+        "asset_mark"
+    }
+
+    fn description(&self) -> &'static str {
+        "Record how deeply an engagement asset has been examined, as a rung of \
+         its profile's coverage depth ladder (monotonic — a shallower rung after \
+         a deeper one keeps the deeper one). The effective rung is returned."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "depth"],
+            "properties": {
+                "kind": { "type": "string", "description": "Profile-namespaced asset kind, e.g. \"network:service\"." },
+                "coordinates": {
+                    "type": "array",
+                    "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}.",
+                    "items": { "type": "object" }
+                },
+                "depth": { "type": "string", "description": "The depth-ladder rung reached, e.g. \"tested\"." },
+                "label": { "type": "string" }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: AssetMarkInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let paths = self.paths.clone();
+        let engagement = self.engagement.clone();
+        let res = tokio::task::spawn_blocking(move || asset_mark(&paths, parsed, &engagement))
+            .await
+            .map_err(|join| ToolError::Execution(format!("asset_mark did not complete: {join}")))?;
+        match res {
+            Ok(out) => Ok(ok_output(
+                format!("asset {} is at depth `{}`", out.id, out.effective_depth),
+                started,
+            )),
+            Err(e) => Ok(err_output(e.to_string(), started)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all 6 coverage tools into the provided registry.
+/// Register the coverage tools into the provided registry. `asset_mark` is
+/// registered only when the run has an active engagement profile (its findings
+/// options carry one); otherwise the tool would have nothing to validate
+/// against, so it is not offered.
 pub fn register(
     registry: &mut crate::tool_registry::ToolRegistry,
     catalog: FlatCatalog,
@@ -508,6 +582,15 @@ pub fn register(
     findings: rupu_coverage::FindingWriteOptions,
 ) {
     let catalog = Arc::new(catalog);
+    if let Some(engagement) = findings.engagement.clone() {
+        registry.insert(
+            "asset_mark",
+            Arc::new(AssetMarkTool {
+                paths: paths.clone(),
+                engagement,
+            }),
+        );
+    }
     registry.insert(
         "coverage_mark",
         Arc::new(CoverageMarkTool {

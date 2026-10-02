@@ -67,6 +67,16 @@ pub struct Args {
     /// passes its step's resolved profile this way.
     #[arg(long, value_name = "PROFILE", value_parser = parse_findings_profile)]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Engagement profile(s) for this run — the asset domain(s) findings are
+    /// validated against (e.g. `network`, `binary`, or a composite like
+    /// `pentest`). Repeatable or comma-separated. Empty = the `code` path.
+    #[arg(
+        long = "engagement-profile",
+        visible_alias = "engagement-profiles",
+        value_name = "ID",
+        value_delimiter = ','
+    )]
+    pub engagement_profiles: Vec<String>,
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -813,7 +823,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // through — bare `rupu run` uses the `LineStreamPrinter`, which
         // renders dispatch children post-hoc from the parent transcript's
         // tool_call/tool_result entries rather than tailing `events.jsonl`.
-        let findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
+        let mut findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
+        // Engagement selection: resolve the chosen profile(s) into the active
+        // set and carry it on the write options, so report_finding routes/gates
+        // and asset_mark is offered. Empty selection = the native code path.
+        findings_base.engagement = crate::findings_opts::resolve_engagement(
+            &global,
+            &workspace_path,
+            &args.engagement_profiles,
+        )?;
         let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
         let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
             global.clone(),
