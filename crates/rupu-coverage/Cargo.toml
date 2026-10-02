@@ -21,7 +21,6 @@ required-features = ["gen"]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
-toml.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "fs", "io-util"] }
 tracing.workspace = true
 thiserror.workspace = true

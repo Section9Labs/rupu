@@ -109,14 +109,6 @@ fn invalid_cases_rejected_by_both() {
             "unknown nested field",
             mutated(|v| v["rating"]["severity"] = json!("High")),
         ),
-        (
-            "empty classification system",
-            mutated(|v| v["classifications"] = json!([{"system": "", "id": "CVE-2026-0001"}])),
-        ),
-        (
-            "empty classification id",
-            mutated(|v| v["classifications"] = json!([{"system": "CVE", "id": ""}])),
-        ),
     ];
     for (name, v) in cases {
         assert!(!rust_accepts(&v), "rust accepted invalid case: {name}");

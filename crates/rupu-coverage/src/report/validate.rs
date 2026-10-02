@@ -157,10 +157,6 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
             c.err(format!("report.cwe[{i}]"), "must look like `CWE-306`");
         }
     }
-    for (i, cl) in r.classifications.iter().enumerate() {
-        c.text(&format!("report.classifications[{i}].system"), &cl.system);
-        c.text(&format!("report.classifications[{i}].id"), &cl.id);
-    }
     c.text("report.description", &r.description);
     c.text("report.impact", &r.impact);
     c.text("report.location.input", &r.location.input);
