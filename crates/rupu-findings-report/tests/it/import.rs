@@ -1,8 +1,6 @@
 //! Best-effort import of Markdown finding reports back into `FindingReport`.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use rupu_coverage::report::{
     validate_report, HopRole, Likelihood, OrSentinel, Relation, RiskLevel, ValidateCtx,
     NOT_PROVIDED_PREFIX,
@@ -15,8 +13,14 @@ use rupu_findings_report::number::number_map;
 use rupu_findings_report::{render_finding, Format};
 use std::collections::HashSet;
 
-const PLAIN: &str = include_str!("fixtures/import/notebin_plain.md");
-const MARKDOWN: &str = include_str!("fixtures/import/notebin_markdown.md");
+const PLAIN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/import/notebin_plain.md"
+));
+const MARKDOWN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/import/notebin_markdown.md"
+));
 const ID1: &str = "fnd_01J00000000000000000000001";
 const ID2: &str = "fnd_01J00000000000000000000002";
 
@@ -1482,4 +1486,114 @@ fn only_an_id_the_label_starts_with_names_the_finding() {
         "{}",
         r.references
     );
+}
+
+// ---- engagement-profile additions --------------------------------------------
+
+#[test]
+fn exported_classifications_read_back_and_typed_blocks_keep_their_text() {
+    use rupu_coverage::report::{Classification, EvidenceBlock};
+    let mut original = full_report();
+    original.classifications = vec![
+        Classification {
+            system: "CAPEC".into(),
+            id: "CAPEC-122".into(),
+            vector: None,
+        },
+        Classification {
+            system: "ATT&CK Enterprise".into(),
+            id: "T1190".into(),
+            // Not printed by the exporter, so not read back.
+            vector: Some("AV:N".into()),
+        },
+    ];
+    original.blocks = vec![
+        EvidenceBlock::ScanOutput {
+            tool: "notescan".into(),
+            output: "GET /api/notes/2 -> 200 (owner: user-a)".into(),
+        },
+        EvidenceBlock::Text {
+            text: "The share page reads the same store.".into(),
+        },
+    ];
+    let md = exported(original.clone());
+    assert!(
+        md.contains("**Classifications:** CAPEC CAPEC-122, ATT&CK Enterprise T1190"),
+        "the exporter's spelling changed:\n{md}"
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.classifications,
+        vec![
+            Classification {
+                system: "CAPEC".into(),
+                id: "CAPEC-122".into(),
+                vector: None,
+            },
+            Classification {
+                system: "ATT&CK Enterprise".into(),
+                id: "T1190".into(),
+                vector: None,
+            },
+        ]
+    );
+    assert!(
+        !other_text(&r).contains("Classifications"),
+        "{}",
+        r.references
+    );
+    // Typed blocks come back as evidence claims: nothing dropped.
+    assert!(r.blocks.is_empty());
+    assert_eq!(r.evidence.len(), original.evidence.len() + 2);
+    let scan = &r.evidence[original.evidence.len()];
+    assert_eq!(scan.claim, "**Scan output** (notescan)");
+    assert_eq!(
+        scan.excerpt.as_deref(),
+        Some("GET /api/notes/2 -> 200 (owner: user-a)")
+    );
+    assert_eq!(
+        r.evidence.last().unwrap().claim,
+        "The share page reads the same store."
+    );
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_classifications_line_that_does_not_read_is_kept_as_other_text() {
+    // Prose, an id with no system, and one item of either in a list that
+    // otherwise reads: none of it is taken, all of it is kept.
+    for value in [
+        "see the threat model",
+        "CAPEC-122, T1190",
+        "CAPEC CAPEC-122, see the threat model",
+    ] {
+        let md = PLAIN.replace(
+            "Attack Vector:",
+            &format!("Classifications: {value}\nAttack Vector:"),
+        );
+        assert!(md.contains(value));
+        let (r, _) = report_of(&md);
+        assert!(
+            r.classifications.is_empty(),
+            "{value}: {:?}",
+            r.classifications
+        );
+        assert!(
+            other_text(&r).contains(&format!("Classifications:\n\n{value}")),
+            "{value}: {}",
+            r.references
+        );
+        assert_valid(&r, &[]);
+    }
+    let md = PLAIN.replace(
+        "Attack Vector:",
+        "Classifications: OWASP A01:2021, CAPEC CAPEC-122\nAttack Vector:",
+    );
+    let (r, _) = report_of(&md);
+    let read: Vec<(&str, &str)> = r
+        .classifications
+        .iter()
+        .map(|c| (c.system.as_str(), c.id.as_str()))
+        .collect();
+    assert_eq!(read, [("OWASP", "A01:2021"), ("CAPEC", "CAPEC-122")]);
 }

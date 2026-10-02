@@ -26,6 +26,13 @@
 //! hop labels) stay collapsed. Claim hashes it shortens are dropped: the
 //! prefix cannot be checked against anything.
 //!
+//! The engagement-profile additions read back as far as the exporter lets
+//! them: its `Classifications:` line becomes `classifications` (without a
+//! vector, which it does not print), and its typed evidence blocks are read
+//! like any other Evidence text, so their text and code become evidence
+//! claims rather than `blocks` (a block the exporter prints as a bare code
+//! fence becomes the excerpt of the claim before it, if that claim has none).
+//!
 //! The report's own finding id is read only from a labelled id line
 //! ([`ID_LABELS`]: `Finding ID: fnd_…`, `Native Finding: fnd_…`, …), in the
 //! header or any section but Cross-References, outside code. An id merely
@@ -35,9 +42,9 @@
 
 use crate::markdown::starts_autolink;
 use rupu_coverage::report::{
-    ArtifactRef, ChainHop, CiDetection, CrossRef, EvidenceClaim, FindingReport, HopRole,
-    Likelihood, OrSentinel, Ownership, Patch, Rating, RegressionTest, Relation, ReportLocation,
-    RiskLevel, Ticket, NOT_PROVIDED_PREFIX,
+    ArtifactRef, ChainHop, CiDetection, Classification, CrossRef, EvidenceClaim, FindingReport,
+    HopRole, Likelihood, OrSentinel, Ownership, Patch, Rating, RegressionTest, Relation,
+    ReportLocation, RiskLevel, Ticket, NOT_PROVIDED_PREFIX,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -190,6 +197,7 @@ const FIELDS: &[&str] = &[
     "impact",
     "category",
     "cwe",
+    "classifications",
     "attack vector",
     "likelihood",
     "risk rating",
@@ -287,6 +295,7 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
         .take(&["attack vector"])
         .ok_or(ImportError::MissingField("Attack Vector"))?;
     let cwe_field = header.take(&["cwe"]);
+    let (classifications, classification_text) = classifications(header.take(&["classifications"]));
 
     let required = |s: Sec| section(&doc, s).ok_or(ImportError::MissingSection(s.name()));
     let description = required(Sec::Description)?.text();
@@ -330,6 +339,7 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
         ("Risk Rating", risk_rating_note),
         ("Risk Factor", risk_factor_note),
         ("CWE", cwe_field.filter(|v| cwe_leftover(v))),
+        ("Classifications", classification_text),
     ];
     for (at, text) in notes {
         if let Some(text) = text {
@@ -375,6 +385,8 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
             references,
             artifacts,
             verification: None,
+            blocks: Vec::new(),
+            classifications,
         },
         own_ids,
     })
@@ -1256,6 +1268,37 @@ fn cwe_ids(text: &str) -> Vec<String> {
         rest = tail;
     }
     out
+}
+
+/// The exporter's `Classifications:` field (`CVE CVE-2024-1234, ATT&CK
+/// T1190`): one `<system> <id>` per comma-separated item, split at the
+/// item's last space (an id has none; a system may), where the id has a
+/// digit in it (`CAPEC-122`, `A01:2021`), as a ticket identifier does. It
+/// prints no vector, so none is read. When any item is not a system and an
+/// id, none of the field is read and all of it is kept as other text.
+fn classifications(v: Option<String>) -> (Vec<Classification>, Option<String>) {
+    let Some(v) = v else {
+        return (Vec::new(), None);
+    };
+    let read: Option<Vec<Classification>> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let (system, id) = item.rsplit_once(char::is_whitespace)?;
+            let system = system.trim();
+            let reads = !system.is_empty() && id.chars().any(|c| c.is_ascii_digit());
+            reads.then(|| Classification {
+                system: system.to_string(),
+                id: id.to_string(),
+                vector: None,
+            })
+        })
+        .collect();
+    match read {
+        Some(c) if !c.is_empty() => (c, None),
+        _ => (Vec::new(), Some(v)),
+    }
 }
 
 /// Whether a `CWE:` field says more than its ids (`CWE-639 (IDOR)`).
