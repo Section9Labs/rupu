@@ -68,16 +68,22 @@ pub fn asset_mark(
     let id = Asset::derive_id(&input.kind, &locator);
 
     // Monotonic clamp: if this asset already sits at a deeper rung, keep it.
-    let existing_idx = crate::asset::read_assets(&paths.assets)?
+    let current = crate::asset::read_assets(&paths.assets)?
         .into_iter()
-        .find(|a| a.id == id)
-        .and_then(|a| a.depth)
-        .and_then(|d| ladder.iter().position(|r| r == &d));
+        .find(|a| a.id == id);
+    let existing_idx = current
+        .as_ref()
+        .and_then(|a| a.depth.as_ref())
+        .and_then(|d| ladder.iter().position(|r| r == d));
     let effective_idx = existing_idx.map_or(new_idx, |e| e.max(new_idx));
     let effective_depth = ladder[effective_idx].clone();
 
     let label = input.label.clone().unwrap_or_else(|| input.kind.clone());
     let mut asset = Asset::new(input.kind.clone(), locator, label, None);
+    // Only the depth moves; the asset's parent and attributes ride along.
+    if let Some(current) = current {
+        asset.carry_state_from(current);
+    }
     asset.depth = Some(effective_depth.clone());
     crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
         .map_err(crate::asset::AssetStoreError::Io)?;
@@ -171,6 +177,39 @@ mod tests {
             }
             other => panic!("expected one assets line, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn marking_keeps_the_assets_parent_and_attributes() {
+        let (_t, p) = paths();
+        let mut existing = Asset::new(
+            "code:file",
+            Locator(vec![Coordinate::Path("a.rs".into())]),
+            "a.rs",
+            Some("code:dir:0123456789abcdef".into()),
+        );
+        existing
+            .attributes
+            .insert("lang".into(), serde_json::json!("rust"));
+        crate::asset::upsert_asset(&p.assets, &existing).unwrap();
+
+        asset_mark(
+            &p,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![Coordinate::Path("a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &active(),
+        )
+        .unwrap();
+
+        let stored = crate::asset::read_assets(&p.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].parent, existing.parent);
+        assert_eq!(stored[0].attributes, existing.attributes);
+        assert_eq!(stored[0].depth.as_deref(), Some("reviewed"));
     }
 
     #[test]

@@ -78,6 +78,19 @@ impl Asset {
             attributes: BTreeMap::new(),
         }
     }
+
+    /// Take over the graph state `current` (this asset's present fold) holds
+    /// and a line built from just a kind and locator does not: its parent,
+    /// depth and attributes. The store folds last-line-wins, so a line that
+    /// omits them erases them; a writer that only means to restate the asset
+    /// (a finding's stamp) or advance one field (a depth mark) carries the
+    /// rest forward with this. The label stays the writer's own.
+    pub(crate) fn carry_state_from(&mut self, current: Asset) {
+        debug_assert_eq!(self.id, current.id, "state carries between one asset's lines");
+        self.parent = current.parent;
+        self.depth = current.depth;
+        self.attributes = current.attributes;
+    }
 }
 
 /// `"network:service"` → `"network"`; a bare kind with no namespace maps to

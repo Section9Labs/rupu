@@ -245,7 +245,16 @@ pub fn report_finding(
             .label
             .clone()
             .unwrap_or_else(|| asset_ref.kind.clone());
-        let asset = crate::asset::Asset::new(asset_ref.kind.clone(), locator, label, None);
+        let mut asset = crate::asset::Asset::new(asset_ref.kind.clone(), locator, label, None);
+        // The store folds last-line-wins, so this line replaces whatever the
+        // asset holds: carry its depth (an `asset_mark`), parent and
+        // attributes forward instead of erasing them.
+        if let Some(current) = crate::asset::read_assets(&paths.assets)?
+            .into_iter()
+            .find(|a| a.id == asset.id)
+        {
+            asset.carry_state_from(current);
+        }
         crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
             .map_err(crate::asset::AssetStoreError::Io)?;
     }
@@ -701,6 +710,105 @@ mod tests {
             }
             other => panic!("expected an assets line then a findings line, got {other:?}"),
         }
+    }
+
+    fn code_engagement_opts(store: &std::path::Path) -> crate::report::FindingWriteOptions {
+        let mut opts = full_opts(store);
+        opts.engagement = Some(std::sync::Arc::new(
+            crate::profile::builtin_registry()
+                .unwrap()
+                .active_set(&["code".into()])
+                .unwrap(),
+        ));
+        opts
+    }
+
+    fn code_file_input(path: &str) -> ReportFindingInput {
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "code:file".into(),
+            coordinates: vec![crate::asset::Coordinate::Path(path.into())],
+            label: Some(path.into()),
+        });
+        inp
+    }
+
+    #[test]
+    fn stamping_a_marked_asset_keeps_its_depth() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        use crate::tools::asset_mark::{asset_mark, AssetMarkInput};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let stream = tmp.path().join("runs/run_1/coverage.jsonl");
+        let paths = CoveragePaths::new(tmp.path(), "t").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "sec".into(),
+        }));
+        let opts = code_engagement_opts(&store);
+        let engagement = opts.engagement.clone().unwrap();
+
+        let marked = asset_mark(
+            &paths,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![crate::asset::Coordinate::Path("src/a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &engagement,
+        )
+        .unwrap();
+        assert_eq!(marked.effective_depth, "reviewed");
+
+        report_finding(&paths, attribution(), code_file_input("src/a.rs"), &opts).unwrap();
+
+        let stored = crate::asset::read_assets(&paths.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].depth.as_deref(),
+            Some("reviewed"),
+            "a finding about a marked asset must not erase its depth"
+        );
+        // The unit's stream carries the full current state, so a coordinator
+        // folding it ends where the unit did.
+        let stamped: Vec<crate::asset::Asset> = std::fs::read_to_string(&stream)
+            .unwrap()
+            .lines()
+            .filter_map(|l| match serde_json::from_str(l).unwrap() {
+                StreamLine::Assets { record, .. } => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamped.len(), 2, "the mark and the stamp");
+        assert_eq!(stamped[1].depth.as_deref(), Some("reviewed"));
+    }
+
+    #[test]
+    fn stamping_an_existing_asset_keeps_its_parent_and_attributes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let opts = code_engagement_opts(&store);
+        let locator =
+            crate::asset::Locator(vec![crate::asset::Coordinate::Path("src/a.rs".into())]);
+        let mut existing = crate::asset::Asset::new(
+            "code:file",
+            locator,
+            "src/a.rs",
+            Some("code:dir:0123456789abcdef".into()),
+        );
+        existing.depth = Some("reviewed".into());
+        existing
+            .attributes
+            .insert("lang".into(), serde_json::json!("rust"));
+        crate::asset::upsert_asset(&paths.assets, &existing).unwrap();
+
+        report_finding(&paths, attribution(), code_file_input("src/a.rs"), &opts).unwrap();
+
+        assert_eq!(
+            crate::asset::read_assets(&paths.assets).unwrap(),
+            vec![existing]
+        );
     }
 
     #[test]
