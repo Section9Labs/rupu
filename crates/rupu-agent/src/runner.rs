@@ -164,6 +164,21 @@ pub(crate) fn seed_sha256(messages: &[Message]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// Append a user turn without breaking role alternation. When the
+/// conversation already ends in a user message (a seed that ends on the
+/// prompt or on tool results), `text` joins that message as an extra block
+/// instead of becoming a second consecutive user message, which some
+/// providers reject. `replay::reconstruct_messages` applies the same rule,
+/// so replaying a transcript keeps reproducing what the runner sent.
+pub(crate) fn push_user_turn(messages: &mut Vec<Message>, text: &str) {
+    match messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.push(ContentBlock::Text {
+            text: text.to_string(),
+        }),
+        _ => messages.push(Message::user(text)),
+    }
+}
+
 /// Drop the oldest assistant↔user exchange from the conversation so the
 /// next request fits the model's context window. Preserves Anthropic's
 /// invariants: the message list still starts with the original (user)
@@ -1463,7 +1478,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
     // with a 400. So we only append when there is an actual message to add.
     // Every existing caller passes a non-empty `user_message` and is unaffected.
     if !opts.user_message.is_empty() {
-        messages.push(Message::user(&opts.user_message));
+        push_user_turn(&mut messages, &opts.user_message);
         writer.write(&Event::UserMessage {
             content: opts.user_message.clone(),
         })?;

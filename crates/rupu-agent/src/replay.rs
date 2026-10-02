@@ -236,7 +236,7 @@ fn reconstruct_with(
                 };
                 messages = seed;
             }
-            Event::UserMessage { content } => messages.push(Message::user(content)),
+            Event::UserMessage { content } => crate::runner::push_user_turn(&mut messages, content),
             Event::Compaction { messages: m, .. } => {
                 messages = serde_json::from_value(m.clone()).map_err(ReplayError::Compaction)?;
             }
@@ -584,6 +584,65 @@ mod tests {
                 ReplayError::SeedChainCycle { .. } | ReplayError::SeedChainTooDeep
             ),
             "expected a chain-cycle/too-deep error, got {err:?}"
+        );
+    }
+
+    /// Recover-on-interrupt spec §1: a non-empty `user_message` that follows a
+    /// seed ending in a user turn joins that turn instead of becoming a second
+    /// consecutive user message — and replay rebuilds exactly what was sent.
+    #[tokio::test]
+    async fn a_user_message_after_a_seed_ending_in_a_user_turn_merges_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("merge.jsonl");
+        let seed = vec![
+            Message::user("summarise notes.txt"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "notes.txt" }),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "alpha\nbeta".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let provider =
+            crate::runner::CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: "summary done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+        let captured = provider.captured.clone();
+        let mut opts = opts_for(Box::new(provider), tmp.path(), transcript.clone());
+        opts.initial_messages = seed.clone();
+        opts.user_message = "you were interrupted".into();
+        run_agent(opts).await.unwrap();
+
+        let mut expected = seed;
+        expected[2].content.push(ContentBlock::Text {
+            text: "you were interrupted".into(),
+        });
+        let sent = captured.lock().unwrap()[0].messages.clone();
+        assert_eq!(
+            serde_json::to_value(&sent).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "the note must join the trailing user turn, not follow it"
+        );
+
+        expected.push(Message::assistant("summary done"));
+        let replayed = reconstruct_transcript(&transcript).unwrap();
+        assert_eq!(
+            serde_json::to_value(&replayed).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "replay must rebuild exactly what the runner sent"
         );
     }
 }
