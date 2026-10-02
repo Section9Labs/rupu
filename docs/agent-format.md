@@ -461,3 +461,21 @@ For predictable behavior:
 - Use [agent-authoring.md](agent-authoring.md) when you are designing a new agent.
 - Use [workflow-format.md](workflow-format.md) when that agent will participate in a workflow.
 - Use [examples/README.md](../examples/README.md) for complete copyable agent and workflow sets.
+
+---
+
+## Continuing an interrupted run
+
+If a run stops before it finishes — a closed terminal, a killed process, a
+crash — pick it up where it left off instead of starting over:
+
+    rupu run <agent> --continue <agent_run_id>
+
+rupu rebuilds the conversation from the run's transcript, drops the turn that
+was in flight when it stopped, and tells the agent it was interrupted (work
+from that turn may be partially applied, so the agent re-checks before going
+on). The new run's transcript links back to the old one rather than copying
+it. If the run had actually finished, its recorded answer is printed without
+calling the model; a run that failed can't be continued — start it fresh.
+Run the command from the same project as the original run. The new run needs
+its own run id, so don't pass `--run-id` equal to the run being continued.
