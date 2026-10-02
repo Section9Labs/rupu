@@ -95,7 +95,7 @@ pub trait LlmProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ContentBlock, Message, StopReason, Usage};
+    use crate::types::{ContentBlock, Message, Stop, StopReason, Usage};
 
     struct MockProvider {
         response: LlmResponse,
@@ -171,7 +171,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: "Hello".into(),
             }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,

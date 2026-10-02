@@ -150,7 +150,9 @@ impl GithubCopilotClient {
         }
 
         let json: serde_json::Value = response.json().await?;
-        crate::openai_wire::parse_chat_completion(&json)
+        let mut resp = crate::openai_wire::parse_chat_completion(&json)?;
+        resp.stop.wire.provider = "github-copilot".to_string();
+        Ok(resp)
     }
 
     /// Streaming send with SSE.
@@ -195,8 +197,11 @@ impl GithubCopilotClient {
             }
         }
 
-        acc.into_response()
-            .ok_or(ProviderError::UnexpectedEndOfStream)
+        let mut resp = acc
+            .into_response()
+            .ok_or(ProviderError::UnexpectedEndOfStream)?;
+        resp.stop.wire.provider = "github-copilot".to_string();
+        Ok(resp)
     }
 
     fn build_headers(&self) -> Result<reqwest::header::HeaderMap, ProviderError> {
@@ -724,7 +729,7 @@ mod tests {
         let response = parse_chat_completion(&json).unwrap();
         assert_eq!(response.id, "chatcmpl-123");
         assert_eq!(response.text(), Some("Hello!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
     }
 
@@ -752,7 +757,7 @@ mod tests {
         });
 
         let response = parse_chat_completion(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -777,7 +782,7 @@ mod tests {
         });
 
         let response = parse_chat_completion(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(response.stop.reason, StopReason::MaxTokens);
     }
 
     #[test]
@@ -843,7 +848,7 @@ mod tests {
         let response = acc.into_response().unwrap();
         assert_eq!(response.id, "chatcmpl-1");
         assert_eq!(response.text(), Some("Hello world!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(events.len(), 2);
     }
 
@@ -871,7 +876,7 @@ mod tests {
         process_completion_sse(&event3, &mut acc, &mut |_| {}).unwrap();
 
         let response = acc.into_response().unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {

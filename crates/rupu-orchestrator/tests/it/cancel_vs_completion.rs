@@ -12,7 +12,7 @@ use rupu_agent::runner::BypassDecider;
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory};
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
-use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, Usage};
+use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, Stop, StopReason, Usage};
 use rupu_providers::{LlmProvider, ProviderError, StreamEvent};
 use rupu_tools::ToolContext;
 use std::collections::BTreeMap;
@@ -55,7 +55,7 @@ impl LlmProvider for CancellingProvider {
             content: vec![ContentBlock::Text {
                 text: "done anyway".into(),
             }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage {
                 input_tokens: 1,
                 output_tokens: 1,

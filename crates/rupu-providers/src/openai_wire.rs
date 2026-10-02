@@ -6,7 +6,9 @@
 //! base URL, auth headers, token exchange — stay in the individual clients.
 
 use crate::error::ProviderError;
-use crate::types::{ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent, Usage};
+use crate::types::{
+    ContentBlock, LlmRequest, LlmResponse, Role, Stop, StopReason, StreamEvent, Usage,
+};
 
 /// Canonical tag for the OpenAI chat-completions dialect. GitHub Copilot and
 /// the generic OpenAI-compatible client both speak it and interoperate within
@@ -184,6 +186,17 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
     body
 }
 
+/// Provider label stamped on stops built here; copilot overrides it.
+const WIRE_PROVIDER: &str = "openai-compatible";
+
+/// Wrap an accumulated stop reason into a [`Stop`] (a `None` is `Unreported`).
+fn legacy_stop(reason: Option<StopReason>) -> Stop {
+    match reason {
+        Some(r) => Stop::synthetic(r, WIRE_PROVIDER),
+        None => Stop::from_wire(StopReason::Unreported, WIRE_PROVIDER, None),
+    }
+}
+
 /// Parse a non-streaming chat-completions response into an `LlmResponse`.
 pub(crate) fn parse_chat_completion(
     json: &serde_json::Value,
@@ -303,7 +316,7 @@ pub(crate) fn parse_chat_completion(
         id,
         model,
         content,
-        stop_reason,
+        stop: legacy_stop(stop_reason),
         usage,
     })
 }
@@ -386,7 +399,7 @@ impl CompletionAccumulator {
             id: self.id,
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
+            stop: legacy_stop(self.stop_reason),
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -782,7 +795,7 @@ mod tests {
         });
         let resp = parse_chat_completion(&json).unwrap();
 
-        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(resp.stop.reason, StopReason::ToolUse);
         assert!(matches!(resp.content[0], ContentBlock::Reasoning { .. }));
         match &resp.content[1] {
             ContentBlock::ToolUse { id, name, input } => {

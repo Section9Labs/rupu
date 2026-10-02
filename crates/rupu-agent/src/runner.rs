@@ -18,7 +18,7 @@ use rupu_coverage::{
 use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::provider::LlmProvider;
 use rupu_providers::types::{
-    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
 use rupu_scm::Registry;
 use rupu_tools::{DerivedEvent, PermissionMode, Tool, ToolContext};
@@ -1156,7 +1156,7 @@ fn is_paused(pause: &Option<tokio_util::sync::CancellationToken>) -> bool {
 
 /// Result of a single provider call attempt inside the retry loop.
 enum CallStep {
-    Ok(LlmResponse),
+    Ok(Box<LlmResponse>),
     Err(rupu_providers::ProviderError),
     /// The pause token fired while the provider call was in flight; the
     /// in-flight stream was dropped and any partial text discarded.
@@ -1165,7 +1165,7 @@ enum CallStep {
 
 /// Outcome of the provider-call retry loop for one turn.
 enum CallOutcome {
-    Response(LlmResponse),
+    Response(Box<LlmResponse>),
     Paused,
 }
 
@@ -1619,7 +1619,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     // returns; a dropped partial is never committed.
                     tokio::select! {
                         r = opts.provider.stream(&req, &mut quiet) => match r {
-                            Ok(x) => CallStep::Ok(x),
+                            Ok(x) => CallStep::Ok(Box::new(x)),
                             Err(e) => CallStep::Err(e),
                         },
                         _ = wait_pause(&pause) => CallStep::Paused,
@@ -1686,7 +1686,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                 }
                             }
                             match result {
-                                Ok(x) => CallStep::Ok(x),
+                                Ok(x) => CallStep::Ok(Box::new(x)),
                                 Err(e) => CallStep::Err(e),
                             }
                         }
@@ -1908,7 +1908,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // was committed for this turn, so the transcript ends at the last
             // complete message and is ready to seed a resume.
             let resp: LlmResponse = match call_outcome {
-                CallOutcome::Response(r) => r,
+                CallOutcome::Response(r) => *r,
                 CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
             // I-48: reasoning tokens (Gemini's thoughtsTokenCount, reported
@@ -2154,15 +2154,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 turn_idx,
                 tokens_in: Some(resp.usage.input_tokens as u64),
                 tokens_out: Some(billable_output_tokens),
-                stop_reason: resp.stop_reason.as_ref().map(|s| {
-                    match s {
-                        StopReason::EndTurn => "end_turn",
-                        StopReason::MaxTokens => "max_tokens",
-                        StopReason::StopSequence => "stop_sequence",
-                        StopReason::ToolUse => "tool_use",
-                    }
-                    .to_string()
-                }),
+                stop_reason: Some(resp.stop.wire_value_or_reason()),
                 response_id: {
                     let id = resp.id.trim();
                     if id.is_empty() {
@@ -3532,7 +3524,7 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, "mock"),
                 usage: Usage {
                     input_tokens,
                     output_tokens,
@@ -3543,7 +3535,7 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content,
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, "mock"),
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -3558,14 +3550,14 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content,
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, "mock"),
                 usage,
             }),
             ScriptedTurn::AssistantTextWithUsage { text, stop, usage } => Ok(LlmResponse {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, "mock"),
                 usage,
             }),
             ScriptedTurn::AssistantToolUse {
@@ -3588,7 +3580,7 @@ impl LlmProvider for MockProvider {
                     id: "mock".to_string(),
                     model: "mock-1".to_string(),
                     content: blocks,
-                    stop_reason: Some(stop),
+                    stop: Stop::synthetic(stop, "mock"),
                     usage: Usage {
                         input_tokens: 1,
                         output_tokens: 1,
@@ -4253,7 +4245,7 @@ mod pause_tests {
                 content: vec![ContentBlock::Text {
                     text: "unused".into(),
                 }],
-                stop_reason: Some(StopReason::EndTurn),
+                stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                 usage: Usage::default(),
             })
         }
@@ -4275,7 +4267,7 @@ mod pause_tests {
                 content: vec![ContentBlock::Text {
                     text: "the full answer".into(),
                 }],
-                stop_reason: Some(StopReason::EndTurn),
+                stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                 usage: Usage::default(),
             })
         }

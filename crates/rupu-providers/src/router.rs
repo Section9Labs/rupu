@@ -339,7 +339,7 @@ mod tests {
                 id: "ok".into(),
                 model: request.model.clone(),
                 content: vec![ContentBlock::Text { text: "ok".into() }],
-                stop_reason: Some(StopReason::EndTurn),
+                stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,

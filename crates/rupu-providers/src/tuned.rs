@@ -277,7 +277,7 @@ impl LlmProvider for RetryingProvider {
 mod tests {
     use super::*;
     use crate::tuning::ProviderTuning;
-    use crate::types::{ContentBlock, Message, StopReason, Usage};
+    use crate::types::{ContentBlock, Message, Stop, StopReason, Usage};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn req() -> LlmRequest {
@@ -306,7 +306,7 @@ mod tests {
             id: "msg".into(),
             model: "m".into(),
             content: vec![ContentBlock::Text { text: "ok".into() }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage::default(),
         }
     }

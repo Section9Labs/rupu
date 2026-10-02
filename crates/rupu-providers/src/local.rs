@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ProviderError;
 use crate::provider::LlmProvider;
 use crate::types::{
-    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
 
 /// Provider backed by a local HTTP inference server (llama.cpp, Ollama, vLLM).
@@ -158,7 +158,7 @@ impl LlmProvider for LocalModelProvider {
             id: json["id"].as_str().unwrap_or("local").to_string(),
             model: self.model_name.clone(),
             content: vec![ContentBlock::Text { text: content }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "local"),
             usage: Usage {
                 input_tokens,
                 output_tokens,

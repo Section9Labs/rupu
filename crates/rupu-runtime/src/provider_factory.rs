@@ -1252,7 +1252,7 @@ mod decorate_kind_tests {
     use super::*;
     use async_trait::async_trait;
     use rupu_providers::{
-        ContentBlock, LlmRequest, LlmResponse, Message, ProviderError, ProviderId as PId,
+        ContentBlock, LlmRequest, LlmResponse, Message, ProviderError, ProviderId as PId, Stop,
         StopReason, StreamEvent, Usage,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1285,7 +1285,7 @@ mod decorate_kind_tests {
             id: "msg".into(),
             model: "m".into(),
             content: vec![ContentBlock::Text { text: "ok".into() }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage::default(),
         }
     }

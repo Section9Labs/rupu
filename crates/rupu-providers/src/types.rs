@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::stop::{
+    FallbackHop, RefusalDetail, RefusalSource, ServedBy, Stop, StopReason, WireStop,
+};
+
 /// Role in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -104,16 +108,6 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-}
-
-/// Why the model stopped generating.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StopReason {
-    EndTurn,
-    MaxTokens,
-    StopSequence,
-    ToolUse,
 }
 
 /// Token usage for a request.
@@ -263,7 +257,8 @@ pub struct LlmResponse {
     pub id: String,
     pub model: String,
     pub content: Vec<ContentBlock>,
-    pub stop_reason: Option<StopReason>,
+    /// How the reply ended — always present (spec 2026-10-01 §4.1).
+    pub stop: Stop,
     pub usage: Usage,
 }
 
@@ -408,7 +403,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: "Hello!".into(),
             }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -434,7 +429,7 @@ mod tests {
                     input: serde_json::json!({}),
                 },
             ],
-            stop_reason: Some(StopReason::ToolUse),
+            stop: Stop::synthetic(StopReason::ToolUse, "mock"),
             usage: Usage::default(),
         };
         assert_eq!(response.tool_calls().len(), 1);
@@ -500,7 +495,7 @@ mod tests {
             id: "msg_1".into(),
             model: "m".into(),
             content: vec![],
-            stop_reason: None,
+            stop: Stop::from_wire(StopReason::Unreported, "mock", None),
             usage: Usage::default(),
         };
         assert_eq!(response.text(), None);
@@ -565,7 +560,7 @@ mod tests {
             id: "msg_1".into(),
             model: "m".into(),
             content,
-            stop_reason: None,
+            stop: Stop::from_wire(StopReason::Unreported, "mock", None),
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,

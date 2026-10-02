@@ -1382,6 +1382,14 @@ fn normalize_tool_call_id(id: &str) -> String {
     format!("fc_{sanitized_prefix}_{hash:016x}")
 }
 
+/// Wrap an accumulated stop reason into a [`Stop`] (a `None` is `Unreported`).
+fn legacy_stop(reason: Option<StopReason>) -> Stop {
+    match reason {
+        Some(r) => Stop::synthetic(r, "openai-codex"),
+        None => Stop::from_wire(StopReason::Unreported, "openai-codex", None),
+    }
+}
+
 /// Parse a complete (non-streaming) Responses API response into LlmResponse.
 #[allow(dead_code)]
 fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
@@ -1453,7 +1461,7 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
         id,
         model,
         content,
-        stop_reason,
+        stop: legacy_stop(stop_reason),
         usage,
     })
 }
@@ -1530,7 +1538,7 @@ impl ResponseAccumulator {
             id: self.id,
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
+            stop: legacy_stop(self.stop_reason),
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -1812,7 +1820,7 @@ mod tests {
         assert_eq!(response.id, "resp_123");
         assert_eq!(response.model, "gpt-4.1");
         assert_eq!(response.text(), Some("Hello!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(response.usage.output_tokens, 5);
     }
@@ -1833,7 +1841,7 @@ mod tests {
         });
 
         let response = parse_response(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -1857,7 +1865,7 @@ mod tests {
         });
 
         let response = parse_response(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(response.stop.reason, StopReason::MaxTokens);
     }
 
     #[test]
@@ -2166,7 +2174,7 @@ mod tests {
             .unwrap();
 
         let response = acc.into_response().unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
     }
@@ -2858,7 +2866,7 @@ mod reasoning_capture_tests {
         // The ToolUse block is still emitted as today.
         let tools = resp.tool_calls();
         assert_eq!(tools.len(), 1);
-        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(resp.stop.reason, StopReason::ToolUse);
     }
 
     #[test]

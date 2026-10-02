@@ -13,7 +13,7 @@ use crate::error::ProviderError;
 use crate::provider::LlmProvider;
 use crate::provider_id::ProviderId;
 use crate::sse::SseParser;
-use crate::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, StreamEvent, Usage};
+use crate::types::{ContentBlock, LlmRequest, LlmResponse, Stop, StopReason, StreamEvent, Usage};
 
 /// Client that sends signed LLM requests to the Credential Broker.
 pub struct BrokerClient {
@@ -107,9 +107,15 @@ impl LlmProvider for BrokerClient {
             model: resp["model"].as_str().unwrap_or_default().to_string(),
             content: serde_json::from_value(resp["content"].clone())
                 .map_err(|e| ProviderError::Json(e.to_string()))?,
-            stop_reason: serde_json::from_value(resp["stop_reason"].clone())
-                .ok()
-                .flatten(),
+            stop: match resp["stop_reason"].as_str() {
+                Some(v) => Stop::from_wire(
+                    serde_json::from_value(serde_json::Value::String(v.to_string()))
+                        .unwrap_or(StopReason::Unrecognized),
+                    "broker",
+                    Some(v),
+                ),
+                None => Stop::from_wire(StopReason::Unreported, "broker", None),
+            },
             usage: serde_json::from_value(resp["usage"].clone()).unwrap_or_default(),
         })
     }
@@ -214,10 +220,10 @@ impl LlmProvider for BrokerClient {
         }
 
         // Determine stop reason
-        let stop_reason = if !tool_blocks.is_empty() {
-            Some(StopReason::ToolUse)
+        let stop = if !tool_blocks.is_empty() {
+            Stop::synthetic(StopReason::ToolUse, "broker")
         } else {
-            Some(StopReason::EndTurn)
+            Stop::synthetic(StopReason::EndTurn, "broker")
         };
 
         // Build content blocks
@@ -231,7 +237,7 @@ impl LlmProvider for BrokerClient {
             id: response_id,
             model: request.model.clone(),
             content,
-            stop_reason,
+            stop,
             usage,
         })
     }

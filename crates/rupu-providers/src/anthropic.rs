@@ -2479,9 +2479,7 @@ impl AnthropicClient {
                 let data: serde_json::Value = serde_json::from_str(&event.data)?;
                 if let Some(delta) = data.get("delta") {
                     if let Some(reason) = delta.get("stop_reason").and_then(|v| v.as_str()) {
-                        acc.stop_reason =
-                            serde_json::from_value(serde_json::Value::String(reason.to_string()))
-                                .ok();
+                        acc.stop_reason = Some(reason.to_string());
                     }
                 }
                 if let Some(usage) = data.get("usage") {
@@ -2675,7 +2673,8 @@ struct StreamAccumulator {
     model: String,
     text: String,
     content_blocks: Vec<ContentBlock>,
-    stop_reason: Option<StopReason>,
+    /// The raw `stop_reason` string off `message_delta`.
+    stop_reason: Option<String>,
     wire: AnthropicWireUsage,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
@@ -2712,7 +2711,7 @@ impl StreamAccumulator {
             id: self.id,
             model: self.model,
             content: self.content_blocks,
-            stop_reason: self.stop_reason,
+            stop: anthropic_stop(self.stop_reason.as_deref()),
             usage: self.wire.normalize(),
         })
     }
@@ -2788,8 +2787,18 @@ struct AnthropicResponse {
     id: String,
     model: String,
     content: Vec<serde_json::Value>,
-    stop_reason: Option<StopReason>,
+    stop_reason: Option<String>,
     usage: AnthropicWireUsage,
+}
+
+/// Build the typed [`Stop`] from Anthropic's raw `stop_reason` string. An
+/// unknown value becomes `Unrecognized` and keeps its wire text; a missing
+/// one is `Unreported`.
+fn anthropic_stop(value: Option<&str>) -> Stop {
+    match value {
+        Some(v) => Stop::from_wire(crate::stop::map::anthropic(v), "anthropic", Some(v)),
+        None => Stop::from_wire(StopReason::Unreported, "anthropic", None),
+    }
 }
 
 impl AnthropicResponse {
@@ -2799,7 +2808,7 @@ impl AnthropicResponse {
             id: self.id,
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
+            stop: anthropic_stop(self.stop_reason.as_deref()),
             usage: self.usage.normalize(),
         }
     }
@@ -3962,14 +3971,14 @@ mod tests {
         acc.id = "msg_123".into();
         acc.model = "claude-sonnet-4-6".into();
         acc.text = "Hello world".into();
-        acc.stop_reason = Some(StopReason::EndTurn);
+        acc.stop_reason = Some("end_turn".to_string());
         acc.wire.input_tokens = 10;
         acc.wire.output_tokens = 5;
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.text(), Some("Hello world"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
     }
 
@@ -3984,7 +3993,7 @@ mod tests {
             name: "read_file".into(),
             input: serde_json::json!({"path": "/tmp/test"}),
         });
-        acc.stop_reason = Some(StopReason::ToolUse);
+        acc.stop_reason = Some("tool_use".to_string());
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.content.len(), 2);
@@ -4027,7 +4036,39 @@ mod tests {
         let response: AnthropicResponse = serde_json::from_str(json).unwrap();
         let llm = response.into_llm_response();
         assert_eq!(llm.text(), Some("Hello!"));
-        assert_eq!(llm.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(llm.stop.reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn an_unknown_stop_reason_decodes_as_unrecognized_and_keeps_its_wire_value() {
+        let json = r#"{
+            "id": "msg_test",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "stop_reason": "brand_new_reason",
+            "usage": {"input_tokens": 10, "output_tokens": 3}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.stop.reason, StopReason::Unrecognized);
+        assert_eq!(llm.stop.wire.value.as_deref(), Some("brand_new_reason"));
+        assert_eq!(llm.stop.wire.provider, "anthropic");
+    }
+
+    #[test]
+    fn a_missing_stop_reason_is_unreported() {
+        let json = r#"{
+            "id": "msg_test",
+            "model": "claude-sonnet-4-6",
+            "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.stop.reason, StopReason::Unreported);
+        assert_eq!(llm.stop.wire.value, None);
     }
 
     #[test]
@@ -4080,7 +4121,7 @@ mod tests {
         assert_eq!(response.id, "msg_1");
         assert_eq!(response.model, "claude-sonnet-4-6");
         assert_eq!(response.text(), Some("Hello world"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 25);
         assert_eq!(response.usage.output_tokens, 3);
         // Verify callback was called with text deltas

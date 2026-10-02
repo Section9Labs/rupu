@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn emit_response_events_surfaces_text_and_tool_calls() {
-        use crate::types::{ContentBlock, LlmResponse, StopReason, Usage};
+        use crate::types::{ContentBlock, LlmResponse, Stop, StopReason, Usage};
         let resp = LlmResponse {
             id: "1".into(),
             model: "m".into(),
@@ -523,7 +523,7 @@ mod tests {
                     input: serde_json::json!({"path": "a.rs"}),
                 },
             ],
-            stop_reason: Some(StopReason::ToolUse),
+            stop: Stop::synthetic(StopReason::ToolUse, "mock"),
             usage: Usage::default(),
         };
         let mut events = Vec::new();

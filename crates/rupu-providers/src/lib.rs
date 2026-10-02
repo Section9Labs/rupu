@@ -39,6 +39,7 @@ pub mod router;
 pub mod routing_history;
 pub mod smart_router;
 pub mod sse;
+pub mod stop;
 pub mod task_classifier;
 pub mod tuned;
 pub mod tuning;

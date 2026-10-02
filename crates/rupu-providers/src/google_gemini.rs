@@ -1244,9 +1244,17 @@ fn parse_generate_content_response(
         id: String::new(), // Gemini doesn't return a response ID in the same way
         model: model.to_string(),
         content,
-        stop_reason,
+        stop: legacy_stop(stop_reason),
         usage,
     })
+}
+
+/// Wrap an accumulated stop reason into a [`Stop`] (a `None` is `Unreported`).
+fn legacy_stop(reason: Option<StopReason>) -> Stop {
+    match reason {
+        Some(r) => Stop::synthetic(r, "google-gemini-cli"),
+        None => Stop::from_wire(StopReason::Unreported, "google-gemini-cli", None),
+    }
 }
 
 /// Map Google finish reason string to StopReason.
@@ -1324,7 +1332,7 @@ impl GeminiAccumulator {
             id: String::new(),
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
+            stop: legacy_stop(self.stop_reason),
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -2400,7 +2408,7 @@ mod tests {
 
         let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
         assert_eq!(response.text(), Some("The answer is 42."));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 15);
         assert_eq!(response.usage.output_tokens, 8);
     }
@@ -2453,7 +2461,7 @@ mod tests {
         });
 
         let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -2475,7 +2483,7 @@ mod tests {
         });
 
         let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(response.stop.reason, StopReason::MaxTokens);
     }
 
     /// Pull the single `Reasoning` block out of a response, or panic.
@@ -2550,7 +2558,7 @@ mod tests {
             ContentBlock::ToolUse { name, .. } => assert_eq!(name, "f"),
             _ => panic!("expected ToolUse"),
         }
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
     }
 
     #[test]
@@ -2584,7 +2592,7 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
     }
 
     #[test]
@@ -2717,7 +2725,7 @@ mod tests {
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.text(), Some("Hello world!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(events.len(), 3);
         assert!(events.iter().any(
@@ -2759,7 +2767,7 @@ mod tests {
         process_gemini_sse(&event, &mut acc, &mut |e| events.push(format!("{e:?}"))).unwrap();
 
         let response = acc.into_response().unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         assert_eq!(response.tool_calls().len(), 1);
         assert!(!events.is_empty()); // ToolUseStart + InputJsonDelta
     }
