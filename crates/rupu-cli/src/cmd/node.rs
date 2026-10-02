@@ -1313,6 +1313,31 @@ impl PendingJobs {
     }
 }
 
+/// What a tick's claim step did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaimOutcome {
+    /// Jobs this tick won the claim for.
+    won: usize,
+    /// The first bucket error the claim step hit (`list_jobs` / `claim_job`),
+    /// if any. It costs the tick's claims, never the worker.
+    error: Option<String>,
+}
+
+/// `--once` has nothing left in flight and is about to exit successfully. That
+/// is only honest if the claim step worked: a worker that claimed nothing
+/// because the claim step itself failed (`claim_error` from the tick just run)
+/// did nothing, and reporting "all runs terminal" with exit 0 would hide an
+/// unreachable or broken bucket. A worker that did claim work (`claimed_any`)
+/// is not failed by a later claim blip: it ran what it claimed.
+fn once_exit_check(claimed_any: bool, claim_error: Option<&str>) -> anyhow::Result<()> {
+    match claim_error {
+        Some(e) if !claimed_any => {
+            anyhow::bail!("--once: nothing was claimed because the claim step failed: {e}")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// One tick of the bucket worker: claim new jobs, then drain every active run.
 ///
 /// Claiming is best-effort — a bucket error there only costs this tick's
@@ -1327,12 +1352,13 @@ async fn bucket_tick(
     runs_root: &Path,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
-) {
-    claim_new_jobs(bucket, exe, host_id, active, pending).await;
+) -> ClaimOutcome {
+    let outcome = claim_new_jobs(bucket, exe, host_id, active, pending).await;
     // First attempt right away; a marker that did not land is retried on
     // every later tick until it does.
     flush_failed_markers(bucket, &mut pending.failed_unmarked).await;
     drain_active_runs(bucket, exe, runs_root, active).await;
+    outcome
 }
 
 /// Step 1: claim every job that is up for grabs and start it.
@@ -1347,7 +1373,8 @@ async fn claim_new_jobs(
     host_id: &str,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
-) {
+) -> ClaimOutcome {
+    let mut outcome = ClaimOutcome::default();
     // Specs that could not be fetched on an earlier tick come first.
     for run_id in std::mem::take(&mut pending.unfetched) {
         start_claimed_job(bucket, exe, run_id, active, pending).await;
@@ -1356,24 +1383,29 @@ async fn claim_new_jobs(
         Ok(ids) => ids,
         Err(e) => {
             warn!(error = %e, "node pull: list_jobs failed; no claims this tick");
-            return;
+            outcome.error = Some(format!("list_jobs: {e}"));
+            return outcome;
         }
     };
     for run_id in job_ids {
         match bucket.claim_job(&run_id, host_id).await {
-            Ok(true) => {}
+            Ok(true) => outcome.won += 1,
             Ok(false) => {
                 info!(run_id = %run_id, "node pull: job already claimed by another node");
                 continue;
             }
             Err(e) => {
                 warn!(run_id = %run_id, error = %e, "node pull: claim_job failed; skipping it this tick");
+                outcome
+                    .error
+                    .get_or_insert_with(|| format!("claim_job {run_id}: {e}"));
                 continue;
             }
         }
         info!(run_id = %run_id, "node pull: claimed job");
         start_claimed_job(bucket, exe, run_id, active, pending).await;
     }
+    outcome
 }
 
 /// Fetch a claimed job's spec and spawn it.
@@ -1600,9 +1632,12 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
     let mut active: HashMap<String, BucketRunState> = HashMap::new();
     let mut pending = PendingJobs::default();
     let mut once_iters: u32 = 0;
+    // For `--once`: did this process claim anything, and did the claim step of
+    // the tick just run fail?
+    let mut claimed_any = false;
 
     loop {
-        bucket_tick(
+        let claim = bucket_tick(
             &bucket,
             &exe,
             &host_id,
@@ -1611,10 +1646,13 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             &mut pending,
         )
         .await;
+        claimed_any |= claim.won > 0;
 
         // ── Loop control ──────────────────────────────────────────────────────
         if args.once {
             if active.is_empty() && pending.is_empty() {
+                // Nothing in flight: only a success if the claim step worked.
+                once_exit_check(claimed_any, claim.error.as_deref())?;
                 info!("node pull: --once: all runs terminal, exiting");
                 break;
             }
@@ -2444,7 +2482,7 @@ mod tests {
         runs_root: &Path,
         active: &mut HashMap<String, BucketRunState>,
         pending: &mut PendingJobs,
-    ) {
+    ) -> ClaimOutcome {
         bucket_tick(
             bucket,
             Path::new(TRUE_EXE),
@@ -2453,7 +2491,7 @@ mod tests {
             active,
             pending,
         )
-        .await;
+        .await
     }
 
     async fn idle_child() -> tokio::process::Child {
@@ -2482,7 +2520,15 @@ mod tests {
         );
         let mut pending = PendingJobs::default();
 
-        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        let claim = tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert_eq!(claim.won, 0);
+        assert!(
+            claim
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("list_jobs")),
+            "the tick reports the claim failure: {claim:?}"
+        );
 
         let results = bucket.inner.list_results("run_A").await.unwrap();
         assert_eq!(results.len(), 1, "{results:?}");
@@ -2490,6 +2536,68 @@ mod tests {
         assert_eq!(std::str::from_utf8(&results[0].1).unwrap(), "e1\n");
         assert!(active.contains_key("run_A"), "the run is still in flight");
         assert!(pending.is_empty());
+    }
+
+    /// `--once` with nothing in flight exits 0 only if the claim step worked: a
+    /// worker that claimed nothing BECAUSE the claim step failed did nothing,
+    /// and "all runs terminal" would hide a broken bucket. One that did claim
+    /// work is not failed by a later blip.
+    #[test]
+    fn once_exit_check_is_honest_about_a_failed_claim_step() {
+        assert!(
+            once_exit_check(false, None).is_ok(),
+            "nothing to claim is fine"
+        );
+        assert!(once_exit_check(true, None).is_ok());
+        assert!(
+            once_exit_check(true, Some("list_jobs: boom")).is_ok(),
+            "it ran what it claimed"
+        );
+        let err = once_exit_check(false, Some("list_jobs: boom")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("claim step failed") && msg.contains("list_jobs: boom"),
+            "{msg}"
+        );
+    }
+
+    /// The first tick of a `--once` worker against a bucket whose claim step
+    /// fails leaves `active` and `pending` empty; what keeps that from reading
+    /// as "all runs terminal" is the tick's reported claim error, for
+    /// `list_jobs` and `claim_job` alike — and a healthy tick reports none.
+    #[tokio::test]
+    async fn a_tick_reports_whether_its_claim_step_failed() {
+        let runs_root = tempdir().unwrap();
+        let bucket = FlakyJobBucket::new();
+        bucket.put_job("run_Q", &agent_job("a")).await.unwrap();
+
+        FlakyJobBucket::set(&bucket.fail_list_jobs, true);
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+        let claim = tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(claim.won, 0);
+        let err = once_exit_check(false, claim.error.as_deref()).unwrap_err();
+        assert!(format!("{err:#}").contains("list_jobs"), "{err:#}");
+
+        FlakyJobBucket::set(&bucket.fail_list_jobs, false);
+        FlakyJobBucket::set(&bucket.fail_claim_job, true);
+        let claim = tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(claim.won, 0);
+        let err = once_exit_check(false, claim.error.as_deref()).unwrap_err();
+        assert!(format!("{err:#}").contains("claim_job run_Q"), "{err:#}");
+
+        // Healthy: the job is claimed and started, no claim error.
+        FlakyJobBucket::set(&bucket.fail_claim_job, false);
+        let claim = tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert_eq!(
+            claim,
+            ClaimOutcome {
+                won: 1,
+                error: None
+            }
+        );
+        assert!(active.contains_key("run_Q"));
     }
 
     /// A failing `claim_job` skips that job for the tick (it is still listed
