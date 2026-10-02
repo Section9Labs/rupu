@@ -3,6 +3,7 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+pub mod asset;
 pub mod audit;
 pub mod catalog;
 pub mod diff;
@@ -22,6 +23,8 @@ pub use tools::{
     CoverageRemainingInput, CoverageStatusInput, RemainingItem, ReportFindingError,
     ReportFindingInput, ReportFindingOutput, SearchResult, SearchResultForm, SearchResultSummary,
 };
+
+pub use asset::{Coordinate, Locator, Proto};
 
 pub use audit::generate::audit as run_audit;
 pub use audit::{
