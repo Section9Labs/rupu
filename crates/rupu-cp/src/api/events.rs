@@ -290,9 +290,14 @@ fn collect_recent_events(
             if line.trim().is_empty() {
                 continue;
             }
+            // An event type a newer rupu wrote parses as `Unknown`: skip it,
+            // as a parse failure was skipped before `Unknown` existed.
             let Ok(event) = serde_json::from_str::<Event>(&line) else {
                 continue;
             };
+            if matches!(event, Event::Unknown) {
+                continue;
+            }
             let ts = event_own_ts_ms(&event).unwrap_or(fallback_ts);
             if !cursor.admits(ts, &run.id, pos) {
                 continue;
@@ -476,6 +481,26 @@ mod tests {
         assert_eq!(rows[1]["ts"], serde_json::json!(t0));
         assert_eq!(rows[1]["type"], "run_started");
         assert_eq!(rows[1]["run_id"], "run_a");
+    }
+
+    #[test]
+    fn recent_events_skip_event_types_this_build_does_not_know() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        seed_run(&store, "run_n", ts(1_000));
+        let known = serde_json::to_string(&Event::RunStarted {
+            event_version: 1,
+            run_id: "run_n".into(),
+            workflow_path: PathBuf::from("/wf.yaml"),
+            started_at: ts(1_000),
+        })
+        .unwrap();
+        let newer = r#"{"type":"step_warped","run_id":"run_n","step_id":"s"}"#;
+        std::fs::write(store.events_path("run_n"), format!("{known}\n{newer}\n")).unwrap();
+
+        let rows = collect_recent_events(&store, 100, EventsCursor::None).expect("collect");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["type"], "run_started");
     }
 
     #[test]

@@ -58,7 +58,12 @@ impl FileTailRunSource {
                     Ok((c, lines)) => {
                         cursor = c;
                         for line in lines {
+                            // A newer rupu's event type parses as
+                            // `Unknown`; subscribers never see it.
                             if let Ok(ev) = serde_json::from_str::<Event>(&line) {
+                                if matches!(ev, Event::Unknown) {
+                                    continue;
+                                }
                                 if tx.send(ev).await.is_err() {
                                     return;
                                 }
