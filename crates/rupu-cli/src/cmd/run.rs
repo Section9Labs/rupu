@@ -778,7 +778,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             anthropic_prompt_cache: spec.anthropic_prompt_cache,
-            anthropic_server_side_fallback: None,
+            anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
             openai_compatible: oai_params,
             tuning: Some(provider_factory::provider_tuning(
                 &provider_name,
@@ -956,6 +956,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             None,
             limits_ctx.clone(),
             Some(coverage_stream.clone()),
+            cfg.providers.clone(),
+            cfg.recovery.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -1094,7 +1096,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             surface_tag: None,
             pause: None,
             codename: Some(codename.to_string()),
-            recovery: Default::default(),
+            recovery: rupu_runtime::hop_builder::recovery_opts(
+                &cfg.recovery,
+                spec.fallbacks.as_deref(),
+                resolver.clone(),
+                cfg.providers.clone(),
+                limits_ctx.clone(),
+                netflow_sink.clone(),
+            ),
         };
         if let Some((messages, seed_source)) = resume_from.take() {
             rupu_agent::continuation::apply_continuation(&mut opts, messages, seed_source);

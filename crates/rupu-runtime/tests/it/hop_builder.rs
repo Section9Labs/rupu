@@ -116,3 +116,34 @@ async fn a_per_model_mock_script_serves_the_hops_model_its_own_turns() {
         assert_eq!(text, want, "model {model}");
     }
 }
+
+/// `recovery_opts` is what every launch site calls: the agent's chain wins
+/// over the config table, and the hop builder is always wired.
+#[test]
+fn recovery_opts_prefers_the_agents_chain_and_wires_a_hop_builder() {
+    use rupu_config::{FallbackEntry, RecoveryConfig};
+    let entry = |m: &str| FallbackEntry {
+        provider: None,
+        model: m.into(),
+    };
+    let table = RecoveryConfig {
+        fallbacks: vec![entry("from-config")],
+        server_side_fallback: false,
+    };
+    let opts = |agent: Option<&[FallbackEntry]>| {
+        rupu_runtime::hop_builder::recovery_opts(
+            &table,
+            agent,
+            Arc::new(KeychainResolver::new()),
+            BTreeMap::new(),
+            LimitsContext::default(),
+            Arc::new(rupu_netflow::MemorySink::default()),
+        )
+    };
+    let from_agent = opts(Some(&[entry("from-agent")]));
+    assert_eq!(from_agent.chain, vec![entry("from-agent")]);
+    assert!(from_agent.hop_builder.is_some());
+    let from_table = opts(None);
+    assert_eq!(from_table.chain, vec![entry("from-config")]);
+    assert!(from_table.hop_builder.is_some());
+}

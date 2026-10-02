@@ -2267,7 +2267,7 @@ async fn create(
             let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
                 anthropic_oauth_system_prefix: None,
                 anthropic_prompt_cache: None,
-                anthropic_server_side_fallback: None,
+                anthropic_server_side_fallback: Some(gen_cfg.recovery.server_side_fallback),
                 openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
                     &req.provider,
                     &gen_cfg.providers,
@@ -3723,6 +3723,8 @@ pub(crate) async fn resume_run(
         )),
         limits_ctx.clone(),
         None,
+        cfg.providers.clone(),
+        cfg.recovery.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -3774,6 +3776,8 @@ pub(crate) async fn resume_run(
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
         findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
         limits_ctx,
+        providers: cfg.providers.clone(),
+        recovery: cfg.recovery.clone(),
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -5433,6 +5437,8 @@ async fn execute_workflow_invocation(
         )),
         limits_ctx.clone(),
         None,
+        cfg.providers.clone(),
+        cfg.recovery.clone(),
     );
     // One codename namer for the whole run — shared by the orchestrator
     // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
@@ -5490,6 +5496,8 @@ async fn execute_workflow_invocation(
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
         findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
         limits_ctx,
+        providers: cfg.providers.clone(),
+        recovery: cfg.recovery.clone(),
     });
 
     let workflow_for_resume = workflow.clone();

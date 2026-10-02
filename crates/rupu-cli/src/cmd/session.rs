@@ -6908,7 +6908,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         anthropic_prompt_cache: session.anthropic_prompt_cache,
-        anthropic_server_side_fallback: None,
+        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7314,7 +7314,7 @@ async fn run_compact_request(
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         anthropic_prompt_cache: session.anthropic_prompt_cache,
-        anthropic_server_side_fallback: None,
+        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7624,6 +7624,34 @@ fn finalize_compact_run(
     Ok(())
 }
 
+/// The fallback chain a session turn runs with. The session record keeps the
+/// agent's prompt, tools and pins but not its `fallbacks:`, so each turn
+/// re-reads the agent file from the same agent dirs `rupu session start`
+/// loaded it from. An agent that no longer loads (renamed, deleted, broken
+/// frontmatter) yields `None`, and the turn uses the `[recovery].fallbacks`
+/// table, the same as an agent that declares no chain.
+fn session_agent_fallbacks(
+    global: &Path,
+    session: &SessionRecord,
+) -> Option<Vec<rupu_config::FallbackEntry>> {
+    let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
+    match load_agent(
+        global,
+        project_agents_parent.as_deref(),
+        &session.agent_name,
+    ) {
+        Ok(spec) => spec.fallbacks,
+        Err(e) => {
+            tracing::warn!(
+                agent = %session.agent_name,
+                error = %e,
+                "session agent did not load; the turn uses the [recovery].fallbacks table"
+            );
+            None
+        }
+    }
+}
+
 async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // See `run_worker`: `log_level` is the `RUPU_LOG` fallback (I-14).
     let turn_cfg = crate::cmd::update::load_cli_config();
@@ -7638,7 +7666,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = crate::accounts::resolver_for(&cfg);
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -7668,13 +7696,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // this turn's sink had buffered — including a `Dropped` accounting
     // line, which has no other way to reach disk — stays unflushed.
     let body_result: anyhow::Result<()> = async move {
-        let scm_registry =
-            Arc::new(rupu_scm::Registry::discover(&resolver, &cfg, netflow_sink.clone()).await);
+        let scm_registry = Arc::new(
+            rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
+        );
 
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
             anthropic_prompt_cache: session.anthropic_prompt_cache,
-            anthropic_server_side_fallback: None,
+            anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
             // `openai_compatible` stays `None` here — a separate,
             // pre-existing limitation (the session worker doesn't support
             // custom openai-compatible endpoints), unrelated to kind
@@ -7690,9 +7719,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             &session.provider_name,
             &session.model,
             session.auth_mode,
-            &resolver,
+            resolver.as_ref(),
             &provider_config,
-            netflow_sink,
+            netflow_sink.clone(),
         )
         .await?;
 
@@ -7808,6 +7837,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // stored value with NO known side is a transient first-turn failure
         // (timeout, network blip), not an answer: resolve again — a cache read
         // unless stale — and persist the result below.
+        let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
         let limits = match session.model_limits.clone() {
             // Without its note: a note describes the resolution that wrote
             // it, often relative to that moment ("refresh failed 2m ago"),
@@ -7825,11 +7855,19 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     &session.provider_name,
                     &session.model,
                     provider.as_mut(),
-                    &rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global),
+                    &limits_ctx,
                 )
                 .await
             }
         };
+        let recovery = rupu_runtime::hop_builder::recovery_opts(
+            &cfg.recovery,
+            session_agent_fallbacks(&global, &session).as_deref(),
+            resolver.clone(),
+            cfg.providers.clone(),
+            limits_ctx,
+            netflow_sink,
+        );
 
         let opts = AgentRunOpts {
             agent_name: session.agent_name.clone(),
@@ -7877,7 +7915,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             seed_source,
             collectors: Vec::new(),
             codename: Some(codename.clone()),
-            recovery: Default::default(),
+            recovery,
         };
 
         // `run_agent_with_limits`, not `run_agent`: the run's final limits come

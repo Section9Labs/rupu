@@ -97,6 +97,13 @@ pub struct CliAgentDispatcher {
     limits_ctx: rupu_runtime::model_limits::LimitsContext,
     /// The parent `rupu run`'s coverage stream; children append to it.
     coverage_stream: Option<PathBuf>,
+    /// `[providers.<name>]` from `config.toml`: what a dispatched child's
+    /// fallback hops are built from (`rupu_runtime::hop_builder`).
+    providers: std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+    /// `[recovery]` from `config.toml`: the fallback table a child uses when
+    /// its agent declares no `fallbacks:`, and the server-side-fallback
+    /// toggle for the child's provider and its hops.
+    recovery: rupu_config::RecoveryConfig,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -135,6 +142,8 @@ impl CliAgentDispatcher {
         usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
         limits_ctx: rupu_runtime::model_limits::LimitsContext,
         coverage_stream: Option<PathBuf>,
+        providers: std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+        recovery: rupu_config::RecoveryConfig,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -157,6 +166,8 @@ impl CliAgentDispatcher {
             usage_ledger,
             limits_ctx,
             coverage_stream,
+            providers,
+            recovery,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -328,7 +339,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             anthropic_prompt_cache: spec.anthropic_prompt_cache,
-            anthropic_server_side_fallback: None,
+            anthropic_server_side_fallback: Some(self.recovery.server_side_fallback),
             openai_compatible: oai_params,
             tuning: self.provider_tuning.get(&provider_name).cloned(),
             kind: self.kinds.get(&provider_name).cloned(),
@@ -339,7 +350,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             spec.auth,
             self.resolver.as_ref(),
             &provider_config,
-            netflow_sink,
+            netflow_sink.clone(),
         )
         .await;
 
@@ -470,7 +481,14 @@ impl AgentDispatcher for CliAgentDispatcher {
             surface_tag: None,
             pause: None,
             codename: codename.clone(),
-            recovery: Default::default(),
+            recovery: rupu_runtime::hop_builder::recovery_opts(
+                &self.recovery,
+                spec.fallbacks.as_deref(),
+                self.resolver.clone(),
+                self.providers.clone(),
+                self.limits_ctx.clone(),
+                netflow_sink,
+            ),
         };
 
         let started = std::time::Instant::now();
@@ -809,6 +827,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -929,6 +949,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1002,6 +1024,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             Some(stream.clone()),
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1103,6 +1127,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -1211,6 +1237,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -1278,6 +1306,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1351,6 +1381,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1434,6 +1466,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1524,6 +1558,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1619,6 +1655,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1699,6 +1737,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(

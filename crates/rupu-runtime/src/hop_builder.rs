@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rupu_agent::recovery::{Hop, HopBuilder};
+use rupu_agent::recovery::{Hop, HopBuilder, RecoveryOpts};
 
 use crate::model_limits::{self, LimitOverrides, LimitsContext};
 use crate::provider_factory::{
@@ -61,5 +61,30 @@ impl HopBuilder for RuntimeHopBuilder {
             model: model.into(),
             limits,
         })
+    }
+}
+
+/// One run's [`RecoveryOpts`]: the agent's `fallbacks:` (else the
+/// `[recovery].fallbacks` table) and a [`RuntimeHopBuilder`] over the
+/// resolver, provider table, limits context and netflow sink the run's
+/// primary provider was built with. Every launch site calls this, so none of
+/// them assembles the builder by hand.
+pub fn recovery_opts(
+    recovery: &rupu_config::RecoveryConfig,
+    agent_fallbacks: Option<&[rupu_config::FallbackEntry]>,
+    resolver: Arc<dyn rupu_auth::CredentialResolver>,
+    providers: BTreeMap<String, rupu_config::ProviderConfig>,
+    limits_ctx: LimitsContext,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> RecoveryOpts {
+    RecoveryOpts {
+        chain: recovery.chain_for(agent_fallbacks),
+        hop_builder: Some(Arc::new(RuntimeHopBuilder {
+            resolver,
+            providers,
+            limits_ctx,
+            sink,
+            server_side_fallback: recovery.server_side_fallback,
+        })),
     }
 }

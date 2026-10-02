@@ -397,6 +397,8 @@ async fn rebuild_opts_from_disk(
         )),
         limits_ctx.clone(),
         None,
+        cfg.providers.clone(),
+        cfg.recovery.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -447,6 +449,8 @@ async fn rebuild_opts_from_disk(
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
         findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
         limits_ctx,
+        providers: cfg.providers.clone(),
+        recovery: cfg.recovery.clone(),
     });
 
     // Rebuild the `run:` step policy from the resolved mode + layered config
