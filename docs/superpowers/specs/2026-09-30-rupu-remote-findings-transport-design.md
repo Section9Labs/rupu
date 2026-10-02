@@ -130,6 +130,7 @@ This is a required method with no default. It streams the host-store blob `<aa>/
 
 - **Response headers:** artifacts of a text kind are served `text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`, never as HTML. Everything else gets `Content-Disposition: attachment; filename="<basename of path>"`.
 - **Bodies stream from disk.**
+- **Security.** The endpoint serves only artifacts a finding's ledger record lists, and the ledger lives in the agent-writable workspace. A forged ledger line that names a registered host and a known sha can therefore make the coordinator pull that blob from that host. The pull is bounded by the recorded size, verified by sha256, and only happens when an operator views the artifact. No URL is ever taken from the ledger: host ids resolve through the CP's registry. The host-side blob endpoint `GET /api/findings/artifacts/:sha256` is not finding-scoped: it serves any stored blob by hash to a bearer-token holder (the host-to-coordinator channel).
 
 ## Error handling summary
 
@@ -231,3 +232,11 @@ Where Plan A differs from the text above (the body is left as designed):
 - **A workflow's remote units and its in-process steps record under different scopes.** The host's `rupu run` uses the agent's name as `scope_name`, and an in-process step uses the workflow's, so one workflow's findings can land in two targets.
 - **`mark_external` also rewrites artifacts that were already `external`.** A host records a workspace file over the copy cap as `external` with no `host`; the merge sets `host` on it like any other artifact. Plan B therefore cannot tell a blob in the host's store from a file in the host's workspace by the record alone.
 - **A standalone remote agent run launched from the CP outside a workflow is mirrored but never merged.** Only the workflow runner ingests a unit's stream.
+
+## Deviations as built (Plan B)
+
+- **A local over-cap file keeps its shipped errors.** §B2.4's "404 `unavailable`" is not what #677/#683 serve, and that path is pinned by tests: a gone workspace file is `404` and a changed one is `409`, both with the standard `{"error": …}` body. `{"unavailable": …}` is the answer for remote (`host`) artifacts.
+- **One header policy.** Every artifact byte response, from both the coordinator endpoint and the host blob endpoint, carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`. The host blob endpoint's download filename is the sha.
+- **`pull_finding_artifact` takes `max_bytes`** (the recorded size) so a transport stops an oversize transfer as it streams.
+- **The web artifact browser is part of Plan B.** It previews and downloads remote artifacts; "web UI rendering" stayed out of scope only for the report renderer itself.
+- **The bucket worker's blob upload is part of the terminal hold.** Plan A made the bucket terminal pass hold a run — no terminal `run.json`, no `finished` marker — until every stream chunk has landed. The §B1 upload runs inside that pass, after the final coverage drain: a bucket error on a blob holds the run and retries it next tick (a blob that landed is skipped by its existence check), while a blob missing from the worker's own store is logged and skipped, since it can never land.
