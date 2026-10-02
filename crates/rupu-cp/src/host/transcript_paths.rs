@@ -213,6 +213,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 
@@ -248,6 +249,8 @@ mod tests {
                         success: true,
                         is_fixer: false,
                         codename: None,
+                        cause: None,
+                        error: None,
                     }],
                     findings: vec![],
                     iterations: 0,
@@ -257,6 +260,8 @@ mod tests {
                     run_outcome: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -276,6 +281,8 @@ mod tests {
                     finished_at: chrono::Utc::now(),
                     host: Some("host_abc".into()),
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

@@ -2244,6 +2244,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     };
     store.create(rec, "").unwrap();
 
@@ -2312,6 +2313,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     };
     store.create(rec, "").unwrap();
 
@@ -2375,6 +2377,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     };
     store.create(rec, "").unwrap();
 

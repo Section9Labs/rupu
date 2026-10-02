@@ -1985,6 +1985,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         rec.sync_awaiting_compat();
         rec
@@ -2415,6 +2416,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         rec.sync_awaiting_compat();
         store
@@ -2537,6 +2539,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         rec.sync_awaiting_compat();
         store
@@ -3818,6 +3821,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store
             .create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML)
@@ -3911,6 +3915,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         // Single gate, `on_timeout: approve` — must route to `ExpireApprove`.
         store
@@ -4238,6 +4243,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         rec.sync_awaiting_compat();
         rec

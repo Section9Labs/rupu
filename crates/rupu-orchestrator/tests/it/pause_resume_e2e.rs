@@ -982,6 +982,8 @@ async fn fanout_pause_resumes_only_incomplete_units() {
                     success: true,
                     is_fixer: false,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             );
     }

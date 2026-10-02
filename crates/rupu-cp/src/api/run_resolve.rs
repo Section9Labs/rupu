@@ -580,6 +580,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 

@@ -1249,6 +1249,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 rupu_orchestrator::RunStatus::Failed
             };
             let error_message = run_result.as_ref().err().map(|e| e.to_string());
+            let cause = run_result
+                .as_ref()
+                .err()
+                .and_then(|e| e.outcome())
+                .cloned();
             let rec = rupu_orchestrator::RunRecord {
                 id: run_id.clone(),
                 workflow_name: format!("agent:{}", spec.name),
@@ -1262,6 +1267,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 finished_at: Some(finished_at),
                 final_output: final_output.clone(),
                 error_message: error_message.clone(),
+                cause: cause.clone(),
                 awaiting: Vec::new(),
                 awaiting_step_id: None,
                 approval_prompt: None,
@@ -1308,6 +1314,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                             loaded.finished_at = Some(finished_at);
                             loaded.final_output = final_output;
                             loaded.error_message = error_message;
+                            loaded.cause = cause;
                             // Under the run lock, on the blocking pool: a cancel
                             // that landed since the load is kept.
                             match store
@@ -1915,6 +1922,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         rupu_cp::api::runs::RunListRow::from(&rec)
     }

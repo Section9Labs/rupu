@@ -100,6 +100,12 @@ pub enum Event {
         run_id: String,
         step_id: String,
         error: String,
+        /// The typed cause when the step failed on a classified response
+        /// outcome (a refusal, a provider error the recovery ladder could
+        /// not route around, ...). `None` for every other failure and in
+        /// older event logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<rupu_transcript::OutcomeRecord>,
     },
     StepSkipped {
         run_id: String,
@@ -154,6 +160,12 @@ pub enum Event {
         /// Absent in older event logs; serde default restores `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
+        /// The typed cause of a failed unit, when it failed on a classified
+        /// response outcome. `None` on success, for an unclassified failure,
+        /// for a remote unit (its error crosses the host boundary as text),
+        /// and in older event logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<rupu_transcript::OutcomeRecord>,
     },
     /// Emitted at the start of each gate-loop iteration in a panel step.
     /// Allows the live view to display a live round counter (e.g. "Round 2 / 5").
@@ -217,6 +229,10 @@ pub enum Event {
         success: bool,
         tokens_in: u64,
         tokens_out: u64,
+        /// The typed cause of a failed child run, when it failed on a
+        /// classified response outcome. Absent in older event logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<rupu_transcript::OutcomeRecord>,
     },
     /// A resumed run picked an interrupted attempt back up. Emitted once per
     /// interrupted attempt (a linear step, or one fan-out unit when
@@ -237,6 +253,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// An event type this build does not know — written by a newer rupu.
+    /// Readers skip it so an older reader can still replay a newer run's
+    /// `events.jsonl`. Never emitted.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Event {
@@ -263,6 +284,7 @@ impl Event {
             | Event::DispatchStarted { run_id, .. }
             | Event::DispatchCompleted { run_id, .. }
             | Event::AttemptResumed { run_id, .. } => run_id,
+            Event::Unknown => "",
         }
     }
 }
@@ -511,6 +533,7 @@ mod tests {
             success: true,
             tokens_in: 12,
             tokens_out: 34,
+            cause: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(
@@ -528,6 +551,7 @@ mod tests {
                 success,
                 tokens_in,
                 tokens_out,
+                ..
             } => {
                 assert_eq!(run_id, "run_parent");
                 assert_eq!(sub_run_id, "sub_child");
@@ -540,10 +564,88 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_type_errors() {
-        let bad = r#"{"type":"step_warped","run_id":"r","step_id":"s"}"#;
-        let res: Result<Event, _> = serde_json::from_str(bad);
-        assert!(res.is_err(), "unknown variant should fail to deserialize");
+    fn unknown_event_type_is_skipped_as_unknown() {
+        // A newer writer's event type must not break an older reader's
+        // `events.jsonl` replay: it parses as `Unknown` and is skipped.
+        let newer = r#"{"type":"step_warped","run_id":"r","step_id":"s"}"#;
+        let ev: Event = serde_json::from_str(newer).expect("unknown type parses");
+        assert!(matches!(ev, Event::Unknown), "got {ev:?}");
+        assert_eq!(ev.run_id(), "");
+    }
+
+    fn refusal_cause() -> rupu_transcript::OutcomeRecord {
+        rupu_transcript::OutcomeRecord {
+            id: "o1".into(),
+            class: "refusal".into(),
+            severity: rupu_transcript::Severity::Error,
+            title: "refused".into(),
+            detail: None,
+            error_class: None,
+            wire: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn step_failed_cause_round_trips_and_legacy_lines_parse() {
+        let ev = Event::StepFailed {
+            run_id: "run_A".into(),
+            step_id: "review".into(),
+            error: "agent failure in step review: refused".into(),
+            cause: Some(refusal_cause()),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains(r#""class":"refusal""#), "json: {json}");
+        match serde_json::from_str::<Event>(&json).expect("deserialize") {
+            Event::StepFailed { cause, .. } => assert_eq!(cause, Some(refusal_cause())),
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+
+        let legacy = r#"{"type":"step_failed","run_id":"r","step_id":"s","error":"boom"}"#;
+        match serde_json::from_str::<Event>(legacy).expect("legacy parses") {
+            Event::StepFailed { cause, error, .. } => {
+                assert_eq!(cause, None);
+                assert_eq!(error, "boom");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+        let none = Event::StepFailed {
+            run_id: "r".into(),
+            step_id: "s".into(),
+            error: "boom".into(),
+            cause: None,
+        };
+        assert!(!serde_json::to_string(&none).unwrap().contains("cause"));
+    }
+
+    #[test]
+    fn unit_and_dispatch_completed_carry_an_optional_cause() {
+        let unit = Event::UnitCompleted {
+            run_id: "r".into(),
+            step_id: "s".into(),
+            index: 1,
+            unit_key: "k".into(),
+            success: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            host: None,
+            cause: Some(refusal_cause()),
+        };
+        let back: Event = serde_json::from_str(&serde_json::to_string(&unit).unwrap()).unwrap();
+        assert!(
+            matches!(back, Event::UnitCompleted { cause: Some(c), .. } if c.class == "refusal")
+        );
+        let dispatch = Event::DispatchCompleted {
+            run_id: "r".into(),
+            sub_run_id: "sub".into(),
+            success: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            cause: Some(refusal_cause()),
+        };
+        let back: Event = serde_json::from_str(&serde_json::to_string(&dispatch).unwrap()).unwrap();
+        assert!(
+            matches!(back, Event::DispatchCompleted { cause: Some(c), .. } if c.class == "refusal")
+        );
     }
 
     #[test]

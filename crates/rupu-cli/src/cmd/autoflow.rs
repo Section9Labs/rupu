@@ -12566,6 +12566,7 @@ mod tests {
                     final_output: None,
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
+                    cause: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -13965,6 +13966,7 @@ steps:
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13988,6 +13990,8 @@ steps:
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -14124,6 +14128,7 @@ steps:
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14147,6 +14152,8 @@ steps:
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -14268,6 +14275,7 @@ steps:
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14306,6 +14314,8 @@ steps:
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -14427,6 +14437,7 @@ steps:
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14450,6 +14461,8 @@ steps:
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -14576,6 +14589,7 @@ steps:
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14599,6 +14613,8 @@ steps:
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -14717,6 +14733,7 @@ steps:
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
                     codename: None,
+                    cause: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -14870,6 +14887,7 @@ steps:
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
                     codename: None,
+                    cause: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -15048,6 +15066,7 @@ steps:
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
                     codename: None,
+                    cause: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -15073,6 +15092,8 @@ steps:
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

@@ -545,6 +545,8 @@ impl RunView {
                     }
                 }
             }
+            // Written by a newer rupu: nothing this view can show.
+            Event::Unknown => {}
         }
     }
 }
@@ -837,6 +839,7 @@ mod tests {
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         });
         v.apply(&Event::UnitCompleted {
             run_id: "r".into(),
@@ -847,6 +850,7 @@ mod tests {
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         });
 
         let step = &v.steps[0];
@@ -1020,6 +1024,7 @@ mod tests {
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         });
 
         assert_eq!(v.steps.len(), 1, "no phantom step");
@@ -1060,6 +1065,7 @@ mod tests {
             success: true,
             tokens_in: 1000,
             tokens_out: 200,
+            cause: None,
         });
 
         let d = &v.dispatches["sub1"];
@@ -1209,6 +1215,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         let mut triage = record("triage", StepKind::Panel);
         triage.findings = vec![finding("High"), finding("high"), finding("low")];

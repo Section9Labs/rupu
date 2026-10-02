@@ -4193,6 +4193,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 
@@ -4351,6 +4352,8 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            cause: None,
+            error: None,
         }
     }
 
@@ -4693,6 +4696,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         std::fs::write(
             &step_results,
@@ -5104,6 +5109,8 @@ mod tests {
                 success: true,
                 is_fixer: false,
                 codename: None,
+                cause: None,
+                error: None,
             }],
             findings: Vec::new(),
             iterations: 0,
@@ -5112,6 +5119,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),

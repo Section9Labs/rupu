@@ -94,6 +94,7 @@ fn base_record(id: &str) -> RunRecord {
         loop_progress: BTreeMap::new(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     }
 }
 

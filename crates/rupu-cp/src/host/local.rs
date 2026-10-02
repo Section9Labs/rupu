@@ -714,6 +714,7 @@ mod pause_resume_tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 

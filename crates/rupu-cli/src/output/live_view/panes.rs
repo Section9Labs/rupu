@@ -960,6 +960,7 @@ steps:
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         });
     }
 
@@ -1549,6 +1550,7 @@ steps:
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         });
         assert_eq!(active_count(&v), 3);
         let fan = Workflow::parse(FANOUT_WF).expect("parses");

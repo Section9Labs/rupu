@@ -22,6 +22,7 @@ mod gate_node;
 mod gate_sweep_smoke;
 mod linear_runner;
 mod multi_gate_path_scoped;
+mod outcome_cause;
 mod pause_resume_e2e;
 mod placed_step_e2e;
 mod remote_coverage_ingest;

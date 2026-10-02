@@ -3551,6 +3551,8 @@ pub(crate) async fn resume_run(
                     success: true,
                     is_fixer: false,
                     codename: cp.codename.clone(),
+                    error: cp.error.clone(),
+                    cause: cp.cause.clone(),
                 },
             );
         } else {
@@ -6338,6 +6340,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 

@@ -389,6 +389,17 @@ pub enum RunWorkflowError {
     LoopExhausted { name: String, max_iterations: u32 },
 }
 
+impl RunWorkflowError {
+    /// The typed cause behind an agent failure, when the agent run failed on
+    /// a classified response outcome. `None` for every other error.
+    pub fn outcome(&self) -> Option<&rupu_transcript::OutcomeRecord> {
+        match self {
+            RunWorkflowError::Agent { source, .. } => source.outcome(),
+            _ => None,
+        }
+    }
+}
+
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
 /// Production impl wires real providers + the default tool registry;
 /// tests inject mock providers.
@@ -702,6 +713,14 @@ pub struct StepResult {
     pub host: Option<String>,
     /// Codename of the singleton member that ran this step; `None` for fan-out/panel/parallel steps.
     pub codename: Option<String>,
+    /// Why the step failed, when `continue_on_error` let the run go on.
+    /// `None` on success. Persisted into
+    /// [`crate::runs::StepResultRecord::error`].
+    pub error: Option<String>,
+    /// The typed cause behind `error`, when it was a classified response
+    /// outcome. Boxed for the same reason as `run_outcome`: an inline
+    /// record would grow every `StepResult` the hot enums carry.
+    pub cause: Option<Box<rupu_transcript::OutcomeRecord>>,
 }
 
 /// Runtime form of one finding emitted by a panelist. Aggregated
@@ -740,6 +759,8 @@ impl Default for StepResult {
             loop_iteration: None,
             host: None,
             codename: None,
+            error: None,
+            cause: None,
         }
     }
 }
@@ -785,6 +806,12 @@ pub struct ItemResult {
     pub is_fixer: bool,
     /// Codename of the agent instance that ran this unit.
     pub codename: Option<String>,
+    /// Why this unit failed. `None` on success.
+    pub error: Option<String>,
+    /// The typed cause behind `error`, when it was a classified response
+    /// outcome. `None` for a remote unit: its error crosses the host
+    /// boundary as text only.
+    pub cause: Option<rupu_transcript::OutcomeRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -1155,6 +1182,7 @@ pub async fn run_workflow(
                 started_at: chrono::Utc::now(),
                 finished_at: None,
                 error_message: None,
+                cause: None,
                 awaiting: Vec::new(),
                 awaiting_step_id: None,
                 approval_prompt: None,
@@ -1568,6 +1596,8 @@ enum RunEnd {
     },
     Failed {
         error: String,
+        /// The typed cause, when an agent failed on a classified outcome.
+        cause: Option<rupu_transcript::OutcomeRecord>,
     },
 }
 
@@ -1605,6 +1635,7 @@ impl RunEnd {
             },
             Err(e) => RunEnd::Failed {
                 error: e.to_string(),
+                cause: e.outcome().cloned(),
             },
         }
     }
@@ -1628,6 +1659,7 @@ impl RunEnd {
                 rec.status = status;
                 rec.finished_at = Some(now);
                 rec.error_message = error;
+                rec.cause = None;
                 rec.awaiting.clear();
                 rec.sync_awaiting_compat();
             }
@@ -1672,10 +1704,11 @@ impl RunEnd {
                 rec.awaiting_since = Some(now);
                 rec.expires_at = None;
             }
-            RunEnd::Failed { error } => {
+            RunEnd::Failed { error, cause } => {
                 rec.status = crate::runs::RunStatus::Failed;
                 rec.finished_at = Some(now);
                 rec.error_message = Some(error);
+                rec.cause = cause;
             }
         }
         rec.runner_pid = None;
@@ -1856,7 +1889,8 @@ fn workflow_has_sync_step(opts: &OrchestratorRunOpts) -> bool {
 /// agent turn). The paused arm carries the seed transcript so the resumed run
 /// can continue from where the agent left off.
 enum LinearStepOutcome {
-    Completed(StepResult),
+    /// Boxed: a `StepResult` dwarfs the paused arm.
+    Completed(Box<StepResult>),
     Paused {
         step_id: String,
         /// The paused agent's `final_messages` (transcript through the last
@@ -1874,7 +1908,8 @@ enum LinearStepOutcome {
 /// ONLY the paused / not-yet-started units — never a unit that already has a
 /// good result.
 enum FanoutStepOutcome {
-    Completed(StepResult),
+    /// Boxed: a `StepResult` dwarfs the paused arm.
+    Completed(Box<StepResult>),
     Paused {
         step_id: String,
         completed_units: std::collections::BTreeMap<usize, ItemResult>,
@@ -3628,6 +3663,7 @@ async fn run_scheduler_scoped(
                                         run_id: run_id.to_string(),
                                         step_id: step.id.clone(),
                                         error: e.to_string(),
+                                        cause: e.outcome().cloned(),
                                     },
                                 );
                             }
@@ -5084,6 +5120,8 @@ fn drain_joins(
                 success: src.success,
                 is_fixer: false,
                 codename: src.codename.clone(),
+                error: src.error.clone(),
+                cause: src.cause.as_deref().cloned(),
             });
         }
         let join_step = &wf.steps[j];
@@ -5722,7 +5760,7 @@ async fn run_node(
                     fanout_completed_units: completed_units,
                 });
             }
-            Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
+            Ok(FanoutStepOutcome::Completed(sr)) => Ok(*sr),
             Err(e) => Err(e),
         }
     } else if step.run.is_some() && step.for_each.is_none() {
@@ -5790,7 +5828,7 @@ async fn run_node(
                     fanout_completed_units: std::collections::BTreeMap::new(),
                 });
             }
-            Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
+            Ok(LinearStepOutcome::Completed(sr)) => Ok(*sr),
             Err(e) => Err(e),
         }
     };
@@ -5820,6 +5858,7 @@ async fn run_node(
                         run_id: run_id.to_string(),
                         step_id: step.id.clone(),
                         error: e.to_string(),
+                        cause: e.outcome().cloned(),
                     },
                 );
             }
@@ -7064,6 +7103,7 @@ async fn run_on_reject_chain(
                                 run_id: run_id.to_string(),
                                 step_id: step.id.clone(),
                                 error: e.to_string(),
+                                cause: e.outcome().cloned(),
                             },
                         );
                     }
@@ -7122,6 +7162,7 @@ async fn run_on_reject_chain(
                             run_id: run_id.to_string(),
                             step_id: step.id.clone(),
                             error: e.to_string(),
+                            cause: None,
                         },
                     );
                 }
@@ -7176,15 +7217,15 @@ async fn run_on_reject_chain(
         .await;
         let duration_ms = step_timer.elapsed().as_millis() as u64;
 
-        let (success, error_text) = match outcome {
-            Ok(_) => (true, String::new()),
+        let (success, error_text, cause) = match outcome {
+            Ok(_) => (true, String::new(), None),
             Err(e) => {
                 warn!(
                     step = %step.id,
                     error = %e,
                     "on_reject cleanup step failed; continuing chain"
                 );
-                (false, e.to_string())
+                (false, e.to_string(), e.outcome().cloned())
             }
         };
         if let Some(sink) = opts.event_sink.as_ref() {
@@ -7206,6 +7247,7 @@ async fn run_on_reject_chain(
                         run_id: run_id.to_string(),
                         step_id: step.id.clone(),
                         error: error_text,
+                        cause,
                     },
                 );
             }
@@ -7881,6 +7923,10 @@ async fn run_linear_step(
         }
     }
 
+    // Why a tolerated (`continue_on_error`) local failure failed. A placed
+    // step's failure crosses the host boundary as text only, and the
+    // placement path records none here.
+    let mut failure: Option<(String, Option<rupu_transcript::OutcomeRecord>)> = None;
     let (output, success) = match step.host.as_deref() {
         Some(host) => {
             let sync =
@@ -7984,6 +8030,7 @@ async fn run_linear_step(
                             error = %source,
                             "step failed but continue_on_error is set; proceeding"
                         );
+                        failure = Some((source.to_string(), source.outcome().cloned()));
                         false
                     } else {
                         return Err(RunWorkflowError::Agent {
@@ -7998,8 +8045,9 @@ async fn run_linear_step(
             (output, success)
         }
     };
+    let (error, cause) = failure.unzip();
 
-    Ok(LinearStepOutcome::Completed(StepResult {
+    Ok(LinearStepOutcome::Completed(Box::new(StepResult {
         step_id: step.id.clone(),
         rendered_prompt: rendered,
         run_id,
@@ -8010,8 +8058,10 @@ async fn run_linear_step(
         items: Vec::new(),
         host: step.host.clone(),
         codename: codename.map(|c| c.to_string()),
+        error,
+        cause: cause.flatten().map(Box::new),
         ..Default::default()
-    }))
+    })))
 }
 
 /// Fan-out step: render `for_each:` to a list, then dispatch the
@@ -8168,6 +8218,8 @@ async fn run_fanout_run_step(
                     finished_at: chrono::Utc::now(),
                     host: None,
                     codename: None,
+                    error: None,
+                    cause: None,
                 };
                 if let Err(e) = store.append_unit_checkpoint(&workflow_run_id, &checkpoint) {
                     warn!(step = %step_clone.id, index = idx, error = %e, "failed to append unit checkpoint");
@@ -8197,6 +8249,8 @@ async fn run_fanout_run_step(
                 success,
                 is_fixer: false,
                 codename: None,
+                error: None,
+                cause: None,
             },
         ));
     }
@@ -8420,7 +8474,7 @@ async fn run_fanout_step(
 
     if items.is_empty() {
         info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
-        return Ok(FanoutStepOutcome::Completed(StepResult {
+        return Ok(FanoutStepOutcome::Completed(Box::new(StepResult {
             step_id: step.id.clone(),
             rendered_prompt: String::new(),
             run_id: String::new(),
@@ -8431,7 +8485,7 @@ async fn run_fanout_step(
             kind: crate::runs::StepKind::ForEach,
             items: Vec::new(),
             ..Default::default()
-        }));
+        })));
     }
 
     let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
@@ -8770,6 +8824,7 @@ async fn run_fanout_step(
                     output: String::new(),
                     success: false,
                     error: None,
+                    cause: None,
                     raw_error: None,
                     workspace_delta: None,
                     paused: true,
@@ -9159,6 +9214,7 @@ async fn run_fanout_step(
                         }
                     }
                 };
+            let cause = raw_error.as_ref().and_then(RunError::outcome).cloned();
 
             if !paused {
                 if let Some(sink) = event_sink.as_ref() {
@@ -9189,6 +9245,7 @@ async fn run_fanout_step(
                             tokens_in,
                             tokens_out,
                             host: placement_host.clone(),
+                            cause: cause.clone(),
                         },
                     );
                 }
@@ -9216,6 +9273,8 @@ async fn run_fanout_step(
                         finished_at: chrono::Utc::now(),
                         host: placement_host.clone(),
                         codename: codename.clone(),
+                        error: error_str.clone(),
+                        cause: cause.clone(),
                     };
                     if let Err(e) = store.append_unit_checkpoint(&workflow_run_id, &checkpoint) {
                         warn!(step = %step_id, index = idx, error = %e, "failed to append unit checkpoint");
@@ -9231,6 +9290,7 @@ async fn run_fanout_step(
                 output,
                 success,
                 error: error_str,
+                cause,
                 raw_error,
                 workspace_delta,
                 paused,
@@ -9305,6 +9365,8 @@ async fn run_fanout_step(
                     success: true,
                     is_fixer: false,
                     codename: o.codename.clone(),
+                    error: None,
+                    cause: None,
                 },
             );
         }
@@ -9331,6 +9393,8 @@ async fn run_fanout_step(
             success: o.success,
             is_fixer: false,
             codename: o.codename.clone(),
+            error: o.error.clone(),
+            cause: o.cause.clone(),
         })
         .collect();
     items_vec.extend(resumed.into_values());
@@ -9379,7 +9443,7 @@ async fn run_fanout_step(
         }
     }
 
-    Ok(FanoutStepOutcome::Completed(StepResult {
+    Ok(FanoutStepOutcome::Completed(Box::new(StepResult {
         step_id: step.id.clone(),
         // The for_each-rendered list of items doubles as the
         // top-level "rendered prompt" for audit purposes; per-item
@@ -9396,7 +9460,7 @@ async fn run_fanout_step(
         // itself names no single member (see `StepResultRecord::codename`).
         codename: None,
         ..Default::default()
-    }))
+    })))
 }
 
 /// Parallel step: render each sub-step's prompt against the same
@@ -9531,6 +9595,7 @@ async fn run_parallel_step(
                 Ok(_) => (true, None, None),
                 Err(e) => (false, Some(e.to_string()), Some(e)),
             };
+            let cause = raw_error.as_ref().and_then(RunError::outcome).cloned();
             let output = read_final_assistant_text(
                 &transcript_clone,
                 success,
@@ -9550,6 +9615,7 @@ async fn run_parallel_step(
                         tokens_in: counters.input.load(std::sync::atomic::Ordering::Relaxed),
                         tokens_out: counters.output.load(std::sync::atomic::Ordering::Relaxed),
                         host: None,
+                        cause: cause.clone(),
                     },
                 );
             }
@@ -9562,6 +9628,7 @@ async fn run_parallel_step(
                 output,
                 success,
                 error: error_str,
+                cause,
                 raw_error,
                 codename: codename.map(|c| c.to_string()),
             }
@@ -9606,6 +9673,8 @@ async fn run_parallel_step(
             success: o.success,
             is_fixer: false,
             codename: o.codename.clone(),
+            error: o.error.clone(),
+            cause: o.cause.clone(),
         })
         .collect();
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
@@ -9643,8 +9712,10 @@ struct ParallelSubOutcome {
     transcript_path: PathBuf,
     output: String,
     success: bool,
-    #[allow(dead_code)]
     error: Option<String>,
+    /// The typed cause behind `error`, read off `raw_error` before the
+    /// abort path takes it.
+    cause: Option<rupu_transcript::OutcomeRecord>,
     raw_error: Option<RunError>,
     codename: Option<String>,
 }
@@ -9660,10 +9731,11 @@ struct FanoutItemOutcome {
     transcript_path: PathBuf,
     output: String,
     success: bool,
-    /// String form, currently unused but kept for future structured
-    /// per-item error reporting in `ItemResult`.
-    #[allow(dead_code)]
+    /// String form of the failure; flows into `ItemResult::error`.
     error: Option<String>,
+    /// The typed cause behind `error`, read off `raw_error` before the
+    /// abort path takes it. `None` for a remote unit.
+    cause: Option<rupu_transcript::OutcomeRecord>,
     raw_error: Option<RunError>,
     /// File-change set returned by a sync-mode unit. `None` for local
     /// (non-sync) units or when the unit returned no delta.
@@ -10214,6 +10286,8 @@ async fn run_panel_step(
                     success: true,
                     is_fixer: true,
                     codename: fixer_codename.as_ref().map(ToString::to_string),
+                    error: None,
+                    cause: None,
                 });
                 subject = output;
                 // Loop continues; pass is dropped — its findings are
@@ -10249,6 +10323,8 @@ async fn run_panel_step(
                     success: false,
                     is_fixer: true,
                     codename: fixer_codename.as_ref().map(ToString::to_string),
+                    error: Some(error.to_string()),
+                    cause: error.outcome().cloned(),
                 });
                 warn!(step = %step.id, error = %error, "fixer agent failed; tolerating via continue_on_error");
                 break (pass, false);
@@ -10313,6 +10389,8 @@ impl PanelPass {
             loop_iteration: None,
             host: None,
             codename: None,
+            error: None,
+            cause: None,
         }
     }
 }
@@ -10440,6 +10518,7 @@ async fn dispatch_fixer(
                 tokens_in: counters.input.load(std::sync::atomic::Ordering::Relaxed),
                 tokens_out: counters.output.load(std::sync::atomic::Ordering::Relaxed),
                 host: None,
+                cause: outcome.as_ref().err().and_then(RunError::outcome).cloned(),
             },
         );
     }
@@ -10611,10 +10690,11 @@ async fn run_panel_iteration(
                 on_usage,
             )
             .await;
-            let (success, _err_str, raw_error) = match outcome {
+            let (success, error_str, raw_error) = match outcome {
                 Ok(_) => (true, None, None),
                 Err(e) => (false, Some(e.to_string()), Some(e)),
             };
+            let cause = raw_error.as_ref().and_then(RunError::outcome).cloned();
             let output = read_final_assistant_text(
                 &transcript_clone,
                 success,
@@ -10634,6 +10714,7 @@ async fn run_panel_iteration(
                         tokens_in: counters.input.load(std::sync::atomic::Ordering::Relaxed),
                         tokens_out: counters.output.load(std::sync::atomic::Ordering::Relaxed),
                         host: None,
+                        cause: cause.clone(),
                     },
                 );
             }
@@ -10645,6 +10726,8 @@ async fn run_panel_iteration(
                 transcript_path,
                 output,
                 success,
+                error: error_str,
+                cause,
                 raw_error,
                 codename: codename.map(|c| c.to_string()),
             }
@@ -10716,6 +10799,8 @@ async fn run_panel_iteration(
             success: o.success,
             is_fixer: false,
             codename: o.codename.clone(),
+            error: o.error.clone(),
+            cause: o.cause.clone(),
         })
         .collect();
     let success = items_vec.iter().all(|i| i.success);
@@ -10745,6 +10830,11 @@ struct PanelOutcome {
     transcript_path: PathBuf,
     output: String,
     success: bool,
+    /// String form of the failure; flows into `ItemResult::error`.
+    error: Option<String>,
+    /// The typed cause behind `error`, read off `raw_error` before the
+    /// abort path takes it.
+    cause: Option<rupu_transcript::OutcomeRecord>,
     raw_error: Option<RunError>,
     /// The panelist's instance codename; stamped on every finding it raises.
     codename: Option<String>,
@@ -12887,6 +12977,8 @@ steps:
                         success: true,
                         is_fixer: false,
                         codename: None,
+                        cause: None,
+                        error: None,
                     },
                 );
         }
@@ -16524,6 +16616,7 @@ loops:
                     loop_progress: BTreeMap::new(),
                     gate_decisions: Vec::new(),
                     codename: None,
+                    cause: None,
                 },
                 REFINE_WF,
             )

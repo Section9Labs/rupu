@@ -3014,6 +3014,8 @@ mod tests {
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -3297,6 +3299,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 

@@ -133,6 +133,12 @@ pub struct RunRecord {
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// The typed cause behind `error_message`, when the run failed on a
+    /// classified response outcome (a refusal, a provider error the
+    /// recovery ladder could not route around, ...). Absent otherwise and
+    /// on every record written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<rupu_transcript::OutcomeRecord>,
     /// Every approval gate currently parked on this run (Phase 2, spec §7).
     /// A DAG can reach several gates on independent concurrent paths in a
     /// single batch-park wave (see `run_scheduler`'s doc); this is the
@@ -726,6 +732,14 @@ pub struct StepResultRecord {
     /// Codename of the singleton member that ran this step. `None` for fan-out/panel/parallel steps (instances live on `items`) and legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codename: Option<String>,
+    /// Why a failed step failed, when the run went on anyway
+    /// (`continue_on_error`). Absent on success and on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The typed cause behind `error`, when it was a classified response
+    /// outcome. Absent otherwise and on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<rupu_transcript::OutcomeRecord>,
 }
 
 /// Captured process outcome for a `run:` step. `None` for every other
@@ -797,6 +811,13 @@ pub struct ItemResultRecord {
     /// Codename of the agent instance that ran this unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codename: Option<String>,
+    /// Why this unit failed. Absent on success and on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The typed cause behind `error`, when it was a classified response
+    /// outcome. Absent otherwise and on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<rupu_transcript::OutcomeRecord>,
 }
 
 /// One durable per-unit checkpoint for a fan-out (`for_each`) step,
@@ -831,6 +852,13 @@ pub struct UnitCheckpoint {
     /// Codename of the agent instance that ran this unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codename: Option<String>,
+    /// Why this unit failed. Absent on success and on legacy checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The typed cause behind `error`, when it was a classified response
+    /// outcome. Absent otherwise and on legacy checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<rupu_transcript::OutcomeRecord>,
 }
 
 /// One agent-attempt ledger row, appended to `attempts.jsonl` at the
@@ -892,6 +920,8 @@ impl From<&StepResult> for StepResultRecord {
             loop_iteration: sr.loop_iteration,
             host: sr.host.clone(),
             codename: sr.codename.clone(),
+            error: sr.error.clone(),
+            cause: sr.cause.as_deref().cloned(),
         }
     }
 }
@@ -909,6 +939,8 @@ impl From<&ItemResult> for ItemResultRecord {
             success: i.success,
             is_fixer: i.is_fixer,
             codename: i.codename.clone(),
+            error: i.error.clone(),
+            cause: i.cause.clone(),
         }
     }
 }
@@ -942,6 +974,8 @@ impl From<&StepResultRecord> for StepResult {
             loop_iteration: rec.loop_iteration,
             host: rec.host.clone(),
             codename: rec.codename.clone(),
+            error: rec.error.clone(),
+            cause: rec.cause.clone().map(Box::new),
         }
     }
 }
@@ -959,6 +993,8 @@ impl From<&ItemResultRecord> for ItemResult {
             success: rec.success,
             is_fixer: rec.is_fixer,
             codename: rec.codename.clone(),
+            error: rec.error.clone(),
+            cause: rec.cause.clone(),
         }
     }
 }
@@ -4261,6 +4297,7 @@ mod tests {
             loop_progress: BTreeMap::new(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 
@@ -4283,6 +4320,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         }
     }
 
@@ -4495,6 +4534,8 @@ mod tests {
             success: true,
             is_fixer: false,
             codename: Some("jade-reef/numbat#2".into()),
+            cause: None,
+            error: None,
         });
         store.append_step_result(&rec.id, &step).unwrap();
         assert_eq!(
@@ -4763,6 +4804,8 @@ mod tests {
             finished_at: Utc::now(),
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         let cp1 = UnitCheckpoint {
             step_id: "review_each".into(),
@@ -4775,6 +4818,8 @@ mod tests {
             finished_at: Utc::now(),
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         store.append_unit_checkpoint(&rec.id, &cp0).unwrap();
         store.append_unit_checkpoint(&rec.id, &cp1).unwrap();
@@ -8050,6 +8095,8 @@ mod tests {
             finished_at: Utc::now(),
             host: Some("h1".into()),
             codename: None,
+            cause: None,
+            error: None,
         };
 
         // Serializes with the host field present.
@@ -8283,6 +8330,100 @@ mod tests {
         );
     }
 
+    fn refusal_cause() -> rupu_transcript::OutcomeRecord {
+        rupu_transcript::OutcomeRecord {
+            id: "o1".into(),
+            class: "refusal".into(),
+            severity: rupu_transcript::Severity::Error,
+            title: "refused".into(),
+            detail: Some("declined the request".into()),
+            error_class: None,
+            wire: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn step_result_record_error_and_cause_round_trip_and_legacy_parses() {
+        let legacy = r#"{"step_id":"s","run_id":"r","transcript_path":"/t.jsonl","output":"","success":false,"skipped":false,"rendered_prompt":"","finished_at":"2026-10-02T00:00:00Z"}"#;
+        let rec: StepResultRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.error, None);
+        assert_eq!(rec.cause, None);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("\"error\""), "absent, not null: {json}");
+        assert!(!json.contains("\"cause\""), "absent, not null: {json}");
+
+        let mut failed = rec.clone();
+        failed.error = Some("agent run ended in status Error (refused)".into());
+        failed.cause = Some(refusal_cause());
+        let back: StepResultRecord =
+            serde_json::from_str(&serde_json::to_string(&failed).unwrap()).unwrap();
+        assert_eq!(back.error, failed.error);
+        assert_eq!(back.cause, Some(refusal_cause()));
+
+        // Both fields survive the runtime round trip the resume path takes.
+        let runtime = crate::runner::StepResult::from(&back);
+        assert_eq!(runtime.error, failed.error);
+        assert_eq!(runtime.cause.as_deref(), Some(&refusal_cause()));
+        let again = StepResultRecord::from(&runtime);
+        assert_eq!(again.error, failed.error);
+        assert_eq!(again.cause, Some(refusal_cause()));
+    }
+
+    #[test]
+    fn item_result_record_error_and_cause_survive_conversion() {
+        let item = crate::runner::ItemResult {
+            index: 0,
+            item: serde_json::json!("a.rs"),
+            sub_id: String::new(),
+            rendered_prompt: String::new(),
+            run_id: "run_U".into(),
+            transcript_path: PathBuf::from("/t.jsonl"),
+            output: String::new(),
+            success: false,
+            is_fixer: false,
+            codename: None,
+            error: Some("refused".into()),
+            cause: Some(refusal_cause()),
+        };
+        let rec = ItemResultRecord::from(&item);
+        let back: ItemResultRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back.error.as_deref(), Some("refused"));
+        assert_eq!(back.cause, Some(refusal_cause()));
+        let runtime = crate::runner::ItemResult::from(&back);
+        assert_eq!(runtime.error.as_deref(), Some("refused"));
+        assert_eq!(runtime.cause, Some(refusal_cause()));
+    }
+
+    #[test]
+    fn unit_checkpoint_error_and_cause_round_trip_and_legacy_parses() {
+        let legacy = r#"{"step_id":"s","index":0,"item":1,"run_id":"run_X","transcript_path":"/t","output":"","success":false,"finished_at":"2026-10-02T00:00:00Z"}"#;
+        let cp: UnitCheckpoint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cp.error, None);
+        assert_eq!(cp.cause, None);
+        assert_eq!(serde_json::to_string(&cp).unwrap(), legacy);
+
+        let failed = UnitCheckpoint {
+            error: Some("refused".into()),
+            cause: Some(refusal_cause()),
+            ..cp
+        };
+        let back: UnitCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&failed).unwrap()).unwrap();
+        assert_eq!(back.error.as_deref(), Some("refused"));
+        assert_eq!(back.cause, Some(refusal_cause()));
+    }
+
+    #[test]
+    fn run_record_cause_round_trips_and_is_absent_when_none() {
+        let mut r = sample_record("run_cause");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("\"cause\""), "absent, not null: {json}");
+        r.cause = Some(refusal_cause());
+        let back: RunRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.cause, Some(refusal_cause()));
+    }
+
     #[test]
     fn legacy_records_round_trip_without_codename_keys() {
         let legacy = r#"{"step_id":"s","index":0,"item":1,"run_id":"run_X","transcript_path":"/t","output":"","success":true,"finished_at":"2026-09-29T00:00:00Z"}"#;
@@ -8304,6 +8445,8 @@ mod tests {
             success: true,
             is_fixer: false,
             codename: Some("jade-reef/heron#1".into()),
+            cause: None,
+            error: None,
         };
         let rec = ItemResultRecord::from(&item);
         assert_eq!(rec.codename.as_deref(), Some("jade-reef/heron#1"));
@@ -8336,6 +8479,8 @@ mod tests {
             output: "o".into(),
             success: true,
             is_fixer: false,
+            cause: None,
+            error: None,
         }];
         store.append_step_result(&rec.id, &sr).unwrap();
         // 2) events: an in-flight unit (retry attempt) + a linear step working + a dispatch
@@ -8458,6 +8603,8 @@ mod tests {
             output: String::new(),
             success: true,
             is_fixer: false,
+            cause: None,
+            error: None,
         }];
         let line = serde_json::to_string(&sr).unwrap();
         let got = known_transcripts_from_step_result_line(&line);
@@ -8599,6 +8746,8 @@ mod tests {
             output: String::new(),
             success: true,
             is_fixer: false,
+            cause: None,
+            error: None,
         }];
         store.append_step_result(&rec.id, &sr).unwrap();
         let events = [

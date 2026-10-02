@@ -312,6 +312,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store
             .create(record.clone(), "name: test\nsteps: []\n")

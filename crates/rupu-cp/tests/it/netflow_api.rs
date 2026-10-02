@@ -262,6 +262,7 @@ fn seed_run(id: &str, workspace_path: PathBuf) -> RunRecord {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     }
 }
 
@@ -284,6 +285,8 @@ fn seed_step(run_id: &str, transcript_path: PathBuf) -> StepResultRecord {
         loop_iteration: None,
         host: None,
         codename: None,
+        cause: None,
+        error: None,
     }
 }
 

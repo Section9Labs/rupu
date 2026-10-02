@@ -62,6 +62,7 @@ fn seed_run(id: &str, status: RunStatus) -> RunRecord {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     }
 }
 

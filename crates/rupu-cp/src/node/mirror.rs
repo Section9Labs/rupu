@@ -179,6 +179,7 @@ impl NodeMirror {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
 
         // Empty workflow YAML: node runs don't carry a local workflow snapshot.
@@ -646,6 +647,8 @@ impl NodeMirror {
             run_outcome: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         if let Err(e) = self.run_store.append_step_result(&record.id, &row) {
             tracing::warn!(

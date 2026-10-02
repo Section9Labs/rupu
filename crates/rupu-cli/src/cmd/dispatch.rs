@@ -208,7 +208,8 @@ impl CliAgentDispatcher {
     /// Best-effort `DispatchCompleted` emission — guards the `Option` and
     /// never fails the child (or parent) run. Called from every exit
     /// path of `dispatch()` reached after the matching `DispatchStarted`
-    /// was emitted.
+    /// was emitted. `cause` is the child's typed failure, when it failed
+    /// on a classified response outcome.
     fn emit_dispatch_completed(
         &self,
         parent_run_id: &str,
@@ -216,6 +217,7 @@ impl CliAgentDispatcher {
         success: bool,
         tokens_in: u64,
         tokens_out: u64,
+        cause: Option<rupu_transcript::OutcomeRecord>,
     ) {
         if let Some(sink) = &self.event_sink {
             sink.emit(
@@ -226,6 +228,7 @@ impl CliAgentDispatcher {
                     success,
                     tokens_in,
                     tokens_out,
+                    cause,
                 },
             );
         }
@@ -376,7 +379,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let mut provider = match built {
             Ok((_resolved, p)) => p,
             Err(e) => {
-                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0, None);
                 if let Some(h) = netflow_handle {
                     h.shutdown().await;
                 }
@@ -504,7 +507,14 @@ impl AgentDispatcher for CliAgentDispatcher {
         let run_result = match run_agent(opts).await {
             Ok(r) => r,
             Err(e) => {
-                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                self.emit_dispatch_completed(
+                    parent_run_id,
+                    &sub_run_id,
+                    false,
+                    0,
+                    0,
+                    e.outcome().cloned(),
+                );
                 if let Some(h) = netflow_handle {
                     h.shutdown().await;
                 }
@@ -556,6 +566,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             success,
             run_result.total_tokens_in,
             run_result.total_tokens_out,
+            terminal.as_ref().and_then(|e| e.outcome()).cloned(),
         );
 
         Ok(DispatchOutcome {
