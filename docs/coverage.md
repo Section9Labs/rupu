@@ -285,7 +285,10 @@ plane's own `artifact_max_bytes` is refused without contacting the host. Concurr
 same blob share one pull. A local over-cap file (`external` with no `host`) is
 served from the workspace while it still hashes to the recorded sha: `404` once
 the file is gone, `409` once it has changed. Text artifacts are served as plain
-text; everything else as an attachment.
+text; PNG, JPEG, GIF and WebP images (recognised by their leading bytes,
+never by file name) inline with their `image/*` type; everything else as an
+attachment. Every response carries `X-Content-Type-Options: nosniff` and a
+`Content-Security-Policy: sandbox`.
 
 When a remote artifact's bytes cannot be had, the response is `404` with
 `{"unavailable": "<reason>"}`: the host is unreachable or not registered, the
@@ -299,6 +302,25 @@ The web finding page's artifact browser uses the same endpoint. It previews
 text up to 256 KiB when you open it and offers a download for every artifact. A
 remote artifact is fetched from its host the first time it is previewed or
 downloaded; a binary one only when you download it.
+
+#### Evidence-block files
+
+An `image`, `hexdump` or `pcap_ref` evidence block names exactly one file, in
+its `artifact.path`. rupu verifies and stores that file the same way as a
+`report.artifacts` entry: the same hashing, the same copy-or-reference rule,
+and the same per-finding limits (`artifact_max_files` and
+`artifact_total_max_bytes` are shared, so block files and PoC artifacts count
+together). A block file is not a proof-of-concept artifact: it does not appear
+in the PoC list. A bad path is rejected like an artifact path, with the field
+named `report.blocks[<i>].artifact.path`.
+
+`GET /api/findings/:id/artifacts/:sha256` serves block files exactly like
+artifacts, including the first-view pull of a remote one from its host (see
+[Downloading artifacts](#downloading-artifacts)); the bucket worker also
+uploads them. The finding page renders every block kind in an "Evidence
+blocks" section. An `image` block shows its picture inline; a block whose file
+lives on a remote host loads only when you click it, so opening a finding
+never pulls from a host.
 
 ### Configuration
 
