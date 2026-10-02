@@ -140,6 +140,8 @@ impl ProviderRouter {
             }
             ProviderId::GithubCopilot => true,
             ProviderId::OpenaiCompatible => true,
+            // A local or broker provider serves whatever model it is given.
+            ProviderId::Local | ProviderId::Broker => true,
         };
 
         if matches {

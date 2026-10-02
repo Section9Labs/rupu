@@ -229,7 +229,7 @@ impl LlmProvider for LocalModelProvider {
     }
 
     fn provider_id(&self) -> crate::provider_id::ProviderId {
-        crate::provider_id::ProviderId::Anthropic
+        crate::provider_id::ProviderId::Local
     }
 }
 
@@ -300,6 +300,19 @@ pub enum RoutingDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_id_is_local() {
+        let provider = LocalModelProvider::new(
+            "http://localhost:8080",
+            "phi-local",
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
+        assert_eq!(
+            provider.provider_id(),
+            crate::provider_id::ProviderId::Local
+        );
+    }
 
     #[test]
     fn test_local_model_provider_new_trims_trailing_slash() {

@@ -14,10 +14,14 @@ pub enum ProviderId {
     GoogleAntigravity,
     GithubCopilot,
     OpenaiCompatible,
+    /// A local model server. Never credentialed, so absent from `ALL`.
+    Local,
+    /// The signed-request LLM broker. Never credentialed, so absent from `ALL`.
+    Broker,
 }
 
 impl ProviderId {
-    /// All known provider IDs, for iteration.
+    /// All configurable provider IDs, for iteration.
     pub const ALL: &[ProviderId] = &[
         ProviderId::Anthropic,
         ProviderId::OpenaiCodex,
@@ -36,19 +40,23 @@ impl ProviderId {
             ProviderId::GoogleAntigravity => "google-antigravity",
             ProviderId::GithubCopilot => "github-copilot",
             ProviderId::OpenaiCompatible => "openai-compatible",
+            ProviderId::Local => "local",
+            ProviderId::Broker => "broker",
         }
     }
 
     /// Environment variable fallback name for this provider's API key.
-    pub fn env_var_name(&self) -> &'static str {
-        match self {
+    /// `None` for providers that are not credentialed (`Local`, `Broker`).
+    pub fn env_var_name(&self) -> Option<&'static str> {
+        Some(match self {
             ProviderId::Anthropic => "ANTHROPIC_API_KEY",
             ProviderId::OpenaiCodex => "OPENAI_API_KEY",
             ProviderId::GoogleGeminiCli => "GOOGLE_GEMINI_API_KEY",
             ProviderId::GoogleAntigravity => "GOOGLE_ANTIGRAVITY_API_KEY",
             ProviderId::GithubCopilot => "GITHUB_TOKEN",
             ProviderId::OpenaiCompatible => "OPENAI_COMPATIBLE_API_KEY",
-        }
+            ProviderId::Local | ProviderId::Broker => return None,
+        })
     }
 }
 
@@ -151,16 +159,37 @@ mod tests {
 
     #[test]
     fn test_env_var_name() {
-        assert_eq!(ProviderId::Anthropic.env_var_name(), "ANTHROPIC_API_KEY");
-        assert_eq!(ProviderId::OpenaiCodex.env_var_name(), "OPENAI_API_KEY");
+        assert_eq!(
+            ProviderId::Anthropic.env_var_name(),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            ProviderId::OpenaiCodex.env_var_name(),
+            Some("OPENAI_API_KEY")
+        );
         assert_eq!(
             ProviderId::GoogleGeminiCli.env_var_name(),
-            "GOOGLE_GEMINI_API_KEY"
+            Some("GOOGLE_GEMINI_API_KEY")
         );
         assert_eq!(
             ProviderId::GoogleAntigravity.env_var_name(),
-            "GOOGLE_ANTIGRAVITY_API_KEY"
+            Some("GOOGLE_ANTIGRAVITY_API_KEY")
         );
-        assert_eq!(ProviderId::GithubCopilot.env_var_name(), "GITHUB_TOKEN");
+        assert_eq!(
+            ProviderId::GithubCopilot.env_var_name(),
+            Some("GITHUB_TOKEN")
+        );
+        assert_eq!(ProviderId::Local.env_var_name(), None);
+        assert_eq!(ProviderId::Broker.env_var_name(), None);
+    }
+
+    #[test]
+    fn local_and_broker_display_and_are_not_configurable() {
+        assert_eq!(ProviderId::Local.to_string(), "local");
+        assert_eq!(ProviderId::Broker.to_string(), "broker");
+        assert!(!ProviderId::ALL.contains(&ProviderId::Local));
+        assert!(!ProviderId::ALL.contains(&ProviderId::Broker));
+        assert!(ProviderId::from_str("local").is_err());
+        assert!(ProviderId::from_str("broker").is_err());
     }
 }

@@ -62,14 +62,18 @@ pub fn resolve_provider_auth(
 
     // Env var fallback
     let env_var = provider.env_var_name();
-    match std::env::var(env_var) {
-        Ok(key) if !key.is_empty() => {
-            info!(provider = auth_key, env_var, "using env var for auth");
+    match env_var.map(|name| (name, std::env::var(name))) {
+        Some((name, Ok(key))) if !key.is_empty() => {
+            info!(
+                provider = auth_key,
+                env_var = name,
+                "using env var for auth"
+            );
             Ok(AuthCredentials::ApiKey { key })
         }
         _ => Err(ProviderError::MissingAuth {
             provider: auth_key.to_string(),
-            env_hint: env_var.to_string(),
+            env_hint: env_var.unwrap_or_default().to_string(),
         }),
     }
 }

@@ -104,22 +104,7 @@ impl LlmProvider for BrokerClient {
             .get("response")
             .ok_or_else(|| ProviderError::Json("missing 'response' field".into()))?;
 
-        Ok(LlmResponse {
-            id: resp["id"].as_str().unwrap_or_default().to_string(),
-            model: resp["model"].as_str().unwrap_or_default().to_string(),
-            content: serde_json::from_value(resp["content"].clone())
-                .map_err(|e| ProviderError::Json(e.to_string()))?,
-            stop: match resp["stop_reason"].as_str() {
-                Some(v) => Stop::from_wire(
-                    serde_json::from_value(serde_json::Value::String(v.to_string()))
-                        .unwrap_or(StopReason::Unrecognized),
-                    "broker",
-                    Some(v),
-                ),
-                None => Stop::from_wire(StopReason::Unreported, "broker", None),
-            },
-            usage: serde_json::from_value(resp["usage"].clone()).unwrap_or_default(),
-        })
+        parse_broker_response(resp)
     }
 
     async fn stream(
@@ -250,8 +235,39 @@ impl LlmProvider for BrokerClient {
     }
 
     fn provider_id(&self) -> ProviderId {
-        ProviderId::Anthropic
+        ProviderId::Broker
     }
+}
+
+/// Parse the broker's `response` object. The broker relays the upstream
+/// stop string, so it is parsed tolerantly: a value this build does not know
+/// is `Unrecognized` (keeping the raw string), and an absent one is
+/// `Unreported`, or `ToolUse` when the content carries tool blocks.
+fn parse_broker_response(resp: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
+    let content: Vec<ContentBlock> = serde_json::from_value(resp["content"].clone())
+        .map_err(|e| ProviderError::Json(e.to_string()))?;
+    let stop = match resp["stop_reason"].as_str() {
+        Some(v) => Stop::from_wire(
+            serde_json::from_value(serde_json::Value::String(v.to_string()))
+                .unwrap_or(StopReason::Unrecognized),
+            "broker",
+            Some(v),
+        ),
+        None if content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })) =>
+        {
+            Stop::from_wire(StopReason::ToolUse, "broker", None)
+        }
+        None => Stop::from_wire(StopReason::Unreported, "broker", None),
+    };
+    Ok(LlmResponse {
+        id: resp["id"].as_str().unwrap_or_default().to_string(),
+        model: resp["model"].as_str().unwrap_or_default().to_string(),
+        content,
+        stop,
+        usage: serde_json::from_value(resp["usage"].clone()).unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -259,6 +275,58 @@ mod tests {
     use super::*;
     use crate::types::Message;
     use ed25519_dalek::Verifier;
+
+    fn sample_client() -> BrokerClient {
+        BrokerClient::new(
+            "http://localhost:9901".into(),
+            SigningKey::from_bytes(&[42u8; 32]),
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+    }
+
+    #[test]
+    fn provider_id_is_broker() {
+        assert_eq!(sample_client().provider_id(), ProviderId::Broker);
+    }
+
+    #[test]
+    fn broker_refusal_stop_is_parsed_with_its_wire_value() {
+        let resp = serde_json::json!({
+            "id": "r1", "model": "m",
+            "content": [{"type": "text", "text": "no"}],
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let r = parse_broker_response(&resp).unwrap();
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(r.stop.wire.provider, "broker");
+        assert_eq!(r.stop.wire.value.as_deref(), Some("refusal"));
+    }
+
+    #[test]
+    fn broker_unknown_stop_is_unrecognized_and_keeps_the_raw_value() {
+        let resp = serde_json::json!({
+            "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "brand_new"
+        });
+        let r = parse_broker_response(&resp).unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("brand_new"));
+    }
+
+    #[test]
+    fn broker_missing_stop_is_unreported_or_tool_use() {
+        let text = serde_json::json!({"content": [{"type": "text", "text": "x"}]});
+        let r = parse_broker_response(&text).unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unreported);
+        assert!(r.stop.wire.value.is_none());
+
+        let tool = serde_json::json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}
+        ]});
+        let r = parse_broker_response(&tool).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+    }
 
     #[test]
     fn test_broker_client_signs_request() {

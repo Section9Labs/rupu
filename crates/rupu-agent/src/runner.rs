@@ -18,6 +18,7 @@ use rupu_coverage::{
 use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::overflow::{context_overflow_of, output_cap_overflow_of};
 use rupu_providers::provider::LlmProvider;
+use rupu_providers::reply_error::ApiErrorBody;
 use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
@@ -3139,6 +3140,20 @@ pub enum ScriptedTurn {
         content: Vec<ContentBlock>,
         stop: StopReason,
     },
+    /// A reply carrying a full [`Stop`] (reason, the provider's wire value,
+    /// refusal detail), for scripting outcomes the bare [`StopReason`]
+    /// variants cannot express.
+    Reply {
+        content: Vec<ContentBlock>,
+        stop: Stop,
+        #[serde(default)]
+        usage: Usage,
+    },
+    /// A structured provider error body, surfaced as
+    /// `ProviderError::Reply`.
+    ReplyError {
+        body: ApiErrorBody,
+    },
     ProviderError(String),
     /// The provider panics mid-send with this message: for a caller's
     /// handling of a task that panicked (a workflow runner's, say).
@@ -3153,13 +3168,27 @@ fn default_mock_tokens() -> u32 {
 /// in `rupu-agent` and (later) `rupu-cli`.
 pub struct MockProvider {
     script: std::sync::Mutex<std::collections::VecDeque<ScriptedTurn>>,
+    provider_id: rupu_providers::ProviderId,
 }
 
 impl MockProvider {
     pub fn new(turns: Vec<ScriptedTurn>) -> Self {
         Self {
             script: std::sync::Mutex::new(turns.into()),
+            provider_id: rupu_providers::ProviderId::Anthropic,
         }
+    }
+
+    /// Report a different provider id (default `Anthropic`), for tests of
+    /// provider-specific handling.
+    pub fn with_provider_id(mut self, id: rupu_providers::ProviderId) -> Self {
+        self.provider_id = id;
+        self
+    }
+
+    /// The label recorded on every synthetic stop this mock builds.
+    fn provider_label(&self) -> &'static str {
+        "mock"
     }
 }
 
@@ -3169,6 +3198,7 @@ impl LlmProvider for MockProvider {
         &mut self,
         _req: &LlmRequest,
     ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+        let label = self.provider_label();
         let next = {
             let mut q = self.script.lock().unwrap();
             q.pop_front()
@@ -3188,6 +3218,20 @@ impl LlmProvider for MockProvider {
                 Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
             }
             ScriptedTurn::Panic(message) => panic!("{message}"),
+            ScriptedTurn::Reply {
+                content,
+                stop,
+                usage,
+            } => Ok(LlmResponse {
+                id: "mock".to_string(),
+                model: "mock-1".to_string(),
+                content,
+                stop,
+                usage,
+            }),
+            ScriptedTurn::ReplyError { body } => {
+                Err(rupu_providers::ProviderError::Reply(Box::new(body)))
+            }
             ScriptedTurn::AssistantText {
                 text,
                 stop,
@@ -3197,7 +3241,7 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
-                stop: Stop::synthetic(stop, "mock"),
+                stop: Stop::synthetic(stop, label),
                 usage: Usage {
                     input_tokens,
                     output_tokens,
@@ -3208,7 +3252,7 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content,
-                stop: Stop::synthetic(stop, "mock"),
+                stop: Stop::synthetic(stop, label),
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -3223,14 +3267,14 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content,
-                stop: Stop::synthetic(stop, "mock"),
+                stop: Stop::synthetic(stop, label),
                 usage,
             }),
             ScriptedTurn::AssistantTextWithUsage { text, stop, usage } => Ok(LlmResponse {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
-                stop: Stop::synthetic(stop, "mock"),
+                stop: Stop::synthetic(stop, label),
                 usage,
             }),
             ScriptedTurn::AssistantToolUse {
@@ -3253,7 +3297,7 @@ impl LlmProvider for MockProvider {
                     id: "mock".to_string(),
                     model: "mock-1".to_string(),
                     content: blocks,
-                    stop: Stop::synthetic(stop, "mock"),
+                    stop: Stop::synthetic(stop, label),
                     usage: Usage {
                         input_tokens: 1,
                         output_tokens: 1,
@@ -3278,7 +3322,7 @@ impl LlmProvider for MockProvider {
     }
 
     fn provider_id(&self) -> rupu_providers::ProviderId {
-        rupu_providers::ProviderId::Anthropic
+        self.provider_id
     }
 }
 

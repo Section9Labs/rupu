@@ -16,6 +16,7 @@ mod engagement_e2e;
 mod findings_full_profile;
 mod findings_without_coverage;
 mod loader;
+mod mock_provider_outcomes;
 mod mcp_attach;
 mod permission_resolution;
 mod prompt_pty;
