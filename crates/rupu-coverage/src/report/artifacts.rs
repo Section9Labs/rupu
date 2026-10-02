@@ -58,6 +58,18 @@ pub struct ArtifactStore {
     root: PathBuf,
 }
 
+/// One file a report's artifacts expand to, as [`ArtifactStore::check`]
+/// found it: what [`ArtifactStore::ingest`] would record for it, but its
+/// hash (and a `size` taken from the file's metadata, where `ingest` records
+/// the bytes it actually read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedArtifact {
+    pub path: String,
+    pub size: u64,
+    pub kind: ArtifactKind,
+    pub stored: ArtifactStorage,
+}
+
 const CHUNK: usize = 64 * 1024;
 
 fn hex(bytes: &[u8]) -> String {
@@ -198,20 +210,40 @@ impl ArtifactStore {
             .collect()
     }
 
-    /// What [`ingest`](Self::ingest) would refuse before it reads a byte:
-    /// every requested path must exist inside the workspace and be a file or
-    /// a directory, and the set they expand to must be within `limits`.
-    /// Nothing is hashed, copied or created (the store need not exist), so a
-    /// file that then cannot be read, or a store that cannot be written, is
-    /// only found by a real `ingest`.
+    /// What [`ingest`](Self::ingest) would record, short of each file's hash,
+    /// or what it would refuse: every requested path must exist inside the
+    /// workspace and be a file or a directory, and the set they expand to
+    /// must be within `limits`. Each file's first 8 KiB is read to tell text
+    /// from binary, as `ingest` does. Nothing is hashed, copied or created
+    /// (the store need not exist), so a file that cannot be read in full, or
+    /// a store that cannot be written, is only found by a real `ingest`.
     pub fn check(
         &self,
         workspace: &Path,
         requested: &[ArtifactRef],
         limits: IngestLimits,
-    ) -> Result<(), ArtifactError> {
+    ) -> Result<Vec<PlannedArtifact>, ArtifactError> {
         let files = self.resolve(workspace, requested, limits.max_files)?;
-        check_total(&files, limits)
+        check_total(&files, limits)?;
+        files
+            .into_iter()
+            .map(|(path, abs, size)| {
+                let kind = sniff_kind(&abs).map_err(|source| ArtifactError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                Ok(PlannedArtifact {
+                    stored: if size > limits.max_file_bytes {
+                        ArtifactStorage::External
+                    } else {
+                        ArtifactStorage::Copied
+                    },
+                    path,
+                    size,
+                    kind,
+                })
+            })
+            .collect()
     }
 
     /// Every file the requested paths name, as `(workspace-relative path,

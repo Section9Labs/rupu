@@ -101,10 +101,11 @@ pub struct ImportArgs {
     /// `Finding ID:` line names a different finding.
     #[arg(long = "id", value_name = "FINDING_ID", value_parser = non_blank)]
     id: Option<String>,
-    /// Parse and validate every report and check that the artifacts it lists
-    /// exist; write nothing (no ledger change, backup or lock file). No
-    /// artifact is read or copied, so trouble found only while copying one
-    /// shows up only on a real import.
+    /// Parse and validate every report, check that the artifacts it lists
+    /// exist and that it is within the size limits once they are recorded;
+    /// write nothing (no ledger change, backup or lock file). No artifact is
+    /// copied (only its first 8 KiB is read), so trouble found only while
+    /// copying one shows up only on a real import.
     #[arg(long)]
     dry_run: bool,
 }
@@ -457,6 +458,15 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
         match parsed {
             Err(e) => {
                 lines.insert(file.clone(), Line::failed(e.to_string()));
+            }
+            // Named with `--id`, the file was meant as that finding's report.
+            Ok(Parsed::NotAReport) if args.id.is_some() => {
+                lines.insert(
+                    file.clone(),
+                    Line::failed(
+                        "not a finding report (fewer than three of the report layout's sections)",
+                    ),
+                );
             }
             Ok(Parsed::NotAReport) => {
                 lines.insert(file.clone(), Line::Skipped("not a finding report".into()));

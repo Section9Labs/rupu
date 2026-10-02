@@ -42,13 +42,17 @@ pub fn read_concern_assertions(paths: &CoveragePaths) -> std::io::Result<Vec<Con
         .collect())
 }
 
+/// Every finding record in the ledger. A line that is not one (blank, not
+/// JSON, or not UTF-8, as a torn write can leave) is skipped on its own: it
+/// never hides the rest of the ledger.
 pub fn read_findings(paths: &CoveragePaths) -> std::io::Result<Vec<FindingRecord>> {
     if !paths.findings.exists() {
         return Ok(vec![]);
     }
-    let raw = std::fs::read_to_string(&paths.findings)?;
+    let raw = std::fs::read(&paths.findings)?;
     Ok(raw
-        .lines()
+        .split(|b| *b == b'\n')
+        .filter_map(|l| std::str::from_utf8(l).ok())
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<FindingRecord>(l).ok())
         .collect())
@@ -172,6 +176,22 @@ mod tests {
         let got = read_findings(&paths).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "fnd_1");
+
+        // A line that is not UTF-8 or not JSON is skipped, not the ledger;
+        // a CRLF line still reads.
+        let mut two = rec.clone();
+        two.id = "fnd_2".to_string();
+        let mut raw = serde_json::to_string(&rec).unwrap().into_bytes();
+        raw.extend_from_slice(b"\n{\"id\":\"fnd_torn\xff\xfe\n not json\n");
+        raw.extend_from_slice(serde_json::to_string(&two).unwrap().as_bytes());
+        raw.extend_from_slice(b"\r\n");
+        std::fs::write(&paths.findings, raw).unwrap();
+        let ids: Vec<String> = read_findings(&paths)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(ids, ["fnd_1", "fnd_2"]);
     }
 
     #[test]

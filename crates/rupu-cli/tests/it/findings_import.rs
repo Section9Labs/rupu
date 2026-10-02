@@ -980,3 +980,54 @@ fn symlinked_reports_are_not_found_while_searching_a_directory() {
         .success();
     assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
 }
+
+#[test]
+fn a_torn_line_elsewhere_in_the_ledger_does_not_hide_the_finding() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let findings = CoveragePaths::new(&repo, "tgt1").findings;
+    // A line that is not UTF-8, as a torn write can leave.
+    let mut raw = std::fs::read(&findings).unwrap();
+    raw.extend_from_slice(b"{\"id\":\"fnd_torn\xff\xfe\n");
+    std::fs::write(&findings, &raw).unwrap();
+    let report = home.path().join("NB-001.md");
+    std::fs::write(&report, PLAIN).unwrap();
+
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&report)
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("1 attached, 0 skipped, 0 failed"), "{out}");
+    let after = std::fs::read(&findings).unwrap();
+    assert!(
+        after.ends_with(b"{\"id\":\"fnd_torn\xff\xfe\n"),
+        "the torn line is written back as it was"
+    );
+    let first = std::str::from_utf8(after.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    let first: serde_json::Value = serde_json::from_str(first).unwrap();
+    assert_eq!(first["id"], ID1);
+    assert_eq!(first["profile"], "full");
+}
+
+#[test]
+fn a_file_named_with_id_that_is_not_a_report_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let notes = home.path().join("notes.md");
+    std::fs::write(&notes, "# Notes\n\nTo do: write the report.\n").unwrap();
+    let before = ledger(&repo);
+
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import", "--id", ID1])
+            .arg(&notes)
+            .assert()
+            .failure(),
+    );
+    assert!(out.contains("notes.md: not a finding report"), "{out}");
+    assert!(out.contains("0 attached, 0 skipped, 1 failed"), "{out}");
+    assert_eq!(ledger(&repo), before);
+}

@@ -492,7 +492,8 @@ export --to md` writes, and a plain-text one with bare heading lines
 `Finding ID: fnd_…`). A file with fewer than three of the layout's section
 headings (a README, an index) is skipped, not failed, unless it has a Finding
 ID line (below): then it fails with `has a Finding ID line but is missing the
-report sections`. A file that holds several findings is refused; split it into
+report sections`. Named with `--id`, such a file fails too (`not a finding
+report`). A file that holds several findings is refused; split it into
 one file per finding first. The title is the file's `# ` heading; failing that,
 the first line after `Filename:` when that line is not a field; failing that,
 the first line that is not a field. A line before the title (a banner) is kept
@@ -525,7 +526,9 @@ nothing, and the other reports in the run are still imported. `summary`,
 `severity` and `evidence` are re-derived from the report, as for any full
 finding; the id, provenance (run, model, surface, declared-at), location and
 every other field of the record are kept. A finding that already has a report
-is skipped, never changed. The size limits (`report_max_bytes` and the
+is skipped, never changed. A finding records no engagement asset, so an import
+runs no [engagement profile](#engagement-profiles) completeness check and
+stamps no asset: the report is held to the finding report contract only. The size limits (`report_max_bytes` and the
 `artifact_max_*` keys) come from `[findings]` in the global config only;
 unlike when an agent records a report, a project's `.rupu/config.toml` is not
 layered in.
@@ -553,16 +556,22 @@ rejected for other reasons still list their own problems). Once you have checked
 findings, delete the backups: each is a full copy of the ledger, and a
 workspace sync or a commit of `.rupu/` would carry it along. A ledger that is a
 symlink is never replaced (the rename would replace the link, not the file it
-points to): its reports fail with the reason, on a dry run too.
+points to): its reports fail with the reason, on a dry run too. An import
+interrupted (Ctrl-C, a crash) after taking its backup and before replacing the
+ledger leaves the ledger as it was, plus that backup and
+`findings.jsonl.import-tmp` beside it; delete both, or just import again (the
+next run overwrites the temp file and takes a backup of its own).
 
 **Dry run.** `--dry-run` parses and validates every report and prints `would
 attach` for those that would go in. It writes nothing: no ledger change, no
 backup, and it takes no lock, so it also works on a read-only ledger directory.
 It checks that each artifact the report lists exists inside the workspace and
-is within the artifact count and size limits, without reading or copying the
-files. Trouble that only appears while copying an artifact, and a report that
-goes over `report_max_bytes` only once a directory artifact has been expanded,
-are found only by a real import.
+is within the artifact count and size limits, and that the report as it would
+be stored (directories expanded, every artifact recorded with its hash, size,
+kind and storage) is within `report_max_bytes`. It copies nothing: it reads
+only the first 8 KiB of each artifact, to tell text from binary as a real
+import does. Trouble that only appears while copying an artifact is found only
+by a real import.
 
 **Missing content.** Nothing is invented. A field or section the schema has no
 sentinel for must be in the file, or the file fails: the title; Category,

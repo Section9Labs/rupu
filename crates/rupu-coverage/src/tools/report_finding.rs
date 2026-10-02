@@ -211,18 +211,31 @@ pub fn report_finding(
 /// across the append so it cannot interleave with an import's rewrite.
 ///
 /// Where the filesystem cannot lock at all (some network and FUSE mounts:
-/// see [`lock_unsupported`]) the line is appended without the lock and a
-/// warning is logged, as before the lock existed: losing the finding would be
-/// worse. An import cannot run on such a ledger (it requires the lock), so
-/// there is nothing to interleave with. Any other lock failure is an error.
+/// see [`lock_unsupported`]), or the lock file cannot be opened (a directory
+/// this user may not create files in), the line is appended without the lock
+/// and a warning is logged, as before the lock existed: losing the finding
+/// would be worse. An import cannot run there without the same lock file, so
+/// it either cannot run at all or runs as a user who can open it, and then
+/// its length check catches the unlocked append. Any other lock failure is an
+/// error.
 fn append_line(
     paths: &CoveragePaths,
     line: &[u8],
     lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let lock_file = open_lock_file(paths)?;
-    if let Err(e) = lock(&lock_file) {
+    let lock_file = match open_lock_file(paths) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                ledger = ?paths.findings,
+                "cannot open the findings ledger's lock file; appending without the lock"
+            );
+            None
+        }
+    };
+    if let Some(Err(e)) = lock_file.as_ref().map(lock) {
         if !lock_unsupported(&e) {
             return Err(e);
         }
@@ -344,10 +357,19 @@ pub(crate) fn prepare_full_report(
     if hashes == ClaimHashes::Record {
         hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
     }
-    // Directory artifacts expand to one entry per file, so the report
-    // can grow far past the budget `validate_report` checked. Re-check
-    // before anything reaches the ledger.
-    let size = serde_json::to_vec(&report)?.len();
+    check_stored_size(&report, opts)?;
+    Ok(report)
+}
+
+/// The size budget, re-checked on the report as it will be stored. Directory
+/// artifacts expand to one entry per file, and every artifact gains its hash,
+/// size, kind and storage, so the report can grow far past the budget
+/// `validate_report` checked.
+pub(crate) fn check_stored_size(
+    report: &crate::report::FindingReport,
+    opts: &crate::report::FindingWriteOptions,
+) -> Result<(), ReportFindingError> {
+    let size = serde_json::to_vec(report)?.len();
     if size > opts.report_max_bytes {
         return Err(ReportFindingError::Report(
             crate::report::ReportValidationError(vec![crate::report::FieldError {
@@ -360,7 +382,7 @@ pub(crate) fn prepare_full_report(
             }]),
         ));
     }
-    Ok(report)
+    Ok(())
 }
 
 /// The record fields a full-profile finding derives from its report.
@@ -389,13 +411,24 @@ pub(crate) fn lock_findings(paths: &CoveragePaths) -> std::io::Result<std::fs::F
 }
 
 /// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing.
+///
+/// A lock needs only a handle on the file, so one this user may not write
+/// (created by another user, say an import run with `sudo`) is opened
+/// read-only instead.
 fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
     paths.ensure_dir()?;
-    std::fs::OpenOptions::new()
+    let path = paths.root.join("findings.jsonl.lock");
+    match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(paths.root.join("findings.jsonl.lock"))
+        .open(&path)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::File::open(&path).map_err(|_| e)
+        }
+        opened => opened,
+    }
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
@@ -1127,6 +1160,48 @@ mod tests {
         assert!(std::fs::read_to_string(&paths.findings)
             .unwrap()
             .ends_with("{\"n\":4}\n"));
+    }
+
+    #[test]
+    fn an_append_goes_ahead_unlocked_when_the_lock_file_cannot_be_opened() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        // Something that cannot be opened as the lock file.
+        std::fs::create_dir_all(paths.root.join("findings.jsonl.lock")).unwrap();
+        append_line(&paths, b"{\"n\":1}\n", std::fs::File::lock)
+            .expect("the finding is still recorded");
+        assert_eq!(
+            std::fs::read_to_string(&paths.findings).unwrap(),
+            "{\"n\":1}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_this_user_cannot_write_is_locked_through_a_read_only_handle() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root can write any file: nothing to fall back from
+        }
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        paths.ensure_dir().unwrap();
+        let sidecar = paths.root.join("findings.jsonl.lock");
+        std::fs::write(&sidecar, "").unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let held = lock_findings(&paths).expect("locked through a read-only handle");
+        let other = std::fs::File::open(&sidecar).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the read-only handle's lock excludes other writers"
+        );
+        drop(held);
+        append_line(&paths, b"{\"n\":1}\n", std::fs::File::lock).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&paths.findings).unwrap(),
+            "{\"n\":1}\n"
+        );
     }
 
     #[test]

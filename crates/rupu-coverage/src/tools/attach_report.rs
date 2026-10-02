@@ -17,17 +17,22 @@
 //! survive). The line that is replaced keeps its own line terminator. A
 //! ledger that is a symlink is never replaced.
 //!
+//! A record holds no engagement asset, so an attached report goes through no
+//! engagement-profile completeness check and stamps no asset (unlike
+//! `report_finding` with an active engagement): it is held to the finding
+//! report contract only.
+//!
 //! A dry run reads the ledger and touches nothing else: it takes no lock and
 //! creates no file or directory, so it works on a read-only ledger directory.
 
 use crate::ledger::events::FindingRecord;
 use crate::ledger::paths::CoveragePaths;
 use crate::report::{
-    ArtifactError, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
+    ArtifactError, ArtifactRef, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
 };
 use crate::tools::report_finding::{
-    check_full_report, derived_fields, lock_findings, prepare_full_report, ClaimHashes,
-    ReportFindingError,
+    check_full_report, check_stored_size, derived_fields, lock_findings, prepare_full_report,
+    ClaimHashes, ReportFindingError,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -242,11 +247,14 @@ fn refuse_symlinked_ledger(findings: &Path) -> std::io::Result<()> {
 }
 
 /// The rejections a real run gives, minus the ones that need the artifact
-/// store to be written to or a file to be read: the report validates, an
-/// artifact store is configured when the report lists artifacts, and every
-/// listed artifact path exists inside the workspace and is within the count
-/// and size limits (`ArtifactError::Missing` / `Escapes` / `TooManyFiles` /
-/// `TooLarge`, as a real ingest gives). Nothing is created, hashed or copied.
+/// store to be written to or a file to be read in full: the report
+/// validates, an artifact store is configured when the report lists
+/// artifacts, every listed artifact path exists inside the workspace and is
+/// within the count and size limits (`ArtifactError::Missing` / `Escapes` /
+/// `TooManyFiles` / `TooLarge`, as a real ingest gives), and the report as it
+/// would be stored, its artifacts expanded and recorded, is within
+/// `report_max_bytes`. Nothing is created, hashed or copied; each artifact's
+/// first 8 KiB is read to tell text from binary, as a real ingest does.
 fn dry_run_check(
     paths: &CoveragePaths,
     report: &FindingReport,
@@ -254,12 +262,29 @@ fn dry_run_check(
     opts: &FindingWriteOptions,
 ) -> Result<(), ReportFindingError> {
     check_full_report(report, known, opts)?;
-    if report.artifacts.is_empty() {
-        return Ok(());
+    // What `prepare_full_report` would store, with `ClaimHashes::Skip`.
+    let mut stored = report.clone();
+    for claim in &mut stored.evidence {
+        claim.sha256 = None;
     }
-    let root = opts.artifact_root.as_ref().ok_or(ArtifactError::NoStore)?;
-    ArtifactStore::new(root).check(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
-    Ok(())
+    if !report.artifacts.is_empty() {
+        let root = opts.artifact_root.as_ref().ok_or(ArtifactError::NoStore)?;
+        stored.artifacts = ArtifactStore::new(root)
+            .check(&paths.workspace, &report.artifacts, opts.ingest_limits())?
+            .into_iter()
+            .map(|a| ArtifactRef {
+                path: a.path,
+                // A stand-in as long as the digest a real ingest records, so
+                // the size checked is the stored report's.
+                sha256: "0".repeat(64),
+                size: a.size,
+                kind: Some(a.kind),
+                stored: Some(a.stored),
+                host: None,
+            })
+            .collect();
+    }
+    check_stored_size(&stored, opts)
 }
 
 /// A ledger line as JSON text: `None` when it is not UTF-8, otherwise the
@@ -315,12 +340,12 @@ fn upgraded_line(line: &str, report: &FindingReport) -> Result<String, serde_jso
 
 /// The first unused `findings.jsonl.pre-import-<stamp>[-n]` in `root`.
 fn backup_path(root: &Path, stamp: &str) -> PathBuf {
-    let base = root.join(format!("findings.jsonl.pre-import-{stamp}"));
-    let mut backup = base.clone();
+    let name = format!("findings.jsonl.pre-import-{stamp}");
+    let mut backup = root.join(&name);
     let mut n = 1;
     while backup.exists() {
         n += 1;
-        backup = PathBuf::from(format!("{}-{n}", base.display()));
+        backup = root.join(format!("{name}-{n}"));
     }
     backup
 }

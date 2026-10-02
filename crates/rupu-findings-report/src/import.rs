@@ -438,7 +438,7 @@ fn id_at_start(s: &str) -> Option<&str> {
     let whole = ulid
         .iter()
         .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
-        && !body.get(26).is_some_and(|b| b.is_ascii_alphanumeric());
+        && body.get(26).is_none_or(|b| !b.is_ascii_alphanumeric());
     whole.then(|| &s[..30])
 }
 

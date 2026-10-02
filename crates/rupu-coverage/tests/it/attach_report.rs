@@ -733,6 +733,98 @@ fn a_dry_run_applies_the_artifact_count_and_size_limits_a_real_run_does() {
     }
 }
 
+/// A workspace whose `evidence/` directory holds a text and a binary file,
+/// the report listing the directory, and options with `report_max_bytes`.
+fn expanding(
+    max: usize,
+) -> (
+    tempfile::TempDir,
+    CoveragePaths,
+    String,
+    FindingWriteOptions,
+) {
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    std::fs::create_dir_all(paths.workspace.join("evidence")).unwrap();
+    std::fs::write(
+        paths.workspace.join("evidence/request.txt"),
+        "GET /api/notes/2",
+    )
+    .unwrap();
+    std::fs::write(paths.workspace.join("evidence/dump.bin"), [0u8, 1, 2, 3]).unwrap();
+    let opts = FindingWriteOptions {
+        artifact_root: Some(d.path().join("store")),
+        report_max_bytes: max,
+        ..full_opts()
+    };
+    (d, paths, id, opts)
+}
+
+fn directory_report() -> FindingReport {
+    let mut r = report();
+    r.artifacts = vec![artifact("evidence")];
+    r
+}
+
+#[test]
+fn a_dry_run_checks_the_size_of_the_report_as_it_would_be_stored() {
+    // The report as a real import stores it: the directory expanded, each
+    // file with its hash, size, kind and storage.
+    let (_d, paths, id, opts) = expanding(256 * 1024);
+    let batch = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id.clone(),
+            report: directory_report(),
+        }],
+        &opts,
+        false,
+    )
+    .unwrap();
+    assert!(matches!(
+        batch.outcomes.as_slice(),
+        [AttachOutcome::Attached]
+    ));
+    let stored = read_findings(&paths)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == id)
+        .unwrap()
+        .report
+        .unwrap();
+    assert_eq!(stored.artifacts.len(), 2);
+    let size = serde_json::to_vec(&stored).unwrap().len();
+    // Well under that before the directory is expanded.
+    assert!(serde_json::to_vec(&directory_report()).unwrap().len() < size - 200);
+
+    // At exactly that budget both runs attach; a byte under, both refuse.
+    for (max, attaches) in [(size, true), (size - 1, false)] {
+        for dry in [true, false] {
+            let (_d, paths, id, opts) = expanding(max);
+            let batch = attach_reports(
+                &paths,
+                vec![AttachItem {
+                    finding_id: id,
+                    report: directory_report(),
+                }],
+                &opts,
+                dry,
+            )
+            .unwrap();
+            match batch.outcomes.as_slice() {
+                [AttachOutcome::Attached] if attaches => {}
+                [AttachOutcome::Rejected(rupu_coverage::ReportFindingError::Report(v))]
+                    if !attaches =>
+                {
+                    assert_eq!(v.0[0].path, "report.artifacts", "{v:?}");
+                    assert!(v.0[0].message.contains(&format!("{size} bytes")), "{v:?}");
+                }
+                o => panic!("max={max} dry={dry}: {o:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn a_dry_run_accepts_a_present_artifact_without_copying_it() {
     let (d, paths) = setup();
