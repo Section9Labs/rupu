@@ -93,6 +93,27 @@ describe('EvidenceClaims language handling', () => {
 });
 
 describe('FixSections', () => {
+  it('never renders an agent-written Markdown image as a fetched <img>', () => {
+    const img = (n: string) => `![${n}](https://example.invalid/${n}.png)`;
+    const patch = report.recommended_patch as Exclude<FindingReport['recommended_patch'], string>;
+    const ci = report.ci_cd_detection as Exclude<FindingReport['ci_cd_detection'], string>;
+    const reg = report.regression_test as Exclude<FindingReport['regression_test'], string>;
+    const { container } = render(
+      <FixSections
+        report={{
+          ...report,
+          recommended_patch: { ...patch, notes: img('notes') },
+          ci_cd_detection: { ...ci, body: img('ci') },
+          regression_test: { ...reg, body: `${img('reg')} <img src="https://example.invalid/raw.png">` },
+        }}
+      />,
+    );
+    expect(container.querySelector('img')).toBeNull();
+    for (const n of ['notes', 'ci', 'reg']) {
+      expect(screen.getByRole('link', { name: `[image: ${n}]` })).toHaveAttribute('href', `https://example.invalid/${n}.png`);
+    }
+  });
+
   it('renders the recommended patch as a diff', () => {
     render(<FixSections report={report} />);
     expect(screen.getByText(/find_by_id_for_owner/)).toBeInTheDocument();
