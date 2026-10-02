@@ -794,6 +794,56 @@ fn a_missing_artifact_fails_a_real_import_and_a_dry_run_alike() {
 }
 
 #[test]
+fn evidence_block_files_are_verified_and_stored() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let file = home.path().join("NB-001.md");
+    let blocks = "![The leaked note](shots/leak.png)\n\n\
+                  _Packet capture: the request and its 200 — `shots/c.pcap`_\n\n";
+    let md = PLAIN.replace("\nRemediation\n", &format!("\n{blocks}Remediation\n"));
+    assert!(md.contains("shots/c.pcap"));
+    std::fs::write(&file, md).unwrap();
+    let before = ledger(&repo);
+    // A block's file must be in the workspace, on a dry run as on a real one.
+    for dry in [true, false] {
+        let mut cmd = rupu(home.path());
+        cmd.args(["findings", "import"]);
+        if dry {
+            cmd.arg("--dry-run");
+        }
+        let out = stdout_of(cmd.arg(&file).assert().failure());
+        assert!(
+            out.contains("report.blocks[0].artifact.path") && out.contains("shots/leak.png"),
+            "dry={dry}: {out}"
+        );
+        assert_eq!(ledger(&repo), before, "dry={dry}");
+    }
+    std::fs::create_dir_all(repo.join("shots")).unwrap();
+    std::fs::write(repo.join("shots/leak.png"), b"\x89PNG\r\n\x1a\nnote").unwrap();
+    std::fs::write(repo.join("shots/c.pcap"), b"\xd4\xc3\xb2\xa1capture").unwrap();
+    rupu(home.path())
+        .args(["findings", "import"])
+        .arg(&file)
+        .assert()
+        .success();
+    let report = &line_of(&ledger(&repo), ID1)["report"];
+    let blocks = report["blocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 2, "{report}");
+    assert_eq!(blocks[0]["kind"], "image");
+    assert_eq!(blocks[0]["caption"], "The leaked note");
+    assert_eq!(blocks[1]["kind"], "pcap_ref");
+    assert_eq!(blocks[1]["summary"], "the request and its 200");
+    for (b, path) in blocks.iter().zip(["shots/leak.png", "shots/c.pcap"]) {
+        let a = &b["artifact"];
+        assert_eq!(a["path"], path);
+        assert_eq!(a["sha256"].as_str().map(str::len), Some(64), "{a}");
+        assert_eq!(a["stored"], "copied", "{a}");
+    }
+    // The original claim is still the evidence.
+    assert_eq!(report["evidence"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
 fn an_id_present_in_two_ledgers_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let repo = seed(home.path(), &[summary_record(ID1)]);
