@@ -533,3 +533,100 @@ async fn fan_out_units_strip_delta_coverage_only_when_their_own_stream_merged() 
         "unit 1 sent no stream"
     );
 }
+
+// ── I4: a finding's artifacts, end to end through the runner ────────────────
+
+/// A unit's stream whose one finding carries a full report with one artifact,
+/// recorded the way the host's own store recorded it (`copied`, no host).
+fn stream_with_artifact(id: &str) -> Vec<u8> {
+    let mut report: rupu_coverage::FindingReport = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    )))
+    .unwrap();
+    report.artifacts = vec![rupu_coverage::report::ArtifactRef {
+        path: "poc/repro.sh".into(),
+        sha256: "c3".repeat(32),
+        size: 42,
+        kind: Some(rupu_coverage::report::ArtifactKind::Text),
+        stored: Some(rupu_coverage::report::ArtifactStorage::Copied),
+        host: None,
+    }];
+    let text = String::from_utf8(stream_with_finding(id)).unwrap();
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut parsed: StreamLine = serde_json::from_str(line).unwrap();
+        if let StreamLine::Findings { record, .. } = &mut parsed {
+            record.profile = rupu_coverage::FindingProfile::Full;
+            record.report = Some(report.clone());
+        }
+        out.push_str(&serde_json::to_string(&parsed).unwrap());
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+fn only_artifact(ws: &std::path::Path) -> rupu_coverage::report::ArtifactRef {
+    let findings = findings_in(ws);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let report = findings[0]
+        .report
+        .clone()
+        .expect("the report survives the merge");
+    assert_eq!(report.artifacts.len(), 1);
+    report.artifacts[0].clone()
+}
+
+/// A placed step on a registry host: the blob lives in THAT host's store, so
+/// the merged finding records its artifact `external` with the host's id —
+/// what the artifact pull (Plan B) dereferences — keeping path, hash, size
+/// and kind.
+#[tokio::test]
+async fn a_registry_hosts_artifact_merges_external_with_that_host() {
+    let (tmp, _sink) = run(
+        PLACED,
+        vec![Ok(UnitOutcome {
+            output: "ok".into(),
+            success: true,
+            error: None,
+            workspace_delta: None,
+            coverage: UnitCoverage::Stream(stream_with_artifact("f_art")),
+        })],
+    )
+    .await;
+    let a = only_artifact(tmp.path());
+    assert_eq!(
+        a.stored,
+        Some(rupu_coverage::report::ArtifactStorage::External)
+    );
+    assert_eq!(a.host.as_deref(), Some("host_01R"));
+    assert_eq!(
+        (a.path.as_str(), a.sha256.as_str(), a.size),
+        ("poc/repro.sh", "c3".repeat(32).as_str(), 42)
+    );
+    assert_eq!(a.kind, Some(rupu_coverage::report::ArtifactKind::Text));
+}
+
+/// A `host: local` unit shares the coordinator's artifact store: the
+/// artifact stays `copied`, with no host.
+#[tokio::test]
+async fn a_local_units_artifact_stays_copied() {
+    let yaml = "name: w\nsteps:\n  - id: s\n    agent: sec\n    prompt: p\n    host: local\n";
+    let (tmp, _sink) = run(
+        yaml,
+        vec![Ok(UnitOutcome {
+            output: "ok".into(),
+            success: true,
+            error: None,
+            workspace_delta: None,
+            coverage: UnitCoverage::Stream(stream_with_artifact("f_local")),
+        })],
+    )
+    .await;
+    let a = only_artifact(tmp.path());
+    assert_eq!(
+        a.stored,
+        Some(rupu_coverage::report::ArtifactStorage::Copied)
+    );
+    assert_eq!(a.host, None);
+}
