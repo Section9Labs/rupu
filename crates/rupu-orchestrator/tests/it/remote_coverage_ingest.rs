@@ -52,6 +52,9 @@ fn stream_with_finding(id: &str) -> Vec<u8> {
             run_id: "run_U".into(),
             model: "m".into(),
             surface: rupu_coverage::Surface::Agent,
+            codename: None,
+            agent: None,
+            provider: None,
         },
         declared_at: chrono::Utc::now(),
         profile: rupu_coverage::FindingProfile::Summary,
@@ -127,6 +130,7 @@ async fn run(
         })),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let _ = run_workflow(opts).await;
     (tmp, sink)

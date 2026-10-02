@@ -6106,6 +6106,7 @@ mod tests {
                 working_dir: None,
                 run_id: Some(run_id.into()),
                 findings_profile: None,
+                codename: None,
             })
             .await
             .unwrap();

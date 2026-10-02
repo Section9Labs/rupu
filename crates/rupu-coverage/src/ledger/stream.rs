@@ -197,6 +197,9 @@ mod tests {
             run_id: "run_S1".into(),
             model: "m".into(),
             surface: Surface::Agent,
+            codename: None,
+            agent: None,
+            provider: None,
         }
     }
 
