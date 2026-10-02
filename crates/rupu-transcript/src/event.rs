@@ -328,18 +328,17 @@ pub enum Event {
 // `Event::serialize`/`Event::deserialize` associated functions instead of
 // trait impls (the standard trick for hooking custom logic around derived
 // serde code — see https://serde.rs/remote-derive.html). We need that hook
-// because serde's `#[serde(other)]` fallback, for an *adjacently* tagged
-// enum (`tag`+`content`, as opposed to internally tagged), still tries to
-// deserialize the unrecognized tag's `content` payload as the catch-all
-// variant. Since `Unknown` is a unit variant, that only succeeds when
-// `content` is `null`/absent — a `content` of `{"x":1}` (any real-world
-// unrecognized event's `data`) fails with "invalid type: map, expected unit
-// variant Event::Unknown" before `#[serde(other)]` ever gets a chance to
-// apply. So we peek the `type` tag ourselves first via a generic
+// because `Unknown` is `#[serde(skip)]`: it carries the raw tag and data of
+// a line this binary does not know, so the derive can neither produce nor
+// consume it. (`#[serde(other)]` cannot do this job: for an *adjacently*
+// tagged enum it still tries to deserialize the unrecognized tag's
+// `content` as the catch-all variant, which fails for any real payload.)
+// So we peek the `type` tag ourselves first via a generic
 // `serde_json::Value` buffer, and only hand off to the derived
 // `Event::deserialize` when the tag is one we recognize; an unrecognized
-// tag short-circuits straight to `Event::Unknown` without ever trying to
-// interpret `content`.
+// tag short-circuits straight to `Event::Unknown { tag, data }` without
+// ever trying to interpret `content`. Serialization mirrors it: `Unknown`
+// is written back as its original `type` + `data`.
 //
 // This fallback must stay NARROW: `Event::Unknown` is reserved for a
 // well-formed line whose `type` is a string that just isn't one we know

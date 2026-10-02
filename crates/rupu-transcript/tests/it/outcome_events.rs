@@ -1,3 +1,4 @@
+use rupu_transcript::outcome::{outcome_line, recovery_line, unknown_line};
 use rupu_transcript::{Event, OutcomeRecord, RecoveryAction, Severity, StopRecord};
 use serde_json::json;
 
@@ -131,4 +132,124 @@ fn unknown_event_keeps_and_re_serializes_its_payload() {
 fn unknown_recovery_action_is_other() {
     let a: RecoveryAction = serde_json::from_value(json!("teleported")).unwrap();
     assert_eq!(a, RecoveryAction::Other);
+}
+
+fn outcome_with(severity: Severity, title: &str, detail: Option<&str>) -> OutcomeRecord {
+    OutcomeRecord {
+        severity,
+        title: title.into(),
+        detail: detail.map(str::to_string),
+        ..record()
+    }
+}
+
+#[test]
+fn outcome_line_glyph_follows_severity() {
+    assert_eq!(
+        outcome_line(&outcome_with(
+            Severity::Error,
+            "refused · cyber",
+            Some("Declined for this example.")
+        )),
+        "✗ refused · cyber — Declined for this example."
+    );
+    assert_eq!(
+        outcome_line(&outcome_with(Severity::Warning, "cut off", None)),
+        "! cut off"
+    );
+    assert_eq!(
+        outcome_line(&outcome_with(Severity::Info, "paused", Some("resuming"))),
+        "· paused — resuming"
+    );
+}
+
+#[test]
+fn recovery_line_phrases_every_action() {
+    use RecoveryAction::*;
+    let line = |action, provider, model, attempt, budget, reason| {
+        recovery_line(action, 1, provider, model, attempt, budget, reason)
+    };
+    assert_eq!(
+        line(Continued, None, None, Some(2), Some(3), None),
+        "↺ rung 1 · continued 2/3"
+    );
+    assert_eq!(
+        line(Retried, None, None, None, None, None),
+        "↺ rung 1 · retried"
+    );
+    assert_eq!(
+        line(Compacted, None, None, None, None, None),
+        "↺ rung 1 · compacted"
+    );
+    assert_eq!(
+        line(
+            FellBack,
+            Some("anthropic"),
+            Some("claude-opus-4-8"),
+            None,
+            None,
+            None
+        ),
+        "↺ rung 1 · fell back to anthropic/claude-opus-4-8"
+    );
+    assert_eq!(
+        line(
+            ServedByFallback,
+            None,
+            Some("claude-opus-5"),
+            None,
+            None,
+            None
+        ),
+        "↺ rung 1 · served by claude-opus-5"
+    );
+    assert_eq!(
+        line(
+            Skipped,
+            Some("openai"),
+            Some("m1"),
+            None,
+            None,
+            Some("no credentials")
+        ),
+        "↺ rung 1 · skipped openai/m1: no credentials"
+    );
+    assert_eq!(
+        line(Failed, None, None, None, None, None),
+        "↺ rung 1 · no recovery left"
+    );
+    assert_eq!(
+        line(Asked, None, None, None, None, None),
+        "↺ rung 1 · asked"
+    );
+    assert_eq!(
+        line(Parked, None, None, None, None, None),
+        "↺ rung 1 · parked"
+    );
+    assert_eq!(
+        line(Other, None, None, None, None, None),
+        "↺ rung 1 · other"
+    );
+    // Missing optional pieces degrade without panicking.
+    assert_eq!(
+        line(Continued, None, None, None, None, None),
+        "↺ rung 1 · continued"
+    );
+}
+
+#[test]
+fn unknown_line_names_the_tag_and_truncates_data() {
+    assert_eq!(
+        unknown_line("brand_new_event", &serde_json::Value::Null),
+        "unrecognized event · brand_new_event"
+    );
+    assert_eq!(
+        unknown_line("brand_new_event", &json!({"x": 1})),
+        "unrecognized event · brand_new_event {\"x\":1}"
+    );
+    let big = json!({"x": "y".repeat(500)});
+    let s = unknown_line("t", &big);
+    let data = s.strip_prefix("unrecognized event · t ").unwrap();
+    assert_eq!(data.chars().count(), 200);
+    assert!(data.ends_with('…'));
 }

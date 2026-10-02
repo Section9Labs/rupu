@@ -1190,14 +1190,14 @@ fn transcript_event_lines(
                 ),
             )]
         }
-        // Task 2 renders these; until then they print nothing.
-        TranscriptEvent::Outcome { .. } | TranscriptEvent::Recovery { .. } => Vec::new(),
-        TranscriptEvent::Unknown { .. } => vec![transcript_event_line(
-            Status::Active,
-            0,
-            false,
-            transcript_event_text(Status::Active, "event", "unrecognized event type (newer rupu wrote this transcript)"),
-        )],
+        TranscriptEvent::Outcome { .. }
+        | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
+            .into_iter()
+            .map(|(status, label, text)| {
+                transcript_event_line(status, 0, false, transcript_event_text(status, label, &text))
+            })
+            .collect(),
     }
 }
 
@@ -1664,14 +1664,14 @@ pub(crate) fn render_pretty_transcript_event(
                 )),
             );
         }
-        // Task 2 renders these; until then they print nothing.
-        TranscriptEvent::Outcome { .. } | TranscriptEvent::Recovery { .. } => {}
-        TranscriptEvent::Unknown { .. } => {
-            printer.sideband_event(
-                Status::Active,
-                "event",
-                Some("unrecognized event type (newer rupu wrote this transcript)"),
-            );
+        TranscriptEvent::Outcome { .. }
+        | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::Unknown { .. } => {
+            if let Some((status, label, text)) =
+                crate::output::outcome_row::outcome_event_row(event)
+            {
+                printer.sideband_event(status, label, Some(&text));
+            }
         }
     }
 }
@@ -2725,6 +2725,30 @@ mod tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
+            TranscriptEvent::Outcome {
+                turn_idx: 1,
+                outcome: rupu_transcript::OutcomeRecord {
+                    id: "oc_1".into(),
+                    class: "refusal".into(),
+                    severity: rupu_transcript::Severity::Error,
+                    title: "refused · cyber".into(),
+                    detail: Some("Declined for this example.".into()),
+                    error_class: None,
+                    wire: serde_json::Value::Null,
+                },
+            },
+            TranscriptEvent::Recovery {
+                outcome_id: "oc_1".into(),
+                rung: 1,
+                action: rupu_transcript::RecoveryAction::FellBack,
+                attempt: None,
+                budget: None,
+                provider: Some("anthropic".into()),
+                model: Some("claude-opus-4-8".into()),
+                reason: None,
+                merge_into_previous: false,
+                continues_output: false,
+            },
             TranscriptEvent::Unknown {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
@@ -2736,6 +2760,18 @@ mod tests {
                 "no row for {ev:?} — silent drop"
             );
         }
+        // The rows carry the text an operator needs, not just a placeholder.
+        let rows = |ev: &TranscriptEvent| -> String {
+            transcript_event_lines(ev, &prefs, LiveViewMode::Compact)
+                .iter()
+                .map(|l| l.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
+        assert!(find("refused · cyber"));
+        assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("unrecognized event · future_event"));
         // thinking_delta stays dropped, like assistant_delta.
         assert!(transcript_event_lines(
             &TranscriptEvent::ThinkingDelta {

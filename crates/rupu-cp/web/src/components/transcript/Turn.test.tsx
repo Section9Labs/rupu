@@ -168,4 +168,34 @@ describe('Turn', () => {
     expect(screen.getByText(/summarized 9/)).toBeInTheDocument();
     expect(screen.getByText(/hologram_projection/)).toBeInTheDocument();
   });
+
+  it('renders outcome blocks with title and detail, recovery as a muted line, and unknown data as JSON', () => {
+    render(
+      <Turn
+        defaultOpen
+        turn={{
+          blocks: [
+            {
+              kind: 'outcome',
+              severity: 'error',
+              title: 'refused · cyber',
+              detail: 'Declined for this example.',
+            },
+            { kind: 'outcome', severity: 'warning', title: 'cut off', detail: null },
+            { kind: 'recovery', text: '↺ rung 1 · retried' },
+            { kind: 'unknown', type: 'brand_new_event', data: { x: 1 } },
+          ],
+          tokensIn: null,
+          tokensOut: null,
+          summary: { toolCount: 0, findingCount: 0, result: 'running' },
+        }}
+      />,
+    );
+    expect(screen.getByText('refused · cyber')).toBeInTheDocument();
+    expect(screen.getByText('Declined for this example.')).toBeInTheDocument();
+    expect(screen.getByText('cut off')).toBeInTheDocument();
+    expect(screen.getByText('↺ rung 1 · retried')).toBeInTheDocument();
+    expect(screen.getByText(/brand_new_event/)).toBeInTheDocument();
+    expect(screen.getByText(/"x": 1/)).toBeInTheDocument();
+  });
 });

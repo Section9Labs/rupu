@@ -261,6 +261,14 @@ fn replay_with_printer(
                         }
                     }
                 }
+                rupu_transcript::Event::Outcome { .. }
+                | rupu_transcript::Event::Recovery { .. } => {
+                    if let Some((status, label, text)) =
+                        crate::output::outcome_row::outcome_event_row(&ev)
+                    {
+                        printer.sideband_event(status, label, Some(&text));
+                    }
+                }
                 _ => {}
             }
         }

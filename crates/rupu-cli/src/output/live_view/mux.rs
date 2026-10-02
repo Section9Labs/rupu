@@ -114,6 +114,19 @@ pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
             ..
         } => Some(Line::new().danger(format!("✕ {tool} blocked"))),
         Event::Notice { message, .. } => Some(Line::new().dim(format!("! {}", squash(message)))),
+        // A classified non-normal reply (refusal, cut-off, malformed call, …)
+        // and what the run did about it. Errors are the rows operators must
+        // not miss; warnings share the finding-meter tone; recovery is dim.
+        Event::Outcome { outcome, .. } => {
+            let text = squash(&rupu_transcript::outcome::outcome_line(outcome));
+            Some(match outcome.severity {
+                rupu_transcript::Severity::Error => Line::new().danger(text),
+                rupu_transcript::Severity::Warning => Line::new().meter(text),
+                rupu_transcript::Severity::Info => Line::new().dim(text),
+            })
+        }
+        Event::Recovery { .. } => crate::output::outcome_row::outcome_event_row(ev)
+            .map(|(_, _, text)| Line::new().dim(squash(&text))),
         _ => None,
     }?;
 
@@ -805,6 +818,38 @@ mod tests {
             None
         )
         .is_none());
+    }
+
+    #[test]
+    fn project_event_surfaces_outcome_and_recovery() {
+        let outcome = Event::Outcome {
+            turn_idx: 1,
+            outcome: rupu_transcript::OutcomeRecord {
+                id: "oc_1".into(),
+                class: "refusal".into(),
+                severity: rupu_transcript::Severity::Error,
+                title: "refused · cyber".into(),
+                detail: None,
+                error_class: None,
+                wire: serde_json::Value::Null,
+            },
+        };
+        let row = project_event(&outcome, Some("otter#3")).expect("outcome row");
+        assert!(render_plain(std::slice::from_ref(&row.line)).contains("refused · cyber"));
+        let recovery = Event::Recovery {
+            outcome_id: "oc_1".into(),
+            rung: 1,
+            action: rupu_transcript::RecoveryAction::Retried,
+            attempt: None,
+            budget: None,
+            provider: None,
+            model: None,
+            reason: None,
+            merge_into_previous: false,
+            continues_output: false,
+        };
+        let row = project_event(&recovery, None).expect("recovery row");
+        assert!(render_plain(std::slice::from_ref(&row.line)).contains("↺ rung 1 · retried"));
     }
 
     // ---- TranscriptMux -------------------------------------------------

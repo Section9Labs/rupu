@@ -225,10 +225,31 @@ function TurnBlockView({
           context compacted · seq {block.seq} · summarized {block.summarized} messages
         </div>
       );
+    case 'outcome': {
+      const tone =
+        block.severity === 'error'
+          ? 'border-err bg-err-bg/40'
+          : block.severity === 'warning'
+            ? 'border-warn bg-warn-bg/40'
+            : 'border-info';
+      return (
+        <div className={`rounded-lg border-l-2 px-2.5 py-2 ${tone}`}>
+          <div className="text-note font-medium text-ink">{block.title}</div>
+          {block.detail && <div className="text-meta text-ink-dim">{block.detail}</div>}
+        </div>
+      );
+    }
+    case 'recovery':
+      return <div className="text-meta text-ink-mute">{block.text}</div>;
     case 'unknown':
       return (
         <div className="text-meta italic text-ink-mute">
           unrecognized event: {block.type} (newer rupu wrote this transcript)
+          {block.data !== undefined && (
+            <pre className="mt-1 max-h-40 overflow-auto rounded bg-surface p-1.5 font-mono not-italic">
+              {JSON.stringify(block.data, null, 2)}
+            </pre>
+          )}
         </div>
       );
   }

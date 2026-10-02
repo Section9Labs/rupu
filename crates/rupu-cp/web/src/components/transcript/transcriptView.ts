@@ -35,9 +35,10 @@
  *     .thinking` string becomes a `thinking` block emitted immediately
  *     before that turn's `assistant` block, so both eras render the same
  *     block shape.
- *   • `gate_requested` / `seed` / `user_message` / `notice` / `compaction`
- *     each become their own block kind. Anything else unrecognised becomes
- *     an `unknown` block carrying the raw event `type` — nothing is ever
+ *   • `gate_requested` / `seed` / `user_message` / `notice` / `compaction` /
+ *     `outcome` / `recovery` each become their own block kind. Anything else
+ *     unrecognised becomes an `unknown` block carrying the raw event `type`
+ *     and its `data` — nothing is ever
  *     silently dropped, EXCEPT `net_flow`: TranscriptSink appends one into
  *     this same JSONL on essentially every provider call, and it already has
  *     a dedicated display (the RunDetail Netflow tab, fed from the separate
@@ -55,7 +56,8 @@
  * No React, no DOM — a deterministic function over the event list.
  */
 
-import type { TranscriptEvent } from '../../lib/transcript';
+import type { TranscriptEvent, OutcomeSeverity } from '../../lib/transcript';
+import { recoveryLine } from '../../lib/outcome';
 
 // ---------------------------------------------------------------------------
 // View model
@@ -153,7 +155,9 @@ export type TurnBlock =
   | { kind: 'seed'; messageCount: number; sourceTranscript: string | null }
   | { kind: 'notice'; noticeKind: string; message: string }
   | { kind: 'compaction'; seq: number; summarized: number }
-  | { kind: 'unknown'; type: string };
+  | { kind: 'outcome'; severity: OutcomeSeverity; title: string; detail: string | null }
+  | { kind: 'recovery'; text: string }
+  | { kind: 'unknown'; type: string; data?: unknown };
 
 export interface TurnView {
   blocks: TurnBlock[];
@@ -693,11 +697,42 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         break;
       }
 
+      case 'outcome': {
+        const o = (data.outcome ?? {}) as Record<string, unknown>;
+        const sev = asString(o.severity);
+        ensureTurn().blocks.push({
+          kind: 'outcome',
+          severity: sev === 'error' || sev === 'warning' || sev === 'info' ? sev : 'info',
+          title: asString(o.title) ?? asString(o.class) ?? 'outcome',
+          detail: asString(o.detail),
+        });
+        break;
+      }
+
+      case 'recovery': {
+        ensureTurn().blocks.push({
+          kind: 'recovery',
+          text: recoveryLine({
+            rung: asNumber(data.rung) ?? 0,
+            action: asString(data.action) ?? 'other',
+            attempt: asNumber(data.attempt),
+            budget: asNumber(data.budget),
+            provider: asString(data.provider),
+            model: asString(data.model),
+            reason: asString(data.reason),
+          }),
+        });
+        break;
+      }
+
       default: {
         // Anything unrecognised (including forward-compat event types the
         // catch-all member of TranscriptEvent admits) still renders, rather
-        // than vanishing silently.
-        ensureTurn().blocks.push({ kind: 'unknown', type: ev.type });
+        // than vanishing silently. The raw data rides along so the row can
+        // show what the newer writer recorded.
+        const block: TurnBlock = { kind: 'unknown', type: ev.type };
+        if (ev.data !== undefined && ev.data !== null) block.data = ev.data;
+        ensureTurn().blocks.push(block);
         break;
       }
     }

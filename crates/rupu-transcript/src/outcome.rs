@@ -63,3 +63,92 @@ pub enum RecoveryAction {
     #[serde(other)]
     Other,
 }
+
+impl RecoveryAction {
+    /// The snake_case wire name (`Other` for an action this reader does not know).
+    pub fn name(self) -> &'static str {
+        match self {
+            RecoveryAction::Continued => "continued",
+            RecoveryAction::Retried => "retried",
+            RecoveryAction::Compacted => "compacted",
+            RecoveryAction::FellBack => "fell_back",
+            RecoveryAction::ServedByFallback => "served_by_fallback",
+            RecoveryAction::Skipped => "skipped",
+            RecoveryAction::Asked => "asked",
+            RecoveryAction::Parked => "parked",
+            RecoveryAction::Failed => "failed",
+            RecoveryAction::Other => "other",
+        }
+    }
+}
+
+/// One-line rendering of an outcome: `✗ title — detail` (`✗` error, `!`
+/// warning, `·` info). Plan 3 replaces this with the full presentation module.
+pub fn outcome_line(o: &OutcomeRecord) -> String {
+    let glyph = match o.severity {
+        Severity::Error => '✗',
+        Severity::Warning => '!',
+        Severity::Info => '·',
+    };
+    match o.detail.as_deref().filter(|d| !d.is_empty()) {
+        Some(detail) => format!("{glyph} {} — {detail}", o.title),
+        None => format!("{glyph} {}", o.title),
+    }
+}
+
+/// One-line rendering of a recovery action: `↺ rung 1 · fell back to p/m`.
+pub fn recovery_line(
+    action: RecoveryAction,
+    rung: u8,
+    provider: Option<&str>,
+    model: Option<&str>,
+    attempt: Option<u32>,
+    budget: Option<u32>,
+    reason: Option<&str>,
+) -> String {
+    let target = || match (provider, model) {
+        (Some(p), Some(m)) => format!("{p}/{m}"),
+        (None, Some(m)) => m.to_string(),
+        (Some(p), None) => p.to_string(),
+        (None, None) => "?".to_string(),
+    };
+    let phrase = match action {
+        RecoveryAction::Continued => match (attempt, budget) {
+            (Some(a), Some(b)) => format!("continued {a}/{b}"),
+            _ => "continued".to_string(),
+        },
+        RecoveryAction::FellBack => format!("fell back to {}", target()),
+        RecoveryAction::ServedByFallback => {
+            format!(
+                "served by {}",
+                model.map(str::to_string).unwrap_or_else(target)
+            )
+        }
+        RecoveryAction::Skipped => match reason {
+            Some(r) => format!("skipped {}: {r}", target()),
+            None => format!("skipped {}", target()),
+        },
+        RecoveryAction::Failed => "no recovery left".to_string(),
+        other => other.name().to_string(),
+    };
+    format!("↺ rung {rung} · {phrase}")
+}
+
+/// Cap on the JSON payload shown for an unrecognized event.
+const UNKNOWN_DATA_MAX_CHARS: usize = 200;
+
+/// One-line rendering of an event this reader does not know: its tag plus
+/// the compact JSON of its data, truncated to 200 characters.
+pub fn unknown_line(tag: &str, data: &Value) -> String {
+    let head = format!("unrecognized event · {tag}");
+    if data.is_null() {
+        return head;
+    }
+    let json = data.to_string();
+    if json.chars().count() <= UNKNOWN_DATA_MAX_CHARS {
+        format!("{head} {json}")
+    } else {
+        let cut: String = json.chars().take(UNKNOWN_DATA_MAX_CHARS - 1).collect();
+        format!("{head} {cut}…")
+    }
+}
