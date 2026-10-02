@@ -150,14 +150,19 @@ function str(v: unknown): string {
 }
 
 export function runItems(rows: RunListRow[]): PaletteItem[] {
-  return rows.map((r) => ({
-    kind: 'run' as const,
-    id: r.id,
-    title: r.workflow_name,
-    subtitle: `${shortId(r.id)} · ${r.status}`,
-    to: `/runs/${r.id}`,
-    keywords: r.id,
-  }));
+  return rows.map((r) => {
+    const remote = r.host_id && r.host_id !== 'local' ? r.host_id : null;
+    return {
+      kind: 'run' as const,
+      id: remote ? `${remote}:${r.id}` : r.id,
+      title: r.workflow_name,
+      subtitle: `${shortId(r.id)} · ${r.status}${remote ? ` · ${remote}` : ''}`,
+      // A remote run's detail must name its host, or the CP falls back to
+      // probing every host to find it.
+      to: remote ? `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(remote)}` : `/runs/${r.id}`,
+      keywords: r.id,
+    };
+  });
 }
 
 export function agentItems(rows: AgentSummary[]): PaletteItem[] {

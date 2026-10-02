@@ -111,6 +111,17 @@ describe('mappers', () => {
     expect(it0.subtitle).toBe('ABC123XY · completed');
   });
 
+  it('runItems links a remote run with its host (and keeps the id unique per host)', () => {
+    const base = { id: 'ABC123XYZ', workflow_name: 'deploy', status: 'completed' } as RunListRow;
+    const [remote] = runItems([{ ...base, id: 'run_r', host_id: 'host_prod' }]);
+    expect(remote.to).toBe('/runs/run_r?host=host_prod');
+    expect(remote.id).toBe('host_prod:run_r');
+    expect(remote.subtitle).toContain('host_prod');
+    const [local] = runItems([{ ...base, id: 'run_l', host_id: 'local' }]);
+    expect(local.to).toBe('/runs/run_l');
+    expect(local.id).toBe('run_l');
+  });
+
   it('agentItems → /agents/:name with provider/model subtitle', () => {
     const rows = [{ name: 'reviewer', provider: 'anthropic', model: 'opus' } as AgentSummary];
     const [a] = agentItems(rows);

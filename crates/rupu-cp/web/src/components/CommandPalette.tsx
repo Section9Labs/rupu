@@ -229,6 +229,9 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const [items, setItems] = useState<PaletteItem[]>([]);
+  // Remote hosts' runs land one host at a time, after (or before) the batch
+  // below commits `items` — kept apart so that commit can't overwrite them.
+  const [remoteRunItems, setRemoteRunItems] = useState<PaletteItem[]>([]);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const navigate = useNavigate();
@@ -274,9 +277,32 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
     setTimeout(() => inputRef.current?.focus(), 0);
 
     let cancelled = false;
+    // One controller per open: closing (or unmounting) aborts every per-host
+    // run request, so a hung remote can't pin a connection per open and
+    // exhaust the browser's per-origin pool.
+    const controller = new AbortController();
+    const { signal } = controller;
+    setRemoteRunItems([]);
     setLoading(true);
     Promise.all([
-      api.getRuns({ limit: 200 }).then(runItems).catch(() => []),
+      // Runs load per host (spec 2026-10-01 §6.6): local is part of the
+      // initial batch; each remote's runs append when that host answers, so
+      // a slow or dead host never holds the palette in a loading state.
+      api.getRegisteredHosts()
+        .catch(() => [{ id: 'local', name: 'Local', transport_kind: 'local' as const }])
+        .then((hosts) => {
+          for (const h of hosts) {
+            if (h.id === 'local') continue;
+            api
+              .getRuns({ host: h.id, limit: 200, signal })
+              .then(runItems)
+              .then((rows) => {
+                if (!cancelled) setRemoteRunItems((prev) => [...prev, ...rows]);
+              })
+              .catch(() => {});
+          }
+          return api.getRuns({ host: 'local', limit: 200, signal }).then(runItems).catch(() => []);
+        }),
       api.getAgents().then(agentItems).catch(() => []),
       api.getWorkflows().then(workflowItems).catch(() => []),
       api.getAutoflowDefs().then(autoflowItems).catch(() => []),
@@ -297,12 +323,13 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [open]);
 
   const groups = useMemo(
-    () => rankPalette(query, items, shell === 'v2' ? NAV_PAGES_V2 : NAV_PAGES),
-    [query, items, shell],
+    () => rankPalette(query, [...items, ...remoteRunItems], shell === 'v2' ? NAV_PAGES_V2 : NAV_PAGES),
+    [query, items, remoteRunItems, shell],
   );
 
   // Flat ordered list for keyboard nav — mirrors the visual group order.
