@@ -554,6 +554,17 @@ pub(crate) trait RemoteExec: Send + Sync {
     /// Run `remote_command` to completion and collect its output.
     async fn run(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError>;
 
+    /// [`run`](Self::run), except that dropping the returned future kills the
+    /// remote command (`SshExec`: `kill_on_drop(true)` on the `ssh` child).
+    /// Only for side-effect-free reads that may be abandoned: the cached
+    /// listing path, whose fetches the listing cache drops on its
+    /// `LISTING_MAX_INFLIGHT` bound. Mutations use `run`, so a dropped caller
+    /// never cuts one short. The default is `run`, for fakes that hold no
+    /// child.
+    async fn run_cancellable(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+        self.run(remote_command).await
+    }
+
     /// Spawn `remote_command` and return a stream of its stdout lines.
     ///
     /// The ssh child is kept alive for the stream's duration. When the stream
@@ -603,9 +614,10 @@ pub(crate) struct SshExec {
     pub identity_file: Option<std::path::PathBuf>,
 }
 
-#[async_trait::async_trait]
-impl RemoteExec for SshExec {
-    async fn run(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+impl SshExec {
+    /// The `ssh` command for a one-shot `remote_command` (shared by `run` and
+    /// `run_cancellable`).
+    fn short_call(&self, remote_command: &str) -> tokio::process::Command {
         let argv = ssh_argv(
             &self.host,
             self.port,
@@ -613,8 +625,14 @@ impl RemoteExec for SshExec {
             remote_command,
             SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
-        let out = tokio::process::Command::new("ssh")
-            .args(&argv)
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv);
+        cmd
+    }
+
+    /// Run `cmd` to completion and collect its output.
+    async fn collect(mut cmd: tokio::process::Command) -> Result<RemoteOutput, RemoteExecError> {
+        let out = cmd
             .output()
             .await
             .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
@@ -623,6 +641,19 @@ impl RemoteExec for SshExec {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             success: out.status.success(),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteExec for SshExec {
+    async fn run(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+        Self::collect(self.short_call(remote_command)).await
+    }
+
+    async fn run_cancellable(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+        let mut cmd = self.short_call(remote_command);
+        cmd.kill_on_drop(true);
+        Self::collect(cmd).await
     }
 
     fn spawn_lines(&self, remote_command: &str) -> Result<LineStream, RemoteExecError> {
@@ -1068,7 +1099,9 @@ fn classify_remote_cli_failure(stderr: &str) -> HostConnectorError {
 /// remote `rupu`. ssh reports these itself on stderr (exit 255) before the
 /// remote command ever runs; `RemoteOutput` carries no exit code, so the
 /// markers are what tells "this host is down" from "this host's rupu is too
-/// old to answer".
+/// old to answer". The listing cache's own bound counts too: a listing with
+/// no answer after `LISTING_MAX_INFLIGHT` is a hung host, not an old rupu
+/// (which fails fast).
 fn is_ssh_transport_failure(stderr: &str) -> bool {
     const MARKERS: &[&str] = &[
         "ssh: ", // "ssh: connect to host …", "ssh: Could not resolve hostname …"
@@ -1087,6 +1120,8 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
         "not responding",        // "Timeout, server <host> not responding."
         "broken pipe",           // "client_loop: send disconnect: Broken pipe"
         "received disconnect",   // "Received disconnect from <ip> port 22:…"
+        // `listing_cache::LISTING_MAX_INFLIGHT` fired: no answer at all.
+        "listing took longer than",
     ];
     let lower = stderr.to_ascii_lowercase();
     MARKERS.iter().any(|m| lower.contains(m))
@@ -1172,21 +1207,35 @@ fn session_item_to_api_shape(item: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(map.clone())
 }
 
+/// How [`exec_rupu_json`] runs its remote command.
+#[derive(Clone, Copy)]
+enum ExecMode {
+    /// [`RemoteExec::run`]: the command runs to completion even if the caller
+    /// goes away. Everything except the cached listings.
+    ToCompletion,
+    /// [`RemoteExec::run_cancellable`]: dropping the call kills the `ssh`
+    /// child. Only [`SshHostConnector::cached_rows`] (side-effect-free
+    /// listings the listing cache may abandon).
+    Cancellable,
+}
+
 /// Run `rupu <argv…>` over `exec` and parse its JSON stdout. A free function
 /// (owned `exec` and argv) so the listing cache can hold the future as
 /// `'static`. [`SshHostConnector::remote_json`] delegates here.
 async fn exec_rupu_json(
     exec: Arc<dyn RemoteExec>,
     argv: Vec<String>,
+    mode: ExecMode,
 ) -> Result<serde_json::Value, HostConnectorError> {
     let owned: Vec<String> = std::iter::once("rupu".to_string())
         .chain(argv.iter().cloned())
         .collect();
     let cmd = build_remote_command(&owned);
-    let out = exec
-        .run(&cmd)
-        .await
-        .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+    let out = match mode {
+        ExecMode::ToCompletion => exec.run(&cmd).await,
+        ExecMode::Cancellable => exec.run_cancellable(&cmd).await,
+    }
+    .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
     if !out.success {
         return Err(HostConnectorError::Unreachable(out.stderr));
     }
@@ -1848,13 +1897,17 @@ impl SshHostConnector {
         exec_rupu_json(
             Arc::clone(&self.exec),
             argv.iter().map(|s| s.to_string()).collect(),
+            ExecMode::ToCompletion,
         )
         .await
     }
 
     /// [`remote_json_rows`](Self::remote_json_rows) through [`Self::listings`]:
     /// one remote run per argv per [`crate::host::listing_cache::LISTING_TTL`],
-    /// shared by every concurrent caller.
+    /// shared by every concurrent caller. The remote command runs through
+    /// [`RemoteExec::run_cancellable`], so when the cache abandons a fetch at
+    /// [`crate::host::listing_cache::LISTING_MAX_INFLIGHT`] the `ssh` child is
+    /// killed rather than left running.
     async fn cached_rows(
         &self,
         argv: &[&str],
@@ -1865,7 +1918,9 @@ impl SshHostConnector {
         let rows = self
             .listings
             .get(&key, move || async move {
-                exec_rupu_json(exec, argv).await.map(|v| json_rows(&v))
+                exec_rupu_json(exec, argv, ExecMode::Cancellable)
+                    .await
+                    .map(|v| json_rows(&v))
             })
             .await?;
         Ok(rows.as_ref().clone())
@@ -3605,6 +3660,99 @@ mod tests {
         assert_eq!(exec.count(SESSION_LIST), 2);
     }
 
+    /// Records whether each remote command went through `run` or
+    /// `run_cancellable`, and answers every command with one run row.
+    #[derive(Default)]
+    struct ModeExec {
+        calls: std::sync::Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl ModeExec {
+        fn count(&self, method: &str, needle: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, c)| *m == method && c.contains(needle))
+                .count()
+        }
+        fn answer() -> RemoteOutput {
+            RemoteOutput {
+                stdout: r#"{"rows":[{"id":"run_1","status":"completed","started_at":"2026-09-01T00:00:00Z","trigger":"manual"}]}"#.into(),
+                stderr: String::new(),
+                success: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for ModeExec {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.calls.lock().unwrap().push(("run", remote.to_string()));
+            Ok(Self::answer())
+        }
+        async fn run_cancellable(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("run_cancellable", remote.to_string()));
+            Ok(Self::answer())
+        }
+        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+            unimplemented!("not used by this test")
+        }
+        async fn run_bytes(
+            &self,
+            _c: &str,
+            _s: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            unimplemented!("not used by this test")
+        }
+    }
+
+    /// The cached listings run through `run_cancellable` (so an abandoned
+    /// listing's `ssh` child is killed); everything else keeps `run`, so a
+    /// dropped caller never cuts a mutation short.
+    #[tokio::test]
+    async fn cached_listings_use_run_cancellable_and_everything_else_run() {
+        let exec = std::sync::Arc::new(ModeExec::default());
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        conn.list_runs(all_runs()).await.unwrap();
+        conn.list_sessions(None).await.unwrap();
+        conn.list_autoflow_runs().await.unwrap();
+        assert_eq!(exec.count("run_cancellable", RUN_LIST), 1);
+        assert_eq!(exec.count("run_cancellable", SESSION_LIST), 1);
+        assert_eq!(exec.count("run_cancellable", AUTOFLOW_HISTORY), 1);
+        assert_eq!(exec.count("run", ""), 0, "no listing went through run");
+
+        let _ = conn.get_run("run_1").await;
+        let _ = conn.archive_run("run_1").await;
+        assert_eq!(exec.count("run", "'run' 'show'"), 1);
+        assert_eq!(exec.count("run", "'archive-run'"), 1);
+        assert_eq!(
+            exec.count("run_cancellable", ""),
+            3,
+            "only the three listings were cancellable"
+        );
+    }
+
+    /// A hung host's listing is abandoned at the cache's in-flight bound and
+    /// reads as offline (`Unreachable`), not as an old rupu (`Unsupported`).
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_listing_times_out_as_unreachable() {
+        let exec = ListingExec::new(
+            (crate::host::listing_cache::LISTING_MAX_INFLIGHT + std::time::Duration::from_secs(30))
+                .as_millis() as u64,
+        );
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m == "listing took longer than 60s"),
+            "{err}"
+        );
+        assert_eq!(exec.count(RUN_LIST), 1);
+    }
+
     #[tokio::test]
     async fn every_mutation_clears_the_listing_cache() {
         let exec = ListingExec::new(0);
@@ -3708,6 +3856,8 @@ mod tests {
             "Timeout, server host-a not responding.",
             "client_loop: send disconnect: Broken pipe",
             "Received disconnect from 10.0.0.9 port 22:2: Too many authentication failures",
+            // The listing cache's in-flight bound.
+            "listing took longer than 60s",
             // The real shape ssh prints for the common case.
             "ssh: connect to host host-a port 22: Connection refused",
         ] {

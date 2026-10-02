@@ -13,16 +13,22 @@
 //!   for a fresh fetch. Stale data is never served.
 //! - Concurrent callers for one key share ONE in-flight fetch, including its
 //!   error. An error is never stored past that fetch.
-//! - A fetch whose every waiter went away (cancelled) is dropped, never
-//!   resumed for a later caller, so its old answer is never served as fresh.
-//!   Dropping it closes the remote command's pipes; it does not kill the
-//!   child (`SshExec::run` is `Command::output()` without `kill_on_drop`),
-//!   which exits on its next write (EPIPE/SIGPIPE).
+//! - The fetch runs in its own spawned task, to completion, whether or not
+//!   anyone is still waiting on it. Its waiters only await its shared result,
+//!   and a caller arriving while it runs joins it, even when every earlier
+//!   waiter went away. So client churn (rapid tab switches, aborted page
+//!   requests) never starts a second listing for a key on a host. A spawned
+//!   task is always polled, so its answer is fresh when it completes, and the
+//!   task itself stores it.
+//! - A fetch is bounded at [`LISTING_MAX_INFLIGHT`]. Past it the fetch future
+//!   is dropped (the ssh listing exec kills its child on drop), every waiter
+//!   gets an `Unreachable` error, and nothing is stored.
 //! - A fetch that panics fails every waiter with an error and stores nothing.
 //! - [`ListingCache::clear`], which every mutating connector method calls via
-//!   [`ClearOnDrop`], drops everything. A fetch that STARTED before the clear
-//!   never stores its (pre-mutation) answer, and a caller arriving after the
-//!   clear never joins it.
+//!   [`ClearOnDrop`], drops every stored listing and forgets every in-flight
+//!   fetch without aborting it (its waiters asked before the mutation). A
+//!   fetch that STARTED before the clear never stores its (pre-mutation)
+//!   answer, and a caller arriving after the clear never joins it.
 
 use crate::host::connector::HostConnectorError;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
@@ -41,6 +47,11 @@ use std::time::{Duration, Instant};
 /// Raise it only together with a server-stamped capture time (spec §11).
 pub const LISTING_TTL: Duration = Duration::from_secs(5);
 
+/// The longest one listing fetch may run. Fetches run to completion even when
+/// nobody waits on them any more, so without this bound a hung remote would
+/// keep its key's fetch (and, for ssh, its child process) alive forever.
+pub const LISTING_MAX_INFLIGHT: Duration = Duration::from_secs(60);
+
 /// One listing's rows, shared between every caller that received it.
 pub type Rows = Arc<Vec<serde_json::Value>>;
 
@@ -48,13 +59,11 @@ type Fetch = Shared<BoxFuture<'static, Result<Rows, HostConnectorError>>>;
 
 /// One fetch in flight for a key.
 struct InFlight {
-    /// Never reused. Only the waiters of THIS fetch may retire or store for
-    /// it, so a fetch that `clear` already dropped can never store.
+    /// Never reused. Only the task running THIS fetch may retire its entry or
+    /// store its rows, so a fetch that `clear` already forgot can never store.
     id: u64,
+    /// The fetch task's result, shared by every caller awaiting it.
     fut: Fetch,
-    /// Callers currently awaiting `fut`. At zero the fetch is dropped: nobody
-    /// is polling it, and resuming it later would serve an old snapshot.
-    waiters: usize,
 }
 
 #[derive(Default)]
@@ -67,7 +76,9 @@ struct State {
 /// See the module docs.
 pub struct ListingCache {
     ttl: Duration,
-    state: Mutex<State>,
+    /// Shared with the spawned fetch tasks, which retire and store their own
+    /// entries.
+    state: Arc<Mutex<State>>,
 }
 
 impl Default for ListingCache {
@@ -80,20 +91,80 @@ fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+fn panicked() -> HostConnectorError {
+    HostConnectorError::Unreachable("listing fetch panicked".into())
+}
+
+/// Retire `key`'s in-flight entry if it is still fetch `id`'s, and on success
+/// store its rows. If `clear` forgot the entry meanwhile (or a newer fetch
+/// replaced it), the id no longer matches and nothing happens.
+fn retire(state: &Mutex<State>, key: &str, id: u64, out: &Result<Rows, HostConnectorError>) {
+    let retired = {
+        let mut s = lock(state);
+        if !matches!(s.inflight.get(key), Some(f) if f.id == id) {
+            return;
+        }
+        if let Ok(rows) = out {
+            s.fresh
+                .insert(key.to_string(), (Instant::now(), Arc::clone(rows)));
+        }
+        s.inflight.remove(key)
+    };
+    // The entry holds a handle on this very fetch; let it go outside the lock.
+    drop(retired);
+}
+
+/// The body of one fetch's spawned task: run `fetch` (bounded, panics caught),
+/// then retire and store its own entry.
+async fn run_fetch<Fut>(
+    state: Arc<Mutex<State>>,
+    key: String,
+    id: u64,
+    fetch: Fut,
+) -> Result<Rows, HostConnectorError>
+where
+    Fut: Future<Output = Result<Vec<serde_json::Value>, HostConnectorError>>,
+{
+    // `timeout` drops `fetch` when it fires (for ssh, `kill_on_drop` then
+    // kills the child). The panic is caught so the task completes normally
+    // and every waiter is woken with the same error. (The panic message
+    // itself still reaches the panic hook.)
+    let out =
+        match tokio::time::timeout(LISTING_MAX_INFLIGHT, AssertUnwindSafe(fetch).catch_unwind())
+            .await
+        {
+            Ok(Ok(rows)) => rows.map(Arc::new),
+            Ok(Err(_)) => Err(panicked()),
+            Err(_) => Err(HostConnectorError::Unreachable(format!(
+                "listing took longer than {}s",
+                LISTING_MAX_INFLIGHT.as_secs()
+            ))),
+        };
+    retire(&state, &key, id, &out);
+    out
+}
+
 impl ListingCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            state: Mutex::default(),
+            state: Arc::default(),
         }
     }
 
-    /// Drop every listing, and make every fetch already in flight unable to
-    /// store its answer: its entry is gone, so its id no longer matches.
+    /// Drop every listing and forget every fetch in flight, so new callers
+    /// start fresh. In-flight fetches are not aborted (their waiters asked
+    /// before the mutation and still get their answer), but they can no
+    /// longer store it: their entry is gone, so their id no longer matches.
     pub fn clear(&self) {
-        let mut s = lock(&self.state);
-        s.fresh.clear();
-        s.inflight.clear();
+        let (fresh, inflight) = {
+            let mut s = lock(&self.state);
+            (
+                std::mem::take(&mut s.fresh),
+                std::mem::take(&mut s.inflight),
+            )
+        };
+        drop((fresh, inflight));
     }
 
     /// Clear when the returned guard drops, i.e. when the mutating call
@@ -104,38 +175,44 @@ impl ListingCache {
     }
 
     /// `key`'s rows: fresh from the cache, joined onto an in-flight fetch, or
-    /// fetched now via `fetch`. `fetch` is only called when neither exists.
+    /// fetched now via `fetch`. `fetch` is only called when neither exists;
+    /// its future then runs in a spawned task (see the module docs). Must be
+    /// called inside a tokio runtime.
     pub async fn get<F, Fut>(&self, key: &str, fetch: F) -> Result<Rows, HostConnectorError>
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Vec<serde_json::Value>, HostConnectorError>> + Send + 'static,
     {
-        let (id, fut) = {
+        let fut = {
             let mut s = lock(&self.state);
             if let Some((at, rows)) = s.fresh.get(key) {
                 if at.elapsed() < self.ttl {
                     return Ok(Arc::clone(rows));
                 }
             }
-            if let Some(joined) = s.inflight.get_mut(key) {
-                joined.waiters += 1;
-                (joined.id, joined.fut.clone())
+            if let Some(joined) = s.inflight.get(key) {
+                joined.fut.clone()
             } else {
                 s.next_id += 1;
                 let id = s.next_id;
-                // The panic is caught INSIDE the shared future: `Shared` marks
-                // itself poisoned on a panic but never wakes the waiters
-                // already parked on it, which would hang them and leave the
-                // key joined to a dead fetch. Caught, the future completes,
-                // so every waiter is woken with the same error. (The panic
-                // message itself still reaches the panic hook.)
-                let fut: Fetch = AssertUnwindSafe(fetch())
-                    .catch_unwind()
-                    .map(|r| match r {
-                        Ok(rows) => rows.map(Arc::new),
-                        Err(_) => Err(HostConnectorError::Unreachable(
-                            "listing fetch panicked".into(),
-                        )),
+                // Spawned while the lock is held, so the entry is in place
+                // before the task can try to retire it.
+                let task = tokio::spawn(run_fetch(
+                    Arc::clone(&self.state),
+                    key.to_string(),
+                    id,
+                    fetch(),
+                ));
+                let (state, owned_key) = (Arc::clone(&self.state), key.to_string());
+                let fut: Fetch = task
+                    .map(move |joined| {
+                        joined.unwrap_or_else(|_| {
+                            // The task itself died (it catches panics, so this
+                            // is the runtime shutting down): retire for it.
+                            let out = Err(panicked());
+                            retire(&state, &owned_key, id, &out);
+                            out
+                        })
                     })
                     .boxed()
                     .shared();
@@ -144,70 +221,12 @@ impl ListingCache {
                     InFlight {
                         id,
                         fut: fut.clone(),
-                        waiters: 1,
                     },
                 );
-                (id, fut)
+                fut
             }
         };
-        // Armed before the await: it runs if this future is dropped there.
-        let mut waiter = Waiter {
-            cache: self,
-            key,
-            id,
-            finished: false,
-        };
-        let out = fut.await;
-        waiter.finished = true;
-        let mut s = lock(&self.state);
-        // The first waiter back retires the entry, and on success stores the
-        // rows. If `clear` dropped the entry meanwhile (or a newer fetch
-        // replaced it), the id no longer matches and nothing is stored.
-        if matches!(s.inflight.get(key), Some(f) if f.id == id) {
-            s.inflight.remove(key);
-            if let Ok(rows) = &out {
-                s.fresh
-                    .insert(key.to_string(), (Instant::now(), Arc::clone(rows)));
-            }
-        }
-        out
-    }
-}
-
-/// One caller's claim on an in-flight fetch. If it is dropped before the fetch
-/// answered (the caller was cancelled), it gives the claim back, and the last
-/// claim to go drops the fetch itself.
-struct Waiter<'a> {
-    cache: &'a ListingCache,
-    key: &'a str,
-    id: u64,
-    finished: bool,
-}
-
-impl Drop for Waiter<'_> {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let orphaned = {
-            let mut s = lock(&self.cache.state);
-            let last = match s.inflight.get_mut(self.key) {
-                Some(f) if f.id == self.id => {
-                    f.waiters -= 1;
-                    f.waiters == 0
-                }
-                // Retired or cleared already: nothing of ours is left.
-                _ => false,
-            };
-            if last {
-                s.inflight.remove(self.key)
-            } else {
-                None
-            }
-        };
-        // Dropping the fetch runs the destructors of whatever it owns (for
-        // `ssh`, its child handle and pipes), so do it outside the lock.
-        drop(orphaned);
+        fut.await
     }
 }
 
@@ -469,7 +488,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cancelled_fetch_is_not_resumed_later() {
+    async fn a_fetch_whose_waiters_left_still_completes_and_serves_the_next_caller() {
         let cache = ListingCache::default();
         let calls = Arc::new(AtomicU32::new(0));
         // The only waiter goes away (a dropped HTTP handler future).
@@ -478,40 +497,86 @@ mod tests {
             cache.get("k", counted(&calls, Ok(rows(1)), 500)),
         )
         .await;
-        assert!(cancelled.is_err(), "the first caller must have timed out");
+        assert!(cancelled.is_err(), "the only caller must have timed out");
+        // Nobody waits on the fetch now; its task finishes it anyway.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            lock(&cache.state).inflight.is_empty(),
+            "the task retired its own entry"
+        );
         let again = cache
             .get("k", counted(&calls, Ok(rows(4)), 0))
             .await
             .unwrap();
-        assert_eq!(again.len(), 4, "served its own fetch, not the orphan's");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(again.len(), 1, "served the completed fetch's rows");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no second listing");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cancelled_waiter_leaves_the_fetch_to_the_others() {
+    async fn callers_arriving_while_an_orphaned_fetch_runs_join_it() {
         let cache = ListingCache::default();
         let calls = Arc::new(AtomicU32::new(0));
-        let (cancelled, kept) = tokio::join!(
-            tokio::time::timeout(
-                Duration::from_millis(5),
-                cache.get("k", counted(&calls, Ok(rows(2)), 40)),
-            ),
-            cache.get("k", counted(&calls, Ok(rows(9)), 40)),
-        );
-        assert!(cancelled.is_err());
-        assert_eq!(
-            kept.unwrap().len(),
-            2,
-            "the survivor finished the one fetch"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // The entry survived the cancellation, so the survivor stored it.
-        let again = cache
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(5),
+            cache.get("k", counted(&calls, Ok(rows(2)), 500)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the first caller must have timed out");
+        // The orphaned fetch is still running: the next caller joins it
+        // instead of starting another listing.
+        let joined = cache
             .get("k", counted(&calls, Ok(rows(9)), 0))
             .await
             .unwrap();
-        assert_eq!(again.len(), 2);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "served from the cache");
+        assert_eq!(joined.len(), 2, "got the orphaned fetch's rows");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "still one listing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_exceeding_the_max_inflight_age_is_abandoned() {
+        use std::sync::atomic::AtomicBool;
+
+        /// Flips its flag when dropped, i.e. when the fetch future is.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cache = ListingCache::default();
+        let calls = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let hung = {
+            let (calls, dropped) = (Arc::clone(&calls), Arc::clone(&dropped));
+            move || async move {
+                let _flag = DropFlag(dropped);
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(LISTING_MAX_INFLIGHT + Duration::from_secs(30)).await;
+                Ok(rows(1))
+            }
+        };
+        // Two waiters on the one hung fetch.
+        let (a, b) = tokio::join!(
+            cache.get("k", hung),
+            cache.get("k", counted(&calls, Ok(rows(9)), 0)),
+        );
+        for out in [a, b] {
+            match out {
+                Err(HostConnectorError::Unreachable(m)) => {
+                    assert_eq!(m, "listing took longer than 60s")
+                }
+                other => panic!("want the timeout error, got {other:?}"),
+            }
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the fetch future was dropped"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let s = lock(&cache.state);
+        assert!(s.fresh.is_empty(), "nothing stored");
+        assert!(s.inflight.is_empty(), "the entry was retired");
     }
 
     #[tokio::test]
@@ -589,10 +654,14 @@ mod tests {
         })
         .await
         .expect("B parks on the in-flight fetch");
+        assert!(
+            lock(&cache.state).inflight.contains_key("k"),
+            "A's fetch is still in flight"
+        );
         assert_eq!(
-            lock(&cache.state).inflight.get("k").map(|f| f.waiters),
-            Some(2),
-            "B joined A's fetch"
+            calls.load(Ordering::SeqCst),
+            1,
+            "B joined A's fetch rather than starting its own"
         );
 
         go_tx.send(()).unwrap();

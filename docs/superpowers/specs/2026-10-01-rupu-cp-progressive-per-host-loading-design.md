@@ -433,15 +433,23 @@ caches one per host.
     ⌘K on one page load, two browser tabs) and back-to-back catch-up and scroll pages.
 - **Single-flight:** concurrent callers for the same key share one in-flight `ssh`,
   including its error. **Errors are never stored** beyond that one call.
-- **Cancellation.** A fetch whose every waiter went away (each caller cancelled or
-  panicked) is **dropped, never resumed** for a later caller, so its old answer is never
-  served as fresh. A waiter count per in-flight fetch decides this. Dropping the fetch
-  closes the remote command's pipes. The `ssh` child is **not killed** (`SshExec::run` is
-  `Command::output()` without `kill_on_drop`); it exits on its next write.
+- **Runs to completion.** The fetch runs in its own `tokio::spawn`ed task, whether or
+  not anyone still waits on it. Waiters only await its shared result, and a caller
+  arriving while it runs joins it, even when every earlier waiter went away. So client
+  churn (rapid tab switches, aborted page requests) never starts a second listing for one
+  key on one host. A spawned task is always polled, so its answer is fresh when it
+  completes; the task itself retires its in-flight entry and, on `Ok`, stores the rows.
+- **Bounded: `LISTING_MAX_INFLIGHT` = 60 s.** A fetch still running after 60 s is
+  abandoned: its future is dropped, every waiter gets
+  `Unreachable("listing took longer than 60s")` (offline, 502; the down-vs-old classifier
+  below counts it as a transport failure), and nothing is stored. The cached listing path
+  runs its remote command through `RemoteExec::run_cancellable`, which `SshExec`
+  implements as `run` plus `kill_on_drop(true)`, so dropping the fetch **kills the `ssh`
+  child**. Every other ssh call, mutations included, keeps `run`, so a dropped caller never
+  cuts one short.
 - **Panic.** A fetch that panics fails **every** waiter, including ones parked on it, with
   an `Unreachable("listing fetch panicked")` error. Nothing is stored. The panic is caught
-  inside the shared future, because `Shared` marks itself poisoned on a panic without
-  waking the waiters already parked on it, which would hang them.
+  inside the fetch task, so the task completes normally and every waiter is woken.
 - **Cleared on mutation.** Every mutating `SshHostConnector` method clears the whole
   cache (a `clear_on_drop` guard), so a refresh straight after an action never shows the
   pre-action row:
@@ -454,9 +462,10 @@ caches one per host.
     `remote_transcript`, which changes what the cached `transcript list` returns)
   
   The cache is cleared after the remote command returns, whether it succeeded or failed:
-  a failed mutation may still have partly applied. A fetch that started before the clear
-  never stores its (pre-mutation) answer, and a caller arriving after the clear never
-  joins it.
+  a failed mutation may still have partly applied. A clear does not abort an in-flight
+  fetch (its waiters asked before the mutation and still get their answer), but it
+  forgets it: a fetch that started before the clear never stores its (pre-mutation)
+  answer, and a caller arriving after the clear never joins it.
 - **Down vs old (classification of `list_runs` / `dashboard_summary` failures).** A host
   that is down is not a host that predates `rupu run list`. An ssh **transport** failure
   (`is_ssh_transport_failure`) passes through as `Unreachable` (**offline**, 502). Only a
@@ -465,17 +474,20 @@ caches one per host.
   markers: `ssh: `, `ssh spawn failed`, `connection refused`, `connection reset by`,
   `connection timed out`, `connection closed by`, `operation timed out`, `no route to host`,
   `permission denied (publickey`, `host key verification failed`,
-  `kex_exchange_identification`, and the mid-session drops `closed by remote host`,
-  `not responding`, `broken pipe`, `received disconnect`. The
+  `kex_exchange_identification`, the mid-session drops `closed by remote host`,
+  `not responding`, `broken pipe`, `received disconnect`, and the cache's own
+  `listing took longer than` (a hung host, not an old rupu, which fails fast). The
   other cached listings (`autoflow history`, `transcript list`, `session list`) pass the
   `Unreachable` through unchanged, so they are offline on any failure.
 - **Shared use:** `list_runs` and `dashboard_summary` share the `run list` entry.
   `list_autoflow_runs`, `list_autoflow_events` and `dashboard_summary` share the
   `autoflow history` entry.
 - **Implementation:** `host/listing_cache.rs`, a sibling of `HostProbeCache`. Per key it
-  keeps one `futures::Shared` fetch behind a `std::sync::Mutex` (never held across an
-  await), plus the waiter count above. Unlike `HostProbeCache`, its fetch is fallible,
-  errors are never stored, there is no serve-stale window, and it has a `clear()`.
+  keeps one in-flight entry (an id plus a `futures::Shared` over the spawned task's
+  `JoinHandle`) behind an `Arc<std::sync::Mutex>` (never held across an await) that the
+  task shares to retire and store its own entry. Unlike `HostProbeCache`, its fetch is
+  fallible, errors are never stored, there is no serve-stale window, and it has a
+  `clear()`.
 
 **SSH budget this buys:** an open All-hosts polling table on a CP with 4 SSH hosts costs
 about **4 remote commands a minute**. Today's All-hosts Running tab costs 48 (4 hosts ×
@@ -557,7 +569,10 @@ new endpoints are added.
   - two concurrent `list_runs` → 1 exec
   - a repeat within 5 s → 0 execs; after 5 s → 1
   - an error is not stored
-  - a cancelled fetch is dropped, not resumed; a panicking fetch fails every waiter
+  - a fetch whose waiters all left still completes and serves the next caller; a caller
+    arriving meanwhile joins it; a fetch past 60 s is abandoned (future dropped, nothing
+    stored); a panicking fetch fails every waiter
+  - the cached listings exec through `run_cancellable`, everything else through `run`
   - each mutating method clears the cache
   - an ssh transport failure is `Unreachable` (offline); a remote-rupu failure is
     `Unsupported` (unavailable)
@@ -615,18 +630,28 @@ Rulings made while implementing; each is folded into the section named.
 - **§7.2: the mutation list gains transcript archive/delete (`remote_transcript`),
   `start_session` and `delete_session`.** They change what a cached listing returns (or, for
   `start_session`, would), so they must clear it too.
-- **§7.2: cancellation drops a fetch, never resumes it.** A fetch whose every waiter went
-  away would otherwise serve an old snapshot as fresh to the next caller. The ssh child is not
-  killed; it exits on its next write.
+- **§7.2: a listing fetch runs in a spawned task to completion, even if every waiter
+  leaves, bounded at `LISTING_MAX_INFLIGHT` = 60 s; on that bound its future is dropped and
+  the ssh child killed (`run_cancellable` = `run` + `kill_on_drop`, on the cached listing
+  path only).** This replaces an earlier "a fetch whose every waiter left is dropped, never
+  resumed" rule, which left the ssh child running and let rapid tab switches start a new
+  `run list --limit 10000` per click on each SSH host. That rule existed because an
+  un-polled `Shared` resumed later served an old snapshot as fresh; a spawned task is always
+  polled, so its answer is fresh when it completes. Later callers join it, so there is at
+  most one listing per key per host whatever the client does.
 - **§7.2: a panicking fetch fails every waiter, parked ones included, and stores nothing.**
-  `Shared` does not wake parked waiters on a panic, so they would hang.
+  The panic is caught inside the fetch task; `Shared` does not wake parked waiters on a
+  panic of its own inner future, so they would hang.
 - **§7.2: a fetch that started before a clear never stores, and a later caller never joins
   it.** A pre-mutation answer must not outlive the mutation.
 - **§7.2: an ssh transport failure is `Unreachable` (offline); only a remote-rupu failure is
   `Unsupported`.** A down host would otherwise read as "needs a newer rupu". The classifier is
   stderr markers because `RemoteOutput` carries no exit code.
-- **§7.2: implementation is `Shared` futures + a waiter count behind a `std` mutex**, not
-  `HostProbeCache`'s `tokio::Mutex` slot, to support cancellation and panics.
+- **§7.2: implementation is a spawned task per fetch, shared through `Shared` behind a
+  `std` mutex**, not `HostProbeCache`'s `tokio::Mutex` slot. The task retires and stores
+  its own entry; `clear()` forgets in-flight fetches without aborting them.
+- **§7.2: a listing timeout reads as offline.** `listing took longer than` is one of the
+  down-vs-old markers, so a hung host is not reported as "needs a newer rupu".
 - **§6.3: a full page 0 that does not overlap the old rows replaces the slice** and sets
   `hasMore = true`. The union would otherwise lose the rows between the two ranges.
 - **§6.3: a full page that adds no rows re-anchors and retries once, then `pagingFailed`
