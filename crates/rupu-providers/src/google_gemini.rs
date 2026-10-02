@@ -3798,6 +3798,65 @@ mod code_assist_project_tests {
         assert_eq!(store.recorded.lock().unwrap().len(), 1);
     }
 
+    /// The setup is shared only while it runs: a client that asks after it
+    /// finished sets the account up afresh (a long-lived process never pins
+    /// a result, and a record that failed is retried by the next client).
+    #[tokio::test]
+    async fn a_setup_is_shared_only_while_it_runs() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "free-tier" },
+                "cloudaicompanionProject": "managed-seq",
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:generateContent");
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+
+        for _ in 0..2 {
+            let mut client = client_for(
+                &server,
+                creds(None, None),
+                GeminiVariant::GeminiCli,
+                Some(store.clone()),
+            );
+            client.send(&request()).await.unwrap();
+        }
+
+        load.assert_hits(2);
+        assert_eq!(store.recorded.lock().unwrap().len(), 2);
+    }
+
+    /// Clients waiting on a setup that fails get its failure, rather than
+    /// each running the setup again one after another.
+    #[tokio::test]
+    async fn clients_waiting_on_a_failed_setup_share_its_failure() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(200))
+                .json_body(json!({ "currentTier": { "id": "standard-tier" } }));
+        });
+        let mut clients: Vec<GoogleGeminiClient> = (0..3)
+            .map(|_| client_for(&server, creds(None, None), GeminiVariant::GeminiCli, None))
+            .collect();
+        let req = request();
+
+        let results =
+            futures_util::future::join_all(clients.iter_mut().map(|c| c.send(&req))).await;
+
+        for r in results {
+            let msg = r.unwrap_err().to_string();
+            assert!(msg.contains("GOOGLE_CLOUD_PROJECT"), "{msg}");
+        }
+        load.assert_hits(1);
+    }
+
     /// A client of the legacy auth file (`ProviderRegistry`, no credential
     /// store) writes the project there, as its token refresh does.
     #[tokio::test]

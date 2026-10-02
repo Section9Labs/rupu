@@ -124,10 +124,15 @@ pub async fn run_with_client(
         random_state()
     };
 
-    // For tests, expose the state so the test driver can craft the redirect.
+    // For tests, expose the state so the test driver can craft the redirect:
+    // in this process's env (an in-process driver), or in a file (a driver
+    // running the `rupu` binary as a child, which can't read its env).
     if std::env::var_os("RUPU_OAUTH_SKIP_BROWSER").is_some() {
         // SAFETY: test-only seam; single-threaded in integration tests.
         std::env::set_var("RUPU_OAUTH_LAST_STATE", &state);
+        if let Ok(path) = std::env::var("RUPU_OAUTH_STATE_FILE") {
+            std::fs::write(&path, &state).with_context(|| format!("write state file {path}"))?;
+        }
     }
 
     // Bind the listener. Some IdPs (notably OpenAI Hydra) only allow

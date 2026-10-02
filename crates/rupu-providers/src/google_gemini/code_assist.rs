@@ -220,37 +220,74 @@ pub async fn setup_user(
     Ok(chosen)
 }
 
-/// The result of a setup some caller in this process already ran for `key`
-/// (an account at an endpoint, with the requested project), or `setup`'s —
-/// run by one caller at a time per key, the others waiting for it. `true`
-/// with the project when this call ran `setup` itself.
+/// `setup`'s result, shared with every caller in this process that asks
+/// for the same `key` (an account at an endpoint, with the requested
+/// project) while it runs: one caller runs it, the ones that arrive
+/// meanwhile wait and get its outcome — success or failure. `true` with the
+/// project when this call ran `setup` itself.
 ///
 /// The first requests of a fan-out on an account with no stored project
 /// would otherwise each set it up, and onboard it, at once; gemini-cli
-/// caches `setupUser` per auth client for the same reason (`userDataCache`
-/// in `setup.ts`). Only a success is kept: after a failure the next caller
-/// runs the setup again.
+/// shares `setupUser` per auth client for the same reason (`userDataCache`
+/// in `setup.ts`). Nothing outlives the run: a caller that asks after it
+/// finished sets up afresh, so a long-lived process never pins a result.
 pub async fn shared_setup<F>(key: String, setup: F) -> Result<(String, bool), ProviderError>
 where
     F: std::future::Future<Output = Result<String, ProviderError>>,
 {
-    type Slot = std::sync::Arc<tokio::sync::Mutex<Option<String>>>;
-    static SETUPS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Slot>>> =
-        std::sync::OnceLock::new();
-    let slot = SETUPS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(key)
-        .or_default()
-        .clone();
-    let mut done = slot.lock().await;
-    if let Some(project) = done.as_ref() {
-        return Ok((project.clone(), false));
+    type Slot = std::sync::Arc<tokio::sync::Mutex<Option<Result<String, ProviderError>>>>;
+    static IN_FLIGHT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Slot>>,
+    > = std::sync::OnceLock::new();
+    let in_flight = || {
+        IN_FLIGHT
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    let slot = in_flight().entry(key.clone()).or_default().clone();
+    let mut outcome = slot.lock().await;
+    if let Some(done) = outcome.as_ref() {
+        return match done {
+            Ok(project) => Ok((project.clone(), false)),
+            Err(e) => Err(duplicate_error(e)),
+        };
     }
-    let project = setup.await?;
-    *done = Some(project.clone());
-    Ok((project, true))
+    // A caller dropped here leaves the slot empty: the next one queued on it
+    // runs the setup instead.
+    let result = setup.await;
+    // Hand the outcome to the callers already queued on this slot, then
+    // retire it, so a later caller sets up afresh.
+    *outcome = Some(match &result {
+        Ok(project) => Ok(project.clone()),
+        Err(e) => Err(duplicate_error(e)),
+    });
+    let mut in_flight = in_flight();
+    if in_flight
+        .get(&key)
+        .is_some_and(|current| std::sync::Arc::ptr_eq(current, &slot))
+    {
+        in_flight.remove(&key);
+    }
+    result.map(|project| (project, true))
+}
+
+/// A copy of a setup failure for each caller that shared it: the same
+/// variant (so the retry layers classify it alike) and message.
+fn duplicate_error(e: &ProviderError) -> ProviderError {
+    match e {
+        ProviderError::Http(m) => ProviderError::Http(m.clone()),
+        ProviderError::Api { status, message } => ProviderError::Api {
+            status: *status,
+            message: message.clone(),
+        },
+        ProviderError::RateLimited { retry_after } => ProviderError::RateLimited {
+            retry_after: *retry_after,
+        },
+        ProviderError::Json(m) => ProviderError::Json(m.clone()),
+        ProviderError::AuthConfig(m) => ProviderError::AuthConfig(m.clone()),
+        other => ProviderError::Other(anyhow::anyhow!("{other}")),
+    }
 }
 
 /// gemini-cli's `coreClientMetadata`, with `duetProject` when a project is
