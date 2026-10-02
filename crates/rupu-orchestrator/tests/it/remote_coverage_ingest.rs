@@ -7,8 +7,8 @@ use rupu_agent::{AgentRunOpts, RunError};
 use rupu_coverage::{target_id, CoveragePaths, StreamLine, STREAM_VERSION};
 use rupu_orchestrator::executor::{Event, EventSink};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
-    UnitFailure, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitCoverage, UnitDispatch,
+    UnitDispatcher, UnitFailure, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
 };
 use rupu_orchestrator::{RunStore, Workflow};
 use std::collections::BTreeMap;
@@ -106,6 +106,19 @@ async fn run(
     yaml: &str,
     results: Vec<Result<UnitOutcome, UnitFailure>>,
 ) -> (tempfile::TempDir, Arc<Collect>) {
+    run_with(
+        yaml,
+        Arc::new(Scripted {
+            results: Mutex::new(results),
+        }),
+    )
+    .await
+}
+
+async fn run_with(
+    yaml: &str,
+    dispatcher: Arc<dyn UnitDispatcher>,
+) -> (tempfile::TempDir, Arc<Collect>) {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(Collect::default());
     let opts = OrchestratorRunOpts {
@@ -125,9 +138,7 @@ async fn run(
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone()),
-        unit_dispatcher: Some(Arc::new(Scripted {
-            results: Mutex::new(results),
-        })),
+        unit_dispatcher: Some(dispatcher),
         action_dispatcher: None,
         pause: None,
         naming: None,
@@ -328,4 +339,197 @@ async fn the_no_begin_line_warning_covers_an_old_host_and_a_lost_stream() {
     assert!(w[0].contains("predate coverage streaming"), "{w:?}");
     assert!(w[0].contains("lost in transport"), "{w:?}");
     assert!(!w[0].contains("upgrade rupu"), "{w:?}");
+}
+
+// ── I3: the delta's `.rupu/coverage/` vs the unit's coverage stream ─────────
+
+/// The coverage file a host's scratch workspace wrote: carried by the
+/// collected delta like any other file.
+const SCRATCH_COVERAGE: &str = ".rupu/coverage/scratch_target/findings.jsonl";
+
+/// A synced unit's delta: one ordinary file plus the host's coverage file.
+/// The payload is a JSON `path → content` map this dispatcher's own
+/// `apply_workspace_deltas` writes, standing in for the workspace codec.
+fn delta_with_coverage(file: &str) -> WorkspaceDelta {
+    let files: BTreeMap<String, String> = [
+        (file.to_string(), "edited".to_string()),
+        (SCRATCH_COVERAGE.to_string(), "{}\n".to_string()),
+    ]
+    .into();
+    WorkspaceDelta {
+        changed: files.keys().cloned().collect(),
+        deleted: vec![],
+        payload: serde_json::to_vec(&files).unwrap(),
+    }
+}
+
+/// Answers each unit by its index, and implements the delta hooks over the
+/// JSON payload of [`delta_with_coverage`].
+struct SyncByIndex {
+    results: Mutex<BTreeMap<usize, Result<UnitOutcome, UnitFailure>>>,
+}
+
+#[async_trait]
+impl UnitDispatcher for SyncByIndex {
+    async fn prepare_workspace(
+        &self,
+        _workspace_path: &std::path::Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        Ok(PreparedWorkspace::new(b"packed".to_vec()))
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        _host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
+        self.results.lock().unwrap().remove(&unit.index).unwrap()
+    }
+
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        let mut files: BTreeMap<String, String> =
+            serde_json::from_slice(&delta.payload).map_err(|e| e.to_string())?;
+        files.retain(|p, _| !p.starts_with(".rupu/coverage/"));
+        Ok(WorkspaceDelta {
+            changed: files.keys().cloned().collect(),
+            deleted: vec![],
+            payload: serde_json::to_vec(&files).unwrap(),
+        })
+    }
+
+    async fn apply_workspace_deltas(
+        &self,
+        workspace_path: &std::path::Path,
+        deltas: &[WorkspaceDelta],
+    ) -> Result<(), WorkspaceConflict> {
+        for d in deltas {
+            let files: BTreeMap<String, String> = serde_json::from_slice(&d.payload).unwrap();
+            for (rel, body) in files {
+                let p = workspace_path.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn synced_ok(file: &str, coverage: UnitCoverage) -> Result<UnitOutcome, UnitFailure> {
+    Ok(UnitOutcome {
+        output: "ok".into(),
+        success: true,
+        error: None,
+        workspace_delta: Some(delta_with_coverage(file)),
+        coverage,
+    })
+}
+
+const PLACED_SYNC: &str = "name: w\nsteps:\n  - id: s\n    agent: sec\n    prompt: p\n    host: host_01R\n    workspace: sync\n";
+
+/// The unit's stream arrived with its begin line and merged: it is the
+/// unit's coverage, so the delta's copy (keyed to the host's scratch path)
+/// is not applied — the rest of the delta is.
+#[tokio::test]
+async fn a_placed_units_merged_stream_replaces_its_delta_coverage() {
+    let (tmp, _sink) = run_with(
+        PLACED_SYNC,
+        Arc::new(SyncByIndex {
+            results: Mutex::new(
+                [(
+                    0,
+                    synced_ok(
+                        "src.txt",
+                        UnitCoverage::Stream(stream_with_finding("f_stream")),
+                    ),
+                )]
+                .into(),
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("src.txt")).unwrap(),
+        "edited"
+    );
+    assert!(
+        !tmp.path().join(SCRATCH_COVERAGE).exists(),
+        "the stream won: the delta's coverage must not be applied"
+    );
+    assert_eq!(findings_in(tmp.path())[0].id, "f_stream");
+}
+
+/// No stream arrived (an older host): the delta's coverage is the only copy,
+/// so it applies exactly as it did before coverage streaming.
+#[tokio::test]
+async fn a_placed_unit_without_a_stream_keeps_its_delta_coverage() {
+    for coverage in [
+        UnitCoverage::Unavailable("host predates it".into()),
+        UnitCoverage::Stream(Vec::new()),
+    ] {
+        let (tmp, _sink) = run_with(
+            PLACED_SYNC,
+            Arc::new(SyncByIndex {
+                results: Mutex::new([(0, synced_ok("src.txt", coverage.clone()))].into()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(SCRATCH_COVERAGE)).unwrap(),
+            "{}\n",
+            "{coverage:?}: no stream, so the delta's coverage applies"
+        );
+        assert!(tmp.path().join("src.txt").exists());
+    }
+}
+
+/// Fan-out: the decision is per unit — unit 0's stream merged (its delta
+/// coverage is stripped), unit 1 sent none (its delta coverage applies).
+#[tokio::test]
+async fn fan_out_units_strip_delta_coverage_only_when_their_own_stream_merged() {
+    let yaml = "name: w\nsteps:\n  - id: fan\n    agent: sec\n    actions: []\n    for_each: \"a\\nb\"\n    prompt: \"p {{ item }}\"\n    workspace: sync\n    distribute:\n      hosts: [host_01A, host_01B]\n";
+    let mut unit_1 = synced_ok("b.txt", UnitCoverage::Unavailable("old host".into()));
+    if let Ok(o) = unit_1.as_mut() {
+        // Distinct coverage path per unit, or the tar-style overlap would be
+        // the thing under test.
+        let files: BTreeMap<String, String> = [
+            ("b.txt".to_string(), "edited".to_string()),
+            (
+                ".rupu/coverage/scratch_b/findings.jsonl".to_string(),
+                "{}\n".to_string(),
+            ),
+        ]
+        .into();
+        o.workspace_delta = Some(WorkspaceDelta {
+            changed: files.keys().cloned().collect(),
+            deleted: vec![],
+            payload: serde_json::to_vec(&files).unwrap(),
+        });
+    }
+    let (tmp, _sink) = run_with(
+        yaml,
+        Arc::new(SyncByIndex {
+            results: Mutex::new(
+                [
+                    (
+                        0,
+                        synced_ok("a.txt", UnitCoverage::Stream(stream_with_finding("f_a"))),
+                    ),
+                    (1, unit_1),
+                ]
+                .into(),
+            ),
+        }),
+    )
+    .await;
+    assert!(tmp.path().join("a.txt").exists() && tmp.path().join("b.txt").exists());
+    assert!(
+        !tmp.path().join(SCRATCH_COVERAGE).exists(),
+        "unit 0's stream merged"
+    );
+    assert!(
+        tmp.path()
+            .join(".rupu/coverage/scratch_b/findings.jsonl")
+            .exists(),
+        "unit 1 sent no stream"
+    );
 }

@@ -672,6 +672,19 @@ impl UnitDispatcher for FleetUnitDispatcher {
         }
     }
 
+    /// Decode the unit's delta, drop its `.rupu/coverage/`
+    /// (`rupu_workspace::Delta::without_coverage`) and re-encode it. On the
+    /// blocking pool: a git patch is parsed and re-printed, a tar archive
+    /// re-packed, and either can be large.
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        let codec = from_orchestrator_delta(delta).map_err(|e| e.to_string())?;
+        let stripped = tokio::task::spawn_blocking(move || codec.without_coverage())
+            .await
+            .map_err(|e| format!("coverage strip task failed: {e}"))?
+            .map_err(|e| e.to_string())?;
+        Ok(to_orchestrator_delta(&stripped))
+    }
+
     /// The path is only truthful when the host will actually EXECUTE the unit
     /// under `unit_run_id` — otherwise the mirror lands at the id the
     /// connector minted for itself and this path names a file that never
@@ -1791,6 +1804,66 @@ steps:
         d.apply_workspace_deltas(ws.path(), &[a, b]).await.unwrap();
         assert!(ws.path().join("a.txt").exists());
         assert!(ws.path().join("b.txt").exists());
+    }
+
+    /// `strip_delta_coverage` bridges to `rupu_workspace::Delta::without_coverage`
+    /// through the wire codec: the root `.rupu/coverage/` file leaves the
+    /// payload and the lists, everything else applies.
+    #[tokio::test]
+    async fn strip_delta_coverage_bridges_to_the_workspace_codec() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            for (path, body) in [
+                ("src.txt", "S"),
+                (".rupu/coverage/t1/findings.jsonl", "{}\n"),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                b.append_data(&mut header, path, body.as_bytes()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let codec = rupu_workspace::Delta {
+            mode: rupu_workspace::SyncMode::Tar,
+            changed: vec![".rupu/coverage/t1/findings.jsonl".into(), "src.txt".into()],
+            deleted: vec![".rupu/coverage/old.jsonl".into()],
+            bytes: buf,
+        };
+        let stripped = d
+            .strip_delta_coverage(&to_orchestrator_delta(&codec))
+            .await
+            .unwrap();
+        assert_eq!(stripped.changed, vec!["src.txt".to_string()]);
+        assert!(stripped.deleted.is_empty());
+
+        let ws = tempfile::tempdir().unwrap();
+        d.apply_workspace_deltas(ws.path(), &[stripped])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("src.txt")).unwrap(),
+            "S"
+        );
+        assert!(!ws.path().join(".rupu/coverage").exists());
+    }
+
+    /// A payload that does not decode is an error, which the runner answers by
+    /// applying the delta whole — never by dropping it.
+    #[tokio::test]
+    async fn strip_delta_coverage_reports_an_undecodable_payload() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let bad = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec![],
+            deleted: vec![],
+            payload: Vec::new(),
+        };
+        assert!(d.strip_delta_coverage(&bad).await.is_err());
     }
 
     /// Two deltas that both touch the same path → `WorkspaceConflict` whose
