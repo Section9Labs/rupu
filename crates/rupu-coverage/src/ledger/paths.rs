@@ -12,6 +12,9 @@ pub struct CoveragePaths {
     pub findings: PathBuf,
     pub catalog: PathBuf,
     pub runs: PathBuf,
+    /// Append-only engagement asset graph (one `Asset` per line), folded on
+    /// read. Absent for a code/no-engagement run.
+    pub assets: PathBuf,
 }
 
 impl CoveragePaths {
@@ -24,6 +27,7 @@ impl CoveragePaths {
             findings: root.join("findings.jsonl"),
             catalog: root.join("catalog.yaml"),
             runs: root.join("runs.jsonl"),
+            assets: root.join("assets.jsonl"),
             root,
         }
     }
@@ -47,6 +51,7 @@ mod tests {
         assert_eq!(paths.findings, paths.root.join("findings.jsonl"));
         assert_eq!(paths.catalog, paths.root.join("catalog.yaml"));
         assert_eq!(paths.runs, paths.root.join("runs.jsonl"));
+        assert_eq!(paths.assets, paths.root.join("assets.jsonl"));
     }
 
     #[test]

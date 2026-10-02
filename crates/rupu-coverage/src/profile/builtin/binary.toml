@@ -1,5 +1,7 @@
 id = "binary"
 name = "Binary reverse engineering"
+evidence_blocks = ["text", "code_slice", "diff", "hexdump", "disasm"]
+classification_systems = ["CWE", "CVE"]
 
 [[asset_kinds]]
 id = "binary"
@@ -11,9 +13,6 @@ id = "function"
 parent = "binary"
 coordinates = ["sha256", "address", "symbol"]
 label = "{symbol} @ {address}"
-
-evidence_blocks = ["text", "code_slice", "diff", "hexdump", "disasm"]
-classification_systems = ["CWE", "CVE"]
 
 [[completeness]]
 id = "evidence_has_listing"
@@ -36,8 +35,3 @@ satisfied_when = { has_classification_system = "CWE" }
 [coverage]
 enumerates = ["binary", "function"]
 depth_ladder = ["located", "disassembled", "analyzed"]
-
-[bundle]
-agents = ["binary-triage", "binary-analyst"]
-tools = ["mcp:radare2", "mcp:ghidra"]
-workflows = ["binary-assessment"]

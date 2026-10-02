@@ -30,6 +30,24 @@ pub struct ReportFindingInput {
     /// The full report. Required under the full profile; refused under summary.
     #[serde(default)]
     pub report: Option<crate::report::FindingReport>,
+    /// The engagement asset this finding is about (engagement profiles). Its
+    /// `kind` routes the finding to the owning profile for completeness
+    /// validation, and the asset is stamped into the asset graph. Ignored on
+    /// the native code path (no active engagement).
+    #[serde(default)]
+    pub asset: Option<AssetRef>,
+}
+
+/// The asset a finding is about: a profile-namespaced `kind` and the locator
+/// coordinates that pin it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetRef {
+    pub kind: String,
+    #[serde(default)]
+    pub coordinates: Vec<crate::asset::Coordinate>,
+    /// Optional human label; defaults to the kind if omitted.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +79,20 @@ pub enum ReportFindingError {
     Report(#[from] crate::report::ReportValidationError),
     #[error("{0}")]
     Artifact(#[from] crate::report::ArtifactError),
+    #[error("asset kind `{kind}` is not owned by any active engagement profile ({active}); declare it in the profile or select the right engagement")]
+    UnownedKind { kind: String, active: String },
+    #[error("finding is incomplete for engagement profile `{profile}`: {}", unsatisfied.join("; "))]
+    CompletenessFailed {
+        profile: String,
+        unsatisfied: Vec<String>,
+    },
+    #[error("completeness predicate error for profile `{profile}`: {source}")]
+    Predicate {
+        profile: String,
+        source: crate::profile::PredicateError,
+    },
+    #[error("asset store: {0}")]
+    AssetStore(#[from] crate::asset::AssetStoreError),
 }
 
 pub fn report_finding(
@@ -171,6 +203,50 @@ pub fn report_finding(
             )
         }
     };
+
+    // Engagement routing + completeness gate + asset stamp. Only when a run
+    // has an active engagement AND the finding names an asset; otherwise this
+    // is the native code path, untouched.
+    if let (Some(active), Some(asset_ref)) = (opts.engagement.as_ref(), input.asset.as_ref()) {
+        let profile = active.profile_for_kind(&asset_ref.kind).ok_or_else(|| {
+            ReportFindingError::UnownedKind {
+                kind: asset_ref.kind.clone(),
+                active: active.ids().join(", "),
+            }
+        })?;
+        let locator = crate::asset::Locator(asset_ref.coordinates.clone());
+        // Completeness gate: only under the full profile, where a report exists
+        // to evaluate predicates against.
+        if let Some(report) = report.as_ref() {
+            let mut unsatisfied = Vec::new();
+            for check in &profile.completeness {
+                if !check.required {
+                    continue;
+                }
+                let ok = crate::profile::evaluate(&check.satisfied_when, report, &locator)
+                    .map_err(|source| ReportFindingError::Predicate {
+                        profile: profile.id.clone(),
+                        source,
+                    })?;
+                if !ok {
+                    unsatisfied.push(check.label.clone());
+                }
+            }
+            if !unsatisfied.is_empty() {
+                return Err(ReportFindingError::CompletenessFailed {
+                    profile: profile.id.clone(),
+                    unsatisfied,
+                });
+            }
+        }
+        // Stamp the asset into the graph.
+        let label = asset_ref
+            .label
+            .clone()
+            .unwrap_or_else(|| asset_ref.kind.clone());
+        let asset = crate::asset::Asset::new(asset_ref.kind.clone(), locator, label, None);
+        crate::asset::upsert_asset(&paths.assets, &asset)?;
+    }
 
     let id = format!("fnd_{}", Ulid::new());
     let record = FindingRecord {
@@ -323,6 +399,7 @@ mod tests {
                 references: vec![],
             }),
             report: None,
+            asset: None,
         }
     }
 
@@ -435,6 +512,7 @@ mod tests {
                     references: vec![],
                 }),
                 report: None,
+                asset: None,
             },
             &summary_opts(),
         )
@@ -465,6 +543,7 @@ mod tests {
                     references: vec![],
                 }),
                 report: None,
+                asset: None,
             },
             &summary_opts(),
         )
@@ -523,7 +602,76 @@ mod tests {
             concern_id: None,
             evidence: None,
             report: Some(report),
+            asset: None,
         }
+    }
+
+    #[test]
+    fn engagement_routes_gates_and_stamps_the_asset() {
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let active = crate::profile::builtin_registry()
+            .unwrap()
+            .active_set(&["code".into()])
+            .unwrap();
+        let mut opts = full_opts(&store);
+        opts.engagement = Some(Arc::new(active));
+
+        // a kind no active profile owns is refused.
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "network:service".into(),
+            coordinates: vec![],
+            label: None,
+        });
+        assert!(matches!(
+            report_finding(&paths, attribution(), inp, &opts),
+            Err(ReportFindingError::UnownedKind { .. })
+        ));
+
+        // code:file with no `path` coordinate fails the `located` check.
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "code:file".into(),
+            coordinates: vec![],
+            label: None,
+        });
+        assert!(matches!(
+            report_finding(&paths, attribution(), inp, &opts),
+            Err(ReportFindingError::CompletenessFailed { .. })
+        ));
+
+        // code:file with a path satisfies completeness, records, and stamps the asset.
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "code:file".into(),
+            coordinates: vec![crate::asset::Coordinate::Path("src/a.rs".into())],
+            label: Some("src/a.rs".into()),
+        });
+        let out = report_finding(&paths, attribution(), inp, &opts).unwrap();
+        assert!(out.id.starts_with("fnd_"));
+        let assets = crate::asset::read_assets(&paths.assets).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, "code:file");
+        assert_eq!(assets[0].label, "src/a.rs");
+    }
+
+    #[test]
+    fn no_engagement_never_touches_the_asset_store() {
+        // The native code path: with no active engagement, an asset on the
+        // input is ignored and no assets.jsonl is written.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let mut inp = input(FindingScope::Repo);
+        inp.asset = Some(AssetRef {
+            kind: "network:service".into(),
+            coordinates: vec![],
+            label: None,
+        });
+        report_finding(&paths, attribution(), inp, &summary_opts()).unwrap();
+        assert!(!paths.assets.exists(), "no engagement => no asset store");
     }
 
     fn only_record(paths: &CoveragePaths) -> FindingRecord {

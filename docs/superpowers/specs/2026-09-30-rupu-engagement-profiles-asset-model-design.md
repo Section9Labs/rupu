@@ -37,13 +37,12 @@ we have.
    (registry). The finding/coverage layer is the last corner that hardcodes its
    content; this finishes the hexagonal architecture on it. New code is only
    needed to add a new *primitive* — rare, and shared by every future profile.
-3. **Scope *is* the root of the asset graph.** Assets nest (service → host;
-   function → binary → firmware image). The root asset(s) of an engagement are
-   its scope. Coverage is the asset tree discovered under the root plus each
-   node's examination depth. For live engagements the root carries rules of
-   engagement, and a live-touch tool checks its target against the in-scope set
-   fail-closed (same spirit as the permission resolver). *Design-level for the
-   pilot; enforced in the network fast-follow.*
+3. **Assets nest into a graph; its roots are the engagement's top-level
+   assets.** Assets nest (service → host; function → binary → firmware image).
+   Coverage is the asset tree discovered under the roots plus each node's
+   examination depth. There is no rules-of-engagement, scope matching, or tool
+   gating — agents reach targets with bash and their own tooling; rupu records
+   and validates the resulting *findings*, it does not run or gate traffic.
 4. **Two orthogonal profile axes.** Keep `FindingProfile` (`full`/`summary`,
    report *verbosity*) exactly as-is — its wire name is used by workflow YAML,
    agent frontmatter, and `--findings-profile`. Add a new **engagement profile**
@@ -59,9 +58,8 @@ we have.
    store" is parked as a graduation-time cleanup.
 6. **Pilot binary first; network as a fast-follow** on the same ABI. Binary is
    fully static/offline, so it exercises the asset graph and the new evidence
-   primitives without the scope-enforcement guardrail. Network then adds only
-   `host`/`port`/`url` coordinates, `http_exchange`/`scan_output`/`pcap_ref`
-   blocks, and scope-as-root enforcement — no new machinery.
+   primitives. Network then adds only `host`/`port`/`url` coordinates and
+   `http_exchange`/`scan_output`/`pcap_ref` blocks — no new machinery.
 7. **Profiles live in rupu; several ship built-in.** Built-in profiles are
    embedded in the binary; operators/projects override or add their own under
    `~/.rupu/profiles/` (global) and `.rupu/profiles/` (project), mirroring
@@ -111,7 +109,7 @@ pilot; `host`/`port`/`url` land with network; `http_route`/`param` with web;
 pub struct Asset {
     pub id: AssetId,                 // derived from kind + locator, stable
     pub kind: String,                // profile-namespaced kind id ("network:service", "web:route")
-    pub parent: Option<AssetId>,     // the graph; roots == scope
+    pub parent: Option<AssetId>,     // the graph; roots == top-level assets
     pub locator: Locator,
     pub label: String,               // rendered from the kind's label template
     pub depth: Option<String>,       // profile-declared coverage depth state
@@ -128,8 +126,7 @@ Asset kinds are **namespaced by their owning profile** (`network:service`,
 `web:route`). When several profiles are active at once, that namespace is how a
 finding finds its validating profile — from the asset it is about — and why two
 active profiles can never collide on a kind id. An engagement may have more than
-one root (a pentest carries a `network:scope` root and one or more `web:target`
-roots); scope enforcement unions their in-scope sets.
+one root (a pentest carries `network:host` roots and `web:site` roots).
 
 ### Evidence blocks
 
@@ -286,14 +283,14 @@ coordinate + block set exists, most add zero Rust.
 | `container` | coding·sec | image | sha256, path, resource_id | table, text | CVE | inventoried→scanned→triaged | — |
 | `binary` | security | blob | sha256, offset, address, symbol | +hexdump, disasm | CWE, CVE | located→disassembled→analyzed | hexdump, disasm *(pilot)* |
 | `firmware` | security | image | +path | +decompile | CWE, CVE | acquired→extracted→unpacked→analyzed | decompile |
-| `network` | security | scope | host, port, url | scan_output, http_exchange, pcap_ref, table | CVE, CWE, CAPEC, ATT&CK | discovered→enumerated→tested→exploited | host/port/url + those blocks |
-| `web` | security | target | url, http_route, param | http_exchange, image | OWASP, CWE, CVE | mapped→crawled→tested→exploited | http_route/param + image |
-| `api` | security | target | url, http_route, param | http_exchange, table | OWASP-API, CWE | mapped→tested→exploited | — (reuses web) |
+| `network` | security | host | host, port, url | scan_output, http_exchange, pcap_ref, table | CVE, CWE, CAPEC, ATT&CK | discovered→enumerated→tested→exploited | host/port/url + those blocks |
+| `web` | security | site | url, http_route, param | http_exchange, image | OWASP, CWE, CVE | mapped→crawled→tested→exploited | http_route/param + image |
+| `api` | security | service | url, http_route, param | http_exchange, table | OWASP-API, CWE | mapped→tested→exploited | — (reuses web) |
 | `cloud` | security | account | resource_id | table, code_slice | CIS, CWE, ATT&CK | inventoried→policy-evaluated→validated | resource_id |
 | `mobile` | security | package | sha256, address, symbol, http_route | disasm, http_exchange, image | MASVS, OWASP, CWE | unpacked→static→dynamic | none — composite (includes binary + web) |
 | `threat-model` | design | system | (none — attributes) | text, image, table | STRIDE, CAPEC, ATT&CK | modeled→reviewed | none — coordinate-less |
-| `redteam` | security | scope | host, resource_id | text, scan_output, image | ATT&CK | planned→executed→validated | none — reuses network |
-| `pentest` | composite | scope + target | network + web kinds | network + web blocks | CVE, CWE, OWASP, CAPEC | both ladders | none — includes network + web |
+| `redteam` | security | host | host, resource_id | text, scan_output, image | ATT&CK | planned→executed→validated | none — reuses network |
+| `pentest` | composite | host + site | network + web kinds | network + web blocks | CVE, CWE, OWASP, CAPEC | both ladders | none — includes network + web |
 
 Two rows stress the model on purpose:
 
@@ -315,25 +312,17 @@ one profile.
 
 ### Worked profiles
 
-`network` (root asset carries rules of engagement):
+`network`:
 
 ```toml
 id = "network"
 name = "Network security assessment"
 
-[scope]
-root_kinds       = ["scope"]
-enforce_in_scope = true          # live-touch tools checked fail-closed
+evidence_blocks        = ["text", "table", "scan_output", "http_exchange", "pcap_ref"]
+classification_systems = ["CVE", "CWE", "CAPEC", "ATT&CK"]
 
 [[asset_kinds]]
-id          = "scope"            # the authorized target set (root)
-coordinates = []
-attributes  = ["cidrs", "out_of_scope", "window"]
-label       = "engagement scope"
-
-[[asset_kinds]]
-id          = "host"
-parent      = "scope"
+id          = "host"             # root
 coordinates = ["host"]
 label       = "{host}"
 
@@ -342,9 +331,6 @@ id          = "service"
 parent      = "host"
 coordinates = ["host", "port"]
 label       = "{host}:{port} {port.proto}"
-
-evidence_blocks        = ["text", "table", "scan_output", "http_exchange", "pcap_ref"]
-classification_systems = ["CVE", "CWE", "CAPEC", "ATT&CK"]
 
 [[completeness]]
 id             = "service_identified"
@@ -368,19 +354,17 @@ workflows = ["network-assessment"]
 id = "web"
 name = "Web application assessment"
 
-[scope]
-root_kinds       = ["target"]
-enforce_in_scope = true
+evidence_blocks        = ["text", "http_exchange", "image", "code_slice", "diff"]
+classification_systems = ["OWASP", "CWE", "CVE"]
 
 [[asset_kinds]]
-id          = "target"          # root: authorized origin(s)
+id          = "site"            # root
 coordinates = ["url"]
-attributes  = ["in_scope_hosts", "auth"]
 label       = "{url}"
 
 [[asset_kinds]]
 id          = "route"
-parent      = "target"
+parent      = "site"
 coordinates = ["http_route"]
 label       = "{http_route.method} {http_route.path}"
 
@@ -389,9 +373,6 @@ id          = "parameter"
 parent      = "route"
 coordinates = ["http_route", "param"]
 label       = "{param}"
-
-evidence_blocks        = ["text", "http_exchange", "image", "code_slice", "diff"]
-classification_systems = ["OWASP", "CWE", "CVE"]
 
 [[completeness]]
 id             = "request_response"
@@ -510,8 +491,10 @@ workflow records a finding whose disasm evidence renders.
 - Renaming the blob store to "evidence store."
 - Every profile in the catalog except `binary` (network, firmware, web, api,
   cloud, mobile, sca, iac, secrets, container, threat-model, redteam) — specified
-  for forward-compatibility, shipped as data as their tooling lands. Live-scope
-  *enforcement* is designed here and built with network.
+  for forward-compatibility, shipped as data as their tooling lands.
+- Any scope/RoE enforcement, sandboxing, egress control, or tool gating. Agents
+  reach targets with bash and their own tooling; rupu validates findings, not
+  traffic.
 - CP web asset-graph viewer polish; macOS app (deprecated — CLI + CP web only).
 - Export polish beyond md/html/pdf for the new blocks.
 - Combined multi-profile engagements at runtime (the model allows it; the pilot

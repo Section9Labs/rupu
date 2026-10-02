@@ -61,6 +61,22 @@ fn not_provided_with_justification_accepted_by_both() {
 }
 
 #[test]
+fn engagement_blocks_and_classifications_accepted_by_both() {
+    let v = mutated(|v| {
+        v["blocks"] = json!([
+            { "kind": "scan_output", "tool": "nmap", "output": "22/tcp open ssh" },
+            { "kind": "http_exchange", "request": "GET / HTTP/1.1", "response": "200 OK" },
+        ]);
+        v["classifications"] = json!([
+            { "system": "CVE", "id": "CVE-2024-1234" },
+            { "system": "ATT&CK", "id": "T1190", "vector": "network" },
+        ]);
+    });
+    assert!(rust_accepts(&v), "rust rejected blocks+classifications");
+    assert!(schema_accepts(&v), "schema rejected blocks+classifications");
+}
+
+#[test]
 fn invalid_cases_rejected_by_both() {
     let cases: Vec<(&str, Value)> = vec![
         (
@@ -110,12 +126,12 @@ fn invalid_cases_rejected_by_both() {
             mutated(|v| v["rating"]["severity"] = json!("High")),
         ),
         (
-            "empty classification system",
-            mutated(|v| v["classifications"] = json!([{"system": "", "id": "CVE-2026-0001"}])),
+            "classification with empty system",
+            mutated(|v| v["classifications"] = json!([{ "system": "", "id": "CVE-1" }])),
         ),
         (
-            "empty classification id",
-            mutated(|v| v["classifications"] = json!([{"system": "CVE", "id": ""}])),
+            "classification missing id",
+            mutated(|v| v["classifications"] = json!([{ "system": "CVE" }])),
         ),
     ];
     for (name, v) in cases {

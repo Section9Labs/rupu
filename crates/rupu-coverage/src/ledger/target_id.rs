@@ -11,7 +11,9 @@ use std::path::Path;
 /// short enough for human-readable directory names, long enough to
 /// avoid collisions in practice.
 pub fn target_id(workspace: &Path, scope_name: &str) -> String {
-    let canonical = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(canonical.display().to_string().as_bytes());
     hasher.update(b"::");

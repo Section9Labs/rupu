@@ -1,0 +1,31 @@
+id = "iac"
+name = "Infrastructure-as-code review"
+evidence_blocks = ["code_slice", "diff", "table"]
+classification_systems = ["CIS", "CWE"]
+
+[[asset_kinds]]
+id = "repo"
+coordinates = ["path"]
+label = "{path}"
+
+[[asset_kinds]]
+id = "resource"
+parent = "repo"
+coordinates = ["path", "line_range"]
+label = "{path}:{line_range}"
+
+[[completeness]]
+id = "located"
+label = "Finding pinned to a file + lines"
+required = true
+satisfied_when = { all = [ { locator_has_coordinate = "path" }, { locator_has_coordinate = "line_range" } ] }
+
+[[completeness]]
+id = "classified"
+label = "Classified (CIS or CWE)"
+required = true
+satisfied_when = { any = [ { has_classification_system = "CIS" }, { has_classification_system = "CWE" } ] }
+
+[coverage]
+enumerates = ["resource"]
+depth_ladder = ["mapped", "reviewed"]

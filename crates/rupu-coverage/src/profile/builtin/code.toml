@@ -1,0 +1,37 @@
+id = "code"
+name = "Source code review"
+evidence_blocks = ["text", "code_slice", "diff"]
+classification_systems = ["CWE", "OWASP"]
+
+[[asset_kinds]]
+id = "repo"
+coordinates = ["path"]
+label = "{path}"
+
+[[asset_kinds]]
+id = "file"
+parent = "repo"
+coordinates = ["path", "line_range"]
+label = "{path}:{line_range}"
+
+[[asset_kinds]]
+id = "function"
+parent = "file"
+coordinates = ["path", "symbol", "line_range"]
+label = "{symbol} ({path})"
+
+[[completeness]]
+id = "located"
+label = "Finding pinned to a path"
+required = true
+satisfied_when = { locator_has_coordinate = "path" }
+
+[[completeness]]
+id = "has_root_cause"
+label = "Root cause stated"
+required = true
+satisfied_when = { has_field = "root_cause" }
+
+[coverage]
+enumerates = ["file"]
+depth_ladder = ["unreviewed", "reviewed"]

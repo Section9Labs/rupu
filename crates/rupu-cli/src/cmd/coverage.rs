@@ -1230,6 +1230,9 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         tmp: false,
         run_id: None,
         findings_profile: None,
+        // Rerun uses the code path unless/until the run manifest records the
+        // engagement selection (follow-on); it never silently guesses one.
+        engagement_profiles: Vec::new(),
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),

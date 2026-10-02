@@ -1,0 +1,35 @@
+id = "api"
+name = "API security assessment"
+evidence_blocks = ["text", "http_exchange", "table"]
+classification_systems = ["OWASP-API", "CWE"]
+
+[[asset_kinds]]
+id = "service"
+coordinates = ["url"]
+label = "{url}"
+
+[[asset_kinds]]
+id = "endpoint"
+parent = "service"
+coordinates = ["url", "http_route", "param"]
+label = "{http_route}"
+
+[[completeness]]
+id = "endpoint_identified"
+label = "Finding pinned to an endpoint"
+required = true
+satisfied_when = { locator_has_coordinate = "http_route" }
+
+[[completeness]]
+id = "evidence_has_exchange"
+label = "Evidence includes an HTTP exchange"
+required = true
+satisfied_when = { has_block_kind = "http_exchange" }
+
+[coverage]
+enumerates = ["service", "endpoint"]
+depth_ladder = ["mapped", "tested", "exploited"]
+
+[bundle]
+agents = ["api-tester"]
+workflows = ["api-assessment"]

@@ -1,0 +1,31 @@
+id = "redteam"
+name = "Red team operation"
+evidence_blocks = ["text", "scan_output", "image"]
+classification_systems = ["ATT&CK"]
+
+[[asset_kinds]]
+id = "host"
+coordinates = ["host"]
+label = "{host}"
+
+[[asset_kinds]]
+id = "objective"
+parent = "host"
+coordinates = ["host", "resource_id"]
+label = "{resource_id}"
+
+[[completeness]]
+id = "mapped_to_attack"
+label = "Technique mapped to ATT&CK"
+required = true
+satisfied_when = { has_classification_system = "ATT&CK" }
+
+[[completeness]]
+id = "has_narrative"
+label = "Execution narrative present"
+required = true
+satisfied_when = { has_field = "description" }
+
+[coverage]
+enumerates = ["host", "objective"]
+depth_ladder = ["planned", "executed", "validated"]

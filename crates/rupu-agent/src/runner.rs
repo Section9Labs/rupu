@@ -1363,6 +1363,18 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
         paths
             .ensure_dir()
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
+        // asset_mark is offered whenever an engagement is active, with or
+        // without a concerns block — it needs the active set to validate a
+        // depth against the profile's ladder.
+        if let Some(engagement) = findings_opts.engagement.clone() {
+            registry.insert(
+                "asset_mark",
+                std::sync::Arc::new(coverage_tools::AssetMarkTool::new(
+                    paths.clone(),
+                    engagement,
+                )),
+            );
+        }
         registry.insert(
             "report_finding",
             std::sync::Arc::new(coverage_tools::ReportFindingTool::new(

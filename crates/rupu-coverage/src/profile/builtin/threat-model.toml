@@ -1,0 +1,31 @@
+id = "threat-model"
+name = "Threat model"
+evidence_blocks = ["text", "image", "table"]
+classification_systems = ["STRIDE", "CAPEC", "ATT&CK"]
+
+[[asset_kinds]]
+id = "system"
+coordinates = []
+label = "system"
+
+[[asset_kinds]]
+id = "component"
+parent = "system"
+coordinates = []
+label = "component"
+
+[[completeness]]
+id = "has_threat"
+label = "Threat described"
+required = true
+satisfied_when = { has_field = "description" }
+
+[[completeness]]
+id = "classified"
+label = "Classified (STRIDE)"
+required = true
+satisfied_when = { has_classification_system = "STRIDE" }
+
+[coverage]
+enumerates = ["component"]
+depth_ladder = ["modeled", "reviewed"]

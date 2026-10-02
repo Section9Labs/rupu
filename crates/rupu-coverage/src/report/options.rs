@@ -1,8 +1,10 @@
 //! Per-run settings for recording findings, carried to the write path on
 //! `ToolContext.findings` (agent builtin) or `FindingsContext` (MCP tool).
 
+use crate::profile::ActiveSet;
 use crate::report::FindingProfile;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const DEFAULT_ARTIFACT_MAX_BYTES: u64 = 500 * 1024 * 1024;
 pub const DEFAULT_REPORT_MAX_BYTES: usize = 256 * 1024;
@@ -32,6 +34,10 @@ pub struct FindingWriteOptions {
     /// Organisation-specific ticket patterns (from `[findings].ticket_patterns`),
     /// appended to the prompt guidance. Nothing org-specific ships in rupu.
     pub ticket_patterns: Vec<String>,
+    /// The run's active engagement profiles. `None` is the native code path:
+    /// findings record exactly as before, with no profile routing, no
+    /// completeness gate, and no asset stamping — byte-identical.
+    pub engagement: Option<Arc<ActiveSet>>,
 }
 
 impl Default for FindingWriteOptions {
@@ -44,6 +50,7 @@ impl Default for FindingWriteOptions {
             artifact_total_max_bytes: DEFAULT_ARTIFACT_TOTAL_MAX_BYTES,
             report_max_bytes: DEFAULT_REPORT_MAX_BYTES,
             ticket_patterns: Vec::new(),
+            engagement: None,
         }
     }
 }

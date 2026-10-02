@@ -17,15 +17,23 @@ pub mod tools;
 #[cfg(feature = "gen")]
 pub mod cwe_gen;
 
-pub use asset::{Coordinate, Locator, Proto};
-pub use asset::{Asset, AssetGraph, AssetId};
-
 pub use tools::{
-    coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
-    coverage_status, report_finding, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
+    asset_mark, coverage_concerns_detail, coverage_concerns_search, coverage_mark,
+    coverage_remaining, coverage_status, report_finding, AssetMarkError, AssetMarkInput,
+    AssetMarkOutput, AssetRef, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
     CoverageConcernsSearchInput, CoverageMarkError, CoverageMarkInput, CoverageMarkOutput,
     CoverageRemainingInput, CoverageStatusInput, RemainingItem, ReportFindingError,
     ReportFindingInput, ReportFindingOutput, SearchResult, SearchResultForm, SearchResultSummary,
+};
+
+pub use asset::{
+    from_assets, profile_of, read_assets, upsert_asset, Asset, AssetId, AssetStoreError,
+    Coordinate, Locator, Proto,
+};
+
+pub use profile::{
+    builtin_profiles, builtin_registry, registry_with_overlay, ActiveSet, AssetKindDef, Bundle,
+    CompletenessCheck, Coverage, EngagementProfile, Predicate, ProfileRegistry, DEFAULT_PROFILE,
 };
 
 pub use audit::generate::audit as run_audit;
@@ -48,6 +56,8 @@ pub use ledger::{
     Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope, RunManifest,
     Surface,
 };
-pub use report::{FindingProfile, FindingReport, FindingWriteOptions};
+pub use report::{
+    Classification, DisasmLine, EvidenceBlock, FindingProfile, FindingReport, FindingWriteOptions,
+};
 pub use rerun::{plan_rerun, RerunError, RerunInvocation};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
