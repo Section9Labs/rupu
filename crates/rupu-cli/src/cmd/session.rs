@@ -7842,6 +7842,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             surface_tag: Some("session".to_string()),
             pause: None,
             seed_source,
+            collectors: Vec::new(),
             codename: Some(codename.clone()),
         };
 

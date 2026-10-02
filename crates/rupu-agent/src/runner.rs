@@ -1061,6 +1061,9 @@ pub struct AgentRunOpts {
     /// messages; the caller owns that invariant and replay verifies it via
     /// the recorded sha256. `None` → the seed is embedded inline in full.
     pub seed_source: Option<PathBuf>,
+    /// Pre-turn collectors (spec §8). Empty = no injection; the loop behaves
+    /// exactly as before. Run off the async runtime via spawn_blocking.
+    pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
 }
 
 /// Outcome of a finished run.
@@ -1517,10 +1520,37 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 );
             }
             writer.write(&Event::TurnStart { turn_idx })?;
+            // Pre-model-call collector phase (spec §8). Empty collectors => no-op,
+            // and `turn_messages` equals `messages.clone()` exactly as before.
+            let turn_messages = if opts.collectors.is_empty() {
+                messages.clone()
+            } else {
+                let pipeline = crate::collector::CollectorPipeline::new(
+                    opts.collectors.clone(),
+                    crate::collector::INJECTION_TOKEN_BUDGET,
+                );
+                let ctx = crate::collector::TurnContext {
+                    run_id: opts.run_id.clone(),
+                    codename: opts.codename.clone(),
+                    participant: opts.agent_name.clone(),
+                    turn_index: turn_idx,
+                };
+                // Run collectors off the async runtime; a panicking collector
+                // degrades to "inject nothing this turn", never kills the run.
+                let assembly = tokio::task::spawn_blocking(move || pipeline.run(&ctx))
+                    .await
+                    .unwrap_or_default();
+                for m in assembly.once {
+                    messages.push(m); // persist once-delivered injections
+                }
+                let mut tm = messages.clone();
+                tm.extend(assembly.every_turn); // transient for this turn only
+                tm
+            };
             let mut req = LlmRequest {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
-                messages: messages.clone(),
+                messages: turn_messages,
                 max_tokens: opts.limits.output.tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
@@ -2342,6 +2372,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2444,6 +2475,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: Some(vec!["read_file".to_string()]),
@@ -2567,6 +2599,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2643,6 +2676,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             codename: Some("jade-reef/heron#3".into()),
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2741,6 +2775,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2817,6 +2852,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2915,6 +2951,7 @@ mod on_tool_call_tests {
 
             let opts = AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: "test-agent".into(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -3881,6 +3918,7 @@ mod compaction_tests {
 
         let mut opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4246,6 +4284,7 @@ mod pause_tests {
     ) -> AgentRunOpts {
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4585,6 +4624,7 @@ mod reasoning_tests {
     ) -> AgentRunOpts {
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,

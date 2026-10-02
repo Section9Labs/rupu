@@ -11284,6 +11284,7 @@ steps:
     ) -> AgentRunOpts {
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -12526,6 +12527,7 @@ mod dag_scheduler_golden {
             }]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -13071,6 +13073,7 @@ steps:
             let provider = MockProvider::new(vec![turn]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -13591,6 +13594,7 @@ loops:
             }]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -13785,6 +13789,7 @@ loops:
                 }]);
                 AgentRunOpts {
                     seed_source: None,
+                    collectors: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -14074,6 +14079,7 @@ loops:
             }]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -14269,6 +14275,7 @@ loops:
                 }]);
                 AgentRunOpts {
                     seed_source: None,
+                    collectors: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -14508,6 +14515,7 @@ loops:
             }]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -14812,6 +14820,7 @@ loops:
                 }]);
                 AgentRunOpts {
                     seed_source: None,
+                    collectors: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -14962,6 +14971,7 @@ loops:
                 }]);
                 AgentRunOpts {
                     seed_source: None,
+                    collectors: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -15191,6 +15201,7 @@ loops:
             }]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -15839,6 +15850,7 @@ mod join_and_prune {
             let provider = MockProvider::new(vec![turn]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -17470,6 +17482,7 @@ mod resume_and_cancel {
             let provider = MockProvider::new(vec![turn]);
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -18231,6 +18244,7 @@ mod agent_terminal_status {
             let provider: Box<dyn LlmProvider> = Box::new(MockProvider::new(self.script.clone()));
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: agent_name.to_string(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -18637,6 +18651,7 @@ mod manual_pause_drain {
                 .unwrap_or_else(|| Box::new(done_provider()));
             AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: agent_name.to_string(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,

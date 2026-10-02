@@ -408,6 +408,7 @@ impl AgentDispatcher for CliAgentDispatcher {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: spec.name.clone(),
             agent_system_prompt: spec.system_prompt.clone(),
             agent_tools: spec.tools.clone(),

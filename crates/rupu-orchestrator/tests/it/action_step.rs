@@ -219,6 +219,7 @@ impl StepFactory for EchoFactory {
         }]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,

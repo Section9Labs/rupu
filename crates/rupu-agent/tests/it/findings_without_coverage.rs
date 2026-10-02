@@ -31,6 +31,7 @@ fn opts_for(
 ) -> AgentRunOpts {
     AgentRunOpts {
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: "net-assessor".into(),
         agent_system_prompt: "You assess hosts.".into(),
         agent_tools,

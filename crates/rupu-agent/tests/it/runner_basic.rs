@@ -18,6 +18,7 @@ async fn happy_path_one_turn_no_tools() {
 
     let opts = AgentRunOpts {
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: "noop".into(),
         agent_system_prompt: "You are a noop agent.".into(),
         agent_tools: None,
