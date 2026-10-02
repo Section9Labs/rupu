@@ -53,6 +53,11 @@ export class PerHostListEngine<T extends HostTagged> {
    * page 0); only the outermost may end the host's `catchingUp`.
    */
   private readonly joins = new Map<string, number>();
+  /**
+   * The rows a replaced refresh took off a host, still shown while the catch-up after it runs
+   * (see `view()`). Removed when that refresh's catch-up ends, however it ends.
+   */
+  private readonly bridging = new Map<string, T[]>();
   private disposed = false;
 
   constructor(
@@ -142,6 +147,8 @@ export class PerHostListEngine<T extends HostTagged> {
 
   /** A row action (archive/restore/delete) took this row out of the list. */
   removeRow(hostId: string, rowId: string): void {
+    const held = this.bridging.get(hostId);
+    if (held) this.bridging.set(hostId, held.filter((r) => this.access.idOf(r) !== rowId));
     this.patch(hostId, (s) => ({ ...s, rows: s.rows.filter((r) => this.access.idOf(r) !== rowId) }));
   }
 
@@ -157,10 +164,32 @@ export class PerHostListEngine<T extends HostTagged> {
 
   // ── internals ──────────────────────────────────────────────────────────
 
+  /** `current` is the engine's own state; `onChange` receives what the page renders (`view()`). */
   private commit(next: HostSlice<T>[]): void {
     if (this.disposed) return;
     this.slices = next;
-    this.onChange(next);
+    this.onChange(this.view(next));
+  }
+
+  /**
+   * What the page renders. While a replaced host pages back down, it keeps showing its old rows
+   * below what it has re-fetched so far, so the list does not collapse to page 0 under the reader
+   * (and jump) for the length of the catch-up. The host is catching up, out of gating, the whole
+   * time, so those rows never move the floor. Once the catch-up ends they are gone and the host
+   * shows exactly what it fetched.
+   */
+  private view(slices: HostSlice<T>[]): HostSlice<T>[] {
+    if (this.bridging.size === 0) return slices;
+    return slices.map((s) => {
+      const held = this.bridging.get(s.hostId);
+      if (!held || !s.catchingUp) return s;
+      let oldest = Infinity;
+      for (const r of s.rows) oldest = Math.min(oldest, this.access.timeOf(r));
+      const keys = new Set(s.rows.map((r) => this.access.keyOf(r, s.hostId)));
+      // Only below the re-fetched span: inside it the fresh rows are authoritative.
+      const below = held.filter((r) => this.access.timeOf(r) < oldest && !keys.has(this.access.keyOf(r, s.hostId)));
+      return below.length ? { ...s, rows: [...s.rows, ...below] } : s;
+    });
   }
 
   private find(id: string): HostSlice<T> | undefined {
@@ -234,6 +263,9 @@ export class PerHostListEngine<T extends HostTagged> {
       return { ok: true, joined: true };
     }
     const { rows, fullyListed, replaced } = spliceHead(cur.rows, page, PAGE, this.access, id);
+    // A re-anchor inside a catch-up that is already bridging keeps the outer refresh's rows.
+    const outer = this.bridging.has(id);
+    if (replaced && !outer) this.bridging.set(id, cur.rows);
     this.patch(id, (s) => ({
       ...s,
       rows,
@@ -248,7 +280,13 @@ export class PerHostListEngine<T extends HostTagged> {
     // Page 0 did not reach the old rows, so the slice just lost every row below it. Page back down
     // at least that far (in single-host mode there is no other host to displace, so the lost count
     // is the whole budget): the list must not get shorter under the reader (spec §6.3).
-    if (replaced) await this.join(id, cur.rows.length - rows.length);
+    if (replaced) {
+      try {
+        await this.join(id, cur.rows.length - rows.length);
+      } finally {
+        if (!outer && this.bridging.delete(id)) this.commit(this.slices);
+      }
+    }
     return { ok: true, joined: replaced };
   }
 

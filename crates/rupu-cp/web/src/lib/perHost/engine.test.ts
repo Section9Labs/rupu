@@ -471,9 +471,9 @@ describe('PerHostListEngine', () => {
     /** 25 rows newer than anything `rows(host, …)` holds, so page 0 cannot overlap the old rows. */
     const landed = (host: string) => rows(host, 25, 0.1, -100).map((r) => ({ ...r, id: `new-${r.id}` }));
 
-    it('single host: the slice ends at least as long as before', async () => {
+    it('single host: the visible list is never shorter than before, at any point', async () => {
       let server = rows('local', 120, 1);
-      const { engine, fetch, visible } = harness(pager0(() => server));
+      const { engine, fetch, history, visible } = harness(pager0(() => server));
       engine.start([LOCAL]);
       await flush();
       await engine.loadMore();
@@ -483,14 +483,50 @@ describe('PerHostListEngine', () => {
 
       server = [...landed('local'), ...server];
       fetch.mockClear();
+      const base = history.length;
       await engine.scheduleHead('local');
+      expect(history.length).toBeGreaterThan(base);
+      for (const h of history.slice(base)) expect(watermarkMerge(h, access).visible.length).toBeGreaterThanOrEqual(before);
       expect(visible().length).toBeGreaterThanOrEqual(before);
       expect(visible()[0].id).toBe('new-local-0');
       expect(fetch.mock.calls.length).toBeGreaterThan(1); // page 0, then the catch-up
       expect(engine.current[0]).toMatchObject({ catchingUp: false, hasMore: true });
     });
 
-    it('all hosts: the replaced host stays out of gating while it pages back, and the list ends no shorter', async () => {
+    it('while it pages back, the old rows stay on screen, and a row action still removes one', async () => {
+      let server = rows('local', 120, 1);
+      let gate: Promise<void> | null = null;
+      const { engine, history } = harness(async (p) => {
+        const page = server.slice(p.offset, p.offset + p.limit);
+        if (p.offset > 0 && gate) await gate;
+        return page;
+      });
+      engine.start([LOCAL]);
+      await flush();
+      await engine.loadMore();
+      await engine.loadMore();
+
+      server = [...landed('local'), ...server];
+      const release = deferred<void>();
+      gate = release.promise;
+      const refresh = engine.scheduleHead('local');
+      for (let i = 0; i < 5; i++) await flush(); // page 0 replaced; the catch-up page is in flight
+      expect(engine.current[0]).toMatchObject({ catchingUp: true });
+      expect(engine.current[0].rows).toHaveLength(20); // the engine's own state: page 0 only
+      const shown = () => watermarkMerge(history[history.length - 1], access).visible.map((r) => r.id);
+      expect(shown()).toHaveLength(80); // page 0 + the 60 old rows below it
+      expect(shown()).toContain('local-59');
+
+      engine.removeRow('local', 'local-59');
+      expect(shown()).not.toContain('local-59');
+
+      release.resolve();
+      await refresh;
+      expect(engine.current[0].catchingUp).toBe(false);
+      expect(shown()).toEqual(engine.current[0].rows.map((r) => r.id)); // the overlay is gone
+    });
+
+    it('all hosts: the replaced host stays out of gating while it pages back, and the list is never shorter', async () => {
       let remote = rows('remote', 120, 3); // one per 3 min
       const local = rows('local', 200, 1); // one a minute
       const { engine, history, visible } = harness((p) => (p.host === 'local' ? pager(local)(p) : pager0(() => remote)(p)));
@@ -504,6 +540,7 @@ describe('PerHostListEngine', () => {
       remote = [...landed('remote'), ...remote];
       const base = history.length;
       await engine.scheduleHead('remote');
+      for (const h of history.slice(base)) expect(watermarkMerge(h, access).visible.length).toBeGreaterThanOrEqual(before);
       expect(visible().length).toBeGreaterThanOrEqual(before);
       // Never gating at page 0's shallow coverage while it pages back down.
       const replacedAt = history.findIndex(
