@@ -2632,7 +2632,14 @@ mod tests {
 
         for _tick in 0..3 {
             upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
-            let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), run_dir.path(), &mut streams).await;
+            let outcome = finish_if_terminal(
+                &bucket,
+                "run_H",
+                run_dir.path(),
+                run_dir.path(),
+                &mut streams,
+            )
+            .await;
             assert_eq!(outcome, Some(("completed".to_string(), false)));
             assert!(
                 bucket.landed().is_empty(),
@@ -2644,7 +2651,14 @@ mod tests {
         bucket.set_failing(None);
         upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
         assert_eq!(bucket.landed_keys(), ["events.0000.jsonl"], "streams first");
-        let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), run_dir.path(), &mut streams).await;
+        let outcome = finish_if_terminal(
+            &bucket,
+            "run_H",
+            run_dir.path(),
+            run_dir.path(),
+            &mut streams,
+        )
+        .await;
         assert_eq!(outcome, Some(("completed".to_string(), true)));
         assert_eq!(
             bucket.landed_keys(),
@@ -2669,7 +2683,14 @@ mod tests {
         upload_routine(&bucket, "run_P", run_dir.path(), &mut streams).await;
         assert_eq!(bucket.landed_keys(), ["run.json"]);
         assert_eq!(
-            finish_if_terminal(&bucket, "run_P", run_dir.path(), run_dir.path(), &mut streams).await,
+            finish_if_terminal(
+                &bucket,
+                "run_P",
+                run_dir.path(),
+                run_dir.path(),
+                &mut streams
+            )
+            .await,
             None
         );
         assert_eq!(
@@ -2810,7 +2831,9 @@ mod tests {
             dest: &std::path::Path,
             max_bytes: u64,
         ) -> Result<(), BucketError> {
-            self.inner.get_artifact_to_file(sha256, dest, max_bytes).await
+            self.inner
+                .get_artifact_to_file(sha256, dest, max_bytes)
+                .await
         }
     }
 

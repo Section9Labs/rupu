@@ -245,7 +245,9 @@ mod tests {
             dest: &std::path::Path,
             max_bytes: u64,
         ) -> Result<(), BucketError> {
-            self.inner.get_artifact_to_file(sha256, dest, max_bytes).await
+            self.inner
+                .get_artifact_to_file(sha256, dest, max_bytes)
+                .await
         }
     }
 

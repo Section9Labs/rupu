@@ -1013,6 +1013,7 @@ async fn unit_coverage_refuses_a_remote_with_no_host_info_route() {
     );
     stream.assert_hits(0);
 }
+
 // ── Remote findings Plan B, Task 3: artifact blobs over HTTP ─────────────────
 
 fn store_blob(global: &std::path::Path, sha: &str, body: &[u8]) {
