@@ -457,7 +457,7 @@ impl Api<'_> {
                 body,
             } => {
                 let mut e = crate::error::api_error_from_response(
-                    "google-gemini-cli",
+                    &self.variant.provider_id().to_string(),
                     status,
                     &headers,
                     &body,
@@ -830,6 +830,34 @@ mod tests {
                 assert!(b.message.contains("backend unavailable"), "{}", b.message);
             }
             other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    /// A setup failure is labelled with the variant's own provider id, so an
+    /// Antigravity failure is not reported as gemini-cli's.
+    #[tokio::test]
+    async fn a_setup_failure_names_the_variant_s_provider() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(503)
+                .json_body(json!({ "error": { "message": "backend unavailable" } }));
+        });
+        for (variant, provider) in [
+            (GeminiVariant::GeminiCli, "google-gemini-cli"),
+            (GeminiVariant::Antigravity, "google-antigravity"),
+        ] {
+            let err = setup_user(
+                &client(),
+                &server.url(""),
+                variant,
+                "access-1",
+                None,
+                &fast(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.reply().expect("a reply error").provider, provider);
         }
     }
 

@@ -1265,21 +1265,17 @@ fn parse_generate_content_response(
 
 /// How a Gemini turn ended. `finish` is the candidate's `finishReason`
 /// exactly as sent (`None` when absent). A function call in the turn wins
-/// over `STOP`, an absent reason and a value rupu doesn't know — Gemini
-/// reports `STOP` for a turn that ends in a tool call — but never over
-/// `MAX_TOKENS`, a safety stop, a malformed call or an incomplete reply.
-/// The wire value is always the provider's own.
+/// over `STOP` and an absent reason — Gemini reports `STOP` for a turn that
+/// ends in a tool call — and nothing else: a value rupu doesn't know stays
+/// `Unrecognized` (the runner still dispatches the call by content), and
+/// `MAX_TOKENS`, a safety stop, a malformed call or an incomplete reply
+/// stay as they are. The wire value is always the provider's own.
 fn gemini_stop(finish: Option<&str>, had_function_call: bool, provider: &str) -> Stop {
     let mut reason = match finish {
         Some(v) => crate::stop::map::gemini_finish(v),
         None => StopReason::Unreported,
     };
-    if had_function_call
-        && matches!(
-            reason,
-            StopReason::EndTurn | StopReason::Unreported | StopReason::Unrecognized
-        )
-    {
+    if had_function_call && matches!(reason, StopReason::EndTurn | StopReason::Unreported) {
         reason = StopReason::ToolUse;
     }
     Stop::from_wire(reason, provider, finish)
@@ -3054,19 +3050,26 @@ mod tests {
         assert_eq!(s.stop.wire.value.as_deref(), Some("STOP"));
     }
 
-    /// `FUNCTION_CALLING` is not a Gemini value: alone it is unrecognized,
-    /// with a function call in the turn the call wins.
+    /// `FUNCTION_CALLING` is not a Gemini value, so it is unrecognized even
+    /// with a function call in the turn: only `EndTurn` and `Unreported` are
+    /// promoted to `ToolUse` (the rule every provider shares). The call
+    /// itself is still in the content, and the runner dispatches by content.
     #[test]
-    fn function_calling_is_unrecognized_but_a_function_call_wins() {
+    fn function_calling_is_unrecognized_even_with_a_function_call() {
         let r = send_parse(finish_body("FUNCTION_CALLING"));
         assert_eq!(r.stop.reason, StopReason::Unrecognized);
         assert_eq!(r.stop.wire.value.as_deref(), Some("FUNCTION_CALLING"));
 
+        let has_call =
+            |c: &[ContentBlock]| c.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
         let r = send_parse(function_call_body("FUNCTION_CALLING"));
-        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
         assert_eq!(r.stop.wire.value.as_deref(), Some("FUNCTION_CALLING"));
+        assert!(has_call(&r.content));
         let s = stream_parse(&[&function_call_body("FUNCTION_CALLING").to_string()]).unwrap();
-        assert_eq!(s.stop.reason, StopReason::ToolUse);
+        assert_eq!(s.stop.reason, StopReason::Unrecognized);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("FUNCTION_CALLING"));
+        assert!(has_call(&s.content));
     }
 
     #[test]
