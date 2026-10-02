@@ -432,6 +432,7 @@ mod tests {
                 references: vec![],
             }),
             report: None,
+            asset: None,
         };
         let attribution = Attribution {
             run_id: "r".into(),

@@ -8,7 +8,11 @@ use rupu_coverage::{
 };
 
 fn report() -> FindingReport {
-    serde_json::from_str(include_str!("fixtures/finding_report/valid_full.json")).unwrap()
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/finding_report/valid_full.json"
+    )))
+    .unwrap()
 }
 
 fn attribution() -> Attribution {
@@ -38,6 +42,7 @@ fn seed_summary(paths: &CoveragePaths) -> String {
             references: vec![],
         }),
         report: None,
+        asset: None,
     };
     let opts = FindingWriteOptions::default().with_profile(FindingProfile::Summary);
     report_finding(paths, attribution(), input, &opts)

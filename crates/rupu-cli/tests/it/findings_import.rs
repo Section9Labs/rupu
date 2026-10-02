@@ -9,10 +9,14 @@ use rupu_coverage::{
 };
 use std::path::{Path, PathBuf};
 
-const PLAIN: &str =
-    include_str!("../../rupu-findings-report/tests/fixtures/import/notebin_plain.md");
-const EXPORTED: &str =
-    include_str!("../../rupu-findings-report/tests/fixtures/import/notebin_markdown.md");
+const PLAIN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../rupu-findings-report/tests/fixtures/import/notebin_plain.md"
+));
+const EXPORTED: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../rupu-findings-report/tests/fixtures/import/notebin_markdown.md"
+));
 const ID1: &str = "fnd_01J00000000000000000000001";
 const ID2: &str = "fnd_01J00000000000000000000002";
 const ID9: &str = "fnd_01J00000000000000000000009";
