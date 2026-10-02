@@ -305,6 +305,15 @@ pub enum RunWorkflowError {
         "run cancelled: {aborted} in-flight node(s) aborted; restart to resume from checkpoint"
     )]
     RunCancelled { aborted: usize },
+    /// A resume reached a run that already finished — `status` is
+    /// `Completed`, `Failed` or `Rejected` on disk
+    /// ([`crate::RunnerClaim::Finished`]). Nothing ran and nothing was
+    /// written.
+    #[error("run {run_id} already finished ({}) — not resuming it", .status.as_str())]
+    RunAlreadyFinished {
+        run_id: String,
+        status: crate::runs::RunStatus,
+    },
     /// Task 3, spec §2c/§8g: `until` never held through `max_iterations`
     /// iterations and the loop's `on_max` is `fail` (the default) —
     /// fail-loudly rather than let a caller believe the last iteration's
@@ -1080,7 +1089,10 @@ pub async fn run_workflow(
     } else if let Some(store) = &opts.run_store {
         // Resume path: become the run's one runner, under the run lock. A
         // `Cancelled` that landed since the resume was decided is
-        // preserved, and the run does not start. A runner already executing
+        // preserved, and the run does not start; so is any other finished
+        // status (the run completed, failed or was rejected before this
+        // late runner claimed it — re-entering would re-run its steps and
+        // overwrite that status). A runner already executing
         // the run (a gate decided while another gate's path runs) is left to
         // apply the recorded decisions itself — a second runner would
         // re-dispatch work the first already has in flight.
@@ -1105,6 +1117,10 @@ pub async fn run_workflow(
             Ok(crate::runs::RunnerClaim::Cancelled) => {
                 info!(run_id = %run_id, "the run was cancelled on disk before it resumed; not starting it");
                 return Err(RunWorkflowError::RunCancelled { aborted: 0 });
+            }
+            Ok(crate::runs::RunnerClaim::Finished { status }) => {
+                info!(run_id = %run_id, status = status.as_str(), "the run already finished on disk before it resumed; not starting it");
+                return Err(RunWorkflowError::RunAlreadyFinished { run_id, status });
             }
             Err(e) => return Err(map_run_store_err(e)),
         }
@@ -14356,6 +14372,18 @@ mod loop_resume {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    /// Take the fixture run, which ran to completion, back to the state a
+    /// resume re-enters a paused run from: `Running`, as `rupu workflow
+    /// resume`'s flip leaves it before it calls `run_workflow`. A runner
+    /// never re-enters a run that is finished on disk
+    /// ([`crate::RunStore::claim_runner`]).
+    fn reopen_for_resume(store: &crate::runs::RunStore, run_id: &str) {
+        let mut rec = store.load(run_id).unwrap();
+        rec.status = crate::runs::RunStatus::Running;
+        rec.finished_at = None;
+        store.update(&rec).unwrap();
+    }
+
     const REFINE_WF: &str = r#"
 name: refine
 steps:
@@ -14642,6 +14670,7 @@ loops:
         let mut rec = store.load(&run_id).unwrap();
         rec.loop_progress.insert("refine".to_string(), 2);
         store.update(&rec).unwrap();
+        reopen_for_resume(&store, &run_id);
 
         // --- Resume. Only `critique` of iteration 2 must be
         // re-dispatched (not gen/test again); the global critique
@@ -14747,6 +14776,7 @@ loops:
             .filter(|sr| sr.step_id != "ship")
             .cloned()
             .collect();
+        reopen_for_resume(&store, &run_id);
 
         // --- Resume. A factory that panics if ANY loop member is
         // dispatched again — only `ship` may run.

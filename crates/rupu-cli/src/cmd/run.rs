@@ -318,10 +318,12 @@ pub async fn handle(
             run_id,
             mode,
             plain,
-        }) => match crate::cmd::workflow::resume_run(&run_id, mode.as_deref(), plain).await {
-            Ok(()) => ExitCode::from(0),
-            Err(e) => crate::output::diag::fail(e),
-        },
+        }) => {
+            match crate::cmd::workflow::resume_run(&run_id, mode.as_deref(), plain, false).await {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => crate::output::diag::fail(e),
+            }
+        }
         Ok(RunAction::List { limit, status }) => match list(limit, status, global_format).await {
             Ok(()) => ExitCode::from(0),
             Err(e) => crate::output::diag::fail(e),

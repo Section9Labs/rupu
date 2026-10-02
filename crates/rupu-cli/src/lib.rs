@@ -665,12 +665,27 @@ mod arg_parse_tests {
                         run_id,
                         mode,
                         plain,
+                        if_unfinished,
                     },
             } => {
                 assert_eq!(run_id, "run_01ABC");
                 assert_eq!(mode.as_deref(), Some("ask"));
                 assert!(plain);
+                assert!(
+                    !if_unfinished,
+                    "an operator's resume may retry a finished run"
+                );
             }
+            other => panic!("expected Workflow(Resume), got {other:?}"),
+        }
+        // How `cp serve` spawns it to serve a request.
+        let cli =
+            Cli::try_parse_from(["rupu", "workflow", "resume", "run_01ABC", "--if-unfinished"])
+                .unwrap();
+        match cli.command {
+            Cmd::Workflow {
+                action: cmd::workflow::Action::Resume { if_unfinished, .. },
+            } => assert!(if_unfinished),
             other => panic!("expected Workflow(Resume), got {other:?}"),
         }
     }
