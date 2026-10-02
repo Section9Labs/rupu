@@ -150,6 +150,21 @@ fn final_assistant_text(events: &[Event]) -> String {
         .unwrap_or_default()
 }
 
+/// Point a freshly built agent run at the interrupted one: seed it with the
+/// rebuilt conversation *by reference* to `seed_source` and hand it the
+/// continuation note (which joins the conversation's trailing user turn).
+/// Everything else on `opts` — agent, provider, model, tools, mode — is the
+/// caller's fresh configuration.
+pub fn apply_continuation(
+    opts: &mut crate::runner::AgentRunOpts,
+    messages: Vec<Message>,
+    seed_source: PathBuf,
+) {
+    opts.initial_messages = messages;
+    opts.seed_source = Some(seed_source);
+    opts.user_message = CONTINUATION_NOTE.to_string();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +422,74 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let t = finished_transcript(tmp.path()).await;
         assert_eq!(transcript_agent(&t).unwrap(), "test-agent");
+    }
+
+    /// The whole primitive: a run dies during turn 2, a fresh run continues
+    /// it. The provider sees the rebuilt conversation with the note merged
+    /// into the trailing user turn; the new transcript seeds BY REFERENCE to
+    /// the old one; replay rebuilds the full conversation across both files;
+    /// and the continued run now reads as finished.
+    #[tokio::test]
+    async fn a_continued_run_picks_up_where_the_interrupted_one_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = finished_transcript(tmp.path()).await;
+        write_lines(&first, &through_first_turn_end(&lines(&first)));
+
+        let Continuation::Resume {
+            messages,
+            seed_source,
+        } = prepare_continuation(&first).unwrap()
+        else {
+            panic!("expected Resume");
+        };
+        let rebuilt = messages.clone();
+
+        let second = tmp.path().join("second.jsonl");
+        let provider =
+            crate::runner::CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: "finished after resume".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+        let captured = provider.captured.clone();
+        let mut opts = opts_for(Box::new(provider), tmp.path(), second.clone());
+        opts.user_message = "this must be replaced".into();
+        apply_continuation(&mut opts, messages, seed_source);
+        assert_eq!(opts.user_message, CONTINUATION_NOTE);
+        run_agent(opts).await.unwrap();
+
+        let mut expected = rebuilt;
+        expected[2].content.push(ContentBlock::Text {
+            text: CONTINUATION_NOTE.into(),
+        });
+        let sent = captured.lock().unwrap()[0].messages.clone();
+        assert_eq!(
+            serde_json::to_value(&sent).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+
+        let seed = lines(&second)
+            .into_iter()
+            .find(|v| kind(v) == "seed")
+            .expect("the continued transcript starts with a seed");
+        assert_eq!(
+            seed["data"]["source_transcript"],
+            first.display().to_string()
+        );
+        assert!(
+            seed["data"].get("messages").is_none(),
+            "seeded by reference, not copied"
+        );
+
+        expected.push(Message::assistant("finished after resume"));
+        assert_eq!(
+            serde_json::to_value(reconstruct_transcript(&second).unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        match prepare_continuation(&second).unwrap() {
+            Continuation::Finished { output } => assert_eq!(output, "finished after resume"),
+            other => panic!("expected Finished, got {other:?}"),
+        }
     }
 }
