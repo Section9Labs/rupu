@@ -448,6 +448,74 @@ describe('PerHostListEngine', () => {
     expect(engine.current[0]).toMatchObject({ pagingFailed: true, catchingUp: false, hasMore: true, reason: 'down' });
   });
 
+  it('retryPaging whose re-anchor fails stays paging-failed for the head\'s reason, with no catch-up request', async () => {
+    let headDown = false;
+    const { engine, fetch } = harness((p) => {
+      if (p.offset > 0) return Promise.reject(new ApiError(502, 'x', '{"error":"page down"}'));
+      if (headDown) return Promise.reject(new ApiError(502, 'x', '{"error":"head down"}'));
+      return pager(rows('local', 60, 1))(p);
+    });
+    engine.start([LOCAL]);
+    await flush();
+    await engine.loadMore();
+    expect(engine.current[0]).toMatchObject({ pagingFailed: true, reason: 'page down' });
+
+    headDown = true;
+    fetch.mockClear();
+    await engine.retryPaging('local');
+    expect(fetch.mock.calls.map((c) => c[0].offset)).toEqual([0]); // the re-anchor only
+    expect(engine.current[0]).toMatchObject({ pagingFailed: true, catchingUp: false, reason: 'head down' });
+  });
+
+  describe('a replaced refresh (20+ new rows on top) pages back down instead of shrinking', () => {
+    /** 25 rows newer than anything `rows(host, …)` holds, so page 0 cannot overlap the old rows. */
+    const landed = (host: string) => rows(host, 25, 0.1, -100).map((r) => ({ ...r, id: `new-${r.id}` }));
+
+    it('single host: the slice ends at least as long as before', async () => {
+      let server = rows('local', 120, 1);
+      const { engine, fetch, visible } = harness(pager0(() => server));
+      engine.start([LOCAL]);
+      await flush();
+      await engine.loadMore();
+      await engine.loadMore();
+      const before = visible().length;
+      expect(before).toBe(60);
+
+      server = [...landed('local'), ...server];
+      fetch.mockClear();
+      await engine.scheduleHead('local');
+      expect(visible().length).toBeGreaterThanOrEqual(before);
+      expect(visible()[0].id).toBe('new-local-0');
+      expect(fetch.mock.calls.length).toBeGreaterThan(1); // page 0, then the catch-up
+      expect(engine.current[0]).toMatchObject({ catchingUp: false, hasMore: true });
+    });
+
+    it('all hosts: the replaced host stays out of gating while it pages back, and the list ends no shorter', async () => {
+      let remote = rows('remote', 120, 3); // one per 3 min
+      const local = rows('local', 200, 1); // one a minute
+      const { engine, history, visible } = harness((p) => (p.host === 'local' ? pager(local)(p) : pager0(() => remote)(p)));
+      engine.start([LOCAL, REMOTE]);
+      await flush();
+      const remoteRows = () => engine.current.find((s) => s.hostId === 'remote')?.rows.length ?? 0;
+      for (let i = 0; i < 40 && remoteRows() < 60; i++) await engine.loadMore();
+      expect(remoteRows()).toBe(60);
+      const before = visible().length;
+
+      remote = [...landed('remote'), ...remote];
+      const base = history.length;
+      await engine.scheduleHead('remote');
+      expect(visible().length).toBeGreaterThanOrEqual(before);
+      // Never gating at page 0's shallow coverage while it pages back down.
+      const replacedAt = history.findIndex(
+        (h, i) => i >= base && (h.find((s) => s.hostId === 'remote')?.rows[0]?.id ?? '').startsWith('new-'),
+      );
+      expect(replacedAt).toBeGreaterThanOrEqual(base);
+      const firstGating = history.findIndex((h, i) => i >= replacedAt && !h.find((s) => s.hostId === 'remote')?.catchingUp);
+      const rowsWhenGating = history[firstGating].find((s) => s.hostId === 'remote')?.rows.length ?? 0;
+      expect(rowsWhenGating).toBeGreaterThanOrEqual(60);
+    });
+  });
+
   it('a timed-out fetch is aborted, and the AbortError it then rejects with changes nothing', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const signals: (AbortSignal | undefined)[] = [];

@@ -39,7 +39,8 @@ export interface PerHostFetchParams {
 }
 
 /** What `head()` reports to a caller that needs to know whether it got an answer. */
-type HeadResult = { ok: true } | { ok: false; reason: string };
+/** `joined`: head() already ran the catch-up (a first answer, or a replaced slice). */
+type HeadResult = { ok: true; joined: boolean } | { ok: false; reason: string };
 
 export class PerHostListEngine<T extends HostTagged> {
   private slices: HostSlice<T>[] = [];
@@ -47,6 +48,11 @@ export class PerHostListEngine<T extends HostTagged> {
   private readonly headQueued = new Set<string>();
   /** One controller per fetch still awaited; `dispose()` aborts them all. */
   private readonly inflight = new Set<AbortController>();
+  /**
+   * Catch-ups running per host. A re-anchor inside a catch-up can run one of its own (a replaced
+   * page 0); only the outermost may end the host's `catchingUp`.
+   */
+  private readonly joins = new Map<string, number>();
   private disposed = false;
 
   constructor(
@@ -123,8 +129,14 @@ export class PerHostListEngine<T extends HostTagged> {
       // Stay out of gating (catchingUp) while re-anchoring: gating again at this host's
       // old, shallower coverage would lift the floor and hide rows right where Retry was clicked.
       this.patch(id, (s) => ({ ...s, pagingFailed: false, reason: null, catchingUp: s.hasMore }));
-      await this.head(id);
-      await this.join(id);
+      const head = await this.head(id);
+      if (!head.ok) {
+        // The re-anchor itself failed: still paging-failed, now for the head's own reason. Do not
+        // spend a catch-up request on a host that could not even answer page 0.
+        this.patch(id, (s) => ({ ...s, pagingFailed: true, catchingUp: false, reason: head.reason }));
+        return;
+      }
+      if (!head.joined) await this.join(id);
     });
   }
 
@@ -196,7 +208,7 @@ export class PerHostListEngine<T extends HostTagged> {
 
   /** Load page 0. `ok: false` carries the failure reason; a disposed engine or a vanished host is `ok`. */
   private async head(id: string): Promise<HeadResult> {
-    if (this.disposed || !this.find(id)) return { ok: true };
+    if (this.disposed || !this.find(id)) return { ok: true, joined: false };
     let page: T[];
     try {
       page = withHost(await this.fetchBounded({ host: id, offset: 0, limit: PAGE }), id);
@@ -204,7 +216,7 @@ export class PerHostListEngine<T extends HostTagged> {
       return { ok: false, reason: this.fail(id, e) };
     }
     const cur = this.find(id);
-    if (this.disposed || !cur) return { ok: true };
+    if (this.disposed || !cur) return { ok: true, joined: false };
     if (cur.state !== 'ok') {
       // First answer or recovery: hold it out of gating until join() decides.
       const hasMore = page.length === PAGE;
@@ -219,36 +231,46 @@ export class PerHostListEngine<T extends HostTagged> {
         receivedAt: Date.now(),
       }));
       await this.join(id);
-      return { ok: true };
+      return { ok: true, joined: true };
     }
     const { rows, fullyListed, replaced } = spliceHead(cur.rows, page, PAGE, this.access, id);
     this.patch(id, (s) => ({
       ...s,
       rows,
       hasMore: fullyListed ? false : replaced ? true : s.hasMore,
+      // A replaced slice is shallower than before; it stays out of gating until join() below has
+      // paged it back down. Gating at page 0's coverage would lift the floor and hold back every
+      // other host's older rows.
+      catchingUp: replaced ? true : s.catchingUp,
       reason: null,
       receivedAt: Date.now(),
     }));
-    return { ok: true };
+    // Page 0 did not reach the old rows, so the slice just lost every row below it. Page back down
+    // at least that far (in single-host mode there is no other host to displace, so the lost count
+    // is the whole budget): the list must not get shorter under the reader (spec §6.3).
+    if (replaced) await this.join(id, cur.rows.length - rows.length);
+    return { ok: true, joined: replaced };
   }
 
   /**
    * Bring a host into the merge without shortening the visible list: fetch
-   * at least as many rows as it would push below the floor (the budget),
-   * stopping early once it reaches the floor or runs out of rows. Then it
-   * gates.
+   * at least as many rows as it would push below the floor (the budget, and
+   * never less than `minBudget`), stopping early once it reaches the floor or
+   * runs out of rows. Then it gates.
    */
-  private async join(id: string): Promise<void> {
+  private async join(id: string, minBudget = 0): Promise<void> {
     const start = this.find(id);
     if (!start) return;
     const others = () => this.slices.filter((o) => o.hostId !== id);
+    this.joins.set(id, (this.joins.get(id) ?? 0) + 1);
     try {
       this.patch(id, (s) => ({ ...s, catchingUp: s.hasMore }));
-      const budget = displacedCount(
+      const displaced = displacedCount(
         watermarkMerge(others(), this.access).visible,
         coveredOf(start, this.access.timeOf),
         this.access.timeOf,
       );
+      const budget = Math.max(displaced, minBudget);
       let added = 0;
       for (;;) {
         const s = this.find(id);
@@ -261,8 +283,11 @@ export class PerHostListEngine<T extends HostTagged> {
         added += got;
       }
     } finally {
+      const depth = (this.joins.get(id) ?? 1) - 1;
+      if (depth > 0) this.joins.set(id, depth);
+      else this.joins.delete(id);
       // Whatever happened (even an unexpected throw), never leave a host catching up forever.
-      if (this.find(id)?.catchingUp) this.patch(id, (s) => ({ ...s, catchingUp: false }));
+      if (depth === 0 && this.find(id)?.catchingUp) this.patch(id, (s) => ({ ...s, catchingUp: false }));
     }
   }
 
