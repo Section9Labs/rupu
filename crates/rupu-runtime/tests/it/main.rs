@@ -10,6 +10,7 @@
 
 mod anthropic_prompt_cache;
 mod gemini_code_assist_project;
+mod hop_builder;
 mod model_limits;
 mod netflow_capture;
 mod oauth_refresh_persists;

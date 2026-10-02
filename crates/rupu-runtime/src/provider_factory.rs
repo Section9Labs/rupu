@@ -359,7 +359,8 @@ pub enum FactoryError {
 /// Test-only seam: when `RUPU_MOCK_PROVIDER_SCRIPT` is set, the factory
 /// builds a `MockProvider` from the JSON script in the env var and
 /// ignores `name`/`resolver`. Production users never set this; tests
-/// use it to drive the agent loop end-to-end without an API key.
+/// use it to drive the agent loop end-to-end without an API key. See
+/// `build_mock_from_script` for the two script shapes.
 pub async fn build_for_provider(
     name: &str,
     model: &str,
@@ -402,7 +403,7 @@ pub async fn build_for_provider_with_config(
     if let Ok(json) = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT") {
         return Ok((
             rupu_providers::AuthMode::ApiKey,
-            build_mock_from_script(&json)?,
+            build_mock_from_script(&json, model)?,
         ));
     }
     let (mode, creds) =
@@ -546,10 +547,29 @@ fn provider_has_native_retry(kind: &str) -> bool {
     kind == "anthropic"
 }
 
-fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
+/// The `RUPU_MOCK_PROVIDER_SCRIPT` seam. Every provider the factory builds
+/// replays a script from its start, so:
+/// - a JSON array is the one script every build replays;
+/// - a JSON object `{"turns": [...], "models": {"<model>": [...]}}` gives a
+///   build for a listed model its own script and every other build `turns`.
+///   A fallback hop builds a second provider mid-run, and this is how a test
+///   scripts what that hop's model answers.
+fn build_mock_from_script(json: &str, model: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
     use rupu_agent::runner::{MockProvider, ScriptedTurn};
-    let turns: Vec<ScriptedTurn> =
-        serde_json::from_str(json).map_err(|e| FactoryError::Other(format!("mock script: {e}")))?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PerModel {
+        turns: Vec<ScriptedTurn>,
+        #[serde(default)]
+        models: std::collections::HashMap<String, Vec<ScriptedTurn>>,
+    }
+    let bad = |e: serde_json::Error| FactoryError::Other(format!("mock script: {e}"));
+    let turns: Vec<ScriptedTurn> = if json.trim_start().starts_with('{') {
+        let mut script: PerModel = serde_json::from_str(json).map_err(bad)?;
+        script.models.remove(model).unwrap_or(script.turns)
+    } else {
+        serde_json::from_str(json).map_err(bad)?
+    };
     Ok(Box::new(MockProvider::new(turns)))
 }
 
