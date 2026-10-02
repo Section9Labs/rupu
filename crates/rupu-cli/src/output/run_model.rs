@@ -144,8 +144,10 @@ pub struct RunView {
     /// step-result record (a finding that persists across bounded-loop
     /// iterations is counted once per iteration). Empty when none.
     pub findings_by_severity: BTreeMap<String, usize>,
-    /// `StepWarning` messages, in arrival order, as `"<step>: <message>"`
-    /// (e.g. a remote unit whose coverage could not be collected).
+    /// `StepWarning` messages, in arrival order, as `"<step>: <message>"` —
+    /// `"<step>[<unit index>]: <message>"` when the warning is about one
+    /// fan-out unit (e.g. a remote unit whose coverage could not be
+    /// collected).
     pub warnings: Vec<String>,
     /// Step that was active most recently — the attribution target for a
     /// dispatch (which carries no `step_id`).
@@ -243,13 +245,22 @@ impl RunView {
                 self.step_mut(step_id).state = StepState::Skipped;
             }
             Event::StepWarning {
-                step_id, message, ..
+                step_id,
+                index,
+                message,
+                ..
             } => {
                 // Information only: never a step or run failure. Kept flat
-                // (for the completion summary) and on the step (for the live
-                // view's marker) — but only on a step the run has reached: a
-                // warning must not conjure a pending step into the view.
-                self.warnings.push(format!("{step_id}: {message}"));
+                // (for the completion summary / `show-run`) as
+                // `<step>[<unit>]: <message>` — the unit named when there is
+                // one, so units of one host don't read as the same line — and
+                // on the step (for the live view's marker), but only on a step
+                // the run has reached: a warning must not conjure a pending
+                // step into the view.
+                self.warnings.push(match index {
+                    Some(i) => format!("{step_id}[{i}]: {message}"),
+                    None => format!("{step_id}: {message}"),
+                });
                 if let Some(s) = self.steps.iter_mut().find(|s| s.step_id == *step_id) {
                     s.warnings.push(message.clone());
                 }
@@ -497,7 +508,7 @@ impl RunView {
         v
     }
 
-    /// The `"<step>: <message>"` lines of every `StepWarning` in a run's
+    /// The `"<step>[<unit>]: <message>"` lines of every `StepWarning` in a run's
     /// event log, in order — what `rupu workflow show-run` prints. Folds just
     /// the warnings through [`RunView::apply`] (so the format is the one the
     /// completion summary uses) without the `run.json` / step-results /
@@ -637,13 +648,15 @@ mod tests {
         assert_eq!(v.steps[0].state, StepState::Complete);
         assert_eq!(v.steps[1].state, StepState::Running);
         assert_eq!(v.status, RunStatus::default());
-        // The flat, summary-facing list still carries every warning in order.
+        // The flat, summary-facing list carries every warning in order, naming
+        // the fan-out unit when there is one (units on one host would
+        // otherwise read as the same line).
         assert_eq!(
             v.warnings,
             vec![
                 "a: no coverage",
-                "b: host went away",
-                "b: host went away again",
+                "b[2]: host went away",
+                "b[5]: host went away again",
                 "ghost: orphan"
             ]
         );
@@ -670,7 +683,7 @@ mod tests {
         assert_eq!(
             RunView::warnings_from_run_dir(&store, "run_W"),
             vec![
-                "sweep: host gpu-9 sent no coverage",
+                "sweep[1]: host gpu-9 sent no coverage",
                 "triage: merge skipped"
             ]
         );

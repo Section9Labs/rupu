@@ -444,7 +444,11 @@ mod tests {
         assert!(warning_lines(&v).is_empty());
         let before = render_completion_summary(&v, now());
         assert!(!before.contains('⚠'), "{before}");
-        for (index, message) in [(None, "no coverage"), (Some(2), "host went away")] {
+        for (index, message) in [
+            (None, "no coverage"),
+            (Some(2), "host went away"),
+            (Some(3), "host went away"),
+        ] {
             v.apply(&rupu_orchestrator::executor::Event::StepWarning {
                 run_id: "run_01ABC".into(),
                 step_id: "assess".into(),
@@ -452,16 +456,31 @@ mod tests {
                 message: message.into(),
             });
         }
-        assert_eq!(v.warnings, vec!["assess: no coverage", "assess: host went away"]);
+        // A unit-scoped warning names its unit, so two units warning the same
+        // thing (one host) do not collapse into identical lines.
+        assert_eq!(
+            v.warnings,
+            vec![
+                "assess: no coverage",
+                "assess[2]: host went away",
+                "assess[3]: host went away"
+            ]
+        );
         assert_eq!(
             warning_lines(&v),
-            vec!["⚠ assess: no coverage", "⚠ assess: host went away"]
+            vec![
+                "⚠ assess: no coverage",
+                "⚠ assess[2]: host went away",
+                "⚠ assess[3]: host went away"
+            ]
         );
         // A warning is information, never a step or run failure.
         assert_eq!(v.status, RunStatus::Completed);
         let s = render_completion_summary(&v, now());
         assert!(
-            s.contains("⚠ assess: no coverage\n⚠ assess: host went away\n"),
+            s.contains(
+                "⚠ assess: no coverage\n⚠ assess[2]: host went away\n⚠ assess[3]: host went away\n"
+            ),
             "every warning, in order:\n{s}"
         );
 
@@ -469,6 +488,6 @@ mod tests {
         let mut parked = awaiting_view(vec![gate("approve", None)]);
         parked.warnings = v.warnings.clone();
         let s = render_completion_summary(&parked, now());
-        assert!(s.contains("⚠ assess: host went away"), "{s}");
+        assert!(s.contains("⚠ assess[3]: host went away"), "{s}");
     }
 }

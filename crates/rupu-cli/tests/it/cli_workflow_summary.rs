@@ -86,7 +86,7 @@ fn completion_summary_from_a_run_dir_lists_every_step_warning() {
     let block = rupu_cli::output::run_summary::render_completion_summary(&v, chrono::Utc::now());
     assert!(
         block.contains(
-            "⚠ sweep: host gpu-9 sent no coverage stream\n⚠ sweep: coverage merge skipped\n"
+            "⚠ sweep[2]: host gpu-9 sent no coverage stream\n⚠ sweep: coverage merge skipped\n"
         ),
         "{block}"
     );
@@ -121,7 +121,7 @@ fn workflow_show_run_prints_the_same_warning_lines() {
     let pretty = run("pretty");
     assert!(
         pretty.contains(
-            "⚠ sweep: host gpu-9 sent no coverage stream\n⚠ sweep: coverage merge skipped\n"
+            "⚠ sweep[2]: host gpu-9 sent no coverage stream\n⚠ sweep: coverage merge skipped\n"
         ),
         "{pretty}"
     );
@@ -130,7 +130,7 @@ fn workflow_show_run_prints_the_same_warning_lines() {
     assert_eq!(
         json["item"]["warnings"],
         serde_json::json!([
-            "sweep: host gpu-9 sent no coverage stream",
+            "sweep[2]: host gpu-9 sent no coverage stream",
             "sweep: coverage merge skipped"
         ]),
         "{json}"
