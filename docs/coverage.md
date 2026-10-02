@@ -497,7 +497,9 @@ report`). A file that holds several findings is refused; split it into
 one file per finding first. The title is the file's `# ` heading; failing that,
 the first line after `Filename:` when that line is not a field; failing that,
 the first line that is not a field. A line before the title (a banner) is kept
-as other text (below).
+as other text (below). A heading at the sections' level that names none of
+them (`## Disclosure Timeline`) is kept with its text as other text, not run
+into the section before it.
 
 **Which finding.** The one id the report's Finding ID line states. The labels
 read, in any case and as `Label:`, `**Label:**` or `**Label**:`, are `Finding
@@ -578,20 +580,29 @@ sentinel for must be in the file, or the file fails: the title; Category,
 Attack Vector, Impact, Likelihood, Risk Rating and Risk Factor; and the
 Description, Impact, Location, Root Cause, Evidence, Remediation, Replication
 Steps and References sections (Evidence and Replication Steps need at least one
-entry). A rating that is not a level the schema allows fails too. Where the
+entry). A rating that is not a level the schema allows fails too, and so does a
+range (`High/Critical`, `Medium-High`, `Medium to High`). Where the
 schema has a sentinel, it is used: `Unknown` for a missing Owner, Product,
 Affected Component, Source Repository, CVSS or ticket-references field; `None`
 for a missing Cross-References section; and `Not Provided — section missing from
 the imported report` for a call chain, patch, CI/CD detection or regression test
 section the file lacks. A part missing from a section that is present, such as
 the stage of a CI check, is `Not stated in the imported report.` Text with no
-field to hold it is kept at the end of References, under `Other imported text:`.
+field to hold it is kept at the end of References, under `Other imported text:`,
+one `From <where>:` block per place it came from (text before the first
+replication step included: it is not a step).
 
 **Cross-references, evidence and artifacts.** The Cross-References text is kept
 verbatim in References. Each `fnd_` id it names also becomes a cross-reference
 link, but only to another finding in the same ledger: an id in a different
 ledger, and the finding's own id, are not linked. Code blocks in a call chain
-become evidence claims. Artifacts the report lists (an Artifacts table or list)
+become evidence claims. A claim's location is the first `path:lines` in it
+whose path has a directory (`src/routes/notes.rs:40-58`), else a bare file name
+in a code span or with a range of lines (`` `notes.rs:40` ``, `notes.rs:40-58`);
+a host and port (`10.0.0.5:9229`, `notebin.example.com:443`) is never read as
+one. A list right after a line that introduces it (`The handler skips two
+checks:`) is part of that line's claim; a claim of several paragraphs comes
+back as one claim per paragraph. Artifacts the report lists (an Artifacts table or list)
 must exist in the finding's workspace; the report is refused with the reason
 when one does not. A list item's path is its leading code span (`` `poc/x.sh` ``),
 else its first word; an item that says more than its path is also kept as
@@ -599,7 +610,11 @@ other text. With no CWE field, the CWE ids are those in Category and on the
 References lines that start with one (`CWE-639: …`, `- CWE-639 …`; every id on
 such a line counts); one mentioned in passing ("unlike CWE-79 …") is not taken.
 A Recommended Patch section with a diff block is a patch, whatever its text
-says; the text becomes the patch's notes.
+says; the text becomes the patch's notes. A report `rupu findings export`
+wrote reads back field for field, with these exceptions: its Classifications
+come back without their vectors (not printed), and its typed evidence blocks
+(scan output, HTTP exchanges, disassembly, …) come back as evidence claims, text
+and code kept, type not.
 
 **Output.** One line per file: `attached` (`would attach` on a dry run),
 `skipped` (not a report, or the finding already has one) or `failed` with the

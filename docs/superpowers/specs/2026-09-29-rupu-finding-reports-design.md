@@ -390,6 +390,14 @@ supported input path.
   Provided — section missing from the imported report`; and a missing part of
   a section that is present is `Not stated in the imported report.` See
   `docs/coverage.md#importing-reports-written-before-the-full-profile`.
+- **Exporter changes for the importer** (Plan 5's final review): so an exported
+  report reads back unambiguously, the Markdown export now prints a
+  `**Command:**` line before the CI/CD Detection and Regression Test command
+  blocks (Plan 3's block shape had the bare `sh` block), labels the code of
+  typed evidence blocks it used to print as a bare fence (`**Diff**`,
+  `**Decompiled** (lang)`, `**Code**`), and escapes a `;` inside one ticket
+  reference as `\;` (Markdown shows `;`; HTML and PDF print it plain),
+  since tickets are joined with `; `.
 
 ## Error handling
 

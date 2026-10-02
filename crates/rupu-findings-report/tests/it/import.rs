@@ -262,7 +262,7 @@ fn an_exported_report_round_trips() {
 }
 
 /// What an export of the fixture carries that no report field takes.
-const EXPORTED_OTHER_TEXT: &str = "Header:\n\n**Identifier:** SEC-001\n\nProvenance:\n\n**Project:** notebin\n**Workflow:** audit\n**Run:** run_01\n**Surface:** workflow\n**Model:** claude-x\n**Declared:** 2026-03-01T10:00:00Z\n**Scope:** repo";
+const EXPORTED_OTHER_TEXT: &str = "From the header:\n\n**Identifier:** SEC-001\n\nFrom Provenance:\n\n**Project:** notebin\n**Workflow:** audit\n**Run:** run_01\n**Surface:** workflow\n**Model:** claude-x\n**Declared:** 2026-03-01T10:00:00Z\n**Scope:** repo";
 
 #[test]
 fn a_file_that_is_not_a_report_is_skipped() {
@@ -563,7 +563,7 @@ fn a_clean_report_keeps_no_other_text_but_its_identifier() {
     // The legacy identifier has no report field and is kept; the file name
     // and the finding id are not.
     let (r, _) = report_of(PLAIN);
-    assert_eq!(other_text(&r), "Header:\n\nIdentifier: NB-001");
+    assert_eq!(other_text(&r), "From the header:\n\nIdentifier: NB-001");
 }
 
 #[test]
@@ -620,7 +620,7 @@ fn an_unknown_section_before_the_first_known_one_is_kept_under_its_name() {
     let (r, _) = report_of(&md);
     assert!(
         other_text(&r).contains(
-            "Executive Summary:\n\nAttackers can read shared notes forever; fix before GA."
+            "From Executive Summary:\n\nAttackers can read shared notes forever; fix before GA."
         ),
         "{}",
         r.references
@@ -636,7 +636,8 @@ fn artifacts_prose_is_kept() {
     assert_eq!(r.artifacts.len(), 1);
     assert_eq!(r.artifacts[0].path, "out/capture.pcap");
     assert!(
-        other_text(&r).contains("Artifacts:\n\nThe capture was taken on the staging box at 10:02."),
+        other_text(&r)
+            .contains("From Artifacts:\n\nThe capture was taken on the staging box at 10:02."),
         "{}",
         r.references
     );
@@ -650,7 +651,7 @@ fn provenance_text_is_kept_but_not_the_finding_id() {
     let (r, _) = report_of(&md);
     let other = other_text(&r);
     assert!(
-        other.contains("Provenance:\n\nFound during the Q2 manual review by the red team."),
+        other.contains("From Provenance:\n\nFound during the Q2 manual review by the red team."),
         "{other}"
     );
     assert!(!other.contains("Finding ID"), "{other}");
@@ -668,7 +669,7 @@ fn unused_structured_ticket_lines_are_kept() {
     };
     assert_eq!(t.len(), 1);
     assert!(
-        other_text(&r).contains("Ticket references:\n\nStatus: Won't fix until 3.0"),
+        other_text(&r).contains("From Ticket references:\n\nStatus: Won't fix until 3.0"),
         "{}",
         r.references
     );
@@ -687,11 +688,11 @@ fn rating_qualifiers_are_kept() {
     assert_eq!(r.rating.risk_factor, RiskLevel::High);
     let other = other_text(&r);
     assert!(
-        other.contains("Impact rating:\n\n— only for tenants with sharing enabled"),
+        other.contains("From Impact rating:\n\n— only for tenants with sharing enabled"),
         "{other}"
     );
     assert!(
-        other.contains("Risk Factor:\n\n(see appendix B)"),
+        other.contains("From Risk Factor:\n\n(see appendix B)"),
         "{other}"
     );
 }
@@ -1279,7 +1280,7 @@ fn text_beyond_the_id_on_an_id_line_is_kept() {
     assert_eq!(own, [ID1]);
     assert!(
         other_text(&r).contains(&format!(
-            "Header:\n\nIdentifier: NB-001\nFinding ID: {ID1} (merged from an earlier duplicate report)"
+            "From the header:\n\nIdentifier: NB-001\nFinding ID: {ID1} (merged from an earlier duplicate report)"
         )),
         "{}",
         other_text(&r)
@@ -1295,7 +1296,7 @@ fn text_beyond_the_id_on_an_id_line_is_kept() {
     assert!(!r.impact.contains("Native Finding"), "{}", r.impact);
     assert!(
         other_text(&r).contains(&format!(
-            "Impact:\n\nNative Finding: {ID1}, first seen on staging"
+            "From Impact:\n\nNative Finding: {ID1}, first seen on staging"
         )),
         "{}",
         other_text(&r)
@@ -1306,7 +1307,7 @@ fn text_beyond_the_id_on_an_id_line_is_kept() {
     let (r, _) = report_of(&md);
     assert!(
         other_text(&r).contains(&format!(
-            "Provenance:\n\nFinding ID: {ID1} (renumbered)\nRun: run_7"
+            "From Provenance:\n\nFinding ID: {ID1} (renumbered)\nRun: run_7"
         )),
         "{}",
         other_text(&r)
@@ -1353,7 +1354,7 @@ fn a_banner_before_the_title_is_kept_as_other_text() {
     let (r, _) = report_of(&format!("{BANNER}\n{PLAIN}"));
     assert_eq!(r.title, "Notes API returns another user's note by id");
     assert!(
-        other_text(&r).starts_with(&format!("Header:\n\n{BANNER}")),
+        other_text(&r).starts_with(&format!("From the header:\n\n{BANNER}")),
         "{}",
         other_text(&r)
     );
@@ -1385,7 +1386,7 @@ fn an_artifact_list_item_is_its_path_and_the_rest_is_kept() {
     let other = other_text(&r);
     assert!(
         other.contains(
-            "Artifacts:\n\n- `poc/fetch_other_note.sh` — the proof-of-concept script\n- out/capture.pcap raw capture from staging"
+            "From Artifacts:\n\n- `poc/fetch_other_note.sh` — the proof-of-concept script\n- out/capture.pcap raw capture from staging"
         ),
         "{other}"
     );
@@ -1579,7 +1580,7 @@ fn a_classifications_line_that_does_not_read_is_kept_as_other_text() {
             r.classifications
         );
         assert!(
-            other_text(&r).contains(&format!("Classifications:\n\n{value}")),
+            other_text(&r).contains(&format!("From Classifications:\n\n{value}")),
             "{value}: {}",
             r.references
         );
@@ -1596,4 +1597,439 @@ fn a_classifications_line_that_does_not_read_is_kept_as_other_text() {
         .map(|c| (c.system.as_str(), c.id.as_str()))
         .collect();
     assert_eq!(read, [("OWASP", "A01:2021"), ("CAPEC", "CAPEC-122")]);
+}
+
+// ---- final review fixes ------------------------------------------------------
+
+/// Every claim's text and excerpt, for checking that text was kept.
+fn evidence_text(r: &rupu_coverage::FindingReport) -> String {
+    r.evidence
+        .iter()
+        .map(|c| format!("{}\n{}", c.claim, c.excerpt.as_deref().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn rating_lines_in_the_references_text_stay_references() {
+    let mut original = full_report();
+    original.references = "OWASP A01:2021\nRisk factor: exploitable only by signed-in users\nCVSS: 9.8 per the vendor advisory".into();
+    let (r, _) = report_of(&exported(original.clone()));
+    assert_eq!(r.rating, original.rating);
+    let (references, _) = r.references.split_once("\n\nOther imported text:").unwrap();
+    assert_eq!(references, original.references);
+    assert_valid(&r, &[]);
+
+    // Not at the end of References, a rating line is still found.
+    let md = PLAIN.replace(
+        "CVSS v3 Base Score: 8.1\nRisk Factor: High\n",
+        "Risk Factor: High\nSee the appendix for the scoring notes.\n",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.risk_factor, RiskLevel::High);
+    assert!(
+        r.references.contains("See the appendix"),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn a_host_and_port_is_not_a_file_and_line() {
+    let md = PLAIN
+        .replace(
+            "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+            "The debug listener at 10.0.0.5:9229 and notebin.example.com:443 serves it (src/routes/notes.rs:40-58):",
+        )
+        .replace(
+            " → get_note() (src/routes/notes.rs:40-58) → ",
+            " → proxy at admin@db.internal:5432 → ",
+        );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.evidence[0].file.as_deref(), Some("src/routes/notes.rs"));
+    assert_eq!(r.evidence[0].lines, Some([40, 58]));
+    let OrSentinel::Value(hops) = &r.call_chain else {
+        panic!()
+    };
+    assert!(hops[1].label.contains("admin@db.internal:5432"), "{hops:?}");
+    assert_eq!(hops[1].file, None, "{hops:?}");
+    assert_valid(&r, &[]);
+
+    // A file named without a directory: in a code span, or with a range.
+    for (claim, file) in [
+        ("The check is missing (`notes.rs:40`).", Some("notes.rs")),
+        ("The check is missing (notes.rs:40-58).", Some("notes.rs")),
+        ("The check is missing (notes.rs:40).", None),
+        ("Served from `example.com:443`.", None),
+    ] {
+        let md = PLAIN.replace(
+            "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+            claim,
+        );
+        let (r, _) = report_of(&md);
+        assert_eq!(r.evidence[0].file.as_deref(), file, "{claim}");
+    }
+}
+
+#[test]
+fn a_description_line_in_prose_is_not_a_second_finding() {
+    let mut original = full_report();
+    original.impact =
+        "Any signed-in user can read every other user's notes.\n\n**Description**\n\nIds are sequential.\n\nDescription: guessable."
+            .into();
+    let (r, _) = report_of(&exported(original.clone()));
+    assert_eq!(r.impact, original.impact);
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_heading_like_line_in_an_export_is_not_adopted_as_a_section() {
+    let mut original = full_report();
+    original.replication_steps[2] = "Request the note.\n\n**Artifacts**\n\n- out/run.log".into();
+    let (r, _) = report_of(&exported(original.clone()));
+    assert_eq!(r.replication_steps, original.replication_steps);
+    assert!(r.artifacts.is_empty(), "{:?}", r.artifacts);
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_claim_holding_a_list_stays_one_claim() {
+    let mut original = full_report();
+    original.evidence[0].claim =
+        "The handler skips two checks:\n- the owner check\n- the audit log".into();
+    let (r, _) = report_of(&exported(original.clone()));
+    let mut want = original.evidence.clone();
+    want[0].sha256 = None;
+    assert_eq!(r.evidence, want);
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_semicolon_in_a_ticket_keeps_the_ticket_whole() {
+    use rupu_coverage::report::Ticket;
+    let mut original = full_report();
+    original.tickets = OrSentinel::Value(vec![
+        Ticket {
+            kind: "Example Tracker".into(),
+            identifier: "NB-42".into(),
+            url: Some("https://tracker.example.com/NB-42".into()),
+            notes: Some("Fix in 3.1; backport to 3.0".into()),
+        },
+        Ticket {
+            kind: "Other".into(),
+            identifier: "NB-43".into(),
+            url: None,
+            notes: None,
+        },
+    ]);
+    let md = exported(original.clone());
+    let (r, _) = report_of(&md);
+    assert_eq!(r.tickets, original.tickets);
+    assert_valid(&r, &[]);
+    // The escape is Markdown's: the other formats print a plain `;`.
+    let f = numbered(vec![input(
+        "notebin",
+        Some("audit"),
+        full_record(ID1, Severity::Critical, original),
+    )])
+    .remove(0);
+    let html = String::from_utf8(
+        render_finding(&f, &number_map(std::slice::from_ref(&f)), Format::Html).unwrap(),
+    )
+    .unwrap();
+    assert!(html.contains("Fix in 3.1; backport to 3.0"), "{html}");
+}
+
+#[test]
+fn every_typed_block_keeps_its_text_and_takes_no_claim_s_excerpt() {
+    use rupu_coverage::report::{ArtifactRef, DisasmLine, EvidenceBlock};
+    let art = |p: &str| ArtifactRef {
+        path: p.into(),
+        sha256: String::new(),
+        size: 0,
+        kind: None,
+        stored: None,
+        host: None,
+    };
+    let mut original = full_report();
+    original.evidence[0].excerpt = None;
+    original.evidence[0].lang = None;
+    original.blocks = vec![
+        EvidenceBlock::Diff {
+            diff: "-find_by_id(id)\n+find_by_id_for_owner(id, user)".into(),
+        },
+        EvidenceBlock::Decompile {
+            lang: "c".into(),
+            listing: "int lookup(int id) { return rows[id]; }".into(),
+        },
+        EvidenceBlock::CodeSlice {
+            file: None,
+            excerpt: "let note = store.get(id);".into(),
+            lang: Some("rust".into()),
+        },
+        EvidenceBlock::CodeSlice {
+            file: Some("src/share/token.rs".into()),
+            excerpt: "pub fn verify(t: &str) -> Claims".into(),
+            lang: Some("rust".into()),
+        },
+        EvidenceBlock::Table {
+            headers: vec!["user".into(), "note".into()],
+            rows: vec![vec!["user-b".into(), "note-of-user-a".into()]],
+        },
+        EvidenceBlock::Image {
+            artifact: art("out/screenshot.png"),
+            caption: Some("The leaked note".into()),
+        },
+        EvidenceBlock::Hexdump {
+            base: 4096,
+            artifact: art("out/dump.bin"),
+            rendered: Some("00001000  6e 6f 74 65".into()),
+        },
+        EvidenceBlock::Disasm {
+            arch: "x86_64".into(),
+            listing: vec![DisasmLine {
+                address: 0x4010a0,
+                bytes: "48 8b 07".into(),
+                mnemonic: "mov".into(),
+                ops: "rax, [rdi]".into(),
+            }],
+        },
+        EvidenceBlock::HttpExchange {
+            request: "GET /api/notes/2 HTTP/1.1".into(),
+            response: "HTTP/1.1 200 OK".into(),
+        },
+        EvidenceBlock::ScanOutput {
+            tool: "notescan".into(),
+            output: "2 notes readable across users".into(),
+        },
+        EvidenceBlock::PcapRef {
+            artifact: art("out/capture.pcap"),
+            summary: "the request and its 200".into(),
+        },
+        EvidenceBlock::Text {
+            text: "The share page reads the same store.".into(),
+        },
+    ];
+    let (r, _) = report_of(&exported(original.clone()));
+    let mut first = original.evidence[0].clone();
+    first.sha256 = None;
+    assert_eq!(r.evidence[0], first, "no block's code became its excerpt");
+    let text = evidence_text(&r);
+    for kept in [
+        "+find_by_id_for_owner(id, user)",
+        "int lookup(int id)",
+        "let note = store.get(id);",
+        "pub fn verify(t: &str) -> Claims",
+        "note-of-user-a",
+        "out/screenshot.png",
+        "00001000  6e 6f 74 65",
+        "mov rax, [rdi]",
+        "GET /api/notes/2 HTTP/1.1",
+        "HTTP/1.1 200 OK",
+        "2 notes readable across users",
+        "out/capture.pcap",
+        "The share page reads the same store.",
+    ] {
+        assert!(text.contains(kept), "{kept} missing from:\n{text}");
+    }
+    // A code slice's file is read back as its claim's file.
+    let slice = r
+        .evidence
+        .iter()
+        .find(|c| c.excerpt.as_deref() == Some("pub fn verify(t: &str) -> Claims"))
+        .unwrap();
+    assert_eq!(slice.file.as_deref(), Some("src/share/token.rs"));
+    assert!(r.blocks.is_empty());
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn classifications_written_as_a_list_read_back() {
+    let md = MARKDOWN.replace(
+        "**Attack Vector:**",
+        "**Classifications:**\n- CAPEC CAPEC-122\n- ATT&CK T1190\n**Attack Vector:**",
+    );
+    let (r, _) = report_of(&md);
+    let read: Vec<(&str, &str)> = r
+        .classifications
+        .iter()
+        .map(|c| (c.system.as_str(), c.id.as_str()))
+        .collect();
+    assert_eq!(read, [("CAPEC", "CAPEC-122"), ("ATT&CK", "T1190")]);
+    assert_valid(&r, &[ID1]);
+}
+
+#[test]
+fn a_rating_range_is_not_a_rating() {
+    for (from, to) in [
+        ("Risk Rating: Critical", "Risk Rating: High/Critical"),
+        ("Impact: High", "Impact: Medium-High"),
+        ("Likelihood: High", "Likelihood: Medium to High"),
+    ] {
+        let err = parse_report(&PLAIN.replace(from, to)).unwrap_err();
+        assert!(matches!(err, ImportError::BadValue { .. }), "{to}: {err:?}");
+    }
+    // A note after the level is not a range.
+    let md = PLAIN.replace(
+        "Risk Rating: Critical",
+        "Risk Rating: Critical — high-value tenants only",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.risk_rating, RiskLevel::Critical);
+}
+
+#[test]
+fn an_unknown_section_after_the_last_is_kept_on_its_own() {
+    let md = format!("{MARKDOWN}\n## Disclosure Timeline\n\n2024-05-01: reported.\n");
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.replication_steps[2],
+        "Open the copied link in a private window; the note still loads."
+    );
+    assert!(
+        other_text(&r).contains("From Disclosure Timeline:\n\n2024-05-01: reported."),
+        "{}",
+        r.references
+    );
+    assert_valid(&r, &[ID1]);
+}
+
+#[test]
+fn text_before_the_first_step_is_not_a_step() {
+    let md = PLAIN.replace(
+        "Replication Steps\nStep 1:",
+        "Replication Steps\nYou need two accounts on the staging site.\nStep 1:",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.replication_steps.len(), 3);
+    assert!(r.replication_steps[0].starts_with("Sign up as user A"));
+    assert!(
+        other_text(&r)
+            .contains("From Replication Steps:\n\nYou need two accounts on the staging site."),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn an_exported_ci_check_keeps_its_own_command() {
+    use rupu_coverage::report::CiDetection;
+    let mut original = full_report();
+    // A `Command:` line in the body is the author's, not the command.
+    original.ci_cd_detection = OrSentinel::Value(CiDetection {
+        stage: "pre-merge".into(),
+        body: "Integration test.\nCommand: make probe (the old entry point)".into(),
+        command: Some("cargo test --test notes_access".into()),
+        expect: "a 200".into(),
+    });
+    let (r, _) = report_of(&exported(original.clone()));
+    assert_eq!(r.ci_cd_detection, original.ci_cd_detection);
+    // No command, and a one-line shell block in the body: still none.
+    original.ci_cd_detection = OrSentinel::Value(CiDetection {
+        stage: "pre-merge".into(),
+        body: "Integration test.\n\n```bash\nmake probe\n```".into(),
+        command: None,
+        expect: "a 200".into(),
+    });
+    let (r, _) = report_of(&exported(original.clone()));
+    assert_eq!(r.ci_cd_detection, original.ci_cd_detection);
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn an_export_with_no_cwe_imports_with_none() {
+    let mut original = full_report();
+    original.cwe = Vec::new();
+    original.category = "Authorization bypass (CWE-639)".into();
+    let (r, _) = report_of(&exported(original.clone()));
+    assert!(r.cwe.is_empty(), "{:?}", r.cwe);
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_ticket_list_after_a_blank_line_is_still_the_field_s() {
+    let (want, _) = report_of(MARKDOWN);
+    let md = MARKDOWN.replace(
+        "**Existing Ticket References:**\n- Type:",
+        "**Existing Ticket References:**\n\n- Type:",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.tickets, want.tickets);
+}
+
+#[test]
+fn an_id_glued_to_an_underscore_is_not_an_id() {
+    let md = PLAIN.replace(
+        &format!("Finding ID: {ID1}"),
+        &format!("Finding ID: {ID1}_old, {ID2}"),
+    );
+    let (r, own) = report_of(&md);
+    assert!(own.is_empty(), "{own:?}");
+    assert!(
+        r.references.contains(&format!("{ID1}_old")),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn importing_an_export_of_an_import_reads_the_same_report() {
+    // Text the first import keeps as other text, from a section and an
+    // unknown heading, must not read as sections when exported and imported
+    // again.
+    let md = PLAIN
+        .replace(
+            "without checking that the note belongs to the signed-in user.",
+            &format!(
+                "without checking that the note belongs to the signed-in user.\nFinding ID: {ID1} (first seen on staging)"
+            ),
+        )
+        .replace(
+            "Replication Steps\n",
+            "Artifacts\nThe capture was taken on the staging box.\n\nReplication Steps\n",
+        );
+    let (first, _) = report_of(&md);
+    assert!(
+        other_text(&first).contains("From Description:"),
+        "{}",
+        first.references
+    );
+    let mut prev = first;
+    for round in 1..=2 {
+        let (next, own) = report_of(&exported(prev.clone()));
+        assert_eq!(own, vec![ID1.to_string()], "round {round}");
+        let mut same = next.clone();
+        same.references = prev.references.clone();
+        assert_eq!(same, prev, "round {round}");
+        assert!(
+            next.references.starts_with(&prev.references),
+            "round {round}: {}",
+            next.references
+        );
+        assert_valid(&next, &[]);
+        prev = next;
+    }
+}
+
+#[test]
+fn a_claim_of_several_paragraphs_comes_back_as_one_per_paragraph() {
+    // Pinned known limit: the exporter prints one claim after another, so a
+    // second paragraph reads as a claim of its own, without the location.
+    let mut original = full_report();
+    original.evidence[0].claim = "The lookup ignores the owner.\n\nThe cache does too.".into();
+    original.evidence[0].excerpt = None;
+    original.evidence[0].lang = None;
+    let (r, _) = report_of(&exported(original));
+    let claims: Vec<(&str, Option<&str>)> = r
+        .evidence
+        .iter()
+        .map(|c| (c.claim.as_str(), c.file.as_deref()))
+        .collect();
+    assert_eq!(
+        claims,
+        [
+            ("The lookup ignores the owner.", Some("src/routes/notes.rs")),
+            ("The cache does too.", None),
+        ]
+    );
 }

@@ -38,10 +38,11 @@ pub fn render(blocks: &[Block]) -> String {
                 }
                 out.push_str("#table(columns: (auto, 1fr), stroke: none, inset: (x: 0pt, y: 2pt), column-gutter: 1em,\n");
                 for (k, v) in rows {
+                    let v = crate::blocks::field_text(k, v);
                     out.push_str(&format!(
                         "  [#strong[#{}]], {},\n",
                         typst_str(k),
-                        content(v)
+                        content(&v)
                     ));
                 }
                 out.push_str(")\n\n");
