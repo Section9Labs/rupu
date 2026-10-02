@@ -3437,6 +3437,14 @@ pub(crate) mod tests {
                 complete: true,
             })
         }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -3745,6 +3753,14 @@ pub(crate) mod tests {
                 bytes: Vec::new(),
                 complete: true,
             })
+        }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
         }
         async fn proxy_get_json(
             &self,

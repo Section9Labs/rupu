@@ -1020,6 +1020,14 @@ mod tests {
                 complete: !self.coverage_incomplete,
             })
         }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
+        }
         async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
             Ok("/stage/w".to_string())
         }
@@ -1112,6 +1120,14 @@ mod tests {
                 bytes: Vec::new(),
                 complete: true,
             })
+        }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
         }
         async fn proxy_get_json(
             &self,
@@ -1615,6 +1631,14 @@ steps:
                 complete: true,
             })
         }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -1993,6 +2017,14 @@ steps:
                 complete: true,
             })
         }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -2129,6 +2161,14 @@ steps:
                 bytes: Vec::new(),
                 complete: true,
             })
+        }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
         }
         async fn proxy_get_json(
             &self,

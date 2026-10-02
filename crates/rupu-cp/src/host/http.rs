@@ -547,6 +547,16 @@ impl HostConnector for HttpHostConnector {
             complete: true,
         })
     }
+    async fn pull_finding_artifact(
+        &self,
+        _sha256: &str,
+        _dest: &std::path::Path,
+        _max_bytes: u64,
+    ) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "artifact pull over this transport is not implemented yet".into(),
+        ))
+    }
 
     async fn proxy_get_json(
         &self,
