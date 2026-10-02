@@ -18,6 +18,7 @@
 //! (default 1, i.e. serial in declared order). Per-item results are
 //! collected into `steps.<id>.results[*]`.
 
+use crate::recovery::AttemptPlan;
 use crate::templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, RenderMode, StepContext,
     StepOutput,
@@ -905,6 +906,15 @@ pub struct ResumeState {
     /// the gate-suppression path. `false` (the default) for every ordinary
     /// approve.
     pub via_timeout: bool,
+    /// What to do with the agent attempts an interrupted run left behind
+    /// (`recovery::discover`; recover-on-interrupt design spec §4). Consumed
+    /// per `for_each` unit by the fan-out runner: a unit with a plan is
+    /// *continued* from its transcript, *recovered* (it had finished; only its
+    /// record was lost) or *restarted*; a unit without one dispatches exactly
+    /// as before. The default is empty — every resume that doesn't run
+    /// discovery (approval, rejection, `--restart-interrupted`) behaves as it
+    /// always did.
+    pub recovery: crate::recovery::RecoveryPlans,
 }
 
 /// A linear step that paused mid-run, carried on [`ResumeState`] so the
@@ -965,6 +975,7 @@ impl ResumeState {
             rejected_reason: None,
             approver: None,
             via_timeout: false,
+            recovery: crate::recovery::RecoveryPlans::default(),
         }
     }
 
@@ -1019,6 +1030,7 @@ impl ResumeState {
             rejected_reason: Some(reason),
             approver: None,
             via_timeout: false,
+            recovery: crate::recovery::RecoveryPlans::default(),
         }
     }
 }
@@ -7260,8 +7272,10 @@ async fn persist_active_step(
 /// A no-op without a run store, and for the in-memory mode's empty
 /// `workflow_run_id` (the same guard the unit-checkpoint appends use).
 /// Best-effort: a failed ledger write is logged, never a failed run.
-/// `continued_from` is always `None` here — a continuation attempt is
-/// stamped by the resume path, not by a fresh start.
+/// `continued_from` is the agent run this attempt picks up from when the
+/// resume continues an interrupted one; `None` for a fresh start (and for a
+/// restart — nothing was carried over).
+#[allow(clippy::too_many_arguments)]
 fn record_attempt(
     store: Option<&crate::runs::RunStore>,
     workflow_run_id: &str,
@@ -7270,6 +7284,7 @@ fn record_attempt(
     agent_run_id: &str,
     transcript_path: &Path,
     host: Option<&str>,
+    continued_from: Option<&str>,
 ) {
     let Some(store) = store.filter(|_| !workflow_run_id.is_empty()) else {
         return;
@@ -7282,7 +7297,7 @@ fn record_attempt(
         agent_run_id: agent_run_id.to_string(),
         transcript_path: transcript_path.to_path_buf(),
         host: host.map(str::to_string),
-        continued_from: None,
+        continued_from: continued_from.map(str::to_string),
         started_at: chrono::Utc::now(),
     };
     if let Err(e) = store.append_attempt(workflow_run_id, &attempt) {
@@ -7704,6 +7719,7 @@ async fn run_linear_step(
         &run_id,
         &transcript_path,
         step.host.as_deref(),
+        None,
     );
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
@@ -7775,7 +7791,12 @@ async fn run_linear_step(
                 .resume_from
                 .as_ref()
                 .and_then(|r| r.paused_steps.iter().find(|ps| ps.step_id == step.id))
-                .map(|ps| split_seed_for_resume(ps.seed_messages.clone()));
+                .map(|ps| split_seed_for_resume(ps.seed_messages.clone()))
+                .map(|(messages, user_message)| ContinuationSeed {
+                    messages,
+                    user_message,
+                    seed_source: None,
+                });
 
             let on_usage = ledger_hook(
                 opts,
@@ -8086,6 +8107,146 @@ async fn run_fanout_run_step(
     })
 }
 
+/// What a dispatched `for_each` unit's recovery plan asks for. (A `Recovered`
+/// unit is never dispatched, so it has no entry here.)
+enum UnitResumePlan {
+    /// Seed the new agent run from the interrupted attempt's transcript.
+    Continue {
+        transcript: PathBuf,
+        from_agent_run_id: String,
+    },
+    /// Start fresh; `reason` is why the interrupted attempt can't be used.
+    Restart { reason: String },
+}
+
+/// How a unit with a recovery plan actually resumes, once its transcript has
+/// been re-read at dispatch time.
+struct UnitResumption {
+    /// `Continued` or `Restarted`.
+    mode: crate::executor::AttemptResumeMode,
+    /// The interrupted agent run being continued (`None` for a restart).
+    from_agent_run_id: Option<String>,
+    /// Why the unit restarted (`None` for a continuation).
+    reason: Option<String>,
+    /// The seed for the new agent run — `Some` exactly for a continuation.
+    seed: Option<ContinuationSeed>,
+}
+
+/// Turn a unit's plan into what will really happen. A continuation is
+/// re-prepared from its transcript here: discovery only classified it, and the
+/// messages are rebuilt now. If that no longer yields something to continue
+/// (the transcript vanished, finished or failed in the meantime) — or the unit
+/// is now placed on another host, where a local transcript can't be picked up
+/// — the unit restarts, and says why.
+async fn resolve_unit_resumption(plan: UnitResumePlan, placed_on: Option<&str>) -> UnitResumption {
+    use crate::executor::AttemptResumeMode;
+    let restart = |reason: String| UnitResumption {
+        mode: AttemptResumeMode::Restarted,
+        from_agent_run_id: None,
+        reason: Some(reason),
+        seed: None,
+    };
+    match plan {
+        UnitResumePlan::Restart { reason } => restart(reason),
+        UnitResumePlan::Continue {
+            transcript,
+            from_agent_run_id,
+        } => {
+            if let Some(host) = placed_on {
+                return restart(format!(
+                    "this unit is now placed on {host}; its local transcript can't be continued there"
+                ));
+            }
+            match ContinuationSeed::from_transcript(&transcript).await {
+                Ok(seed) => UnitResumption {
+                    mode: AttemptResumeMode::Continued,
+                    from_agent_run_id: Some(from_agent_run_id),
+                    reason: None,
+                    seed: Some(seed),
+                },
+                Err(reason) => restart(reason),
+            }
+        }
+    }
+}
+
+/// Fold a recovered `for_each` unit — an attempt that had finished, with only
+/// its record lost — into the run: checkpoint it (so the next resume sees it
+/// as done) and announce it. No agent runs, and no ledger row is written: the
+/// attempt is the one the ledger already has.
+///
+/// `UnitStarted` precedes `UnitCompleted` so a live view has a row to
+/// complete (it ignores a completion for a unit it never saw start); the
+/// token totals are read off the finished transcript, as for a placed unit.
+fn record_recovered_unit(
+    opts: &OrchestratorRunOpts,
+    workflow_run_id: &str,
+    step: &Step,
+    unit: &ItemResult,
+) {
+    if !workflow_run_id.is_empty() {
+        if let Some(store) = opts.run_store.as_ref() {
+            let checkpoint = crate::runs::UnitCheckpoint {
+                step_id: step.id.clone(),
+                index: unit.index,
+                item: unit.item.clone(),
+                run_id: unit.run_id.clone(),
+                transcript_path: unit.transcript_path.clone(),
+                output: unit.output.clone(),
+                success: true,
+                finished_at: chrono::Utc::now(),
+                host: None,
+                codename: unit.codename.clone(),
+            };
+            if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
+                warn!(step = %step.id, index = unit.index, error = %e, "failed to append unit checkpoint");
+            }
+        }
+    }
+    let Some(sink) = opts.event_sink.as_ref() else {
+        return;
+    };
+    let unit_key = fanout_unit_key(&unit.item);
+    let (tokens_in, tokens_out) = mirrored_unit_tokens(&unit.transcript_path);
+    sink.emit(
+        workflow_run_id,
+        &crate::executor::Event::UnitStarted {
+            run_id: workflow_run_id.to_string(),
+            step_id: step.id.clone(),
+            index: unit.index,
+            unit_key: unit_key.clone(),
+            agent: step.agent.clone(),
+            transcript_path: unit.transcript_path.clone(),
+            host: None,
+            codename: unit.codename.clone(),
+        },
+    );
+    sink.emit(
+        workflow_run_id,
+        &crate::executor::Event::AttemptResumed {
+            run_id: workflow_run_id.to_string(),
+            step_id: step.id.clone(),
+            unit_index: Some(unit.index),
+            mode: crate::executor::AttemptResumeMode::Recovered,
+            from_agent_run_id: Some(unit.run_id.clone()),
+            reason: None,
+        },
+    );
+    sink.emit(
+        workflow_run_id,
+        &crate::executor::Event::UnitCompleted {
+            run_id: workflow_run_id.to_string(),
+            step_id: step.id.clone(),
+            index: unit.index,
+            unit_key,
+            success: true,
+            tokens_in,
+            tokens_out,
+            host: None,
+        },
+    );
+}
+
 async fn run_fanout_step(
     workflow_run_id: &str,
     step: &Step,
@@ -8137,6 +8298,9 @@ async fn run_fanout_step(
     // trust the index mapping, so we fall back to re-running every unit.
     let mut resumed: std::collections::BTreeMap<usize, ItemResult> =
         std::collections::BTreeMap::new();
+    // The recovery plans below are keyed by the same unit index, so they are
+    // only as trustworthy as that mapping.
+    let mut plans_trusted = true;
     if let Some(prior) = opts
         .resume_from
         .as_ref()
@@ -8144,6 +8308,7 @@ async fn run_fanout_step(
     {
         let checkpointed_len = prior.keys().copied().max().map(|m| m + 1).unwrap_or(0);
         if checkpointed_len > total {
+            plans_trusted = false;
             warn!(
                 step = %step.id,
                 checkpointed = checkpointed_len,
@@ -8176,6 +8341,75 @@ async fn run_fanout_step(
                     replayed = resumed.len(),
                     total,
                     "resume: replaying succeeded fan-out units from disk"
+                );
+            }
+        }
+    }
+
+    // Resume: what `recovery::discover` decided for the units this step left
+    // interrupted — no success checkpoint, so they would otherwise all be
+    // dispatched from scratch.
+    //   - Recovered: the attempt had finished and only its record was lost.
+    //     Folded in right here, with no dispatch (and so no model call).
+    //   - Continue / Restart: dispatched below like any other unit; the plan
+    //     decides whether the new agent run picks up the old one's transcript.
+    // A unit with no plan dispatches exactly as it always did.
+    let mut dispatch_plans: std::collections::BTreeMap<usize, UnitResumePlan> =
+        std::collections::BTreeMap::new();
+    let planned_units = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.recovery.step(&step.id))
+        .filter(|_| plans_trusted)
+        .map(|plans| &plans.units);
+    for (&idx, plan) in planned_units.into_iter().flatten() {
+        // Out of range for this list, or already replayed from a checkpoint.
+        if idx >= total || resumed.contains_key(&idx) {
+            continue;
+        }
+        match plan {
+            AttemptPlan::Recovered {
+                output,
+                agent_run_id,
+                transcript,
+            } => {
+                let unit = ItemResult {
+                    index: idx,
+                    item: items[idx].clone(),
+                    sub_id: String::new(),
+                    rendered_prompt: String::new(),
+                    run_id: agent_run_id.clone(),
+                    transcript_path: transcript.clone(),
+                    output: output.clone(),
+                    success: true,
+                    is_fixer: false,
+                    codename: opts
+                        .naming
+                        .as_ref()
+                        .zip(step.agent.as_deref())
+                        .map(|(n, a)| n.unit(&step.id, a, idx).to_string()),
+                };
+                record_recovered_unit(opts, workflow_run_id, step, &unit);
+                resumed.insert(idx, unit);
+            }
+            AttemptPlan::Continue {
+                transcript,
+                from_agent_run_id,
+            } => {
+                dispatch_plans.insert(
+                    idx,
+                    UnitResumePlan::Continue {
+                        transcript: transcript.clone(),
+                        from_agent_run_id: from_agent_run_id.clone(),
+                    },
+                );
+            }
+            AttemptPlan::Restart { reason } => {
+                dispatch_plans.insert(
+                    idx,
+                    UnitResumePlan::Restart {
+                        reason: reason.clone(),
+                    },
                 );
             }
         }
@@ -8346,6 +8580,8 @@ async fn run_fanout_step(
             .map(|n| n.unit(&step.id, &agent_name_root, idx));
         // Each unit checkpoints itself the moment it finishes (below).
         let store_for_task = opts.run_store.clone();
+        // How this unit resumes an interrupted attempt, if its plan says so.
+        let resume_plan = dispatch_plans.remove(&idx);
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -8388,9 +8624,19 @@ async fn run_fanout_step(
                 };
             }
 
+            // Resume: re-read the interrupted attempt's transcript now, past
+            // the pause check — a unit that never starts consumes nothing, and
+            // its plan stays valid for the next resume. What discovery planned
+            // as a continuation may not be one any more.
+            let resumption = match resume_plan {
+                Some(plan) => Some(resolve_unit_resumption(plan, placement_host.as_deref()).await),
+                None => None,
+            };
+
             // Ledger row at the attempt's start (past the pause check, so a
             // unit that never started has none), written whether or not a
-            // live event sink is attached.
+            // live event sink is attached. A continuation names the attempt
+            // it picks up.
             record_attempt(
                 store_for_task.as_deref(),
                 &workflow_run_id,
@@ -8399,6 +8645,9 @@ async fn run_fanout_step(
                 &run_id,
                 &transcript_path,
                 placement_host.as_deref(),
+                resumption
+                    .as_ref()
+                    .and_then(|r| r.from_agent_run_id.as_deref()),
             );
             if let Some(sink) = event_sink.as_ref() {
                 sink.emit(
@@ -8414,7 +8663,24 @@ async fn run_fanout_step(
                         codename: unit_codename.as_ref().map(ToString::to_string),
                     },
                 );
+                // After `UnitStarted`, so a live view always has the unit's
+                // row by the time it hears the unit is a resumption.
+                if let Some(r) = resumption.as_ref() {
+                    sink.emit(
+                        &workflow_run_id,
+                        &crate::executor::Event::AttemptResumed {
+                            run_id: workflow_run_id.clone(),
+                            step_id: step_id.clone(),
+                            unit_index: Some(idx),
+                            mode: r.mode,
+                            from_agent_run_id: r.from_agent_run_id.clone(),
+                            reason: r.reason.clone(),
+                        },
+                    );
+                }
             }
+            // Only the local path seeds an agent run (a restart carries none).
+            let resume_seed = resumption.and_then(|r| r.seed);
 
             // Branch: remote (placed) vs local (inline) path.
             let (output, success, error_str, raw_error, workspace_delta, paused) =
@@ -8586,6 +8852,7 @@ async fn run_fanout_step(
                                             &retry_run_id,
                                             &transcript_path,
                                             placement_host.as_deref(),
+                                            None,
                                         );
                                         // Announce the fallback host's mirror path
                                         // on the live stream. Both frontends
@@ -8703,7 +8970,7 @@ async fn run_fanout_step(
                         transcript_clone.clone(),
                         None,
                         pause_for_task.clone(),
-                        None,
+                        resume_seed,
                         AgentAnnounce {
                             sink: event_sink.as_ref(),
                             workflow_run_id: &workflow_run_id,
@@ -9260,6 +9527,55 @@ struct FanoutItemOutcome {
     codename: Option<String>,
 }
 
+/// What [`dispatch_one`] seeds an agent run with when it picks up earlier work
+/// instead of starting from the rendered prompt.
+struct ContinuationSeed {
+    /// The conversation so far.
+    messages: Vec<Message>,
+    /// The turn sent on top of `messages`. Only a plain seed (`seed_source`
+    /// `None` — a manually paused step re-entering its own conversation) uses
+    /// it; a continuation takes its turn from
+    /// [`rupu_agent::continuation::apply_continuation`], which owns the note.
+    user_message: String,
+    /// The interrupted transcript `messages` was rebuilt from, when this run
+    /// continues it *by reference* (`rupu_agent::continuation`). `None` for a
+    /// plain seed.
+    seed_source: Option<PathBuf>,
+}
+
+impl ContinuationSeed {
+    /// Continue the interrupted run recorded in `transcript` — the seed is
+    /// whatever `prepare_continuation` rebuilds from it. `Err` carries the
+    /// operator-facing reason it can't be continued (it finished since
+    /// discovery, failed, or can't be read), in which case the caller starts
+    /// fresh. Reads the transcript on the blocking pool.
+    async fn from_transcript(transcript: &Path) -> Result<Self, String> {
+        use rupu_agent::continuation::{prepare_continuation, Continuation};
+        let path = transcript.to_path_buf();
+        let prepared = tokio::task::spawn_blocking(move || prepare_continuation(&path))
+            .await
+            .map_err(|e| format!("reading {} failed: {e}", transcript.display()))?;
+        match prepared {
+            Ok(Continuation::Resume {
+                messages,
+                seed_source,
+            }) => Ok(Self {
+                messages,
+                user_message: String::new(),
+                seed_source: Some(seed_source),
+            }),
+            Ok(Continuation::Finished { .. }) => {
+                Err("the interrupted attempt finished after the resume was planned".to_string())
+            }
+            Ok(Continuation::Failed { error, .. }) => Err(format!(
+                "the interrupted attempt failed{}",
+                error.map(|e| format!(": {e}")).unwrap_or_default()
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 /// Build the agent opts via the factory and dispatch one agent run.
 /// Shared by the linear and fan-out paths. Returns the full [`RunResult`]
 /// so callers can distinguish a cooperative pause (`RunResult::paused`) from
@@ -9268,7 +9584,9 @@ struct FanoutItemOutcome {
 /// `pause` is the cooperative pause token, forced onto the factory-built opts
 /// (factories default it to `None`). `resume_seed`, when `Some`, overrides the
 /// factory-built `initial_messages` + `user_message` so a paused-incomplete
-/// step re-runs from its persisted transcript with correct role alternation.
+/// step re-runs from its persisted transcript with correct role alternation —
+/// or, when it carries a `seed_source`, so an interrupted run is continued
+/// from its transcript (see [`ContinuationSeed`]).
 ///
 /// # A non-`Ok` terminal status is folded into `Err` here, on purpose
 ///
@@ -9299,7 +9617,7 @@ async fn dispatch_one(
     transcript_path: PathBuf,
     on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     pause: Option<CancellationToken>,
-    resume_seed: Option<(Vec<Message>, String)>,
+    resume_seed: Option<ContinuationSeed>,
     announce: AgentAnnounce<'_>,
     on_usage: Option<rupu_agent::OnUsageCallback>,
 ) -> Result<RunResult, RunError> {
@@ -9339,9 +9657,19 @@ async fn dispatch_one(
     }
     // Likewise the usage-ledger hook (see `ledger_hook`).
     agent_opts.on_usage = on_usage;
-    if let Some((initial_messages, user_message)) = resume_seed {
-        agent_opts.initial_messages = initial_messages;
-        agent_opts.user_message = user_message;
+    if let Some(seed) = resume_seed {
+        match seed.seed_source {
+            // Picking up an interrupted run by reference: `apply_continuation`
+            // owns the note that goes on top of the conversation, including
+            // not stacking a second one onto a continuation that died early.
+            Some(source) => {
+                rupu_agent::continuation::apply_continuation(&mut agent_opts, seed.messages, source)
+            }
+            None => {
+                agent_opts.initial_messages = seed.messages;
+                agent_opts.user_message = seed.user_message;
+            }
+        }
     }
     let result = run_agent(agent_opts).await?;
     match result.terminal_error() {
