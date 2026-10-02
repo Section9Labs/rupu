@@ -33,7 +33,7 @@
 use async_trait::async_trait;
 use rupu_agent::continuation::CONTINUATION_NOTE;
 use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::{AttemptResumeMode, Event, EventSink};
 use rupu_orchestrator::recovery::{discover, AttemptPlan, RecoveryPlans};
 use rupu_orchestrator::runner::{

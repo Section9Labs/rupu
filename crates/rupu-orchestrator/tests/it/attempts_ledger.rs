@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
+    UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::runs::AttemptRecord;
 use rupu_orchestrator::{RunStore, Workflow};
@@ -133,7 +134,18 @@ impl FlakyDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for FlakyDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         let first_try = {
             let mut calls = self.calls.lock().unwrap();
             let first = !calls
@@ -148,13 +160,14 @@ impl UnitDispatcher for FlakyDispatcher {
             first
         };
         if self.fail_index == Some(unit.index) && first_try {
-            return Err(RunError::Provider("host down".into()));
+            return Err(RunError::Provider("host down".into()).into());
         }
         Ok(UnitOutcome {
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }
