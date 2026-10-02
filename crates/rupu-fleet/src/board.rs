@@ -1,12 +1,34 @@
 use crate::error::FleetError;
 use crate::types::{ClaimGuard, ClaimOutcome, ClaimRecord};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Upper bound on claim/reap retries under contention (about 1s at
+/// `RETRY_INTERVAL`). Exhausting it yields `Denied`, never `Err`.
+const CLAIM_ATTEMPTS: u32 = 200;
+const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+/// A `.reap` mutex older than this was left behind by a crashed reaper.
+const REAP_MUTEX_STALE: Duration = Duration::from_secs(30);
+/// Longest readable prefix kept in a claim filename.
+const STEM_PREFIX_MAX: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct Board {
     pub root: PathBuf,
+}
+
+/// Holder of a per-key reap mutex (`<stem>.reap`, created `O_EXCL`). Dropping
+/// it releases the mutex.
+struct ReapGuard {
+    path: PathBuf,
+}
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl Board {
@@ -19,12 +41,21 @@ impl Board {
     }
 
     fn claim_path(&self, key: &str) -> PathBuf {
-        self.claims_dir().join(format!("{}.json", sanitize(key)))
+        self.claims_dir().join(format!("{}.json", claim_stem(key)))
+    }
+
+    fn reap_path(&self, key: &str) -> PathBuf {
+        self.claims_dir().join(format!("{}.reap", claim_stem(key)))
     }
 
     /// Atomically claim a work unit. Returns `Granted` with an RAII guard, or
     /// `Denied` with the current holder. A claim whose lease has expired is
     /// reaped and re-granted. Mirrors `AutoflowClaimStore::try_acquire_active_lock`.
+    ///
+    /// Contention never surfaces as `Err`: under any number of concurrent
+    /// claimants exactly one is `Granted` and the rest are `Denied`. Reaping an
+    /// expired lease is serialized per key by an `O_EXCL` mutex so a claimant
+    /// holding a stale read can never delete another claimant's live lease.
     pub fn claim(&self, key: &str, owner: &str, ttl: Duration) -> Result<ClaimOutcome, FleetError> {
         let path = self.claim_path(key);
         if let Some(parent) = path.parent() {
@@ -33,28 +64,39 @@ impl Board {
                 source: e,
             })?;
         }
-        match self.try_create_claim(&path, owner, ttl) {
-            Ok(()) => Ok(ClaimOutcome::Granted(ClaimGuard { path })),
-            Err(FleetError::Claimed { .. }) => {
-                if self.reap_if_expired(&path)? {
-                    // lease was expired and removed; retry once
-                    match self.try_create_claim(&path, owner, ttl) {
-                        Ok(()) => Ok(ClaimOutcome::Granted(ClaimGuard { path })),
-                        Err(FleetError::Claimed { holder, .. }) => {
-                            Ok(ClaimOutcome::Denied { holder })
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    let holder = self.claim_holder(key)?.unwrap_or_default();
-                    Ok(ClaimOutcome::Denied { holder })
-                }
+        let mut last_holder = String::new();
+        for _ in 0..CLAIM_ATTEMPTS {
+            if self.try_create_claim(&path, owner, ttl)? {
+                return Ok(ClaimOutcome::Granted(ClaimGuard { path }));
             }
-            Err(e) => Err(e),
+            // A lease exists. Inspect it.
+            let Some(rec) = read_claim(&path)? else {
+                // Released or reaped since our create attempt: just retry.
+                continue;
+            };
+            if !is_expired(&rec) {
+                return Ok(ClaimOutcome::Denied { holder: rec.owner });
+            }
+            last_holder = rec.owner;
+            // Expired: one claimant at a time may reap. Whether we reaped, found
+            // the lease already gone, or lost the mutex, we retry the create.
+            if !self.reap_expired(key, &path)? {
+                std::thread::sleep(RETRY_INTERVAL);
+            }
         }
+        Ok(ClaimOutcome::Denied {
+            holder: last_holder,
+        })
     }
 
-    fn try_create_claim(&self, path: &Path, owner: &str, ttl: Duration) -> Result<(), FleetError> {
+    /// `Ok(true)` if the create succeeded, `Ok(false)` if a lease already
+    /// exists (contention is not an error).
+    fn try_create_claim(
+        &self,
+        path: &Path,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, FleetError> {
         use std::io::Write;
         let now = Utc::now();
         let expires =
@@ -75,15 +117,9 @@ impl Board {
                     action: format!("write claim {}", path.display()),
                     source: e,
                 })?;
-                Ok(())
+                Ok(true)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = read_claim(path)?.map(|r| r.owner).unwrap_or_default();
-                Err(FleetError::Claimed {
-                    key: path.display().to_string(),
-                    holder,
-                })
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(FleetError::Io {
                 action: format!("create claim {}", path.display()),
                 source: e,
@@ -91,25 +127,74 @@ impl Board {
         }
     }
 
-    fn reap_if_expired(&self, path: &Path) -> Result<bool, FleetError> {
-        let Some(rec) = read_claim(path)? else {
+    /// Try to remove an expired lease under the per-key reap mutex. Returns
+    /// `Ok(true)` if this call held the mutex (the caller should retry the
+    /// create immediately) and `Ok(false)` if another claimant is reaping (the
+    /// caller should back off briefly, then retry).
+    ///
+    /// The lease is re-read UNDER the mutex and removed only if it is still
+    /// expired: a stale read taken before another claimant reaped and
+    /// re-granted must never delete that claimant's live lease. A lease that is
+    /// already gone is not an error — someone else reaped it.
+    fn reap_expired(&self, key: &str, claim_path: &Path) -> Result<bool, FleetError> {
+        let Some(_guard) = self.acquire_reap_mutex(key)? else {
             return Ok(false);
         };
-        let expired = chrono::DateTime::parse_from_rfc3339(&rec.lease_expires_at)
-            .map(|t| t.with_timezone(&Utc) <= Utc::now())
-            .unwrap_or(false);
-        if expired {
-            std::fs::remove_file(path).map_err(|e| FleetError::Io {
-                action: format!("reap claim {}", path.display()),
-                source: e,
-            })?;
+        if let Some(rec) = read_claim(claim_path)? {
+            if is_expired(&rec) {
+                match std::fs::remove_file(claim_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(FleetError::Io {
+                            action: format!("reap claim {}", claim_path.display()),
+                            source: e,
+                        })
+                    }
+                }
+            }
         }
-        Ok(expired)
+        Ok(true)
+    }
+
+    /// `O_EXCL`-create the per-key reap mutex. `None` if someone else holds it.
+    /// A mutex older than `REAP_MUTEX_STALE` belongs to a crashed reaper and is
+    /// cleared so the key cannot stay wedged.
+    fn acquire_reap_mutex(&self, key: &str) -> Result<Option<ReapGuard>, FleetError> {
+        let path = self.reap_path(key);
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Some(ReapGuard { path })),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > REAP_MUTEX_STALE);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Ok(None)
+            }
+            Err(e) => Err(FleetError::Io {
+                action: format!("create reap mutex {}", path.display()),
+                source: e,
+            }),
+        }
     }
 
     pub fn claim_holder(&self, key: &str) -> Result<Option<String>, FleetError> {
         Ok(read_claim(&self.claim_path(key))?.map(|r| r.owner))
     }
+}
+
+fn is_expired(rec: &ClaimRecord) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&rec.lease_expires_at)
+        .map(|t| t.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(false)
 }
 
 /// How long a reader waits for a just-created claim file to be populated.
@@ -146,9 +231,13 @@ fn read_claim(path: &Path) -> Result<Option<ClaimRecord>, FleetError> {
     }
 }
 
-/// Map a work-unit key to a safe filename component.
-fn sanitize(key: &str) -> String {
-    key.chars()
+/// Filename stem for a work-unit key: a readable sanitized prefix (for
+/// debuggability) plus a short hex SHA-256 of the RAW key, so distinct keys
+/// never collide (`a:b` vs `a-b`).
+fn claim_stem(key: &str) -> String {
+    let readable: String = key
+        .chars()
+        .take(STEM_PREFIX_MAX)
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -156,7 +245,10 @@ fn sanitize(key: &str) -> String {
                 '-'
             }
         })
-        .collect()
+        .collect();
+    let digest = Sha256::digest(key.as_bytes());
+    let hash: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{readable}-{hash}")
 }
 
 #[cfg(test)]
@@ -240,5 +332,109 @@ mod tests {
             .filter(|won| *won)
             .count();
         assert_eq!(wins, 1, "exactly one thread may win the claim");
+    }
+
+    #[test]
+    fn contention_on_expired_lease_has_exactly_one_winner_and_no_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Pre-expire a lock and leak the guard: a crashed owner's leftover.
+        {
+            let board = Board::new(&root);
+            let g = board
+                .claim("race:expired", "dead-owner", Duration::from_secs(0))
+                .unwrap();
+            let ClaimOutcome::Granted(g) = g else {
+                panic!("seed claim must be granted");
+            };
+            std::mem::forget(g);
+        }
+
+        const N: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let board = Board::new(&root);
+                barrier.wait();
+                board.claim(
+                    "race:expired",
+                    &format!("agent-{i}"),
+                    Duration::from_secs(60),
+                )
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let errs: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(errs.is_empty(), "contention must never yield Err: {errs:?}");
+        let wins = results
+            .iter()
+            .filter(|r| matches!(r, Ok(ClaimOutcome::Granted(_))))
+            .count();
+        assert_eq!(wins, 1, "exactly one claimant may win an expired lease");
+    }
+
+    #[test]
+    fn keys_that_differ_only_in_punctuation_get_independent_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+
+        let pairs = [
+            ("a:b", "a-b"),
+            ("service:1.1.2.2:443", "service-1.1.2.2-443"),
+            ("host:1.1.2.2", "host-1.1.2.2"),
+        ];
+        let mut guards = Vec::new();
+        for (x, y) in pairs {
+            for key in [x, y] {
+                match board.claim(key, "agent", Duration::from_secs(60)).unwrap() {
+                    ClaimOutcome::Granted(g) => guards.push(g),
+                    ClaimOutcome::Denied { holder } => {
+                        panic!("{key} wrongly denied (held by {holder}): distinct keys collided")
+                    }
+                }
+            }
+        }
+        // The same raw key still contends with itself.
+        assert!(matches!(
+            board
+                .claim("a:b", "other", Duration::from_secs(60))
+                .unwrap(),
+            ClaimOutcome::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_reap_mutex_from_a_crashed_reaper_does_not_wedge_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+
+        // Expired lease left by a dead owner.
+        let ClaimOutcome::Granted(g) = board
+            .claim("wedge:key", "dead-owner", Duration::from_secs(0))
+            .unwrap()
+        else {
+            panic!("seed claim must be granted");
+        };
+        std::mem::forget(g);
+
+        // ...and a reap mutex left by a reaper that crashed an hour ago.
+        let reap = board.reap_path("wedge:key");
+        let f = std::fs::File::create(&reap).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+
+        let outcome = board
+            .claim("wedge:key", "agent-b", Duration::from_secs(60))
+            .unwrap();
+        assert!(
+            matches!(outcome, ClaimOutcome::Granted(_)),
+            "a stale reap mutex must be cleared, not wedge the key"
+        );
     }
 }
