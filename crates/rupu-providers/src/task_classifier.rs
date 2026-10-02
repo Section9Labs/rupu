@@ -318,7 +318,7 @@ mod tests {
                     content: vec![ContentBlock::Text {
                         text: "Research".into(),
                     }],
-                    stop_reason: Some(StopReason::EndTurn),
+                    stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                     usage: Usage {
                         input_tokens: 5,
                         output_tokens: 1,

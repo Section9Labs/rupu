@@ -1,4 +1,3 @@
-use crate::auth_mode::AuthMode;
 use reqwest::header::HeaderMap;
 use std::time::Duration;
 use thiserror::Error;
@@ -8,8 +7,15 @@ pub enum ProviderError {
     #[error("HTTP request failed: {0}")]
     Http(String),
 
-    #[error("API error {status}: {message}")]
-    Api { status: u16, message: String },
+    /// A provider's error reply — an HTTP error body or a mid-stream error
+    /// event — parsed (spec 2026-10-01 §4.4).
+    #[error("{0}")]
+    Reply(Box<crate::reply_error::ApiErrorBody>),
+
+    /// The stream ended before the provider finished the reply (e.g. an
+    /// Anthropic stream with `message_start` but no `message_stop`).
+    #[error("stream ended before the reply finished: {0}")]
+    IncompleteStream(String),
 
     #[error("SSE parse error: {0}")]
     SseParse(String),
@@ -39,25 +45,6 @@ pub enum ProviderError {
 
     #[error("provider {provider} is not yet implemented")]
     NotImplemented { provider: String },
-
-    #[error("rate limited (retry after {retry_after:?})")]
-    RateLimited { retry_after: Option<Duration> },
-
-    #[error("unauthorized: {provider} ({auth_mode}). {hint}")]
-    Unauthorized {
-        provider: String,
-        auth_mode: AuthMode,
-        hint: String,
-    },
-
-    #[error("quota exceeded for {provider}")]
-    QuotaExceeded { provider: String },
-
-    #[error("model unavailable: {model}")]
-    ModelUnavailable { model: String },
-
-    #[error("bad request: {message}")]
-    BadRequest { message: String },
 
     #[error("transient error: {0}")]
     Transient(#[source] anyhow::Error),
@@ -104,8 +91,56 @@ impl From<serde_json::Error> for ProviderError {
 }
 
 impl ProviderError {
+    /// A synthetic HTTP error with a plain-text message — for tests and for
+    /// errors rupu itself produces in the shape of a reply (router exhaustion).
+    pub fn api(provider: &str, status: u16, message: &str) -> ProviderError {
+        ProviderError::Reply(Box::new(crate::reply_error::parse_error_body(
+            provider,
+            crate::reply_error::ErrorOrigin::Http { status },
+            message,
+            None,
+            None,
+        )))
+    }
+
+    pub fn reply(&self) -> Option<&crate::reply_error::ApiErrorBody> {
+        match self {
+            ProviderError::Reply(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        self.reply().and_then(|b| b.status())
+    }
+
+    /// Normalized class for every variant (spec §4.4's fixed table for the
+    /// errors that aren't a reply body).
+    pub fn class(&self) -> crate::reply_error::ErrorClass {
+        use crate::reply_error::ErrorClass as C;
+        match self {
+            ProviderError::Reply(b) => b.class,
+            ProviderError::Http(_)
+            | ProviderError::SseParse(_)
+            | ProviderError::UnexpectedEndOfStream
+            | ProviderError::IncompleteStream(_)
+            | ProviderError::Transient(_) => C::Server,
+            ProviderError::TokenRefreshFailed(_)
+            | ProviderError::MissingAuth { .. }
+            | ProviderError::AuthConfig(_) => C::Auth,
+            ProviderError::LongContextUnavailable { .. } => C::ContextOverflow,
+            ProviderError::Json(_)
+            | ProviderError::Preflight(_)
+            | ProviderError::NotImplemented { .. }
+            | ProviderError::Other(_)
+            | ProviderError::Terminating => C::Unrecognized,
+        }
+    }
+}
+
+impl ProviderError {
     /// Anthropic's long-context refusal in either shape: the extra-usage 429
-    /// on a request without the 1M beta (`Api { status: 429 }`), or
+    /// on a request without the 1M beta (a `Reply` with status 429), or
     /// [`ProviderError::LongContextUnavailable`] after one with it. The same
     /// request is refused the same way every time, so no retry layer — the
     /// providers' (`tuned::is_retryable`) or the agent runner's — retries
@@ -113,10 +148,9 @@ impl ProviderError {
     pub fn is_long_context_refusal(&self) -> bool {
         match self {
             ProviderError::LongContextUnavailable { .. } => true,
-            ProviderError::Api {
-                status: 429,
-                message,
-            } => is_long_context_refusal(message),
+            ProviderError::Reply(b) if b.status() == Some(429) => {
+                is_long_context_refusal(&b.message)
+            }
             _ => false,
         }
     }
@@ -136,23 +170,33 @@ pub fn is_long_context_refusal(message: &str) -> bool {
         .contains("extra usage is required for long context")
 }
 
-/// Build the right `ProviderError` from a non-2xx HTTP response. 429s parse
-/// the server's `Retry-After` header into `RateLimited { retry_after }` so
-/// `tuned::RetryingProvider` can honor it (I-83); every other status keeps
-/// the existing `Api { status, message }` shape.
-///
-/// This is the client-boundary call site: `headers` must come from the same
-/// `reqwest::Response` the body was drained from (grab
-/// `response.headers().clone()` *before* consuming the response with
-/// `.text()`/`.json()` — headers are unavailable afterward).
-pub fn api_error_from_response(status: u16, headers: &HeaderMap, message: String) -> ProviderError {
-    if status == 429 {
-        ProviderError::RateLimited {
-            retry_after: parse_retry_after(headers),
-        }
+/// Build the error for a non-2xx HTTP response. `body` is the drained body
+/// text; `headers` must come from the same response (grab them before
+/// `.text()`). 429s carry the server's `Retry-After` (I-83).
+pub fn api_error_from_response(
+    provider: &str,
+    status: u16,
+    headers: &HeaderMap,
+    body: &str,
+) -> ProviderError {
+    let request_id = ["request-id", "x-request-id"].iter().find_map(|h| {
+        headers
+            .get(*h)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    });
+    let retry_after = if status == 429 {
+        parse_retry_after(headers)
     } else {
-        ProviderError::Api { status, message }
-    }
+        None
+    };
+    ProviderError::Reply(Box::new(crate::reply_error::parse_error_body(
+        provider,
+        crate::reply_error::ErrorOrigin::Http { status },
+        body,
+        request_id,
+        retry_after,
+    )))
 }
 
 /// Parse `Retry-After` as delta-seconds (RFC 9110 §10.2.3). The HTTP-date
@@ -260,18 +304,8 @@ mod listing_helper_tests {
 #[cfg(test)]
 mod structured_variants_tests {
     use super::*;
+    use crate::reply_error::ErrorClass;
     use std::time::Duration;
-
-    use crate::auth_mode::AuthMode;
-
-    #[test]
-    fn rate_limited_carries_retry_after() {
-        let e = ProviderError::RateLimited {
-            retry_after: Some(Duration::from_secs(7)),
-        };
-        let s = e.to_string();
-        assert!(s.contains("rate limited"), "got: {s}");
-    }
 
     #[test]
     fn parse_retry_after_reads_delta_seconds() {
@@ -296,67 +330,56 @@ mod structured_variants_tests {
     }
 
     #[test]
-    fn api_error_from_response_maps_429_to_rate_limited_with_header() {
+    fn api_error_from_response_carries_retry_after_on_a_429() {
         let mut headers = HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
-        let e = api_error_from_response(429, &headers, "rate limited".into());
-        match e {
-            ProviderError::RateLimited { retry_after } => {
-                assert_eq!(retry_after, Some(Duration::from_secs(5)));
-            }
-            other => panic!("expected RateLimited, got {other:?}"),
-        }
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        let e = api_error_from_response("anthropic", 429, &headers, "slow down");
+        assert_eq!(e.class(), ErrorClass::RateLimited);
+        assert_eq!(
+            e.reply().unwrap().retry_after(),
+            Some(Duration::from_secs(7))
+        );
     }
 
     #[test]
-    fn api_error_from_response_maps_429_without_header_to_rate_limited_none() {
-        let e = api_error_from_response(429, &HeaderMap::new(), "rate limited".into());
-        assert!(matches!(
-            e,
-            ProviderError::RateLimited { retry_after: None }
-        ));
+    fn api_error_from_response_without_header_has_no_retry_after() {
+        let e = api_error_from_response("anthropic", 429, &HeaderMap::new(), "slow down");
+        assert_eq!(e.reply().unwrap().retry_after(), None);
     }
 
     #[test]
-    fn api_error_from_response_keeps_other_statuses_as_api() {
-        let e = api_error_from_response(500, &HeaderMap::new(), "boom".into());
-        assert!(matches!(e, ProviderError::Api { status: 500, .. }));
+    fn api_error_from_response_keeps_status_and_request_id_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req_h1".parse().unwrap());
+        let e = api_error_from_response("openai-compatible", 500, &headers, "boom");
+        assert_eq!(e.status(), Some(500));
+        assert_eq!(e.class(), ErrorClass::Server);
+        assert_eq!(e.reply().unwrap().request_id.as_deref(), Some("req_h1"));
     }
 
     #[test]
-    fn unauthorized_renders_provider_and_mode() {
-        let e = ProviderError::Unauthorized {
-            provider: "anthropic".into(),
-            auth_mode: AuthMode::Sso,
-            hint: "run rupu auth login --provider anthropic --mode sso".into(),
-        };
-        let s = e.to_string();
-        assert!(s.contains("anthropic"));
-        assert!(s.contains("sso"));
-        assert!(s.contains("rupu auth login"));
+    fn long_context_429_body_is_a_long_context_refusal() {
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Extra usage is required for long context requests"}}"#;
+        let e = api_error_from_response("anthropic", 429, &HeaderMap::new(), body);
+        assert!(e.is_long_context_refusal());
+        let plain = api_error_from_response("anthropic", 429, &HeaderMap::new(), "slow down");
+        assert!(!plain.is_long_context_refusal());
     }
 
     #[test]
-    fn quota_exceeded_names_provider() {
-        let e = ProviderError::QuotaExceeded {
-            provider: "openai".into(),
-        };
-        assert!(e.to_string().contains("openai"));
-    }
-
-    #[test]
-    fn model_unavailable_names_model() {
-        let e = ProviderError::ModelUnavailable {
-            model: "gpt-5".into(),
-        };
-        assert!(e.to_string().contains("gpt-5"));
-    }
-
-    #[test]
-    fn bad_request_includes_message() {
-        let e = ProviderError::BadRequest {
-            message: "max_tokens too large".into(),
-        };
-        assert!(e.to_string().contains("max_tokens too large"));
+    fn non_reply_variants_have_a_fixed_class() {
+        assert_eq!(ProviderError::Http("x".into()).class(), ErrorClass::Server);
+        assert_eq!(
+            ProviderError::IncompleteStream("x".into()).class(),
+            ErrorClass::Server
+        );
+        assert_eq!(
+            ProviderError::TokenRefreshFailed("x".into()).class(),
+            ErrorClass::Auth
+        );
+        assert_eq!(
+            ProviderError::Other(anyhow::anyhow!("x")).class(),
+            ErrorClass::Unrecognized
+        );
     }
 }

@@ -328,9 +328,10 @@ impl OpenAiCodexClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "openai-codex",
                 status,
                 &headers,
-                truncate_error(&text, 500),
+                &text,
             ));
         }
 
@@ -348,7 +349,6 @@ impl OpenAiCodexClient {
         }
 
         acc.into_response()
-            .ok_or(ProviderError::UnexpectedEndOfStream)
     }
 
     fn build_headers(&self) -> Result<reqwest::header::HeaderMap, ProviderError> {
@@ -519,7 +519,7 @@ impl OpenAiCodexClient {
                     // Either already consumed by the verbatim replay above, or a
                     // foreign provider's block, which is deliberately ignored.
                     ContentBlock::Reasoning { .. } => {}
-                    ContentBlock::Unknown => {}
+                    ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
                 }
             }
 
@@ -670,77 +670,101 @@ impl OpenAiCodexClient {
                     acc.raw_output.push(item.clone());
 
                     if item["type"].as_str() == Some("function_call") {
-                        // Finalize tool call
-                        if let (Some(id), Some(name)) =
-                            (acc.current_tool_id.take(), acc.current_tool_name.take())
-                        {
-                            let input_str = std::mem::take(&mut acc.current_tool_input);
-                            let input: serde_json::Value = serde_json::from_str(&input_str)
-                                .map_err(|e| {
-                                    ProviderError::Json(format!(
-                                        "malformed tool arguments for '{name}': {e}"
-                                    ))
-                                })?;
-                            acc.content_blocks
-                                .push(ContentBlock::ToolUse { id, name, input });
+                        // Finalize the tool call. When its
+                        // `output_item.added` was missed, the done item's
+                        // own `call_id`/`name` name it instead.
+                        let id = acc
+                            .current_tool_id
+                            .take()
+                            .unwrap_or_else(|| item["call_id"].as_str().unwrap_or("").to_string());
+                        let name = acc.current_tool_name.take().unwrap_or_else(|| {
+                            desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""))
+                        });
+                        // A zero-argument call may stream no argument deltas:
+                        // fall back to the done item's own `arguments`, then
+                        // to an empty object (as the Anthropic path does).
+                        let streamed = std::mem::take(&mut acc.current_tool_input);
+                        let arguments = if streamed.trim().is_empty() {
+                            item["arguments"].as_str().unwrap_or("")
+                        } else {
+                            streamed.as_str()
+                        };
+                        match tool_call_block(id, name, arguments) {
+                            Ok(block) => acc.content_blocks.push(block),
+                            // Overwrites an earlier bad tool on purpose, as
+                            // the Anthropic accumulator does: one record is
+                            // enough to name the failure.
+                            Err(bad) => acc.bad_tool = Some(bad),
+                        }
+                    }
+                    if let Some(parts) = item
+                        .get("content")
+                        .filter(|_| item["type"].as_str() == Some("message"))
+                        .and_then(|c| c.as_array())
+                    {
+                        if let Some(text) = refusal_in_parts(parts) {
+                            acc.refusal = text;
                         }
                     }
                 }
             }
-            "response.completed" => {
+            "response.refusal.delta" => {
+                // A refusal is not answer text: it is buffered for the stop
+                // and never reaches `on_event` as a `TextDelta`.
+                if let Some(delta) = data["delta"].as_str() {
+                    acc.refusal.push_str(delta);
+                }
+            }
+            "response.refusal.done" => {
+                if let Some(text) = data["refusal"].as_str() {
+                    acc.refusal = text.to_string();
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                acc.terminal_seen = true;
+                let incomplete_event = event_type == "response.incomplete";
                 if let Some(resp) = data.get("response") {
-                    // Extract usage
-                    if let Some(usage) = resp.get("usage") {
-                        acc.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
-                        acc.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
-                        // Prompt-cache hits live under
-                        // `input_tokens_details.cached_tokens` and are a
-                        // subset of `input_tokens` — the convention the
-                        // cost calculator assumes. Absent on servers that
-                        // don't report the breakdown.
-                        acc.cached_tokens = usage["input_tokens_details"]["cached_tokens"]
-                            .as_u64()
-                            .unwrap_or(0) as u32;
-                        // `output_tokens` already includes reasoning tokens
-                        // on the Codex wire, so reasoning_tokens stays at 0
-                        // — see the contrast note on `Usage::reasoning_tokens`.
-                        on_event(StreamEvent::UsageSnapshot(Usage {
-                            input_tokens: acc.input_tokens,
-                            output_tokens: acc.output_tokens,
-                            cached_tokens: acc.cached_tokens,
-                            cache_write_tokens: 0,
-                            reasoning_tokens: 0,
-                        }));
-                    }
-                    // Extract stop reason
-                    let status = resp["status"].as_str().unwrap_or("completed");
-                    acc.stop_reason = match status {
-                        "completed" => Some(StopReason::EndTurn),
-                        "incomplete" => Some(StopReason::MaxTokens),
-                        _ => Some(StopReason::EndTurn),
-                    };
-                    // Check if any output items have tool use
-                    if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
-                        for item in output {
-                            if item["type"].as_str() == Some("function_call") {
-                                acc.stop_reason = Some(StopReason::ToolUse);
-                                break;
-                            }
-                        }
-                    }
+                    absorb_terminal_response(acc, resp, on_event);
+                    acc.stop = Some(responses_stop(
+                        resp,
+                        incomplete_event,
+                        has_function_call(resp, &acc.content_blocks),
+                    ));
+                } else if incomplete_event {
+                    // The event itself says the reply is incomplete even
+                    // though it carries no reason.
+                    acc.stop = Some(Stop::from_wire(
+                        StopReason::Incomplete,
+                        "openai-codex",
+                        Some("incomplete"),
+                    ));
                 }
             }
             "response.failed" => {
-                let error_msg = data
+                let error = data
                     .get("response")
                     .and_then(|r| r.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("response failed (no details)");
-                return Err(ProviderError::Api {
-                    status: 500,
-                    message: error_msg.to_string(),
-                });
+                    .filter(|e| !e.is_null())
+                    .cloned()
+                    .unwrap_or_else(
+                        || serde_json::json!({"message": "response failed (no details)"}),
+                    );
+                return Err(ProviderError::Reply(Box::new(
+                    crate::reply_error::parse_error_value(
+                        "openai-codex",
+                        crate::reply_error::ErrorOrigin::Stream,
+                        &error,
+                    ),
+                )));
+            }
+            "error" => {
+                return Err(ProviderError::Reply(Box::new(
+                    crate::reply_error::parse_error_value(
+                        "openai-codex",
+                        crate::reply_error::ErrorOrigin::Stream,
+                        &data,
+                    ),
+                )));
             }
             _ => {
                 debug!(event_type, "ignoring OpenAI SSE event");
@@ -835,17 +859,14 @@ impl OpenAiCodexClient {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::api_error_from_response(
+                "openai-codex",
+                status.as_u16(),
+                &headers,
+                &text,
+            ));
         }
         let body = resp
             .text()
@@ -1382,15 +1403,195 @@ fn normalize_tool_call_id(id: &str) -> String {
     format!("fc_{sanitized_prefix}_{hash:016x}")
 }
 
+/// The text of the first `refusal` part in a message item's `content`.
+fn refusal_in_parts(parts: &[serde_json::Value]) -> Option<String> {
+    parts
+        .iter()
+        .find(|p| p["type"].as_str() == Some("refusal"))
+        .and_then(|p| p["refusal"].as_str())
+        .map(str::to_string)
+}
+
+/// Whether a terminal response called a function: a `function_call` item in
+/// its `output`, or a `ToolUse` block already streamed into `content` (some
+/// backends send `output: []` on the terminal event).
+fn has_function_call(resp: &serde_json::Value, content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        || resp
+            .get("output")
+            .and_then(|o| o.as_array())
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|i| i["type"].as_str() == Some("function_call"))
+            })
+}
+
+/// Token usage off a Responses `usage` object.
+///
+/// `output_tokens` already includes reasoning tokens on the Codex wire, so
+/// `reasoning_tokens` stays at 0 (see the contrast note on
+/// `Usage::reasoning_tokens`). Prompt-cache hits live under
+/// `input_tokens_details.cached_tokens` and are a subset of `input_tokens`,
+/// the convention the cost calculator assumes; the breakdown is absent on
+/// servers that do not report it.
+fn usage_from_value(usage: &serde_json::Value) -> Usage {
+    Usage {
+        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
+        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
+        cached_tokens: usage["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0) as u32,
+        ..Default::default()
+    }
+}
+
+/// Read usage off a terminal `response` object (`completed` and `incomplete`
+/// share it) into the accumulator and report it to the caller.
+fn absorb_terminal_response(
+    acc: &mut ResponseAccumulator,
+    resp: &serde_json::Value,
+    on_event: &mut (impl FnMut(StreamEvent) + ?Sized),
+) {
+    if let Some(usage) = resp.get("usage").filter(|u| !u.is_null()) {
+        let usage = usage_from_value(usage);
+        acc.input_tokens = usage.input_tokens;
+        acc.output_tokens = usage.output_tokens;
+        acc.cached_tokens = usage.cached_tokens;
+        on_event(StreamEvent::UsageSnapshot(usage));
+    }
+}
+
+/// How a terminal Responses `response` object ended, from its `status` and
+/// `incomplete_details`. `incomplete_event` is true for a
+/// `response.incomplete` event, whose status is incomplete whatever the
+/// object says. A `function_call` item makes a completed response
+/// `ToolUse` but never overrides an incomplete or cancelled one.
+fn responses_stop(
+    resp: &serde_json::Value,
+    incomplete_event: bool,
+    has_function_call: bool,
+) -> Stop {
+    let status = resp["status"].as_str();
+    if incomplete_event || status == Some("incomplete") {
+        let details = resp.get("incomplete_details").filter(|d| !d.is_null());
+        let wire = details.and_then(|d| d["reason"].as_str());
+        let mut stop = Stop::from_wire(
+            crate::stop::map::responses_incomplete(wire),
+            "openai-codex",
+            Some(wire.unwrap_or("incomplete")),
+        );
+        if let Some(d) = details {
+            stop.set_detail("incomplete_details", d.clone());
+        }
+        return stop;
+    }
+    if status == Some("cancelled") {
+        return Stop::from_wire(StopReason::Incomplete, "openai-codex", Some("cancelled"));
+    }
+    // `failed`, `queued` and `in_progress` are not a finished answer.
+    if let Some(other) = status.filter(|s| *s != "completed") {
+        return Stop::from_wire(StopReason::Incomplete, "openai-codex", Some(other));
+    }
+    let reason = if has_function_call {
+        StopReason::ToolUse
+    } else {
+        StopReason::EndTurn
+    };
+    Stop::from_wire(reason, "openai-codex", Some("completed"))
+}
+
+/// One function call's block. Empty or whitespace-only arguments are a
+/// zero-parameter call (`{}`); anything else must parse, and a call needs a
+/// name. On failure the record the stop's `bad_tool` detail carries is
+/// returned. Shared by the streaming and non-streaming paths.
+fn tool_call_block(
+    id: String,
+    name: String,
+    arguments: &str,
+) -> Result<ContentBlock, serde_json::Value> {
+    if name.is_empty() {
+        warn!(id = %id, "dropping tool call with no function name");
+        return Err(serde_json::json!({
+            "name": "",
+            "id": id,
+            "error": "tool call has no function name",
+        }));
+    }
+    let arguments = if arguments.trim().is_empty() {
+        "{}"
+    } else {
+        arguments
+    };
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(input) => Ok(ContentBlock::ToolUse { id, name, input }),
+        Err(e) => {
+            warn!(tool = %name, error = %e, "dropping tool call with unparseable arguments");
+            Err(serde_json::json!({
+                "name": name,
+                "id": id,
+                "error": e.to_string(),
+            }))
+        }
+    }
+}
+
+/// Apply the tool-use promotion, the refusal override, then the bad-tool
+/// rule to a reply's stop. Shared by the streaming and non-streaming paths
+/// so they cannot drift. Only `EndTurn` and `Unreported` become `ToolUse`
+/// when the reply carries tool calls (the rule every provider shares). A
+/// refusal keeps the provider's own wire value.
+fn finalize_stop(
+    stop: Option<Stop>,
+    has_tool_use: bool,
+    refusal: &str,
+    bad_tool: Option<serde_json::Value>,
+) -> Stop {
+    let mut stop =
+        stop.unwrap_or_else(|| Stop::from_wire(StopReason::Unreported, "openai-codex", None));
+    if has_tool_use && matches!(stop.reason, StopReason::EndTurn | StopReason::Unreported) {
+        stop.reason = StopReason::ToolUse;
+    }
+    if !refusal.is_empty() {
+        stop.reason = StopReason::Refusal;
+        stop.refusal = Some(RefusalDetail {
+            category: None,
+            explanation: Some(refusal.to_string()),
+            recommended_model: None,
+            source: RefusalSource::Model,
+        });
+    }
+    stop.apply_bad_tool(bad_tool);
+    stop
+}
+
 /// Parse a complete (non-streaming) Responses API response into LlmResponse.
 #[allow(dead_code)]
 fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
+    if json["status"].as_str() == Some("failed") {
+        let error = json
+            .get("error")
+            .filter(|e| !e.is_null())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"message": "response failed (no details)"}));
+        return Err(ProviderError::Reply(Box::new(
+            crate::reply_error::parse_error_value(
+                "openai-codex",
+                crate::reply_error::ErrorOrigin::Stream,
+                &error,
+            ),
+        )));
+    }
+
     let id = json["id"].as_str().unwrap_or("").to_string();
     let model = json["model"].as_str().unwrap_or("").to_string();
 
     let mut content = Vec::new();
-    let mut stop_reason = Some(StopReason::EndTurn);
     let mut raw_output: Vec<serde_json::Value> = Vec::new();
+    let mut refusal = String::new();
+    let mut bad_tool: Option<serde_json::Value> = None;
 
     if let Some(output) = json.get("output").and_then(|o| o.as_array()) {
         for item in output {
@@ -1402,6 +1603,9 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
             match item["type"].as_str() {
                 Some("message") => {
                     if let Some(blocks) = item.get("content").and_then(|c| c.as_array()) {
+                        if let Some(text) = refusal_in_parts(blocks) {
+                            refusal = text;
+                        }
                         for block in blocks {
                             if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                 content.push(ContentBlock::Text {
@@ -1414,16 +1618,11 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
                 Some("function_call") => {
                     let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                     let name = desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""));
-                    let args_str = item["arguments"].as_str().unwrap_or("{}");
-                    let input: serde_json::Value = serde_json::from_str(args_str).map_err(|e| {
-                        ProviderError::Json(format!("malformed tool arguments for '{}': {e}", name))
-                    })?;
-                    content.push(ContentBlock::ToolUse {
-                        id: call_id,
-                        name,
-                        input,
-                    });
-                    stop_reason = Some(StopReason::ToolUse);
+                    let arguments = item["arguments"].as_str().unwrap_or("");
+                    match tool_call_block(call_id, name, arguments) {
+                        Ok(block) => content.push(block),
+                        Err(bad) => bad_tool = Some(bad),
+                    }
                 }
                 _ => {}
             }
@@ -1434,26 +1633,31 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
         content.insert(0, block);
     }
 
-    let status = json["status"].as_str().unwrap_or("completed");
-    if status == "incomplete" {
-        stop_reason = Some(StopReason::MaxTokens);
-    }
+    let has_tool_use = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    let stop = finalize_stop(
+        Some(responses_stop(
+            json,
+            false,
+            has_function_call(json, &content),
+        )),
+        has_tool_use,
+        &refusal,
+        bad_tool,
+    );
 
-    let usage = if let Some(u) = json.get("usage") {
-        Usage {
-            input_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-            output_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-            ..Default::default()
-        }
-    } else {
-        Usage::default()
-    };
+    let usage = json
+        .get("usage")
+        .filter(|u| !u.is_null())
+        .map(usage_from_value)
+        .unwrap_or_default();
 
     Ok(LlmResponse {
         id,
         model,
         content,
-        stop_reason,
+        stop,
         usage,
     })
 }
@@ -1478,7 +1682,15 @@ struct ResponseAccumulator {
     model: String,
     text: String,
     content_blocks: Vec<ContentBlock>,
-    stop_reason: Option<StopReason>,
+    /// Set by the terminal event; `None` until one arrives.
+    stop: Option<Stop>,
+    /// True once `response.completed` or `response.incomplete` arrived.
+    terminal_seen: bool,
+    /// Streamed refusal text (`response.refusal.*` or a refusal content part).
+    refusal: String,
+    /// The last function call whose arguments did not parse. Only the last
+    /// is kept, as in the Anthropic accumulator.
+    bad_tool: Option<serde_json::Value>,
     input_tokens: u32,
     output_tokens: u32,
     cached_tokens: u32,
@@ -1498,7 +1710,10 @@ impl ResponseAccumulator {
             model: String::new(),
             text: String::new(),
             content_blocks: Vec::new(),
-            stop_reason: None,
+            stop: None,
+            terminal_seen: false,
+            refusal: String::new(),
+            bad_tool: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
@@ -1510,9 +1725,14 @@ impl ResponseAccumulator {
         }
     }
 
-    fn into_response(self) -> Option<LlmResponse> {
+    fn into_response(self) -> Result<LlmResponse, ProviderError> {
         if self.id.is_empty() && self.text.is_empty() && self.content_blocks.is_empty() {
-            return None;
+            return Err(ProviderError::UnexpectedEndOfStream);
+        }
+        if !self.terminal_seen {
+            return Err(ProviderError::IncompleteStream(
+                "openai-codex: no terminal response event".into(),
+            ));
         }
         let mut content = Vec::new();
         if !self.text.is_empty() {
@@ -1526,11 +1746,14 @@ impl ResponseAccumulator {
             content.insert(0, block);
         }
 
-        Some(LlmResponse {
+        let has_tool_use = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        Ok(LlmResponse {
             id: self.id,
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
+            stop: finalize_stop(self.stop, has_tool_use, &self.refusal, self.bad_tool),
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -1812,7 +2035,7 @@ mod tests {
         assert_eq!(response.id, "resp_123");
         assert_eq!(response.model, "gpt-4.1");
         assert_eq!(response.text(), Some("Hello!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(response.usage.output_tokens, 5);
     }
@@ -1833,7 +2056,7 @@ mod tests {
         });
 
         let response = parse_response(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -1852,12 +2075,22 @@ mod tests {
             "id": "resp_789",
             "model": "gpt-4.1",
             "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}],
             "usage": {"input_tokens": 5, "output_tokens": 100}
         });
 
         let response = parse_response(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(response.stop.reason, StopReason::MaxTokens);
+        assert_eq!(
+            response.stop.wire.value.as_deref(),
+            Some("max_output_tokens")
+        );
+
+        // No reason given: the stop is `Incomplete`, not a guessed `MaxTokens`.
+        let json = serde_json::json!({"id": "r", "model": "m", "status": "incomplete"});
+        let response = parse_response(&json).unwrap();
+        assert_eq!(response.stop.reason, StopReason::Incomplete);
     }
 
     #[test]
@@ -2166,7 +2399,7 @@ mod tests {
             .unwrap();
 
         let response = acc.into_response().unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
     }
@@ -2183,12 +2416,17 @@ mod tests {
             event_type: "message".into(),
             data: r#"{"type":"response.failed","response":{"id":"resp_3","status":"failed","error":{"type":"server_error","message":"LLM request failed"}}}"#.into(),
         };
-        let result = client.process_sse_event(&failed, &mut acc, &mut |_| {});
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("LLM request failed"));
+        let err = client
+            .process_sse_event(&failed, &mut acc, &mut |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("LLM request failed"));
+        match err {
+            ProviderError::Reply(body) => {
+                assert_eq!(body.origin, crate::reply_error::ErrorOrigin::Stream);
+                assert_eq!(body.class, crate::reply_error::ErrorClass::Server);
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2417,8 +2655,41 @@ mod tests {
             event_type: "message".into(),
             data: r#"{"type":"response.failed"}"#.into(),
         };
-        let result = client.process_sse_event(&malformed, &mut acc, &mut |_| {});
-        assert!(result.is_err(), "response.failed must always return error");
+        let err = client
+            .process_sse_event(&malformed, &mut acc, &mut |_| {})
+            .expect_err("response.failed must always return error");
+        match err {
+            ProviderError::Reply(body) => {
+                assert_eq!(body.origin, crate::reply_error::ErrorOrigin::Stream);
+                assert_eq!(body.message, "response failed (no details)");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sse_failed_event_with_null_error() {
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey {
+                key: "sk-test".into(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        let mut acc = ResponseAccumulator::new();
+        let failed = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data:
+                r#"{"type":"response.failed","response":{"id":"r","status":"failed","error":null}}"#
+                    .into(),
+        };
+        match client.process_sse_event(&failed, &mut acc, &mut |_| {}) {
+            Err(ProviderError::Reply(body)) => {
+                assert_eq!(body.message, "response failed (no details)")
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2658,6 +2929,16 @@ mod reasoning_capture_tests {
         }
     }
 
+    /// Close a hand-fed stream with its terminal event.
+    fn finish(c: &OpenAiCodexClient, acc: &mut ResponseAccumulator) {
+        c.process_sse_event(
+            &sse(r#"{"type":"response.completed","response":{"status":"completed"}}"#),
+            acc,
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+
     #[test]
     fn request_includes_encrypted_content_and_summary() {
         let request = LlmRequest {
@@ -2858,7 +3139,7 @@ mod reasoning_capture_tests {
         // The ToolUse block is still emitted as today.
         let tools = resp.tool_calls();
         assert_eq!(tools.len(), 1);
-        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(resp.stop.reason, StopReason::ToolUse);
     }
 
     #[test]
@@ -3000,6 +3281,7 @@ mod reasoning_capture_tests {
         )
         .unwrap();
 
+        finish(&c, &mut acc);
         let resp = acc.into_response().expect("response");
 
         match &resp.content[0] {
@@ -3099,6 +3381,7 @@ mod reasoning_capture_tests {
         )
         .unwrap();
 
+        finish(&c, &mut acc);
         let resp = acc.into_response().expect("response");
         match &resp.content[0] {
             ContentBlock::Reasoning { text, .. } => {
@@ -3125,6 +3408,7 @@ mod reasoning_capture_tests {
         )
         .unwrap();
 
+        finish(&c, &mut acc);
         let resp = acc.into_response().expect("response");
         assert!(!resp
             .content
@@ -3330,6 +3614,36 @@ mod reasoning_capture_tests {
     }
 
     #[test]
+    fn fallback_and_unknown_blocks_are_absent_from_body() {
+        let request = request_with(vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Fallback {
+                        from_model: "a".into(),
+                        to_model: "b".into(),
+                    },
+                    ContentBlock::Unknown {
+                        provider: None,
+                        raw: serde_json::json!({"type": "x"}),
+                    },
+                    ContentBlock::Text {
+                        text: "calling".into(),
+                    },
+                ],
+            },
+        ]);
+        let body = client().build_request_body(&request, false);
+        let text = body.to_string();
+        assert!(!text.contains("fallback"), "{text}");
+        assert!(!text.contains("\"x\""), "{text}");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["content"][0]["text"], "calling");
+    }
+
+    #[test]
     fn foreign_provider_reasoning_is_not_replayed() {
         // `openai_chat` is Plan 3's chat-completions tag: same vendor, a
         // DIFFERENT wire format. It must never cross into the Responses API.
@@ -3451,6 +3765,7 @@ mod reasoning_capture_tests {
 
         // The captured content goes STRAIGHT into the next request — no
         // hand-building. This is the seam under test.
+        finish(&c, &mut acc);
         let response = acc.into_response().expect("response");
         let request = request_with(vec![
             Message::user("go"),
@@ -4020,10 +4335,7 @@ mod fetch_models_tests {
         catalog.assert_hits(1);
         public.assert_hits(1);
         // The public `/v1/models` failure is the one reported.
-        assert!(
-            matches!(err, ProviderError::Api { status: 500, .. }),
-            "{err:?}"
-        );
+        assert!(err.status() == Some(500), "{err:?}");
     }
 
     // ── review fixes: shapes, decode errors, fallback, production URL ─────
@@ -4349,5 +4661,605 @@ mod fetch_models_tests {
             ids(serde_json::json!({ "models": "nope", "data": 3 }), false),
             Err(ProviderError::Json(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    //! Every Responses reply shape (spec 2026-10-01 response-outcomes §4).
+    use super::*;
+    use crate::reply_error::{ErrorClass, ErrorOrigin};
+
+    fn client() -> OpenAiCodexClient {
+        OpenAiCodexClient::new(
+            crate::auth::AuthCredentials::ApiKey { key: "k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap()
+    }
+
+    /// Feed each event in order, collecting what the stream callback saw.
+    fn run(events: &[serde_json::Value]) -> (Result<LlmResponse, ProviderError>, Vec<StreamEvent>) {
+        let c = client();
+        let mut acc = ResponseAccumulator::new();
+        let mut seen = Vec::new();
+        for ev in events {
+            let sse = crate::sse::SseEvent {
+                event_type: "message".into(),
+                data: ev.to_string(),
+            };
+            if let Err(e) = c.process_sse_event(&sse, &mut acc, &mut |e| seen.push(e)) {
+                return (Err(e), seen);
+            }
+        }
+        (acc.into_response(), seen)
+    }
+
+    fn created() -> serde_json::Value {
+        serde_json::json!({"type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "status": "in_progress"}})
+    }
+
+    fn reply_of(err: ProviderError) -> Box<crate::reply_error::ApiErrorBody> {
+        match err {
+            ProviderError::Reply(b) => b,
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_event_max_output_tokens() {
+        let (r, seen) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_text.delta", "delta": "partial"}),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "id": "resp_1", "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+                "usage": {"input_tokens": 12, "output_tokens": 34,
+                          "input_tokens_details": {"cached_tokens": 4}}}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("max_output_tokens"));
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(r.usage.input_tokens, 12);
+        assert_eq!(r.usage.output_tokens, 34);
+        assert_eq!(r.usage.cached_tokens, 4);
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e, StreamEvent::UsageSnapshot(u) if u.output_tokens == 34)));
+    }
+
+    #[test]
+    fn incomplete_event_content_filter() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"}}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Safety);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn incomplete_event_other_or_missing_reason() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "incomplete_details": {"reason": "steered"}}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Incomplete);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("steered"));
+
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.incomplete", "response": {}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Incomplete);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("incomplete"));
+        assert!(r.stop.wire.details.is_none());
+    }
+
+    #[test]
+    fn completed_with_incomplete_status_is_incomplete() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[test]
+    fn incomplete_with_function_call_stays_incomplete() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "function_call", "call_id": "c1", "name": "f"}]}}),
+        ]);
+        assert_eq!(r.unwrap().stop.reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn completed_with_function_call_is_tool_use() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed",
+                "output": [{"type": "function_call", "call_id": "c1", "name": "f"}]}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn cancelled_status_is_incomplete() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "cancelled", "output": []}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Incomplete);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn refusal_events_become_refusal() {
+        let (r, seen) = run(&[
+            created(),
+            serde_json::json!({"type": "response.refusal.delta", "delta": "I cannot "}),
+            serde_json::json!({"type": "response.refusal.delta", "delta": "assist."}),
+            serde_json::json!({"type": "response.refusal.done", "refusal": "I cannot assist."}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        // The provider's own wire value is kept; the refusal is the reason.
+        assert_eq!(r.stop.wire.value.as_deref(), Some("completed"));
+        let detail = r.stop.refusal.clone().expect("refusal detail");
+        assert_eq!(detail.explanation.as_deref(), Some("I cannot assist."));
+        assert_eq!(detail.source, RefusalSource::Model);
+        assert!(detail.category.is_none());
+        assert!(detail.recommended_model.is_none());
+        assert!(
+            !seen.iter().any(|e| matches!(e, StreamEvent::TextDelta(_))),
+            "a refusal is not answer text"
+        );
+        assert!(r.text().is_none());
+    }
+
+    #[test]
+    fn refusal_deltas_alone_accumulate() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.refusal.delta", "delta": "No "}),
+            serde_json::json!({"type": "response.refusal.delta", "delta": "way."}),
+            serde_json::json!({"type": "response.completed", "response": {"status": "completed"}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(
+            r.stop.refusal.unwrap().explanation.as_deref(),
+            Some("No way.")
+        );
+    }
+
+    #[test]
+    fn refusal_content_part_becomes_refusal() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "message", "id": "msg_1", "role": "assistant",
+                "content": [{"type": "refusal",
+                             "refusal": "Not able to help with that example."}]}}),
+            serde_json::json!({"type": "response.completed", "response": {"status": "completed"}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(
+            r.stop.refusal.unwrap().explanation.as_deref(),
+            Some("Not able to help with that example.")
+        );
+    }
+
+    #[test]
+    fn refusal_part_in_non_streaming_response() {
+        let r = parse_response(&serde_json::json!({
+            "id": "resp_2", "model": "gpt-5", "status": "completed",
+            "output": [{"type": "message", "content": [
+                {"type": "refusal", "refusal": "Declined."}]}]
+        }))
+        .unwrap();
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("completed"));
+        assert!(r.text().is_none());
+    }
+
+    #[test]
+    fn failed_event_is_a_classified_stream_error() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.failed", "response": {
+                "status": "failed",
+                "error": {"code": "server_error", "message": "boom"}}}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.origin, ErrorOrigin::Stream);
+        assert_eq!(body.class, ErrorClass::Server);
+        assert!(body.is_retryable());
+        assert_eq!(body.message, "boom");
+    }
+
+    #[test]
+    fn failed_event_policy_code_is_policy() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.failed", "response": {
+                "status": "failed",
+                "error": {"code": "bio_policy", "message": "declined by policy"}}}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.class, ErrorClass::Policy);
+        assert!(!body.is_retryable());
+    }
+
+    #[test]
+    fn error_event_is_a_stream_error() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "error", "code": "rate_limit_exceeded",
+                "message": "slow down", "param": null}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.origin, ErrorOrigin::Stream);
+        assert_eq!(body.class, ErrorClass::RateLimited);
+        assert_eq!(body.message, "slow down");
+    }
+
+    fn bad_args_stream(terminal: serde_json::Value) -> Result<LlmResponse, ProviderError> {
+        run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_9", "name": "read_file"}}),
+            serde_json::json!({"type": "response.function_call_arguments.delta",
+                "delta": "{\"path\": \"/tm"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_9", "name": "read_file",
+                "arguments": "{\"path\": \"/tm"}}),
+            terminal,
+        ])
+        .0
+    }
+
+    #[test]
+    fn bad_arguments_under_max_tokens_are_truncated_tool() {
+        let r = bad_args_stream(serde_json::json!({
+            "type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}}}))
+        .unwrap();
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
+        let d = r.stop.wire.details.as_ref().unwrap();
+        assert_eq!(d["truncated_tool"]["name"], "read_file");
+        assert_eq!(d["truncated_tool"]["id"], "call_9");
+        assert!(d["truncated_tool"]["error"].is_string());
+        assert!(r.tool_calls().is_empty(), "the bad block is dropped");
+    }
+
+    #[test]
+    fn bad_arguments_otherwise_are_malformed_tool_call() {
+        let r = bad_args_stream(serde_json::json!({
+            "type": "response.completed", "response": {"status": "completed"}}))
+        .unwrap();
+        assert_eq!(r.stop.reason, StopReason::MalformedToolCall);
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["malformed_tool"]["name"],
+            "read_file"
+        );
+        assert!(r.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn bad_arguments_in_non_streaming_response() {
+        let r = parse_response(&serde_json::json!({
+            "id": "resp_3", "model": "gpt-5", "status": "completed",
+            "output": [{"type": "function_call", "call_id": "c", "name": "f",
+                        "arguments": "{\"a\":"}]
+        }))
+        .unwrap();
+        assert_eq!(r.stop.reason, StopReason::MalformedToolCall);
+        assert!(r.stop.wire.details.as_ref().unwrap()["malformed_tool"].is_object());
+    }
+
+    fn tool_input(r: &LlmResponse) -> serde_json::Value {
+        match r.tool_calls().as_slice() {
+            [ContentBlock::ToolUse { id, name, input }] => {
+                assert_eq!((id.as_str(), name.as_str()), ("call_0", "list_files"));
+                input.clone()
+            }
+            other => panic!("expected one tool call, got {other:?}"),
+        }
+    }
+
+    fn zero_arg_call(item_arguments: Option<&str>) -> Result<LlmResponse, ProviderError> {
+        let mut item = serde_json::json!({
+            "type": "function_call", "call_id": "call_0", "name": "list_files"});
+        if let Some(a) = item_arguments {
+            item["arguments"] = serde_json::json!(a);
+        }
+        run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files"}}),
+            serde_json::json!({"type": "response.output_item.done", "item": item}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_0"}]}}),
+        ])
+        .0
+    }
+
+    #[test]
+    fn zero_arg_call_without_deltas_uses_item_arguments() {
+        let r = zero_arg_call(Some("{}")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(tool_input(&r), serde_json::json!({}));
+        // Whitespace-only arguments count as empty too.
+        let r = zero_arg_call(Some("  ")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn zero_arg_call_without_deltas_or_arguments_is_empty_object() {
+        let r = zero_arg_call(None).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(tool_input(&r), serde_json::json!({}));
+    }
+
+    #[test]
+    fn incomplete_event_without_response_is_incomplete() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.incomplete"}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Incomplete);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("incomplete"));
+    }
+
+    #[test]
+    fn bare_completed_event_without_response_stays_unreported() {
+        let (r, _) = run(&[created(), serde_json::json!({"type": "response.completed"})]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unreported);
+        assert!(r.stop.wire.value.is_none());
+    }
+
+    #[test]
+    fn unfinished_terminal_statuses_are_incomplete() {
+        for status in ["failed", "queued", "in_progress"] {
+            let (r, _) = run(&[
+                created(),
+                serde_json::json!({"type": "response.completed",
+                    "response": {"status": status, "output": []}}),
+            ]);
+            let r = r.unwrap();
+            assert_eq!(r.stop.reason, StopReason::Incomplete, "{status}");
+            assert_eq!(r.stop.wire.value.as_deref(), Some(status));
+        }
+    }
+
+    #[test]
+    fn streamed_tool_use_counts_when_output_is_empty() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_5", "name": "f"}}),
+            serde_json::json!({"type": "response.function_call_arguments.delta", "delta": "{}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_5", "name": "f", "arguments": "{}"}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn streamed_tool_use_does_not_override_incomplete_or_refusal() {
+        let call = |terminal: serde_json::Value| {
+            run(&[
+                created(),
+                serde_json::json!({"type": "response.output_item.added", "item": {
+                    "type": "function_call", "call_id": "call_6", "name": "f"}}),
+                serde_json::json!({"type": "response.function_call_arguments.delta",
+                    "delta": "{}"}),
+                serde_json::json!({"type": "response.output_item.done", "item": {
+                    "type": "function_call", "call_id": "call_6", "name": "f",
+                    "arguments": "{}"}}),
+                serde_json::json!({"type": "response.refusal.done", "refusal": "No."}),
+                terminal,
+            ])
+            .0
+            .unwrap()
+        };
+        let r = call(
+            serde_json::json!({"type": "response.incomplete", "response": {
+            "status": "incomplete", "incomplete_details": {"reason": "content_filter"},
+            "output": []}}),
+        );
+        // Refusal is applied after the incomplete mapping.
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["incomplete_details"]["reason"],
+            "content_filter"
+        );
+
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_7", "name": "f"}}),
+            serde_json::json!({"type": "response.function_call_arguments.delta", "delta": "{}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_7", "name": "f", "arguments": "{}"}}),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+                "output": []}}),
+        ]);
+        assert_eq!(r.unwrap().stop.reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn no_terminal_event_is_incomplete_stream() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_text.delta", "delta": "half an ans"}),
+        ]);
+        match r {
+            Err(ProviderError::IncompleteStream(m)) => {
+                assert_eq!(m, "openai-codex: no terminal response event")
+            }
+            other => panic!("expected IncompleteStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_stream_is_unexpected_end() {
+        let (r, _) = run(&[]);
+        assert!(matches!(r, Err(ProviderError::UnexpectedEndOfStream)));
+    }
+
+    #[test]
+    fn non_streaming_incomplete_and_failed() {
+        let r = parse_response(&serde_json::json!({
+            "id": "r", "model": "m", "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"}, "output": []
+        }))
+        .unwrap();
+        assert_eq!(r.stop.reason, StopReason::Safety);
+
+        let err = parse_response(&serde_json::json!({
+            "id": "r", "status": "failed",
+            "error": {"code": "bio_policy", "message": "no"}
+        }))
+        .unwrap_err();
+        assert_eq!(reply_of(err).class, ErrorClass::Policy);
+    }
+
+    /// A `function_call` whose `output_item.added` was missed is built from
+    /// the done item's own `call_id`/`name`/`arguments`, not dropped.
+    #[test]
+    fn function_call_done_without_added_is_kept() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": "{\"dir\":\"src\"}"}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(tool_input(&r), serde_json::json!({"dir": "src"}));
+
+        // Streamed argument deltas still win over the item's arguments.
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.function_call_arguments.delta",
+                "delta": "{\"dir\":\"lib\"}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": "{\"dir\":\"src\"}"}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        assert_eq!(tool_input(&r.unwrap()), serde_json::json!({"dir": "lib"}));
+
+        // Empty everywhere → {}.
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": ""}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        assert_eq!(tool_input(&r.unwrap()), serde_json::json!({}));
+    }
+
+    /// The non-streaming parser treats empty arguments as the stream does:
+    /// a zero-parameter call, `{}`.
+    #[test]
+    fn non_streaming_empty_arguments_are_an_empty_object() {
+        for args in [Some(""), Some("  "), None] {
+            let mut item = serde_json::json!({
+                "type": "function_call", "call_id": "call_0", "name": "list_files"});
+            if let Some(a) = args {
+                item["arguments"] = serde_json::json!(a);
+            }
+            let r = parse_response(&serde_json::json!({
+                "id": "r", "model": "m", "status": "completed", "output": [item]
+            }))
+            .unwrap();
+            assert_eq!(r.stop.reason, StopReason::ToolUse, "{args:?}");
+            assert_eq!(tool_input(&r), serde_json::json!({}), "{args:?}");
+        }
+    }
+
+    /// A terminal event that reports nothing is `Unreported`, promoted to
+    /// `ToolUse` when the turn called a function (the shared promotion rule).
+    #[test]
+    fn bare_completed_event_with_a_streamed_call_is_tool_use() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files"}}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": "{}"}}),
+            serde_json::json!({"type": "response.completed"}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert!(r.stop.wire.value.is_none());
+    }
+
+    /// The Responses API's flat `error` event with no code: no kind, so it
+    /// is retried; with a code it classifies by the code.
+    #[test]
+    fn flat_error_event_without_a_code_is_retried() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "error", "code": null, "message": "stream reset", "param": null}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.kind, None);
+        assert_eq!(body.class, ErrorClass::Unrecognized);
+        assert!(body.is_retryable());
+
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "error", "code": "rate_limit_exceeded", "message": "slow down"}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.kind.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(body.class, ErrorClass::RateLimited);
     }
 }

@@ -332,14 +332,19 @@ impl GoogleGeminiClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                &self.variant.provider_id().to_string(),
                 status,
                 &headers,
-                extract_google_error(&text),
+                &text,
             ));
         }
 
         let resp_json: serde_json::Value = response.json().await?;
-        parse_generate_content_response(&resp_json, &request.model)
+        parse_generate_content_response(
+            &resp_json,
+            &request.model,
+            &self.variant.provider_id().to_string(),
+        )
     }
 
     /// Streaming send with SSE.
@@ -366,14 +371,16 @@ impl GoogleGeminiClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                &self.variant.provider_id().to_string(),
                 status,
                 &headers,
-                extract_google_error(&text),
+                &text,
             ));
         }
 
         let mut parser = SseParser::new();
-        let mut acc = GeminiAccumulator::new(&request.model);
+        let mut acc =
+            GeminiAccumulator::new(&request.model, &self.variant.provider_id().to_string());
         let mut bytes_stream = response.bytes_stream();
 
         use futures_util::StreamExt;
@@ -920,17 +927,14 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
             let status = resp.status();
             if !status.is_success() {
-                let message: String = resp
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(500)
-                    .collect();
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message,
-                });
+                let headers = resp.headers().clone();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(crate::error::api_error_from_response(
+                    &provider,
+                    status.as_u16(),
+                    &headers,
+                    &text,
+                ));
             }
             let body = resp
                 .text()
@@ -1119,7 +1123,7 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                 // Either already consumed by the verbatim replay above, or a
                 // foreign provider's block, which is deliberately ignored.
                 ContentBlock::Reasoning { .. } => {}
-                ContentBlock::Unknown => {}
+                ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
             }
         }
 
@@ -1147,63 +1151,73 @@ fn generate_content_payload(json: &serde_json::Value) -> &serde_json::Value {
 fn parse_generate_content_response(
     json: &serde_json::Value,
     model: &str,
+    provider: &str,
 ) -> Result<LlmResponse, ProviderError> {
     let json = generate_content_payload(json);
     let mut content = Vec::new();
-    let mut stop_reason = Some(StopReason::EndTurn);
+    let mut stop: Option<Stop> = None;
+    let mut had_function_call = false;
     let mut tool_call_counter: u32 = 0;
     // The turn's parts, stored verbatim so `convert_messages` can replay them.
     let mut raw_parts: Vec<serde_json::Value> = Vec::new();
     let mut thought_text = String::new();
 
-    if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
-        if let Some(candidate) = candidates.first() {
-            if let Some(parts) = candidate
-                .get("content")
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.as_array())
-            {
-                for part in parts {
-                    // Every part is stored verbatim — it may carry a
-                    // thoughtSignature that has to return on this exact part.
-                    raw_parts.push(part.clone());
+    let candidates = json.get("candidates").and_then(|c| c.as_array());
+    if let Some(candidate) = candidates.and_then(|c| c.first()) {
+        if let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+        {
+            for part in parts {
+                // Every part is stored verbatim — it may carry a
+                // thoughtSignature that has to return on this exact part.
+                raw_parts.push(part.clone());
 
-                    let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        if is_thought {
-                            // A thought part's text is reasoning, not answer text:
-                            // collect it for the transcript, emit no Text block.
-                            if !thought_text.is_empty() {
-                                thought_text.push_str("\n\n");
-                            }
-                            thought_text.push_str(text);
-                        } else {
-                            content.push(ContentBlock::Text {
-                                text: text.to_string(),
-                            });
+                let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if is_thought {
+                        // A thought part's text is reasoning, not answer text:
+                        // collect it for the transcript, emit no Text block.
+                        if !thought_text.is_empty() {
+                            thought_text.push_str("\n\n");
                         }
-                    }
-                    // Checked even on a thought part: a part can carry both, and
-                    // the old `continue` here silently dropped the tool call.
-                    if let Some(fc) = part.get("functionCall") {
-                        let name = fc["name"].as_str().unwrap_or("").to_string();
-                        let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
-                        tool_call_counter += 1;
-                        content.push(ContentBlock::ToolUse {
-                            id: format!("gemini_tc_{tool_call_counter}"),
-                            name,
-                            input: args,
+                        thought_text.push_str(text);
+                    } else {
+                        content.push(ContentBlock::Text {
+                            text: text.to_string(),
                         });
-                        stop_reason = Some(StopReason::ToolUse);
                     }
                 }
-            }
-
-            // Map finish reason
-            if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
-                stop_reason = Some(map_finish_reason(reason));
+                // Checked even on a thought part: a part can carry both, and
+                // the old `continue` here silently dropped the tool call.
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc["name"].as_str().unwrap_or("").to_string();
+                    let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                    tool_call_counter += 1;
+                    content.push(ContentBlock::ToolUse {
+                        id: format!("gemini_tc_{tool_call_counter}"),
+                        name,
+                        input: args,
+                    });
+                    had_function_call = true;
+                }
             }
         }
+
+        stop = Some(candidate_stop(
+            candidate.get("finishReason").and_then(|r| r.as_str()),
+            candidate.get("finishMessage"),
+            candidate.get("safetyRatings"),
+            had_function_call,
+            provider,
+        ));
+    } else if let Some(block) = json
+        .get("promptFeedback")
+        .and_then(|f| prompt_block_stop(f, provider))
+    {
+        // No candidates at all: the prompt itself was refused.
+        stop = Some(block);
     }
 
     // Store the turn's parts verbatim so convert_messages can replay them. This is
@@ -1244,20 +1258,68 @@ fn parse_generate_content_response(
         id: String::new(), // Gemini doesn't return a response ID in the same way
         model: model.to_string(),
         content,
-        stop_reason,
+        stop: stop.unwrap_or_else(|| Stop::from_wire(StopReason::Unreported, provider, None)),
         usage,
     })
 }
 
-/// Map Google finish reason string to StopReason.
-fn map_finish_reason(reason: &str) -> StopReason {
-    match reason {
-        "STOP" => StopReason::EndTurn,
-        "MAX_TOKENS" => StopReason::MaxTokens,
-        "STOP_SEQUENCE" => StopReason::StopSequence,
-        "FUNCTION_CALLING" => StopReason::ToolUse,
-        _ => StopReason::EndTurn, // SAFETY, OTHER, etc. → graceful
+/// How a Gemini turn ended. `finish` is the candidate's `finishReason`
+/// exactly as sent (`None` when absent). A function call in the turn wins
+/// over `STOP` and an absent reason — Gemini reports `STOP` for a turn that
+/// ends in a tool call — and nothing else: a value rupu doesn't know stays
+/// `Unrecognized` (the runner still dispatches the call by content), and
+/// `MAX_TOKENS`, a safety stop, a malformed call or an incomplete reply
+/// stay as they are. The wire value is always the provider's own.
+fn gemini_stop(finish: Option<&str>, had_function_call: bool, provider: &str) -> Stop {
+    let mut reason = match finish {
+        Some(v) => crate::stop::map::gemini_finish(v),
+        None => StopReason::Unreported,
+    };
+    if had_function_call && matches!(reason, StopReason::EndTurn | StopReason::Unreported) {
+        reason = StopReason::ToolUse;
     }
+    Stop::from_wire(reason, provider, finish)
+}
+
+/// [`gemini_stop`] plus the candidate's `finishMessage` and `safetyRatings`
+/// kept in `wire.details`.
+fn candidate_stop(
+    finish: Option<&str>,
+    finish_message: Option<&serde_json::Value>,
+    safety_ratings: Option<&serde_json::Value>,
+    had_function_call: bool,
+    provider: &str,
+) -> Stop {
+    let mut stop = gemini_stop(finish, had_function_call, provider);
+    if let Some(m) = finish_message.filter(|m| !m.is_null()) {
+        stop.set_detail("finishMessage", m.clone());
+    }
+    if let Some(r) = safety_ratings.filter(|r| !r.is_null()) {
+        stop.set_detail("safetyRatings", r.clone());
+    }
+    stop
+}
+
+/// A refused prompt: `promptFeedback.blockReason` with no candidates. Any
+/// block reason is a safety stop — one rupu does not know keeps its wire
+/// value, with a log line so the table can be extended.
+fn prompt_block_stop(feedback: &serde_json::Value, provider: &str) -> Option<Stop> {
+    let reason = feedback.get("blockReason").and_then(|r| r.as_str())?;
+    if !crate::stop::map::gemini_block_reason_is_known(reason) {
+        warn!(
+            block_reason = reason,
+            "unknown Gemini promptFeedback.blockReason"
+        );
+    }
+    let mut stop = Stop::from_wire(StopReason::Safety, provider, Some(reason));
+    stop.set_detail("prompt_blocked", serde_json::Value::Bool(true));
+    if let Some(r) = feedback.get("safetyRatings").filter(|r| !r.is_null()) {
+        stop.set_detail("safetyRatings", r.clone());
+    }
+    if let Some(m) = feedback.get("blockReasonMessage").filter(|m| !m.is_null()) {
+        stop.set_detail("blockReasonMessage", m.clone());
+    }
+    Some(stop)
 }
 
 // ── SSE Processing ───────────────────────────────────────────────────
@@ -1266,7 +1328,12 @@ fn map_finish_reason(reason: &str) -> StopReason {
 struct GeminiAccumulator {
     text: String,
     content_blocks: Vec<ContentBlock>,
-    stop_reason: Option<StopReason>,
+    /// The candidate's `finishReason`, as sent, once a chunk carries one.
+    finish: Option<String>,
+    finish_message: Option<serde_json::Value>,
+    safety_ratings: Option<serde_json::Value>,
+    /// A refused prompt (`promptFeedback.blockReason`, no candidates).
+    prompt_block: Option<Stop>,
     input_tokens: u32,
     output_tokens: u32,
     reasoning_tokens: u32,
@@ -1275,14 +1342,19 @@ struct GeminiAccumulator {
     raw_parts: Vec<serde_json::Value>,
     thought_text: String,
     model: String,
+    /// `ProviderId` display string stamped on the stop and on error bodies.
+    provider: String,
 }
 
 impl GeminiAccumulator {
-    fn new(model: &str) -> Self {
+    fn new(model: &str, provider: &str) -> Self {
         Self {
             text: String::new(),
             content_blocks: Vec::new(),
-            stop_reason: None,
+            finish: None,
+            finish_message: None,
+            safety_ratings: None,
+            prompt_block: None,
             input_tokens: 0,
             output_tokens: 0,
             reasoning_tokens: 0,
@@ -1290,13 +1362,44 @@ impl GeminiAccumulator {
             raw_parts: Vec::new(),
             thought_text: String::new(),
             model: model.to_string(),
+            provider: provider.to_string(),
         }
     }
 
+    /// `Some` once the stream produced anything: parts, or a recorded stop
+    /// (a finish reason or a prompt block) even with no parts.
     fn into_response(self) -> Option<LlmResponse> {
-        if self.text.is_empty() && self.content_blocks.is_empty() && self.raw_parts.is_empty() {
+        let had_function_call = self
+            .content_blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let stop = match self.prompt_block {
+            Some(block) => Some(block),
+            None if self.finish.is_some() => Some(candidate_stop(
+                self.finish.as_deref(),
+                self.finish_message.as_ref(),
+                self.safety_ratings.as_ref(),
+                had_function_call,
+                &self.provider,
+            )),
+            None => None,
+        };
+        if stop.is_none()
+            && self.text.is_empty()
+            && self.content_blocks.is_empty()
+            && self.raw_parts.is_empty()
+        {
             return None;
         }
+        let stop = stop.unwrap_or_else(|| {
+            candidate_stop(
+                None,
+                self.finish_message.as_ref(),
+                self.safety_ratings.as_ref(),
+                had_function_call,
+                &self.provider,
+            )
+        });
         let mut content = Vec::new();
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
@@ -1324,7 +1427,7 @@ impl GeminiAccumulator {
             id: String::new(),
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
+            stop,
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -1345,67 +1448,96 @@ fn process_gemini_sse(
         return Ok(());
     }
 
-    let data: serde_json::Value = serde_json::from_str(&event.data)?;
-    let data = generate_content_payload(&data);
+    let raw: serde_json::Value = serde_json::from_str(&event.data)?;
+    let data = generate_content_payload(&raw);
 
-    // Process candidates
-    if let Some(candidates) = data.get("candidates").and_then(|c| c.as_array()) {
-        if let Some(candidate) = candidates.first() {
-            if let Some(parts) = candidate
-                .get("content")
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.as_array())
-            {
-                for part in parts {
-                    // Every part is stored verbatim — it may carry a
-                    // thoughtSignature that has to return on this exact part.
-                    acc.raw_parts.push(part.clone());
+    // An error chunk inside a 200 stream (an upstream overload, a quota
+    // failure after the headers went out). Code Assist may put it beside
+    // or inside the `response` envelope.
+    for candidate in [&raw, data] {
+        if candidate.get("error").is_some_and(|e| !e.is_null()) {
+            return Err(ProviderError::Reply(Box::new(
+                crate::reply_error::parse_error_value(
+                    &acc.provider,
+                    crate::reply_error::ErrorOrigin::Stream,
+                    candidate,
+                ),
+            )));
+        }
+    }
 
-                    let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        if is_thought {
-                            // Deliberately no "\n\n" separator here, unlike the
-                            // non-streaming join in parse_generate_content_response:
-                            // SSE commonly delivers a single thought summary
-                            // fragmented across chunks, and inserting a separator
-                            // per chunk would corrupt it into disjoint paragraphs.
-                            // Display-only (reasoning_text()) — raw["parts"] and
-                            // the replay path are unaffected either way. Do not
-                            // "fix" this to match the non-streaming path.
-                            acc.thought_text.push_str(text);
-                            on_event(StreamEvent::ReasoningDelta(text.to_string()));
-                        } else {
-                            acc.text.push_str(text);
-                            on_event(StreamEvent::TextDelta(text.to_string()));
-                        }
-                    }
+    // Process the first candidate. With none (absent or an empty array) the
+    // prompt itself may have been refused, as in the non-streaming parse.
+    let first_candidate = data
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
+    if let Some(candidate) = first_candidate {
+        if let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+        {
+            for part in parts {
+                // Every part is stored verbatim — it may carry a
+                // thoughtSignature that has to return on this exact part.
+                acc.raw_parts.push(part.clone());
 
-                    // Checked even on a thought part: a part can carry both, and
-                    // the old `continue` here silently dropped the tool call.
-                    if let Some(fc) = part.get("functionCall") {
-                        let name = fc["name"].as_str().unwrap_or("").to_string();
-                        let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
-                        acc.tool_call_counter += 1;
-                        let id = format!("gemini_tc_{}", acc.tool_call_counter);
-                        on_event(StreamEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: name.clone(),
-                        });
-                        let args_str = args.to_string();
-                        on_event(StreamEvent::InputJsonDelta(args_str));
-                        acc.content_blocks.push(ContentBlock::ToolUse {
-                            id,
-                            name,
-                            input: args,
-                        });
+                let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if is_thought {
+                        // Deliberately no "\n\n" separator here, unlike the
+                        // non-streaming join in parse_generate_content_response:
+                        // SSE commonly delivers a single thought summary
+                        // fragmented across chunks, and inserting a separator
+                        // per chunk would corrupt it into disjoint paragraphs.
+                        // Display-only (reasoning_text()) — raw["parts"] and
+                        // the replay path are unaffected either way. Do not
+                        // "fix" this to match the non-streaming path.
+                        acc.thought_text.push_str(text);
+                        on_event(StreamEvent::ReasoningDelta(text.to_string()));
+                    } else {
+                        acc.text.push_str(text);
+                        on_event(StreamEvent::TextDelta(text.to_string()));
                     }
                 }
-            }
 
-            if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
-                acc.stop_reason = Some(map_finish_reason(reason));
+                // Checked even on a thought part: a part can carry both, and
+                // the old `continue` here silently dropped the tool call.
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc["name"].as_str().unwrap_or("").to_string();
+                    let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                    acc.tool_call_counter += 1;
+                    let id = format!("gemini_tc_{}", acc.tool_call_counter);
+                    on_event(StreamEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                    let args_str = args.to_string();
+                    on_event(StreamEvent::InputJsonDelta(args_str));
+                    acc.content_blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input: args,
+                    });
+                }
             }
         }
+
+        if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
+            acc.finish = Some(reason.to_string());
+        }
+        if let Some(m) = candidate.get("finishMessage").filter(|m| !m.is_null()) {
+            acc.finish_message = Some(m.clone());
+        }
+        if let Some(r) = candidate.get("safetyRatings").filter(|r| !r.is_null()) {
+            acc.safety_ratings = Some(r.clone());
+        }
+    } else if let Some(block) = data
+        .get("promptFeedback")
+        .and_then(|f| prompt_block_stop(f, &acc.provider))
+    {
+        acc.prompt_block = Some(block);
     }
 
     // Process usage metadata
@@ -1459,20 +1591,6 @@ fn truncate(text: &str, max_len: usize) -> String {
             .unwrap_or(0);
         format!("{}...", &text[..end])
     }
-}
-
-/// Extract a clean error message from a Google API JSON error response.
-fn extract_google_error(text: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(msg) = json
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-        {
-            return msg.to_string();
-        }
-    }
-    truncate(text, 500)
 }
 
 #[cfg(test)]
@@ -2239,6 +2357,28 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_drops_fallback_and_unknown_blocks() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Fallback {
+                    from_model: "a".into(),
+                    to_model: "b".into(),
+                },
+                ContentBlock::Unknown {
+                    provider: None,
+                    raw: serde_json::json!({"type": "x"}),
+                },
+                ContentBlock::Text { text: "hi".into() },
+            ],
+        }];
+        let contents = convert_messages(&messages);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "hi");
+    }
+
+    #[test]
     fn convert_messages_drops_foreign_provider_reasoning_block() {
         // An Anthropic thinking block is an alien wire format: never replay it,
         // and never let its signature reach Gemini.
@@ -2350,11 +2490,13 @@ mod tests {
         let json = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": parts},
-                "finishReason": "FUNCTION_CALLING"
+                "finishReason": "STOP"
             }]
         });
 
-        let resp = parse_generate_content_response(&json, "gemini-3-pro-preview").unwrap();
+        let resp =
+            parse_generate_content_response(&json, "gemini-3-pro-preview", "google-gemini-cli")
+                .unwrap();
 
         // Feed resp.content straight into a fresh Message — do NOT hand-build
         // the assistant turn the way `replay_turn` does elsewhere in this file.
@@ -2398,9 +2540,10 @@ mod tests {
             }
         });
 
-        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-2.5-pro", "google-gemini-cli").unwrap();
         assert_eq!(response.text(), Some("The answer is 42."));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 15);
         assert_eq!(response.usage.output_tokens, 8);
     }
@@ -2428,7 +2571,8 @@ mod tests {
             }
         });
 
-        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-2.5-pro", "google-gemini-cli").unwrap();
         assert_eq!(response.usage.input_tokens, 15);
         assert_eq!(response.usage.output_tokens, 8);
         assert_eq!(response.usage.reasoning_tokens, 200);
@@ -2447,13 +2591,14 @@ mod tests {
                         }
                     }]
                 },
-                "finishReason": "FUNCTION_CALLING"
+                "finishReason": "STOP"
             }],
             "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
         });
 
-        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        let response =
+            parse_generate_content_response(&json, "gemini-2.5-pro", "google-gemini-cli").unwrap();
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -2474,8 +2619,9 @@ mod tests {
             }]
         });
 
-        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        let response =
+            parse_generate_content_response(&json, "gemini-2.5-pro", "google-gemini-cli").unwrap();
+        assert_eq!(response.stop.reason, StopReason::MaxTokens);
     }
 
     /// Pull the single `Reasoning` block out of a response, or panic.
@@ -2513,7 +2659,8 @@ mod tests {
             }]
         });
 
-        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-3-pro", "google-gemini-cli").unwrap();
 
         // Text blocks are unaffected: the thought part never becomes answer text.
         assert_eq!(response.text(), Some("The answer is 42."));
@@ -2533,11 +2680,12 @@ mod tests {
         let json = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": parts},
-                "finishReason": "FUNCTION_CALLING"
+                "finishReason": "STOP"
             }]
         });
 
-        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-3-pro", "google-gemini-cli").unwrap();
 
         let (_, _, raw) = only_reasoning(&response);
         assert_eq!(raw["parts"][0]["thoughtSignature"], "sig_abc");
@@ -2550,7 +2698,7 @@ mod tests {
             ContentBlock::ToolUse { name, .. } => assert_eq!(name, "f"),
             _ => panic!("expected ToolUse"),
         }
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
     }
 
     #[test]
@@ -2570,11 +2718,12 @@ mod tests {
                         "thoughtSignature": "sig_abc"
                     }]
                 },
-                "finishReason": "FUNCTION_CALLING"
+                "finishReason": "STOP"
             }]
         });
 
-        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-3-pro", "google-gemini-cli").unwrap();
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match tools[0] {
@@ -2584,7 +2733,7 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
     }
 
     #[test]
@@ -2598,7 +2747,8 @@ mod tests {
             }]
         });
 
-        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-3-pro", "google-gemini-cli").unwrap();
 
         let (text, _, raw) = only_reasoning(&response);
         assert_eq!(*text, None);
@@ -2614,7 +2764,8 @@ mod tests {
             }]
         });
 
-        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let response =
+            parse_generate_content_response(&json, "gemini-3-pro", "google-gemini-cli").unwrap();
         assert!(response
             .content
             .iter()
@@ -2623,7 +2774,7 @@ mod tests {
 
     #[test]
     fn sse_captures_thought_parts_and_emits_reasoning_delta() {
-        let mut acc = GeminiAccumulator::new("gemini-3-pro");
+        let mut acc = GeminiAccumulator::new("gemini-3-pro", "google-gemini-cli");
         let mut events = Vec::new();
 
         let event = crate::sse::SseEvent {
@@ -2646,7 +2797,7 @@ mod tests {
 
     #[test]
     fn sse_accumulates_all_parts_verbatim_across_chunks() {
-        let mut acc = GeminiAccumulator::new("gemini-3-pro");
+        let mut acc = GeminiAccumulator::new("gemini-3-pro", "google-gemini-cli");
 
         let event1 = crate::sse::SseEvent {
             event_type: "message".into(),
@@ -2678,11 +2829,11 @@ mod tests {
     fn sse_thought_part_with_function_call_still_yields_tool_use() {
         // The old code `continue`d on thought:true before checking for a
         // functionCall on the same part, silently losing the tool call.
-        let mut acc = GeminiAccumulator::new("gemini-3-pro");
+        let mut acc = GeminiAccumulator::new("gemini-3-pro", "google-gemini-cli");
 
         let event = crate::sse::SseEvent {
             event_type: "message".into(),
-            data: r#"{"candidates":[{"content":{"parts":[{"thought":true,"functionCall":{"name":"f","args":{"x":1}},"thoughtSignature":"sig_abc"}]},"finishReason":"FUNCTION_CALLING"}]}"#.into(),
+            data: r#"{"candidates":[{"content":{"parts":[{"thought":true,"functionCall":{"name":"f","args":{"x":1}},"thoughtSignature":"sig_abc"}]},"finishReason":"STOP"}]}"#.into(),
         };
         process_gemini_sse(&event, &mut acc, &mut |_| {}).unwrap();
 
@@ -2700,7 +2851,7 @@ mod tests {
 
     #[test]
     fn test_sse_text_streaming() {
-        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
         let mut events = Vec::new();
 
         let event1 = crate::sse::SseEvent {
@@ -2717,7 +2868,7 @@ mod tests {
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.text(), Some("Hello world!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(events.len(), 3);
         assert!(events.iter().any(
@@ -2729,7 +2880,7 @@ mod tests {
     /// `StreamEvent::UsageSnapshot` too, not just the non-streaming parse.
     #[test]
     fn test_sse_usage_snapshot_counts_thinking_tokens() {
-        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
         let mut events = Vec::new();
 
         let event = crate::sse::SseEvent {
@@ -2749,17 +2900,17 @@ mod tests {
 
     #[test]
     fn test_sse_function_call_streaming() {
-        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
         let mut events = Vec::new();
 
         let event = crate::sse::SseEvent {
             event_type: "message".into(),
-            data: r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell_exec","args":{"command":"ls"}}}]},"finishReason":"FUNCTION_CALLING"}]}"#.into(),
+            data: r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell_exec","args":{"command":"ls"}}}]},"finishReason":"STOP"}]}"#.into(),
         };
         process_gemini_sse(&event, &mut acc, &mut |e| events.push(format!("{e:?}"))).unwrap();
 
         let response = acc.into_response().unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         assert_eq!(response.tool_calls().len(), 1);
         assert!(!events.is_empty()); // ToolUseStart + InputJsonDelta
     }
@@ -2792,25 +2943,298 @@ mod tests {
             .contains("antigravity"));
     }
 
-    #[test]
-    fn test_map_finish_reason() {
-        assert_eq!(map_finish_reason("STOP"), StopReason::EndTurn);
-        assert_eq!(map_finish_reason("MAX_TOKENS"), StopReason::MaxTokens);
-        assert_eq!(map_finish_reason("FUNCTION_CALLING"), StopReason::ToolUse);
-        assert_eq!(map_finish_reason("SAFETY"), StopReason::EndTurn); // graceful
-        assert_eq!(map_finish_reason("UNKNOWN"), StopReason::EndTurn);
+    fn sse(data: &str) -> crate::sse::SseEvent {
+        crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: data.into(),
+        }
+    }
+
+    /// Run one body through the send parser.
+    fn send_parse(json: serde_json::Value) -> LlmResponse {
+        parse_generate_content_response(&json, "gemini-2.5-pro", "google-gemini-cli").unwrap()
+    }
+
+    /// Run bodies through the stream parser, in order.
+    fn stream_parse(chunks: &[&str]) -> Option<LlmResponse> {
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
+        for c in chunks {
+            process_gemini_sse(&sse(c), &mut acc, &mut |_| {}).unwrap();
+        }
+        acc.into_response()
+    }
+
+    fn finish_body(finish: &str) -> serde_json::Value {
+        serde_json::json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "partial"}]},
+            "finishReason": finish
+        }]})
     }
 
     #[test]
-    fn test_extract_google_error_json() {
-        let text = r#"{"error":{"code":429,"message":"Rate limit exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
-        assert_eq!(extract_google_error(text), "Rate limit exceeded");
+    fn safety_finish_reason_is_safety_with_details() {
+        let body = serde_json::json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "I can"}]},
+            "finishReason": "SAFETY",
+            "finishMessage": "Blocked by the safety filter.",
+            "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
+        }]});
+        let check = |r: &LlmResponse| {
+            assert_eq!(r.stop.reason, StopReason::Safety);
+            assert_eq!(r.stop.wire.value.as_deref(), Some("SAFETY"));
+            let d = r.stop.wire.details.as_ref().unwrap();
+            assert_eq!(d["finishMessage"], "Blocked by the safety filter.");
+            assert_eq!(d["safetyRatings"][0]["probability"], "HIGH");
+        };
+        check(&send_parse(body.clone()));
+        check(&stream_parse(&[&body.to_string()]).unwrap());
     }
 
     #[test]
-    fn test_extract_google_error_plain() {
-        let text = "Internal server error";
-        assert_eq!(extract_google_error(text), "Internal server error");
+    fn recitation_and_prohibited_content_are_safety() {
+        for v in [
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "SPII",
+            "LANGUAGE",
+        ] {
+            let r = send_parse(finish_body(v));
+            assert_eq!(r.stop.reason, StopReason::Safety, "{v}");
+            assert_eq!(r.stop.wire.value.as_deref(), Some(v));
+            let s = stream_parse(&[&finish_body(v).to_string()]).unwrap();
+            assert_eq!(s.stop.reason, StopReason::Safety, "{v} stream");
+        }
+    }
+
+    #[test]
+    fn malformed_function_call_is_malformed_tool_call() {
+        for v in [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+        ] {
+            let r = send_parse(finish_body(v));
+            assert_eq!(r.stop.reason, StopReason::MalformedToolCall, "{v}");
+            assert_eq!(r.stop.wire.value.as_deref(), Some(v));
+            let s = stream_parse(&[&finish_body(v).to_string()]).unwrap();
+            assert_eq!(s.stop.reason, StopReason::MalformedToolCall, "{v} stream");
+        }
+    }
+
+    fn function_call_body(finish: &str) -> serde_json::Value {
+        serde_json::json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]},
+            "finishReason": finish
+        }]})
+    }
+
+    #[test]
+    fn stop_with_function_call_is_tool_use() {
+        let r = send_parse(function_call_body("STOP"));
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("STOP"));
+        let s = stream_parse(&[&function_call_body("STOP").to_string()]).unwrap();
+        assert_eq!(s.stop.reason, StopReason::ToolUse);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("STOP"));
+    }
+
+    #[test]
+    fn stop_with_function_call_in_an_earlier_chunk_is_tool_use() {
+        let s = stream_parse(&[
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{}}}]}}]}"#,
+            r#"{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}"#,
+        ])
+        .unwrap();
+        assert_eq!(s.stop.reason, StopReason::ToolUse);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("STOP"));
+    }
+
+    /// `FUNCTION_CALLING` is not a Gemini value, so it is unrecognized even
+    /// with a function call in the turn: only `EndTurn` and `Unreported` are
+    /// promoted to `ToolUse` (the rule every provider shares). The call
+    /// itself is still in the content, and the runner dispatches by content.
+    #[test]
+    fn function_calling_is_unrecognized_even_with_a_function_call() {
+        let r = send_parse(finish_body("FUNCTION_CALLING"));
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("FUNCTION_CALLING"));
+
+        let has_call =
+            |c: &[ContentBlock]| c.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let r = send_parse(function_call_body("FUNCTION_CALLING"));
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("FUNCTION_CALLING"));
+        assert!(has_call(&r.content));
+        let s = stream_parse(&[&function_call_body("FUNCTION_CALLING").to_string()]).unwrap();
+        assert_eq!(s.stop.reason, StopReason::Unrecognized);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("FUNCTION_CALLING"));
+        assert!(has_call(&s.content));
+    }
+
+    #[test]
+    fn a_function_call_never_masks_a_stronger_finish_reason() {
+        for (v, want) in [
+            ("MAX_TOKENS", StopReason::MaxTokens),
+            ("SAFETY", StopReason::Safety),
+            ("MALFORMED_FUNCTION_CALL", StopReason::MalformedToolCall),
+            ("OTHER", StopReason::Incomplete),
+        ] {
+            let r = send_parse(function_call_body(v));
+            assert_eq!(r.stop.reason, want, "{v}");
+            let s = stream_parse(&[&function_call_body(v).to_string()]).unwrap();
+            assert_eq!(s.stop.reason, want, "{v} stream");
+        }
+    }
+
+    #[test]
+    fn no_finish_reason_is_unreported_or_tool_use() {
+        let text = serde_json::json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "hi"}]}
+        }]});
+        let r = send_parse(text.clone());
+        assert_eq!(r.stop.reason, StopReason::Unreported);
+        assert_eq!(r.stop.wire.value, None);
+        let s = stream_parse(&[&text.to_string()]).unwrap();
+        assert_eq!(s.stop.reason, StopReason::Unreported);
+
+        let fc = serde_json::json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]}
+        }]});
+        let r = send_parse(fc.clone());
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.stop.wire.value, None);
+        let s = stream_parse(&[&fc.to_string()]).unwrap();
+        assert_eq!(s.stop.reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn prompt_blocked_send() {
+        let r = send_parse(serde_json::json!({
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT", "safetyRatings": []}
+        }));
+        assert_eq!(r.stop.reason, StopReason::Safety);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("PROHIBITED_CONTENT"));
+        let d = r.stop.wire.details.as_ref().unwrap();
+        assert_eq!(d["prompt_blocked"], true);
+        assert_eq!(d["safetyRatings"], serde_json::json!([]));
+        assert!(r.content.is_empty());
+    }
+
+    #[test]
+    fn prompt_blocked_stream() {
+        let s = stream_parse(&[
+            r#"{"promptFeedback":{"blockReason":"PROHIBITED_CONTENT","safetyRatings":[{"category":"HARM_CATEGORY_HARASSMENT","probability":"HIGH"}]}}"#,
+        ])
+        .expect("a prompt block is a reply, not an unexpected end of stream");
+        assert_eq!(s.stop.reason, StopReason::Safety);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("PROHIBITED_CONTENT"));
+        let d = s.stop.wire.details.as_ref().unwrap();
+        assert_eq!(d["prompt_blocked"], true);
+        assert_eq!(d["safetyRatings"][0]["probability"], "HIGH");
+    }
+
+    #[test]
+    fn prompt_block_inside_the_code_assist_envelope_and_unknown_reason() {
+        let r = send_parse(serde_json::json!({
+            "response": {"promptFeedback": {"blockReason": "A_NEW_REASON"}},
+            "traceId": "t"
+        }));
+        assert_eq!(r.stop.reason, StopReason::Safety);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("A_NEW_REASON"));
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["prompt_blocked"],
+            true
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_stream_with_an_empty_candidates_array() {
+        let s = stream_parse(&[r#"{"candidates":[],"promptFeedback":{"blockReason":"SAFETY"}}"#])
+            .expect("an empty candidates array with a block is a reply");
+        assert_eq!(s.stop.reason, StopReason::Safety);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("SAFETY"));
+        assert_eq!(
+            s.stop.wire.details.as_ref().unwrap()["prompt_blocked"],
+            true
+        );
+
+        let r = send_parse(serde_json::json!({
+            "candidates": [], "promptFeedback": {"blockReason": "SAFETY"}
+        }));
+        assert_eq!(r.stop.reason, StopReason::Safety);
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["prompt_blocked"],
+            true
+        );
+    }
+
+    #[test]
+    fn stream_error_body_carries_the_antigravity_provider() {
+        let mut acc = GeminiAccumulator::new("m", "google-antigravity");
+        let err = process_gemini_sse(
+            &sse(r#"{"error":{"code":429,"message":"Quota.","status":"RESOURCE_EXHAUSTED"}}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        match err {
+            ProviderError::Reply(body) => assert_eq!(body.provider, "google-antigravity"),
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_provider_follows_the_variant() {
+        let body = finish_body("STOP");
+        let r = parse_generate_content_response(&body, "m", "google-antigravity").unwrap();
+        assert_eq!(r.stop.wire.provider, "google-antigravity");
+        let mut acc = GeminiAccumulator::new("m", "google-antigravity");
+        process_gemini_sse(&sse(&body.to_string()), &mut acc, &mut |_| {}).unwrap();
+        assert_eq!(
+            acc.into_response().unwrap().stop.wire.provider,
+            "google-antigravity"
+        );
+    }
+
+    #[test]
+    fn stream_error_chunk_is_a_stream_error() {
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
+        let err = process_gemini_sse(
+            &sse(
+                r#"{"error":{"code":503,"message":"The model is overloaded.","status":"UNAVAILABLE"}}"#,
+            ),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        match err {
+            ProviderError::Reply(body) => {
+                assert_eq!(body.class, crate::reply_error::ErrorClass::Overloaded);
+                assert_eq!(body.origin, crate::reply_error::ErrorOrigin::Stream);
+                assert_eq!(body.provider, "google-gemini-cli");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_is_incomplete_and_unknown_is_unrecognized() {
+        let r = send_parse(finish_body("OTHER"));
+        assert_eq!(r.stop.reason, StopReason::Incomplete);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("OTHER"));
+        let r = send_parse(finish_body("SOMETHING_NEW"));
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("SOMETHING_NEW"));
+        let s = stream_parse(&[&finish_body("SOMETHING_NEW").to_string()]).unwrap();
+        assert_eq!(s.stop.reason, StopReason::Unrecognized);
+    }
+
+    #[test]
+    fn a_finish_reason_with_no_parts_is_still_a_reply_on_the_stream() {
+        let s = stream_parse(&[r#"{"candidates":[{"finishReason":"SAFETY"}]}"#]).unwrap();
+        assert_eq!(s.stop.reason, StopReason::Safety);
+        assert!(s.content.is_empty());
     }
 
     #[test]
@@ -2962,7 +3386,7 @@ mod tests {
 
     #[test]
     fn test_process_gemini_sse_malformed_json_returns_error() {
-        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
         let bad_event = crate::sse::SseEvent {
             event_type: "message".into(),
             data: "{ not valid json".into(),
@@ -2973,7 +3397,7 @@ mod tests {
 
     #[test]
     fn test_gemini_accumulator_empty_returns_none() {
-        let acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
         assert!(acc.into_response().is_none());
     }
 }
@@ -3137,7 +3561,7 @@ mod llm_provider_impl_tests {
         let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
-        assert!(matches!(err, ProviderError::Api { status: 403, .. }));
+        assert_eq!(err.status(), Some(403));
     }
 
     #[tokio::test]
@@ -3912,11 +4336,16 @@ mod code_assist_project_tests {
     /// `CaGenerateContentResponse`); both parsers read through it.
     #[test]
     fn the_code_assist_envelope_is_read_through() {
-        let whole = parse_generate_content_response(&wrapped_answer(), "gemini-2.5-pro").unwrap();
+        let whole = parse_generate_content_response(
+            &wrapped_answer(),
+            "gemini-2.5-pro",
+            "google-gemini-cli",
+        )
+        .unwrap();
         assert_eq!(text_of(&whole), "hello back");
         assert_eq!(whole.usage.input_tokens, 3);
 
-        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro", "google-gemini-cli");
         let event = crate::sse::SseEvent {
             event_type: "message".into(),
             data: wrapped_answer().to_string(),

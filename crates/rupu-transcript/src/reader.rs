@@ -19,6 +19,47 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use thiserror::Error;
 
+/// Separator between the text fragments of one turn in [`final_turn_text`].
+/// A blank line, so fragments the model wrote as separate blocks (split by a
+/// thinking block) stay separate paragraphs in Markdown.
+const FRAGMENT_SEPARATOR: &str = "\n\n";
+
+/// The run's final answer text: every non-empty `AssistantMessage` written
+/// after the last `TurnStart`, joined by a blank line. A provider can end a
+/// turn with several text blocks (text, thinking, text), and the runner
+/// writes one `AssistantMessage` per block, so the last message alone is
+/// only the last fragment.
+///
+/// Falls back to the last non-empty `AssistantMessage` when the transcript
+/// has no `TurnStart` (older writers) or the final turn wrote no text.
+/// `None` when no assistant text was written at all. Shared by the workflow
+/// step output and the dispatch tool's child output.
+pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String> {
+    let mut saw_turn_start = false;
+    let mut turn_fragments: Vec<String> = Vec::new();
+    let mut last_non_empty: Option<String> = None;
+    for event in events {
+        match event {
+            Event::TurnStart { .. } => {
+                saw_turn_start = true;
+                turn_fragments.clear();
+            }
+            Event::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                if saw_turn_start {
+                    turn_fragments.push(content.clone());
+                }
+                last_non_empty = Some(content);
+            }
+            _ => {}
+        }
+    }
+    if turn_fragments.is_empty() {
+        last_non_empty
+    } else {
+        Some(turn_fragments.join(FRAGMENT_SEPARATOR))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ReadError {
     #[error("io: {0}")]

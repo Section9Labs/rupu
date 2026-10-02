@@ -143,14 +143,15 @@ impl GithubCopilotClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "github-copilot",
                 status,
                 &headers,
-                truncate(&text, 500),
+                &text,
             ));
         }
 
         let json: serde_json::Value = response.json().await?;
-        crate::openai_wire::parse_chat_completion(&json)
+        crate::openai_wire::parse_chat_completion(&json, "github-copilot")
     }
 
     /// Streaming send with SSE.
@@ -176,14 +177,15 @@ impl GithubCopilotClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "github-copilot",
                 status,
                 &headers,
-                truncate(&text, 500),
+                &text,
             ));
         }
 
         let mut parser = SseParser::new();
-        let mut acc = crate::openai_wire::CompletionAccumulator::new();
+        let mut acc = crate::openai_wire::CompletionAccumulator::new("github-copilot");
         let mut bytes_stream = response.bytes_stream();
 
         use futures_util::StreamExt;
@@ -195,7 +197,7 @@ impl GithubCopilotClient {
             }
         }
 
-        acc.into_response()
+        acc.into_response()?
             .ok_or(ProviderError::UnexpectedEndOfStream)
     }
 
@@ -421,17 +423,14 @@ impl crate::provider::LlmProvider for GithubCopilotClient {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::api_error_from_response(
+                "github-copilot",
+                status.as_u16(),
+                &headers,
+                &text,
+            ));
         }
         let body = resp
             .text()
@@ -721,10 +720,10 @@ mod tests {
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
         });
 
-        let response = parse_chat_completion(&json).unwrap();
+        let response = parse_chat_completion(&json, "github-copilot").unwrap();
         assert_eq!(response.id, "chatcmpl-123");
         assert_eq!(response.text(), Some("Hello!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
     }
 
@@ -751,8 +750,8 @@ mod tests {
             "usage": {"prompt_tokens": 20, "completion_tokens": 10}
         });
 
-        let response = parse_chat_completion(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        let response = parse_chat_completion(&json, "github-copilot").unwrap();
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -776,8 +775,8 @@ mod tests {
             }]
         });
 
-        let response = parse_chat_completion(&json).unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        let response = parse_chat_completion(&json, "github-copilot").unwrap();
+        assert_eq!(response.stop.reason, StopReason::MaxTokens);
     }
 
     #[test]
@@ -825,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_sse_text_streaming() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("github-copilot");
         let mut events = Vec::new();
 
         let event1 = crate::sse::SseEvent {
@@ -840,16 +839,16 @@ mod tests {
         };
         process_completion_sse(&event2, &mut acc, &mut |e| events.push(format!("{e:?}"))).unwrap();
 
-        let response = acc.into_response().unwrap();
+        let response = acc.into_response().unwrap().unwrap();
         assert_eq!(response.id, "chatcmpl-1");
         assert_eq!(response.text(), Some("Hello world!"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(events.len(), 2);
     }
 
     #[test]
     fn test_sse_tool_call_streaming() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("github-copilot");
         let mut events = Vec::new();
 
         let event1 = crate::sse::SseEvent {
@@ -870,8 +869,8 @@ mod tests {
         };
         process_completion_sse(&event3, &mut acc, &mut |_| {}).unwrap();
 
-        let response = acc.into_response().unwrap();
-        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        let response = acc.into_response().unwrap().unwrap();
+        assert_eq!(response.stop.reason, StopReason::ToolUse);
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
         match &tools[0] {
@@ -886,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_sse_done_signal() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("github-copilot");
         let done = crate::sse::SseEvent {
             event_type: "message".into(),
             data: "[DONE]".into(),
@@ -896,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_sse_malformed_json_returns_error() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("github-copilot");
         let bad = crate::sse::SseEvent {
             event_type: "message".into(),
             data: "not json".into(),
@@ -906,8 +905,8 @@ mod tests {
 
     #[test]
     fn test_accumulator_empty_returns_none() {
-        let acc = CompletionAccumulator::new();
-        assert!(acc.into_response().is_none());
+        let acc = CompletionAccumulator::new("github-copilot");
+        assert!(acc.into_response().unwrap().is_none());
     }
 
     #[test]
@@ -1009,11 +1008,16 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let result = parse_chat_completion(&json);
+        let resp = parse_chat_completion(&json, "github-copilot").unwrap();
         assert!(
-            result.is_err(),
-            "malformed tool arguments should return error"
+            !resp
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            "a call with unparseable arguments is never dispatched"
         );
+        assert_eq!(resp.stop.reason, StopReason::MalformedToolCall);
+        assert_eq!(resp.stop.wire.provider, "github-copilot");
     }
 
     #[tokio::test]
@@ -1084,13 +1088,12 @@ mod tests {
         let err = <GithubCopilotClient as LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
-        match err {
-            ProviderError::Api { status, message } => {
-                assert_eq!(status, 401);
-                assert_eq!(message, "Unauthorized");
-            }
-            _ => panic!("expected ProviderError::Api with status 401, got {err:?}"),
-        }
+        let reply = err
+            .reply()
+            .unwrap_or_else(|| panic!("expected a reply error, got {err:?}"));
+        assert_eq!(reply.status(), Some(401));
+        assert_eq!(reply.message, "Unauthorized");
+        assert_eq!(reply.provider, "github-copilot");
     }
 }
 

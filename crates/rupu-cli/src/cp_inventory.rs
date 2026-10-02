@@ -16,7 +16,7 @@
 use chrono::Utc;
 use rupu_auth::CredentialResolver;
 use rupu_cp::fleet_inventory::{FleetInventory, InventorySnapshot, ProbeState, ProviderProbeRow};
-use rupu_providers::{error::ProviderError, provider::LlmProvider};
+use rupu_providers::{error::ProviderError, provider::LlmProvider, reply_error::ErrorClass};
 use std::sync::{Arc, RwLock};
 
 /// How long a probe result stays authoritative. Long enough that a fleet of
@@ -83,19 +83,25 @@ pub struct CpFleetInventory {
 ///
 /// `NotImplemented` is NOT a failure — it means this provider has no probe, so
 /// nothing has been established about it and it must land in `NeverProbed`.
-/// Everything auth-shaped is `AuthFailed`; everything transport- or
+/// Everything auth-shaped is `AuthFailed`, and so is an exhausted quota or
+/// billing failure: the provider answered, the account cannot be used until
+/// the operator fixes it, and "Unreachable" would send them to check the
+/// network instead. Everything transport- or
 /// server-shaped is `Unreachable`. That split is what lets the operator tell
 /// "my key is wrong" from "the provider is down".
 pub fn classify(err: &ProviderError) -> ProbeState {
     match err {
         ProviderError::NotImplemented { .. } => ProbeState::NeverProbed,
-        ProviderError::Unauthorized { .. }
-        | ProviderError::MissingAuth { .. }
+        ProviderError::MissingAuth { .. }
         | ProviderError::TokenRefreshFailed(_)
         | ProviderError::AuthConfig(_) => ProbeState::AuthFailed {
             detail: err.to_string(),
         },
-        ProviderError::Api { status, .. } if *status == 401 || *status == 403 => {
+        e if matches!(
+            e.class(),
+            ErrorClass::Auth | ErrorClass::Permission | ErrorClass::Quota
+        ) =>
+        {
             ProbeState::AuthFailed {
                 detail: err.to_string(),
             }
@@ -419,7 +425,7 @@ async fn probe_one(name: &str, creds: rupu_providers::auth::AuthCredentials) -> 
         // Rate limiting is NOT a health failure: a 429 proves the credential
         // works. Reporting it red would light the strip up during normal
         // heavy use.
-        Err(ProviderError::RateLimited { .. }) => ProbeState::Ok,
+        Err(e) if e.class() == ErrorClass::RateLimited => ProbeState::Ok,
         Err(e) => classify(&e),
     }
 }
@@ -609,25 +615,14 @@ mod tests {
     #[test]
     fn auth_shaped_errors_classify_as_auth_failed() {
         let cases = [
-            ProviderError::Unauthorized {
-                provider: "anthropic".into(),
-                auth_mode: rupu_providers::auth_mode::AuthMode::ApiKey,
-                hint: "check your key".into(),
-            },
             ProviderError::MissingAuth {
                 provider: "anthropic".into(),
                 env_hint: "ANTHROPIC_API_KEY".into(),
             },
             ProviderError::TokenRefreshFailed("expired".into()),
             ProviderError::AuthConfig("bad auth.json".into()),
-            ProviderError::Api {
-                status: 401,
-                message: "nope".into(),
-            },
-            ProviderError::Api {
-                status: 403,
-                message: "nope".into(),
-            },
+            ProviderError::api("anthropic", 401, "nope"),
+            ProviderError::api("anthropic", 403, "nope"),
         ];
         for err in cases {
             assert!(
@@ -637,14 +632,26 @@ mod tests {
         }
     }
 
+    /// A 429 whose body says the quota is exhausted is not a rate limit (the
+    /// probe maps those to Ok) and not an outage: the account needs attention.
+    #[test]
+    fn an_exhausted_quota_classifies_as_auth_failed() {
+        let quota = ProviderError::api(
+            "openai-codex",
+            429,
+            r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        );
+        assert_eq!(quota.class(), ErrorClass::Quota);
+        assert!(matches!(classify(&quota), ProbeState::AuthFailed { .. }));
+        let billing = ProviderError::api("anthropic", 402, "payment required");
+        assert!(matches!(classify(&billing), ProbeState::AuthFailed { .. }));
+    }
+
     #[test]
     fn transport_and_server_errors_classify_as_unreachable() {
         let cases = [
             ProviderError::Http("connection refused".into()),
-            ProviderError::Api {
-                status: 503,
-                message: "down".into(),
-            },
+            ProviderError::api("anthropic", 503, "down"),
         ];
         for err in cases {
             assert!(

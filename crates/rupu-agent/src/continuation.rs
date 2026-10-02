@@ -152,23 +152,17 @@ fn seeded_from(events: &[Event]) -> Option<PathBuf> {
     })
 }
 
-/// The run's answer: the last assistant text event with anything in it.
+/// The run's answer: the final turn's text ([`rupu_transcript::final_turn_text`]
+/// — every non-empty `AssistantMessage` after the last `TurnStart`, joined by
+/// a blank line; the last non-empty one for a transcript without `TurnStart`).
 ///
-/// The runner emits one `AssistantMessage` per text block, so this is the
-/// final text block of the final turn that produced one. Both `Finished`
-/// paths use it, so the recovered answer never depends on whether
+/// The runner emits one `AssistantMessage` per text block, so a final turn
+/// text → thinking → text has two fragments, and both are the answer — the
+/// same rule a workflow step's output and the dispatch tool use. Both
+/// `Finished` paths use it, so the recovered answer never depends on whether
 /// `RunComplete` landed.
 fn final_assistant_text(events: &[Event]) -> String {
-    events
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            Event::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                Some(content.clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_default()
+    rupu_transcript::final_turn_text(events.iter().cloned()).unwrap_or_default()
 }
 
 /// Point a freshly built agent run at the interrupted one: seed it with the
@@ -415,8 +409,48 @@ mod tests {
             .collect();
         write_lines(&t, &without);
         let without_complete = finished_output(&t);
-        assert_eq!(with_complete, "b");
+        assert_eq!(with_complete, "a\n\nb");
         assert_eq!(without_complete, with_complete);
+    }
+
+    /// A finished run whose final turn is text → thinking → text reports
+    /// both fragments, the same rule a workflow step's output uses; the
+    /// earlier tool turn's text is not part of the answer.
+    #[tokio::test]
+    async fn a_two_fragment_final_turn_is_the_whole_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "alpha\n").unwrap();
+        let transcript = tmp.path().join("fragments.jsonl");
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: Some("reading first".into()),
+                tool_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                tool_input: serde_json::json!({ "path": "notes.txt" }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantBlocks {
+                content: vec![
+                    ContentBlock::Text {
+                        text: "Summary:".into(),
+                    },
+                    ContentBlock::Reasoning {
+                        text: Some("check the notes again".into()),
+                        provider: "anthropic".into(),
+                        model: "mock-1".into(),
+                        raw: serde_json::json!({}),
+                    },
+                    ContentBlock::Text {
+                        text: "alpha only".into(),
+                    },
+                ],
+                stop: StopReason::EndTurn,
+            },
+        ]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), transcript.clone());
+        opts.user_message = "summarise notes.txt".into();
+        run_agent(opts).await.unwrap();
+        assert_eq!(finished_output(&transcript), "Summary:\n\nalpha only");
     }
 
     #[tokio::test]

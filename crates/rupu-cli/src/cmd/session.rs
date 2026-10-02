@@ -6871,7 +6871,8 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
                         // is "omitted".
                         raw.to_string().len()
                     }
-                    rupu_providers::types::ContentBlock::Unknown => 0,
+                    rupu_providers::types::ContentBlock::Unknown { .. }
+                    | rupu_providers::types::ContentBlock::Fallback { .. } => 0,
                 })
                 .sum::<usize>()
         })
@@ -7424,7 +7425,8 @@ async fn run_compact_request(
                         // is "omitted".
                         raw.to_string().len()
                     }
-                    rupu_providers::types::ContentBlock::Unknown => 0,
+                    rupu_providers::types::ContentBlock::Unknown { .. }
+                    | rupu_providers::types::ContentBlock::Fallback { .. } => 0,
                 })
                 .sum::<usize>()
         })

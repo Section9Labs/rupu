@@ -9316,10 +9316,11 @@ fn mirrored_unit_tokens(transcript_path: &Path) -> (u64, u64) {
 }
 
 /// Read the just-finished transcript to extract the final assistant
-/// text. The JSONL reader silently skips truncated lines, so this is
-/// robust against half-written transcripts. We do this even on
-/// failure so partial output is observable to downstream `when:`
-/// gates.
+/// text ([`rupu_transcript::final_turn_text`]: every text fragment of the
+/// final turn, the same rule the dispatch tool uses). The JSONL reader
+/// silently skips truncated lines, so this is robust against half-written
+/// transcripts. We do this even on failure so partial output is observable
+/// to downstream `when:` gates.
 pub fn read_final_assistant_text(
     transcript_path: &Path,
     success: bool,
@@ -9328,11 +9329,7 @@ pub fn read_final_assistant_text(
 ) -> String {
     let mut output = String::new();
     if let Ok(iter) = JsonlReader::iter(transcript_path) {
-        for ev in iter.flatten() {
-            if let Event::AssistantMessage { content, .. } = ev {
-                output = content;
-            }
-        }
+        output = rupu_transcript::final_turn_text(iter.flatten()).unwrap_or_default();
     } else if success {
         warn!(
             run_id = %run_id,

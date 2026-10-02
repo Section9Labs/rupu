@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::stop::{
+    FallbackHop, RefusalDetail, RefusalSource, ServedBy, Stop, StopReason, WireStop,
+};
+
 /// Role in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -9,7 +13,7 @@ pub enum Role {
 }
 
 /// A content block within a message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
@@ -50,14 +54,117 @@ pub enum ContentBlock {
         raw: serde_json::Value,
     },
 
-    /// Forward-compatibility catch-all: an unrecognized block type lands here
-    /// instead of failing the whole turn's deserialization.
-    ///
-    /// This variant is never valid on any provider's wire — it serializes as
-    /// `{"type":"Unknown"}`, which no provider accepts. Each provider's
-    /// request builder must drop `Unknown` blocks before sending a request.
-    #[serde(other)]
-    Unknown,
+    /// An Anthropic server-side fallback boundary (`{"type":"fallback",
+    /// "from":{"model":…},"to":{"model":…}}` on the wire). Echoed back to
+    /// Anthropic in place; every other provider's request builder drops it.
+    #[serde(rename = "fallback")]
+    Fallback {
+        from_model: String,
+        to_model: String,
+    },
+
+    /// A block rupu doesn't model, kept verbatim with its producing provider
+    /// (spec 2026-10-01 §4.5). Rendered, never interpreted, and never sent
+    /// back to a provider — every request builder drops it.
+    #[serde(rename = "unknown")]
+    Unknown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        raw: serde_json::Value,
+    },
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Known {
+            #[serde(rename = "text")]
+            Text { text: String },
+            #[serde(rename = "tool_use")]
+            ToolUse {
+                id: String,
+                name: String,
+                input: serde_json::Value,
+            },
+            #[serde(rename = "tool_result")]
+            ToolResult {
+                tool_use_id: String,
+                content: String,
+                #[serde(default)]
+                is_error: bool,
+            },
+            #[serde(rename = "reasoning")]
+            Reasoning {
+                #[serde(default)]
+                text: Option<String>,
+                provider: String,
+                model: String,
+                raw: serde_json::Value,
+            },
+            #[serde(rename = "fallback")]
+            Fallback {
+                from_model: String,
+                to_model: String,
+            },
+            #[serde(rename = "unknown")]
+            Unknown {
+                #[serde(default)]
+                provider: Option<String>,
+                raw: serde_json::Value,
+            },
+        }
+        let value = serde_json::Value::deserialize(d)?;
+        let tag = value
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        let known = matches!(
+            tag,
+            "text" | "tool_use" | "tool_result" | "reasoning" | "fallback" | "unknown"
+        );
+        if !known {
+            // Any unrecognized tag (including the legacy literal "Unknown")
+            // keeps the whole object so nothing the provider sent is lost.
+            return Ok(ContentBlock::Unknown {
+                provider: None,
+                raw: value,
+            });
+        }
+        let k: Known = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(match k {
+            Known::Text { text } => ContentBlock::Text { text },
+            Known::ToolUse { id, name, input } => ContentBlock::ToolUse { id, name, input },
+            Known::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            },
+            Known::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            },
+            Known::Fallback {
+                from_model,
+                to_model,
+            } => ContentBlock::Fallback {
+                from_model,
+                to_model,
+            },
+            Known::Unknown { provider, raw } => ContentBlock::Unknown { provider, raw },
+        })
+    }
 }
 
 /// A conversation message.
@@ -104,16 +211,6 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-}
-
-/// Why the model stopped generating.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StopReason {
-    EndTurn,
-    MaxTokens,
-    StopSequence,
-    ToolUse,
 }
 
 /// Token usage for a request.
@@ -263,7 +360,8 @@ pub struct LlmResponse {
     pub id: String,
     pub model: String,
     pub content: Vec<ContentBlock>,
-    pub stop_reason: Option<StopReason>,
+    /// How the reply ended — always present (spec 2026-10-01 §4.1).
+    pub stop: Stop,
     pub usage: Usage,
 }
 
@@ -408,7 +506,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: "Hello!".into(),
             }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -434,7 +532,7 @@ mod tests {
                     input: serde_json::json!({}),
                 },
             ],
-            stop_reason: Some(StopReason::ToolUse),
+            stop: Stop::synthetic(StopReason::ToolUse, "mock"),
             usage: Usage::default(),
         };
         assert_eq!(response.tool_calls().len(), 1);
@@ -500,7 +598,7 @@ mod tests {
             id: "msg_1".into(),
             model: "m".into(),
             content: vec![],
-            stop_reason: None,
+            stop: Stop::from_wire(StopReason::Unreported, "mock", None),
             usage: Usage::default(),
         };
         assert_eq!(response.text(), None);
@@ -537,10 +635,7 @@ mod tests {
         assert!(e.to_string().contains("ANTHROPIC_API_KEY"));
         assert!(e.to_string().contains("anthropic"));
 
-        let e = ProviderError::Api {
-            status: 401,
-            message: "Unauthorized".into(),
-        };
+        let e = ProviderError::api("anthropic", 401, "Unauthorized");
         let s = e.to_string();
         assert!(s.contains("401"));
         assert!(s.contains("Unauthorized"));
@@ -565,7 +660,7 @@ mod tests {
             id: "msg_1".into(),
             model: "m".into(),
             content,
-            stop_reason: None,
+            stop: Stop::from_wire(StopReason::Unreported, "mock", None),
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -606,22 +701,100 @@ mod tests {
     }
 
     #[test]
-    fn unknown_block_type_deserializes_instead_of_erroring() {
-        // Regression guard: a strict tagged enum used to fail the whole turn.
+    fn unknown_block_type_keeps_its_payload() {
         let json = serde_json::json!({"type": "some_future_block", "payload": 1});
-        let block: ContentBlock =
-            serde_json::from_value(json).expect("unknown block must not error");
-        assert_eq!(block, ContentBlock::Unknown);
+        let block: ContentBlock = serde_json::from_value(json.clone()).expect("must not error");
+        assert_eq!(
+            block,
+            ContentBlock::Unknown {
+                provider: None,
+                raw: json
+            }
+        );
     }
 
     #[test]
-    fn unknown_block_serializes_with_literal_unknown_tag() {
-        // Pins the wire contract: ContentBlock::Unknown is NOT deserialize-only,
-        // it round-trips to `{"type":"Unknown"}`. A later task's request builder
-        // relies on this exact literal tag to identify and drop Unknown blocks
-        // before they reach a provider (no provider accepts this tag).
-        let json = serde_json::to_value(&ContentBlock::Unknown).unwrap();
-        assert_eq!(json["type"], "Unknown");
+    fn legacy_unknown_literal_still_deserializes() {
+        let block: ContentBlock =
+            serde_json::from_value(serde_json::json!({"type": "Unknown"})).unwrap();
+        assert!(matches!(
+            block,
+            ContentBlock::Unknown { provider: None, .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_and_fallback_round_trip() {
+        for b in [
+            ContentBlock::Unknown {
+                provider: Some("anthropic".into()),
+                raw: serde_json::json!({"type": "server_tool_use", "id": "srv_1"}),
+            },
+            ContentBlock::Fallback {
+                from_model: "claude-opus-5-5".into(),
+                to_model: "claude-opus-4-8".into(),
+            },
+        ] {
+            let v = serde_json::to_value(&b).unwrap();
+            assert_eq!(serde_json::from_value::<ContentBlock>(v).unwrap(), b);
+        }
+        let v = serde_json::to_value(ContentBlock::Fallback {
+            from_model: "a".into(),
+            to_model: "b".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"type": "fallback", "from_model": "a", "to_model": "b"})
+        );
+    }
+
+    #[test]
+    fn known_blocks_still_round_trip() {
+        for b in [
+            ContentBlock::Text { text: "hi".into() },
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"p": 1}),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "ok".into(),
+                is_error: false,
+            },
+        ] {
+            let v = serde_json::to_value(&b).unwrap();
+            assert_eq!(serde_json::from_value::<ContentBlock>(v).unwrap(), b);
+        }
+    }
+
+    #[test]
+    fn legacy_shapes_with_defaults_still_parse() {
+        let r: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "reasoning", "provider": "anthropic", "model": "m", "raw": {"type": "thinking"}
+        }))
+        .unwrap();
+        assert!(matches!(r, ContentBlock::Reasoning { text: None, .. }));
+        let t: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "tool_result", "tool_use_id": "t", "content": "c"
+        }))
+        .unwrap();
+        assert!(matches!(
+            t,
+            ContentBlock::ToolResult {
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_known_block_is_still_an_error() {
+        // A known tag with a missing required field is corrupt, not unknown.
+        assert!(
+            serde_json::from_value::<ContentBlock>(serde_json::json!({"type": "text"})).is_err()
+        );
     }
 
     #[test]

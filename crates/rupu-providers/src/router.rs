@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use crate::error::ProviderError;
 use crate::provider::LlmProvider;
 use crate::provider_id::ProviderId;
+use crate::reply_error::ErrorClass;
 use crate::types::{LlmRequest, LlmResponse, StreamEvent};
 
 /// Maximum rounds of trying all providers before giving up.
@@ -139,6 +140,8 @@ impl ProviderRouter {
             }
             ProviderId::GithubCopilot => true,
             ProviderId::OpenaiCompatible => true,
+            // A local or broker provider serves whatever model it is given.
+            ProviderId::Local | ProviderId::Broker => true,
         };
 
         if matches {
@@ -149,9 +152,23 @@ impl ProviderRouter {
     }
 }
 
+/// A provider's refusal that another provider may not share: its rate limit,
+/// its exhausted quota, or its rejection of this account's credentials. Only a
+/// parsed reply counts: a local auth-config failure (`MissingAuth`,
+/// `AuthConfig`) is the operator's to fix and must surface as it is.
+fn reply_fails_over(e: &ProviderError) -> bool {
+    e.reply().is_some_and(|b| {
+        matches!(
+            b.class,
+            ErrorClass::RateLimited | ErrorClass::Quota | ErrorClass::Auth | ErrorClass::Permission
+        )
+    })
+}
+
 #[async_trait]
 impl LlmProvider for ProviderRouter {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+        let mut last_err: Option<ProviderError> = None;
         for round in 0..MAX_ROUTER_ROUNDS {
             if round > 0 {
                 let backoff = ROUTER_ROUND_BACKOFF_MS * 2u64.pow(round - 1);
@@ -170,40 +187,33 @@ impl LlmProvider for ProviderRouter {
 
                 match provider.send(&req).await {
                     Ok(resp) => return Ok(resp),
-                    Err(ProviderError::Api { status: 429, .. })
-                    | Err(ProviderError::RateLimited { .. }) => {
+                    Err(e @ ProviderError::TokenRefreshFailed(_)) => {
                         warn!(
                             provider = %provider.provider_id(),
-                            "rate-limited (429), trying next provider"
-                        );
-                        continue;
-                    }
-                    Err(ProviderError::Api {
-                        status: status @ (401 | 403),
-                        ref message,
-                    }) => {
-                        warn!(
-                            provider = %provider.provider_id(),
-                            status,
-                            message,
-                            "auth failure, trying next provider"
-                        );
-                        continue;
-                    }
-                    Err(ProviderError::TokenRefreshFailed(ref msg)) => {
-                        warn!(
-                            provider = %provider.provider_id(),
-                            error = msg.as_str(),
+                            error = %e,
                             "token refresh failed, trying next provider"
                         );
+                        last_err = Some(e);
                         continue;
                     }
-                    Err(ProviderError::Http(ref msg)) => {
+                    Err(e @ ProviderError::Http(_)) => {
                         warn!(
                             provider = %provider.provider_id(),
-                            error = msg.as_str(),
+                            error = %e,
                             "network error, trying next provider"
                         );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) if reply_fails_over(&e) => {
+                        warn!(
+                            provider = %provider.provider_id(),
+                            class = ?e.class(),
+                            status = e.status(),
+                            message = %e,
+                            "provider refused the request, trying next provider"
+                        );
+                        last_err = Some(e);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -219,15 +229,23 @@ impl LlmProvider for ProviderRouter {
                 req.model = model;
                 match provider.send(&req).await {
                     Ok(resp) => return Ok(resp),
-                    Err(_) => continue,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
                 }
             }
         }
 
-        Err(ProviderError::Api {
-            status: 503,
-            message: "all providers exhausted after all retry rounds".into(),
-        })
+        // The last real failure (it carries the actionable text); the
+        // synthetic 503 only when no provider ever produced one.
+        Err(last_err.unwrap_or_else(|| {
+            ProviderError::api(
+                "router",
+                503,
+                "all providers exhausted after all retry rounds",
+            )
+        }))
     }
 
     async fn stream(
@@ -235,6 +253,7 @@ impl LlmProvider for ProviderRouter {
         request: &LlmRequest,
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<LlmResponse, ProviderError> {
+        let mut last_err: Option<ProviderError> = None;
         for round in 0..MAX_ROUTER_ROUNDS {
             if round > 0 {
                 let backoff = ROUTER_ROUND_BACKOFF_MS * 2u64.pow(round - 1);
@@ -253,40 +272,33 @@ impl LlmProvider for ProviderRouter {
 
                 match provider.stream(&req, on_event).await {
                     Ok(resp) => return Ok(resp),
-                    Err(ProviderError::Api { status: 429, .. })
-                    | Err(ProviderError::RateLimited { .. }) => {
+                    Err(e @ ProviderError::TokenRefreshFailed(_)) => {
                         warn!(
                             provider = %provider.provider_id(),
-                            "rate-limited (429), trying next provider"
-                        );
-                        continue;
-                    }
-                    Err(ProviderError::Api {
-                        status: status @ (401 | 403),
-                        ref message,
-                    }) => {
-                        warn!(
-                            provider = %provider.provider_id(),
-                            status,
-                            message,
-                            "auth failure, trying next provider"
-                        );
-                        continue;
-                    }
-                    Err(ProviderError::TokenRefreshFailed(ref msg)) => {
-                        warn!(
-                            provider = %provider.provider_id(),
-                            error = msg.as_str(),
+                            error = %e,
                             "token refresh failed, trying next provider"
                         );
+                        last_err = Some(e);
                         continue;
                     }
-                    Err(ProviderError::Http(ref msg)) => {
+                    Err(e @ ProviderError::Http(_)) => {
                         warn!(
                             provider = %provider.provider_id(),
-                            error = msg.as_str(),
+                            error = %e,
                             "network error, trying next provider"
                         );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) if reply_fails_over(&e) => {
+                        warn!(
+                            provider = %provider.provider_id(),
+                            class = ?e.class(),
+                            status = e.status(),
+                            message = %e,
+                            "provider refused the request, trying next provider"
+                        );
+                        last_err = Some(e);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -302,15 +314,23 @@ impl LlmProvider for ProviderRouter {
                 req.model = model;
                 match provider.stream(&req, on_event).await {
                     Ok(resp) => return Ok(resp),
-                    Err(_) => continue,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
                 }
             }
         }
 
-        Err(ProviderError::Api {
-            status: 503,
-            message: "all providers exhausted after all retry rounds".into(),
-        })
+        // The last real failure (it carries the actionable text); the
+        // synthetic 503 only when no provider ever produced one.
+        Err(last_err.unwrap_or_else(|| {
+            ProviderError::api(
+                "router",
+                503,
+                "all providers exhausted after all retry rounds",
+            )
+        }))
     }
 
     fn default_model(&self) -> &str {
@@ -339,7 +359,7 @@ mod tests {
                 id: "ok".into(),
                 model: request.model.clone(),
                 content: vec![ContentBlock::Text { text: "ok".into() }],
-                stop_reason: Some(StopReason::EndTurn),
+                stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -369,20 +389,14 @@ mod tests {
     #[async_trait]
     impl LlmProvider for RateLimitedProvider {
         async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-            Err(ProviderError::Api {
-                status: 429,
-                message: "rate limited".into(),
-            })
+            Err(ProviderError::api("mock", 429, "rate limited"))
         }
         async fn stream(
             &mut self,
             _: &LlmRequest,
             _: &mut (dyn FnMut(StreamEvent) + Send),
         ) -> Result<LlmResponse, ProviderError> {
-            Err(ProviderError::Api {
-                status: 429,
-                message: "rate limited".into(),
-            })
+            Err(ProviderError::api("mock", 429, "rate limited"))
         }
         fn default_model(&self) -> &str {
             "limited"
@@ -451,8 +465,110 @@ mod tests {
             }),
         ];
         let mut router = ProviderRouter::new(providers).unwrap();
+        // The last real failure, not a synthetic 503 over it.
         let err = router.send(&test_request()).await.unwrap_err();
-        assert!(matches!(err, ProviderError::Api { status: 503, .. }));
+        assert_eq!(err.status(), Some(429));
+    }
+
+    #[tokio::test]
+    async fn stream_all_rate_limited_returns_the_last_real_error() {
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(RateLimitedProvider {
+                id: ProviderId::Anthropic,
+            }),
+            Box::new(RateLimitedProvider {
+                id: ProviderId::OpenaiCodex,
+            }),
+        ];
+        let mut router = ProviderRouter::new(providers).unwrap();
+        let err = router
+            .stream(&test_request(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), Some(429));
+    }
+
+    /// A provider that fails every call with the error `make` builds.
+    struct ErrProvider {
+        id: ProviderId,
+        make: fn() -> ProviderError,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ErrProvider {
+        async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            Err((self.make)())
+        }
+        async fn stream(
+            &mut self,
+            _: &LlmRequest,
+            _: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            Err((self.make)())
+        }
+        fn default_model(&self) -> &str {
+            "err"
+        }
+        fn provider_id(&self) -> ProviderId {
+            self.id
+        }
+    }
+
+    fn quota_exhausted() -> ProviderError {
+        ProviderError::api(
+            "mock",
+            429,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+        )
+    }
+
+    /// An exhausted account is the textbook reason to try the next provider.
+    #[tokio::test]
+    async fn falls_back_on_an_exhausted_quota() {
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(ErrProvider {
+                id: ProviderId::Anthropic,
+                make: quota_exhausted,
+            }),
+            Box::new(OkProvider {
+                model: "o4-mini".into(),
+                id: ProviderId::OpenaiCodex,
+            }),
+        ];
+        let mut router = ProviderRouter::new(providers).unwrap();
+        assert_eq!(router.send(&test_request()).await.unwrap().model, "o4-mini");
+        let resp = router.stream(&test_request(), &mut |_| {}).await.unwrap();
+        assert_eq!(resp.model, "o4-mini");
+    }
+
+    /// A local auth-config failure is the operator's to fix: it surfaces as
+    /// itself instead of burning every round into a synthetic, retryable 503.
+    #[tokio::test]
+    async fn all_missing_auth_returns_missing_auth_not_a_503() {
+        fn missing() -> ProviderError {
+            ProviderError::MissingAuth {
+                provider: "anthropic".into(),
+                env_hint: "ANTHROPIC_API_KEY".into(),
+            }
+        }
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(ErrProvider {
+                id: ProviderId::Anthropic,
+                make: missing,
+            }),
+            Box::new(ErrProvider {
+                id: ProviderId::OpenaiCodex,
+                make: missing,
+            }),
+        ];
+        let mut router = ProviderRouter::new(providers).unwrap();
+        let err = router.send(&test_request()).await.unwrap_err();
+        assert!(matches!(err, ProviderError::MissingAuth { .. }), "{err:?}");
+        let err = router
+            .stream(&test_request(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::MissingAuth { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -597,20 +713,14 @@ mod tests {
         #[async_trait]
         impl LlmProvider for ErrorProvider {
             async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-                Err(ProviderError::Api {
-                    status: self.status,
-                    message: "server error".into(),
-                })
+                Err(ProviderError::api("mock", self.status, "server error"))
             }
             async fn stream(
                 &mut self,
                 _: &LlmRequest,
                 _: &mut (dyn FnMut(StreamEvent) + Send),
             ) -> Result<LlmResponse, ProviderError> {
-                Err(ProviderError::Api {
-                    status: self.status,
-                    message: "server error".into(),
-                })
+                Err(ProviderError::api("mock", self.status, "server error"))
             }
             fn default_model(&self) -> &str {
                 "err"
@@ -631,7 +741,7 @@ mod tests {
         let mut router = ProviderRouter::new(providers).unwrap();
         let err = router.send(&test_request()).await.unwrap_err();
         assert!(
-            matches!(err, ProviderError::Api { status: 500, .. }),
+            err.status() == Some(500),
             "non-429 error must propagate immediately"
         );
     }
@@ -647,20 +757,14 @@ mod tests {
     #[async_trait]
     impl LlmProvider for AuthFailProvider {
         async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-            Err(ProviderError::Api {
-                status: 401,
-                message: "invalid_grant".into(),
-            })
+            Err(ProviderError::api("mock", 401, "invalid_grant"))
         }
         async fn stream(
             &mut self,
             _: &LlmRequest,
             _: &mut (dyn FnMut(StreamEvent) + Send),
         ) -> Result<LlmResponse, ProviderError> {
-            Err(ProviderError::Api {
-                status: 401,
-                message: "invalid_grant".into(),
-            })
+            Err(ProviderError::api("mock", 401, "invalid_grant"))
         }
         fn default_model(&self) -> &str {
             "broken"
