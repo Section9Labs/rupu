@@ -467,6 +467,19 @@ describe('PerHostListEngine', () => {
     expect(engine.current[0]).toMatchObject({ pagingFailed: true, catchingUp: false, reason: 'head down' });
   });
 
+  it('rename takes the registered name without refetching or touching rows', async () => {
+    const { engine, fetch } = harness((p) => Promise.resolve(rows(p.host, 3, 1)));
+    engine.start([{ id: 'host_ab12', name: 'host_ab12', transport_kind: '' }]);
+    await flush();
+    fetch.mockClear();
+    engine.rename('host_ab12', 'prod', 'ssh');
+    expect(engine.current[0]).toMatchObject({ name: 'prod', transportKind: 'ssh', state: 'ok' });
+    expect(engine.current[0].rows).toHaveLength(3);
+    expect(fetch).not.toHaveBeenCalled();
+    engine.rename('gone', 'x', 'ssh'); // an unknown host is ignored
+    expect(engine.current).toHaveLength(1);
+  });
+
   describe('a replaced refresh (20+ new rows on top) pages back down instead of shrinking', () => {
     /** 25 rows newer than anything `rows(host, …)` holds, so page 0 cannot overlap the old rows. */
     const landed = (host: string) => rows(host, 25, 0.1, -100).map((r) => ({ ...r, id: `new-${r.id}` }));

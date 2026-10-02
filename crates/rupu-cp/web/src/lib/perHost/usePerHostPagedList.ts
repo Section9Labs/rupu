@@ -4,7 +4,8 @@
 // `host: null` lists every registered host: `/api/hosts/registered` (a
 // store read, no SSH), then one request per host, merged by the watermark
 // rule. `host: '<id>'` is one slice, so a page has one code path whatever
-// its filter. The engine (engine.ts) owns per-host state; this hook owns one
+// its filter; for a remote id the host list is read only for its display
+// name, after the first fetch has gone out. The engine (engine.ts) owns per-host state; this hook owns one
 // engine per filter generation and the cadence timers:
 //   local  — every 5 s on polling tables (unchanged)
 //   remote — every 60 s while the tab is visible, plus on tab focus
@@ -94,6 +95,19 @@ export function usePerHostPagedList<T extends HostTagged>({
     if (one !== null) {
       engine.start([{ id: one, name: one === 'local' ? 'Local' : one, transport_kind: one === 'local' ? 'local' : '' }]);
       setHostsKnown(true);
+      if (one !== 'local') {
+        // A picked remote shows under its registered name, but its first fetch never waits on the
+        // host-list read (a store read, no SSH). Until it answers, or if it fails, the raw id.
+        Promise.resolve()
+          .then(() => api.getRegisteredHosts())
+          .then(
+            (hs) => {
+              const h = engineRef.current === engine ? hs.find((x) => x.id === one) : undefined;
+              if (h) engine.rename(one, h.name, h.transport_kind);
+            },
+            () => {},
+          );
+      }
     } else {
       api.getRegisteredHosts().then(
         (hs) => {

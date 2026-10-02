@@ -145,6 +145,12 @@ export class PerHostListEngine<T extends HostTagged> {
     });
   }
 
+  /** Show a host under its registered name (and transport) once known. Rows and state are kept. */
+  rename(id: string, name: string, transportKind: string): void {
+    if (!this.find(id)) return;
+    this.patch(id, (s) => ({ ...s, name, transportKind }));
+  }
+
   /** A row action (archive/restore/delete) took this row out of the list. */
   removeRow(hostId: string, rowId: string): void {
     const held = this.bridging.get(hostId);

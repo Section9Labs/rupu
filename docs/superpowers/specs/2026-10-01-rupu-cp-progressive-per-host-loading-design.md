@@ -192,8 +192,9 @@ timers. A disposed engine ignores every late answer.
 
 The deps/generation handling is the same as `usePagedList`: deps are compared index by
 index into a stable `gen`, and `fetch` is read through a ref. `host: string` (one id)
-produces a single slice and skips the registered-hosts read, so every page has one code
-path whatever its filter.
+produces a single slice, so every page has one code path whatever its filter. Its first
+fetch never waits on the registered-hosts read; for a remote id that read only supplies the
+slice's display name once it answers (the raw id until then, or if it fails).
 
 **Bootstrap** (on mount, or when `gen` changes):
 
@@ -668,6 +669,11 @@ Rulings made while implementing; each is folded into the section named.
   `clamp(budget, 20, 195) + 5` so they never exceed the server's `MAX_LIMIT`.
 - **§6.3: the hook takes `host: string | null` (not `hosts`), a required `idField`, and
   returns `retryPaging` and `removeRow`.** They are what the pages' Retry and row actions use.
+- **§6.3: a replaced page 0 stays out of gating and pages back down at once** (`join()` with a
+  minimum budget of the rows the slice lost), showing its old rows below the re-fetched span
+  meanwhile. Gating at page 0's coverage lifted the floor and collapsed the list under the
+  reader. A single picked remote takes its registered display name without delaying its first
+  fetch.
 - **§6.5: `group_by` is pinned to `model`, not omitted.** It is the server default and every
   transport can answer it; the page never reads `breakdown`.
 - **§6.5: a host that is `ok` for an older window and failed for the current one

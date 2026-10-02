@@ -55,11 +55,35 @@ describe('usePerHostPagedList', () => {
     expect(result.current.slices.map((s) => s.state)).toEqual(['ok', 'ok']);
   });
 
-  it('single-host mode skips the registered-hosts read', async () => {
+  it('single-host mode fetches without waiting on the host list, then shows the registered name', async () => {
+    const hosts = deferred<RegisteredHostView[]>();
+    vi.spyOn(api, 'getRegisteredHosts').mockReturnValue(hosts.promise);
+    const fetch = vi.fn(() => Promise.resolve([] as Row[]));
+    const { result } = renderHook(() => useList(fetch, 'host_prod'));
+    // The host list has not answered, and the first fetch is already out under the raw id.
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })));
+    expect(result.current.slices.map((s) => s.name)).toEqual(['host_prod']);
+
+    await act(async () => hosts.resolve([REG_LOCAL, REG_PROD]));
+    await waitFor(() => expect(result.current.slices.map((s) => s.name)).toEqual(['prod']));
+    expect(result.current.slices[0].transportKind).toBe('http_cp');
+    expect(fetch).toHaveBeenCalledTimes(1); // naming the host refetches nothing
+  });
+
+  it('single-host mode keeps the raw id when the host list cannot be read', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockRejectedValue(new Error('boom'));
+    const fetch = vi.fn(() => Promise.resolve([] as Row[]));
+    const { result } = renderHook(() => useList(fetch, 'host_ab12'));
+    await waitFor(() => expect(result.current.slices.map((s) => s.state)).toEqual(['ok']));
+    expect(result.current.slices[0].name).toBe('host_ab12');
+    expect(result.current.error).toBeNull();
+  });
+
+  it('single-host local never reads the host list', async () => {
     const reg = vi.spyOn(api, 'getRegisteredHosts');
     const fetch = vi.fn(() => Promise.resolve([] as Row[]));
-    renderHook(() => useList(fetch, 'host_prod'));
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })));
+    renderHook(() => useList(fetch, 'local'));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' })));
     expect(reg).not.toHaveBeenCalled();
   });
 
