@@ -443,6 +443,11 @@ impl RunView {
                 s.panel_round = Some(*round);
                 s.panel_max = Some(*max_iterations);
             }
+            // A resumed attempt is announced for display only; it carries no
+            // state the projection folds yet. The `Continued`/`Recovered`/
+            // `Restarted` mark on the step/unit row is rendered by Plan 2
+            // Task 8.
+            Event::AttemptResumed { .. } => {}
         }
     }
 }

@@ -15,7 +15,7 @@ pub mod jsonl_sink;
 pub mod sink;
 
 pub use errors::ExecutorError;
-pub use event::Event;
+pub use event::{AttemptResumeMode, Event};
 pub use file_tail::FileTailRunSource;
 pub use in_memory_sink::InMemorySink;
 pub use in_process::{
