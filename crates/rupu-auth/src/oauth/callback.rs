@@ -270,9 +270,6 @@ pub async fn run_with_client(
         .context("token exchange json")?;
 
     let mut stored = stored_credential_for(provider, token);
-    if provider == ProviderId::Gemini {
-        crate::oauth::gemini::set_up_code_assist(&mut stored).await;
-    }
     if chosen {
         if let AuthCredentials::OAuth { extra, .. } = &mut stored.credentials {
             extra.insert(EXTRA_CLIENT_ID.into(), app.client_id.into());
@@ -287,7 +284,10 @@ pub async fn run_with_client(
 /// adapter can send `metadata.user_id.account_uuid`, binding traffic to
 /// the user's Pro/Max quota pool) and — for OpenAI only — the ID token the
 /// Codex client takes its account id from. Any other provider's ID token
-/// (Gemini's carries the user's email) is not stored.
+/// (Gemini's carries the user's email) is not stored. A Gemini credential
+/// records the OAuth client it was issued to (`variant`: the Gemini CLI's);
+/// its Code Assist project is set up once it is stored
+/// ([`crate::oauth::gemini::set_up_code_assist`]).
 fn stored_credential_for(provider: ProviderId, token: TokenResponse) -> StoredCredential {
     let expires_at = token
         .expires_in
@@ -305,6 +305,15 @@ fn stored_credential_for(provider: ProviderId, token: TokenResponse) -> StoredCr
     if provider == ProviderId::Openai {
         if let Some(id_token) = token.id_token {
             extra.insert("id_token".into(), serde_json::Value::String(id_token));
+        }
+    }
+    if provider == ProviderId::Gemini {
+        let variant = rupu_providers::google_gemini::GeminiVariant::GeminiCli;
+        if let Some(hint) = variant.credential_hint() {
+            extra.insert(
+                rupu_providers::google_gemini::code_assist::EXTRA_VARIANT.into(),
+                hint.into(),
+            );
         }
     }
 

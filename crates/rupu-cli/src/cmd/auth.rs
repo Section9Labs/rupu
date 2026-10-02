@@ -499,6 +499,9 @@ async fn login(
             };
             resolver.store_named(account, mode_neutral, &stored).await?;
             println!("rupu: stored {account} sso credential");
+            if pid == ProviderId::Gemini {
+                rupu_auth::oauth::gemini::set_up_code_assist(&resolver, account, &stored).await;
+            }
         }
     }
     Ok(())

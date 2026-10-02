@@ -58,25 +58,8 @@ async fn run_flow(
     // the caller asserts on it after the flow returns.
     let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
     let token_mock = server.mock(token);
-    let stored = run_flow_on(server, provider, None).await;
+    let stored = drive("/callback", &server.url("/token"), callback::run(provider)).await;
     (stored, token_mock)
-}
-
-/// The callback flow for `provider` against `server`: its token endpoint at
-/// `/token`, and Code Assist — a Gemini login's setup step — on the same
-/// server (a call nothing mocks gets a 404). `google_cloud_project` is the
-/// `GOOGLE_CLOUD_PROJECT` the flow sees; the developer's own value never
-/// leaks in.
-async fn run_flow_on(
-    server: &MockServer,
-    provider: ProviderId,
-    google_cloud_project: Option<&str>,
-) -> StoredCredential {
-    let _code_assist =
-        EnvVarGuard::set("RUPU_CODE_ASSIST_ENDPOINT_OVERRIDE", Some(&server.url("")));
-    let _project = EnvVarGuard::set("GOOGLE_CLOUD_PROJECT", google_cloud_project);
-    let _project_id = EnvVarGuard::set("GOOGLE_CLOUD_PROJECT_ID", None);
-    drive("/callback", &server.url("/token"), callback::run(provider)).await
 }
 
 /// Drive a started callback `flow` through its redirect: wait for its
@@ -266,12 +249,41 @@ fn oauth_extra(stored: &StoredCredential) -> &std::collections::HashMap<String, 
     }
 }
 
-/// A Gemini login runs gemini-cli's Code Assist setup with the new token
-/// and stores the account's project (and the variant the token belongs to)
-/// in the credential — which the store then carries through a refresh.
+/// The browser flow records which OAuth client a Gemini token belongs to
+/// (`rupu auth login` signs in as the Gemini CLI client) and makes no Code
+/// Assist call: the project is set up once the credential is stored.
 #[tokio::test]
 #[serial]
-async fn a_gemini_login_sets_up_code_assist_and_stores_the_project() {
+async fn a_gemini_login_records_the_variant_its_token_belongs_to() {
+    let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
+    let token = server.mock(google_token);
+    let code_assist = server.mock(|when, then| {
+        when.path_contains("/v1internal");
+        then.status(500);
+    });
+    let _code_assist =
+        EnvVarGuard::set("RUPU_CODE_ASSIST_ENDPOINT_OVERRIDE", Some(&server.url("")));
+
+    let stored = drive(
+        "/callback",
+        &server.url("/token"),
+        callback::run(ProviderId::Gemini),
+    )
+    .await;
+
+    token.assert();
+    code_assist.assert_hits(0);
+    let extra = oauth_extra(&stored);
+    assert_eq!(extra["variant"], serde_json::json!("gemini-cli"));
+    assert!(!extra.contains_key("project_id"), "{extra:?}");
+}
+
+/// A Gemini login end to end, as `rupu auth login` runs it: the flow, the
+/// store, then gemini-cli's Code Assist setup with the new token — the
+/// project lands in the stored credential, and a refresh keeps it.
+#[tokio::test]
+#[serial]
+async fn a_gemini_login_stores_the_code_assist_project_which_survives_a_refresh() {
     let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
     let token = server.mock(google_token);
     let load = server.mock(|when, then| {
@@ -290,24 +302,32 @@ async fn a_gemini_login_sets_up_code_assist_and_stores_the_project() {
             "cloudaicompanionProject": "managed-123",
         }));
     });
-
-    let stored = run_flow_on(server, ProviderId::Gemini, None).await;
-
-    load.assert_hits(1);
-    let extra = oauth_extra(&stored);
-    assert_eq!(extra["project_id"], serde_json::json!("managed-123"));
-    assert_eq!(extra["variant"], serde_json::json!("gemini-cli"));
-
-    // Stored, then refreshed: the project is still there, in the file too.
     let tmp = assert_fs::TempDir::new().unwrap();
     let auth_path = tmp.path().join("auth.json");
     let _file = EnvVarGuard::set("RUPU_AUTH_FILE", auth_path.to_str());
-    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", Some(&server.url("/token")));
+    let _code_assist =
+        EnvVarGuard::set("RUPU_CODE_ASSIST_ENDPOINT_OVERRIDE", Some(&server.url("")));
+    let _project = EnvVarGuard::set("GOOGLE_CLOUD_PROJECT", None);
+    let _project_id = EnvVarGuard::set("GOOGLE_CLOUD_PROJECT_ID", None);
+
+    let stored = drive(
+        "/callback",
+        &server.url("/token"),
+        callback::run(ProviderId::Gemini),
+    )
+    .await;
     let resolver = rupu_auth::resolver::KeychainResolver::new();
     resolver
         .store_named("gemini", rupu_providers::AuthMode::Sso, &stored)
         .await
         .unwrap();
+    rupu_auth::oauth::gemini::set_up_code_assist(&resolver, "gemini", &stored).await;
+
+    load.assert_hits(1);
+    let saved = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(saved.contains("managed-123"), "{saved}");
+
+    let _url = EnvVarGuard::set("RUPU_OAUTH_TOKEN_URL_OVERRIDE", Some(&server.url("/token")));
     let refreshed = rupu_auth::resolver::CredentialResolver::refresh(
         &resolver,
         "gemini",
@@ -319,54 +339,12 @@ async fn a_gemini_login_sets_up_code_assist_and_stores_the_project() {
     match refreshed {
         rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => {
             assert_eq!(extra["project_id"], serde_json::json!("managed-123"));
+            assert_eq!(extra["variant"], serde_json::json!("gemini-cli"));
         }
         other => panic!("expected OAuth, got {other:?}"),
     }
     let saved = std::fs::read_to_string(&auth_path).unwrap();
     assert!(saved.contains("managed-123"), "{saved}");
-}
-
-/// A setup that fails (here: Code Assist answers 404) does not fail the
-/// login: the token is good, and the first Gemini request retries the
-/// setup. No project is stored.
-#[tokio::test]
-#[serial]
-async fn a_failed_code_assist_setup_does_not_fail_the_gemini_login() {
-    let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
-    let token = server.mock(google_token);
-
-    let stored = run_flow_on(server, ProviderId::Gemini, None).await;
-
-    token.assert();
-    let extra = oauth_extra(&stored);
-    assert!(!extra.contains_key("project_id"), "{extra:?}");
-    assert_eq!(extra["variant"], serde_json::json!("gemini-cli"));
-}
-
-/// With `GOOGLE_CLOUD_PROJECT` set, the login sets the account up with that
-/// project (gemini-cli's requested project) but does not store it: the
-/// variable is an override for as long as it is set, not the account's
-/// project.
-#[tokio::test]
-#[serial]
-async fn a_gemini_login_sets_up_with_but_does_not_store_google_cloud_project() {
-    let server: &'static MockServer = Box::leak(Box::new(MockServer::start()));
-    server.mock(google_token);
-    let load = server.mock(|when, then| {
-        when.method(POST)
-            .path("/v1internal:loadCodeAssist")
-            .json_body_partial(r#"{ "cloudaicompanionProject": "my-project-123" }"#);
-        then.status(200).json_body(serde_json::json!({
-            "currentTier": { "id": "standard-tier" },
-            "cloudaicompanionProject": "my-project-123",
-        }));
-    });
-
-    let stored = run_flow_on(server, ProviderId::Gemini, Some("my-project-123")).await;
-
-    load.assert_hits(1);
-    let extra = oauth_extra(&stored);
-    assert!(!extra.contains_key("project_id"), "{extra:?}");
 }
 
 /// A GitLab login with a chosen application — a self-managed instance's, or

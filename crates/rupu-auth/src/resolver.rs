@@ -388,14 +388,17 @@ impl KeychainResolver {
     }
 
     /// Merge `fields` into `account`'s stored SSO credential's `extra`, if it
-    /// is still the grant whose refresh token is `holder_refresh`; `false`
+    /// is still the grant `holder` (the credential a client holds) came from
+    /// — the same refresh token, or with none, the same access token; `false`
     /// (nothing written) when it is not — a re-login or logout since. The
-    /// caller holds the [`AuthFileLock`]. A rotation the file could not take
+    /// credential's own fields are never overwritten (reserved keys are
+    /// dropped, as every writer of the credential drops them). The caller
+    /// holds the [`AuthFileLock`]. A rotation the file could not take
     /// ([`unpersisted`]) is the credential merged into, and lands with it.
     fn record_extra_at(
         path: &std::path::Path,
         account: &str,
-        holder_refresh: &str,
+        holder: &AuthCredentials,
         fields: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bool> {
         let key = format!("{account}/{}", AuthMode::Sso.as_str());
@@ -408,7 +411,7 @@ impl KeychainResolver {
             },
         };
         let mut sc = parse_stored_credential(&current, AuthMode::Sso)?;
-        if stored_refresh_token(&sc) != Some(holder_refresh) {
+        if !same_grant(&sc.credentials, holder) {
             return Ok(false);
         }
         let AuthCredentials::OAuth { extra, .. } = &mut sc.credentials else {
@@ -417,6 +420,7 @@ impl KeychainResolver {
         for (k, v) in fields {
             extra.insert(k.clone(), v.clone());
         }
+        sc.credentials.sanitize_extra();
         let payload = serde_json::to_string(&sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
         Self::write_account_at(path, &key, &payload)?;
         Ok(true)
@@ -1076,6 +1080,39 @@ impl RefreshWhen {
     }
 }
 
+/// Whether `stored` is the grant `holder` came from: the same refresh token
+/// — or, for a grant issued without one, the same access token (two logins
+/// without refresh tokens would otherwise look alike).
+fn same_grant(stored: &AuthCredentials, holder: &AuthCredentials) -> bool {
+    match (stored, holder) {
+        (
+            AuthCredentials::OAuth {
+                access: stored_access,
+                refresh: stored_refresh,
+                ..
+            },
+            AuthCredentials::OAuth {
+                access: holder_access,
+                refresh: holder_refresh,
+                ..
+            },
+        ) if holder_refresh.is_empty() => {
+            stored_refresh.is_empty() && stored_access == holder_access
+        }
+        (
+            AuthCredentials::OAuth {
+                refresh: stored_refresh,
+                ..
+            },
+            AuthCredentials::OAuth {
+                refresh: holder_refresh,
+                ..
+            },
+        ) => stored_refresh == holder_refresh,
+        _ => false,
+    }
+}
+
 fn stored_refresh_token(sc: &StoredCredential) -> Option<&str> {
     match &sc.credentials {
         AuthCredentials::OAuth { refresh, .. } => Some(refresh.as_str()),
@@ -1118,24 +1155,31 @@ impl rupu_providers::credential_writes::OAuthRefresher for KeychainRefresher {
         .map_err(|e| rupu_providers::ProviderError::TokenRefreshFailed(e.to_string()))
     }
 
+    /// As a tracked task ([`rupu_providers::credential_writes`], drained
+    /// before exit), holding the process-wide [`file_mutex`] and the
+    /// [`AuthFileLock`] across re-read → merge → write: a caller dropped
+    /// mid-way only stops waiting, and never lets go of the mutex while the
+    /// write still runs.
     async fn record_extra(
         &self,
         holder: AuthCredentials,
         fields: std::collections::HashMap<String, serde_json::Value>,
     ) -> std::result::Result<bool, rupu_providers::ProviderError> {
-        let AuthCredentials::OAuth {
-            refresh: holder_refresh,
-            ..
-        } = holder
-        else {
-            return Ok(false);
-        };
-        let account = self.account.clone();
-        KeychainResolver::with_lock_at(self.path.clone(), self.lock_timeout, move |path| {
-            KeychainResolver::record_extra_at(path, &account, &holder_refresh, &fields)
-        })
-        .await
-        .map_err(|e| rupu_providers::ProviderError::AuthConfig(e.to_string()))
+        let (path, account, lock_timeout) =
+            (self.path.clone(), self.account.clone(), self.lock_timeout);
+        let job = rupu_providers::credential_writes::spawn(async move {
+            KeychainResolver::with_lock_at(path, lock_timeout, move |path| {
+                KeychainResolver::record_extra_at(path, &account, &holder, &fields)
+            })
+            .await
+        });
+        job.await
+            .map_err(|e| {
+                rupu_providers::ProviderError::AuthConfig(format!(
+                    "credential write task failed: {e}"
+                ))
+            })?
+            .map_err(|e| rupu_providers::ProviderError::AuthConfig(e.to_string()))
     }
 }
 

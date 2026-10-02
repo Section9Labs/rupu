@@ -576,29 +576,60 @@ impl GoogleGeminiClient {
         match code_assist::project_override(self.env)? {
             Some(o) if o.project == self.project_id => {}
             Some(o) => {
-                let project = self.set_up_user(Some(&o.project)).await?;
-                info!(var = o.var, project = %project, "Code Assist project from the environment");
+                let (project, _) = self.set_up_user(Some(&o.project)).await?;
+                info!(var = o.var, requested = %o.project, project = %project, "Code Assist project set up from the environment");
                 self.override_project = Some(project);
             }
             None if !self.project_id.is_empty() => {}
             None => {
-                let project = self.set_up_user(None).await?;
-                self.record_project(&project).await;
-                self.project_id = project;
+                let (project, ran_it) = self.set_up_user(None).await?;
+                // Settled before the record, so a caller dropped while the
+                // store waits for its lock leaves this client settled.
+                self.project_id = project.clone();
+                self.project_settled = true;
+                // The client that ran the setup records it; the ones that
+                // shared its result (see `shared_setup`) leave it to that one.
+                if ran_it {
+                    self.record_project(&project).await;
+                }
+                return Ok(());
             }
         }
         self.project_settled = true;
         Ok(())
     }
 
-    async fn set_up_user(&self, project: Option<&str>) -> Result<String, ProviderError> {
-        code_assist::setup_user(
-            &self.client,
-            &self.code_assist_base,
+    /// The setup for this client's account at its endpoint, shared with
+    /// every other client in the process asking for the same
+    /// ([`code_assist::shared_setup`]); `true` when this call ran it. The
+    /// grant is keyed by a hash of its refresh token (the access token when
+    /// there is none), so no token is kept beyond the clients holding it.
+    async fn set_up_user(&self, project: Option<&str>) -> Result<(String, bool), ProviderError> {
+        use std::hash::{Hash, Hasher};
+        let grant = if self.refresh_token.is_empty() {
+            &self.access_token
+        } else {
+            &self.refresh_token
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        grant.hash(&mut hasher);
+        let key = format!(
+            "{}\n{:?}\n{:016x}\n{}",
+            self.code_assist_base,
             self.variant,
-            &self.access_token,
-            project,
-            &self.onboard_poll,
+            hasher.finish(),
+            project.unwrap_or_default()
+        );
+        code_assist::shared_setup(
+            key,
+            code_assist::setup_user(
+                &self.client,
+                &self.code_assist_base,
+                self.variant,
+                &self.access_token,
+                project,
+                &self.onboard_poll,
+            ),
         )
         .await
     }
@@ -628,7 +659,7 @@ impl GoogleGeminiClient {
                 };
                 match store.record_extra(holder, fields).await {
                     Ok(true) => info!(project, "recorded the Code Assist project in the stored credential"),
-                    Ok(false) => info!(project, "the stored credential changed since this client read it (a re-login or logout); the Code Assist project was not recorded in it"),
+                    Ok(false) => info!(project, "the stored credential is no longer the one this client holds (a re-login or logout since, or another holder's token rotation); the Code Assist project was not recorded in it"),
                     Err(e) => warn!(project, error = %e, "the Code Assist project could not be recorded in the stored credential; the next process sets it up again"),
                 }
             }
@@ -646,7 +677,15 @@ impl GoogleGeminiClient {
                     expires: self.expires_ms,
                     extra,
                 };
-                if let Err(e) = save_provider_auth(path, self.variant.provider_id(), &creds) {
+                let (path, provider) = (path.clone(), self.variant.provider_id());
+                let written = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || save_provider_auth(&path, provider, &creds)
+                })
+                .await
+                .map_err(|e| ProviderError::AuthConfig(format!("write task failed: {e}")))
+                .and_then(|r| r);
+                if let Err(e) = written {
                     warn!(path = %path.display(), project, error = %e, "the Code Assist project could not be written; the next process sets it up again");
                 }
             }
@@ -3712,6 +3751,91 @@ mod code_assist_project_tests {
         generate.assert_hits(0);
         generate_lower.assert_hits(0);
         assert!(store.recorded.lock().unwrap().is_empty());
+    }
+
+    /// The first requests of a fan-out on an account with no stored project
+    /// (several clients in one process at once) set the account up once —
+    /// one `loadCodeAssist`, one record — and all carry the project.
+    #[tokio::test]
+    async fn concurrent_first_requests_set_the_account_up_once() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(200))
+                .json_body(json!({
+                    "currentTier": { "id": "free-tier" },
+                    "cloudaicompanionProject": "managed-fan",
+                }));
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:generateContent")
+                .json_body_partial(r#"{ "project": "managed-fan" }"#);
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut clients: Vec<GoogleGeminiClient> = (0..3)
+            .map(|_| {
+                client_for(
+                    &server,
+                    creds(None, None),
+                    GeminiVariant::GeminiCli,
+                    Some(store.clone()),
+                )
+            })
+            .collect();
+        let req = request();
+
+        let results =
+            futures_util::future::join_all(clients.iter_mut().map(|c| c.send(&req))).await;
+
+        for r in results {
+            r.unwrap();
+        }
+        load.assert_hits(1);
+        generate.assert_hits(3);
+        assert_eq!(store.recorded.lock().unwrap().len(), 1);
+    }
+
+    /// A client of the legacy auth file (`ProviderRegistry`, no credential
+    /// store) writes the project there, as its token refresh does.
+    #[tokio::test]
+    async fn the_legacy_auth_file_records_the_project() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "free-tier" },
+                "cloudaicompanionProject": "managed-legacy",
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:generateContent");
+            then.status(200).json_body(wrapped_answer());
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = GoogleGeminiClient::new(
+            creds(None, None),
+            GeminiVariant::GeminiCli,
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.code_assist_base = server.url("");
+        client.env = no_env;
+
+        client.send(&request()).await.unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["google-gemini-cli"]["project_id"],
+            json!("managed-legacy"),
+            "{saved}"
+        );
+        assert_eq!(saved["google-gemini-cli"]["refresh"], json!("refresh-1"));
     }
 
     #[test]

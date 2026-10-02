@@ -220,6 +220,39 @@ pub async fn setup_user(
     Ok(chosen)
 }
 
+/// The result of a setup some caller in this process already ran for `key`
+/// (an account at an endpoint, with the requested project), or `setup`'s —
+/// run by one caller at a time per key, the others waiting for it. `true`
+/// with the project when this call ran `setup` itself.
+///
+/// The first requests of a fan-out on an account with no stored project
+/// would otherwise each set it up, and onboard it, at once; gemini-cli
+/// caches `setupUser` per auth client for the same reason (`userDataCache`
+/// in `setup.ts`). Only a success is kept: after a failure the next caller
+/// runs the setup again.
+pub async fn shared_setup<F>(key: String, setup: F) -> Result<(String, bool), ProviderError>
+where
+    F: std::future::Future<Output = Result<String, ProviderError>>,
+{
+    type Slot = std::sync::Arc<tokio::sync::Mutex<Option<String>>>;
+    static SETUPS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Slot>>> =
+        std::sync::OnceLock::new();
+    let slot = SETUPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    let mut done = slot.lock().await;
+    if let Some(project) = done.as_ref() {
+        return Ok((project.clone(), false));
+    }
+    let project = setup.await?;
+    *done = Some(project.clone());
+    Ok((project, true))
+}
+
 /// gemini-cli's `coreClientMetadata`, with `duetProject` when a project is
 /// requested.
 fn client_metadata(project: Option<&str>) -> serde_json::Value {
@@ -580,7 +613,12 @@ mod tests {
         // answers with the first-created matching mock, so the "done" mock is
         // added before the "pending" one goes: no poll can fall in a gap.
         let flip = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while pending.hits() < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the operation was never polled twice"
+                );
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             let done = server.mock(|when, then| {
