@@ -16,6 +16,7 @@ pub mod event_match;
 pub mod event_vocab;
 pub mod executor;
 pub mod generate;
+pub mod recovery;
 pub mod run_step;
 pub mod runner;
 pub mod runs;
@@ -33,6 +34,7 @@ pub use generate::{
     generate_definition, pick_default_gen_model, GenKind, GenerateError, GenerateOutcome,
     GenerateRequest,
 };
+pub use recovery::{AttemptPlan, PlanCounts, RecoveryPlans, StepPlan};
 pub use runner::{
     read_final_assistant_text, resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult,
     OrchestratorRunOpts, OrchestratorRunResult, PauseReason, PausedStep, ResumeState,
