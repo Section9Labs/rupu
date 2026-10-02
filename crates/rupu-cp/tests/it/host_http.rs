@@ -1053,11 +1053,18 @@ async fn pull_finding_artifact_streams_a_real_remotes_blob() {
         c.pull_finding_artifact(&sha, &out, 3).await,
         Err(HostConnectorError::Invalid(_))
     ));
-    // Absent on the remote.
-    assert!(matches!(
-        c.pull_finding_artifact(&"cd".repeat(32), &out, 10).await,
-        Err(HostConnectorError::NotFound(_))
-    ));
+    // Absent on the remote: an actionable reason naming the blob and the
+    // host, not the bare request URL.
+    let absent = "cd".repeat(32);
+    let err = c
+        .pull_finding_artifact(&absent, &out, 10)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::NotFound(m)
+            if *m == format!("artifact {absent} is not in host http://{addr}'s store")),
+        "{err:?}"
+    );
     // A malformed digest never reaches the wire.
     assert!(matches!(
         c.pull_finding_artifact("../x", &out, 10).await,

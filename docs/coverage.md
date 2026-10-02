@@ -275,7 +275,8 @@ it depends on the transport:
   until they land.
 
 A pull is capped at the recorded size, then checked against the recorded size
-and sha256 before the blob enters the store. Concurrent first downloads of the
+and sha256 before the blob enters the store. A recorded size over this control
+plane's own `artifact_max_bytes` is refused without contacting the host. Concurrent first downloads of the
 same blob share one pull. A local over-cap file (`external` with no `host`) is
 served from the workspace while it still hashes to the recorded sha: `404` once
 the file is gone, `409` once it has changed. Text artifacts are served as plain
@@ -285,7 +286,8 @@ When a remote artifact's bytes cannot be had, the response is `404` with
 `{"unavailable": "<reason>"}`: the host is unreachable or not registered, the
 node is offline, the blob is not in the host's store (this includes a file the
 host recorded by reference because it was over the copy cap), the host is too
-old to serve it, or the bytes failed the size or hash check. Nothing is stored
+old to serve it, the recorded size is over this control plane's
+`artifact_max_bytes`, or the bytes failed the size or hash check. Nothing is stored
 for a failed pull, and the next view tries again.
 
 The web finding page's artifact browser uses the same endpoint. It previews

@@ -707,6 +707,13 @@ async fn open_store_blob(path: &std::path::Path) -> Result<Option<tokio::fs::Fil
 /// any host), otherwise pulled from `host` — and only `host`, resolved
 /// through the host registry — into the store first. `Err` is the
 /// `unavailable` reason.
+///
+/// The recorded `size` caps the pull, but it comes from an agent-writable
+/// ledger: a forged size of many gigabytes would let a host (or a bucket
+/// writer) fill this CP's disk before the hash check fails. A copied artifact
+/// cannot legitimately exceed its host's copy cap, so a recorded size over
+/// this CP's own `[findings].artifact_max_bytes` is refused before any host
+/// is contacted.
 async fn remote_artifact(
     s: &AppState,
     blob: &std::path::Path,
@@ -716,6 +723,18 @@ async fn remote_artifact(
 ) -> Result<tokio::fs::File, String> {
     if let Some(file) = open_store_blob(blob).await? {
         return Ok(file);
+    }
+    let limit = s
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.findings.artifact_max_bytes)
+        .unwrap_or(rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES);
+    if size > limit {
+        return Err(format!(
+            "artifact {sha256} is recorded as {size} bytes, over this control plane's \
+             [findings].artifact_max_bytes of {limit} bytes"
+        ));
     }
     let conn = s.hosts.resolve(host).map_err(|e| match e {
         crate::host::connector::HostConnectorError::NotFound(_) => {
@@ -797,6 +816,11 @@ impl Drop for RetireOnDrop {
 }
 
 /// Run `pull` as THE pull into `dest`, or join the one already in flight.
+///
+/// A request that joins an in-flight pull for the same destination gets that
+/// pull's outcome, even if its own record names a different host or size: a
+/// successful pull is still sha-verified into the content address, so only a
+/// failure can be shared.
 ///
 /// Cancel-safe: the pull runs in its own spawned task, to completion,
 /// whether or not anyone still waits on it. A request whose client goes away
@@ -2568,7 +2592,9 @@ mod tests {
             vec![artifact_ref(
                 "/var/log/big.bin",
                 &sha,
-                9_999_999_999,
+                // Under the coordinator's own size limit, which is refused
+                // before the host is even resolved.
+                4_096,
                 Some(ArtifactKind::Binary),
                 Some(ArtifactStorage::External),
                 Some("build-box-7"),

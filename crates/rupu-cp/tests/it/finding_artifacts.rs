@@ -389,9 +389,105 @@ async fn a_blob_missing_on_the_remote_is_unavailable_naming_the_host() {
         .unwrap();
     let reason = unavailable_reason(r).await;
     assert!(reason.contains(&host), "{reason}");
-    assert!(reason.contains("not found"), "{reason}");
+    assert!(
+        reason.contains(&format!(
+            "artifact {sha} is not in host http://{remote_addr}'s store"
+        )),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("/api/"),
+        "no bare URL as the reason: {reason}"
+    );
     assert!(!stored(coord.path(), &sha).exists());
     assert!(pull_leftovers(coord.path()).is_empty());
+}
+
+/// The recorded size caps the pull, but it comes from an agent-writable
+/// ledger: a forged size of many gigabytes would let a host (or a bucket
+/// writer) fill this control plane's disk before the hash check fails. A
+/// recorded size over the coordinator's own `[findings].artifact_max_bytes`
+/// (default `DEFAULT_ARTIFACT_MAX_BYTES`) is refused as unavailable, naming
+/// the limit, without contacting the host.
+#[tokio::test]
+async fn a_recorded_size_over_the_coordinators_limit_is_unavailable_without_a_pull() {
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "9.9.9", "features": ["findings.artifact_blob"]
+        }));
+    });
+    let blob = server.mock(|when, then| {
+        when.method("GET")
+            .path_matches(httpmock::Regex::new(r"^/api/findings/artifacts/").unwrap());
+        then.status(200).body("whatever");
+    });
+    let coord = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let (st, host) = coordinator(coord.path(), ws.path(), &server.base_url());
+    let small = sha_of(b"fourteen bytes");
+    let id = write_finding(
+        ws.path(),
+        "find_OVERCAP",
+        artifact(&small, 14, ArtifactKind::Binary, Some(&host)),
+    );
+    // The coordinator's limit (8 bytes) is under the recorded 14.
+    st.config.write().unwrap().findings.artifact_max_bytes = Some(8);
+    let addr = serve(st).await;
+
+    let r = reqwest::get(format!("http://{addr}/api/findings/{id}/artifacts/{small}"))
+        .await
+        .unwrap();
+    let reason = unavailable_reason(r).await;
+    assert!(reason.contains("artifact_max_bytes"), "{reason}");
+    assert!(
+        reason.contains("14 bytes") && reason.contains("8 bytes"),
+        "{reason}"
+    );
+    info.assert_hits(0);
+    blob.assert_hits(0);
+    assert!(!stored(coord.path(), &small).exists());
+    assert!(pull_leftovers(coord.path()).is_empty());
+}
+
+/// With no `[findings].artifact_max_bytes`, the limit is the default.
+#[tokio::test]
+async fn a_recorded_size_over_the_default_limit_is_unavailable_without_a_pull() {
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "9.9.9", "features": ["findings.artifact_blob"]
+        }));
+    });
+    let coord = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let (st, host) = coordinator(coord.path(), ws.path(), &server.base_url());
+    let forged = sha_of(b"forged");
+    let id = write_finding(
+        ws.path(),
+        "find_FORGED",
+        artifact(
+            &forged,
+            rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES + 1,
+            ArtifactKind::Binary,
+            Some(&host),
+        ),
+    );
+    let addr = serve(st).await;
+    let r = reqwest::get(format!(
+        "http://{addr}/api/findings/{id}/artifacts/{forged}"
+    ))
+    .await
+    .unwrap();
+    let reason = unavailable_reason(r).await;
+    assert!(reason.contains("artifact_max_bytes"), "{reason}");
+    assert!(
+        reason.contains(&rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES.to_string()),
+        "{reason}"
+    );
+    info.assert_hits(0);
 }
 
 /// A remote whose blob route parks every request until the test releases it,

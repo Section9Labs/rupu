@@ -589,7 +589,7 @@ impl HostConnector for HttpHostConnector {
                 idle.as_secs()
             ))
         };
-        let resp = tokio::time::timeout(
+        let sent = tokio::time::timeout(
             idle,
             self.send(
                 self.client
@@ -598,7 +598,19 @@ impl HostConnector for HttpHostConnector {
             ),
         )
         .await
-        .map_err(|_| stalled())??;
+        .map_err(|_| stalled())?;
+        let resp = match sent {
+            Ok(resp) => resp,
+            // `send`'s NotFound carries the bare request URL, which tells a
+            // viewer nothing they can act on.
+            Err(HostConnectorError::NotFound(_)) => {
+                return Err(HostConnectorError::NotFound(format!(
+                    "artifact {sha256} is not in host {}'s store",
+                    self.base_url
+                )))
+            }
+            Err(e) => return Err(e),
+        };
         let too_big = || {
             HostConnectorError::Invalid(format!(
                 "artifact {sha256} exceeds its recorded {max_bytes} bytes"
