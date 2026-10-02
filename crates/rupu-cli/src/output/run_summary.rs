@@ -46,7 +46,8 @@ fn findings_line(by_severity: &BTreeMap<String, usize>) -> Option<String> {
     Some(parts.join(" · "))
 }
 
-/// One `⚠ <step>: <message>` line per `StepWarning` the run emitted, in
+/// One `⚠ <step>: <message>` line per `StepWarning` the run emitted
+/// (`⚠ <step>[<unit index>]: <message>` when it is about one fan-out unit), in
 /// arrival order. The summary is printed after the live view's alternate
 /// screen is gone, so this is the only place a warning (e.g. a remote unit
 /// whose coverage could not be collected) outlives the run — print every one;
@@ -55,9 +56,10 @@ fn warning_lines(v: &RunView) -> Vec<String> {
     format_warnings(&v.warnings)
 }
 
-/// The `⚠ <step>: <message>` form of `RunView::warnings`-shaped entries —
-/// shared by the completion summary and `rupu workflow show-run` so the two
-/// can never print a warning differently.
+/// The `⚠ <step>: <message>` form of `RunView::warnings`-shaped entries
+/// (`<step>[<unit index>]` for a unit-scoped warning) — shared by the
+/// completion summary and `rupu workflow show-run` so the two can never print
+/// a warning differently.
 pub fn format_warnings(warnings: &[String]) -> Vec<String> {
     warnings.iter().map(|w| format!("⚠ {w}")).collect()
 }

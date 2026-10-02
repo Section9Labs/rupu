@@ -384,6 +384,11 @@ Rules:
 - Remote steps (`host:` / `distribute:`) follow the same order. The coordinator resolves the step's value, else `defaults.findings_profile`, and launches each unit with `rupu run --findings-profile <profile>`. When neither is set, the host resolves the agent's `findingsProfile` from its own copy of the agent file, then `full`. A fan-out unit retried on its fallback host keeps the profile.
 - A remote host that can't honour the profile refuses the launch; the unit doesn't run under a different profile. That covers an older tunnel node that didn't advertise support, a bucket whose pull workers haven't advertised it, and an HTTP host whose `/api/host/info` doesn't list it. An older SSH host's `rupu run` rejects the unknown flag, so the unit fails. One gap remains on bucket hosts: an old worker polling the same bucket as an upgraded one can't be detected and may still claim the unit.
 - Upgrade rupu on a remote host before adding `findingsProfile` to an agent it runs: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys.
+- A remote unit's findings and coverage reach the coordinator through the
+  run's coverage stream, not the workspace delta: `.rupu/coverage/` is not
+  carried back by `workspace: sync`. A host that can't deliver the stream (an
+  older release, say) shows a `StepWarning` on the step and the unit is not
+  failed; see `docs/coverage.md`.
 - The field must never be silently ignored, so these are parse errors:
   - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
   - `findings_profile` on an `action:` step that calls any tool other than `findings.record` (e.g. `action: issues.comment`) — only `findings.record` has a findings contract for the profile to configure.
@@ -1127,7 +1132,7 @@ steps:
 
 ### `workspace:`
 
-`workspace: sync` makes the coordinator's workspace available on the remote host and brings file changes back afterward. The default — `workspace:` omitted, or `workspace: none` — keeps the step self-contained: the remote step sees only its rendered prompt plus prior steps' string outputs, no files.
+`workspace: sync` makes the coordinator's workspace available on the remote host and brings file changes back afterward. The default — `workspace:` omitted, or `workspace: none` — keeps the step self-contained: the remote step sees only its rendered prompt plus prior steps' string outputs, no files. Coverage ledgers under `.rupu/coverage/` are not part of the returned delta; they travel in the run's coverage stream.
 
 `workspace:` is only meaningful on a remote step (one with `host:` or `distribute:`); setting `sync` on a purely local step is rejected at parse time as author confusion. A workflow-level `defaults.workspace:` sets the fallback used by every remote step that doesn't set its own.
 

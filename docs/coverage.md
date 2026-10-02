@@ -210,11 +210,21 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A path that escapes the workspace, names the workspace root itself (`.`),
   does not exist, or names something other than a regular file (a device,
   socket, or the like) rejects the finding, so a typo is not silently dropped.
-- A remote workflow unit (`host:` / `distribute:`) runs `report_finding` on the
-  host, so its artifacts go into **that host's** store and are recorded
-  `stored: copied` with no `host`. Recording them as `stored: external` with
-  `host` set, and pulling them into the coordinator's store on first view, is
-  specified but not built yet.
+- A remote workflow unit (`host:` / `distribute:`) records findings on its
+  host. Every `rupu run` also streams its coverage (runs, file touches,
+  concern assertions, findings, engagement assets) to
+  `$RUPU_HOME/runs/<run_id>/coverage.jsonl`, which the host's connector
+  delivers to the coordinator when the unit ends — success or failure — on
+  every transport. The coordinator merges it under its own workspace's targets
+  and records the unit's artifacts `stored: external` with `host` set (their
+  blobs stay in the host's store; a unit placed on the coordinator's own
+  `local` host shares its store, so its artifacts stay `copied`). A host too
+  old to stream, or a stream that cannot be collected or merged, shows a
+  `StepWarning` on the step — in the control-plane run view (a marker on the
+  run graph and a card in the event feed), in the Situation Room, in the CLI
+  live view, and in the completion summary and `rupu workflow show-run`; the
+  unit is not failed. Pulling the blobs into the coordinator's store on first
+  view is specified but not built yet.
 
 Each evidence claim's `sha256` is taken only from a file that resolves inside
 the workspace and is no larger than `artifact_max_bytes`; other claims are
@@ -304,10 +314,10 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
   external artifact on this machine is opened once and hashed from that same
   handle: `409` if it no longer matches the recorded hash, `404` if it is gone.
   Artifacts recorded by remote or placed units are not viewable in the control
-  plane yet: such a unit ingests into that host's own store, and nothing records
-  the host on the artifact today. Should an artifact ever carry a `host`, the
-  endpoint answers `404` for it, because fetching from another host is not
-  built (see `TODO.md`).
+  plane yet: such a unit's findings arrive through its run's coverage stream and
+  are recorded `stored: external` with `host` set, but their blobs stay in that
+  host's store. The endpoint answers `404` for an artifact that carries a `host`,
+  because fetching from another host is not built (see `TODO.md`).
 
 ### Exporting reports
 

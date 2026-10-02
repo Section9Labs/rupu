@@ -208,3 +208,15 @@ This is a required method with no default. It streams the host-store blob `<aa>/
 ## Changes to the parent spec
 
 §Artifacts's placed-unit rule is implemented as written. §CP API's `GET /api/findings/:id/artifacts/:sha256` is delivered by Plan B, ahead of the parent's Plan 2, which renders it. It adds one reason for the `unavailable` body: the local external workspace file has changed.
+
+## As built (Plan A)
+
+Where Plan A differs from the text above (the body is left as designed):
+
+- **The stream path rides on `ToolContext.coverage_stream`**, not a new `AgentRunOpts` field. `AgentRunOpts` has about 58 struct literals and no `Default`, and `ToolContext` already carries run-scoped coverage state. `rupu run` sets it; `DefaultStepFactory` and sessions leave it `None`.
+- **The write helper is `ledger::stream::append_record`**, not `ledger::append`. The catalog snapshot goes through `stream_catalog`. The async file-touch writer writes and flushes its ledger line and then mirrors it with `stream_json`, rather than keeping a second append handle for the stream. A stream write that fails is logged and never returned, so it cannot fail the run.
+- **`.rupu/coverage/` is excluded when the delta is collected, and is not ignored on apply.** Collection runs on the host, so an older host's delta still carries its coverage, and applying it keeps that host's findings arriving as before. The exclusion matches only `.rupu/coverage/` at the workspace root, and a coverage file the host deleted from the baseline is not reported as a deletion.
+- **`dispatch_agent` children on a host stream into the unit's file.** `CliAgentDispatcher` carries the stream path and hands it to each child's `ToolContext`.
+- **The stream has a seventh line kind, `assets`**: the engagement asset ledger (#716), merged after this spec was written. `ingest_unit_stream` de-duplicates asset lines by how many times each line occurs, since the asset store folds last-line-wins and a state may legitimately recur.
+- **`Event::StepWarning` is shown** on the run graph and event feed in the CP run view, in the Situation Room, in the CLI live view, and in the completion summary and `rupu workflow show-run`.
+- **`Event::StepWarning` is not in the macOS fixtures.** The app is deprecated and decodes unknown event tags as `.unknown`.

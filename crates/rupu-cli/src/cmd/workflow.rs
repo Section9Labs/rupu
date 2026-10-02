@@ -1033,8 +1033,9 @@ struct WorkflowShowRunItem {
     awaiting_since: Option<String>,
     expires_at: Option<String>,
     steps: Vec<WorkflowShowRunStep>,
-    /// `<step>: <message>` per `StepWarning` in the run's event log, in
-    /// order (pretty output prints each as `⚠ <step>: <message>`).
+    /// `<step>: <message>` per `StepWarning` in the run's event log
+    /// (`<step>[<unit index>]: <message>` when it is about one fan-out unit),
+    /// in order (pretty output prints each prefixed with `⚠ `).
     warnings: Vec<String>,
     usage_rows: Vec<WorkflowShowRunUsageRow>,
     usage_totals: Option<WorkflowShowRunUsageTotals>,
