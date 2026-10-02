@@ -1118,7 +1118,7 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                 // Either already consumed by the verbatim replay above, or a
                 // foreign provider's block, which is deliberately ignored.
                 ContentBlock::Reasoning { .. } => {}
-                ContentBlock::Unknown => {}
+                ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
             }
         }
 
@@ -2229,6 +2229,28 @@ mod tests {
         assert_eq!(parts[0]["text"], "calling");
         assert_eq!(parts[1]["functionCall"]["name"], "f");
         assert_eq!(parts[1]["functionCall"]["args"]["x"], 1);
+    }
+
+    #[test]
+    fn convert_messages_drops_fallback_and_unknown_blocks() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Fallback {
+                    from_model: "a".into(),
+                    to_model: "b".into(),
+                },
+                ContentBlock::Unknown {
+                    provider: None,
+                    raw: serde_json::json!({"type": "x"}),
+                },
+                ContentBlock::Text { text: "hi".into() },
+            ],
+        }];
+        let contents = convert_messages(&messages);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "hi");
     }
 
     #[test]

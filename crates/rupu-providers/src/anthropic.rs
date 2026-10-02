@@ -152,8 +152,10 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
 /// fine, and *stripping* them is what triggers ordering/signature 400s. The gate
 /// is the provider tag only; do not add a model check here.
 ///
-/// `Unknown` blocks are dropped too: they serialize as `{"type":"Unknown"}`
-/// (pinned by a test in `types.rs`), which no provider accepts.
+/// `Unknown` blocks are dropped too: they serialize as `{"type":"unknown"}`,
+/// which no provider accepts. A `Fallback` block is rewritten into Anthropic's
+/// own `{"type":"fallback","from":{"model":…},"to":{"model":…}}` shape and
+/// echoed in place.
 fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
@@ -187,7 +189,23 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
                     }
                     // else: foreign provider — drop.
                 }
-                Some("Unknown") => {} // never goes on the wire
+                Some("unknown") => {} // never goes on the wire
+                Some("fallback") => {
+                    let model = |k: &str| {
+                        block
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .map(|m| serde_json::json!({ "model": m }))
+                    };
+                    match (model("from_model"), model("to_model")) {
+                        (Some(from), Some(to)) => restored.push(serde_json::json!({
+                            "type": "fallback",
+                            "from": from,
+                            "to": to,
+                        })),
+                        _ => debug!("dropping fallback block with missing model names"),
+                    }
+                }
                 _ => restored.push(block.clone()),
             }
         }
@@ -3662,19 +3680,26 @@ mod tests {
 
     #[test]
     fn unknown_block_is_dropped_from_request() {
-        // `ContentBlock::Unknown` serializes as `{"type":"Unknown"}` (pinned by
-        // a test in types.rs), which no provider accepts.
+        // `ContentBlock::Unknown` serializes as `{"type":"unknown",…}`, which
+        // no provider accepts.
         // Caching off: this pins the restoration shape exactly;
         // `restored_reasoning_raw_block_is_byte_identical` pins the cache-on shape.
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
             .with_prompt_cache(false);
         assert_eq!(
-            serde_json::to_value(ContentBlock::Unknown).unwrap()["type"],
-            "Unknown",
+            serde_json::to_value(ContentBlock::Unknown {
+                provider: None,
+                raw: serde_json::json!({"type": "x"}),
+            })
+            .unwrap()["type"],
+            "unknown",
             "Unknown's wire tag changed — restore_reasoning_blocks must follow"
         );
         let request = request_with_assistant_blocks(vec![
-            ContentBlock::Unknown,
+            ContentBlock::Unknown {
+                provider: None,
+                raw: serde_json::json!({"type": "x"}),
+            },
             ContentBlock::Text {
                 text: "the answer".into(),
             },
@@ -3684,6 +3709,27 @@ mod tests {
             body["messages"][1]["content"],
             serde_json::json!([{ "type": "text", "text": "the answer" }])
         );
+    }
+
+    #[test]
+    fn fallback_block_is_echoed_in_wire_shape() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Fallback {
+                from_model: "a".into(),
+                to_model: "b".into(),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            serde_json::json!({"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}})
+        );
+        assert_eq!(body["messages"][1]["content"][1]["type"], "text");
     }
 
     #[test]

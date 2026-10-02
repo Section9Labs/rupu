@@ -289,7 +289,7 @@ fn emit_response_events(resp: &LlmResponse, on_event: &mut (dyn FnMut(StreamEven
             }
             ContentBlock::ToolResult { .. } => {}
             ContentBlock::Reasoning { .. } => {}
-            ContentBlock::Unknown => {}
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
         }
     }
 }

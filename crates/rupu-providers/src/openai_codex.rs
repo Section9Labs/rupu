@@ -520,7 +520,7 @@ impl OpenAiCodexClient {
                     // Either already consumed by the verbatim replay above, or a
                     // foreign provider's block, which is deliberately ignored.
                     ContentBlock::Reasoning { .. } => {}
-                    ContentBlock::Unknown => {}
+                    ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
                 }
             }
 
@@ -3337,6 +3337,36 @@ mod reasoning_capture_tests {
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[2]["call_id"], "c1");
         assert_eq!(input[2]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn fallback_and_unknown_blocks_are_absent_from_body() {
+        let request = request_with(vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Fallback {
+                        from_model: "a".into(),
+                        to_model: "b".into(),
+                    },
+                    ContentBlock::Unknown {
+                        provider: None,
+                        raw: serde_json::json!({"type": "x"}),
+                    },
+                    ContentBlock::Text {
+                        text: "calling".into(),
+                    },
+                ],
+            },
+        ]);
+        let body = client().build_request_body(&request, false);
+        let text = body.to_string();
+        assert!(!text.contains("fallback"), "{text}");
+        assert!(!text.contains("\"x\""), "{text}");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["content"][0]["text"], "calling");
     }
 
     #[test]

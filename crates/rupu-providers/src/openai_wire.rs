@@ -118,7 +118,7 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
                             // Gemini part): an alien wire format that this
                             // endpoint never sent and would reject. Drop it.
                         }
-                        ContentBlock::Unknown => {}
+                        ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
                     }
                 }
 
@@ -1187,7 +1187,31 @@ mod tests {
     fn unknown_block_is_not_echoed() {
         let body = build_chat_request_body(
             &req(vec![assistant(vec![
-                ContentBlock::Unknown,
+                ContentBlock::Unknown {
+                    provider: None,
+                    raw: serde_json::json!({"type": "x"}),
+                },
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ])]),
+            false,
+        );
+
+        assert_eq!(
+            only_assistant_msg(&body),
+            &serde_json::json!({"role": "assistant", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn fallback_block_is_not_echoed() {
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                ContentBlock::Fallback {
+                    from_model: "a".into(),
+                    to_model: "b".into(),
+                },
                 ContentBlock::Text {
                     text: "hello".into(),
                 },
