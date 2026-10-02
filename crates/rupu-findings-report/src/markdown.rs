@@ -203,6 +203,61 @@ fn agent_markdown(md: &str) -> String {
     close_open_fence(&shift_headings(&escape_html_block_starts(&md)))
 }
 
+/// Plain text made literal inside Markdown inline content (alt text, an
+/// emphasized caption): one line, every ASCII punctuation character
+/// backslash-escaped, so nothing in it can open emphasis, a link or an image.
+fn literal_inline(s: &str) -> String {
+    let mut out = String::new();
+    for c in one_line(s).chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether `path` reads as a URL (`scheme:…`, `//host/…`, a UNC
+/// `\\host\…`: any two leading slashes either way) rather than a
+/// file path. A Markdown viewer would fetch such an image reference, so it is
+/// never emitted as one. A one-letter "scheme" is a Windows drive (`C:`).
+fn looks_like_url(path: &str) -> bool {
+    let p = path.trim_start();
+    let mut lead = p.chars();
+    let slash = |c: char| matches!(c, '/' | '\\');
+    if lead
+        .next()
+        .zip(lead.next())
+        .is_some_and(|(a, b)| slash(a) && slash(b))
+    {
+        return true;
+    }
+    match p.find(':') {
+        Some(i) if i >= 2 => {
+            let scheme = &p.as_bytes()[..i];
+            scheme[0].is_ascii_alphabetic()
+                && scheme
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'))
+        }
+        _ => false,
+    }
+}
+
+/// `path` as a pointy-bracket link destination (`<…>`): one line, with `\`,
+/// `<` and `>` backslash-escaped so the destination cannot end early.
+fn link_destination(path: &str) -> String {
+    let mut out = String::from("<");
+    for c in one_line(path).chars() {
+        if matches!(c, '\\' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('>');
+    out
+}
+
 /// Render blocks as CommonMark (with GFM tables), the reference layout the
 /// other emitters follow.
 ///
@@ -268,6 +323,14 @@ pub fn render(blocks: &[Block]) -> String {
                 out.push('\n');
             }
             Block::PageBreak => out.push_str("---\n\n"),
+            // A reference to the file by its recorded path, never its bytes.
+            Block::Image { caption, path, .. } => {
+                let caption = literal_inline(caption);
+                if !looks_like_url(path) {
+                    out.push_str(&format!("![{caption}]({})\n\n", link_destination(path)));
+                }
+                out.push_str(&format!("_{caption}_\n\n"));
+            }
         }
     }
     out.trim_end().to_string() + "\n"

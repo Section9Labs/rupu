@@ -10,6 +10,7 @@ use rupu_findings_report::import::{
     fnd_ids, parse_report, retain_known_cross_references, ImportError, Parsed, NOT_STATED,
 };
 use rupu_findings_report::number::number_map;
+use rupu_findings_report::Blobs;
 use rupu_findings_report::{render_finding, Format};
 use std::collections::HashSet;
 
@@ -215,7 +216,13 @@ fn an_exported_report_round_trips() {
     )])
     .remove(0);
     let md = String::from_utf8(
-        render_finding(&f, &number_map(std::slice::from_ref(&f)), Format::Markdown).unwrap(),
+        render_finding(
+            &f,
+            &number_map(std::slice::from_ref(&f)),
+            Format::Markdown,
+            Blobs::NONE,
+        )
+        .unwrap(),
     )
     .unwrap();
     let (r, own) = report_of(&md);
@@ -403,7 +410,13 @@ fn exported(report: rupu_coverage::FindingReport) -> String {
     )])
     .remove(0);
     String::from_utf8(
-        render_finding(&f, &number_map(std::slice::from_ref(&f)), Format::Markdown).unwrap(),
+        render_finding(
+            &f,
+            &number_map(std::slice::from_ref(&f)),
+            Format::Markdown,
+            Blobs::NONE,
+        )
+        .unwrap(),
     )
     .unwrap()
 }
@@ -1734,7 +1747,13 @@ fn a_semicolon_in_a_ticket_keeps_the_ticket_whole() {
     )])
     .remove(0);
     let html = String::from_utf8(
-        render_finding(&f, &number_map(std::slice::from_ref(&f)), Format::Html).unwrap(),
+        render_finding(
+            &f,
+            &number_map(std::slice::from_ref(&f)),
+            Format::Html,
+            Blobs::NONE,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(html.contains("Fix in 3.1; backport to 3.0"), "{html}");

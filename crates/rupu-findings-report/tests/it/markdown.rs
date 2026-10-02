@@ -6,11 +6,16 @@ use rupu_findings_report::blocks::{finding_blocks, project_blocks, Block};
 use rupu_findings_report::markdown::render;
 use rupu_findings_report::model::ReportMeta;
 use rupu_findings_report::number::number_map;
+use rupu_findings_report::Blobs;
 use std::collections::HashMap;
 
 fn full_md() -> String {
     let f = full_finding();
-    render(&finding_blocks(&f, &number_map(std::slice::from_ref(&f))))
+    render(&finding_blocks(
+        &f,
+        &number_map(std::slice::from_ref(&f)),
+        Blobs::NONE,
+    ))
 }
 
 fn h2_lines(md: &str) -> Vec<&str> {
@@ -97,7 +102,11 @@ fn artifacts_section_sits_between_replication_and_provenance() {
         full_record("fnd_a", Severity::High, report),
     )])
     .remove(0);
-    let md = render(&finding_blocks(&f, &number_map(std::slice::from_ref(&f))));
+    let md = render(&finding_blocks(
+        &f,
+        &number_map(std::slice::from_ref(&f)),
+        Blobs::NONE,
+    ));
     let h = h2_lines(&md);
     assert_eq!(
         &h[h.len() - 3..],
@@ -128,7 +137,7 @@ fn provenance_lists_the_record_and_dash_for_a_missing_workflow() {
         full_record("fnd_full", Severity::High, full_report()),
     )])
     .remove(0);
-    let md = render(&finding_blocks(&f, &HashMap::new()));
+    let md = render(&finding_blocks(&f, &HashMap::new(), Blobs::NONE));
     assert!(md.contains("**Workflow:** —"));
 }
 
@@ -155,7 +164,7 @@ fn a_cross_reference_renders_the_display_number_not_the_finding_id() {
     .remove(0);
     let numbers: HashMap<String, String> =
         HashMap::from([("fnd_other".to_string(), "SEC-002".to_string())]);
-    let md = render(&finding_blocks(&f, &numbers));
+    let md = render(&finding_blocks(&f, &numbers, Blobs::NONE));
     assert!(md.contains("- SEC-002 (duplicate) — same handler"), "{md}");
     assert!(!md.contains("fnd_other"), "{md}");
     // Not in the set being exported: the id is all there is to show.
@@ -170,7 +179,7 @@ fn a_summary_finding_renders_the_note_and_no_full_report_sections() {
         summary_record("fnd_sum", Severity::High),
     )])
     .remove(0);
-    let md = render(&finding_blocks(&f, &HashMap::new()));
+    let md = render(&finding_blocks(&f, &HashMap::new(), Blobs::NONE));
     assert!(md.starts_with(
         "Filename: SEC-001 - Lookup ignores the owner.pdf\n\n# Lookup ignores the owner\n"
     ));
@@ -198,7 +207,7 @@ fn a_summary_finding_without_a_locator_or_concern_shows_dashes() {
     r.evidence.code_excerpt = None;
     r.evidence.references.clear();
     let f = numbered(vec![input("notebin", None, r)]).remove(0);
-    let md = render(&finding_blocks(&f, &HashMap::new()));
+    let md = render(&finding_blocks(&f, &HashMap::new(), Blobs::NONE));
     assert!(md.contains("**Location:** —"));
     assert!(md.contains("**Concern:** —"));
     assert_eq!(h2_lines(&md), ["## Rationale", "## Provenance"]);
@@ -223,7 +232,7 @@ fn a_project_renders_an_index_and_a_rule_between_findings() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "Project notebin · severity ≥ high".into(),
     };
-    let md = render(&project_blocks(&meta, &all, &HashMap::new()));
+    let md = render(&project_blocks(&meta, &all, &HashMap::new(), Blobs::NONE));
     assert!(md.starts_with("# Notebin findings\n"), "{md}");
     for want in [
         "**Generated:** 2026-09-29T12:00:00Z",
@@ -254,7 +263,7 @@ fn an_empty_project_reports_zero_findings() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "all".into(),
     };
-    let md = render(&project_blocks(&meta, &[], &HashMap::new()));
+    let md = render(&project_blocks(&meta, &[], &HashMap::new(), Blobs::NONE));
     assert!(md.contains("**Findings:** 0"));
     assert!(!md.contains("---\n"));
 }
@@ -457,7 +466,7 @@ fn an_unclosed_fence_in_one_finding_does_not_swallow_the_next_finding() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "all".into(),
     };
-    let md = render(&project_blocks(&meta, &all, &HashMap::new()));
+    let md = render(&project_blocks(&meta, &all, &HashMap::new(), Blobs::NONE));
 
     // The fence is closed right after the description, before the next section.
     let fence = md
@@ -499,7 +508,7 @@ fn a_hostile_hop_label_does_not_add_a_heading_to_the_document() {
         full_record("fnd_h", Severity::High, report),
     )])
     .remove(0);
-    let md = render(&finding_blocks(&f, &HashMap::new()));
+    let md = render(&finding_blocks(&f, &HashMap::new(), Blobs::NONE));
     assert_eq!(
         h2_lines(&md)
             .iter()
@@ -514,7 +523,7 @@ fn a_full_record_without_its_report_renders_the_could_not_load_note() {
     let mut rec = summary_record("fnd_broken", Severity::High);
     rec.profile = rupu_coverage::FindingProfile::Full;
     let f = numbered(vec![input("notebin", None, rec)]).remove(0);
-    let md = render(&finding_blocks(&f, &HashMap::new()));
+    let md = render(&finding_blocks(&f, &HashMap::new(), Blobs::NONE));
     assert!(md.contains("_Full report could not be loaded by this build — summary record shown._"));
     assert!(!md.contains("no full report was recorded"));
     assert!(!md.contains("## Root Cause"));
@@ -530,7 +539,7 @@ fn with_description(description: &str) -> String {
         full_record("fnd_d", Severity::High, report),
     )])
     .remove(0);
-    render(&finding_blocks(&f, &HashMap::new()))
+    render(&finding_blocks(&f, &HashMap::new(), Blobs::NONE))
 }
 
 const SECTIONS: [&str; 14] = [
@@ -613,7 +622,7 @@ fn an_unclosed_html_block_in_one_finding_does_not_swallow_the_next_finding() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "all".into(),
     };
-    let md = render(&project_blocks(&meta, &all, &HashMap::new()));
+    let md = render(&project_blocks(&meta, &all, &HashMap::new(), Blobs::NONE));
     let h1 = headings(&md, HeadingLevel::H1);
     assert!(h1.contains(&"Second finding".to_string()), "{h1:?}\n{md}");
     assert!(h1.contains(&"Third finding".to_string()), "{h1:?}");

@@ -1,17 +1,19 @@
 //! PDF rendering: compiles our own Typst markup in-process with the fonts
-//! bundled by `typst-assets`. The only source is the generated document;
-//! every other file access is refused.
+//! bundled by `typst-assets`. The only source is the generated document, and
+//! the only files are the images it carries in memory
+//! ([`TypstDoc::files`]); every other file access is refused.
 
 use std::sync::LazyLock;
 use typst::diag::{FileError, FileResult, SourceDiagnostic};
 use typst::foundations::{Bytes, Datetime, Duration};
-use typst::syntax::{FileId, Source};
+use typst::syntax::{FileId, Source, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use typst_layout::PagedDocument;
 
 use crate::render::ExportError;
+use crate::typst_doc::TypstDoc;
 
 struct Fonts {
     book: LazyHash<FontBook>,
@@ -34,6 +36,7 @@ static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Lib
 
 struct ReportWorld {
     main: Source,
+    files: std::collections::BTreeMap<String, std::sync::Arc<[u8]>>,
 }
 
 impl World for ReportWorld {
@@ -57,8 +60,16 @@ impl World for ReportWorld {
         }
     }
 
-    fn file(&self, _id: FileId) -> FileResult<Bytes> {
-        Err(FileError::AccessDenied)
+    /// Only the document's own in-memory images, by their exact virtual
+    /// path in the project root; nothing on disk.
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        if *id.root() != VirtualRoot::Project {
+            return Err(FileError::AccessDenied);
+        }
+        self.files
+            .get(id.vpath().get_with_slash())
+            .map(|b| Bytes::new(std::sync::Arc::clone(b)))
+            .ok_or(FileError::AccessDenied)
     }
 
     fn font(&self, index: usize) -> Option<Font> {
@@ -105,18 +116,21 @@ impl Drop for EvictCacheOnDrop {
     }
 }
 
-/// Compile `markup` (a complete Typst document) to PDF bytes. A compile error
-/// is returned, never panicked on.
+/// Compile `doc` (a complete Typst document: markup, or markup with its
+/// images) to PDF bytes. A compile error — an image Typst cannot decode
+/// included — is returned, never panicked on.
 ///
 /// Only the fonts bundled with `typst-assets` are available (Libertinus Serif,
 /// New Computer Modern, DejaVu Sans Mono), and none of them covers CJK or
 /// emoji: those characters are not lost from the file, but they render as
 /// missing-glyph boxes. Use the Markdown or HTML export where the reader's own
 /// fonts matter.
-pub fn render_pdf(markup: String) -> Result<Vec<u8>, ExportError> {
+pub fn render_pdf(doc: impl Into<TypstDoc>) -> Result<Vec<u8>, ExportError> {
     let _evict = EvictCacheOnDrop;
+    let doc = doc.into();
     let world = ReportWorld {
-        main: Source::detached(markup),
+        main: Source::detached(doc.markup),
+        files: doc.files,
     };
     let doc: PagedDocument = typst::compile(&world).output.map_err(typst_error)?;
     typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default()).map_err(typst_error)

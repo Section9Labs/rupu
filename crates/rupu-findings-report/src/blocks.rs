@@ -3,17 +3,19 @@
 //! (Markdown, HTML, Typst) only decides how to draw a block, never which
 //! blocks exist or in what order.
 
-use crate::model::{ExportFinding, ReportMeta};
+use crate::model::{Blobs, ExportFinding, ReportMeta};
 use crate::number;
 use crate::text::{escape_semicolons, longest_backtick_run, one_line, unescape_semicolons};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::report::{
-    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, EvidenceBlock, FindingReport, HopRole,
-    Likelihood, OrSentinel, Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
+    is_sha256_hex, raster_image_type, ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop,
+    EvidenceBlock, FindingReport, HopRole, Likelihood, OrSentinel, Relation, RiskLevel, Ticket,
+    VerificationStatus, NOT_PROVIDED_PREFIX,
 };
 use rupu_coverage::FindingRecord;
 use rupu_coverage::{FindingProfile, FindingScope, Severity, Surface};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
@@ -38,7 +40,25 @@ pub enum Block {
         rows: Vec<Vec<String>>,
     },
     PageBreak,
+    /// A raster image (PNG / JPEG / GIF / WebP by its magic bytes) read from
+    /// the local artifact store, at most [`MAX_EMBED_BYTES`]. HTML embeds it
+    /// as a `data:` URI and PDF as the image itself; Markdown references
+    /// `path` instead (no bytes inlined). `caption` is plain text: the alt
+    /// text and the line under the image. A `Prose` block naming the file
+    /// (path, sha256, size) always follows it.
+    Image {
+        caption: String,
+        path: String,
+        sha256: String,
+        /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+        mime: &'static str,
+        bytes: Arc<[u8]>,
+    },
 }
+
+/// The largest image an export embeds; a bigger one is shown by reference
+/// (path, sha256, size) with a note saying it was not embedded.
+pub const MAX_EMBED_BYTES: u64 = 4 * 1024 * 1024;
 
 /// `Not Provided — why` reads `Not provided: why`; every other sentinel
 /// (`None`, `Unknown`, `None Provided`) is shown verbatim.
@@ -83,12 +103,90 @@ fn nonblank(s: &Option<String>) -> Option<&str> {
     s.as_deref().filter(|s| !s.trim().is_empty())
 }
 
+/// A file an evidence block points at, as one Markdown line: its recorded
+/// path, sha256 and size, and the host it lives on when it is not here.
+fn file_facts(a: &ArtifactRef) -> String {
+    let mut s = code_span(&a.path);
+    if !a.sha256.trim().is_empty() {
+        s.push_str(&format!(" · sha256 {}", code_span(&a.sha256)));
+    }
+    s.push_str(&format!(" · {} bytes", a.size));
+    if let Some(h) = nonblank(&a.host) {
+        s.push_str(&format!(" · on host {}", code_span(h)));
+    }
+    s
+}
+
+/// The bytes of `a` from the local artifact store, or why there are none.
+/// Only a file recorded `stored: copied` with no host is looked up, and only
+/// up to `max` bytes: a file on another host, or one the store never copied,
+/// is never fetched from anywhere.
+fn local_blob(a: &ArtifactRef, blobs: Blobs<'_>, max: u64) -> Result<Vec<u8>, String> {
+    if let Some(h) = nonblank(&a.host) {
+        return Err(format!("the file is on host {}", code_span(h)));
+    }
+    if a.stored != Some(ArtifactStorage::Copied) {
+        return Err("the file was not copied into the artifact store".to_string());
+    }
+    if !is_sha256_hex(&a.sha256) {
+        return Err("no valid sha256 was recorded for the file".to_string());
+    }
+    if a.size > max {
+        return Err(format!(
+            "{} bytes is over the {} MiB embed limit",
+            a.size,
+            max / (1024 * 1024)
+        ));
+    }
+    if !blobs.is_available() {
+        return Err("no artifact store was available to this export".to_string());
+    }
+    blobs
+        .read(&a.sha256, max)
+        .ok_or_else(|| "the file is not in this machine's artifact store".to_string())
+}
+
+/// An `image` block: the image itself when it is a raster image in the local
+/// store within [`MAX_EMBED_BYTES`], else the file by reference with the
+/// reason it was not embedded.
+fn image_blocks(artifact: &ArtifactRef, caption: Option<&str>, blobs: Blobs<'_>) -> Vec<Block> {
+    let caption = caption.map(one_line).filter(|c| !c.is_empty());
+    let embedded = local_blob(artifact, blobs, MAX_EMBED_BYTES).and_then(|bytes| {
+        match raster_image_type(&bytes) {
+            Some(mime) => Ok((mime, bytes)),
+            None => Err("the file is not a PNG, JPEG, GIF or WebP image".to_string()),
+        }
+    });
+    match embedded {
+        Ok((mime, bytes)) => vec![
+            Block::Image {
+                caption: caption.unwrap_or_else(|| "Image".to_string()),
+                path: artifact.path.clone(),
+                sha256: artifact.sha256.clone(),
+                mime,
+                bytes: bytes.into(),
+            },
+            prose(file_facts(artifact)),
+        ],
+        Err(why) => {
+            let label = match caption {
+                Some(c) => format!("**Image:** {c}"),
+                None => "**Image**".to_string(),
+            };
+            vec![prose(format!(
+                "{label} — {} — *not embedded: {why}*",
+                file_facts(artifact)
+            ))]
+        }
+    }
+}
+
 /// Map one typed engagement [`EvidenceBlock`] onto the renderer-neutral
-/// [`Block`] model the emitters already draw. No emitter changes are needed —
-/// every block lowers to Prose / Code / Table / Note. A code block always
-/// follows a line saying what it is, so it never reads as the excerpt of the
-/// evidence claim printed before it.
-fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
+/// [`Block`] model. A code block always follows a line saying what it is, so
+/// it never reads as the excerpt of the evidence claim printed before it. A
+/// block's file is named by path, sha256 and size; only an `image` block's
+/// file is ever read, through `blobs` (see [`image_blocks`]).
+fn render_evidence_block(blk: &EvidenceBlock, blobs: Blobs<'_>, out: &mut Vec<Block>) {
     match blk {
         EvidenceBlock::Text { text } => out.push(prose(text.clone())),
         EvidenceBlock::CodeSlice {
@@ -111,23 +209,23 @@ fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
             rows: rows.clone(),
         }),
         EvidenceBlock::Image { artifact, caption } => {
-            let cap = caption.as_deref().unwrap_or("Image");
-            out.push(Block::Note(format!(
-                "{cap} — {}",
-                code_span(&artifact.path)
-            )));
+            out.extend(image_blocks(artifact, caption.as_deref(), blobs));
         }
         EvidenceBlock::Hexdump {
             base,
             artifact,
             rendered,
         } => {
+            // `{:#x}` formats the u64 itself: exact for every 64-bit base.
             out.push(prose(format!(
                 "**Hexdump** (base {base:#x}) — {}",
-                code_span(&artifact.path)
+                file_facts(artifact)
             )));
-            if let Some(r) = nonblank(rendered) {
-                out.push(code(None, r));
+            match nonblank(rendered) {
+                Some(r) => out.push(code(None, r)),
+                None => out.push(Block::Note(
+                    "No rendered dump was recorded; the bytes are in the file above.".to_string(),
+                )),
             }
         }
         EvidenceBlock::Disasm { arch, listing } => {
@@ -161,10 +259,13 @@ fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
             out.push(code(None, output));
         }
         EvidenceBlock::PcapRef { artifact, summary } => {
-            out.push(Block::Note(format!(
-                "Packet capture: {summary} — {}",
-                code_span(&artifact.path)
+            out.push(prose(format!(
+                "**Packet capture** — {}",
+                file_facts(artifact)
             )));
+            if !summary.trim().is_empty() {
+                out.push(prose(summary.clone()));
+            }
         }
     }
 }
@@ -386,10 +487,17 @@ fn provenance(f: &ExportFinding, report: Option<&FindingReport>) -> Vec<Block> {
 /// One finding, in the reporting standard's section order. A finding with no
 /// recorded report gets the short summary layout: a summary record says so,
 /// and a full record whose report this build could not load says that.
-pub fn finding_blocks(f: &ExportFinding, numbers: &HashMap<String, String>) -> Vec<Block> {
+///
+/// `blobs` is the local artifact store: an `image` evidence block's file is
+/// embedded from it when it can be (see [`MAX_EMBED_BYTES`]).
+pub fn finding_blocks(
+    f: &ExportFinding,
+    numbers: &HashMap<String, String>,
+    blobs: Blobs<'_>,
+) -> Vec<Block> {
     let r = &f.input.record;
     match (&r.report, r.profile) {
-        (Some(report), _) => full_blocks(f, report, numbers),
+        (Some(report), _) => full_blocks(f, report, numbers, blobs),
         (None, FindingProfile::Full) => summary_blocks(
             f,
             "Full report could not be loaded by this build — summary record shown.",
@@ -462,6 +570,7 @@ fn full_blocks(
     f: &ExportFinding,
     r: &FindingReport,
     numbers: &HashMap<String, String>,
+    blobs: Blobs<'_>,
 ) -> Vec<Block> {
     let mut identity = vec![
         kv("Identifier", f.number.clone()),
@@ -537,7 +646,7 @@ fn full_blocks(
         }
     }
     for blk in &r.blocks {
-        render_evidence_block(blk, &mut b);
+        render_evidence_block(blk, blobs, &mut b);
     }
 
     b.push(heading("Remediation"));
@@ -737,17 +846,18 @@ pub(crate) fn with_own_numbers(
 /// caller passes the numbers of every finding the selection was made from (a
 /// finding the selection left out is still cited by its `SEC-00N`, as its own
 /// single-finding export would cite it), and the findings' own numbers are
-/// added to it.
+/// added to it. `blobs` is as for [`finding_blocks`].
 pub fn project_blocks(
     meta: &ReportMeta,
     findings: &[ExportFinding],
     numbers: &HashMap<String, String>,
+    blobs: Blobs<'_>,
 ) -> Vec<Block> {
     let numbers = with_own_numbers(numbers, findings);
     let mut b = index_blocks(meta, findings);
     for f in findings {
         b.push(Block::PageBreak);
-        b.extend(finding_blocks(f, &numbers));
+        b.extend(finding_blocks(f, &numbers, blobs));
     }
     b
 }

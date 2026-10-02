@@ -2,7 +2,7 @@
 //! per-finding split archive.
 
 use crate::blocks::{finding_blocks, index_blocks, project_blocks, Block};
-use crate::model::{ExportFinding, ReportMeta};
+use crate::model::{Blobs, ExportFinding, ReportMeta};
 use crate::number::{
     filename, fit_file_name, is_invisible_format, title, truncate_bytes, MAX_NAME_BYTES,
 };
@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 #[cfg(feature = "pdf")]
-use crate::{pdf, typst_doc};
+use crate::pdf;
+#[cfg(feature = "pdf")]
+use crate::typst_doc::{self, TypstDoc};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -81,7 +83,51 @@ fn ensure_supported(fmt: Format) -> Result<(), ExportError> {
 
 #[cfg(feature = "pdf")]
 fn pdf_bytes(blocks: &[Block]) -> Result<Vec<u8>, ExportError> {
-    pdf::render_pdf(typst_doc::render(blocks))
+    compile_blocks(blocks, &pdf::render_pdf)
+}
+
+/// Compile `blocks` with `compile`. Should that fail while the document embeds
+/// images (failure path only), each image is compiled on its own, and every
+/// one Typst cannot decode (magic bytes are only a sniff) becomes a note
+/// saying so before the document is compiled again: a corrupt image costs its
+/// own figure, not the export.
+#[cfg(feature = "pdf")]
+fn compile_blocks(
+    blocks: &[Block],
+    compile: &impl Fn(TypstDoc) -> Result<Vec<u8>, ExportError>,
+) -> Result<Vec<u8>, ExportError> {
+    let err = match compile(typst_doc::render_doc(blocks)) {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+    let mut undecodable: HashSet<&str> = HashSet::new();
+    let mut decodable: HashSet<&str> = HashSet::new();
+    for b in blocks {
+        if let Block::Image { sha256, .. } = b {
+            if undecodable.contains(sha256.as_str()) || decodable.contains(sha256.as_str()) {
+                continue;
+            }
+            match compile(typst_doc::render_doc(std::slice::from_ref(b))) {
+                Ok(_) => decodable.insert(sha256),
+                Err(_) => undecodable.insert(sha256),
+            };
+        }
+    }
+    if undecodable.is_empty() {
+        return Err(err);
+    }
+    let kept: Vec<Block> = blocks
+        .iter()
+        .map(|b| match b {
+            Block::Image {
+                caption, sha256, ..
+            } if undecodable.contains(sha256.as_str()) => Block::Note(format!(
+                "{caption} — not embedded: the image could not be decoded for the PDF"
+            )),
+            other => other.clone(),
+        })
+        .collect();
+    compile(typst_doc::render_doc(&kept))
 }
 
 #[cfg(not(feature = "pdf"))]
@@ -117,15 +163,19 @@ fn name_finding(number: &str, e: ExportError) -> ExportError {
     }
 }
 
+/// One finding as a stand-alone report. `blobs` is the local artifact store
+/// an `image` evidence block's file is embedded from (HTML, PDF); pass
+/// [`Blobs::NONE`] to show every file by reference only.
 pub fn render_finding(
     f: &ExportFinding,
     numbers: &HashMap<String, String>,
     fmt: Format,
+    blobs: Blobs<'_>,
 ) -> Result<Vec<u8>, ExportError> {
     ensure_supported(fmt)?;
     emit(
         &format!("{} - {}", f.number, title(f)),
-        &finding_blocks(f, numbers),
+        &finding_blocks(f, numbers, blobs),
         fmt,
     )
 }
@@ -139,18 +189,19 @@ fn project_pdf(
     meta: &ReportMeta,
     findings: &[ExportFinding],
     numbers: &HashMap<String, String>,
-    compile: impl Fn(String) -> Result<Vec<u8>, ExportError>,
+    blobs: Blobs<'_>,
+    compile: impl Fn(TypstDoc) -> Result<Vec<u8>, ExportError>,
 ) -> Result<Vec<u8>, ExportError> {
     let numbers = crate::blocks::with_own_numbers(numbers, findings);
-    let blocks = project_blocks(meta, findings, &numbers);
-    let err = match compile(typst_doc::render(&blocks)) {
+    let blocks = project_blocks(meta, findings, &numbers, blobs);
+    let err = match compile_blocks(&blocks, &compile) {
         Ok(bytes) => return Ok(bytes),
         Err(e) => e,
     };
     let failing: Vec<(&str, String)> = findings
         .iter()
         .filter_map(|f| {
-            compile(typst_doc::render(&finding_blocks(f, &numbers)))
+            compile_blocks(&finding_blocks(f, &numbers, blobs), &compile)
                 .err()
                 .map(|e| (f.number.as_str(), detail(e)))
         })
@@ -174,21 +225,27 @@ fn project_pdf(
 /// display numbers for cross-references: pass the map of every finding the
 /// selection was made from (see [`crate::blocks::project_blocks`]), so a
 /// reference to a finding the selection left out still prints its number.
-/// The findings' own numbers are always included.
+/// The findings' own numbers are always included. `blobs` is as for
+/// [`render_finding`].
 pub fn render_project(
     meta: &ReportMeta,
     findings: &[ExportFinding],
     numbers: &HashMap<String, String>,
     fmt: Format,
+    blobs: Blobs<'_>,
 ) -> Result<Vec<u8>, ExportError> {
     ensure_supported(fmt)?;
     #[cfg(feature = "pdf")]
     {
         if fmt == Format::Pdf {
-            return project_pdf(meta, findings, numbers, pdf::render_pdf);
+            return project_pdf(meta, findings, numbers, blobs, pdf::render_pdf);
         }
     }
-    emit(&meta.title, &project_blocks(meta, findings, numbers), fmt)
+    emit(
+        &meta.title,
+        &project_blocks(meta, findings, numbers, blobs),
+        fmt,
+    )
 }
 
 /// A zip entry name that is one flat file name whatever the caller put in the
@@ -261,16 +318,19 @@ fn unique_entry_name(name: String, used: &mut HashSet<String>) -> String {
 
 /// One file per finding (named by [`filename`]) plus `index.md`, the Markdown
 /// project index. The index stays Markdown whatever the finding format is.
-/// `numbers` is as for [`render_project`]. Every entry is dated
+/// `numbers` and `blobs` are as for [`render_project`]. Every entry is dated
 /// `meta.generated_at` (see [`zip_time`]).
 pub fn render_split_zip(
     meta: &ReportMeta,
     findings: &[ExportFinding],
     numbers: &HashMap<String, String>,
     fmt: Format,
+    blobs: Blobs<'_>,
 ) -> Result<Vec<u8>, ExportError> {
     ensure_supported(fmt)?;
-    build_zip(meta, findings, numbers, fmt, render_finding)
+    build_zip(meta, findings, numbers, fmt, |f, n, fmt| {
+        render_finding(f, n, fmt, blobs)
+    })
 }
 
 /// A zip entry timestamp for `t`. Zip stores a local-time date with no zone
@@ -514,7 +574,8 @@ mod tests {
         /// A stand-in compiler: `POISON-A` / `POISON-B` in the markup make it
         /// fail with a diagnostic of that name (A wins when both are present,
         /// as a combined document would report its first error).
-        fn fake(markup: String) -> Result<Vec<u8>, ExportError> {
+        fn fake(doc: TypstDoc) -> Result<Vec<u8>, ExportError> {
+            let markup = doc.markup;
             if markup.contains("POISON-A") {
                 Err(ExportError::Typst("bad A".into()))
             } else if markup.contains("POISON-B") {
@@ -532,7 +593,7 @@ mod tests {
                 finding(3, "fine"),
                 finding(4, "POISON-B"),
             ];
-            let err = project_pdf(&meta(), &all, &HashMap::new(), fake)
+            let err = project_pdf(&meta(), &all, &HashMap::new(), Blobs::NONE, fake)
                 .unwrap_err()
                 .to_string();
             // Each finding carries the diagnostic from ITS OWN compile; the
@@ -550,7 +611,7 @@ mod tests {
         fn a_single_bad_finding_is_named_in_the_singular() {
             // Only SEC-002 is broken; the fault is reported once.
             let all = vec![finding(1, "fine"), finding(2, "POISON-B")];
-            let err = project_pdf(&meta(), &all, &HashMap::new(), fake)
+            let err = project_pdf(&meta(), &all, &HashMap::new(), Blobs::NONE, fake)
                 .unwrap_err()
                 .to_string();
             assert_eq!(
@@ -563,8 +624,8 @@ mod tests {
         fn a_failure_no_single_finding_reproduces_keeps_the_original_error() {
             // Fails only on the combined document (it has the index heading).
             let all = vec![finding(1, "fine"), finding(2, "fine")];
-            let err = project_pdf(&meta(), &all, &HashMap::new(), |m| {
-                if m.contains("Index") {
+            let err = project_pdf(&meta(), &all, &HashMap::new(), Blobs::NONE, |d| {
+                if d.markup.contains("Index") {
                     Err(ExportError::Typst("combined only".into()))
                 } else {
                     Ok(vec![])
@@ -581,7 +642,7 @@ mod tests {
         fn a_successful_project_compiles_once_and_skips_the_per_finding_pass() {
             let calls = Cell::new(0);
             let all = vec![finding(1, "fine"), finding(2, "fine")];
-            let out = project_pdf(&meta(), &all, &HashMap::new(), |m| {
+            let out = project_pdf(&meta(), &all, &HashMap::new(), Blobs::NONE, |m| {
                 calls.set(calls.get() + 1);
                 fake(m)
             })

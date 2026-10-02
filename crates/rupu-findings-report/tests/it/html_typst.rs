@@ -5,6 +5,7 @@ use rupu_findings_report::html;
 use rupu_findings_report::model::ReportMeta;
 use rupu_findings_report::number::number_map;
 use rupu_findings_report::typst_doc;
+use rupu_findings_report::Blobs;
 use std::collections::HashMap;
 
 const XSS: &str = "<img src=x onerror=alert(1)>";
@@ -12,7 +13,7 @@ const TYPST_INJECT: &str = "#set page(width: 1cm)";
 
 fn full_blocks() -> Vec<Block> {
     let f = full_finding();
-    finding_blocks(&f, &number_map(std::slice::from_ref(&f)))
+    finding_blocks(&f, &number_map(std::slice::from_ref(&f)), Blobs::NONE)
 }
 
 fn two_finding_blocks() -> Vec<Block> {
@@ -29,7 +30,7 @@ fn two_finding_blocks() -> Vec<Block> {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "Project notebin".into(),
     };
-    project_blocks(&meta, &all, &HashMap::new())
+    project_blocks(&meta, &all, &HashMap::new(), Blobs::NONE)
 }
 
 // ---------------------------------------------------------------- HTML
@@ -154,7 +155,7 @@ fn html_export_of_a_report_with_an_image_in_its_prose_has_no_img() {
         full_record("fnd_img", Severity::High, report),
     )])
     .remove(0);
-    let blocks = finding_blocks(&f, &number_map(std::slice::from_ref(&f)));
+    let blocks = finding_blocks(&f, &number_map(std::slice::from_ref(&f)), Blobs::NONE);
     let h = html::render("t", &blocks);
     assert!(h.contains("alt text"), "{h}");
     assert!(!h.to_ascii_lowercase().contains("<img"), "{h}");

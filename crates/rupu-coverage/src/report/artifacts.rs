@@ -131,6 +131,19 @@ pub fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The `image/*` type of a raster image, by its magic bytes — never by name
+/// or by anything an agent wrote. SVG (text) is never an image here. Shared by
+/// the CP's artifact endpoint and the report exports.
+pub fn raster_image_type(head: &[u8]) -> Option<&'static str> {
+    match head {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
+}
+
 /// SHA-256 of a file's contents, streamed.
 pub fn sha256_file(p: &Path) -> std::io::Result<String> {
     sha256_file_counted(p).map(|(sha, _)| sha)
@@ -217,6 +230,24 @@ impl ArtifactStore {
     /// Use this for any caller-supplied digest (e.g. an HTTP path segment).
     pub fn blob_path_checked(&self, sha256: &str) -> Option<PathBuf> {
         is_sha256_hex(sha256).then(|| self.blob_path(sha256))
+    }
+
+    /// The bytes of blob `sha256`, read from one open handle and checked
+    /// against the key before they are returned. `None` when the key is not a
+    /// well-formed sha256, the blob is absent or unreadable, holds more than
+    /// `max_bytes` (never read past `max_bytes + 1`), or does not hash to its
+    /// key.
+    pub fn read_verified(&self, sha256: &str, max_bytes: u64) -> Option<Vec<u8>> {
+        let file = File::open(self.blob_path_checked(sha256)?).ok()?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > max_bytes {
+            return None;
+        }
+        let (got, _) = sha256_reader_counted(&mut bytes.as_slice()).ok()?;
+        (got == sha256).then_some(bytes)
     }
 
     /// A fresh temp path for pulling blob `sha256` from another host:
@@ -977,6 +1008,50 @@ mod tests {
             matches!(&err, ArtifactError::Path { reason, .. } if reason.contains("workspace root")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn raster_image_type_is_decided_by_magic_bytes() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(raster_image_type(&png), Some("image/png"));
+        assert_eq!(
+            raster_image_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]),
+            Some("image/jpeg")
+        );
+        assert_eq!(raster_image_type(b"GIF87a\x01\x00"), Some("image/gif"));
+        assert_eq!(raster_image_type(b"GIF89a\x01\x00"), Some("image/gif"));
+        assert_eq!(
+            raster_image_type(b"RIFF\x10\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(raster_image_type(b"<svg xmlns"), None);
+        assert_eq!(raster_image_type(b"%PDF-1.7"), None);
+        assert_eq!(raster_image_type(b"GIF8"), None);
+        assert_eq!(raster_image_type(b"RIFF\0\0\0\0WAVE"), None);
+        assert_eq!(raster_image_type(b""), None);
+    }
+
+    #[test]
+    fn read_verified_returns_only_a_matching_blob_within_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(tmp.path());
+        let body = b"tiny blob body".to_vec();
+        let sha = sha256_reader(&mut body.as_slice()).unwrap();
+        let blob = store.blob_path(&sha);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, &body).unwrap();
+
+        assert_eq!(store.read_verified(&sha, 1024), Some(body.clone()));
+        assert_eq!(
+            store.read_verified(&sha, body.len() as u64),
+            Some(body.clone())
+        );
+        assert_eq!(store.read_verified(&sha, body.len() as u64 - 1), None);
+        assert_eq!(store.read_verified("../../etc/passwd", 1024), None);
+        assert_eq!(store.read_verified(&"0".repeat(64), 1024), None);
+        // A blob whose bytes no longer hash to its key is refused.
+        fs::write(&blob, b"tampered").unwrap();
+        assert_eq!(store.read_verified(&sha, 1024), None);
     }
 
     #[test]

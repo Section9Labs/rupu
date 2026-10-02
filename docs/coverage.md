@@ -472,18 +472,39 @@ the time the report was generated. A project report is named after its title
   (`default-src 'none'`, no `<base>`, no form posts) and a no-referrer policy are
   embedded in the document as defence in depth. Report text is escaped or passed
   through a Markdown converter that neutralises raw HTML and script-like URLs,
-  and images are rendered as their alt text rather than loaded.
+  and images in report text are rendered as their alt text rather than loaded.
+  The only images it shows are `image` evidence blocks, inlined as `data:` URIs
+  (see below).
 - **PDF** (`pdf`): generated in process with Typst, with no headless browser
   and no external tools. Fonts are bundled (Libertinus Serif, New Computer
   Modern, DejaVu Sans Mono), so output does not depend on the machine; the flip
   side is that the bundle has no CJK or emoji glyphs, so those characters do not
   render in a PDF (Markdown and HTML keep them). The PDF renderer cannot read
-  files from disk, so a report cannot pull in a local file or image. PDF export
+  files from disk, so a report cannot pull in a local file or image; the only
+  files it sees are the `image` evidence blocks' bytes, handed to it in memory.
+  PDF export
   is behind the `pdf` cargo feature, on by default and forwarded by `rupu-cp`
   and `rupu-cli`; it adds roughly 45-55 MB to a release binary. A build without
   it (`--no-default-features`) still exports Markdown and HTML, and asking for
   PDF fails with "compiled without PDF support" (a non-zero exit from the CLI,
   `501` from the control plane).
+
+**Evidence-block files.** An `image` block whose file is in this machine's
+artifact store (recorded `stored: copied`, no `host`) is embedded when its
+bytes are a PNG, JPEG, GIF or WebP image — recognised by their leading bytes,
+never by name, so an SVG is never embedded — and the blob is at most 4 MiB and
+still hashes to its recorded sha256. HTML inlines it as a `data:` URI and PDF
+places the image itself, both with the caption under it; Markdown references
+it by its recorded path (`![caption](<path>)`, never for a path that looks
+like a URL) and inlines no bytes. A file that is `external`, lives on another
+host, is missing from the store, too big or not a raster image is shown by
+path, sha256 and size with a note saying why it was not embedded. An export
+never fetches anything from another host, even for a file the finding page
+would pull on view. An image Typst cannot decode becomes that note in the PDF
+instead of failing the export. A `hexdump` block shows its `rendered` text as
+a code block, its base in hex (exact for any 64-bit value), and its file; a
+`pcap_ref` block shows its summary and its file. The files of those two are
+never read by an export.
 
 **Project reports.** A project report has a title, a summary of what it covers,
 an index (number, severity, title, project, finding id, profile), then each
