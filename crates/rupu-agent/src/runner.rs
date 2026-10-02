@@ -1245,8 +1245,8 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 .map_err(|e| RunError::Coverage(format!("ensure coverage dir: {e}")))?;
             write_snapshot(&catalog, &paths.catalog)
                 .map_err(|e| RunError::Coverage(format!("write catalog snapshot: {e}")))?;
-            rupu_coverage::stream_catalog(&paths, &catalog)
-                .map_err(|e| RunError::Coverage(format!("stream catalog snapshot: {e}")))?;
+            // Infallible: a stream problem is logged, never fails the run.
+            rupu_coverage::stream_catalog(&paths, &catalog);
             // Capture a run manifest describing this run's defining inputs.
             // This is the single all-surfaces seam (workflow / agent /
             // autoflow / session all reach run_agent), so every run becomes

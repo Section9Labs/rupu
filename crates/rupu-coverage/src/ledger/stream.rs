@@ -7,6 +7,12 @@
 //! [`StreamLine`] envelope. The stream carries `scope_name`, never
 //! `target_id`: the target id hashes the host's workspace path, so the
 //! coordinator recomputes it for its own workspace.
+//!
+//! The async file-touch writer (`ledger::writer`) keeps the ledger-first
+//! rule — it streams a line only after its ledger write was accepted — but
+//! not the on-disk ordering: its ledger handle is buffered (flushed on
+//! `shutdown`) while the stream line is appended immediately, so the stream
+//! can reach the disk before the ledger line it mirrors.
 
 use crate::asset::Asset;
 use crate::catalog::types::FlatCatalog;
@@ -177,10 +183,17 @@ pub fn append_record(
 }
 
 /// Stream the catalog snapshot a run writes at start. No-op without a stream.
-pub fn stream_catalog(paths: &CoveragePaths, catalog: &FlatCatalog) -> std::io::Result<()> {
-    let json = serde_json::to_string(catalog)?;
-    stream_json(paths, Ledger::Catalog, &json);
-    Ok(())
+/// Infallible like every stream write: a problem here is logged, never
+/// returned, so it cannot fail the run that is only mirroring its coverage.
+pub fn stream_catalog(paths: &CoveragePaths, catalog: &FlatCatalog) {
+    match serde_json::to_string(catalog) {
+        Ok(json) => stream_json(paths, Ledger::Catalog, &json),
+        Err(e) => tracing::error!(
+            error = %e,
+            ledger = Ledger::Catalog.as_str(),
+            "coverage catalog serialization failed; a coordinator will not see this record"
+        ),
+    }
 }
 
 /// Write a stream's first line (creating the file and its directory).
@@ -352,7 +365,7 @@ mod tests {
             sources: Default::default(),
             render_modes: Default::default(),
         };
-        stream_catalog(&paths, &catalog).unwrap();
+        stream_catalog(&paths, &catalog);
 
         let got: Vec<StreamLine> = lines(&stream)
             .iter()

@@ -2,7 +2,7 @@ use crate::ledger::events::FileTouchEvent;
 use crate::ledger::paths::CoveragePaths;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -70,18 +70,7 @@ async fn run_writer(paths: CoveragePaths, mut rx: mpsc::Receiver<WriteRequest>) 
 
     while let Some(req) = rx.recv().await {
         match req {
-            WriteRequest::File(ev) => {
-                if let Ok(mut line) = serde_json::to_string(&ev) {
-                    line.push('\n');
-                    let _ = files_f.write_all(line.as_bytes()).await;
-                    line.pop();
-                    crate::ledger::stream::stream_json(
-                        &paths,
-                        crate::ledger::stream::Ledger::Files,
-                        &line,
-                    );
-                }
-            }
+            WriteRequest::File(ev) => persist_file_event(&mut files_f, &paths, &ev).await,
             WriteRequest::Flush(ack) => {
                 let _ = files_f.flush().await;
                 let _ = ack.send(());
@@ -89,6 +78,33 @@ async fn run_writer(paths: CoveragePaths, mut rx: mpsc::Receiver<WriteRequest>) 
         }
     }
     let _ = files_f.flush().await;
+}
+
+/// Write one file-touch line to the ledger handle, then mirror it into the
+/// run stream — and only once the ledger write was accepted, the same order
+/// `append_record` keeps: a stream line for a record the ledger lost would
+/// show a coordinator a touch this host's own coverage never had. A failed
+/// ledger write is logged (the writer is a detached task; there is no caller
+/// to return it to).
+async fn persist_file_event<W: AsyncWrite + Unpin>(
+    ledger: &mut W,
+    paths: &CoveragePaths,
+    ev: &FileTouchEvent,
+) {
+    let mut line = match serde_json::to_string(ev) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::error!(?e, "serialize coverage file-touch event");
+            return;
+        }
+    };
+    line.push('\n');
+    if let Err(e) = ledger.write_all(line.as_bytes()).await {
+        tracing::error!(?e, path = ?paths.files, "write coverage files.jsonl; line not streamed");
+        return;
+    }
+    line.pop();
+    crate::ledger::stream::stream_json(paths, crate::ledger::stream::Ledger::Files, &line);
 }
 
 #[cfg(test)]
@@ -172,5 +188,65 @@ mod tests {
             }
             other => panic!("expected a files line, got {other:?}"),
         }
+    }
+
+    /// A ledger handle whose every write fails.
+    struct FailingLedger;
+
+    impl AsyncWrite for FailingLedger {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("disk full")))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn read_event(path: &str) -> FileTouchEvent {
+        FileTouchEvent::Read {
+            path: path.to_string(),
+            line_range: [1, 10],
+            tool: "read_file".to_string(),
+            attribution: attribution(),
+            at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_ledger_write_is_not_streamed() {
+        use crate::ledger::stream::RunStream;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stream = tmp.path().join("runs/run_test/coverage.jsonl");
+        let paths =
+            CoveragePaths::new(tmp.path(), "test-target").with_run_stream(Some(RunStream {
+                path: stream.clone(),
+                scope_name: "sec".to_string(),
+            }));
+
+        persist_file_event(&mut FailingLedger, &paths, &read_event("a.rs")).await;
+        assert!(
+            !stream.exists(),
+            "a record the ledger lost must not reach the stream"
+        );
+
+        // The healthy path still streams, to a ledger that accepted the line.
+        let mut ledger = Vec::new();
+        persist_file_event(&mut ledger, &paths, &read_event("b.rs")).await;
+        assert_eq!(String::from_utf8(ledger).unwrap().lines().count(), 1);
+        assert_eq!(std::fs::read_to_string(&stream).unwrap().lines().count(), 1);
     }
 }
