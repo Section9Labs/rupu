@@ -13,9 +13,34 @@ use rupu_agent::recovery::{Hop, HopBuilder, RecoveryOpts};
 
 use crate::model_limits::{self, LimitOverrides, LimitsContext};
 use crate::provider_factory::{
-    build_for_provider_with_config, is_dispatchable_provider, provider_config_for,
+    build_for_provider_with_config, is_dispatchable_provider, provider_config_for, ProviderConfig,
 };
 
+/// The agent's own provider settings, which a hop keeps. Each launch site
+/// passes exactly what it put into its primary provider's `ProviderConfig`
+/// and auth hint.
+#[derive(Debug, Clone, Default)]
+pub struct AgentOverrides {
+    /// `anthropicOauthPrefix`. Applied to every hop; non-Anthropic clients
+    /// ignore it.
+    pub oauth_prefix: Option<bool>,
+    /// `anthropicPromptCache`. Applied to every hop; non-Anthropic clients
+    /// ignore it.
+    pub prompt_cache: Option<bool>,
+    /// The agent's `auth:` mode. Applied only to a hop on `origin_provider`:
+    /// it names how the agent reaches its own provider, and says nothing
+    /// about another provider's credentials.
+    pub auth: Option<rupu_providers::AuthMode>,
+    /// The provider the run started on.
+    pub origin_provider: String,
+}
+
+/// Builds a fallback hop's provider from config. It uses the same
+/// credential resolver, `[providers]` table and netflow sink as the run's
+/// primary provider, plus the agent's own provider settings
+/// ([`AgentOverrides`]), so a hop to the same provider differs only in
+/// model. It then resolves the hop model's limits through config and
+/// discovery.
 pub struct RuntimeHopBuilder {
     pub resolver: Arc<dyn rupu_auth::CredentialResolver>,
     /// `[providers.<name>]`, the same table the primary provider was built from.
@@ -25,6 +50,21 @@ pub struct RuntimeHopBuilder {
     pub sink: Arc<dyn rupu_netflow::FlowSink>,
     /// `[recovery].server_side_fallback`, applied to the hop's provider too.
     pub server_side_fallback: bool,
+    pub agent_overrides: AgentOverrides,
+}
+
+impl RuntimeHopBuilder {
+    /// The `ProviderConfig` and auth hint a hop on `provider` is built with.
+    pub fn hop_config(&self, provider: &str) -> (ProviderConfig, Option<rupu_providers::AuthMode>) {
+        let mut cfg = provider_config_for(provider, &self.providers);
+        cfg.anthropic_server_side_fallback = Some(self.server_side_fallback);
+        cfg.anthropic_oauth_system_prefix = self.agent_overrides.oauth_prefix;
+        cfg.anthropic_prompt_cache = self.agent_overrides.prompt_cache;
+        let auth = (provider == self.agent_overrides.origin_provider)
+            .then_some(self.agent_overrides.auth)
+            .flatten();
+        (cfg, auth)
+    }
 }
 
 #[async_trait]
@@ -33,12 +73,11 @@ impl HopBuilder for RuntimeHopBuilder {
         if !is_dispatchable_provider(provider, &self.providers) {
             return Err(format!("provider {provider} is not configured"));
         }
-        let mut cfg = provider_config_for(provider, &self.providers);
-        cfg.anthropic_server_side_fallback = Some(self.server_side_fallback);
+        let (cfg, auth_hint) = self.hop_config(provider);
         let (_mode, mut provider_box) = build_for_provider_with_config(
             provider,
             model,
-            None,
+            auth_hint,
             self.resolver.as_ref(),
             &cfg,
             self.sink.clone(),
@@ -67,8 +106,9 @@ impl HopBuilder for RuntimeHopBuilder {
 /// One run's [`RecoveryOpts`]: the agent's `fallbacks:` (else the
 /// `[recovery].fallbacks` table) and a [`RuntimeHopBuilder`] over the
 /// resolver, provider table, limits context and netflow sink the run's
-/// primary provider was built with. Every launch site calls this, so none of
-/// them assembles the builder by hand.
+/// primary provider was built with, keeping the agent's own provider settings.
+/// Every launch site calls this, so none of them assembles the builder by
+/// hand.
 pub fn recovery_opts(
     recovery: &rupu_config::RecoveryConfig,
     agent_fallbacks: Option<&[rupu_config::FallbackEntry]>,
@@ -76,6 +116,7 @@ pub fn recovery_opts(
     providers: BTreeMap<String, rupu_config::ProviderConfig>,
     limits_ctx: LimitsContext,
     sink: Arc<dyn rupu_netflow::FlowSink>,
+    agent_overrides: AgentOverrides,
 ) -> RecoveryOpts {
     RecoveryOpts {
         chain: recovery.chain_for(agent_fallbacks),
@@ -85,6 +126,7 @@ pub fn recovery_opts(
             limits_ctx,
             sink,
             server_side_fallback: recovery.server_side_fallback,
+            agent_overrides,
         })),
     }
 }

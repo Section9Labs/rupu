@@ -2,7 +2,13 @@
 //! agent runner. It builds a fallback hop's provider through the same factory
 //! the primary provider uses, and resolves that hop's model limits.
 //!
-//! Every test here is `#[serial]`: the mock-script seam is a process env var.
+//! Env rule for this binary: every test that sets `RUPU_MOCK_PROVIDER_SCRIPT`
+//! (or any other process env var) AND every test that reaches the provider
+//! factory (a hop build, `model_limits::refresh`) is `#[serial]`, all on the
+//! one default key. The variable is process-global and the tests share one
+//! process: an unserialized factory-reaching neighbour that ran while a test
+//! here had the script set would build a `MockProvider` instead of its real
+//! provider and fail for a reason unrelated to what it tests.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -10,7 +16,8 @@ use std::sync::Arc;
 use rupu_agent::recovery::HopBuilder;
 use rupu_auth::KeychainResolver;
 use rupu_config::CustomModel;
-use rupu_runtime::hop_builder::RuntimeHopBuilder;
+use rupu_providers::AuthMode;
+use rupu_runtime::hop_builder::{AgentOverrides, RuntimeHopBuilder};
 use rupu_runtime::model_limits::LimitsContext;
 use serial_test::serial;
 
@@ -31,6 +38,7 @@ fn builder(limits_ctx: LimitsContext) -> RuntimeHopBuilder {
         limits_ctx,
         sink: Arc::new(rupu_netflow::MemorySink::default()),
         server_side_fallback: true,
+        agent_overrides: AgentOverrides::default(),
     }
 }
 
@@ -138,6 +146,7 @@ fn recovery_opts_prefers_the_agents_chain_and_wires_a_hop_builder() {
             BTreeMap::new(),
             LimitsContext::default(),
             Arc::new(rupu_netflow::MemorySink::default()),
+            AgentOverrides::default(),
         )
     };
     let from_agent = opts(Some(&[entry("from-agent")]));
@@ -146,4 +155,39 @@ fn recovery_opts_prefers_the_agents_chain_and_wires_a_hop_builder() {
     let from_table = opts(None);
     assert_eq!(from_table.chain, vec![entry("from-config")]);
     assert!(from_table.hop_builder.is_some());
+}
+
+fn agent_pinned_builder() -> RuntimeHopBuilder {
+    let mut b = builder(LimitsContext::default());
+    b.server_side_fallback = false;
+    b.agent_overrides = AgentOverrides {
+        oauth_prefix: Some(false),
+        prompt_cache: Some(false),
+        auth: Some(AuthMode::ApiKey),
+        origin_provider: "anthropic".into(),
+    };
+    b
+}
+
+/// A same-provider hop keeps the agent's Anthropic settings and its auth
+/// mode: without them the hop would turn the OAuth prefix and the prompt
+/// cache back on, and could move an API-key run onto SSO.
+#[test]
+fn a_same_provider_hop_keeps_the_agents_settings_and_auth() {
+    let (cfg, auth) = agent_pinned_builder().hop_config("anthropic");
+    assert_eq!(cfg.anthropic_oauth_system_prefix, Some(false));
+    assert_eq!(cfg.anthropic_prompt_cache, Some(false));
+    assert_eq!(cfg.anthropic_server_side_fallback, Some(false));
+    assert_eq!(auth, Some(AuthMode::ApiKey));
+}
+
+/// The agent's auth mode names how it reaches ITS provider; another
+/// provider's credential precedence decides for a cross-provider hop.
+#[test]
+fn a_cross_provider_hop_does_not_inherit_the_agents_auth() {
+    let (cfg, auth) = agent_pinned_builder().hop_config("openai");
+    assert_eq!(auth, None);
+    // Anthropic-only knobs ride along; a non-Anthropic client ignores them.
+    assert_eq!(cfg.anthropic_oauth_system_prefix, Some(false));
+    assert_eq!(cfg.anthropic_prompt_cache, Some(false));
 }

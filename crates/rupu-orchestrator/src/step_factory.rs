@@ -426,6 +426,14 @@ impl StepFactory for DefaultStepFactory {
                 self.providers.clone(),
                 self.limits_ctx.clone(),
                 sink,
+                // Exactly what the step's primary `ProviderConfig` and auth
+                // hint above carry, so a hop keeps the agent's settings.
+                rupu_runtime::hop_builder::AgentOverrides {
+                    oauth_prefix: spec.anthropic_oauth_prefix,
+                    prompt_cache: spec.anthropic_prompt_cache,
+                    auth: auth_hint,
+                    origin_provider: provider_name.clone(),
+                },
             ),
             _ => Default::default(),
         };

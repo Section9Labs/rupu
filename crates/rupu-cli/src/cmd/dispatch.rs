@@ -423,6 +423,14 @@ impl AgentDispatcher for CliAgentDispatcher {
             coverage_stream: self.coverage_stream.clone(),
         };
 
+        // What a fallback hop keeps from this child's agent: exactly what its
+        // primary provider's `ProviderConfig` and auth hint above carry.
+        let hop_overrides = rupu_runtime::hop_builder::AgentOverrides {
+            oauth_prefix: spec.anthropic_oauth_prefix,
+            prompt_cache: spec.anthropic_prompt_cache,
+            auth: spec.auth,
+            origin_provider: provider_name.clone(),
+        };
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
@@ -488,6 +496,7 @@ impl AgentDispatcher for CliAgentDispatcher {
                 self.providers.clone(),
                 self.limits_ctx.clone(),
                 netflow_sink,
+                hop_overrides,
             ),
         };
 

@@ -7642,10 +7642,25 @@ fn session_agent_fallbacks(
     ) {
         Ok(spec) => spec.fallbacks,
         Err(e) => {
+            // Loading one agent parses every file in the agent dirs, so a
+            // broken file that is NOT this agent's also lands here: name the
+            // file, not only the agent.
+            let cause = match &e {
+                rupu_agent::AgentLoadError::Parse { path, .. }
+                | rupu_agent::AgentLoadError::Io { path, .. } => format!(
+                    "agent file {path} in the agent dirs did not load (it need not be this \
+                     agent's own file)"
+                ),
+                rupu_agent::AgentLoadError::NotFound(_) => {
+                    "no agent by this name in the agent dirs".to_string()
+                }
+            };
             tracing::warn!(
                 agent = %session.agent_name,
+                global_agents = %global.join("agents").display(),
+                project_agents = ?project_agents_parent.as_ref().map(|p| p.join("agents")),
                 error = %e,
-                "session agent did not load; the turn uses the [recovery].fallbacks table"
+                "{cause}; the turn uses the [recovery].fallbacks table"
             );
             None
         }
@@ -7867,6 +7882,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             cfg.providers.clone(),
             limits_ctx,
             netflow_sink,
+            // Exactly what this turn's primary `ProviderConfig` and auth hint
+            // above carry, so a hop keeps the session's settings.
+            rupu_runtime::hop_builder::AgentOverrides {
+                oauth_prefix: session.anthropic_oauth_prefix,
+                prompt_cache: session.anthropic_prompt_cache,
+                auth: session.auth_mode,
+                origin_provider: session.provider_name.clone(),
+            },
         );
 
         let opts = AgentRunOpts {

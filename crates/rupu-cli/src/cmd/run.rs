@@ -1047,6 +1047,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         )
         .await;
 
+        // What a fallback hop keeps from this agent: exactly what the primary
+        // provider's `ProviderConfig` and auth hint above carry.
+        let hop_overrides = rupu_runtime::hop_builder::AgentOverrides {
+            oauth_prefix: spec.anthropic_oauth_prefix,
+            prompt_cache: spec.anthropic_prompt_cache,
+            auth: spec.auth,
+            origin_provider: provider_name.clone(),
+        };
         let mut opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
@@ -1103,6 +1111,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 cfg.providers.clone(),
                 limits_ctx.clone(),
                 netflow_sink.clone(),
+                hop_overrides,
             ),
         };
         if let Some((messages, seed_source)) = resume_from.take() {
