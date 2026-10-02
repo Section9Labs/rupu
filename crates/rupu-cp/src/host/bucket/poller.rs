@@ -65,10 +65,13 @@ async fn mirror_new_results(
     run_id: &str,
     consumed: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
-    let results = bucket
+    let mut results = bucket
         .list_results(run_id)
         .await
         .with_context(|| format!("list_results for run {run_id}"))?;
+    // A listing comes back in key order, which is not chunk order past seq
+    // 9,999 (see `result_order`); lines must land in the order written.
+    results.sort_by(|(a, _), (b, _)| result_order(a).cmp(&result_order(b)));
 
     for (key, body) in results {
         if consumed.contains(&key) {
@@ -115,6 +118,20 @@ async fn mirror_new_results(
     }
 
     Ok(())
+}
+
+/// The order result objects are mirrored in: by kind, then by the numeric
+/// sequence parsed from `<kind>.<seq>.jsonl`. The worker zero-pads `seq` to
+/// four digits (`result_key`), which keeps lexicographic order right only up
+/// to 9,999 — `coverage.10000.jsonl` sorts before `coverage.9999.jsonl` —
+/// and older workers write that format, so the key format stays and the
+/// order comes from the number. A key that does not parse sorts after every
+/// parsed one of its name, by name.
+fn result_order(key: &str) -> (&str, u64, &str) {
+    key.strip_suffix(".jsonl")
+        .and_then(|stem| stem.rsplit_once('.'))
+        .and_then(|(kind, seq)| seq.parse::<u64>().ok().map(|n| (kind, n, key)))
+        .unwrap_or((key, u64::MAX, key))
 }
 
 /// Map a result-object filename (not the full path) to the matching
@@ -265,6 +282,72 @@ mod tests {
             "the object that landed after the list but before the marker is mirrored too"
         );
         assert!(consumed.contains("coverage.0001.jsonl"));
+    }
+
+    /// Result keys are `<kind>.<seq:04>.jsonl`, so past 9,999 chunks the
+    /// zero-padding runs out and a listing's lexicographic order puts
+    /// `10000` before `9999`. Chunks are mirrored in numeric order per kind.
+    #[tokio::test]
+    async fn results_past_seq_9999_are_mirrored_in_numeric_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(dir.path().join("runs")));
+        let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
+        let (run_id, host_id) = ("run_POLLSEQ00000001", "host_SEQ");
+        mirror
+            .create_run(
+                run_id,
+                host_id,
+                &crate::node::protocol::RunSpec {
+                    kind: crate::node::protocol::RunSpecKind::Workflow,
+                    name: "w".into(),
+                    inputs: Default::default(),
+                    prompt: None,
+                    mode: None,
+                    target: None,
+                    findings_profile: None,
+                },
+            )
+            .unwrap();
+        let bucket = ObjectStoreBucket::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            "p",
+        );
+        for (key, body) in [
+            ("coverage.9998.jsonl", "c1\n"),
+            ("coverage.9999.jsonl", "c2\n"),
+            ("coverage.10000.jsonl", "c3\n"),
+            ("coverage.10001.jsonl", "c4\n"),
+            ("events.9999.jsonl", "{\"e\":1}\n"),
+            ("events.10000.jsonl", "{\"e\":2}\n"),
+        ] {
+            bucket
+                .put_result(run_id, key, body.as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut consumed = HashSet::new();
+        poll_bucket_run(&bucket, &mirror, host_id, run_id, &mut consumed)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirror.coverage_path(run_id)).unwrap(),
+            "c1\nc2\nc3\nc4\n"
+        );
+        let events = std::fs::read_to_string(store.events_path(run_id)).unwrap();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            vec!["{\"e\":1}", "{\"e\":2}"]
+        );
+    }
+
+    #[test]
+    fn result_order_parses_the_numeric_sequence() {
+        assert!(result_order("coverage.9999.jsonl") < result_order("coverage.10000.jsonl"));
+        assert!(result_order("events.0002.jsonl") < result_order("events.0010.jsonl"));
+        // Kinds stay apart; an unparseable key sorts by its name after them.
+        assert!(result_order("coverage.10000.jsonl") < result_order("events.0001.jsonl"));
+        assert_eq!(result_order("run.json").1, u64::MAX);
     }
 
     #[test]
