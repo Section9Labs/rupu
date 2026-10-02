@@ -1,7 +1,7 @@
 # rupu CP — progressive per-host loading for Activity, Usage and ⌘K
 
 - **Date:** 2026-10-01
-- **Status:** design approved in brainstorm; awaiting spec review
+- **Status:** design approved in brainstorm; awaiting spec review; implemented on branch `claude/cp-progressive-per-host-loading`
 - **Branch:** `claude/cp-progressive-per-host-loading`
 - **Prior art:** the dashboard's per-host load (`web/src/lib/dashboard/useDashboardData.ts`,
   spec `2026-07-30-rupu-dashboard-fleet-strip-design.md`); the `/api/hosts` probe cache
@@ -103,7 +103,7 @@ Facts established while designing. Some of them correct the original framing.
                             │ ?host=<id> (single-host path, already exists)
                ┌──────────── rupu cp serve ───────────┐
                │ single-host list handlers            │
-               │   connector error → 502 / 501        │  (§7.1)
+               │   connector error → 502 / 501        │  (§7.1; 404 = unknown host id only)
                │ SshHostConnector                     │
                │   ListingCache: 5 s TTL, single-flight, cleared on mutation │  (§7.2)
                └──────────────────────────────────────┘
@@ -169,13 +169,14 @@ It returns `{ visible, floor, hasMore, ended, gatingHosts, excludedHosts }`.
 
 ```ts
 usePerHostPagedList<T>({
-  hosts: 'all' | string,                 // ALL_HOSTS sentinel or one host id
-  fetch: (p: { host: string; offset: number; limit: number }) => Promise<T[]>,
+  host: string | null,                   // one host id, or null = every registered host
+  fetch: (p: { host: string; offset: number; limit: number; signal?: AbortSignal }) => Promise<T[]>,
   timeField: keyof T & string,
-  idField?: keyof T & string,            // default 'id'
+  idField: keyof T & string,
   deps: unknown[],
   poll?: boolean,
-}) → { rows, slices, loading, error, hasMore, ended, sentinelRef, refresh, refreshHost }
+}) → { rows, slices, loading, error, hasMore, ended, sentinelRef,
+       refresh, refreshHost, retryPaging, removeRow }
 ```
 
 `rows` is `watermarkMerge(...).visible`.
@@ -183,10 +184,14 @@ usePerHostPagedList<T>({
 - `loading` is true only until the host list is known and at least one slice has left
   `loading`. After that, per-host loading lives in `slices`, and the page shows "Waiting
   on …" (§8) rather than a spinner.
-- `error` is set only when every slice has failed.
+- `error` is set when the host list could not be read, or when every slice has failed.
+
+Per-host state lives in `lib/perHost/engine.ts` (`PerHostListEngine`), outside React. The
+hook owns one engine per filter generation, disposes it on change, and owns the cadence
+timers. A disposed engine ignores every late answer.
 
 The deps/generation handling is the same as `usePagedList`: deps are compared index by
-index into a stable `gen`, and `fetch` is read through a ref. `hosts: string` (one id)
+index into a stable `gen`, and `fetch` is read through a ref. `host: string` (one id)
 produces a single slice and skips the registered-hosts read, so every page has one code
 path whatever its filter.
 
@@ -205,17 +210,18 @@ rows. This covers a remote's first page and a host recovering from offline. In t
   the rows that would drop below the floor if `h` started gating now.
 - If `displaced = 0` or `¬h.hasMore`: `h` gates immediately.
 - Otherwise `h.catchingUp = true`, with a budget of `displaced` rows. The hook fetches
-  batches of `limit = clamp(remaining budget, 20, 200)` (200 is the server's `MAX_LIMIT`)
-  until one of these holds:
+  batches of `limit = clamp(remaining budget, 20, 195) + 5` (the 5-row overlap; 200 is the
+  server's `MAX_LIMIT`) until one of these holds:
   - `covered(h) ≤ F` (computed without `h`)
   - `¬hasMore`
   - the budget is spent
   
   Then `catchingUp = false` and `h` gates.
-- **Property (tested):** a late host never makes the visible list shorter. If catch-up
-  reaches `F`, nothing is displaced. If the budget runs out first, the late host has added
-  at least `displaced` rows, all above the new floor, and the rows it now displaces are a
-  subset of the original `displaced` set.
+- **Property (tested, with a real catch-up batch):** the visible list is never shorter than
+  it was before the late host arrived. The visible count can peak during catch-up and then
+  settle. If catch-up reaches `F`, nothing is displaced. If the budget runs out first, the
+  late host has added at least `displaced` rows, all above the new floor, and the rows it
+  now displaces are a subset of the original `displaced` set.
 - A late host can still insert rows above the row you're reading, because that is what
   merging means. The browser's default scroll anchoring keeps the row being read in place.
   The live check (§10) verifies this.
@@ -226,17 +232,36 @@ and the result is de-duplicated. The 5-row overlap absorbs up to 5 rows leaving 
 host's list between pages without skipping any. A page is full when
 `returned.length === limit`.
 
+**Offset drift.** A full page that adds no new rows means rows landed on top of the host's
+list and shifted every offset, so the cursor now points at rows already held. The host
+re-anchors (a page-0 splice for that host) and retries the page once. If it still adds
+nothing, the host gets `pagingFailed` with the reason "list shifted while paging", rather
+than silently ending its list. If the re-anchor itself fails, the host gets `pagingFailed`
+with that failure's reason, and the page is not retried. A short page that adds nothing is
+the real end of the list.
+
 **At most one request in flight per host.** A refresh that comes due while that host
 has a page or catch-up request in flight runs after it, coalesced. This bounds
 concurrency per host and table to 1. Together with the server's single-flight (§7.2),
 that bounds the SSH commands an open table can cause.
 
+**Bounded fetches.** Every engine fetch is bounded at 45 s (`FETCH_TIMEOUT_MS`): a host
+that has not answered by then fails with "no answer after 45s" (offline for a first load,
+`pagingFailed` for a page), so one hung host cannot hold its own queue, or `loadMore`'s
+scroll lock, forever. `PerHostFetchParams.signal` is aborted on that timeout and when the
+engine is disposed, and the list and usage api calls forward it to `fetch`. Without that,
+abandoned requests to a hung host would pile up and exhaust the browser's 6-per-origin
+connection pool.
+
 **Refresh merge rule** (pure, `lib/perHost/spliceHead.ts`). Given a host's old rows `O`
 and a fresh page 0 `P`, requested with `limit L`:
 
 - If `|P| < L`, the host is fully listed: `rows = P`, `hasMore = false`.
-- Otherwise, let `cutoff = t(last of P)`. Then
-  `rows = P ∪ { o ∈ O : t(o) ≤ cutoff ∧ o.id ∉ P }`, re-sorted, with `hasMore` unchanged.
+- Otherwise, if `P` does not overlap the old rows (`O` is empty, or the newest old row is
+  older than `cutoff = t(last of P)`), the union would leave a gap of rows between the two
+  ranges. `P` **replaces** the slice and `hasMore = true`.
+- Otherwise `rows = P ∪ { o ∈ O : t(o) ≤ cutoff ∧ o.id ∉ P }`, re-sorted, with `hasMore`
+  unchanged.
   - Old rows newer than `cutoff` that are missing from `P` are dropped. They left the
     list: finished, archived, or filtered out.
   - Rows exactly at `cutoff` are kept, so a timestamp tie is never lost.
@@ -257,10 +282,16 @@ This replaces `usePagedList`'s splice (§2.7).
 Polling tables are WorkflowRuns and AgentRuns on Running, Sessions on Active, and
 Autoflow cycles and events.
 
+**Retry.** `retryPaging(id)` is a no-op unless that host is `pagingFailed`. It clears the
+flag and re-anchors on a fresh page 0 before rejoining the merge (catch-up as for a late
+host). Throughout the re-anchor the host stays out of gating (`catchingUp`): gating again at
+its old, shallower coverage would lift the floor and hide rows right where Retry was clicked.
+
 **Manual Refresh** re-reads `/api/hosts/registered`, adding slices for new hosts and
 dropping removed ones. It then applies the refresh merge rule to every host. It does not
 reset the list, so nothing flashes. **`refreshHost(id)`** refreshes one slice. Row
-actions (archive/restore/delete) use it for the host that owns the row.
+actions (archive/restore/delete) use it for the host that owns the row, after
+`removeRow(hostId, id)` drops the acted-on row from that slice.
 
 **`usePagedList` cleanup.** Once the Activity tables move off it, `usePagedList` has no
 `poll: true` caller left. Its `poll` option and the buggy splice are removed. The
@@ -284,32 +315,70 @@ project tabs and Claims keep using it, without polling.
 - **`useUsageData(window)`** follows `useDashboardData`'s shape: read
   `/api/hosts/registered`, seed one `loading` entry per host, then fire
   `getUsage({ since, until }, host)` per host independently.
-- **No `group_by` is sent.** The page never reads `breakdown`, so a pivot click no longer
-  refetches, and SSH hosts stay in the headline under every pivot (§2.4).
+- **`group_by` is pinned to `model`** (the server default, which every transport, SSH
+  included, can answer), not omitted. The page never reads `breakdown`, so a pivot click no
+  longer refetches, and SSH hosts stay in the headline under every pivot (§2.4).
 - **Each response's own `hosts[0]` entry is authoritative** (the dashboard rule). A 200
   whose entry says `offline`/`unavailable` is stored as that state, without its zeroed
   summary.
-- **`mergeUsage`** runs over the `ok` hosts. It ports `usage::rollup` (sum tokens and
-  runs; `cost_usd` is `None` unless some host priced; `priced` ANDs; `partial` ORs) and
-  `merge_unpriced` (union of models, sum of rows).
-- **Headline honesty.** When any host is not `ok`, the headline's sub-label adds
-  "· excludes mini (offline)", and loading hosts are named the same way.
+- **`mergeUsage`** runs over the hosts that are `ok` for the current window. It ports
+  `usage::rollup` (sum tokens and runs; `cost_usd` is `None` unless some host priced;
+  `priced` ANDs; `partial` ORs) and `merge_unpriced` (union of models, sum of rows).
+- **Headline honesty.** When any host is not current for the window, the headline's
+  sub-label adds "· excludes mini (offline)". Loading hosts are named the same way, and a
+  stale one reads "(stale)" (below).
 - **Cadence.**
   - Local refetches whenever the window changes: the existing 30 s preset tick, and any
     user range change.
   - Remotes refetch every 60 s while visible, on focus, and immediately on a
     user-initiated window change (range click or drag-select). They do not refetch on the
     30 s tick.
+  - The 60 s poll and the focus refetch skip any host that already has a request in
+    flight: restarting it would mean a host slower than the poll never answers. A user
+    window change and the tick supersede the in-flight request on purpose.
   - A remote's figure can therefore lag local by up to 60 s; the strip shows each host's
     age.
-- **Stale-on-error:** last-good data stays visible, as on the dashboard.
+- **Bounded and abortable requests.** Each usage request is bounded at 45 s
+  (`FETCH_TIMEOUT_MS`, shared with the list engine): a host that has not answered is
+  aborted and recorded as failed ("no answer after 45s"), so the in-flight skip above can
+  never leave a host loading forever. A newer request for a host aborts its previous one,
+  and unmount aborts them all, so a hung remote does not hold a browser connection for as
+  long as it lives. An aborted or superseded request never marks its host offline.
+- **A 404 drops a non-local host** (removed from the registry), as the list engine does.
+  `local` is never dropped; it shows as offline.
+- **Stale-on-error:** a host that answered for window A and then fails its request for
+  window B keeps its old answer, but is excluded from B's headline. The failure is
+  recorded against the window it failed for (`failedKey`). A host whose `failedKey` is the
+  current window counts as **failed** for it, whatever stale data it still holds:
+  - it shows `offline` in the strip and `(stale)` in the headline's excluded list;
+  - it counts toward `error`, so a page whose every host ended up that way reads as an
+    error rather than loading forever;
+  - it **stays** failed while a retry for that same window (tick, poll, focus) is in
+    flight, until the retry answers, so the error does not flicker back to a spinner each
+    poll cycle.
+
+  A failure for some other window says nothing about this one: a window change reads
+  `loading`, not failed.
+- **Window changes keep the last good headline.** `useUsageData` returns no headline from a
+  user window change until the first host answers for the new window (it never mixes an old
+  window's figures into a new one). The page keeps the last good headline on screen
+  meanwhile, with its "updating" cue and the strip's `loading` entries, and does not
+  collapse to the full-page spinner (which would unmount the timeline and delay its run-rows
+  fetch).
 
 ### 6.6 ⌘K palette
 
-The runs source becomes per host: `getRuns({ host, limit: 200 })` for each registered
-host, with that host's items appended as it answers. The palette's loading spinner tracks
-the non-run sources and local runs only, so a hung remote never holds the palette in a
-loading state.
+The runs source becomes per host: `getRuns({ host, limit: 200, signal })` for each
+registered host, with that host's items appended as it answers. The palette's loading
+spinner tracks the non-run sources and local runs only, so a hung remote never holds the
+palette in a loading state. A failed host contributes no runs and no error.
+
+**One `AbortController` per open.** Closing the palette (or unmounting it) aborts every
+per-host run request, so a hung remote cannot pin a connection per open and exhaust the
+browser's 6-per-origin pool.
+
+A remote run's entry links to `/runs/<id>?host=<host_id>` and is keyed `<host_id>:<id>`.
+Without the host, the CP would have to probe every host to find the run.
 
 ## 7. Server
 
@@ -327,11 +396,18 @@ The mapping:
 | `HostConnectorError` | Status | Client state |
 |---|---|---|
 | `Unsupported`, `Invalid` | 501 (`ApiError::not_available`) | `unavailable` |
-| `NotFound` | 404 | slice dropped (host removed) |
-| everything else (`Unreachable`, `Unauthorized`, `Remote`, `NotJson`, …) | 502 (`ApiError::bad_gateway`) | `offline` |
+| everything else (`Unreachable`, `Unauthorized`, `Remote`, `NotJson`, **`NotFound`**, …) | 502 (`ApiError::bad_gateway`) | `offline` |
+| *(not a connector error)* `resolve_host`'s unknown host id | 404 | slice dropped as "host removed" |
+
+The helper is `api::runs::host_list_error`. A connector `NotFound` on a list path is
+**502**, never 404: a reachable HTTP remote that answers a list route with 404 would
+otherwise vanish silently. **404 on these paths comes only from `resolve_host`'s unknown
+host id**, i.e. the host was removed from the registry, and the client drops that slice.
+(The client drops a 404 slice only in All-hosts mode, and never `local`.)
 
 The body stays `{ "error": "<reason>" }`, and the client shows the reason. Today all of
-these return 500, which can't tell "down" from "too old".
+these return 500, which can't tell "down" from "too old". For SSH, which side of that line
+a failure is on is decided in §7.2.
 
 ### 7.2 SSH listing cache
 
@@ -357,21 +433,49 @@ caches one per host.
     ⌘K on one page load, two browser tabs) and back-to-back catch-up and scroll pages.
 - **Single-flight:** concurrent callers for the same key share one in-flight `ssh`,
   including its error. **Errors are never stored** beyond that one call.
+- **Cancellation.** A fetch whose every waiter went away (each caller cancelled or
+  panicked) is **dropped, never resumed** for a later caller, so its old answer is never
+  served as fresh. A waiter count per in-flight fetch decides this. Dropping the fetch
+  closes the remote command's pipes. The `ssh` child is **not killed** (`SshExec::run` is
+  `Command::output()` without `kill_on_drop`); it exits on its next write.
+- **Panic.** A fetch that panics fails **every** waiter, including ones parked on it, with
+  an `Unreachable("listing fetch panicked")` error. Nothing is stored. The panic is caught
+  inside the shared future, because `Shared` marks itself poisoned on a panic without
+  waking the waiters already parked on it, which would hang them.
 - **Cleared on mutation.** Every mutating `SshHostConnector` method clears the whole
-  cache, so a refresh straight after an action never shows the pre-action row:
+  cache (a `clear_on_drop` guard), so a refresh straight after an action never shows the
+  pre-action row:
   - runs: `approve_run`, `reject_run`, `cancel_run`, `pause_run`, `resume_run`,
     `archive_run`, `restore_run`, `delete_run`
   - launches: `launch_run`, `launch_agent`
-  - sessions: `send_session_turn`, `archive_session`, `restore_session`
+  - sessions: `start_session`, `send_session_turn`, `archive_session`, `restore_session`,
+    `delete_session`
+  - transcripts: `archive_transcript`, `delete_transcript` (both through
+    `remote_transcript`, which changes what the cached `transcript list` returns)
   
   The cache is cleared after the remote command returns, whether it succeeded or failed:
-  a failed mutation may still have partly applied.
+  a failed mutation may still have partly applied. A fetch that started before the clear
+  never stores its (pre-mutation) answer, and a caller arriving after the clear never
+  joins it.
+- **Down vs old (classification of `list_runs` / `dashboard_summary` failures).** A host
+  that is down is not a host that predates `rupu run list`. An ssh **transport** failure
+  (`is_ssh_transport_failure`) passes through as `Unreachable` (**offline**, 502). Only a
+  failure of the remote rupu itself maps to `Unsupported` (**unavailable**, "needs a
+  newer rupu", 501). `RemoteOutput` carries no exit code, so the classifier is stderr
+  markers: `ssh: `, `ssh spawn failed`, `connection refused`, `connection reset by`,
+  `connection timed out`, `connection closed by`, `operation timed out`, `no route to host`,
+  `permission denied (publickey`, `host key verification failed`,
+  `kex_exchange_identification`, and the mid-session drops `closed by remote host`,
+  `not responding`, `broken pipe`, `received disconnect`. The
+  other cached listings (`autoflow history`, `transcript list`, `session list`) pass the
+  `Unreachable` through unchanged, so they are offline on any failure.
 - **Shared use:** `list_runs` and `dashboard_summary` share the `run list` entry.
   `list_autoflow_runs`, `list_autoflow_events` and `dashboard_summary` share the
   `autoflow history` entry.
-- **Implementation:** a small sibling of `HostProbeCache` with the same per-key slot and
-  `tokio::Mutex` single-flight. Unlike `HostProbeCache`, its fetch is fallible, errors
-  are never stored, there is no serve-stale window, and it has a `clear()`.
+- **Implementation:** `host/listing_cache.rs`, a sibling of `HostProbeCache`. Per key it
+  keeps one `futures::Shared` fetch behind a `std::sync::Mutex` (never held across an
+  await), plus the waiter count above. Unlike `HostProbeCache`, its fetch is fallible,
+  errors are never stored, there is no serve-stale window, and it has a `clear()`.
 
 **SSH budget this buys:** an open All-hosts polling table on a CP with 4 SSH hosts costs
 about **4 remote commands a minute**. Today's All-hosts Running tab costs 48 (4 hosts ×
@@ -391,8 +495,10 @@ new endpoints are added.
   `reason` is set, and the strip shows it as stale with its age. Only a host that never
   answered becomes `offline`/`unavailable`.
 - **Paging or catch-up failure:** `pagingFailed = true`. The host stops gating, so the
-  list never gets stuck behind it. The footer reads "older rows from `<host>` couldn't
-  load · Retry", and Retry clears the flag and retries the page.
+  list never gets stuck behind it. This covers a failed or timed-out page, a failed
+  re-anchor, and a list that kept shifting ("list shifted while paging", §6.3). The footer
+  reads "older rows from `<host>` couldn't load · Retry", and Retry re-anchors the host on
+  a fresh page 0 and resumes (§6.3).
 - **Never claim emptiness we can't vouch for:**
   - Hosts still loading and no rows yet → "Waiting on mini, kuki…", not the empty state.
   - Every host answered with zero rows → today's empty state. If any host is
@@ -446,12 +552,15 @@ new endpoints are added.
 **Rust (`cargo test -p rupu-cp`)**
 
 - Error mapping for each listed handler, with a stub connector: `Unreachable` → 502,
-  `Unsupported` → 501, `NotFound` → 404.
+  `Unsupported` → 501, `NotFound` → 502 (404 only from `resolve_host`'s unknown host id).
 - `ListingCache` + `SshHostConnector`, using `FakeExec` to count exec calls:
   - two concurrent `list_runs` → 1 exec
   - a repeat within 5 s → 0 execs; after 5 s → 1
   - an error is not stored
+  - a cancelled fetch is dropped, not resumed; a panicking fetch fails every waiter
   - each mutating method clears the cache
+  - an ssh transport failure is `Unreachable` (offline); a remote-rupu failure is
+    `Unsupported` (unavailable)
   - `list_runs` and `dashboard_summary` share one `run list` exec
   
   These call-count assertions are the guarantee against SSH bursts.
@@ -495,3 +604,59 @@ run locally because `ci.yml` skips it.
 - **Default flip to All hosts on a CP with many slow hosts:** each table load costs one
   request per host. Bounded by single-flight, the one-in-flight-per-host rule and the
   60 s remote cadence.
+
+## 13. Execution amendments (2026-10-01)
+
+Rulings made while implementing; each is folded into the section named.
+
+- **§7.1: a connector `NotFound` on a list path is 502, not 404.** 404 comes only from
+  `resolve_host`'s unknown host id. A reachable HTTP remote that answers a list route with
+  404 would otherwise vanish silently as "host removed".
+- **§7.2: the mutation list gains transcript archive/delete (`remote_transcript`),
+  `start_session` and `delete_session`.** They change what a cached listing returns (or, for
+  `start_session`, would), so they must clear it too.
+- **§7.2: cancellation drops a fetch, never resumes it.** A fetch whose every waiter went
+  away would otherwise serve an old snapshot as fresh to the next caller. The ssh child is not
+  killed; it exits on its next write.
+- **§7.2: a panicking fetch fails every waiter, parked ones included, and stores nothing.**
+  `Shared` does not wake parked waiters on a panic, so they would hang.
+- **§7.2: a fetch that started before a clear never stores, and a later caller never joins
+  it.** A pre-mutation answer must not outlive the mutation.
+- **§7.2: an ssh transport failure is `Unreachable` (offline); only a remote-rupu failure is
+  `Unsupported`.** A down host would otherwise read as "needs a newer rupu". The classifier is
+  stderr markers because `RemoteOutput` carries no exit code.
+- **§7.2: implementation is `Shared` futures + a waiter count behind a `std` mutex**, not
+  `HostProbeCache`'s `tokio::Mutex` slot, to support cancellation and panics.
+- **§6.3: a full page 0 that does not overlap the old rows replaces the slice** and sets
+  `hasMore = true`. The union would otherwise lose the rows between the two ranges.
+- **§6.3: a full page that adds no rows re-anchors and retries once, then `pagingFailed`
+  ("list shifted while paging").** Rows landing on top shift every offset; silently ending the
+  list hid older rows. A failed re-anchor reports its own reason.
+- **§6.3: `retryPaging` is a no-op unless paging-failed, re-anchors before rejoining, and
+  stays out of gating while doing so.** Gating at the old, shallower coverage would lift the
+  floor and hide rows where Retry was clicked.
+- **§6.3: every engine fetch is bounded at 45 s, and its `signal` is aborted on timeout and
+  dispose.** Abandoned requests to a hung host would exhaust the browser's 6-per-origin
+  connection pool.
+- **§6.3: the catch-up property is "never shorter than the pre-arrival list", tested with a
+  real catch-up batch.** The count can peak during catch-up and then settle. Batches are
+  `clamp(budget, 20, 195) + 5` so they never exceed the server's `MAX_LIMIT`.
+- **§6.3: the hook takes `host: string | null` (not `hosts`), a required `idField`, and
+  returns `retryPaging` and `removeRow`.** They are what the pages' Retry and row actions use.
+- **§6.5: `group_by` is pinned to `model`, not omitted.** It is the server default and every
+  transport can answer it; the page never reads `breakdown`.
+- **§6.5: a host that is `ok` for an older window and failed for the current one
+  (`failedKey === windowKey`) counts as failed.** Otherwise a page whose every host ended up
+  that way read `loading` forever. It stays failed while a same-window retry is in flight, so
+  the error does not flicker back to a spinner each poll.
+- **§6.5: usage requests are bounded at 45 s, a newer request aborts the previous one, and
+  unmount aborts all.** The same connection-pool starvation as the list engine.
+- **§6.5: the 60 s poll and focus refetch skip hosts with a request in flight.** Restarting
+  it would mean a host slower than the poll never answers.
+- **§6.5: a 404 drops a non-local host.** It was removed from the registry.
+- **§6.5: the page keeps the last good headline, with its "updating" cue, while a
+  user-changed window loads.** The hook never mixes an old window's figures into a new
+  one, and collapsing to the full-page spinner would unmount the timeline.
+- **§6.6: the palette aborts its per-host run requests when it closes, and a remote run
+  links with `?host=`.** A hung remote would otherwise pin a connection per open, and a
+  host-less link makes the CP probe every host to find the run.
