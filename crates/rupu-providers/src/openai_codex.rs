@@ -670,40 +670,31 @@ impl OpenAiCodexClient {
                     acc.raw_output.push(item.clone());
 
                     if item["type"].as_str() == Some("function_call") {
-                        // Finalize tool call
-                        if let (Some(id), Some(name)) =
-                            (acc.current_tool_id.take(), acc.current_tool_name.take())
-                        {
-                            // A zero-argument call may stream no argument deltas:
-                            // fall back to the done item's own `arguments`, then
-                            // to an empty object (as the Anthropic path does).
-                            let streamed = std::mem::take(&mut acc.current_tool_input);
-                            let input_str = if !streamed.trim().is_empty() {
-                                streamed
-                            } else {
-                                match item["arguments"].as_str() {
-                                    Some(a) if !a.trim().is_empty() => a.to_string(),
-                                    _ => "{}".to_string(),
-                                }
-                            };
-                            match serde_json::from_str::<serde_json::Value>(&input_str) {
-                                Ok(input) => acc.content_blocks.push(ContentBlock::ToolUse {
-                                    id,
-                                    name,
-                                    input,
-                                }),
-                                Err(e) => {
-                                    warn!(tool = %name, error = %e, "dropping tool call with unparseable arguments");
-                                    // Overwrites an earlier bad tool on purpose,
-                                    // as the Anthropic accumulator does: one
-                                    // record is enough to name the failure.
-                                    acc.bad_tool = Some(serde_json::json!({
-                                        "name": name,
-                                        "id": id,
-                                        "error": e.to_string(),
-                                    }));
-                                }
-                            }
+                        // Finalize the tool call. When its
+                        // `output_item.added` was missed, the done item's
+                        // own `call_id`/`name` name it instead.
+                        let id = acc
+                            .current_tool_id
+                            .take()
+                            .unwrap_or_else(|| item["call_id"].as_str().unwrap_or("").to_string());
+                        let name = acc.current_tool_name.take().unwrap_or_else(|| {
+                            desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""))
+                        });
+                        // A zero-argument call may stream no argument deltas:
+                        // fall back to the done item's own `arguments`, then
+                        // to an empty object (as the Anthropic path does).
+                        let streamed = std::mem::take(&mut acc.current_tool_input);
+                        let arguments = if streamed.trim().is_empty() {
+                            item["arguments"].as_str().unwrap_or("")
+                        } else {
+                            streamed.as_str()
+                        };
+                        match tool_call_block(id, name, arguments) {
+                            Ok(block) => acc.content_blocks.push(block),
+                            // Overwrites an earlier bad tool on purpose, as
+                            // the Anthropic accumulator does: one record is
+                            // enough to name the failure.
+                            Err(bad) => acc.bad_tool = Some(bad),
                         }
                     }
                     if let Some(parts) = item
@@ -1512,14 +1503,59 @@ fn responses_stop(
     Stop::from_wire(reason, "openai-codex", Some("completed"))
 }
 
-/// Apply the refusal override, then the bad-tool rule, to a reply's stop.
-/// Shared by the streaming and non-streaming paths so they cannot drift.
-fn finalize_stop(stop: Option<Stop>, refusal: &str, bad_tool: Option<serde_json::Value>) -> Stop {
+/// One function call's block. Empty or whitespace-only arguments are a
+/// zero-parameter call (`{}`); anything else must parse, and a call needs a
+/// name. On failure the record the stop's `bad_tool` detail carries is
+/// returned. Shared by the streaming and non-streaming paths.
+fn tool_call_block(
+    id: String,
+    name: String,
+    arguments: &str,
+) -> Result<ContentBlock, serde_json::Value> {
+    if name.is_empty() {
+        warn!(id = %id, "dropping tool call with no function name");
+        return Err(serde_json::json!({
+            "name": "",
+            "id": id,
+            "error": "tool call has no function name",
+        }));
+    }
+    let arguments = if arguments.trim().is_empty() {
+        "{}"
+    } else {
+        arguments
+    };
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(input) => Ok(ContentBlock::ToolUse { id, name, input }),
+        Err(e) => {
+            warn!(tool = %name, error = %e, "dropping tool call with unparseable arguments");
+            Err(serde_json::json!({
+                "name": name,
+                "id": id,
+                "error": e.to_string(),
+            }))
+        }
+    }
+}
+
+/// Apply the tool-use promotion, the refusal override, then the bad-tool
+/// rule to a reply's stop. Shared by the streaming and non-streaming paths
+/// so they cannot drift. Only `EndTurn` and `Unreported` become `ToolUse`
+/// when the reply carries tool calls (the rule every provider shares). A
+/// refusal keeps the provider's own wire value.
+fn finalize_stop(
+    stop: Option<Stop>,
+    has_tool_use: bool,
+    refusal: &str,
+    bad_tool: Option<serde_json::Value>,
+) -> Stop {
     let mut stop =
         stop.unwrap_or_else(|| Stop::from_wire(StopReason::Unreported, "openai-codex", None));
+    if has_tool_use && matches!(stop.reason, StopReason::EndTurn | StopReason::Unreported) {
+        stop.reason = StopReason::ToolUse;
+    }
     if !refusal.is_empty() {
         stop.reason = StopReason::Refusal;
-        stop.wire.value = Some("refusal".to_string());
         stop.refusal = Some(RefusalDetail {
             category: None,
             explanation: Some(refusal.to_string()),
@@ -1582,20 +1618,10 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
                 Some("function_call") => {
                     let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                     let name = desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""));
-                    let args_str = item["arguments"].as_str().unwrap_or("{}");
-                    match serde_json::from_str::<serde_json::Value>(args_str) {
-                        Ok(input) => content.push(ContentBlock::ToolUse {
-                            id: call_id,
-                            name,
-                            input,
-                        }),
-                        Err(e) => {
-                            bad_tool = Some(serde_json::json!({
-                                "name": name,
-                                "id": call_id,
-                                "error": e.to_string(),
-                            }));
-                        }
+                    let arguments = item["arguments"].as_str().unwrap_or("");
+                    match tool_call_block(call_id, name, arguments) {
+                        Ok(block) => content.push(block),
+                        Err(bad) => bad_tool = Some(bad),
                     }
                 }
                 _ => {}
@@ -1607,12 +1633,16 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
         content.insert(0, block);
     }
 
+    let has_tool_use = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     let stop = finalize_stop(
         Some(responses_stop(
             json,
             false,
             has_function_call(json, &content),
         )),
+        has_tool_use,
         &refusal,
         bad_tool,
     );
@@ -1716,11 +1746,14 @@ impl ResponseAccumulator {
             content.insert(0, block);
         }
 
+        let has_tool_use = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
         Ok(LlmResponse {
             id: self.id,
             model: self.model,
             content,
-            stop: finalize_stop(self.stop, &self.refusal, self.bad_tool),
+            stop: finalize_stop(self.stop, has_tool_use, &self.refusal, self.bad_tool),
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -4798,7 +4831,8 @@ mod outcome_tests {
         ]);
         let r = r.unwrap();
         assert_eq!(r.stop.reason, StopReason::Refusal);
-        assert_eq!(r.stop.wire.value.as_deref(), Some("refusal"));
+        // The provider's own wire value is kept; the refusal is the reason.
+        assert_eq!(r.stop.wire.value.as_deref(), Some("completed"));
         let detail = r.stop.refusal.clone().expect("refusal detail");
         assert_eq!(detail.explanation.as_deref(), Some("I cannot assist."));
         assert_eq!(detail.source, RefusalSource::Model);
@@ -4853,6 +4887,7 @@ mod outcome_tests {
         }))
         .unwrap();
         assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("completed"));
         assert!(r.text().is_none());
     }
 
@@ -5126,5 +5161,83 @@ mod outcome_tests {
         }))
         .unwrap_err();
         assert_eq!(reply_of(err).class, ErrorClass::Policy);
+    }
+
+    /// A `function_call` whose `output_item.added` was missed is built from
+    /// the done item's own `call_id`/`name`/`arguments`, not dropped.
+    #[test]
+    fn function_call_done_without_added_is_kept() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": "{\"dir\":\"src\"}"}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(tool_input(&r), serde_json::json!({"dir": "src"}));
+
+        // Streamed argument deltas still win over the item's arguments.
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.function_call_arguments.delta",
+                "delta": "{\"dir\":\"lib\"}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": "{\"dir\":\"src\"}"}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        assert_eq!(tool_input(&r.unwrap()), serde_json::json!({"dir": "lib"}));
+
+        // Empty everywhere → {}.
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": ""}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        assert_eq!(tool_input(&r.unwrap()), serde_json::json!({}));
+    }
+
+    /// The non-streaming parser treats empty arguments as the stream does:
+    /// a zero-parameter call, `{}`.
+    #[test]
+    fn non_streaming_empty_arguments_are_an_empty_object() {
+        for args in [Some(""), Some("  "), None] {
+            let mut item = serde_json::json!({
+                "type": "function_call", "call_id": "call_0", "name": "list_files"});
+            if let Some(a) = args {
+                item["arguments"] = serde_json::json!(a);
+            }
+            let r = parse_response(&serde_json::json!({
+                "id": "r", "model": "m", "status": "completed", "output": [item]
+            }))
+            .unwrap();
+            assert_eq!(r.stop.reason, StopReason::ToolUse, "{args:?}");
+            assert_eq!(tool_input(&r), serde_json::json!({}), "{args:?}");
+        }
+    }
+
+    /// A terminal event that reports nothing is `Unreported`, promoted to
+    /// `ToolUse` when the turn called a function (the shared promotion rule).
+    #[test]
+    fn bare_completed_event_with_a_streamed_call_is_tool_use() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files"}}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files",
+                "arguments": "{}"}}),
+            serde_json::json!({"type": "response.completed"}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert!(r.stop.wire.value.is_none());
     }
 }
