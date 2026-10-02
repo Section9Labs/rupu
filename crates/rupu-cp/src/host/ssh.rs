@@ -2935,19 +2935,27 @@ impl HostConnector for SshHostConnector {
     ) -> Result<(), HostConnectorError> {
         crate::host::connector::validate_sha256(sha256)?;
         // One invocation per pull (no connection bursts at the host). An
-        // older remote rupu has no `__findings` and fails with its clap error,
-        // which reaches the caller as the unavailable reason.
+        // older remote rupu has no `__findings` and fails with clap's
+        // unknown-subcommand error, which becomes an actionable Unsupported
+        // rather than clap's raw text as the unavailable reason.
         let cmd = build_remote_command(&[
             "rupu".into(),
             "__findings".into(),
             "artifact".into(),
             sha256.to_string(),
         ]);
-        self.exec
-            .run_to_file(&cmd, dest, max_bytes)
-            .await
-            .map_err(map_remote_err)?;
-        Ok(())
+        match self.exec.run_to_file(&cmd, dest, max_bytes).await {
+            Ok(_) => Ok(()),
+            Err(RemoteExecError::NonZero { stderr, .. })
+                if stderr.contains("unrecognized subcommand '__findings'") =>
+            {
+                Err(HostConnectorError::Unsupported(format!(
+                    "host {} runs a rupu without artifact pulls; upgrade rupu there",
+                    self.host_id
+                )))
+            }
+            Err(e) => Err(map_remote_err(e)),
+        }
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
@@ -4332,11 +4340,15 @@ mod tests {
     #[tokio::test]
     async fn pull_finding_artifact_maps_remote_failures() {
         let sha = "ab".repeat(32);
-        // The remote helper exits nonzero (an older rupu without `__findings`
-        // fails here with its clap error): the reason reaches the caller.
+        // An older rupu without `__findings` fails with clap's error (this is
+        // clap 4's wording, tip included): an actionable Unsupported naming
+        // the host, not the raw clap text.
         let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
             code: Some(2),
-            stderr: "unrecognized subcommand '__findings'".into(),
+            stderr: "error: unrecognized subcommand '__findings'\n\n  tip: a similar \
+                     subcommand exists: 'findings'\n\nUsage: rupu [OPTIONS] <COMMAND>\n\n\
+                     For more information, try '--help'.\n"
+                .into(),
         }));
         let (conn, _store, tmp) = make_conn(fake);
         let err = conn
@@ -4344,7 +4356,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, HostConnectorError::Remote(2, m) if m.contains("__findings")),
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m == "host host_abc runs a rupu without artifact pulls; upgrade rupu there"),
+            "{err:?}"
+        );
+        // The helper's own refusal (the blob is not in that host's store)
+        // keeps its reason.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(1),
+            stderr: format!("error: artifact {sha} is not in this host's store"),
+        }));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Remote(1, m) if m.contains("not in this host's store")),
             "{err:?}"
         );
         // More bytes than recorded: refused as Invalid.
