@@ -47,7 +47,9 @@ use crate::output::live_view::layout::printable;
 use crate::output::live_view::nav::{Depth, NavState, UnitFilter};
 use crate::output::live_view::row::{truncate_to, Line, Segment, Style};
 use crate::output::palette::Status;
-use crate::output::run_model::{fmt_hms, RunView, StepState, StepView, UnitStatus, UnitView};
+use crate::output::run_model::{
+    fmt_hms, ResumedMark, RunView, StepState, StepView, UnitStatus, UnitView,
+};
 
 /// Marker column of the operator-selected node.
 const SELECT_MARK: &str = "▸ ";
@@ -55,6 +57,9 @@ const SELECT_MARK: &str = "▸ ";
 const NO_MARK: &str = "  ";
 /// A vertical rail.
 const PIPE: &str = "│";
+/// Leads the mark of a step / unit that picks up an interrupted attempt
+/// (`↩ continued`). Not `↻` / `↺`, which are a loop's frame and a retry.
+const RESUMED_GLYPH: char = '↩';
 /// Dotted leader between a row's label part and its right-hand state
 /// (`<label> ···· <state>`). Always its own segment, so a clip can find the
 /// state that follows it.
@@ -206,6 +211,9 @@ struct Facts<'a> {
     host: Option<&'a str>,
     /// Short note beside the identity, e.g. a panel's `round 1/3`.
     detail: Option<String>,
+    /// The row's attempt picks up an interrupted one (`↩ continued` /
+    /// `↩ recovered`); shown beside the identity.
+    resumed: Option<ResumedMark>,
     /// The right-hand state: status plus its text (a duration, `running`, …).
     state: Option<(NodeStatus, String)>,
     /// How many `StepWarning`s the step has. Rides beside `state` as `⚠` /
@@ -260,6 +268,7 @@ fn facts_of_step<'a>(step: &Step, live: Option<&'a StepView>) -> Facts<'a> {
         facts.model = sv.model.as_deref();
         facts.host = sv.host.as_deref();
         facts.detail = round_label(sv).filter(|_| kind == NodeKind::Panel);
+        facts.resumed = sv.resumed;
         facts.state = state_of_step(sv);
         facts.warnings = sv.warnings.len();
     }
@@ -347,6 +356,7 @@ impl<'a> Block<'a> {
                 provider: u.provider.as_deref(),
                 model: u.model.as_deref(),
                 host: u.host.as_deref(),
+                resumed: u.resumed,
                 state: Some(state_of_unit(u)),
                 ..Facts::default()
             };
@@ -459,7 +469,8 @@ fn codename_line(codename: &str) -> Option<Line> {
 }
 
 /// The identity parts that follow a row's label, each its own [`Line`]:
-/// `detail`, `codename`, `agent`, `provider/model`. `shown` holds the row's
+/// `detail`, the `↩ continued` / `↩ recovered` mark, `codename`, `agent`,
+/// `provider/model`. `shown` holds the row's
 /// meta texts so an agent app-canvas already printed there is not repeated.
 fn identity_parts(facts: &Facts<'_>, shown: &[&str]) -> Vec<Line> {
     // An empty string is "not produced" (it would print as a bare ` · `).
@@ -467,6 +478,12 @@ fn identity_parts(facts: &Facts<'_>, shown: &[&str]) -> Vec<Line> {
     let mut parts = Vec::new();
     if let Some(detail) = &facts.detail {
         parts.push(Line::new().dim(printable(detail)));
+    }
+    if let Some(mark) = facts.resumed {
+        parts.push(Line::new().status(
+            Status::Retrying,
+            format!("{RESUMED_GLYPH} {}", mark.label()),
+        ));
     }
     if let Some(c) = facts.codename.and_then(codename_line) {
         parts.push(c);
@@ -873,6 +890,7 @@ impl Scaffold {
             provider: unit.provider.as_deref(),
             model: unit.model.as_deref(),
             host: unit.host.as_deref(),
+            resumed: unit.resumed,
             state: Some(state_of_unit(unit)),
             ..Facts::default()
         };
@@ -2595,6 +2613,7 @@ steps:
             model: started.then(|| "claude-opus-5-5".to_string()),
             host: None,
             status,
+            resumed: None,
         }
     }
 
@@ -2934,6 +2953,51 @@ steps:
         u.unit_key = String::new();
         let rows = structure_pane(&v, &wf, &NavState::default(), W, 40);
         assert!(plain(row(&rows, "unit 0")).contains("◐├─ unit 0"));
+    }
+
+    /// A step or unit a resume picked back up carries a `↩ continued` /
+    /// `↩ recovered` mark beside its identity; an ordinary row — and a
+    /// restarted one — carries none.
+    #[test]
+    fn a_resumed_step_and_unit_carry_their_mark() {
+        use rupu_orchestrator::executor::AttemptResumeMode;
+        let wf = scale_wf(2);
+        let mut v = RunView::default();
+        start(&mut v, "s01", StepKind::Linear, Some("scanner"), None, None);
+        v.apply(&Event::AttemptResumed {
+            run_id: "r".into(),
+            step_id: "s01".into(),
+            unit_index: None,
+            mode: AttemptResumeMode::Continued,
+            from_agent_run_id: Some("run_old".into()),
+            reason: None,
+        });
+        start(&mut v, "hunt", StepKind::ForEach, None, None, None);
+        give_units(&mut v, "hunt", &[UnitStatus::Done, UnitStatus::Running]);
+        v.step_mut("hunt").units.get_mut(&0).unwrap().resumed = Some(ResumedMark::Recovered);
+
+        let rows = structure_pane(&v, &wf, &NavState::default(), W, 40);
+        let step = row(&rows, "s01");
+        assert!(plain(step).contains("↩ continued"), "{}", plain(step));
+        assert_eq!(
+            *style_of(step, "↩ continued"),
+            Style::Status(Status::Retrying)
+        );
+        let unit = row(&rows, "svc-0");
+        assert!(
+            plain(unit).contains("svc-0  ↩ recovered · "),
+            "{}",
+            plain(unit)
+        );
+        let plain_unit = plain(row(&rows, "svc-1"));
+        assert!(!plain_unit.contains('↩'), "{plain_unit}");
+        let marked_rows = rows.iter().filter(|l| plain(l).contains('↩')).count();
+        assert_eq!(
+            marked_rows,
+            2,
+            "only the two resumed rows:\n{}",
+            render_plain(&rows)
+        );
     }
 
     #[test]

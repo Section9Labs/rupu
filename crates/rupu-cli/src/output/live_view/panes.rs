@@ -776,6 +776,7 @@ steps:
             model: started.then(|| "claude-opus-5-5".to_string()),
             host: started.then(|| HOSTS[i % HOSTS.len()].to_string()),
             status,
+            resumed: None,
         }
     }
 

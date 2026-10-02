@@ -24,7 +24,7 @@
 //! already finished, `parallel` / `panel` steps (continuing those is deferred),
 //! members of a `loops:` subgraph (the "done" check would have to be
 //! iteration-aware), and attempts placed on a remote host (a remote transcript
-//! can't be continued from here — see [`classify`]).
+//! can't be continued from here — see `classify`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
