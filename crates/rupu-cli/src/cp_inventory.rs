@@ -83,7 +83,10 @@ pub struct CpFleetInventory {
 ///
 /// `NotImplemented` is NOT a failure — it means this provider has no probe, so
 /// nothing has been established about it and it must land in `NeverProbed`.
-/// Everything auth-shaped is `AuthFailed`; everything transport- or
+/// Everything auth-shaped is `AuthFailed`, and so is an exhausted quota or
+/// billing failure: the provider answered, the account cannot be used until
+/// the operator fixes it, and "Unreachable" would send them to check the
+/// network instead. Everything transport- or
 /// server-shaped is `Unreachable`. That split is what lets the operator tell
 /// "my key is wrong" from "the provider is down".
 pub fn classify(err: &ProviderError) -> ProbeState {
@@ -94,7 +97,11 @@ pub fn classify(err: &ProviderError) -> ProbeState {
         | ProviderError::AuthConfig(_) => ProbeState::AuthFailed {
             detail: err.to_string(),
         },
-        e if matches!(e.class(), ErrorClass::Auth | ErrorClass::Permission) => {
+        e if matches!(
+            e.class(),
+            ErrorClass::Auth | ErrorClass::Permission | ErrorClass::Quota
+        ) =>
+        {
             ProbeState::AuthFailed {
                 detail: err.to_string(),
             }
@@ -623,6 +630,21 @@ mod tests {
                 "{err:?} must classify as AuthFailed"
             );
         }
+    }
+
+    /// A 429 whose body says the quota is exhausted is not a rate limit (the
+    /// probe maps those to Ok) and not an outage: the account needs attention.
+    #[test]
+    fn an_exhausted_quota_classifies_as_auth_failed() {
+        let quota = ProviderError::api(
+            "openai-codex",
+            429,
+            r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        );
+        assert_eq!(quota.class(), ErrorClass::Quota);
+        assert!(matches!(classify(&quota), ProbeState::AuthFailed { .. }));
+        let billing = ProviderError::api("anthropic", 402, "payment required");
+        assert!(matches!(classify(&billing), ProbeState::AuthFailed { .. }));
     }
 
     #[test]

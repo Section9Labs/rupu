@@ -2861,6 +2861,10 @@ impl crate::provider::LlmProvider for AnthropicClient {
         if status.is_success() {
             return Ok(());
         }
+        // The error's `Display` string ends up in a cache the dashboard reads,
+        // not in a log the operator greps: `ApiErrorBody::message` is a short
+        // preview (`MESSAGE_PREVIEW_CHARS`), so it stays bounded however large
+        // the body is. The full body is kept in the error's `raw` field.
         let headers = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
         Err(crate::error::api_error_from_response(

@@ -11,6 +11,15 @@ use std::time::Duration;
 /// Raw bodies are kept up to this many bytes (cut on a char boundary).
 pub const RAW_CAP_BYTES: usize = 64 * 1024;
 
+/// `message` (what `Display` prints) is cut to this many characters. The full
+/// body stays in `raw`. The text reaches logs, transcripts and the dashboard's
+/// provider-health cache, so a 64 KB HTML error page must not ride along.
+pub const MESSAGE_PREVIEW_CHARS: usize = 500;
+
+fn preview(text: &str) -> String {
+    text.chars().take(MESSAGE_PREVIEW_CHARS).collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ErrorOrigin {
@@ -115,11 +124,12 @@ pub fn parse_error_body(
         Ok(v) => parse_error_value(provider, origin, &v),
         Err(_) => {
             let capped = cap_chars(text.trim(), RAW_CAP_BYTES).to_string();
+            let message = preview(&capped);
             ApiErrorBody {
                 provider: provider.to_string(),
                 origin,
                 kind: None,
-                message: capped.clone(),
+                message,
                 request_id: None,
                 details: None,
                 raw: serde_json::Value::String(capped.clone()),
@@ -153,21 +163,30 @@ pub fn parse_error_value(
     let err = v.get("error").unwrap_or(v);
     let str_at =
         |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string);
-    let (kind, message, details) = match err {
-        serde_json::Value::String(s) => (None, s.clone(), None),
+    // Every kind candidate is tried against the kind table, in this order: an
+    // unrecognized `code` must not hide a recognized `type`. `kind` reports
+    // the first one present.
+    let (kinds, full_message, details) = match err {
+        serde_json::Value::String(s) => (Vec::new(), s.clone(), None),
         serde_json::Value::Object(_) => {
-            let kind = str_at(err, "code")
-                .or_else(|| str_at(err, "status"))
-                .or_else(|| str_at(err, "type"));
+            let kinds: Vec<String> = ["code", "status", "type"]
+                .iter()
+                .filter_map(|k| str_at(err, k))
+                .collect();
             let message = str_at(err, "message")
                 .or_else(|| str_at(err, "detail"))
                 .unwrap_or_else(|| err.to_string());
             let details = err.get("details").or_else(|| err.get("param")).cloned();
-            (kind, message, details)
+            (kinds, message, details)
         }
-        other => (None, other.to_string(), None),
+        other => (Vec::new(), other.to_string(), None),
     };
-    let class = classify(origin, kind.as_deref(), &message);
+    let kind = kinds.first().cloned();
+    let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+    // Classify on the full text (an overflow format can sit anywhere in it),
+    // then keep only a preview for display.
+    let class = classify_kinds(origin, &kind_refs, &full_message);
+    let message = preview(&full_message);
     ApiErrorBody {
         provider: provider.to_string(),
         origin,
@@ -184,30 +203,41 @@ pub fn parse_error_value(
 /// Provider kind/code first, then HTTP status. An `invalid_request`-class
 /// error whose message is a context-overflow format is `ContextOverflow`.
 pub fn classify(origin: ErrorOrigin, kind: Option<&str>, message: &str) -> ErrorClass {
-    let by_kind = kind.and_then(|k| match k.to_ascii_lowercase().as_str() {
-        "rate_limit_error" | "rate_limit_exceeded" | "resource_exhausted" => {
-            Some(ErrorClass::RateLimited)
-        }
-        "overloaded_error" | "unavailable" => Some(ErrorClass::Overloaded),
-        "api_error" | "server_error" | "internal" => Some(ErrorClass::Server),
-        "timeout_error" | "deadline_exceeded" => Some(ErrorClass::Timeout),
-        "context_length_exceeded" | "model_max_prompt_tokens_exceeded" => {
-            Some(ErrorClass::ContextOverflow)
-        }
-        "authentication_error" | "unauthenticated" | "invalid_api_key" => Some(ErrorClass::Auth),
-        "permission_error" | "permission_denied" => Some(ErrorClass::Permission),
-        "billing_error" | "insufficient_quota" => Some(ErrorClass::Quota),
-        "not_found_error" | "not_found" | "model_not_found" => Some(ErrorClass::NotFound),
-        "request_too_large" => Some(ErrorClass::TooLarge),
-        "bio_policy"
-        | "misalignment_policy_violation"
-        | "content_policy_violation"
-        | "image_content_policy_violation" => Some(ErrorClass::Policy),
-        "invalid_request_error" | "invalid_argument" | "invalid_prompt" => {
-            Some(ErrorClass::InvalidRequest)
-        }
-        _ => None,
-    });
+    let kinds: Vec<&str> = kind.into_iter().collect();
+    classify_kinds(origin, &kinds, message)
+}
+
+/// [`classify`] over several kind candidates: the first one the kind table
+/// knows wins, and only when none is known does the HTTP status decide.
+pub fn classify_kinds(origin: ErrorOrigin, kinds: &[&str], message: &str) -> ErrorClass {
+    let by_kind = kinds
+        .iter()
+        .find_map(|k| match k.to_ascii_lowercase().as_str() {
+            "rate_limit_error" | "rate_limit_exceeded" | "resource_exhausted" => {
+                Some(ErrorClass::RateLimited)
+            }
+            "overloaded_error" | "unavailable" => Some(ErrorClass::Overloaded),
+            "api_error" | "server_error" | "internal" => Some(ErrorClass::Server),
+            "timeout_error" | "deadline_exceeded" => Some(ErrorClass::Timeout),
+            "context_length_exceeded" | "model_max_prompt_tokens_exceeded" => {
+                Some(ErrorClass::ContextOverflow)
+            }
+            "authentication_error" | "unauthenticated" | "invalid_api_key" => {
+                Some(ErrorClass::Auth)
+            }
+            "permission_error" | "permission_denied" => Some(ErrorClass::Permission),
+            "billing_error" | "insufficient_quota" => Some(ErrorClass::Quota),
+            "not_found_error" | "not_found" | "model_not_found" => Some(ErrorClass::NotFound),
+            "request_too_large" => Some(ErrorClass::TooLarge),
+            "bio_policy"
+            | "misalignment_policy_violation"
+            | "content_policy_violation"
+            | "image_content_policy_violation" => Some(ErrorClass::Policy),
+            "invalid_request_error" | "invalid_argument" | "invalid_prompt" => {
+                Some(ErrorClass::InvalidRequest)
+            }
+            _ => None,
+        });
     let class = by_kind.unwrap_or(match origin {
         ErrorOrigin::Http { status } => match status {
             429 => ErrorClass::RateLimited,
@@ -390,5 +420,38 @@ mod tests {
             &serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
         );
         assert_eq!(s.to_string(), "stream error (overloaded_error): Overloaded");
+    }
+
+    #[test]
+    fn large_non_json_body_has_a_bounded_message_and_a_full_raw() {
+        let text = "x".repeat(RAW_CAP_BYTES * 2);
+        let b = parse_error_body("anthropic", http(502), &text, None, None);
+        assert_eq!(b.message.chars().count(), MESSAGE_PREVIEW_CHARS);
+        assert!(b.to_string().len() < MESSAGE_PREVIEW_CHARS + 64);
+        assert_eq!(b.raw.as_str().unwrap().len(), RAW_CAP_BYTES);
+    }
+
+    #[test]
+    fn a_pathologically_long_json_message_is_previewed_but_still_classified() {
+        let long = format!(
+            "{} prompt is too long: 215000 tokens > 200000 maximum",
+            "y".repeat(2000)
+        );
+        let v = serde_json::json!({"error": {"type": "invalid_request_error", "message": long}});
+        let b = parse_error_value("anthropic", http(400), &v);
+        assert_eq!(b.message.chars().count(), MESSAGE_PREVIEW_CHARS);
+        assert_eq!(b.class, ErrorClass::ContextOverflow);
+        assert_eq!(
+            b.raw["error"]["message"].as_str().unwrap().len(),
+            long.len()
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_code_does_not_hide_a_recognized_type() {
+        let v = serde_json::json!({"error": {"code": "new_code", "type": "invalid_request_error", "message": "bad"}});
+        let b = parse_error_value("openai-compatible", ErrorOrigin::Stream, &v);
+        assert_eq!(b.kind.as_deref(), Some("new_code"));
+        assert_eq!(b.class, ErrorClass::InvalidRequest);
     }
 }

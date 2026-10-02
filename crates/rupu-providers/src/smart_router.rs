@@ -124,7 +124,7 @@ fn is_retriable(e: &ProviderError) -> bool {
     match e {
         ProviderError::Reply(b) => matches!(
             b.class,
-            ErrorClass::RateLimited | ErrorClass::Auth | ErrorClass::Permission
+            ErrorClass::RateLimited | ErrorClass::Quota | ErrorClass::Auth | ErrorClass::Permission
         ),
         ProviderError::TokenRefreshFailed(_) | ProviderError::Http(_) => true,
         _ => false,
@@ -170,6 +170,7 @@ async fn record_err(
 #[async_trait]
 impl LlmProvider for SmartRouter {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+        let mut last_err: Option<ProviderError> = None;
         // 0. Refresh model availability (recover from expired rate limits / degraded)
         self.model_pool.refresh_availability();
 
@@ -193,15 +194,16 @@ impl LlmProvider for SmartRouter {
             for provider in self.providers.values_mut() {
                 match provider.send(request).await {
                     Ok(resp) => return Ok(resp),
-                    Err(e) if is_retriable(&e) => continue,
+                    Err(e) if is_retriable(&e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }
-            return Err(ProviderError::api(
-                "router",
-                503,
-                "all models exhausted (empty scoring)",
-            ));
+            return Err(last_err.unwrap_or_else(|| {
+                ProviderError::api("router", 503, "all models exhausted (empty scoring)")
+            }));
         }
 
         debug!(
@@ -241,7 +243,7 @@ impl LlmProvider for SmartRouter {
                     .await;
                     return Ok(resp);
                 }
-                Err(ref e) if is_retriable(e) => {
+                Err(e) if is_retriable(&e) => {
                     warn!(provider = %scored.model.provider, model = scored.model.id.as_str(), error = %e, "retriable, next model");
                     record_err(
                         &pool,
@@ -250,9 +252,10 @@ impl LlmProvider for SmartRouter {
                         &scored.model.id,
                         task_type,
                         start.elapsed().as_millis() as u64,
-                        e,
+                        &e,
                     )
                     .await;
+                    last_err = Some(e);
                     continue;
                 }
                 Err(e) => {
@@ -288,16 +291,17 @@ impl LlmProvider for SmartRouter {
                 req.model = scored.model.id.clone();
                 match provider.send(&req).await {
                     Ok(resp) => return Ok(resp),
-                    Err(_) => continue,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
                 }
             }
         }
 
-        Err(ProviderError::api(
-            "router",
-            503,
-            "all models exhausted after smart routing",
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            ProviderError::api("router", 503, "all models exhausted after smart routing")
+        }))
     }
 
     async fn stream(
@@ -305,6 +309,7 @@ impl LlmProvider for SmartRouter {
         request: &LlmRequest,
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<LlmResponse, ProviderError> {
+        let mut last_err: Option<ProviderError> = None;
         self.model_pool.refresh_availability();
         let task_type = self.classifier.classify(request, None).await;
 
@@ -324,15 +329,16 @@ impl LlmProvider for SmartRouter {
             for provider in self.providers.values_mut() {
                 match provider.stream(request, on_event).await {
                     Ok(resp) => return Ok(resp),
-                    Err(e) if is_retriable(&e) => continue,
+                    Err(e) if is_retriable(&e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }
-            return Err(ProviderError::api(
-                "router",
-                503,
-                "all models exhausted (empty scoring)",
-            ));
+            return Err(last_err.unwrap_or_else(|| {
+                ProviderError::api("router", 503, "all models exhausted (empty scoring)")
+            }));
         }
 
         debug!(task_type = %task_type, top = ranked[0].model.id.as_str(), score = ranked[0].score, n = ranked.len(), "routing (stream)");
@@ -364,7 +370,7 @@ impl LlmProvider for SmartRouter {
                     .await;
                     return Ok(resp);
                 }
-                Err(ref e) if is_retriable(e) => {
+                Err(e) if is_retriable(&e) => {
                     warn!(provider = %scored.model.provider, model = scored.model.id.as_str(), error = %e, "retriable, next model");
                     record_err(
                         &pool,
@@ -373,9 +379,10 @@ impl LlmProvider for SmartRouter {
                         &scored.model.id,
                         task_type,
                         start.elapsed().as_millis() as u64,
-                        e,
+                        &e,
                     )
                     .await;
+                    last_err = Some(e);
                     continue;
                 }
                 Err(e) => {
@@ -410,16 +417,17 @@ impl LlmProvider for SmartRouter {
                 req.model = scored.model.id.clone();
                 match provider.stream(&req, on_event).await {
                     Ok(resp) => return Ok(resp),
-                    Err(_) => continue,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
                 }
             }
         }
 
-        Err(ProviderError::api(
-            "router",
-            503,
-            "all models exhausted after smart routing",
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            ProviderError::api("router", 503, "all models exhausted after smart routing")
+        }))
     }
 
     fn default_model(&self) -> &str {
@@ -626,7 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_fail_returns_503() {
+    async fn test_all_fail_returns_the_last_real_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut providers: HashMap<ProviderId, Box<dyn LlmProvider>> = HashMap::new();
         providers.insert(
@@ -652,8 +660,83 @@ mod tests {
             BudgetMode::Unlimited,
         )
         .unwrap();
+        // The last real failure, not a synthetic 503 over it.
         let err = router.send(&test_request()).await.unwrap_err();
-        assert_eq!(err.status(), Some(503));
+        assert!(matches!(err.status(), Some(429 | 401)), "{err:?}");
+    }
+
+    fn quota_exhausted() -> ProviderError {
+        ProviderError::api(
+            "mock",
+            429,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+        )
+    }
+
+    #[test]
+    fn an_exhausted_quota_is_retriable() {
+        assert!(is_retriable(&quota_exhausted()));
+        assert!(is_retriable(&ProviderError::api("mock", 402, "")));
+    }
+
+    #[test]
+    fn a_local_auth_config_failure_is_not_retriable() {
+        assert!(!is_retriable(&ProviderError::MissingAuth {
+            provider: "anthropic".into(),
+            env_hint: "ANTHROPIC_API_KEY".into(),
+        }));
+        assert!(!is_retriable(&ProviderError::AuthConfig("bad".into())));
+    }
+
+    struct QuotaProvider(ProviderId);
+
+    #[async_trait]
+    impl LlmProvider for QuotaProvider {
+        async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            Err(quota_exhausted())
+        }
+        async fn stream(
+            &mut self,
+            _: &LlmRequest,
+            _: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            Err(quota_exhausted())
+        }
+        fn default_model(&self) -> &str {
+            "quota"
+        }
+        fn provider_id(&self) -> ProviderId {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn falls_back_on_an_exhausted_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers: HashMap<ProviderId, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            ProviderId::Anthropic,
+            Box::new(QuotaProvider(ProviderId::Anthropic)),
+        );
+        providers.insert(
+            ProviderId::OpenaiCodex,
+            Box::new(OkProvider {
+                model: "gpt-5.4".into(),
+                id: ProviderId::OpenaiCodex,
+            }),
+        );
+        let mut router = SmartRouter::new(
+            providers,
+            TaskClassifier::heuristic_only(),
+            setup_pool(),
+            history(dir.path()),
+            BudgetMode::Unlimited,
+        )
+        .unwrap();
+        let resp = router.send(&test_request()).await.unwrap();
+        assert_eq!(resp.model, "gpt-5.4");
+        let resp = router.stream(&test_request(), &mut |_| {}).await.unwrap();
+        assert_eq!(resp.model, "gpt-5.4");
     }
 
     #[tokio::test]
@@ -715,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_all_fail_returns_503() {
+    async fn test_stream_all_fail_returns_the_last_real_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut providers: HashMap<ProviderId, Box<dyn LlmProvider>> = HashMap::new();
         providers.insert(
@@ -745,6 +828,6 @@ mod tests {
             .stream(&test_request(), &mut |_| {})
             .await
             .unwrap_err();
-        assert_eq!(err.status(), Some(503));
+        assert!(matches!(err.status(), Some(429 | 401)), "{err:?}");
     }
 }
