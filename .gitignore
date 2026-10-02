@@ -6,7 +6,10 @@ node_modules/
 .vscode/
 *.swp
 .worktrees/
-.claude/
+# Claude Code: only the shared settings (hooks) are tracked; worktrees,
+# settings.local.json and session state stay local.
+.claude/*
+!.claude/settings.json
 .superpowers/
 crates/rupu-coverage/build/cwe/*.xml
 crates/rupu-coverage/build/cwe/*.zip

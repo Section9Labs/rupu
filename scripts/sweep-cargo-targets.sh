@@ -37,31 +37,24 @@
 # instead of failing, and a target that is mid-build is left for the next run.
 #
 # Usage:
-#   scripts/sweep-cargo-targets.sh --repo DIR [--scan DIR]... [options]
-#   scripts/sweep-cargo-targets.sh --install --repo DIR [--scan DIR]... [options]
-#   scripts/sweep-cargo-targets.sh --uninstall
+#   scripts/sweep-cargo-targets.sh [--target DIR]... [--repo DIR] [--scan DIR]... [options]
 #
+#   --target DIR               sweep this target dir
 #   --repo DIR                 sweep target/ of every worktree of this git repo
-#   --scan DIR                 also sweep every cargo target dir under DIR
-#                              (found by cargo's CACHEDIR.TAG); repeatable
+#   --scan DIR                 sweep every cargo target dir under DIR (found by
+#                              cargo's CACHEDIR.TAG); repeatable
 #   --binary-age-hours N       default 24
 #   --incremental-age-hours N  default 48
 #   --min-free-gb N            default 200; 0 never evicts
 #   --evict-idle-hours N       default 1
 #   --dry-run                  report what would go, delete nothing
 #   --log FILE                 append output to FILE (rotated at 1 MB)
-#   --install                  macOS: copy this script out of the repo and run
-#                              it hourly from a launchd agent with the other
-#                              options given
-#   --uninstall                remove that launchd agent
 #
-# `make sweep-targets` runs it once; `make sweep-targets-install` installs it.
+# Run for you by the Claude Code hook in .claude/settings.json
+# (scripts/claude-hook-sweep-target.sh): after a session runs cargo or make,
+# it sweeps that session's own target/ with eviction off. `make sweep-targets`
+# runs it by hand over every worktree plus Claude Code scratch builds.
 set -uo pipefail
-
-LABEL="dev.rupu.sweep-cargo-targets"
-INSTALL_DIR="$HOME/Library/Application Support/rupu"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DEFAULT="$HOME/Library/Logs/rupu-sweep-cargo-targets.log"
 
 # Objects with no binary or library left are only deleted once they are this
 # old, so a first link that has written its objects but not yet its binary is
@@ -198,58 +191,6 @@ last_used() {
   done | awk '{ if ($1 > m) m = $1; if ($2 > m) m = $2 } END { print m + 0 }'
 }
 
-# ---------------------------------------------------------------- install --
-
-xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
-
-install_agent() {
-  [ "$(uname)" = Darwin ] || die "--install sets up a launchd agent and is macOS-only"
-  local args=("$@") dest="$INSTALL_DIR/sweep-cargo-targets.sh" a
-  mkdir -p "$INSTALL_DIR" "$(dirname "$PLIST")" "$(dirname "$LOG_DEFAULT")"
-  cp "$0" "$dest" && chmod 755 "$dest"
-  {
-    cat <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>$(xml_escape "$dest")</string>
-EOF
-    for a in ${args[@]+"${args[@]}"} --log "$LOG_DEFAULT"; do
-      echo "    <string>$(xml_escape "$a")</string>"
-    done
-    cat <<EOF
-  </array>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>ProcessType</key><string>Background</string>
-  <key>LowPriorityIO</key><true/>
-  <key>Nice</key><integer>10</integer>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
-  </dict>
-</dict>
-</plist>
-EOF
-  } > "$PLIST"
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-  launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed"
-  echo "installed $LABEL: runs hourly (and now); log: $LOG_DEFAULT"
-  echo "  script: $dest"
-  echo "  args:   ${args[*]-}"
-}
-
-uninstall_agent() {
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-  rm -f "$PLIST" "$INSTALL_DIR/sweep-cargo-targets.sh"
-  echo "uninstalled $LABEL"
-}
-
 # ------------------------------------------------------------------- main --
 
 # Internal: re-entered under with_locks, which can only run a command.
@@ -261,21 +202,20 @@ if [ "${1:-}" = "--_locked" ]; then
   exit $?
 fi
 
-REPO="" SCANS=() INSTALL="" UNINSTALL="" LOG="" PASS=()
+REPO="" SCANS=() TARGET_ARGS=() LOG=""
 export SWEEP_BINARY_AGE_HOURS=24 SWEEP_INCREMENTAL_AGE_HOURS=48 SWEEP_DRY_RUN=""
 MIN_FREE_GB=200 EVICT_IDLE_HOURS=1
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) REPO="${2:?}"; PASS+=("$1" "$2"); shift ;;
-    --scan) SCANS+=("${2:?}"); PASS+=("$1" "$2"); shift ;;
-    --binary-age-hours) SWEEP_BINARY_AGE_HOURS="${2:?}"; PASS+=("$1" "$2"); shift ;;
-    --incremental-age-hours) SWEEP_INCREMENTAL_AGE_HOURS="${2:?}"; PASS+=("$1" "$2"); shift ;;
-    --min-free-gb) MIN_FREE_GB="${2:?}"; PASS+=("$1" "$2"); shift ;;
-    --evict-idle-hours) EVICT_IDLE_HOURS="${2:?}"; PASS+=("$1" "$2"); shift ;;
+    --target) TARGET_ARGS+=("${2:?}"); shift ;;
+    --repo) REPO="${2:?}"; shift ;;
+    --scan) SCANS+=("${2:?}"); shift ;;
+    --binary-age-hours) SWEEP_BINARY_AGE_HOURS="${2:?}"; shift ;;
+    --incremental-age-hours) SWEEP_INCREMENTAL_AGE_HOURS="${2:?}"; shift ;;
+    --min-free-gb) MIN_FREE_GB="${2:?}"; shift ;;
+    --evict-idle-hours) EVICT_IDLE_HOURS="${2:?}"; shift ;;
     --dry-run) SWEEP_DRY_RUN=1 ;;
     --log) LOG="${2:?}"; shift ;;
-    --install) INSTALL=1 ;;
-    --uninstall) UNINSTALL=1 ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -285,22 +225,8 @@ for n in "$SWEEP_BINARY_AGE_HOURS" "$SWEEP_INCREMENTAL_AGE_HOURS" "$MIN_FREE_GB"
   is_int "$n" || die "expected a whole number, got '$n'"
 done
 
-if [ -n "$UNINSTALL" ]; then uninstall_agent; exit 0; fi
-[ -n "$REPO" ] || [ ${#SCANS[@]} -gt 0 ] || die "nothing to sweep: pass --repo and/or --scan (see --help)"
-if [ -n "$INSTALL" ]; then
-  # The agent must outlive whichever worktree installed it: point it at the
-  # main checkout, not this worktree.
-  if [ -n "$REPO" ]; then
-    common=$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
-      die "--repo $REPO is not a git repository"
-    main=$(dirname "$common")
-    for i in "${!PASS[@]}"; do
-      [ "${PASS[$i]}" = "--repo" ] && PASS[$((i + 1))]="$main"
-    done
-  fi
-  install_agent ${PASS[@]+"${PASS[@]}"}
-  exit $?
-fi
+[ -n "$REPO" ] || [ ${#SCANS[@]} -gt 0 ] || [ ${#TARGET_ARGS[@]} -gt 0 ] ||
+  die "nothing to sweep: pass --target, --repo and/or --scan (see --help)"
 
 if [ -n "$LOG" ]; then
   mkdir -p "$(dirname "$LOG")"
@@ -312,6 +238,9 @@ command -v perl >/dev/null 2>&1 ||
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 TARGETS=$(
+  for t in ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"}; do
+    grep -q 'created by cargo' "$t/CACHEDIR.TAG" 2>/dev/null && echo "$t"
+  done
   if [ -n "$REPO" ]; then
     git -C "$REPO" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' |
       while IFS= read -r wt; do
@@ -325,7 +254,9 @@ TARGETS=$(
       while IFS= read -r tag; do
         grep -q 'created by cargo' "$tag" 2>/dev/null && dirname "$tag"
       done
-  done | sort -u
+  done |
+    # Physical paths, so /tmp and /private/tmp spellings dedupe and match lsof.
+    while IFS= read -r t; do (cd "$t" 2>/dev/null && pwd -P); done | sort -u
 )
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') sweep${SWEEP_DRY_RUN:+ (dry run)}: $(printf '%s\n' "$TARGETS" | grep -c .) target dirs"
@@ -353,6 +284,10 @@ done)
 if [ -n "$low_disk" ] && command -v perl >/dev/null 2>&1; then
   now=$(date +%s)
   credit=0  # dry run: what earlier "evictions" would have freed
+  # Programs running from (or a compiler mapping files in) a target: evicting
+  # it would not stop them, but anything that relaunches from that path (cp
+  # serve spawns `rupu` children) would fail until rebuilt.
+  mapped=$(lsof -nP -d txt -Fn 2>/dev/null | sed -n 's/^n//p')
   while IFS=' ' read -r used t; do
     [ -d "$t" ] || continue
     free=$(( $(free_kb "$t") + credit ))
@@ -360,6 +295,16 @@ if [ -n "$low_disk" ] && command -v perl >/dev/null 2>&1; then
     idle=$(( (now - used) / 3600 ))
     if [ $((now - used)) -lt $((EVICT_IDLE_HOURS * 3600)) ]; then
       echo "  low disk ($(gb "$free") free < $MIN_FREE_GB GB) but $t was used ${idle}h ago; not evicting"
+      continue
+    fi
+    if ! command -v lsof >/dev/null 2>&1; then
+      echo "  lsof not found, so cannot tell whether $t is in use; not evicting"
+      continue
+    fi
+    # A here-string, not printf | grep -q: under pipefail, grep -q exiting at
+    # the first match SIGPIPEs a writer of this much text and reads as no match.
+    if grep -qF "$t/" <<< "$mapped"; then
+      echo "  low disk but a running program was started from $t; not evicting"
       continue
     fi
     kb=$(du -sk "$t" 2>/dev/null | awk '{ print $1 + 0 }')
