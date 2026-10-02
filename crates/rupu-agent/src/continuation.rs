@@ -155,22 +155,47 @@ fn final_assistant_text(events: &[Event]) -> String {
 /// continuation note (which joins the conversation's trailing user turn).
 /// Everything else on `opts` — agent, provider, model, tools, mode — is the
 /// caller's fresh configuration.
+///
+/// If the conversation already ends with the note — the run being continued
+/// was itself a continuation that died before its first turn finished — the
+/// run is seed-only (empty `user_message`): the model has been told once, and
+/// repeating it would stack a second identical note into the turn.
 pub fn apply_continuation(
     opts: &mut crate::runner::AgentRunOpts,
     messages: Vec<Message>,
     seed_source: PathBuf,
 ) {
+    opts.user_message = if ends_with_note(&messages) {
+        String::new()
+    } else {
+        CONTINUATION_NOTE.to_string()
+    };
     opts.initial_messages = messages;
     opts.seed_source = Some(seed_source);
-    opts.user_message = CONTINUATION_NOTE.to_string();
+}
+
+/// Does `messages` already end in a user turn carrying [`CONTINUATION_NOTE`]?
+/// True of the rebuilt conversation of a continuation that died before its
+/// first turn finished: its note was recorded, so it replays into the history.
+fn ends_with_note(messages: &[Message]) -> bool {
+    messages.last().is_some_and(|m| {
+        m.role == Role::User
+            && matches!(
+                m.content.last(),
+                Some(ContentBlock::Text { text }) if text == CONTINUATION_NOTE
+            )
+    })
 }
 
 /// The transcript `opts` continues, when it describes a continuation: a run
-/// seeded by reference whose conversation ends with [`CONTINUATION_NOTE`].
-/// `run_agent` records it on the run's coverage manifest.
+/// seeded by reference whose conversation ends with [`CONTINUATION_NOTE`]
+/// (sent as its `user_message`, or already in the seed). `run_agent` records
+/// it on the run's coverage manifest.
 pub(crate) fn continued_from(opts: &crate::runner::AgentRunOpts) -> Option<&Path> {
     let source = opts.seed_source.as_deref()?;
-    (opts.user_message == CONTINUATION_NOTE).then_some(source)
+    let carries_note = opts.user_message == CONTINUATION_NOTE
+        || (opts.user_message.is_empty() && ends_with_note(&opts.initial_messages));
+    carries_note.then_some(source)
 }
 
 #[cfg(test)]
@@ -558,5 +583,144 @@ mod tests {
             rupu_coverage::plan_rerun(&m),
             Err(rupu_coverage::RerunError::ContinuedRun { continued, .. }) if continued == "first"
         ));
+    }
+
+    /// Continue `interrupted` into `dest` the way the CLI does, answering
+    /// `answer`. Returns the conversation the provider was sent.
+    async fn continue_run(interrupted: &Path, dest: &Path, answer: &str) -> Vec<Message> {
+        let Continuation::Resume {
+            messages,
+            seed_source,
+        } = prepare_continuation(interrupted).unwrap()
+        else {
+            panic!("expected Resume");
+        };
+        let provider =
+            crate::runner::CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: answer.into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+        let captured = provider.captured.clone();
+        let dir = dest.parent().unwrap();
+        let mut opts = opts_for(Box::new(provider), dir, dest.to_path_buf());
+        apply_continuation(&mut opts, messages, seed_source);
+        run_agent(opts).await.unwrap();
+        let sent = captured.lock().unwrap()[0].messages.clone();
+        sent
+    }
+
+    /// Cut a continued transcript back to before its first turn — a runner
+    /// that died waiting on the model leaves the seed and the note behind.
+    fn die_before_first_turn(t: &Path) {
+        let all = lines(t);
+        let first_turn = all.iter().position(|v| kind(v) == "turn_start").unwrap();
+        write_lines(t, &all[..first_turn]);
+    }
+
+    fn note_blocks(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| matches!(b, ContentBlock::Text { text } if text == CONTINUATION_NOTE))
+            .count()
+    }
+
+    /// A -> B -> C. A died after its tool turn; B continued it and died
+    /// before its first turn, so B's conversation already ends with the note.
+    /// C must not stack a second note on top, and replay must still rebuild
+    /// the whole conversation across all three files.
+    #[tokio::test]
+    async fn re_continuing_a_continuation_that_died_early_adds_no_second_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = finished_transcript(tmp.path()).await;
+        write_lines(&a, &through_first_turn_end(&lines(&a)));
+
+        let b = tmp.path().join("b.jsonl");
+        let sent_b = continue_run(&a, &b, "from b").await;
+        assert_eq!(note_blocks(&sent_b), 1);
+        die_before_first_turn(&b);
+
+        let c = tmp.path().join("c.jsonl");
+        let sent_c = continue_run(&b, &c, "from c").await;
+        assert_eq!(
+            note_blocks(&sent_c),
+            1,
+            "the note is already in the conversation; sending it again would repeat it"
+        );
+        assert_eq!(
+            serde_json::to_value(&sent_c).unwrap(),
+            serde_json::to_value(&sent_b).unwrap(),
+            "C resumes from exactly the conversation B had sent"
+        );
+
+        let mut expected = sent_c;
+        expected.push(Message::assistant("from c"));
+        assert_eq!(
+            serde_json::to_value(reconstruct_transcript(&c).unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "replay resolves C -> B -> A"
+        );
+        match prepare_continuation(&c).unwrap() {
+            Continuation::Finished { output } => assert_eq!(output, "from c"),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    /// `apply_continuation` on a conversation that already ends with the note
+    /// runs seed-only: the note is not sent twice.
+    #[test]
+    fn apply_continuation_is_seed_only_when_the_note_is_already_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), tmp.path().join("t.jsonl"));
+        let mut tool_turn = Message::user("go");
+        tool_turn.content.push(ContentBlock::Text {
+            text: CONTINUATION_NOTE.into(),
+        });
+        let messages = vec![Message::assistant("thinking"), tool_turn];
+        apply_continuation(&mut opts, messages.clone(), PathBuf::from("/t/b.jsonl"));
+        assert_eq!(opts.user_message, "");
+        assert_eq!(
+            serde_json::to_value(&opts.initial_messages).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        assert_eq!(opts.seed_source, Some(PathBuf::from("/t/b.jsonl")));
+        // A seed-only continuation is still a continuation.
+        assert_eq!(continued_from(&opts), Some(Path::new("/t/b.jsonl")));
+    }
+
+    /// A continued transcript whose referenced source was edited after the
+    /// fact no longer replays: the seed's recorded hash catches it.
+    #[tokio::test]
+    async fn a_continuation_whose_source_was_edited_does_not_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = finished_transcript(tmp.path()).await;
+        write_lines(&a, &through_first_turn_end(&lines(&a)));
+        let b = tmp.path().join("b.jsonl");
+        continue_run(&a, &b, "from b").await;
+        die_before_first_turn(&b);
+        assert!(matches!(
+            prepare_continuation(&b).unwrap(),
+            Continuation::Resume { .. }
+        ));
+
+        let edited: Vec<_> = lines(&a)
+            .into_iter()
+            .map(|mut v| {
+                if kind(&v) == "tool_result" {
+                    v["data"]["output"] = "tampered".into();
+                }
+                v
+            })
+            .collect();
+        write_lines(&a, &edited);
+        match prepare_continuation(&b) {
+            Err(ContinuationError::Replay { source, .. }) => {
+                assert!(matches!(source, ReplayError::SeedHashMismatch { .. }))
+            }
+            other => panic!("expected Replay(SeedHashMismatch), got {other:?}"),
+        }
     }
 }
