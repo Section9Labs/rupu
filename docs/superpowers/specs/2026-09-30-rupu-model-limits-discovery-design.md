@@ -285,6 +285,8 @@ Refetch refreshes the CP machine's cache only. Remote hosts keep their own cache
 
 ## 9. Deferred to the response-outcomes spec
 
+> *Superseded in part (2026-10-01): the response-outcomes spec (`2026-10-01-rupu-response-outcomes-design.md` §2) replaces "anything rupu doesn't recognise becomes a surfaced error" — unrecognized replies are parsed, rendered with their raw payload, and handled by content.*
+
 These came up here and belong to the companion spec:
 
 - **Stop reasons:** `StopReason::ContextWindowExceeded` (compact and continue), `pause_turn`, `refusal` with Anthropic server-side `fallbacks`, and every other provider's finish, safety and incomplete signals. No unidentified reply: anything rupu doesn't recognise becomes a surfaced error that carries the raw payload.
