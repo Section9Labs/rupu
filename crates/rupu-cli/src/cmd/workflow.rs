@@ -6923,17 +6923,19 @@ mod tests {
         (store, ship)
     }
 
-    /// The resume worker (or the gate sweep) spawned `workflow resume` for a
-    /// gate decision recorded on a run still waiting at the gate, and the
-    /// run finished — completed by the runner that applied the decision,
-    /// failed, rejected — before that resume claimed it. The late runner is
-    /// refused, saying the run already finished, and nothing runs:
-    /// re-entering the run would re-run the decided path (LLM cost, tool
-    /// side effects) and overwrite the finished status. Driven exactly: the
-    /// test holds `run.json.lock` while the resume loads the run (awaiting,
-    /// with the decision) and rebuilds its runtime (observable: it opens
-    /// the run's `events.jsonl`), finishes the run, then releases the lock
-    /// the claim waits on.
+    /// The resume worker (or the gate sweep) spawned `workflow resume
+    /// --if-unfinished` for a gate decision recorded on a run still waiting
+    /// at the gate, and the run finished — completed by the runner that
+    /// applied the decision, failed, rejected — before that resume claimed
+    /// it. The late runner is refused, saying the run already finished, and
+    /// nothing runs: re-entering the run would re-run the decided path (LLM
+    /// cost, tool side effects) and overwrite the finished status. Driven
+    /// exactly: the test holds `run.json.lock` while the resume loads the
+    /// run (awaiting, with the decision) and rebuilds its runtime
+    /// (observable: it opens the run's `events.jsonl`), finishes the run,
+    /// then releases the lock the claim waits on. The same resume of a run
+    /// nothing finished applies the decision and runs `ship`: what the
+    /// refusals' "nothing ran" is measured against.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_resume_for_recorded_decisions_refuses_a_run_that_finished_before_it_claimed_it() {
         let _env = crate::test_support::ENV_LOCK.lock().await;
@@ -6956,7 +6958,7 @@ mod tests {
 
             let resume = {
                 let run_id = run_id.clone();
-                tokio::spawn(async move { resume_run(&run_id, None, true, false).await })
+                tokio::spawn(async move { resume_run(&run_id, None, true, true).await })
             };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !store.events_path(&run_id).exists() {
@@ -6993,6 +6995,24 @@ mod tests {
                 "the {status} record is untouched"
             );
         }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, ship) = parked_gate_ship_run(tmp.path(), "run_not_late");
+        store
+            .request_resume_approval("run_not_late", "web", None, Utc::now(), None)
+            .unwrap();
+        resume_run("run_not_late", None, true, true)
+            .await
+            .expect("an unfinished run's decision is applied");
+        assert_eq!(
+            std::fs::read_to_string(&ship).unwrap(),
+            "ran\n",
+            "the approved path ran `ship`"
+        );
+        assert_eq!(
+            store.load("run_not_late").unwrap().status,
+            RunStatus::Completed
+        );
         std::env::remove_var("RUPU_HOME");
     }
 

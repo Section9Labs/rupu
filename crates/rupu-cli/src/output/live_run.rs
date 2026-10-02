@@ -1838,8 +1838,8 @@ mod tests {
 
     /// An approve's resume that reaches a run finished since the decision
     /// (failed by a sweep, completed by another runner) starts nothing: the
-    /// refusal comes back as the notice row's message, once — the follow-up
-    /// is not retried — and the finished record is left as it is.
+    /// refusal comes back as the notice row's message, and the finished
+    /// record is left as it is.
     #[tokio::test]
     async fn the_approve_follow_up_on_a_run_finished_since_reports_it_and_runs_nothing() {
         crate::test_support::ensure_crypto_provider();

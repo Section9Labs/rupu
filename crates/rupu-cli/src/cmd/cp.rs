@@ -879,7 +879,7 @@ fn build_resume_argv<'a>(
             argv.push("--approver");
             argv.push(a);
         }
-    } else {
+    } else if subcommand == "resume" {
         // The child serves a request made while the run was unfinished; a
         // run that finished since (its own runner completed it, a sweep
         // failed it, a cancel) is refused, never retried.
@@ -952,7 +952,7 @@ fn reap_detached(child: std::process::Child, run_id: &str, what: &'static str) {
                     tracing::info!(run_id = %run_id, pid, "{what}: child exited cleanly");
                 }
                 Ok(status) => {
-                    tracing::warn!(run_id = %run_id, pid, %status, "{what}: child exited without success; what it was spawned for stays on the record for the next attempt");
+                    tracing::warn!(run_id = %run_id, pid, %status, "{what}: child exited without success; anything it was spawned for that is still pending stays on the record for the next attempt (a run that finished meanwhile has none)");
                 }
                 Err(e) => {
                     tracing::warn!(run_id = %run_id, pid, error = %e, "{what}: waiting for the child failed");
