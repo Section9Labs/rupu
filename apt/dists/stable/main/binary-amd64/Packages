@@ -1,0 +1,20 @@
+Package: rupu
+Version: 0.80.0
+Architecture: amd64
+Maintainer: Section9Labs <matias@section9labs.com>
+Installed-Size: 88002
+Depends: ripgrep
+Recommends: git
+Suggests: ast-grep
+Filename: pool/stable/rupu_0.80.0_amd64.deb
+Size: 32265514
+MD5sum: ca8e272c53fec4c96f2e5722ea62838d
+SHA1: f730b41fdae6e486c0c2264d446141896c1b1bf1
+SHA256: 6151ecc02a9243d7604b90a7ca191cfa88589e14eb8df2f04f4c52f4d7467841
+Section: devel
+Priority: optional
+Homepage: https://github.com/Section9Labs/rupu
+Description: Agentic code-development CLI.
+ Runs agents and workflows against your repositories from the terminal.
+License: Apache-2.0
+

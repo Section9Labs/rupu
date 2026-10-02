@@ -1,0 +1,31 @@
+Architectures: amd64 arm64
+Codename: stable
+Components: main
+Date: Sun, 27 Sep 2026 15:23:30 +0000
+Label: rupu
+Origin: Section9Labs
+Suite: stable
+MD5Sum:
+ 8c010c0e4aa43b57ae5482a42beceb3f              146 Release
+ 6c6d67222c95b56a7af49e41d357bccd              612 main/binary-amd64/Packages
+ 922f2deca16d01245b96e86efa90119f              453 main/binary-amd64/Packages.gz
+ e5cbc9f7b1b4d974246d8cff2acc4f1b              612 main/binary-arm64/Packages
+ 35c78ca83225ac15f2cd82e909b19807              453 main/binary-arm64/Packages.gz
+SHA1:
+ 42cabb2f6d0ca0acaa336740501bb1ece1e9b586              146 Release
+ 7512c3d1105ee6c55a734e941bdfa0e9bd49c7ab              612 main/binary-amd64/Packages
+ f2e958d180d5a68c0e7e1de9ab6de1a1ddc078b1              453 main/binary-amd64/Packages.gz
+ 402714c3c1391cb7b55864847fc7f1733ee5eeb6              612 main/binary-arm64/Packages
+ 7b06e452b396c3ddcd18b769f0fb39298d72c6f8              453 main/binary-arm64/Packages.gz
+SHA256:
+ b45f895d102b75fb25e6e779d4611e27ae2cdc1419dc0470f44929dc18feb6c8              146 Release
+ 597bd45cd09e6463991fb21a568ed94eb524da56eca43a4a8e0a6fb0f95df6e9              612 main/binary-amd64/Packages
+ 29dbc2da7d26f6e7afbb1dd6c41c62d5e7949f30494bb1e4c8bad1907be08136              453 main/binary-amd64/Packages.gz
+ 3390119549243824ef76b089e25cee07252d41fb4871533b6687d443c6883fe4              612 main/binary-arm64/Packages
+ 85421e7b6baeca69802b3bc3c3a8caf9f0a2e077975717d1da17e56a29d07b7d              453 main/binary-arm64/Packages.gz
+SHA512:
+ 6fb02032264616d29c18f1f89a045b017e82ce126b3e8426a5c1bae94c9e1f0831c2ab58cbb4a64eec56f713a0f8bf3a87df7f4aef4627007e7dda7be56466c6              146 Release
+ 7bc641ba1e69b8d0baf5abd8902c2435482e5e76c628591ba21cccb15acd157d30db566ffe596909305d224f6b8d2b74b64ee8eb28d4e833bee8a5975149a4ee              612 main/binary-amd64/Packages
+ 429dfe1aa0d6cbad05a241bcb124fb03647537e5b7f4f94b1567408f4dad08992cad7eb7d3c59ba1039acb19ca0ff6beac668bee3dba595c88f7750d58ffb062              453 main/binary-amd64/Packages.gz
+ 504e31edcfa13dea36f562d3572dd33e217e50eac234c240d12cc86356805c75f1c81ceb5cd08e23556ea554e50d44fb2afb3d4a0dbca3dd3488daf12ddc02a9              612 main/binary-arm64/Packages
+ 967b392ef362099277b06aa7a30cbc4e31dadd2fd66d02b8f73371029737e1ef8bc15a1f318dec435576b8fa47528d7872d3539e32f37965d4afd0d50ba6c6b8              453 main/binary-arm64/Packages.gz
