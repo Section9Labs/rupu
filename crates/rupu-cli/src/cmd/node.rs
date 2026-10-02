@@ -32,7 +32,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
-use rupu_cp::host::bucket::{Bucket, ControlEnvelope, ObjectStoreBucket};
+use rupu_cp::host::bucket::{Bucket, BucketError, ControlEnvelope, ObjectStoreBucket};
 use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, CAP_USAGE_LEDGER};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
@@ -1028,14 +1028,16 @@ where
 /// not yet written.
 fn read_terminal_status(run_json: &Path) -> Option<(String, String)> {
     let body = std::fs::read_to_string(run_json).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let status = terminal_status_in(&body)?;
+    Some((status, body))
+}
+
+/// The status in a `run.json` body when it is terminal; `None` for an
+/// in-flight, unparseable or status-less body.
+fn terminal_status_in(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let status = v.get("status")?.as_str()?;
-    let terminal = matches!(status, "completed" | "failed" | "rejected" | "cancelled");
-    if terminal {
-        Some((status.to_string(), body))
-    } else {
-        None
-    }
+    matches!(status, "completed" | "failed" | "rejected" | "cancelled").then(|| status.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1139,15 @@ async fn upload_new_lines(
 ) -> bool {
     if let Some(end) = stream.pending_end {
         let (lines, next) = peek_lines_until(path, stream.offset, end);
+        if lines.is_empty() {
+            // The pinned chunk held lines when it was first tried; an empty
+            // read now (a transient read error, a truncated file) is NOT "all
+            // sent". Clearing the pin here would let the next chunk grow into
+            // a superset under the same key, which the CP poller may already
+            // have consumed. Keep the pin until exactly that chunk lands.
+            warn!(run_id = %rid, "node pull: a pinned {kind} chunk could not be re-read; holding it");
+            return false;
+        }
         if !put_lines(bucket, rid, kind, lines, &mut stream.seq).await {
             return false;
         }
@@ -1179,17 +1190,21 @@ async fn upload_usage_ledger(
 }
 
 /// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
-/// upload whatever every stream still holds, the terminal `run.json`, and only
-/// then write the `finished` marker. Returns `true` when the marker landed.
+/// upload whatever every stream still holds, then the terminal `run.json`, and
+/// only then write the `finished` marker. Returns `true` when the marker
+/// landed.
 ///
 /// A row the runner appended after the routine drain would otherwise never be
 /// uploaded — the run leaves `active` once this returns `true` — and the CP
-/// would finish the run short. The marker is the CP's "nothing more is coming"
-/// signal, so it is written ONLY after every upload landed: if any stream, the
-/// `run.json` or the marker itself fails, this returns `false` without a
-/// marker and the caller keeps the run active, retrying next tick (the
-/// failed chunks retry byte-exact under their own keys). Every stream is
-/// still attempted when one fails.
+/// would finish the run short. The CP finishes a run on the terminal
+/// `run.json` body and stops polling it from then on, so that body and the
+/// marker are the CP's "nothing more is coming" signals: each is written ONLY
+/// after everything before it landed. If any stream fails, nothing after it is
+/// attempted (no `run.json`, no marker); if `run.json` or the marker fails, the
+/// marker is not written / reported. Either way this returns `false` and the
+/// caller keeps the run active, retrying next tick (a failed chunk retries
+/// byte-exact under its own key). Every stream is still attempted when one
+/// fails.
 async fn finish_bucket_run(
     bucket: &dyn Bucket,
     rid: &str,
@@ -1198,16 +1213,13 @@ async fn finish_bucket_run(
     run_json: &[u8],
     status: &str,
 ) -> bool {
-    let mut landed = streams.upload_all(bucket, rid, run_dir).await;
-    // The routine pass uploaded run.json earlier in the tick; it can have
-    // changed since (that is how it came to read terminal), and a failure
-    // there is only a warning. The CP finishes the run from this body, so it
-    // must land before the marker.
+    if !streams.upload_all(bucket, rid, run_dir).await {
+        return false;
+    }
+    // The routine pass withholds a terminal run.json (see `upload_routine`), so
+    // this is the only place the CP can learn the terminal body.
     if let Err(e) = bucket.put_result(rid, "run.json", run_json).await {
         warn!(run_id = %rid, error = %e, "node pull: put terminal run.json failed");
-        landed = false;
-    }
-    if !landed {
         return false;
     }
     match bucket.put_finished(rid, status).await {
@@ -1217,6 +1229,51 @@ async fn finish_bucket_run(
             false
         }
     }
+}
+
+/// The routine (non-terminal) uploads for a run: every stream, then the
+/// in-progress `run.json`.
+///
+/// A `run.json` that already reads TERMINAL is deliberately NOT uploaded here.
+/// The CP mirror finishes the run on that body and its poller only polls
+/// non-terminal runs, so publishing it while a stream's chunk is still held
+/// would make the CP stop reading the run — stranding that chunk and the
+/// `finished` marker for good, even after the node heals. [`finish_bucket_run`]
+/// uploads the terminal body, once every stream has landed.
+async fn upload_routine(
+    bucket: &dyn Bucket,
+    rid: &str,
+    run_dir: &Path,
+    streams: &mut BucketStreams,
+) {
+    streams.upload_all(bucket, rid, run_dir).await;
+    let Ok(body) = std::fs::read(run_dir.join("run.json")) else {
+        return;
+    };
+    let terminal = std::str::from_utf8(&body)
+        .ok()
+        .and_then(terminal_status_in)
+        .is_some();
+    if terminal {
+        return;
+    }
+    if let Err(e) = bucket.put_result(rid, "run.json", &body).await {
+        warn!(run_id = %rid, error = %e, "node pull: put run.json failed");
+    }
+}
+
+/// When the run's `run.json` reads terminal, run the terminal pass
+/// ([`finish_bucket_run`]): `Some((status, marker_landed))`. `None` while the
+/// run is still in flight.
+async fn finish_if_terminal(
+    bucket: &dyn Bucket,
+    rid: &str,
+    run_dir: &Path,
+    streams: &mut BucketStreams,
+) -> Option<(String, bool)> {
+    let (status, body) = read_terminal_status(&run_dir.join("run.json"))?;
+    let landed = finish_bucket_run(bucket, rid, run_dir, streams, body.as_bytes(), &status).await;
+    Some((status, landed))
 }
 
 /// Write the `failed` marker for every claimed job whose spawn failed and
@@ -1237,6 +1294,273 @@ async fn flush_failed_markers(bucket: &dyn Bucket, pending: &mut Vec<String>) {
 // ---------------------------------------------------------------------------
 // Bucket pull agent loop
 // ---------------------------------------------------------------------------
+
+/// Claimed jobs the worker still owes work on after a tick.
+#[derive(Debug, Default)]
+struct PendingJobs {
+    /// Claimed, but the job spec could not be fetched (a bucket error): the
+    /// claim is ours and `list_jobs` no longer shows the job, so the fetch is
+    /// retried every tick.
+    unfetched: Vec<String>,
+    /// Claimed jobs that cannot run (spawn failed, spec unusable) whose
+    /// `failed` marker has not landed yet ([`flush_failed_markers`]).
+    failed_unmarked: Vec<String>,
+}
+
+impl PendingJobs {
+    fn is_empty(&self) -> bool {
+        self.unfetched.is_empty() && self.failed_unmarked.is_empty()
+    }
+}
+
+/// One tick of the bucket worker: claim new jobs, then drain every active run.
+///
+/// Claiming is best-effort — a bucket error there only costs this tick's
+/// claims — so the drain of runs already in flight (and the retry of held
+/// chunks and unlanded markers) happens whatever the bucket did to the claim
+/// step: an outage is exactly when held uploads need retrying, and a worker
+/// that exits loses them.
+async fn bucket_tick(
+    bucket: &dyn Bucket,
+    exe: &Path,
+    host_id: &str,
+    runs_root: &Path,
+    active: &mut HashMap<String, BucketRunState>,
+    pending: &mut PendingJobs,
+) {
+    claim_new_jobs(bucket, exe, host_id, active, pending).await;
+    // First attempt right away; a marker that did not land is retried on
+    // every later tick until it does.
+    flush_failed_markers(bucket, &mut pending.failed_unmarked).await;
+    drain_active_runs(bucket, exe, runs_root, active).await;
+}
+
+/// Step 1: claim every job that is up for grabs and start it.
+///
+/// No bucket error here ends the worker: a failing `list_jobs` or
+/// `claim_job` skips that claim for this tick (the job is still listed next
+/// tick if the claim did not land), and a claimed job whose spec cannot be
+/// fetched is parked in `pending.unfetched` and retried every tick.
+async fn claim_new_jobs(
+    bucket: &dyn Bucket,
+    exe: &Path,
+    host_id: &str,
+    active: &mut HashMap<String, BucketRunState>,
+    pending: &mut PendingJobs,
+) {
+    // Specs that could not be fetched on an earlier tick come first.
+    for run_id in std::mem::take(&mut pending.unfetched) {
+        start_claimed_job(bucket, exe, run_id, active, pending).await;
+    }
+    let job_ids = match bucket.list_jobs().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(error = %e, "node pull: list_jobs failed; no claims this tick");
+            return;
+        }
+    };
+    for run_id in job_ids {
+        match bucket.claim_job(&run_id, host_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(run_id = %run_id, "node pull: job already claimed by another node");
+                continue;
+            }
+            Err(e) => {
+                warn!(run_id = %run_id, error = %e, "node pull: claim_job failed; skipping it this tick");
+                continue;
+            }
+        }
+        info!(run_id = %run_id, "node pull: claimed job");
+        start_claimed_job(bucket, exe, run_id, active, pending).await;
+    }
+}
+
+/// Fetch a claimed job's spec and spawn it.
+///
+/// - spec fetch fails (a bucket error): parked in `pending.unfetched`, retried
+///   next tick — the claim is ours, so nobody else will run it.
+/// - the job object is gone, or the spec does not deserialize: the job is
+///   unusable and a retry cannot fix it, so it is marked `failed` (same as a
+///   spawn failure) rather than ending the worker.
+/// - spawn fails: marked `failed`.
+async fn start_claimed_job(
+    bucket: &dyn Bucket,
+    exe: &Path,
+    run_id: String,
+    active: &mut HashMap<String, BucketRunState>,
+    pending: &mut PendingJobs,
+) {
+    let job_bytes = match bucket.get_job(&run_id).await {
+        Ok(b) => b,
+        Err(BucketError::NotFound(_)) => {
+            warn!(run_id = %run_id, "node pull: claimed job has no spec object; marking it failed");
+            pending.failed_unmarked.push(run_id);
+            return;
+        }
+        Err(e) => {
+            warn!(run_id = %run_id, error = %e, "node pull: get_job failed; will retry next tick");
+            pending.unfetched.push(run_id);
+            return;
+        }
+    };
+    let spec: RunSpec = match serde_json::from_slice(&job_bytes) {
+        Ok(spec) => spec,
+        Err(e) => {
+            warn!(run_id = %run_id, error = %e, "node pull: job spec is malformed; marking it failed");
+            pending.failed_unmarked.push(run_id);
+            return;
+        }
+    };
+    match spawn_run(exe, &run_id, &spec) {
+        Ok(child) => {
+            info!(run_id = %run_id, "node pull: run spawned");
+            active.insert(
+                run_id,
+                BucketRunState {
+                    child,
+                    streams: BucketStreams::default(),
+                    last_ctrl_seq: None,
+                },
+            );
+        }
+        Err(e) => {
+            warn!(run_id = %run_id, error = %e, "node pull: spawn failed");
+            pending.failed_unmarked.push(run_id);
+        }
+    }
+}
+
+/// Step 2: drain every active run — routine uploads, queued control messages,
+/// and the terminal pass for a run whose `run.json` reads terminal. A run
+/// leaves `active` only once its `finished` marker landed; otherwise it stays
+/// and the next tick re-reads `run.json` and retries.
+async fn drain_active_runs(
+    bucket: &dyn Bucket,
+    exe: &Path,
+    runs_root: &Path,
+    active: &mut HashMap<String, BucketRunState>,
+) {
+    let run_ids: Vec<String> = active.keys().cloned().collect();
+    let mut finished: Vec<String> = Vec::new();
+
+    for rid in &run_ids {
+        let state = active.get_mut(rid).expect("rid came from active.keys()");
+        let run_dir = runs_root.join(rid);
+
+        // Each stream: peek the new lines, upload, and only then commit the
+        // cursor — a failed put retries the same chunk under the same key next
+        // tick instead of losing it. Plus the in-progress run.json.
+        upload_routine(bucket, rid, &run_dir, &mut state.streams).await;
+
+        // Drain queued control messages beyond the last-applied seq.
+        match bucket.list_control(rid).await {
+            Ok(controls) => {
+                for (seq, bytes) in &controls {
+                    // Skip already-applied controls.
+                    if let Some(last) = state.last_ctrl_seq {
+                        if *seq <= last {
+                            continue;
+                        }
+                    }
+                    match serde_json::from_slice::<ControlEnvelope>(bytes) {
+                        Ok(envelope) => {
+                            match envelope.kind.as_str() {
+                                "cancel" => {
+                                    info!(run_id = %rid, seq, "node pull: cancel");
+                                    if let Err(e) = state.child.start_kill() {
+                                        warn!(run_id = %rid, error = %e, "node pull: kill child failed");
+                                    }
+                                    // Cancel: advance unconditionally — the process
+                                    // is gone (or already dead) regardless of kill() error.
+                                    state.last_ctrl_seq = Some(*seq);
+                                }
+                                "approve" => {
+                                    info!(run_id = %rid, seq, "node pull: approve");
+                                    let argv = build_control_argv(
+                                        ControlKind::Approve,
+                                        rid,
+                                        envelope.mode.as_deref().unwrap_or(""),
+                                        None,
+                                    );
+                                    match spawn_control(exe, &argv) {
+                                        Ok(child) => {
+                                            state.child = child;
+                                            // Advance ONLY on successful spawn so a
+                                            // transient spawn error causes a retry
+                                            // next tick instead of stranding the run.
+                                            state.last_ctrl_seq = Some(*seq);
+                                        }
+                                        Err(e) => {
+                                            warn!(run_id = %rid, error = %e, "node pull: approve spawn failed");
+                                            // Leave last_ctrl_seq unchanged → retry.
+                                        }
+                                    }
+                                }
+                                "reject" => {
+                                    info!(run_id = %rid, seq, "node pull: reject");
+                                    let argv = build_control_argv(
+                                        ControlKind::Reject,
+                                        rid,
+                                        "",
+                                        envelope.reason.as_deref(),
+                                    );
+                                    match spawn_control(exe, &argv) {
+                                        Ok(child) => {
+                                            state.child = child;
+                                            // Advance ONLY on successful spawn.
+                                            state.last_ctrl_seq = Some(*seq);
+                                        }
+                                        Err(e) => {
+                                            warn!(run_id = %rid, error = %e, "node pull: reject spawn failed");
+                                            // Leave last_ctrl_seq unchanged → retry.
+                                        }
+                                    }
+                                }
+                                other => {
+                                    warn!(run_id = %rid, seq, kind = other, "node pull: unknown control kind (ignored)");
+                                    // Advance past unknown kinds so they are never
+                                    // reprocessed (the kind won't become known on retry).
+                                    state.last_ctrl_seq = Some(*seq);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(run_id = %rid, seq, error = %e, "node pull: failed to deserialize ControlEnvelope (skipped)");
+                            // Advance past corrupt envelopes so they are never
+                            // reprocessed (the bytes won't change on retry).
+                            state.last_ctrl_seq = Some(*seq);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(run_id = %rid, error = %e, "node pull: list_control failed");
+            }
+        }
+
+        // Check for terminal status → the terminal pass (final drain of
+        // every stream, run.json, then the `finished` marker).
+        match finish_if_terminal(bucket, rid, &run_dir, &mut state.streams).await {
+            Some((status, true)) => {
+                info!(run_id = %rid, status = %status, "node pull: run finished");
+                finished.push(rid.clone());
+            }
+            Some((status, false)) => {
+                warn!(
+                    run_id = %rid,
+                    status = %status,
+                    "node pull: run is terminal but its final uploads or finished marker did not land; keeping it active to retry"
+                );
+            }
+            None => {}
+        }
+    }
+
+    for rid in &finished {
+        active.remove(rid);
+    }
+}
 
 /// Maximum polling iterations in `--once` mode before giving up on
 /// active runs that have not reached a terminal status.
@@ -1274,189 +1598,23 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
         .context("advertise worker capabilities (nodes/<worker>.json)")?;
 
     let mut active: HashMap<String, BucketRunState> = HashMap::new();
-    // Claimed jobs whose spawn failed but whose `failed` marker has not landed.
-    let mut failed_unmarked: Vec<String> = Vec::new();
+    let mut pending = PendingJobs::default();
     let mut once_iters: u32 = 0;
 
     loop {
-        // ── Step 1: claim new jobs ────────────────────────────────────────────
-        let job_ids = bucket.list_jobs().await.context("list_jobs")?;
-        for run_id in job_ids {
-            let won = bucket
-                .claim_job(&run_id, &host_id)
-                .await
-                .context("claim_job")?;
-            if !won {
-                info!(run_id = %run_id, "node pull: job already claimed by another node");
-                continue;
-            }
-            info!(run_id = %run_id, "node pull: claimed job");
-            let job_bytes = bucket.get_job(&run_id).await.context("get_job")?;
-            let spec: RunSpec =
-                serde_json::from_slice(&job_bytes).context("deserialize RunSpec")?;
-            match spawn_run(&exe, &run_id, &spec) {
-                Ok(child) => {
-                    active.insert(
-                        run_id.clone(),
-                        BucketRunState {
-                            child,
-                            streams: BucketStreams::default(),
-                            last_ctrl_seq: None,
-                        },
-                    );
-                    info!(run_id = %run_id, "node pull: run spawned");
-                }
-                Err(e) => {
-                    warn!(run_id = %run_id, error = %e, "node pull: spawn failed");
-                    failed_unmarked.push(run_id);
-                }
-            }
-        }
-        // First attempt right away; a marker that did not land is retried on
-        // every later tick until it does.
-        flush_failed_markers(&bucket, &mut failed_unmarked).await;
-
-        // ── Step 2: drain active runs ─────────────────────────────────────────
-        let run_ids: Vec<String> = active.keys().cloned().collect();
-        let mut finished: Vec<String> = Vec::new();
-
-        for rid in &run_ids {
-            let state = active.get_mut(rid).expect("rid came from active.keys()");
-            let run_dir = runs_root.join(rid);
-
-            // Each stream: peek the new lines, upload, and only then commit
-            // the cursor — a failed put retries the same chunk under the same
-            // key next tick instead of losing it.
-            state.streams.upload_all(&bucket, rid, &run_dir).await;
-
-            // Upload run.json (always — reflects current in-progress status).
-            let run_json_path = run_dir.join("run.json");
-            if let Ok(body) = std::fs::read(&run_json_path) {
-                if let Err(e) = bucket.put_result(rid, "run.json", &body).await {
-                    warn!(run_id = %rid, error = %e, "node pull: put run.json failed");
-                }
-            }
-
-            // Drain queued control messages beyond the last-applied seq.
-            match bucket.list_control(rid).await {
-                Ok(controls) => {
-                    for (seq, bytes) in &controls {
-                        // Skip already-applied controls.
-                        if let Some(last) = state.last_ctrl_seq {
-                            if *seq <= last {
-                                continue;
-                            }
-                        }
-                        match serde_json::from_slice::<ControlEnvelope>(bytes) {
-                            Ok(envelope) => {
-                                match envelope.kind.as_str() {
-                                    "cancel" => {
-                                        info!(run_id = %rid, seq, "node pull: cancel");
-                                        if let Err(e) = state.child.start_kill() {
-                                            warn!(run_id = %rid, error = %e, "node pull: kill child failed");
-                                        }
-                                        // Cancel: advance unconditionally — the process
-                                        // is gone (or already dead) regardless of kill() error.
-                                        state.last_ctrl_seq = Some(*seq);
-                                    }
-                                    "approve" => {
-                                        info!(run_id = %rid, seq, "node pull: approve");
-                                        let argv = build_control_argv(
-                                            ControlKind::Approve,
-                                            rid,
-                                            envelope.mode.as_deref().unwrap_or(""),
-                                            None,
-                                        );
-                                        match spawn_control(&exe, &argv) {
-                                            Ok(child) => {
-                                                state.child = child;
-                                                // Advance ONLY on successful spawn so a
-                                                // transient spawn error causes a retry
-                                                // next tick instead of stranding the run.
-                                                state.last_ctrl_seq = Some(*seq);
-                                            }
-                                            Err(e) => {
-                                                warn!(run_id = %rid, error = %e, "node pull: approve spawn failed");
-                                                // Leave last_ctrl_seq unchanged → retry.
-                                            }
-                                        }
-                                    }
-                                    "reject" => {
-                                        info!(run_id = %rid, seq, "node pull: reject");
-                                        let argv = build_control_argv(
-                                            ControlKind::Reject,
-                                            rid,
-                                            "",
-                                            envelope.reason.as_deref(),
-                                        );
-                                        match spawn_control(&exe, &argv) {
-                                            Ok(child) => {
-                                                state.child = child;
-                                                // Advance ONLY on successful spawn.
-                                                state.last_ctrl_seq = Some(*seq);
-                                            }
-                                            Err(e) => {
-                                                warn!(run_id = %rid, error = %e, "node pull: reject spawn failed");
-                                                // Leave last_ctrl_seq unchanged → retry.
-                                            }
-                                        }
-                                    }
-                                    other => {
-                                        warn!(run_id = %rid, seq, kind = other, "node pull: unknown control kind (ignored)");
-                                        // Advance past unknown kinds so they are never
-                                        // reprocessed (the kind won't become known on retry).
-                                        state.last_ctrl_seq = Some(*seq);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(run_id = %rid, seq, error = %e, "node pull: failed to deserialize ControlEnvelope (skipped)");
-                                // Advance past corrupt envelopes so they are never
-                                // reprocessed (the bytes won't change on retry).
-                                state.last_ctrl_seq = Some(*seq);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(run_id = %rid, error = %e, "node pull: list_control failed");
-                }
-            }
-
-            // Check for terminal status → the terminal pass (final drain of
-            // every stream, run.json, then the `finished` marker). The run
-            // leaves `active` only once the marker landed; otherwise it stays
-            // and the next tick re-reads run.json and retries.
-            if let Some((status, body)) = read_terminal_status(&run_json_path) {
-                if finish_bucket_run(
-                    &bucket,
-                    rid,
-                    &run_dir,
-                    &mut state.streams,
-                    body.as_bytes(),
-                    &status,
-                )
-                .await
-                {
-                    info!(run_id = %rid, status = %status, "node pull: run finished");
-                    finished.push(rid.clone());
-                } else {
-                    warn!(
-                        run_id = %rid,
-                        status = %status,
-                        "node pull: run is terminal but its final uploads or finished marker did not land; keeping it active to retry"
-                    );
-                }
-            }
-        }
-
-        for rid in &finished {
-            active.remove(rid);
-        }
+        bucket_tick(
+            &bucket,
+            &exe,
+            &host_id,
+            &runs_root,
+            &mut active,
+            &mut pending,
+        )
+        .await;
 
         // ── Loop control ──────────────────────────────────────────────────────
         if args.once {
-            if active.is_empty() && failed_unmarked.is_empty() {
+            if active.is_empty() && pending.is_empty() {
                 info!("node pull: --once: all runs terminal, exiting");
                 break;
             }
@@ -1464,10 +1622,12 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             if once_iters >= ONCE_MAX_ITERS {
                 warn!(
                     active = active.len(),
-                    unmarked_failures = failed_unmarked.len(),
+                    unfetched_jobs = pending.unfetched.len(),
+                    unmarked_failures = pending.failed_unmarked.len(),
                     "node pull: --once: max-iterations reached, exiting with active runs \
                      (a terminal run whose final uploads or finished marker never landed is \
-                     left active, with no marker) or unmarked spawn failures"
+                     left active, with no marker), claimed jobs whose spec could not be \
+                     fetched, or unmarked failures"
                 );
                 break;
             }
@@ -1696,8 +1856,6 @@ mod tests {
         assert_eq!(gated.usage, 0);
     }
 
-    use rupu_cp::host::bucket::BucketError;
-
     /// A [`Bucket`] that records the writes the terminal pass makes, in order,
     /// and can be told to fail some of them:
     /// - `ops`: the writes that LANDED — `put_result` as `(key, body)`,
@@ -1910,6 +2068,10 @@ mod tests {
         let keys = bucket.landed_keys();
         assert!(!keys.contains(&"finished".to_string()), "{keys:?}");
         assert!(
+            !keys.contains(&"run.json".to_string()),
+            "the terminal run.json is not published while a stream is held: {keys:?}"
+        );
+        assert!(
             keys.contains(&"coverage.0000.jsonl".to_string()),
             "the other streams are still attempted: {keys:?}"
         );
@@ -2078,6 +2240,328 @@ mod tests {
             fb.bucket.get_finished("run_1").await.unwrap().as_deref(),
             Some("completed")
         );
+    }
+
+    /// A terminal `run.json` is what makes the CP mirror finish the run, and its
+    /// poller stops polling a finished run. So while a stream's chunk is held
+    /// (its put keeps failing) NEITHER the routine pass NOR the terminal pass may
+    /// publish that body — over many ticks, with `run.json` puts perfectly
+    /// healthy. After the bucket heals the order is: streams, run.json, marker.
+    #[tokio::test]
+    async fn a_terminal_run_json_is_not_published_while_a_stream_is_held() {
+        let run_dir = tempdir().unwrap();
+        append(&run_dir.path().join("events.jsonl"), "e1\n");
+        std::fs::write(run_dir.path().join("run.json"), RUN_JSON).unwrap();
+        let bucket = RecordingBucket::failing("events");
+        let mut streams = BucketStreams::default();
+
+        for _tick in 0..3 {
+            upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
+            let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), &mut streams).await;
+            assert_eq!(outcome, Some(("completed".to_string(), false)));
+            assert!(
+                bucket.landed().is_empty(),
+                "nothing, in particular no terminal run.json, may land: {:?}",
+                bucket.landed()
+            );
+        }
+
+        bucket.set_failing(None);
+        upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
+        assert_eq!(bucket.landed_keys(), ["events.0000.jsonl"], "streams first");
+        let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), &mut streams).await;
+        assert_eq!(outcome, Some(("completed".to_string(), true)));
+        assert_eq!(
+            bucket.landed_keys(),
+            ["events.0000.jsonl", "run.json", "finished"]
+        );
+        assert_eq!(
+            bucket.landed_body("events.0000.jsonl").as_deref(),
+            Some("e1\n")
+        );
+    }
+
+    /// The routine pass still publishes an in-progress `run.json` every tick
+    /// (that is how the CP sees `awaiting_approval` and friends), and
+    /// `finish_if_terminal` is a no-op for it.
+    #[tokio::test]
+    async fn an_in_progress_run_json_is_published_by_the_routine_pass() {
+        let run_dir = tempdir().unwrap();
+        std::fs::write(run_dir.path().join("run.json"), b"{\"status\":\"running\"}").unwrap();
+        let bucket = RecordingBucket::default();
+        let mut streams = BucketStreams::default();
+
+        upload_routine(&bucket, "run_P", run_dir.path(), &mut streams).await;
+        assert_eq!(bucket.landed_keys(), ["run.json"]);
+        assert_eq!(
+            finish_if_terminal(&bucket, "run_P", run_dir.path(), &mut streams).await,
+            None
+        );
+        assert_eq!(
+            bucket.landed_keys(),
+            ["run.json"],
+            "not terminal: no marker"
+        );
+    }
+
+    /// A pinned chunk that reads back EMPTY (a transient read error, a truncated
+    /// file) is not "all sent": the pin stays, nothing is put, and once the
+    /// bytes are readable again exactly that chunk is retried under its key —
+    /// never a grown superset the CP may have half-consumed.
+    #[tokio::test]
+    async fn an_unreadable_pinned_chunk_stays_pinned_until_it_can_be_re_sent() {
+        let run_dir = tempdir().unwrap();
+        let stream = coverage_path(run_dir.path());
+        std::fs::write(&stream, "a\nb\n").unwrap();
+        let bucket = RecordingBucket::failing("coverage");
+        let mut cur = BucketStream::default();
+
+        assert!(!upload_new_lines(&bucket, "run_1", "coverage", &stream, &mut cur).await);
+        let pinned = cur.pending_end;
+        assert_eq!(pinned, Some(4));
+
+        // The file cannot be read now; the bucket is back.
+        std::fs::remove_file(&stream).unwrap();
+        bucket.set_failing(None);
+        assert!(!upload_new_lines(&bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!((cur.offset, cur.seq), (0, 0), "nothing committed");
+        assert_eq!(cur.pending_end, pinned, "the pin is kept");
+        assert!(bucket.landed().is_empty(), "nothing was uploaded");
+
+        // Readable again, and the run has written more since.
+        std::fs::write(&stream, "a\nb\nc\n").unwrap();
+        assert!(upload_new_lines(&bucket, "run_1", "coverage", &stream, &mut cur).await);
+        assert_eq!(
+            bucket.landed(),
+            vec![
+                ("coverage.0000.jsonl".to_string(), "a\nb\n".to_string()),
+                ("coverage.0001.jsonl".to_string(), "c\n".to_string()),
+            ]
+        );
+        assert_eq!((cur.seq, cur.pending_end), (2, None));
+    }
+
+    /// A bucket whose job-queue calls can be made to fail, over an in-memory
+    /// store, for the claim step of a tick.
+    struct FlakyJobBucket {
+        inner: ObjectStoreBucket,
+        fail_list_jobs: std::sync::atomic::AtomicBool,
+        fail_claim_job: std::sync::atomic::AtomicBool,
+        fail_get_job: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyJobBucket {
+        fn new() -> Self {
+            Self {
+                inner: ObjectStoreBucket::from_url("memory:///", None).unwrap(),
+                fail_list_jobs: Default::default(),
+                fail_claim_job: Default::default(),
+                fail_get_job: Default::default(),
+            }
+        }
+
+        fn set(flag: &std::sync::atomic::AtomicBool, on: bool) {
+            flag.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn is_on(flag: &std::sync::atomic::AtomicBool) -> bool {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Bucket for FlakyJobBucket {
+        async fn put_job(&self, run_id: &str, b: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_job(run_id, b).await
+        }
+        async fn list_jobs(&self) -> Result<Vec<String>, BucketError> {
+            if Self::is_on(&self.fail_list_jobs) {
+                return Err(BucketError::Io("injected list_jobs failure".into()));
+            }
+            self.inner.list_jobs().await
+        }
+        async fn claim_job(&self, run_id: &str, w: &str) -> Result<bool, BucketError> {
+            if Self::is_on(&self.fail_claim_job) {
+                return Err(BucketError::Io("injected claim_job failure".into()));
+            }
+            self.inner.claim_job(run_id, w).await
+        }
+        async fn get_job(&self, run_id: &str) -> Result<Vec<u8>, BucketError> {
+            if Self::is_on(&self.fail_get_job) {
+                return Err(BucketError::Io("injected get_job failure".into()));
+            }
+            self.inner.get_job(run_id).await
+        }
+        async fn put_control(&self, run_id: &str, seq: u64, b: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_control(run_id, seq, b).await
+        }
+        async fn list_control(&self, run_id: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError> {
+            self.inner.list_control(run_id).await
+        }
+        async fn put_result(&self, run_id: &str, key: &str, b: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_result(run_id, key, b).await
+        }
+        async fn list_results(&self, run_id: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+            self.inner.list_results(run_id).await
+        }
+        async fn put_finished(&self, run_id: &str, status: &str) -> Result<(), BucketError> {
+            self.inner.put_finished(run_id, status).await
+        }
+        async fn get_finished(&self, run_id: &str) -> Result<Option<String>, BucketError> {
+            self.inner.get_finished(run_id).await
+        }
+        async fn probe(&self) -> Result<(), BucketError> {
+            self.inner.probe().await
+        }
+        async fn put_worker_info(&self, id: &str, b: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_worker_info(id, b).await
+        }
+        async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
+            self.inner.list_worker_info().await
+        }
+    }
+
+    /// A harmless stand-in for the `rupu` executable: exits at once, ignoring
+    /// whatever argv the worker builds.
+    const TRUE_EXE: &str = "true";
+
+    fn agent_job(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&RunSpec {
+            kind: RunSpecKind::Agent,
+            name: name.to_string(),
+            inputs: BTreeMap::new(),
+            prompt: Some("hi".into()),
+            mode: None,
+            target: None,
+            findings_profile: None,
+        })
+        .unwrap()
+    }
+
+    /// One bucket tick against `TRUE_EXE`.
+    async fn tick(
+        bucket: &dyn Bucket,
+        runs_root: &Path,
+        active: &mut HashMap<String, BucketRunState>,
+        pending: &mut PendingJobs,
+    ) {
+        bucket_tick(
+            bucket,
+            Path::new(TRUE_EXE),
+            "host_1",
+            runs_root,
+            active,
+            pending,
+        )
+        .await;
+    }
+
+    async fn idle_child() -> tokio::process::Child {
+        tokio::process::Command::new(TRUE_EXE).spawn().unwrap()
+    }
+
+    /// A bucket outage on the claim step must not end the worker before the
+    /// drain of the runs it already holds: a tick whose `list_jobs` fails still
+    /// uploads an active run's lines (and a restart would lose every held
+    /// chunk).
+    #[tokio::test]
+    async fn a_failing_list_jobs_tick_still_drains_an_active_run() {
+        let bucket = FlakyJobBucket::new();
+        FlakyJobBucket::set(&bucket.fail_list_jobs, true);
+        let runs_root = tempdir().unwrap();
+        std::fs::create_dir_all(runs_root.path().join("run_A")).unwrap();
+        append(&runs_root.path().join("run_A").join("events.jsonl"), "e1\n");
+        let mut active = HashMap::new();
+        active.insert(
+            "run_A".to_string(),
+            BucketRunState {
+                child: idle_child().await,
+                streams: BucketStreams::default(),
+                last_ctrl_seq: None,
+            },
+        );
+        let mut pending = PendingJobs::default();
+
+        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+
+        let results = bucket.inner.list_results("run_A").await.unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].0, "events.0000.jsonl");
+        assert_eq!(std::str::from_utf8(&results[0].1).unwrap(), "e1\n");
+        assert!(active.contains_key("run_A"), "the run is still in flight");
+        assert!(pending.is_empty());
+    }
+
+    /// A failing `claim_job` skips that job for the tick (it is still listed
+    /// next tick if the claim did not land); it neither ends the worker nor
+    /// leaves the job half-claimed.
+    #[tokio::test]
+    async fn a_failing_claim_job_skips_the_job_and_it_is_claimed_next_tick() {
+        let bucket = FlakyJobBucket::new();
+        bucket.put_job("run_C", &agent_job("a")).await.unwrap();
+        FlakyJobBucket::set(&bucket.fail_claim_job, true);
+        let runs_root = tempdir().unwrap();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(bucket.inner.list_jobs().await.unwrap(), ["run_C"]);
+
+        FlakyJobBucket::set(&bucket.fail_claim_job, false);
+        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert!(active.contains_key("run_C"));
+    }
+
+    /// A job claimed but whose spec could not be fetched is NOT dropped: the
+    /// claim is ours and `list_jobs` no longer shows it, so nobody else would
+    /// ever run it. It is parked and retried every tick.
+    #[tokio::test]
+    async fn a_claimed_job_whose_spec_cannot_be_fetched_is_retried_next_tick() {
+        let bucket = FlakyJobBucket::new();
+        bucket.put_job("run_G", &agent_job("a")).await.unwrap();
+        FlakyJobBucket::set(&bucket.fail_get_job, true);
+        let runs_root = tempdir().unwrap();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert!(active.is_empty());
+        assert_eq!(pending.unfetched, ["run_G"]);
+        assert!(
+            bucket.inner.list_jobs().await.unwrap().is_empty(),
+            "the claim landed: the job is no longer listed"
+        );
+
+        FlakyJobBucket::set(&bucket.fail_get_job, false);
+        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+        assert!(active.contains_key("run_G"), "spawned on the retry");
+        assert!(pending.is_empty());
+    }
+
+    /// A job whose spec does not deserialize is unusable and no retry fixes it:
+    /// it is marked `failed` (as a spawn failure is) and the worker carries on.
+    #[tokio::test]
+    async fn a_malformed_job_spec_is_marked_failed_and_does_not_end_the_worker() {
+        let bucket = FlakyJobBucket::new();
+        bucket
+            .put_job("run_BAD", b"{ not a run spec")
+            .await
+            .unwrap();
+        bucket.put_job("run_OK", &agent_job("a")).await.unwrap();
+        let runs_root = tempdir().unwrap();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
+
+        assert_eq!(
+            bucket.get_finished("run_BAD").await.unwrap().as_deref(),
+            Some("failed")
+        );
+        assert!(pending.is_empty());
+        assert!(
+            active.contains_key("run_OK"),
+            "the good job beside it still runs"
+        );
+        assert!(!active.contains_key("run_BAD"));
     }
 
     /// A claimed job whose spawn failed is marked `failed`; a marker that did
