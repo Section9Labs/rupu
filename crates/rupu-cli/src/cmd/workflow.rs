@@ -157,6 +157,77 @@ fn settle_awaiting(result: &mut OrchestratorRunResult, runs_dir: &Path) {
     }
 }
 
+/// A panic out of a workflow runner: what it carried.
+type RunnerPanic = Box<dyn std::any::Any + Send>;
+
+/// `run_workflow(opts)` for a caller that watches the run's status on disk
+/// to know when it is over — the attach printers return only on a parked or
+/// terminal status, the live view tails the run's events, the CP lists it —
+/// with a panic in it caught: a runner that panics writes neither, so a
+/// printer would wait on its `Running` forever (and `workflow run --plain`
+/// with it), and the run would stay `Running` under a process that is still
+/// alive, which no reaper ends. The panic finalizes `run_id` `Failed` first
+/// ([`RunStore::fail_in_flight`]: a cancel that landed, a gate the run
+/// parked at, or a runner that took the run since is kept), then comes back
+/// as the `Err`.
+///
+/// [`RunStore::fail_in_flight`]: rupu_orchestrator::RunStore::fail_in_flight
+async fn run_workflow_catching_panic(
+    opts: OrchestratorRunOpts,
+    run_id: &str,
+) -> Result<Result<OrchestratorRunResult, RunWfErr>, RunnerPanic> {
+    use futures_util::FutureExt as _;
+    let store = opts.run_store.clone();
+    let panic = match std::panic::AssertUnwindSafe(run_workflow(opts))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => return Ok(result),
+        Err(panic) => panic,
+    };
+    if let Some(store) = store {
+        let error = format!("workflow runner panicked: {}", panic_message(&*panic));
+        let id = run_id.to_string();
+        match store
+            .blocking(move |s| s.fail_in_flight(&id, &error, chrono::Utc::now()))
+            .await
+        {
+            Ok(true) => {
+                tracing::warn!(run_id = %run_id, "workflow runner panicked; the run is marked failed");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(run_id = %run_id, error = %e, "workflow runner panicked; could not mark the run failed");
+            }
+        }
+    }
+    Err(panic)
+}
+
+/// `tokio::spawn(run_workflow(opts))` through
+/// [`run_workflow_catching_panic`]: a panic finalizes the run `Failed`, then
+/// unwinds on, so the join still reports it.
+fn spawn_runner(
+    opts: OrchestratorRunOpts,
+    run_id: String,
+) -> tokio::task::JoinHandle<Result<OrchestratorRunResult, RunWfErr>> {
+    tokio::spawn(async move {
+        match run_workflow_catching_panic(opts, &run_id).await {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// The message a panic carried: its `&str` or `String` payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a payload that is not a string")
+}
+
 /// Drive `run_workflow(opts)` while painting the live view in a sibling task,
 /// returning the workflow result. The view tails `events.jsonl` + the run's
 /// transcripts and stops when the run reaches a terminal state. Shared by
@@ -174,7 +245,7 @@ async fn run_workflow_with_live_view(
     pricing: rupu_config::PricingConfig,
 ) -> Result<OrchestratorRunResult, RunWfErr> {
     let settle_dir = runs_dir.clone();
-    let runner_task = tokio::spawn(run_workflow(opts));
+    let runner_task = spawn_runner(opts, run_id.clone());
     let mut view_task = tokio::spawn(async move {
         let _ =
             crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id, pricing).await;
@@ -4952,7 +5023,22 @@ fn build_artifact_manifest(
         uri: None,
         inline_json: None,
     });
-    for step in run_store.read_step_results(&run.id)? {
+    // Best-effort: the manifest is written after a run that may have ended
+    // because its step results could not be read back (the inline
+    // approve-resume's read). The run-level artifacts and the metadata the
+    // manifest path rides along with (`source_wake_id` labels the run's
+    // trigger) still land; the step transcripts that could not be
+    // enumerated are what is missing — logged, and named in the run
+    // summary's `step_results_error`, so a reader of the manifest can tell
+    // them from a run that had no steps.
+    let (steps, step_results_error) = match run_store.read_step_results(&run.id) {
+        Ok(steps) => (steps, None),
+        Err(e) => {
+            tracing::warn!(run_id = %run.id, error = %e, "artifact manifest: step results unreadable; the manifest lists no step transcripts");
+            (Vec::new(), Some(e.to_string()))
+        }
+    };
+    for step in steps {
         manifest.artifacts.push(ArtifactRef {
             id: format!(
                 "art_step_{}_transcript",
@@ -4973,13 +5059,19 @@ fn build_artifact_manifest(
         producer: "run".into(),
         local_path: None,
         uri: None,
-        inline_json: Some(serde_json::json!({
-            "status": run.status.as_str(),
-            "awaiting_step_id": run.awaiting_step_id,
-            "error_message": run.error_message,
-            "issue_ref": run.issue_ref,
-            "workspace_id": run.workspace_id,
-        })),
+        inline_json: Some({
+            let mut summary = serde_json::json!({
+                "status": run.status.as_str(),
+                "awaiting_step_id": run.awaiting_step_id,
+                "error_message": run.error_message,
+                "issue_ref": run.issue_ref,
+                "workspace_id": run.workspace_id,
+            });
+            if let Some(error) = step_results_error {
+                summary["step_results_error"] = serde_json::Value::String(error);
+            }
+            summary
+        }),
     });
     Ok(manifest)
 }
@@ -5344,7 +5436,7 @@ async fn execute_workflow_invocation(
         .await
         .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
     } else if ctx.attach_ui {
-        let runner_task = tokio::spawn(run_workflow(opts));
+        let runner_task = spawn_runner(opts, run_id.clone());
         let rid = run_id.clone();
 
         let mut attach_opts = crate::output::workflow_printer::AttachOpts {
@@ -5406,15 +5498,8 @@ async fn execute_workflow_invocation(
                     )
                 }
             })
-            .await
-            .map_err(|e| anyhow::anyhow!("workflow printer task panicked: {e}"))?;
-            let outcome = match outcome_result {
-                Ok(o) => o,
-                Err(e) => {
-                    eprintln!("rupu: printer error: {e}");
-                    crate::output::workflow_printer::AttachOutcome::Detached
-                }
-            };
+            .await;
+            let outcome = printer_outcome(outcome_result);
 
             use crate::output::workflow_printer::AttachOutcome;
             if matches!(outcome, AttachOutcome::Cancelled) {
@@ -5541,7 +5626,7 @@ async fn execute_workflow_invocation(
                         // static-slot words and dispatch counters.
                         naming: Some(Arc::clone(&naming)),
                     };
-                    current_runner = tokio::spawn(run_workflow(resume_opts));
+                    current_runner = spawn_runner(resume_opts, current_run_id.clone());
                     current_run_id = result.run_id.clone();
                     attach_opts = crate::output::workflow_printer::AttachOpts {
                         skip_header: true,
@@ -5556,9 +5641,15 @@ async fn execute_workflow_invocation(
             }
         }
     } else {
-        run_workflow(opts)
-            .await
-            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
+        // In the caller's task, which a panic must not take down: in `cp
+        // serve` that is the cron loop, for good.
+        match run_workflow_catching_panic(opts, &run_id).await {
+            Ok(result) => result.map_err(|e| to_anyhow_with_input_snippet(e, &path, &body)),
+            Err(panic) => Err(anyhow::anyhow!(
+                "workflow runner panicked: {}",
+                panic_message(&*panic)
+            )),
+        }
     };
 
     // The run has finished (terminal or paused); the marker poller has no
@@ -5640,6 +5731,30 @@ async fn finish_operator_cancel(
         backend_id: Some(prepared.backend_id.clone()),
         worker_id: prepared.worker_id.clone(),
     })
+}
+
+/// The attach loop's printer ending as the loop acts on it: its outcome,
+/// or `Detached` when the printer failed or panicked — reported on stderr —
+/// so the loop still waits for the runner, which goes on without a view,
+/// and ends through the summary and the portable-metadata persist rather
+/// than abandoning the run mid-way.
+fn printer_outcome(
+    joined: Result<
+        io::Result<crate::output::workflow_printer::AttachOutcome>,
+        tokio::task::JoinError,
+    >,
+) -> crate::output::workflow_printer::AttachOutcome {
+    match joined {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
+            eprintln!("rupu: printer error: {e}");
+            crate::output::workflow_printer::AttachOutcome::Detached
+        }
+        Err(e) => {
+            eprintln!("rupu: printer panicked: {e}");
+            crate::output::workflow_printer::AttachOutcome::Detached
+        }
+    }
 }
 
 /// `execute_workflow_invocation`'s last step, run whatever the run
@@ -6083,6 +6198,31 @@ mod tests {
             workspace_strategy: None,
             worker_id: Some("worker-1".into()),
         }
+    }
+
+    /// The attach loop's printer ending in a panic is handled like one
+    /// ending in an error: `Detached`, so the loop still waits for the
+    /// runner and ends through the summary and the portable-metadata
+    /// persist. Before, the panic returned out of the invocation on the
+    /// spot, the runner abandoned mid-run and nothing persisted.
+    #[tokio::test]
+    async fn a_printer_that_panicked_or_failed_detaches_from_the_run() {
+        use crate::output::workflow_printer::AttachOutcome;
+        let panicked = tokio::task::spawn_blocking(|| -> io::Result<AttachOutcome> {
+            panic!("a printer bug")
+        })
+        .await;
+        assert!(matches!(printer_outcome(panicked), AttachOutcome::Detached));
+        let failed = tokio::task::spawn_blocking(|| -> io::Result<AttachOutcome> {
+            Err(io::Error::other("a printer error"))
+        })
+        .await;
+        assert!(matches!(printer_outcome(failed), AttachOutcome::Detached));
+        let done = tokio::task::spawn_blocking(|| -> io::Result<AttachOutcome> {
+            Ok(AttachOutcome::Done)
+        })
+        .await;
+        assert!(matches!(printer_outcome(done), AttachOutcome::Done));
     }
 
     /// A cancelled run in a store of its own: status, message and terminal

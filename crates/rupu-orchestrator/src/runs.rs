@@ -1067,6 +1067,22 @@ pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscrip
     out
 }
 
+/// What [`RunStore::clear_resume_if_marked_at`] did to a run's resume
+/// marker and claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeGiveBack {
+    /// The marker was still the one the spawner read: it and the claim are
+    /// cleared.
+    Cleared,
+    /// Only the claim was given back: the spawner took no marker as its
+    /// own, or the one it read was replaced or consumed since, and whatever
+    /// marker the run holds stays for the resume worker.
+    ClaimReleased,
+    /// The run is cancelled on disk: its marker and claim are left as they
+    /// are.
+    Cancelled,
+}
+
 /// Filesystem-backed run store. One root directory; one
 /// sub-directory per run. The store is stateless — every method
 /// reads/writes from disk, so concurrent CLIs sharing the same
@@ -3440,20 +3456,22 @@ impl RunStore {
     /// that consumes it, and only then clear — and a web decision recorded
     /// in between overwrote the marker with one the child was not spawned
     /// for. `marked_at` is the `resume_requested_at` the spawner read
-    /// (`None` when it read no marker). Under the run lock, on the record
-    /// as it is now: while the marker is still the one read, the marker and
-    /// the claim are cleared (`Ok(true)`); otherwise only the claim is given
-    /// back ([`release_resume_claim`](Self::release_resume_claim)) and the
-    /// newer marker stays for the resume worker (`Ok(false)`). A cancel is
-    /// left alone. The wait blocks its thread: async callers go through
-    /// [`RunStore::blocking`].
+    /// (`None` when it took no marker as its own). Under the run lock, on
+    /// the record as it is now: while the marker is still the one read, the
+    /// marker and the claim are cleared ([`ResumeGiveBack::Cleared`]);
+    /// otherwise only the claim is given back
+    /// ([`release_resume_claim`](Self::release_resume_claim)) and whatever
+    /// marker the run holds stays for the resume worker
+    /// ([`ResumeGiveBack::ClaimReleased`]). A cancel is left alone
+    /// ([`ResumeGiveBack::Cancelled`]). The wait blocks its thread: async
+    /// callers go through [`RunStore::blocking`].
     pub fn clear_resume_if_marked_at(
         &self,
         run_id: &str,
         marked_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<bool, RunStoreError> {
+    ) -> Result<ResumeGiveBack, RunStoreError> {
         let cleared = std::cell::Cell::new(false);
-        self.modify_unless_cancelled(run_id, |record| {
+        let written = self.modify_unless_cancelled(run_id, |record| {
             record.resume_claimed_at = None;
             record.resume_claimed_by = None;
             if marked_at.is_some() && record.resume_requested_at == marked_at {
@@ -3462,7 +3480,11 @@ impl RunStore {
             }
             true
         })?;
-        Ok(cleared.get())
+        Ok(match written {
+            None => ResumeGiveBack::Cancelled,
+            Some(_) if cleared.get() => ResumeGiveBack::Cleared,
+            Some(_) => ResumeGiveBack::ClaimReleased,
+        })
     }
 
     /// Runs the `cp serve` gate sweep must still run an `on_reject`
@@ -3685,6 +3707,52 @@ impl RunStore {
         };
         let error =
             format!("runner process {pid} is no longer alive; run marked failed by the gate sweep");
+        self.finalize_failed(&mut current, error, now)?;
+        *record = current;
+        Ok(true)
+    }
+
+    /// Finalize a `Pending`/`Running` run `Failed` with `error`, for a
+    /// runner that cannot make its own last write — its task panicked, and
+    /// whoever watches the run's status (a printer attached to it, the CP)
+    /// would otherwise wait on a `Running` that never ends. The orphan
+    /// reaper's transition ([`reap_if_orphaned`](Self::reap_if_orphaned))
+    /// for a runner whose process is still alive. Under the run lock, on
+    /// the record as it is on disk: any other status — a cancel that
+    /// landed, a gate the run parked at, a pause, a run already over — is
+    /// kept, as is a run another runner has taken since
+    /// ([`live_runner`](Self::live_runner): a resume that claimed it while
+    /// this one was failing); nothing is written, and this is `Ok(false)`.
+    /// The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn fail_in_flight(
+        &self,
+        run_id: &str,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let mut current = self.load(run_id)?;
+        if !matches!(current.status, RunStatus::Pending | RunStatus::Running)
+            || self.live_runner(&current).is_some()
+        {
+            return Ok(false);
+        }
+        self.finalize_failed(&mut current, error.to_string(), now)?;
+        Ok(true)
+    }
+
+    /// The `Failed` transition [`reap_if_orphaned`](Self::reap_if_orphaned)
+    /// and [`fail_in_flight`](Self::fail_in_flight) make for a runner that
+    /// is gone: status, finish time, error, no runner and no active step,
+    /// written, then the terminal `RunFailed` event watchers end on. The
+    /// caller holds the run lock and decided on `current` as it is on disk.
+    fn finalize_failed(
+        &self,
+        current: &mut RunRecord,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), RunStoreError> {
         current.status = RunStatus::Failed;
         current.finished_at = Some(now);
         current.error_message = Some(error.clone());
@@ -3693,7 +3761,7 @@ impl RunStore {
         current.active_step_kind = None;
         current.active_step_agent = None;
         current.active_step_transcript_path = None;
-        self.update(&current)?;
+        self.update(current)?;
         self.append_terminal_event(
             &current.id,
             &crate::executor::Event::RunFailed {
@@ -3702,8 +3770,7 @@ impl RunStore {
                 finished_at: now,
             },
         );
-        *record = current;
-        Ok(true)
+        Ok(())
     }
 
     /// Cooperatively pause a `Pending`/`Running` run: flips the persisted
@@ -6827,9 +6894,12 @@ mod tests {
         current.resume_approver = Some("web".into());
         current.resume_mode = Some("bypass".into());
         store.update(&current).unwrap();
-        assert!(!store
-            .clear_resume_if_marked_at(&rec.id, Some(read_at))
-            .unwrap());
+        assert_eq!(
+            store
+                .clear_resume_if_marked_at(&rec.id, Some(read_at))
+                .unwrap(),
+            ResumeGiveBack::ClaimReleased
+        );
         let kept = store.load(&rec.id).unwrap();
         assert_eq!(
             kept.resume_requested_at,
@@ -6844,16 +6914,22 @@ mod tests {
 
         // A spawner that read no marker clears none either.
         assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
-        assert!(!store.clear_resume_if_marked_at(&rec.id, None).unwrap());
+        assert_eq!(
+            store.clear_resume_if_marked_at(&rec.id, None).unwrap(),
+            ResumeGiveBack::ClaimReleased
+        );
         let kept = store.load(&rec.id).unwrap();
         assert_eq!(kept.resume_requested_at, Some(since));
         assert_eq!(kept.resume_claimed_at, None);
 
         // Still the marker that was read: marker and claim cleared.
         assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
-        assert!(store
-            .clear_resume_if_marked_at(&rec.id, Some(since))
-            .unwrap());
+        assert_eq!(
+            store
+                .clear_resume_if_marked_at(&rec.id, Some(since))
+                .unwrap(),
+            ResumeGiveBack::Cleared
+        );
         let cleared = store.load(&rec.id).unwrap();
         assert_eq!(cleared.resume_requested_at, None);
         assert_eq!(cleared.resume_gate_id, None);
@@ -6864,9 +6940,12 @@ mod tests {
 
         // Nothing to clear: the claim alone is given back.
         assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
-        assert!(!store
-            .clear_resume_if_marked_at(&rec.id, Some(since))
-            .unwrap());
+        assert_eq!(
+            store
+                .clear_resume_if_marked_at(&rec.id, Some(since))
+                .unwrap(),
+            ResumeGiveBack::ClaimReleased
+        );
         assert_eq!(store.load(&rec.id).unwrap().resume_claimed_at, None);
 
         assert!(matches!(
@@ -6890,7 +6969,10 @@ mod tests {
         rec.resume_claimed_by = Some("worker".into());
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
-        assert!(!store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap());
+        assert_eq!(
+            store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap(),
+            ResumeGiveBack::Cancelled
+        );
         let untouched = store.load(&rec.id).unwrap();
         assert_eq!(untouched.status, RunStatus::Cancelled);
         assert_eq!(untouched.resume_requested_at, Some(now));
@@ -7053,7 +7135,10 @@ mod tests {
 
         // The worker consumes the marker; the child dies without claiming.
         assert!(store.claim_resume(&rec.id, "worker", now).unwrap());
-        assert!(store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap());
+        assert_eq!(
+            store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap(),
+            ResumeGiveBack::Cleared
+        );
 
         // Within the lease of the attempt: nothing, however old the decision.
         for later in [
@@ -7648,6 +7733,85 @@ mod tests {
 
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(reloaded.status, RunStatus::Completed);
+    }
+
+    /// A runner that cannot make its own last write (its task panicked)
+    /// finalizes its in-flight run `Failed` with the terminal event, as
+    /// the orphan reaper would once its process died — and leaves any
+    /// other status alone: a cancel that landed, a gate it parked at, a
+    /// pause, a run already over.
+    #[test]
+    fn fail_in_flight_finalizes_only_a_pending_or_running_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut running = sample_record("run_fail_in_flight_running");
+        running.status = RunStatus::Running;
+        running.runner_pid = Some(std::process::id());
+        running.active_step_id = Some("step_a".into());
+        running.active_step_agent = Some("agent_a".into());
+        running.active_step_transcript_path = Some(PathBuf::from("/tmp/step_a.jsonl"));
+        store.create(running.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(store
+            .fail_in_flight(&running.id, "workflow runner panicked: boom", now)
+            .unwrap());
+
+        let failed = store.load(&running.id).unwrap();
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.finished_at, Some(now));
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("workflow runner panicked: boom")
+        );
+        assert!(failed.runner_pid.is_none());
+        assert!(failed.active_step_id.is_none());
+        assert!(failed.active_step_agent.is_none());
+        assert!(failed.active_step_transcript_path.is_none());
+        match last_event(&store, &running.id) {
+            crate::executor::Event::RunFailed { run_id, error, .. } => {
+                assert_eq!(run_id, running.id);
+                assert_eq!(error, "workflow runner panicked: boom");
+            }
+            other => panic!("expected RunFailed, got {other:?}"),
+        }
+
+        // A run another runner has taken since — its process alive — is
+        // that runner's to end: neither failed nor stripped of its pid.
+        let mut other_runner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut taken = sample_record("run_fail_in_flight_taken");
+        taken.status = RunStatus::Running;
+        taken.runner_pid = Some(other_runner.id());
+        store.create(taken.clone(), SAMPLE_YAML).unwrap();
+        let kept = store.fail_in_flight(&taken.id, "boom", now);
+        let reloaded = store.load(&taken.id).unwrap();
+        let _ = other_runner.kill();
+        let _ = other_runner.wait();
+        assert!(!kept.unwrap(), "a live runner's run is not failed");
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert_eq!(reloaded.runner_pid, Some(other_runner.id()));
+        assert_eq!(reloaded.error_message, None);
+
+        for status in [
+            RunStatus::Cancelled,
+            RunStatus::AwaitingApproval,
+            RunStatus::Paused,
+            RunStatus::Completed,
+        ] {
+            let mut rec = sample_record(&format!("run_fail_in_flight_{}", status.as_str()));
+            rec.status = status;
+            store.create(rec.clone(), SAMPLE_YAML).unwrap();
+            assert!(
+                !store.fail_in_flight(&rec.id, "boom", now).unwrap(),
+                "{status:?}"
+            );
+            let kept = store.load(&rec.id).unwrap();
+            assert_eq!(kept.status, status);
+            assert_eq!(kept.error_message, None, "{status:?}");
+        }
     }
 
     #[test]

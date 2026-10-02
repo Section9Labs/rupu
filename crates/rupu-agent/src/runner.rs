@@ -3406,6 +3406,9 @@ pub enum ScriptedTurn {
         stop: StopReason,
     },
     ProviderError(String),
+    /// The provider panics mid-send with this message: for a caller's
+    /// handling of a task that panicked (a workflow runner's, say).
+    Panic(String),
 }
 
 fn default_mock_tokens() -> u32 {
@@ -3450,6 +3453,7 @@ impl LlmProvider for MockProvider {
             ScriptedTurn::ProviderError(e) => {
                 Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
             }
+            ScriptedTurn::Panic(message) => panic!("{message}"),
             ScriptedTurn::AssistantText {
                 text,
                 stop,
