@@ -281,7 +281,7 @@ describe('Sessions — canonical run-table column order', () => {
   });
 
   it('renders a Started cell with relativeTime(created_at)', async () => {
-    // Real timers throughout — usePagedList's polling + testing-library's
+    // Real timers throughout — the per-host list's poll timers + testing-library's
     // waitFor both rely on real timers, so fake system time would hang them.
     // Instead pin `created_at` a known 3 minutes before the real "now".
     const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();

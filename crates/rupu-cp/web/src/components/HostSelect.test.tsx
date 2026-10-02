@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-// HostSelect — lists hosts from api.getHosts(), defaults to local, emits
-// chosen id via onChange. Falls back to a plain "Local" option on error.
+// HostSelect — the launcher variant lists hosts from api.getHosts() with their
+// status, the allowAll variant from api.getRegisteredHosts() (no probe). Emits
+// the chosen id via onChange. Falls back to a plain "Local" option on error.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -96,7 +97,7 @@ describe('HostSelect', () => {
 });
 
 describe('HostSelect — allowAll (fan-out variant)', () => {
-  it('renders This host, registered hosts, and All hosts, in that order', async () => {
+  it('renders This host, All hosts, then the registered hosts, in that order', async () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
 
     render(<HostSelect value="local" onChange={vi.fn()} allowAll />);

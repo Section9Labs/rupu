@@ -1,13 +1,15 @@
-// HostSelect — a small dropdown of registered hosts. The allowAll (list-filter) variant reads the probe-free api.getRegisteredHosts(); the launcher variant reads api.getHosts() for status.
-// and emits the chosen host_id. Defaults to "local". Falls back to a single
-// "Local" option when the hosts fetch fails or has not resolved yet.
+// HostSelect — a small dropdown of hosts that emits the chosen host_id. The
+// allowAll (list-filter) variant reads the probe-free api.getRegisteredHosts();
+// the launcher variant reads api.getHosts(), whose status it shows. The
+// launcher variant falls back to a single "Local" option while the hosts fetch
+// is pending or when it fails; the allowAll variant to "This host" + "All hosts".
 //
 // Restyled internally onto `ui/Select`'s shared chrome (visual parity — same
 // classes, now sourced from one place) per the One Control Language kit.
 //
 // `allowAll` switches on the fan-out variant the run-list pages need: "This
-// host" (local) + registered non-local hosts + a trailing "All hosts"
-// (value = ALL_HOSTS) option, absorbing what used to be page-local
+// host" (local) + "All hosts" (value = ALL_HOSTS) + the registered non-local
+// hosts, absorbing what used to be page-local
 // host-listing logic duplicated across WorkflowRuns/AgentRuns. Default false
 // keeps the launcher-sheet consumers (LauncherSheet, AgentLauncherSheet)
 // unchanged.
