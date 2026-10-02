@@ -983,7 +983,7 @@ pub async fn copy_blob_capped(
     let path = src.to_path_buf();
     let opened = tokio::task::spawn_blocking(move || crate::api::fs_open::open_regular_file(&path))
         .await
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        .map_err(|e| HostConnectorError::Invalid(format!("opening the stored blob failed: {e}")))?;
     let file = match opened {
         Ok(f) => f,
         Err(e)
@@ -994,11 +994,15 @@ pub async fn copy_blob_capped(
         {
             return Err(not_in_store())
         }
-        Err(e) => return Err(HostConnectorError::Invalid(e.to_string())),
+        Err(e) => {
+            return Err(HostConnectorError::Invalid(format!(
+                "opening the stored blob failed: {e}"
+            )))
+        }
     };
     let len = file
         .metadata()
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
+        .map_err(|e| HostConnectorError::Invalid(format!("reading the stored blob failed: {e}")))?
         .len();
     if len > max_bytes {
         return Err(HostConnectorError::Invalid(format!(
@@ -1010,7 +1014,10 @@ pub async fn copy_blob_capped(
 
 /// Write at most `max_bytes` from `reader` to `dest` (created or truncated);
 /// `Invalid` if the reader has more. Reads one byte past the cap to tell
-/// "exactly `max_bytes`" from "more", never further.
+/// "exactly `max_bytes`" from "more", never further, and never writes the
+/// over-cap bytes. Each failure says which side failed: the coordinator's
+/// `dest` ("local write failed"), the source ("reading the stored blob
+/// failed"), or the size cap.
 async fn copy_reader_capped<R>(
     reader: R,
     dest: &Path,
@@ -1020,16 +1027,29 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let io = |e: std::io::Error| HostConnectorError::Invalid(e.to_string());
-    let mut out = tokio::fs::File::create(dest).await.map_err(io)?;
+    let write_err =
+        |e: std::io::Error| HostConnectorError::Invalid(format!("local write failed: {e}"));
+    let read_err = |e: std::io::Error| {
+        HostConnectorError::Invalid(format!("reading the stored blob failed: {e}"))
+    };
+    let mut out = tokio::fs::File::create(dest).await.map_err(write_err)?;
     let mut limited = reader.take(max_bytes.saturating_add(1));
-    let copied = tokio::io::copy(&mut limited, &mut out).await.map_err(io)?;
-    out.flush().await.map_err(io)?;
-    if copied > max_bytes {
-        return Err(HostConnectorError::Invalid(format!(
-            "stored blob is larger than its recorded {max_bytes} bytes"
-        )));
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied: u64 = 0;
+    loop {
+        let n = limited.read(&mut buf).await.map_err(read_err)?;
+        if n == 0 {
+            break;
+        }
+        copied += n as u64;
+        if copied > max_bytes {
+            return Err(HostConnectorError::Invalid(format!(
+                "stored blob is larger than its recorded {max_bytes} bytes"
+            )));
+        }
+        out.write_all(&buf[..n]).await.map_err(write_err)?;
     }
+    out.flush().await.map_err(write_err)?;
     Ok(())
 }
 
@@ -1457,10 +1477,55 @@ pub(crate) mod testing {
             matches!(res, Err(HostConnectorError::Invalid(_))),
             "{res:?}"
         );
-        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 11);
+        // Only in-cap bytes ever reach the file.
+        assert!(std::fs::metadata(&dest).unwrap().len() <= 10);
         // Exactly at the cap is fine.
         let ok = copy_reader_capped(&b"0123456789"[..], &dest, 10).await;
         assert!(ok.is_ok(), "{ok:?}");
         assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    }
+
+    /// A reader that fails on the first read.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("disk gone")))
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_reader_capped_labels_which_side_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Source read failure.
+        let err = copy_reader_capped(FailingReader, &tmp.path().join("dest"), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m == "reading the stored blob failed: disk gone"),
+            "{err:?}"
+        );
+        // Coordinator-side destination failure (parent directory missing).
+        let err = copy_reader_capped(&b"abc"[..], &tmp.path().join("no-dir").join("dest"), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m) if m.starts_with("local write failed: ")),
+            "{err:?}"
+        );
+        // Over the cap: its own message, neither of the above.
+        let err = copy_reader_capped(&b"0123456789ab"[..], &tmp.path().join("dest"), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m == "stored blob is larger than its recorded 10 bytes"),
+            "{err:?}"
+        );
     }
 }

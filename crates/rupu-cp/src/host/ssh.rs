@@ -755,8 +755,10 @@ impl SshExec {
     /// Run `cmd` and stream its stdout into `dest` (created or truncated) in
     /// 64 KiB chunks — never buffering the whole output. Once MORE than
     /// `max_bytes` have arrived the child is killed and `TooLarge` returned;
-    /// if no chunk arrives for `idle` the child is killed and `Idle` returned
-    /// (an established connection that goes silent must not pin the caller);
+    /// if no chunk arrives for `idle` — or, once the output ends, the child's
+    /// exit or its stderr takes longer than `idle` — the child is killed and
+    /// `Idle` returned (a connection that goes silent must not pin the
+    /// caller);
     /// a nonzero exit is `NonZero` with the child's stderr. Failures writing
     /// `dest` are `LocalIo`. On any error `dest` may be left partially
     /// written — the caller owns its cleanup. `host` only labels the `Idle`
@@ -791,7 +793,7 @@ impl SshExec {
             .ok_or_else(|| RemoteExecError::Spawn("no stderr pipe".into()))?;
         // Drain stderr concurrently so a chatty remote cannot fill the pipe
         // and stall stdout.
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut s = Vec::new();
             let _ = stderr.read_to_end(&mut s).await;
             s
@@ -825,8 +827,31 @@ impl SshExec {
             file.write_all(&buf[..n]).await.map_err(local)?;
         }
         file.flush().await.map_err(local)?;
-        let status = child.wait().await.map_err(io)?;
-        let stderr = stderr_task.await.unwrap_or_default();
+        // The output ended, but a remote that closed stdout and kept running —
+        // or a connection that died between EOF and the exit status — would
+        // hang `wait()` and the stderr join forever, pinning everyone sharing
+        // this pull. Bound both with the same idle timeout.
+        let unfinished = || {
+            RemoteExecError::Idle(format!(
+                "{host} did not finish within {idle:?} of ending its output"
+            ))
+        };
+        let status = match tokio::time::timeout(idle, child.wait()).await {
+            Ok(status) => status.map_err(io)?,
+            Err(_) => {
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(unfinished());
+            }
+        };
+        let stderr = match tokio::time::timeout(idle, &mut stderr_task).await {
+            Ok(joined) => joined.unwrap_or_default(),
+            Err(_) => {
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(unfinished());
+            }
+        };
         if !status.success() {
             return Err(RemoteExecError::NonZero {
                 code: status.code(),
@@ -3774,6 +3799,8 @@ mod tests {
         run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
         /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
         last_bytes_call: std::sync::Mutex<Option<(String, Option<Vec<u8>>)>>,
+        /// How many times `run_bytes` was invoked.
+        bytes_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeExec {
@@ -3796,6 +3823,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3818,6 +3846,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3842,6 +3871,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3866,6 +3896,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3889,6 +3920,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
     }
@@ -3985,6 +4017,8 @@ mod tests {
             remote_command: &str,
             stdin: Option<Vec<u8>>,
         ) -> Result<Vec<u8>, RemoteExecError> {
+            self.bytes_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_bytes_call.lock().unwrap() = Some((remote_command.to_string(), stdin));
             self.run_bytes_out
                 .lock()
@@ -4165,6 +4199,59 @@ mod tests {
         assert!(!alive, "the silent child (pid {pid}) was not killed");
     }
 
+    #[tokio::test]
+    async fn stream_to_file_bounds_the_exit_wait_after_stdout_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // Sends a little, closes its stdout (the reader sees a clean EOF),
+        // then lives on far longer than the injected bound.
+        let script = format!(
+            "echo $$ > {}; printf abc; exec 1>&-; exec sleep 60",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(
+                sh(&script),
+                &dest,
+                1000,
+                std::time::Duration::from_millis(1000),
+                "lingering-host",
+            ),
+        )
+        .await
+        .expect("a lingering child must hit the bound, not be waited on");
+        match res {
+            Err(RemoteExecError::Idle(m)) => {
+                assert!(m.contains("lingering-host did not finish within"), "{m}")
+            }
+            other => panic!("expected Idle, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the lingering child (pid {pid}) was not killed");
+    }
+
     #[test]
     fn map_remote_err_maps_every_run_to_file_failure() {
         assert!(matches!(
@@ -4211,7 +4298,16 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"blob");
         let (cmd, _stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
         assert_eq!(cmd, format!("'rupu' '__findings' 'artifact' '{sha}'"));
+        // Exactly one exec call for the pull: no probe, no retry, no second
+        // channel (never burst connections at a host).
+        let exec_calls = |f: &FakeExec| {
+            f.bytes_calls.load(std::sync::atomic::Ordering::SeqCst)
+                + f.commands.lock().unwrap().len()
+        };
+        assert_eq!(exec_calls(&fake), 1);
+        // A refused digest adds none.
         assert!(conn.pull_finding_artifact("nope", &dest, 4).await.is_err());
+        assert_eq!(exec_calls(&fake), 1);
     }
 
     #[tokio::test]
