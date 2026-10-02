@@ -9,6 +9,8 @@
 //! Agent files are markdown with YAML frontmatter (Okesu/Claude
 //! convention). See [`spec::AgentSpec`].
 
+// Continue an interrupted agent run from its transcript (recover-on-interrupt).
+pub mod continuation;
 // Task 18: coverage tool wrappers (injected when concerns: is present)
 pub mod coverage_tools;
 // Open-file limit management + agent-run admission pacing.
