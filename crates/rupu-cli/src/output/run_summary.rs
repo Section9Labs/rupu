@@ -52,7 +52,14 @@ fn findings_line(by_severity: &BTreeMap<String, usize>) -> Option<String> {
 /// whose coverage could not be collected) outlives the run — print every one;
 /// dropping any would hide a gap in the findings.
 fn warning_lines(v: &RunView) -> Vec<String> {
-    v.warnings.iter().map(|w| format!("⚠ {w}")).collect()
+    format_warnings(&v.warnings)
+}
+
+/// The `⚠ <step>: <message>` form of `RunView::warnings`-shaped entries —
+/// shared by the completion summary and `rupu workflow show-run` so the two
+/// can never print a warning differently.
+pub fn format_warnings(warnings: &[String]) -> Vec<String> {
+    warnings.iter().map(|w| format!("⚠ {w}")).collect()
 }
 
 pub fn render_completion_summary(v: &RunView, now: DateTime<Utc>) -> String {

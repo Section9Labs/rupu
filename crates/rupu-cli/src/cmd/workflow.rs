@@ -1033,6 +1033,9 @@ struct WorkflowShowRunItem {
     awaiting_since: Option<String>,
     expires_at: Option<String>,
     steps: Vec<WorkflowShowRunStep>,
+    /// `<step>: <message>` per `StepWarning` in the run's event log, in
+    /// order (pretty output prints each as `⚠ <step>: <message>`).
+    warnings: Vec<String>,
     usage_rows: Vec<WorkflowShowRunUsageRow>,
     usage_totals: Option<WorkflowShowRunUsageTotals>,
 }
@@ -1225,6 +1228,7 @@ impl EventOutput for WorkflowShowRunOutput {
         render_pretty_workflow_run(
             &self.record,
             &self.step_results_log,
+            &self.report.item.warnings,
             &self.report.item.usage_rows,
             self.report.item.usage_totals.as_ref(),
             &self.prefs,
@@ -1236,6 +1240,7 @@ impl EventOutput for WorkflowShowRunOutput {
 fn render_pretty_workflow_run(
     record: &rupu_orchestrator::RunRecord,
     step_results_log: &Path,
+    warnings: &[String],
     usage_rows: &[WorkflowShowRunUsageRow],
     usage_totals: Option<&WorkflowShowRunUsageTotals>,
     prefs: &crate::cmd::ui::UiPrefs,
@@ -1252,6 +1257,11 @@ fn render_pretty_workflow_run(
         prefs,
         width,
     );
+    // The same `⚠ <step>: <message>` lines the completion summary prints.
+    if !warnings.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(&crate::output::run_summary::format_warnings(warnings).join("\n"));
+    }
     let usage_block = render_workflow_usage_block(usage_rows, usage_totals);
     if !usage_block.is_empty() {
         body.push_str("\n\n");
@@ -2819,6 +2829,7 @@ async fn show_run(
         .read_step_results(run_id)
         .map_err(|e| anyhow::anyhow!("read step results failed: {e}"))?;
 
+    let warnings = crate::output::run_model::RunView::warnings_from_run_dir(&store, run_id);
     let usage_rows = aggregate_run_usage_from_store(&store, run_id);
     let usage_detail_rows = usage_rows
         .iter()
@@ -2909,6 +2920,7 @@ async fn show_run(
                     .expires_at
                     .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
                 steps: step_rows,
+                warnings,
                 usage_rows: usage_detail_rows,
                 usage_totals,
             },

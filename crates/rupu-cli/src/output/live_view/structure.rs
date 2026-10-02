@@ -208,6 +208,9 @@ struct Facts<'a> {
     detail: Option<String>,
     /// The right-hand state: status plus its text (a duration, `running`, …).
     state: Option<(NodeStatus, String)>,
+    /// How many `StepWarning`s the step has. Rides beside `state` as `⚠` /
+    /// `⚠N` — a notice, never a status.
+    warnings: usize,
 }
 
 fn state_of_step(step: &StepView) -> Option<(NodeStatus, String)> {
@@ -258,6 +261,7 @@ fn facts_of_step<'a>(step: &Step, live: Option<&'a StepView>) -> Facts<'a> {
         facts.host = sv.host.as_deref();
         facts.detail = round_label(sv).filter(|_| kind == NodeKind::Panel);
         facts.state = state_of_step(sv);
+        facts.warnings = sv.warnings.len();
     }
     facts
 }
@@ -549,11 +553,13 @@ fn paint(row: &GraphRow, facts: &Facts<'_>, gutter: Option<NodeStatus>) -> Line 
     right_hand_state(line, facts)
 }
 
-/// `···· <glyph> <state> @host` — the protected tail of a node row; absent
-/// when the run has nothing to say about the node yet.
+/// `···· <glyph> <state> ⚠N @host` — the protected tail of a node row; absent
+/// when the run has nothing to say about the node yet. The `⚠` (with its count
+/// past the first) sits beside the state, in the warning tone: the step's own
+/// state is untouched.
 fn right_hand_state(mut line: Line, facts: &Facts<'_>) -> Line {
     let host = facts.host.filter(|h| !h.is_empty());
-    if facts.state.is_none() && host.is_none() {
+    if facts.state.is_none() && host.is_none() && facts.warnings == 0 {
         return line;
     }
     line = line.dim(LEADER);
@@ -561,8 +567,20 @@ fn right_hand_state(mut line: Line, facts: &Facts<'_>) -> Line {
         let st = palette_status(*ns);
         line = line.status(st, format!("{} {}", st.glyph(), printable(text)));
     }
-    if let Some(host) = host {
+    if facts.warnings > 0 {
         let gap = if facts.state.is_some() { " " } else { "" };
+        let marker = match facts.warnings {
+            1 => "⚠".to_string(),
+            n => format!("⚠{n}"),
+        };
+        line = line.status(Status::SoftFailed, format!("{gap}{marker}"));
+    }
+    if let Some(host) = host {
+        let gap = if facts.state.is_some() || facts.warnings > 0 {
+            " "
+        } else {
+            ""
+        };
         line = line.dim(format!("{gap}@{}", printable(host)));
     }
     line
@@ -930,7 +948,8 @@ fn fan_block(scaffold: &Scaffold, step: &StepView, nav: &NavState, drilled: bool
 enum Class {
     /// Running or awaiting approval — the live frontier. Never collapsed.
     Frontier,
-    /// Failed, paused, selected, or part of a loop still in play. Never collapsed.
+    /// Failed, paused, warned, selected, or part of a loop still in play.
+    /// Never collapsed.
     Keep,
     /// Complete or skipped, and nothing above. Folds first.
     Settled,
@@ -983,6 +1002,7 @@ impl Group {
 }
 
 fn class_of(view: &RunView, id: &str, live: Option<&StepView>, selected: bool) -> Class {
+    let warned = live.is_some_and(|s| !s.warnings.is_empty());
     let below_running =
         live.is_some_and(|s| s.units.values().any(|u| u.status == UnitStatus::Running))
             || view.dispatches.values().any(|d| {
@@ -992,6 +1012,9 @@ fn class_of(view: &RunView, id: &str, live: Option<&StepView>, selected: bool) -
         Some(StepState::Running | StepState::AwaitingApproval) => Class::Frontier,
         _ if below_running => Class::Frontier,
         _ if selected => Class::Keep,
+        // A warning is only visible as its row's `⚠`: folding the step into a
+        // `✓ a … b (+N done)` summary would hide it.
+        Some(StepState::Complete | StepState::Skipped) if warned => Class::Keep,
         Some(StepState::Complete | StepState::Skipped) => Class::Settled,
         None | Some(StepState::Pending) => Class::Pending,
         Some(StepState::Failed | StepState::Paused) => Class::Keep,
@@ -2091,6 +2114,80 @@ steps:
         });
         let rows = structure_rows(&v, &kinds_wf(), &NavState::default());
         insta::assert_snapshot!(render_plain(&rows));
+    }
+
+    fn warn(v: &mut RunView, step: &str, index: Option<usize>, message: &str) {
+        v.apply(&Event::StepWarning {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            message: message.into(),
+        });
+    }
+
+    /// A step with warnings wears a `⚠` in its right-hand state — beside its
+    /// real state, never in place of it; several warnings carry their count.
+    #[test]
+    fn a_warned_step_wears_a_marker_beside_its_state() {
+        let mut v = live();
+        warn(&mut v, "probe", None, "no coverage from the host");
+        warn(&mut v, "sweep", Some(0), "host went away");
+        warn(&mut v, "sweep", Some(1), "host went away again");
+        let rows = structure_rows(&v, &wf(), &nav_on(&v, "sweep"));
+        let s = render_plain(&rows);
+        insta::assert_snapshot!(s);
+
+        // The state glyph and word are exactly what the lifecycle said.
+        assert!(
+            plain(row(&rows, "probe  prober")).ends_with("···· ✓ 1m 35s ⚠"),
+            "{s}"
+        );
+        assert!(
+            plain(row(&rows, "sweep  sweeper")).ends_with("···· ◐ running ⚠2 @mini"),
+            "{s}"
+        );
+        assert_eq!(node_status_of(&v, "probe"), NodeStatus::Complete);
+        assert_eq!(node_status_of(&v, "sweep"), NodeStatus::Working);
+        // The marker is the warning tone, not a failure red.
+        assert_eq!(
+            style_of(row(&rows, "probe  prober"), " ⚠"),
+            &Style::Status(Status::SoftFailed)
+        );
+        // Unwarned rows carry none.
+        assert!(!plain(row(&rows, "preflight")).contains('⚠'), "{s}");
+    }
+
+    /// A settled step that warned must not fold away into `✓ a … b (+N done)`:
+    /// the marker is the only place the warning lives while the run is live.
+    #[test]
+    fn a_warned_settled_step_is_never_folded_away() {
+        let (mut v, wf) = (scale_view(20), scale_wf(20));
+        let quiet = pane(&v, &wf, &NavState::default(), W, 16);
+        assert!(!quiet.contains("s10"), "unwarned s10 folds:\n{quiet}");
+
+        warn(&mut v, "s10", None, "no coverage from the host");
+        let rows = structure_pane(&v, &wf, &NavState::default(), W, 16);
+        let s = render_plain(&rows);
+        assert!(rows.len() <= 16, "{} rows:\n{s}", rows.len());
+        let line = plain(row(&rows, "s10"));
+        assert!(line.contains('⚠'), "{s}");
+        assert!(line.contains("✓"), "its own state still reads done:\n{s}");
+    }
+
+    /// The marker rides in the protected right-hand state, so a tight column
+    /// clips the label, not the warning.
+    #[test]
+    fn the_warning_marker_survives_a_tight_clip() {
+        let mut v = live();
+        warn(&mut v, "probe", None, "no coverage");
+        let rows = structure_pane(&v, &wf(), &NavState::default(), 30, 40);
+        let line = plain(row(&rows, "1m 35s"));
+        assert!(line.ends_with("✓ 1m 35s ⚠"), "{line}");
+        assert!(
+            line.contains('…'),
+            "the label gave way, not the state: {line}"
+        );
+        assert!(line.chars().count() <= 30, "{line}");
     }
 
     #[test]

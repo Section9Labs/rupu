@@ -92,6 +92,9 @@ pub struct StepView {
     pub panel_round: Option<u32>,
     pub panel_max: Option<u32>,
     pub loop_iteration: Option<u32>,
+    /// `StepWarning` messages for this step (step-level and per-unit), in
+    /// arrival order. Information only — never part of `state`.
+    pub warnings: Vec<String>,
     /// First-seen order, for stable rendering.
     pub order: usize,
 }
@@ -169,6 +172,7 @@ impl RunView {
             panel_round: None,
             panel_max: None,
             loop_iteration: None,
+            warnings: Vec::new(),
             order,
         });
         self.steps.last_mut().unwrap()
@@ -241,8 +245,14 @@ impl RunView {
             Event::StepWarning {
                 step_id, message, ..
             } => {
-                // Information only: never a step or run failure.
+                // Information only: never a step or run failure. Kept flat
+                // (for the completion summary) and on the step (for the live
+                // view's marker) — but only on a step the run has reached: a
+                // warning must not conjure a pending step into the view.
                 self.warnings.push(format!("{step_id}: {message}"));
+                if let Some(s) = self.steps.iter_mut().find(|s| s.step_id == *step_id) {
+                    s.warnings.push(message.clone());
+                }
             }
             Event::StepPaused { step_id, .. } => {
                 self.step_mut(step_id).state = StepState::Paused;
@@ -487,6 +497,23 @@ impl RunView {
         v
     }
 
+    /// The `"<step>: <message>"` lines of every `StepWarning` in a run's
+    /// event log, in order — what `rupu workflow show-run` prints. Folds just
+    /// the warnings through [`RunView::apply`] (so the format is the one the
+    /// completion summary uses) without the `run.json` / step-results /
+    /// usage work of [`RunView::from_run_dir`]. Empty for a run with no
+    /// warnings or no readable event log.
+    pub fn warnings_from_run_dir(store: &RunStore, run_id: &str) -> Vec<String> {
+        let mut v = RunView::default();
+        let mut tailer = crate::output::jsonl_reader::WfEventTailer::new(store.events_path(run_id));
+        for ev in tailer.drain_events() {
+            if matches!(ev, Event::StepWarning { .. }) {
+                v.apply(&ev);
+            }
+        }
+        v.warnings
+    }
+
     /// Wall-clock elapsed time: `finished_at − started_at`, or
     /// `now − started_at` while the run is still live. `None` until the run
     /// has started; a clock that runs backwards clamps to 0.
@@ -574,6 +601,80 @@ mod tests {
         assert_eq!(v.steps[0].duration_ms, Some(18_000));
         assert_eq!(v.steps[1].state, StepState::Running);
         assert!(matches!(v.steps[0].kind, StepKind::Run));
+    }
+
+    #[test]
+    fn step_warnings_are_kept_per_step_and_never_change_a_state() {
+        let mut v = RunView::default();
+        v.apply(&started("a", StepKind::Run));
+        v.apply(&Event::StepCompleted {
+            run_id: "r".into(),
+            step_id: "a".into(),
+            success: true,
+            duration_ms: 1_000,
+            host: None,
+        });
+        v.apply(&started("b", StepKind::ForEach));
+        let warn = |step: &str, index: Option<usize>, message: &str| Event::StepWarning {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            message: message.into(),
+        };
+        v.apply(&warn("a", None, "no coverage"));
+        v.apply(&warn("b", Some(2), "host went away"));
+        v.apply(&warn("b", Some(5), "host went away again"));
+        // A warning for a step the run never reached must not conjure one.
+        v.apply(&warn("ghost", None, "orphan"));
+
+        assert_eq!(v.steps.len(), 2, "no phantom step for a warned unknown id");
+        assert_eq!(v.steps[0].warnings, vec!["no coverage"]);
+        assert_eq!(
+            v.steps[1].warnings,
+            vec!["host went away", "host went away again"]
+        );
+        // Information only: the step states and the run status are untouched.
+        assert_eq!(v.steps[0].state, StepState::Complete);
+        assert_eq!(v.steps[1].state, StepState::Running);
+        assert_eq!(v.status, RunStatus::default());
+        // The flat, summary-facing list still carries every warning in order.
+        assert_eq!(
+            v.warnings,
+            vec![
+                "a: no coverage",
+                "b: host went away",
+                "b: host went away again",
+                "ghost: orphan"
+            ]
+        );
+    }
+
+    #[test]
+    fn warnings_from_run_dir_reads_only_the_warnings_of_the_event_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(tmp.path().join("runs/run_W")).unwrap();
+        let log = [
+            r#"{"type":"run_started","event_version":1,"run_id":"run_W","workflow_path":"wf","started_at":"2026-09-30T10:00:00Z"}"#,
+            r#"{"type":"step_started","run_id":"run_W","step_id":"sweep","kind":"for_each","agent":null}"#,
+            r#"{"type":"step_warning","run_id":"run_W","step_id":"sweep","index":1,"message":"host gpu-9 sent no coverage"}"#,
+            r#"{"type":"step_warning","run_id":"run_W","step_id":"triage","message":"merge skipped"}"#,
+        ]
+        .join("\n");
+        std::fs::write(
+            tmp.path().join("runs/run_W/events.jsonl"),
+            format!("{log}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            RunView::warnings_from_run_dir(&store, "run_W"),
+            vec![
+                "sweep: host gpu-9 sent no coverage",
+                "triage: merge skipped"
+            ]
+        );
+        assert!(RunView::warnings_from_run_dir(&store, "run_NOPE").is_empty());
     }
 
     #[test]
