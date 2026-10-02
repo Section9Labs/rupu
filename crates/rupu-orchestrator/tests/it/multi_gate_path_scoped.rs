@@ -14,10 +14,10 @@ use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::runner::{
     run_reject_cleanup, run_workflow, OrchestratorRunOpts, OrchestratorRunResult, ResumeState,
-    StepFactory,
+    RunWorkflowError, StepFactory,
 };
 use rupu_orchestrator::{
-    ApprovalError, GateVerdict, RunStatus, RunStore, StepKind, StepResult, Workflow,
+    ApprovalError, GateVerdict, RunStatus, RunStore, RunnerClaim, StepKind, StepResult, Workflow,
 };
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
@@ -746,4 +746,94 @@ async fn cancelling_while_an_approved_path_executes_cancels_the_run() {
         "the runner keeps the cancel"
     );
     assert!(rec.awaiting.is_empty());
+}
+
+/// Put the run on disk as having finished as `status` — what a late runner
+/// finds when the run's own runner (or a sweep, a reject) finished it
+/// between that runner's look and its claim — and return `run.json`'s bytes.
+fn finish_on_disk(h: &Harness, run_id: &str, status: RunStatus) -> Vec<u8> {
+    let mut rec = h.store.load(run_id).unwrap();
+    rec.status = status;
+    rec.finished_at = Some(chrono::Utc::now());
+    rec.runner_pid = None;
+    h.store.update(&rec).unwrap();
+    std::fs::read(h.store.run_json_path(run_id)).unwrap()
+}
+
+/// A runner that arrives after the run finished — the `workflow resume`
+/// that `cp serve`'s resume worker or gate sweep spawned just before the
+/// run's own runner finished it, or an operator re-running a command — must
+/// never re-enter it, whatever it finished as: it is refused, nothing is
+/// dispatched (not even the path of the decision it was started to apply)
+/// and the finished record is left exactly as it was.
+#[tokio::test]
+async fn a_late_runner_never_reenters_a_finished_run() {
+    for status in [RunStatus::Completed, RunStatus::Failed, RunStatus::Rejected] {
+        let h = Harness::new(TWO_GATES);
+        let run_id = h.park_both().await;
+        // The decision the late runner was started to apply...
+        h.approve(&run_id, "gate_a");
+        // ...but the run finished before that runner claimed it.
+        let finished = finish_on_disk(&h, &run_id, status);
+
+        let late = run_workflow(h.opts(Some(ResumeState::from_decisions(
+            run_id.clone(),
+            h.prior(&run_id),
+        ))))
+        .await;
+        let err = late.expect_err("a finished run is refused");
+        assert!(
+            matches!(err, RunWorkflowError::RunAlreadyFinished { run_id: ref id, status: s } if *id == run_id && s == status),
+            "{err:?}"
+        );
+        let status = status.as_str();
+        assert_eq!(
+            err.to_string(),
+            format!("run {run_id} already finished ({status}) — not resuming it")
+        );
+        assert!(
+            h.factory.calls.lock().unwrap().is_empty(),
+            "no agent ran on the {status} run: {:?}",
+            h.factory.calls.lock().unwrap()
+        );
+        assert_eq!(
+            std::fs::read(h.store.run_json_path(&run_id)).unwrap(),
+            finished,
+            "the {status} record is untouched"
+        );
+    }
+}
+
+/// `claim_runner` itself, under the run lock: a run that finished —
+/// whatever it finished as — is never claimed, and the refused claim writes
+/// nothing (no `runner_pid` of the refused process).
+#[tokio::test]
+async fn claim_runner_refuses_every_finished_run() {
+    let h = Harness::new(TWO_GATES);
+    let run_id = h.park_both().await;
+    for status in [
+        RunStatus::Completed,
+        RunStatus::Failed,
+        RunStatus::Rejected,
+        RunStatus::Cancelled,
+    ] {
+        let finished = finish_on_disk(&h, &run_id, status);
+        let claim = h.store.claim_runner(&run_id).unwrap();
+        let refused = match claim {
+            RunnerClaim::Cancelled => status == RunStatus::Cancelled,
+            RunnerClaim::Finished { status: s } => s == status && s != RunStatus::Cancelled,
+            _ => false,
+        };
+        assert!(
+            refused,
+            "a {} run is refused as such: {claim:?}",
+            status.as_str()
+        );
+        assert_eq!(
+            std::fs::read(h.store.run_json_path(&run_id)).unwrap(),
+            finished,
+            "a refused claim writes nothing to the {} run",
+            status.as_str()
+        );
+    }
 }

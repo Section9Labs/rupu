@@ -305,6 +305,15 @@ pub enum RunWorkflowError {
         "run cancelled: {aborted} in-flight node(s) aborted; restart to resume from checkpoint"
     )]
     RunCancelled { aborted: usize },
+    /// A resume reached a run that already finished — `status` is
+    /// `Completed`, `Failed` or `Rejected` on disk
+    /// ([`crate::RunnerClaim::Finished`]). Nothing ran and nothing was
+    /// written.
+    #[error("run {run_id} already finished ({}) — not resuming it", .status.as_str())]
+    RunAlreadyFinished {
+        run_id: String,
+        status: crate::runs::RunStatus,
+    },
     /// Task 3, spec §2c/§8g: `until` never held through `max_iterations`
     /// iterations and the loop's `on_max` is `fail` (the default) —
     /// fail-loudly rather than let a caller believe the last iteration's
@@ -1080,7 +1089,10 @@ pub async fn run_workflow(
     } else if let Some(store) = &opts.run_store {
         // Resume path: become the run's one runner, under the run lock. A
         // `Cancelled` that landed since the resume was decided is
-        // preserved, and the run does not start. A runner already executing
+        // preserved, and the run does not start; so is any other finished
+        // status (the run completed, failed or was rejected before this
+        // late runner claimed it — re-entering would re-run its steps and
+        // overwrite that status). A runner already executing
         // the run (a gate decided while another gate's path runs) is left to
         // apply the recorded decisions itself — a second runner would
         // re-dispatch work the first already has in flight.
@@ -1105,6 +1117,10 @@ pub async fn run_workflow(
             Ok(crate::runs::RunnerClaim::Cancelled) => {
                 info!(run_id = %run_id, "the run was cancelled on disk before it resumed; not starting it");
                 return Err(RunWorkflowError::RunCancelled { aborted: 0 });
+            }
+            Ok(crate::runs::RunnerClaim::Finished { status }) => {
+                info!(run_id = %run_id, status = status.as_str(), "the run already finished on disk before it resumed; not starting it");
+                return Err(RunWorkflowError::RunAlreadyFinished { run_id, status });
             }
             Err(e) => return Err(map_run_store_err(e)),
         }

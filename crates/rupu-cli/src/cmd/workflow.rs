@@ -540,6 +540,15 @@ pub enum Action {
         /// Use the plain line printer instead of the live graph view.
         #[arg(long)]
         plain: bool,
+        /// Resume only a run that has not finished. Internal: `cp serve`'s
+        /// resume worker and gate sweep pass it when they spawn this
+        /// command to serve a request made while the run was unfinished (a
+        /// web resume of a pause, gate decisions recorded on a waiting
+        /// run). A run that finished since — completed, failed, rejected,
+        /// cancelled — is refused rather than retried: retrying a finished
+        /// run is an operator's call, made without this flag.
+        #[arg(long, hide = true)]
+        if_unfinished: bool,
     },
     /// Archive a terminal run (move it out of the active list; reversible).
     ArchiveRun {
@@ -704,7 +713,8 @@ pub async fn handle(
             run_id,
             mode,
             plain,
-        } => resume_run(&run_id, mode.as_deref(), plain).await,
+            if_unfinished,
+        } => resume_run(&run_id, mode.as_deref(), plain, if_unfinished).await,
         Action::ArchiveRun { run_id } => archive_run(&run_id).await,
         Action::RestoreRun { run_id } => restore_run(&run_id).await,
         Action::DeleteRun { run_id, force } => delete_run(&run_id, force).await,
@@ -3307,6 +3317,22 @@ fn resume_refused_by_status_change(
     }
 }
 
+/// Why a `--if-unfinished` resume — one `cp serve` spawned to serve a
+/// request made while the run was unfinished — refuses a run that finished
+/// since: retrying a finished run is an operator's call, made without the
+/// flag (and a completed run is never resumed at all).
+fn finished_since_request(run_id: &str, status: rupu_orchestrator::RunStatus) -> anyhow::Error {
+    let retry = if status == rupu_orchestrator::RunStatus::Completed {
+        String::new()
+    } else {
+        format!(" (retry it with `rupu workflow resume {run_id}`)")
+    };
+    anyhow::anyhow!(
+        "run {run_id} already finished ({}) since this resume was requested — not resuming it{retry}",
+        status.as_str()
+    )
+}
+
 /// The record edit `resume_run` makes when it takes a run back: `Running`
 /// under this process, with every leftover of the pause or terminal state
 /// it came from cleared. A manual pause stores the paused step in
@@ -3340,6 +3366,7 @@ pub(crate) async fn resume_run(
     run_id: &str,
     mode: Option<&str>,
     plain: bool,
+    if_unfinished: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -3375,6 +3402,11 @@ pub(crate) async fn resume_run(
         return Ok(());
     }
     match record.status {
+        // A request's runner (`--if-unfinished`, spawned by `cp serve`)
+        // that finds the run finished since the request never retries it.
+        status if if_unfinished && status.is_terminal() => {
+            return Err(finished_since_request(run_id, status));
+        }
         RunStatus::Running | RunStatus::Pending => {
             anyhow::bail!(
                 "run {run_id} is `{}` — refusing to resume an in-flight run (cancel it first with `rupu workflow cancel {run_id}`)",
@@ -6736,7 +6768,7 @@ mod tests {
         rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
 
         let run_id = record.id.clone();
-        let resume = tokio::spawn(async move { resume_run(&run_id, None, true).await });
+        let resume = tokio::spawn(async move { resume_run(&run_id, None, true, false).await });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while store.pause_marker_exists(&record.id) {
@@ -6821,7 +6853,7 @@ mod tests {
         rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
 
         let run_id = record.id.clone();
-        let resume = tokio::spawn(async move { resume_run(&run_id, None, true).await });
+        let resume = tokio::spawn(async move { resume_run(&run_id, None, true, false).await });
 
         // Once the marker is gone, the resume has loaded the run as
         // `Paused` and passed its guards; its flip is next, and waits on
@@ -6861,6 +6893,165 @@ mod tests {
             "the cancel is preserved"
         );
         assert_eq!(reloaded.runner_pid, None, "the run never started");
+        std::env::remove_var("RUPU_HOME");
+    }
+
+    /// `gate`, then a `run:` step appending to `inputs.ship`: whether the
+    /// gate's path ran is a file on disk, not a status read.
+    const GATE_SHIP: &str = "name: gate-ship\nsteps:\n  - id: gate\n    approval:\n      prompt: ship?\n  - id: ship\n    run:\n      cmd: sh\n      args: [\"-c\", \"echo ran >> {{ inputs.ship }}\"]\n";
+
+    /// A `gate-ship` run parked at `gate`, under `home` (`RUPU_HOME`, with
+    /// `run:` steps enabled). Returns the store and the `ship` marker path.
+    fn parked_gate_ship_run(
+        home: &std::path::Path,
+        run_id: &str,
+    ) -> (rupu_orchestrator::RunStore, PathBuf) {
+        std::fs::write(
+            home.join("config.toml"),
+            "[workflow]\nrun_step_enabled = true\n",
+        )
+        .unwrap();
+        std::env::set_var("RUPU_HOME", home);
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ship = home.join("ship.txt");
+        let mut rec = single_gate_awaiting_record(run_id, &workspace, Utc::now(), None);
+        rec.workflow_name = "gate-ship".into();
+        rec.inputs.insert("ship".into(), ship.display().to_string());
+        let store = rupu_orchestrator::RunStore::new(home.join("runs"));
+        store.create(rec, GATE_SHIP).unwrap();
+        (store, ship)
+    }
+
+    /// The resume worker (or the gate sweep) spawned `workflow resume` for a
+    /// gate decision recorded on a run still waiting at the gate, and the
+    /// run finished — completed by the runner that applied the decision,
+    /// failed, rejected — before that resume claimed it. The late runner is
+    /// refused, saying the run already finished, and nothing runs:
+    /// re-entering the run would re-run the decided path (LLM cost, tool
+    /// side effects) and overwrite the finished status. Driven exactly: the
+    /// test holds `run.json.lock` while the resume loads the run (awaiting,
+    /// with the decision) and rebuilds its runtime (observable: it opens
+    /// the run's `events.jsonl`), finishes the run, then releases the lock
+    /// the claim waits on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_for_recorded_decisions_refuses_a_run_that_finished_before_it_claimed_it() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+        for status in [RunStatus::Completed, RunStatus::Failed, RunStatus::Rejected] {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_id = format!("run_late_{}", status.as_str());
+            let (store, ship) = parked_gate_ship_run(tmp.path(), &run_id);
+            store
+                .request_resume_approval(&run_id, "web", None, Utc::now(), None)
+                .unwrap();
+
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(tmp.path().join("runs").join(&run_id).join("run.json.lock"))
+                .unwrap();
+            rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+            let resume = {
+                let run_id = run_id.clone();
+                tokio::spawn(async move { resume_run(&run_id, None, true, false).await })
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !store.events_path(&run_id).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the resume never rebuilt its runtime"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                !resume.is_finished(),
+                "the resume is still in flight (its claim waits on the lock)"
+            );
+            let mut finished = store.load(&run_id).unwrap();
+            finished.status = status;
+            finished.finished_at = Some(Utc::now());
+            store.update(&finished).unwrap();
+            let finished = std::fs::read(store.run_json_path(&run_id)).unwrap();
+            drop(lock_file);
+
+            let status = status.as_str();
+            let err = resume
+                .await
+                .unwrap()
+                .expect_err("a finished run is never resumed");
+            assert_eq!(
+                err.to_string(),
+                format!("run {run_id} already finished ({status}) — not resuming it")
+            );
+            assert!(!ship.exists(), "nothing ran on the {status} run");
+            assert_eq!(
+                std::fs::read(store.run_json_path(&run_id)).unwrap(),
+                finished,
+                "the {status} record is untouched"
+            );
+        }
+        std::env::remove_var("RUPU_HOME");
+    }
+
+    /// `--if-unfinished` — how `cp serve`'s resume worker and gate sweep
+    /// spawn `workflow resume` — serves a request made while the run was
+    /// unfinished: a web resume of a pause, or gate decisions recorded on a
+    /// waiting run. A run that finished before that spawned resume loaded it
+    /// is refused, saying so, and nothing runs. Retrying a failed, rejected
+    /// or cancelled run is an operator's call — the same command without
+    /// the flag — and that still takes the run back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_requested_resume_never_retries_a_run_that_finished_since_the_request() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+        for status in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Rejected,
+            RunStatus::Cancelled,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_id = format!("run_requested_{}", status.as_str());
+            let (store, ship) = parked_gate_ship_run(tmp.path(), &run_id);
+            let mut rec = store.load(&run_id).unwrap();
+            rec.status = status;
+            rec.finished_at = Some(Utc::now());
+            rec.awaiting.clear();
+            rec.sync_awaiting_compat();
+            store.update(&rec).unwrap();
+            let finished = std::fs::read(store.run_json_path(&run_id)).unwrap();
+
+            let err = resume_run(&run_id, None, true, true)
+                .await
+                .expect_err("a requested resume never retries a finished run");
+            let status = status.as_str();
+            assert!(
+                err.to_string()
+                    .starts_with(&format!("run {run_id} already finished ({status})")),
+                "{err}"
+            );
+            assert!(!ship.exists(), "nothing ran on the {status} run");
+            assert_eq!(
+                std::fs::read(store.run_json_path(&run_id)).unwrap(),
+                finished,
+                "the {status} record is untouched"
+            );
+
+            if status != RunStatus::Completed.as_str() {
+                resume_run(&run_id, None, true, false)
+                    .await
+                    .expect("the operator's retry takes the run back");
+                let retried = store.load(&run_id).unwrap();
+                assert_eq!(
+                    (retried.status, retried.awaiting_step_id.as_deref()),
+                    (RunStatus::AwaitingApproval, Some("gate")),
+                    "the retried {status} run re-ran to its gate"
+                );
+            }
+        }
         std::env::remove_var("RUPU_HOME");
     }
 
@@ -7249,7 +7440,7 @@ mod tests {
         // Step 2: the resume worker's spawned `workflow resume`, simulated
         // in-process (see `resume_one_run`'s own test for the argv half).
         std::env::set_var("RUPU_HOME", &home);
-        let result = resume_run(&rec.id, None, true).await;
+        let result = resume_run(&rec.id, None, true, false).await;
         std::env::remove_var("RUPU_HOME");
         result.expect("the web-approved run resumes");
 

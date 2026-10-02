@@ -1146,6 +1146,9 @@ pub enum RunnerClaim {
     Live { pid: u32 },
     /// The run is `Cancelled` on disk.
     Cancelled,
+    /// The run already finished: `status` (`Completed`, `Failed` or
+    /// `Rejected`) is on disk.
+    Finished { status: RunStatus },
 }
 
 /// Outcome of [`RunStore::finish_runner`].
@@ -1864,18 +1867,29 @@ impl RunStore {
     }
 
     /// Become the one runner of an existing run (a resume), under the run
-    /// lock: unless the run is `Cancelled` on disk or another live runner
+    /// lock: unless the run finished on disk (`Cancelled`, or any other
+    /// [terminal](RunStatus::is_terminal) status) or another live runner
     /// already executes it ([`live_runner`](Self::live_runner)), record this
     /// process as its runner. A gate decision recorded while a runner
     /// executes the run therefore never starts a second runner — the
     /// caller gets [`RunnerClaim::Live`] and the live runner applies the
-    /// decision itself. The wait blocks its thread: async callers go
-    /// through [`RunStore::blocking`].
+    /// decision itself. And a runner that arrives after the run finished —
+    /// a `workflow resume` spawned just before the run's own runner
+    /// finished it — never re-enters it: its steps would run again (LLM
+    /// cost, tool side effects) and its final write would overwrite the
+    /// finished status. A resume that retries a finished run takes it back
+    /// to `Running` itself before it claims. The wait blocks its thread:
+    /// async callers go through [`RunStore::blocking`].
     pub fn claim_runner(&self, run_id: &str) -> Result<RunnerClaim, RunStoreError> {
         let _lock = self.lock_run_json(run_id);
         let mut record = self.load(run_id)?;
         if record.status == RunStatus::Cancelled {
             return Ok(RunnerClaim::Cancelled);
+        }
+        if record.status.is_terminal() {
+            return Ok(RunnerClaim::Finished {
+                status: record.status,
+            });
         }
         if let Some(pid) = self.live_runner(&record) {
             return Ok(RunnerClaim::Live { pid });

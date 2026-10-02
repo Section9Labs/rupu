@@ -831,8 +831,9 @@ fn resume_subcommand(run: &rupu_orchestrator::RunRecord) -> &'static str {
     }
 }
 
-/// Build the `rupu workflow <subcommand> <run_id> [--gate <g>] [--mode <m>]`
-/// argv the resume worker spawns for a claimed run. Pure + independently
+/// Build the `rupu workflow <subcommand> <run_id> [--gate <g>] [--approver
+/// <a>] [--if-unfinished] [--mode <m>]` argv the resume worker spawns for a
+/// claimed run. Pure + independently
 /// testable (T5b-2b-i correctness fix, spec §7): `gate` MUST come from the
 /// run's `resume_gate_id` MARKER field, not live `awaiting_step_id` — a
 /// second concurrent approve request can reorder the latter before this
@@ -849,6 +850,11 @@ fn resume_subcommand(run: &rupu_orchestrator::RunRecord) -> &'static str {
 /// shipped bug (fixed as part of T5b-2b-i) — see
 /// `resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child`
 /// for the regression test.
+///
+/// `workflow resume` always carries `--if-unfinished`: the child serves a
+/// request made while the run was unfinished, so a run that finished before
+/// the child loads it is refused instead of retried the way an operator's
+/// `workflow resume` retries a failed, rejected or cancelled run.
 fn build_resume_argv<'a>(
     subcommand: &'a str,
     run_id: &'a str,
@@ -873,6 +879,11 @@ fn build_resume_argv<'a>(
             argv.push("--approver");
             argv.push(a);
         }
+    } else {
+        // The child serves a request made while the run was unfinished; a
+        // run that finished since (its own runner completed it, a sweep
+        // failed it, a cancel) is refused, never retried.
+        argv.push("--if-unfinished");
     }
     if let Some(m) = mode {
         argv.push("--mode");
@@ -1601,7 +1612,9 @@ async fn spawn_decision_runner(
             return;
         }
     }
-    let mut argv: Vec<&str> = vec!["workflow", "resume", run_id];
+    // `--if-unfinished`: a run that finished before the child loads it is
+    // refused, never retried (see `build_resume_argv`).
+    let mut argv: Vec<&str> = vec!["workflow", "resume", run_id, "--if-unfinished"];
     if let Some(m) = rec.resume_mode.as_deref() {
         argv.push("--mode");
         argv.push(m);
@@ -1750,9 +1763,21 @@ mod tests {
         // `workflow resume` (a cooperative-pause resume) has no gate
         // concept — `--gate` must never appear even if `gate` is `Some`
         // (e.g. a stale marker field left over from a different flow).
+        // It serves the request only while the run is unfinished.
         assert_eq!(
             build_resume_argv("resume", "run_x", Some("gate_b"), None, None),
-            vec!["workflow", "resume", "run_x"],
+            vec!["workflow", "resume", "run_x", "--if-unfinished"],
+        );
+        assert_eq!(
+            build_resume_argv("resume", "run_x", None, Some("bypass"), None),
+            vec![
+                "workflow",
+                "resume",
+                "run_x",
+                "--if-unfinished",
+                "--mode",
+                "bypass"
+            ],
         );
     }
 
@@ -1804,7 +1829,7 @@ mod tests {
         // over from a different flow).
         assert_eq!(
             build_resume_argv("resume", "run_x", None, None, Some("web")),
-            vec!["workflow", "resume", "run_x"],
+            vec!["workflow", "resume", "run_x", "--if-unfinished"],
         );
     }
 
@@ -3285,7 +3310,7 @@ mod tests {
         let captured = poll_captured_argv(&capture_path).await;
         assert_eq!(
             captured.trim(),
-            format!("workflow resume {} --mode bypass", rec.id),
+            format!("workflow resume {} --if-unfinished --mode bypass", rec.id),
             "the child was spawned for the marker the worker looked at"
         );
         let after = store.load(&rec.id).unwrap();
@@ -3407,7 +3432,10 @@ mod tests {
         let (exe, capture_path) = capture_exe(tmp.path());
         resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
         let captured = poll_captured_argv(&capture_path).await;
-        assert_eq!(captured.trim(), format!("workflow resume {}", rec.id));
+        assert_eq!(
+            captured.trim(),
+            format!("workflow resume {} --if-unfinished", rec.id)
+        );
 
         // The decisions are the run's, not the marker's: clearing it after
         // the spawn loses neither.
@@ -3456,7 +3484,10 @@ mod tests {
         .await;
 
         let captured = poll_captured_argv(&capture_path).await;
-        assert_eq!(captured.trim(), format!("workflow resume {}", rec.id));
+        assert_eq!(
+            captured.trim(),
+            format!("workflow resume {} --if-unfinished", rec.id)
+        );
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(
             reloaded.status,

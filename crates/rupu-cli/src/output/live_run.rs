@@ -1836,6 +1836,58 @@ mod tests {
         );
     }
 
+    /// An approve's resume that reaches a run finished since the decision
+    /// (failed by a sweep, completed by another runner) starts nothing: the
+    /// refusal comes back as the notice row's message, once — the follow-up
+    /// is not retried — and the finished record is left as it is.
+    #[tokio::test]
+    async fn the_approve_follow_up_on_a_run_finished_since_reports_it_and_runs_nothing() {
+        crate::test_support::ensure_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let runs_dir = tmp.path().join("home").join("runs");
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = RunStore::new(runs_dir.clone());
+        let mut rec = record("run_t", "awaiting_approval", &[("gate_a", None)]);
+        rec.workspace_path = workspace.clone();
+        rec.transcript_dir = workspace.join(".rupu/transcripts");
+        store.create(rec, GATES_YAML).unwrap();
+
+        let follow_up = decide_gate(
+            &store,
+            &parse(GATES_YAML),
+            "run_t",
+            &gate_view("gate_a", None),
+            GateVerb::Approve,
+            "op",
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&follow_up, GateFollowUp::Resume { .. }),
+            "{follow_up:?}"
+        );
+        let mut finished = store.load("run_t").unwrap();
+        finished.status = RunStatus::Failed;
+        finished.finished_at = Some(Utc::now());
+        store.update(&finished).unwrap();
+        let finished = std::fs::read(store.run_json_path("run_t")).unwrap();
+
+        let msg = run_follow_up(&runs_dir, "run_t", follow_up)
+            .await
+            .expect_err("a finished run is not resumed");
+        assert_eq!(
+            msg,
+            "resume failed: run run_t already finished (failed) — not resuming it"
+        );
+        assert_eq!(
+            std::fs::read(store.run_json_path("run_t")).unwrap(),
+            finished,
+            "the failed record is untouched"
+        );
+        assert!(store.read_step_results("run_t").unwrap().is_empty());
+    }
+
     // ── the footer and the keys agree ───────────────────────────────────
 
     #[test]
