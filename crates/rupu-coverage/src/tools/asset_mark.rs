@@ -78,12 +78,9 @@ pub fn asset_mark(
     let effective_idx = existing_idx.map_or(new_idx, |e| e.max(new_idx));
     let effective_depth = ladder[effective_idx].clone();
 
-    let label = input.label.clone().unwrap_or_else(|| input.kind.clone());
-    let mut asset = Asset::new(input.kind.clone(), locator, label, None);
-    // Only the depth moves; the asset's parent and attributes ride along.
-    if let Some(current) = current {
-        asset.carry_state_from(current);
-    }
+    // Only the depth moves; the asset's label (unless one is given here),
+    // parent and attributes ride along.
+    let mut asset = Asset::next_line(input.kind.clone(), locator, input.label.clone(), current);
     asset.depth = Some(effective_depth.clone());
     crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
         .map_err(crate::asset::AssetStoreError::Io)?;
@@ -210,6 +207,58 @@ mod tests {
         assert_eq!(stored[0].parent, existing.parent);
         assert_eq!(stored[0].attributes, existing.attributes);
         assert_eq!(stored[0].depth.as_deref(), Some("reviewed"));
+    }
+
+    #[test]
+    fn marking_without_a_label_keeps_the_assets_descriptive_label() {
+        let (_t, p) = paths();
+        let existing = Asset::new(
+            "code:file",
+            Locator(vec![Coordinate::Path("a.rs".into())]),
+            "the auth handler",
+            None,
+        );
+        crate::asset::upsert_asset(&p.assets, &existing).unwrap();
+        let mk = |label: Option<&str>| AssetMarkInput {
+            kind: "code:file".into(),
+            coordinates: vec![Coordinate::Path("a.rs".into())],
+            depth: "reviewed".into(),
+            label: label.map(str::to_string),
+        };
+
+        // No label: the last-line-wins fold must not demote the descriptive
+        // label to the bare kind.
+        asset_mark(&p, mk(None), &active()).unwrap();
+        let stored = crate::asset::read_assets(&p.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].label, "the auth handler");
+
+        // An explicit label still replaces it.
+        asset_mark(&p, mk(Some("renamed")), &active()).unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&p.assets).unwrap()[0].label,
+            "renamed"
+        );
+    }
+
+    #[test]
+    fn a_new_asset_marked_without_a_label_is_labelled_with_its_kind() {
+        let (_t, p) = paths();
+        asset_mark(
+            &p,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![Coordinate::Path("a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &active(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&p.assets).unwrap()[0].label,
+            "code:file"
+        );
     }
 
     #[test]

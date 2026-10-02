@@ -45,7 +45,8 @@ pub struct AssetRef {
     pub kind: String,
     #[serde(default)]
     pub coordinates: Vec<crate::asset::Coordinate>,
-    /// Optional human label; defaults to the kind if omitted.
+    /// Optional human label; if omitted, the asset keeps its existing label
+    /// (or, for a new asset, takes its kind).
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -240,21 +241,31 @@ pub fn report_finding(
             }
         }
         // Stamp the asset into the graph (and the run stream, so a
-        // coordinator collecting this run sees it).
-        let label = asset_ref
-            .label
-            .clone()
-            .unwrap_or_else(|| asset_ref.kind.clone());
-        let mut asset = crate::asset::Asset::new(asset_ref.kind.clone(), locator, label, None);
-        // The store folds last-line-wins, so this line replaces whatever the
-        // asset holds: carry its depth (an `asset_mark`), parent and
-        // attributes forward instead of erasing them.
-        if let Some(current) = crate::asset::read_assets(&paths.assets)?
-            .into_iter()
-            .find(|a| a.id == asset.id)
-        {
-            asset.carry_state_from(current);
-        }
+        // coordinator collecting this run sees it). The store folds
+        // last-line-wins, so this line replaces whatever the asset holds:
+        // `next_line` carries its label (unless one is given here), depth (an
+        // `asset_mark`), parent and attributes forward instead of erasing them.
+        // A finding is never lost to the asset graph: if the store cannot be
+        // read the asset is stamped without that carried state, and the
+        // finding records as normal.
+        let id = crate::asset::Asset::derive_id(&asset_ref.kind, &locator);
+        let current = match crate::asset::read_assets(&paths.assets) {
+            Ok(assets) => assets.into_iter().find(|a| a.id == id),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %paths.assets.display(),
+                    "asset store unreadable; stamping the finding's asset without its prior state"
+                );
+                None
+            }
+        };
+        let asset = crate::asset::Asset::next_line(
+            asset_ref.kind.clone(),
+            locator,
+            asset_ref.label.clone(),
+            current,
+        );
         crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
             .map_err(crate::asset::AssetStoreError::Io)?;
     }
@@ -809,6 +820,74 @@ mod tests {
             crate::asset::read_assets(&paths.assets).unwrap(),
             vec![existing]
         );
+    }
+
+    #[test]
+    fn stamping_without_a_label_keeps_the_assets_descriptive_label() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let opts = code_engagement_opts(&store);
+        let locator =
+            crate::asset::Locator(vec![crate::asset::Coordinate::Path("src/a.rs".into())]);
+        let existing = crate::asset::Asset::new("code:file", locator, "the auth handler", None);
+        crate::asset::upsert_asset(&paths.assets, &existing).unwrap();
+
+        // No label on the stamp: the last-line-wins fold must not demote the
+        // descriptive label to the bare kind.
+        let mut inp = code_file_input("src/a.rs");
+        inp.asset.as_mut().unwrap().label = None;
+        report_finding(&paths, attribution(), inp, &opts).unwrap();
+        let stored = crate::asset::read_assets(&paths.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].label, "the auth handler");
+
+        // An explicit label still replaces it.
+        let mut inp = code_file_input("src/a.rs");
+        inp.asset.as_mut().unwrap().label = Some("renamed".into());
+        report_finding(&paths, attribution(), inp, &opts).unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&paths.assets).unwrap()[0].label,
+            "renamed"
+        );
+    }
+
+    #[test]
+    fn a_new_asset_stamped_without_a_label_is_labelled_with_its_kind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let mut inp = code_file_input("src/a.rs");
+        inp.asset.as_mut().unwrap().label = None;
+        report_finding(
+            &paths,
+            attribution(),
+            inp,
+            &code_engagement_opts(&tmp.path().join("store")),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&paths.assets).unwrap()[0].label,
+            "code:file"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_asset_store_does_not_lose_the_finding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        paths.ensure_dir().unwrap();
+        std::fs::write(&paths.assets, "this is not json\n{\"half\":\n").unwrap();
+
+        let out = report_finding(
+            &paths,
+            attribution(),
+            code_file_input("src/a.rs"),
+            &code_engagement_opts(&store),
+        )
+        .expect("a finding must not be lost to the asset graph");
+
+        assert_eq!(only_record(&paths).id, out.id);
     }
 
     #[test]

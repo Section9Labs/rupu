@@ -79,17 +79,34 @@ impl Asset {
         }
     }
 
-    /// Take over the graph state `current` (this asset's present fold) holds
-    /// and a line built from just a kind and locator does not: its parent,
-    /// depth and attributes. The store folds last-line-wins, so a line that
-    /// omits them erases them; a writer that only means to restate the asset
-    /// (a finding's stamp) or advance one field (a depth mark) carries the
-    /// rest forward with this. The label stays the writer's own.
-    pub(crate) fn carry_state_from(&mut self, current: Asset) {
-        debug_assert_eq!(self.id, current.id, "state carries between one asset's lines");
-        self.parent = current.parent;
-        self.depth = current.depth;
-        self.attributes = current.attributes;
+    /// The line a writer appends to restate or advance an asset that may
+    /// already be in the store (`current` is its present fold). The store
+    /// folds last-line-wins, so a line built from just a kind and locator
+    /// would erase what the asset already holds; this one carries it forward.
+    /// The parent, depth and attributes always ride along. The label is the
+    /// caller's when given, else the asset's existing one (a call that names
+    /// no label must not demote a descriptive label to the bare kind), else
+    /// the kind.
+    pub(crate) fn next_line(
+        kind: String,
+        locator: Locator,
+        label: Option<String>,
+        current: Option<Asset>,
+    ) -> Asset {
+        let label = label
+            .or_else(|| current.as_ref().map(|c| c.label.clone()))
+            .unwrap_or_else(|| kind.clone());
+        let mut asset = Asset::new(kind, locator, label, None);
+        if let Some(current) = current {
+            debug_assert_eq!(
+                asset.id, current.id,
+                "state carries between one asset's lines"
+            );
+            asset.parent = current.parent;
+            asset.depth = current.depth;
+            asset.attributes = current.attributes;
+        }
+        asset
     }
 }
 
