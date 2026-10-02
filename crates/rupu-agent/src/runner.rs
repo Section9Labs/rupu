@@ -353,6 +353,23 @@ pub struct CompactionOutcome {
     pub usage: rupu_providers::Usage,
 }
 
+/// Why [`compact_messages`] did not produce a compacted history.
+#[derive(Debug, Error)]
+pub enum CompactionError {
+    /// The summariser call itself failed (or was never started); nothing
+    /// was billed that the caller can see.
+    #[error("{0}")]
+    Provider(#[from] rupu_providers::ProviderError),
+    /// The summariser answered but the answer is unusable (refused,
+    /// truncated or empty). The call was billed, so its usage comes back
+    /// with the rejection and the caller records it like a success's.
+    #[error("compaction summary rejected: {reason}")]
+    Rejected {
+        reason: String,
+        usage: rupu_providers::Usage,
+    },
+}
+
 /// Compact a conversation by summarising the middle messages. Returns
 /// `Ok(Some(outcome))` when compaction was performed, `Ok(None)` when the
 /// history is too short or there is nothing to summarise.
@@ -379,7 +396,7 @@ pub async fn compact_messages(
     model: &str,
     compact_threshold: u64,
     last_input_tokens: u32,
-) -> Result<Option<CompactionOutcome>, rupu_providers::ProviderError> {
+) -> Result<Option<CompactionOutcome>, CompactionError> {
     // Calibrate: derive tokens-per-char from what the provider actually charged.
     let total_chars: usize = messages.iter().map(message_chars).sum();
     let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
@@ -442,7 +459,7 @@ self-contained.";
     // (which also refuses earlier, closing its transcript as aborted),
     // `rupu session compact` and the session worker's compaction turn.
     if rupu_providers::credential_writes::terminating() {
-        return Err(rupu_providers::ProviderError::Terminating);
+        return Err(rupu_providers::ProviderError::Terminating.into());
     }
     let summary_resp = provider.send(&summary_req).await?;
 
@@ -472,9 +489,10 @@ self-contained.";
         _ => None,
     };
     if let Some(title) = rejection {
-        return Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(
-            "compaction summary rejected: {title}"
-        )));
+        return Err(CompactionError::Rejected {
+            reason: title,
+            usage: summary_resp.usage.clone(),
+        });
     }
 
     // Extract task text from messages[0].
@@ -559,36 +577,7 @@ async fn compact_context(
     {
         Ok(Some(outcome)) => {
             let middle_len = outcome.summarized_messages;
-            // The summariser call is billed like any other: record it in the
-            // transcript (tagged `purpose: compaction`) and tell the usage
-            // hook, so the run's spend is complete. Deliberately NOT added to
-            // `total_in`/`total_out` — those feed `RunComplete.total_tokens`
-            // and the context-budget arithmetic, which are turn-scoped.
-            let cu = &outcome.usage;
-            let billable = cu.output_tokens as u64 + cu.reasoning_tokens as u64;
-            if let Err(e) = writer.write(&Event::Usage {
-                provider: opts.provider_name.clone(),
-                model: opts.model.clone(),
-                served_model: None,
-                input_tokens: cu.input_tokens,
-                output_tokens: billable as u32,
-                cached_tokens: cu.cached_tokens,
-                cache_write_tokens: cu.cache_write_tokens,
-                purpose: Some("compaction".to_string()),
-            }) {
-                tracing::warn!(error = %e, "failed to write compaction usage event to transcript");
-            }
-            if let Some(cb) = &opts.on_usage {
-                cb(&UsageTurn {
-                    kind: UsageKind::Compaction,
-                    provider: opts.provider_name.clone(),
-                    model: opts.model.clone(),
-                    input_tokens: cu.input_tokens as u64,
-                    output_tokens: billable,
-                    cached_tokens: cu.cached_tokens as u64,
-                    cache_write_tokens: cu.cache_write_tokens as u64,
-                });
-            }
+            record_compaction_usage(opts, writer, &outcome.usage);
             *messages = outcome.messages;
             let post = serde_json::to_value(&*messages).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to serialize post-compaction messages");
@@ -614,10 +603,56 @@ async fn compact_context(
             true
         }
         Ok(None) => false,
+        Err(CompactionError::Rejected { reason, usage }) => {
+            // Billed like any other call even though its answer was thrown
+            // away: the spend must still reach the transcript and the hook.
+            record_compaction_usage(opts, writer, &usage);
+            tracing::warn!(
+                reason = %reason,
+                "compaction summary rejected — skipping compaction"
+            );
+            false
+        }
         Err(e) => {
             tracing::warn!(error = %e, "compaction summariser call failed — skipping compaction");
             false
         }
+    }
+}
+
+/// Record a compaction summariser call's usage. The call is billed like any
+/// other: write it to the transcript (tagged `purpose: compaction`) and tell
+/// the usage hook, so the run's spend is complete. Deliberately NOT added to
+/// `total_in`/`total_out` — those feed `RunComplete.total_tokens` and the
+/// context-budget arithmetic, which are turn-scoped.
+fn record_compaction_usage(
+    opts: &AgentRunOpts,
+    writer: &mut JsonlWriter,
+    cu: &rupu_providers::Usage,
+) {
+    let billable = cu.output_tokens as u64 + cu.reasoning_tokens as u64;
+    if let Err(e) = writer.write(&Event::Usage {
+        provider: opts.provider_name.clone(),
+        model: opts.model.clone(),
+        served_model: None,
+        input_tokens: cu.input_tokens,
+        output_tokens: billable as u32,
+        cached_tokens: cu.cached_tokens,
+        cache_write_tokens: cu.cache_write_tokens,
+        purpose: Some("compaction".to_string()),
+    }) {
+        tracing::warn!(error = %e, "failed to write compaction usage event to transcript");
+    }
+    if let Some(cb) = &opts.on_usage {
+        cb(&UsageTurn {
+            kind: UsageKind::Compaction,
+            provider: opts.provider_name.clone(),
+            model: opts.model.clone(),
+            input_tokens: cu.input_tokens as u64,
+            output_tokens: billable,
+            cached_tokens: cu.cached_tokens as u64,
+            cache_write_tokens: cu.cache_write_tokens as u64,
+        });
     }
 }
 
@@ -4581,17 +4616,12 @@ mod compaction_tests {
         assert_eq!(result[1].role, Role::Assistant);
     }
 
-    #[tokio::test]
-    async fn compact_context_returns_false_on_provider_error_and_leaves_messages_unchanged() {
-        let tmp_dir = tempfile::tempdir().expect("tmpdir");
-        let transcript_path = tmp_dir.path().join("run_compaction_test.jsonl");
-
-        // Provider that errors on every call.
-        let provider = MockProvider::new(vec![ScriptedTurn::ProviderError(
-            "summary call failed".to_string(),
-        )]);
-
-        let mut opts = AgentRunOpts {
+    fn compaction_test_opts(
+        provider: MockProvider,
+        dir: &std::path::Path,
+        transcript_path: &std::path::Path,
+    ) -> AgentRunOpts {
+        AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             agent_name: "test".into(),
@@ -4602,12 +4632,12 @@ mod compaction_tests {
             model: "mock-1".into(),
             run_id: "run_compact_test".into(),
             workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path: transcript_path.clone(),
+            workspace_path: dir.to_path_buf(),
+            transcript_path: transcript_path.to_path_buf(),
             max_turns: 5,
             decider: Arc::new(BypassDecider),
             tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
+                workspace_path: dir.to_path_buf(),
                 ..Default::default()
             },
             user_message: "task".into(),
@@ -4640,7 +4670,20 @@ mod compaction_tests {
             pause: None,
             codename: None,
             recovery: Default::default(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_context_returns_false_on_provider_error_and_leaves_messages_unchanged() {
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_compaction_test.jsonl");
+
+        // Provider that errors on every call.
+        let provider = MockProvider::new(vec![ScriptedTurn::ProviderError(
+            "summary call failed".to_string(),
+        )]);
+
+        let mut opts = compaction_test_opts(provider, tmp_dir.path(), &transcript_path);
 
         let mut messages = vec![
             Message::user("task"),
@@ -4672,6 +4715,85 @@ mod compaction_tests {
             original_len,
             "messages must be unchanged after error"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_context_records_the_usage_of_a_rejected_summary() {
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_rejected_summary.jsonl");
+
+        // A refused summary: billed, but its text must not replace history.
+        let provider = MockProvider::new(vec![ScriptedTurn::Reply {
+            content: vec![ContentBlock::Text {
+                text: "I cannot help".to_string(),
+            }],
+            stop: Stop::synthetic(StopReason::Refusal, "mock"),
+            usage: Usage {
+                input_tokens: 700,
+                output_tokens: 11,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            },
+        }]);
+        let mut opts = compaction_test_opts(provider, tmp_dir.path(), &transcript_path);
+        let seen: Arc<std::sync::Mutex<Vec<UsageTurn>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+            sink.lock().unwrap().push(u.clone());
+        }));
+
+        let dense_chunk = "x".repeat(1000);
+        let mut messages = vec![Message::user(&format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            messages.push(Message::assistant(&format!("a{i}: {dense_chunk}")));
+            messages.push(Message::user(&format!("u{i}: {dense_chunk}")));
+        }
+        let original_len = messages.len();
+
+        let mut writer = JsonlWriter::create(&transcript_path).expect("writer");
+        let compacted = compact_context(
+            &mut messages,
+            &mut opts,
+            "run_rejected_summary",
+            1,
+            &mut writer,
+            900_000,
+        )
+        .await;
+        writer.flush().expect("flush");
+
+        assert!(!compacted, "a rejected summary is a failed compaction");
+        assert_eq!(messages.len(), original_len, "history is untouched");
+
+        let usage_events: Vec<Event> = rupu_transcript::JsonlReader::iter(&transcript_path)
+            .expect("reader")
+            .filter_map(Result::ok)
+            .filter(|e| matches!(e, Event::Usage { .. }))
+            .collect();
+        assert_eq!(
+            usage_events.len(),
+            1,
+            "the billed call is in the transcript"
+        );
+        match &usage_events[0] {
+            Event::Usage {
+                input_tokens,
+                output_tokens,
+                purpose,
+                ..
+            } => {
+                assert_eq!(*input_tokens, 700);
+                assert_eq!(*output_tokens, 11);
+                assert_eq!(purpose.as_deref(), Some("compaction"));
+            }
+            other => panic!("expected a usage event, got {other:?}"),
+        }
+        let hooked = seen.lock().unwrap();
+        assert_eq!(hooked.len(), 1, "on_usage fired once");
+        assert_eq!(hooked[0].kind, UsageKind::Compaction);
+        assert_eq!(hooked[0].input_tokens, 700);
+        assert_eq!(hooked[0].output_tokens, 11);
     }
 
     #[tokio::test]
@@ -4736,7 +4858,7 @@ mod compaction_tests {
     async fn compact_with_summary_reply(
         content: Vec<ContentBlock>,
         reason: StopReason,
-    ) -> Result<Option<CompactionOutcome>, rupu_providers::ProviderError> {
+    ) -> Result<Option<CompactionOutcome>, CompactionError> {
         let dense_chunk = "x".repeat(1000);
         let mut msgs = vec![text_msg(Role::User, &format!("task: {dense_chunk}"))];
         for i in 0..5 {

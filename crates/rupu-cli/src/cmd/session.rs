@@ -6971,6 +6971,16 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             println!("nothing to compact: history is too short or already compact");
         }
         Err(e) => {
+            // A rejected summary was still billed: record its spend the same
+            // way a successful compaction's is, then surface the reason.
+            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+                record_offline_compaction_usage(
+                    latest_transcript.as_deref(),
+                    &session.provider_name,
+                    &session.model,
+                    usage,
+                );
+            }
             anyhow::bail!("compaction failed: {e}");
         }
     }
@@ -7523,6 +7533,15 @@ async fn run_compact_request(
         }
         Err(e) => {
             let err_str = e.to_string();
+            // A rejected summary was billed: record it in this pseudo-run's
+            // transcript like a successful compaction's usage.
+            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+                writer.write(&compaction_usage_event(
+                    &session.provider_name,
+                    &session.model,
+                    usage,
+                ))?;
+            }
             writer.write(&TranscriptEvent::RunComplete {
                 run_id: request.run_id.clone(),
                 status: RunStatus::Error,
@@ -10833,6 +10852,9 @@ mod tests {
 
     const SUMMARY_SCRIPT: &str = r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#;
 
+    /// A summariser that refuses: billed, but its answer is rejected.
+    const REFUSED_SUMMARY_SCRIPT: &str = r#"[{ "AssistantText": { "text": "I cannot help.", "stop": "refusal", "input_tokens": 500, "output_tokens": 10 } }]"#;
+
     /// Ruling (Task 3 review): the compaction summariser's `Usage` event
     /// carries the WHOLE history as input — calibrating the next manual
     /// `session compact` against it would size the recent budget wrong.
@@ -10948,6 +10970,117 @@ mod tests {
         );
         // The appended event never mis-calibrates the next compaction.
         assert_eq!(last_turn_input_tokens(&last), Some(6_000));
+    }
+
+    /// A rejected (refused) summary was still billed: the offline compact
+    /// records its spend like a successful one's, leaves the history alone,
+    /// and fails with the rejection reason.
+    #[tokio::test]
+    async fn manual_compact_records_the_spend_of_a_rejected_summary() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_reject1");
+        let last = record.transcripts_dir.join("run_prev.jsonl");
+        write_events(
+            &last,
+            &[
+                TranscriptEvent::RunStart {
+                    codename: None,
+                    run_id: "run_prev".into(),
+                    workspace_id: "ws_test".into(),
+                    agent: "issue-reader".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    started_at: Utc::now(),
+                    mode: RunMode::Bypass,
+                    schema: None,
+                    system_prompt: None,
+                },
+                usage_event(6_000, 50, None),
+                TranscriptEvent::RunComplete {
+                    run_id: "run_prev".into(),
+                    status: RunStatus::Ok,
+                    total_tokens: 6_050,
+                    duration_ms: 10,
+                    error: None,
+                    outcome: None,
+                },
+            ],
+        );
+        record.last_run_id = Some("run_prev".into());
+        record.last_transcript_path = Some(last.clone());
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let history_len = record.message_history.len();
+
+        let err = with_mock_home(
+            &global,
+            REFUSED_SUMMARY_SCRIPT,
+            compact(&record.session_id, Some(1000)),
+        )
+        .await
+        .expect_err("a refused summary fails the compaction");
+        assert!(
+            err.to_string()
+                .contains("compaction summary rejected: refused"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            compaction_usage(&last),
+            vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
+        );
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(
+            after.message_history.len(),
+            history_len,
+            "history untouched"
+        );
+    }
+
+    /// Same for the worker's compact pseudo-run: the rejected summary's spend
+    /// lands in its own transcript, and the run ends in error with the reason.
+    #[tokio::test]
+    async fn compact_pseudo_run_records_the_spend_of_a_rejected_summary() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_reject2");
+        record.context_window_tokens = Some(1000);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let request = SessionTurnRequest {
+            version: SessionTurnRequest::VERSION,
+            request_id: "req_1".into(),
+            run_id: "run_compact02".into(),
+            prompt: "[compact]".into(),
+            transcript_path: record.transcripts_dir.join("run_compact02.jsonl"),
+            enqueued_at: Utc::now(),
+            compact: true,
+        };
+
+        with_mock_home(
+            &global,
+            REFUSED_SUMMARY_SCRIPT,
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request),
+        )
+        .await
+        .expect("the pseudo-run finishes even though the summary is rejected");
+
+        assert_eq!(
+            compaction_usage(&request.transcript_path),
+            vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
+        );
+        let failed = JsonlReader::iter(&request.transcript_path)
+            .expect("open transcript")
+            .filter_map(Result::ok)
+            .any(|e| match e {
+                TranscriptEvent::RunComplete { status, error, .. } => {
+                    status == RunStatus::Error
+                        && error
+                            .as_deref()
+                            .is_some_and(|m| m.contains("compaction summary rejected: refused"))
+                }
+                _ => false,
+            });
+        assert!(failed, "RunComplete carries the rejection reason");
     }
 
     /// Ruling (Task 3 review): the worker's compact pseudo-run writes its
