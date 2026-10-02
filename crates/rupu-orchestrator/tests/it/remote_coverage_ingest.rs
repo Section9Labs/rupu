@@ -219,7 +219,8 @@ async fn a_stream_without_a_begin_line_is_a_warning() {
     let events = sink.0.lock().unwrap();
     assert!(events.iter().any(|e| matches!(
         e,
-        Event::StepWarning { message, .. } if message.contains("no coverage stream")
+        Event::StepWarning { message, .. }
+            if message.contains("no coverage stream") && message.contains("workspace-sync delta")
     )));
 }
 

@@ -188,7 +188,7 @@ mod tests {
         existing
             .attributes
             .insert("lang".into(), serde_json::json!("rust"));
-        crate::asset::upsert_asset(&p.assets, &existing).unwrap();
+        crate::asset::store::upsert_asset(&p.assets, &existing).unwrap();
 
         asset_mark(
             &p,
@@ -218,7 +218,7 @@ mod tests {
             "the auth handler",
             None,
         );
-        crate::asset::upsert_asset(&p.assets, &existing).unwrap();
+        crate::asset::store::upsert_asset(&p.assets, &existing).unwrap();
         let mk = |label: Option<&str>| AssetMarkInput {
             kind: "code:file".into(),
             coordinates: vec![Coordinate::Path("a.rs".into())],

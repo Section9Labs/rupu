@@ -3,7 +3,6 @@
 //! that re-marks an asset simply writes a newer line.
 
 use super::Asset;
-use std::io::Write;
 use std::path::Path;
 
 /// Errors reading or writing the asset store.
@@ -64,7 +63,15 @@ pub(crate) fn read_asset_lines(path: &Path) -> Result<Vec<Asset>, AssetStoreErro
 
 /// Append one asset as a JSON line, creating the parent directory and file as
 /// needed. Upsert semantics come from fold-on-read, not from rewriting.
-pub fn upsert_asset(path: &Path, asset: &Asset) -> Result<(), AssetStoreError> {
+///
+/// Test-only: this writes `assets.jsonl` WITHOUT mirroring the line into the
+/// run's coverage stream. Production writers go through
+/// `ledger::stream::append_record(.., Ledger::Assets, ..)`, so a remote unit's
+/// asset reaches the coordinator; keeping this out of the public API stops a
+/// future caller from silently bypassing the stream.
+#[cfg(test)]
+pub(crate) fn upsert_asset(path: &Path, asset: &Asset) -> Result<(), AssetStoreError> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }

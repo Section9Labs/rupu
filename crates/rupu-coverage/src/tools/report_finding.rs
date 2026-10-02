@@ -812,7 +812,7 @@ mod tests {
         existing
             .attributes
             .insert("lang".into(), serde_json::json!("rust"));
-        crate::asset::upsert_asset(&paths.assets, &existing).unwrap();
+        crate::asset::store::upsert_asset(&paths.assets, &existing).unwrap();
 
         report_finding(&paths, attribution(), code_file_input("src/a.rs"), &opts).unwrap();
 
@@ -831,7 +831,7 @@ mod tests {
         let locator =
             crate::asset::Locator(vec![crate::asset::Coordinate::Path("src/a.rs".into())]);
         let existing = crate::asset::Asset::new("code:file", locator, "the auth handler", None);
-        crate::asset::upsert_asset(&paths.assets, &existing).unwrap();
+        crate::asset::store::upsert_asset(&paths.assets, &existing).unwrap();
 
         // No label on the stamp: the last-line-wins fold must not demote the
         // descriptive label to the bare kind.

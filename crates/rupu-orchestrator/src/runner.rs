@@ -7314,7 +7314,8 @@ async fn ingest_remote_unit_coverage(
     match merged {
         Ok(Ok(r)) if !r.begin_seen => warn(format!(
             "host {host} sent no coverage stream (it may predate coverage streaming — upgrade \
-             rupu there); this unit's findings and coverage were not collected"
+             rupu there); its findings and coverage reach the coordinator only through a \
+             workspace-sync delta, if any"
         )),
         Ok(Ok(r)) if r.malformed > 0 => warn(format!(
             "{} malformed coverage line(s) from host {host} were skipped ({} merged)",

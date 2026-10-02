@@ -9,7 +9,7 @@ pub mod coordinate;
 pub mod store;
 
 pub use coordinate::{Coordinate, Locator, Proto};
-pub use store::{from_assets, read_assets, upsert_asset, AssetStoreError};
+pub use store::{from_assets, read_assets, AssetStoreError};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

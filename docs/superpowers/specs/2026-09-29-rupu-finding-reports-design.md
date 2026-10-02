@@ -250,8 +250,9 @@ Deviations as built (Plan 2): artifact errors use the CP's standard
 `{"error": …}` body with the usual status (`404`/`409`), not
 `{"unavailable": …}`. An artifact with a recorded `host` answers `404` — no
 code sets `host` yet and there is no `pull_finding_artifact`, so artifacts from
-remote/placed units are not viewable in the CP (tracked in `TODO.md`). Claim
-staleness hashes files up to 64 MiB only (larger reports `unknown`).
+remote/placed units are not viewable in the CP (tracked in `TODO.md`)
+(superseded: remote-findings transport Plan A now records `external` + `host`).
+Claim staleness hashes files up to 64 MiB only (larger reports `unknown`).
 
 ## Rendering
 

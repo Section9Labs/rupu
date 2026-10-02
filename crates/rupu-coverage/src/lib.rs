@@ -27,8 +27,8 @@ pub use tools::{
 };
 
 pub use asset::{
-    from_assets, profile_of, read_assets, upsert_asset, Asset, AssetId, AssetStoreError,
-    Coordinate, Locator, Proto,
+    from_assets, profile_of, read_assets, Asset, AssetId, AssetStoreError, Coordinate, Locator,
+    Proto,
 };
 
 pub use profile::{
