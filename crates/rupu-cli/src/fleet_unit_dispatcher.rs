@@ -419,6 +419,11 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     continue;
                 }
                 Err(e) => {
+                    // A best-effort snapshot, unlike the terminal arm below:
+                    // the poll just failed after the run was seen, so the
+                    // unit may well still be running on the host, and no
+                    // `await_run_mirror` is done here. Whatever it writes to
+                    // its coverage stream after this read is not collected.
                     let coverage = collect_coverage(&conn, &run_id, host).await;
                     return Err(UnitFailure {
                         error: host_err_to_run_err(e),
@@ -526,6 +531,11 @@ impl UnitDispatcher for FleetUnitDispatcher {
 
         // A run the host never showed has no stream to collect — and saying
         // "no coverage stream" on top of "never started" would mislead.
+        //
+        // Otherwise this read is a best-effort snapshot, not a final one: on a
+        // wall timeout the unit may still be running on the host (we only gave
+        // up watching), and no `await_run_mirror` is done here, so lines it
+        // writes to its coverage stream after this read are not collected.
         let coverage = if never_started {
             UnitCoverage::NotLaunched
         } else {

@@ -508,11 +508,14 @@ async fn connect_and_run(
                 send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
             }
             // coverage.jsonl — only a CP that advertised it parses these frames.
-            if mirror_coverage {
-                for line in drain_coverage(&run_dir, &mut state.offsets.coverage) {
-                    send_artifact(&mut sink, rid, ArtifactFile::Coverage, line).await;
-                }
-            }
+            ship_coverage(
+                &mut sink,
+                rid,
+                &run_dir,
+                &mut state.offsets.coverage,
+                mirror_coverage,
+            )
+            .await;
             // run.json — check for terminal status.
             if let Some((status, body)) = read_terminal_status(&run_dir.join("run.json")) {
                 // A ledger row can land between the drain above and this
@@ -529,11 +532,14 @@ async fn connect_and_run(
                 }
                 // Final coverage drain: the run may have written its last lines
                 // after the drain above and before run.json turned terminal.
-                if mirror_coverage {
-                    for line in drain_coverage(&run_dir, &mut state.offsets.coverage) {
-                        send_artifact(&mut sink, rid, ArtifactFile::Coverage, line).await;
-                    }
-                }
+                ship_coverage(
+                    &mut sink,
+                    rid,
+                    &run_dir,
+                    &mut state.offsets.coverage,
+                    mirror_coverage,
+                )
+                .await;
                 send_artifact(&mut sink, rid, ArtifactFile::RunJson, body).await;
                 let frame = Frame::RunFinished {
                     run_id: rid.clone(),
@@ -602,12 +608,14 @@ async fn connect_and_run(
                     }
                     // Last chance to ship coverage the run wrote since the
                     // previous drain — a cancelled run gets no terminal block.
-                    if mirror_coverage {
-                        let run_dir = runs_root.join(&run_id);
-                        for line in drain_coverage(&run_dir, &mut state.offsets.coverage) {
-                            send_artifact(&mut sink, &run_id, ArtifactFile::Coverage, line).await;
-                        }
-                    }
+                    ship_coverage(
+                        &mut sink,
+                        &run_id,
+                        &runs_root.join(&run_id),
+                        &mut state.offsets.coverage,
+                        mirror_coverage,
+                    )
+                    .await;
                     let cancelled_frame = Frame::RunFinished {
                         run_id: run_id.clone(),
                         status: "cancelled".to_string(),
@@ -934,6 +942,33 @@ fn read_terminal_status(run_json: &Path) -> Option<(String, String)> {
 /// New lines of a run's coverage stream (`runs/<id>/coverage.jsonl`).
 fn drain_coverage(run_dir: &Path, offset: &mut u64) -> Vec<String> {
     drain_new_lines(&run_dir.join(rupu_coverage::STREAM_FILE), offset)
+}
+
+/// Send the run's new coverage lines to the CP as `ArtifactFile::Coverage`
+/// frames — the one place the tunnel does it (the routine drain, the terminal
+/// drain before `run.json` / `RunFinished`, and the cancel drain all call
+/// this).
+///
+/// `mirror_coverage` is the capability gate (the CP's `Welcome` advertised
+/// `mirror.coverage`); when it is `false` an older CP could not parse the
+/// frame, so nothing is sent AND `*offset` does not move — the stream is not
+/// consumed. Offsets make repeat calls exact-once: a later call sends only
+/// what was appended since, and a trailing partial line is held back.
+async fn ship_coverage<S>(
+    sink: &mut S,
+    run_id: &str,
+    run_dir: &Path,
+    offset: &mut u64,
+    mirror_coverage: bool,
+) where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    if !mirror_coverage {
+        return;
+    }
+    for line in drain_coverage(run_dir, offset) {
+        send_artifact(sink, run_id, ArtifactFile::Coverage, line).await;
+    }
 }
 
 /// Build the result object key for a drained JSONL file chunk.
@@ -2023,6 +2058,151 @@ mod tests {
         assert_eq!(drain_coverage(run_dir, &mut off), vec!["a", "b"]);
         std::fs::write(run_dir.join(rupu_coverage::STREAM_FILE), "a\nb\nc\n").unwrap();
         assert_eq!(drain_coverage(run_dir, &mut off), vec!["c"]);
+    }
+
+    /// An in-memory `Sink` that records what the tunnel would put on the wire.
+    #[derive(Default)]
+    struct VecSink(Vec<Message>);
+
+    impl futures_util::Sink<Message> for VecSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            mut self: std::pin::Pin<&mut Self>,
+            item: Message,
+        ) -> Result<(), Self::Error> {
+            self.0.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl VecSink {
+        /// Every frame sent, as `(run_id, line)` — asserting each one is a
+        /// `Frame::Artifact { file: Coverage, .. }`.
+        fn coverage_frames(&self) -> Vec<(String, String)> {
+            self.0
+                .iter()
+                .map(|m| match parse_frame(m).unwrap() {
+                    Frame::Artifact {
+                        run_id,
+                        file: ArtifactFile::Coverage,
+                        line,
+                    } => (run_id, line),
+                    other => panic!("expected a coverage artifact frame, got {other:?}"),
+                })
+                .collect()
+        }
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// A CP that never advertised `mirror.coverage` can't parse the frame:
+    /// nothing is sent, and the offset stays put so a later connection whose
+    /// CP does advertise it still ships the whole stream.
+    #[tokio::test]
+    async fn ship_coverage_gated_off_sends_nothing_and_does_not_move_the_offset() {
+        let run_dir = tempdir().unwrap();
+        append(&run_dir.path().join(rupu_coverage::STREAM_FILE), "a\nb\n");
+        let mut sink = VecSink::default();
+        let mut off = 0u64;
+
+        ship_coverage(&mut sink, "run_1", run_dir.path(), &mut off, false).await;
+        assert!(sink.0.is_empty(), "no frame to an incapable CP");
+        assert_eq!(
+            off, 0,
+            "nothing consumed that a capable connection could send"
+        );
+
+        // The same stream, now to a capable CP: everything still ships.
+        ship_coverage(&mut sink, "run_1", run_dir.path(), &mut off, true).await;
+        assert_eq!(
+            sink.coverage_frames(),
+            vec![("run_1".into(), "a".into()), ("run_1".into(), "b".into())]
+        );
+    }
+
+    /// One frame per complete line, in order; a trailing partial line (the
+    /// writer is mid-flush) is held back until its newline lands.
+    #[tokio::test]
+    async fn ship_coverage_sends_each_complete_line_in_order_and_holds_back_a_partial() {
+        let run_dir = tempdir().unwrap();
+        let stream = run_dir.path().join(rupu_coverage::STREAM_FILE);
+        append(&stream, "{\"n\":1}\n{\"n\":2}\n{\"n\":3");
+        let mut sink = VecSink::default();
+        let mut off = 0u64;
+
+        ship_coverage(&mut sink, "run_9", run_dir.path(), &mut off, true).await;
+        assert_eq!(
+            sink.coverage_frames(),
+            vec![
+                ("run_9".to_string(), "{\"n\":1}".to_string()),
+                ("run_9".to_string(), "{\"n\":2}".to_string()),
+            ],
+            "the unterminated third line must not be sent yet"
+        );
+
+        // The newline arrives: now (and only now) the third line goes.
+        append(&stream, "}\n");
+        ship_coverage(&mut sink, "run_9", run_dir.path(), &mut off, true).await;
+        let frames = sink.coverage_frames();
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert_eq!(frames[2], ("run_9".to_string(), "{\"n\":3}".to_string()));
+    }
+
+    /// The terminal / cancel drain is a SECOND call after the routine one: it
+    /// ships exactly the lines appended in between, never the ones already sent.
+    #[tokio::test]
+    async fn ship_coverage_second_call_sends_only_the_lines_appended_since() {
+        let run_dir = tempdir().unwrap();
+        let stream = run_dir.path().join(rupu_coverage::STREAM_FILE);
+        append(&stream, "a\nb\n");
+        let mut sink = VecSink::default();
+        let mut off = 0u64;
+
+        ship_coverage(&mut sink, "run_2", run_dir.path(), &mut off, true).await;
+        assert_eq!(sink.0.len(), 2);
+
+        // Nothing new: the terminal drain of a quiet run sends nothing.
+        ship_coverage(&mut sink, "run_2", run_dir.path(), &mut off, true).await;
+        assert_eq!(sink.0.len(), 2, "no re-send of lines already shipped");
+
+        // The run wrote its last lines just before turning terminal.
+        append(&stream, "c\nd\n");
+        ship_coverage(&mut sink, "run_2", run_dir.path(), &mut off, true).await;
+        let lines: Vec<String> = sink.coverage_frames().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(
+            lines,
+            ["a", "b", "c", "d"],
+            "each line exactly once, in order"
+        );
     }
 
     #[tokio::test]
