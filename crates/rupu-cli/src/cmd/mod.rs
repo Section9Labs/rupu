@@ -16,6 +16,7 @@ pub mod create_common;
 pub mod cron;
 pub mod dispatch;
 pub mod editor;
+pub mod features_helper;
 pub mod findings;
 pub mod host;
 pub mod init;

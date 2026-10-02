@@ -17,16 +17,12 @@ pub fn routes() -> Router<AppState> {
 struct HostInfoResponse {
     version: String,
     capabilities: HostCapabilities,
-    /// Request fields this server's launch endpoints honour, so a
-    /// coordinator can refuse to send one to a remote that would silently
-    /// drop it (see `HttpHostConnector::require_feature`).
+    /// What this build honours as a host
+    /// ([`crate::node::protocol::host_features`]) — e.g. request fields its
+    /// launch endpoints take, so a coordinator can refuse to send one to a
+    /// remote that would silently drop it (see
+    /// `HttpHostConnector::require_feature`).
     features: Vec<String>,
-}
-
-/// What this build's launch endpoints honour. Same vocabulary as the tunnel
-/// `Hello.capabilities` and the bucket worker markers.
-fn host_features() -> Vec<String> {
-    vec![crate::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string()]
 }
 
 async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResponse>> {
@@ -70,6 +66,6 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             scm_hosts: scm_hosts_vec,
             permission_modes: permission_modes_vec,
         },
-        features: host_features(),
+        features: crate::node::protocol::host_features(),
     }))
 }
