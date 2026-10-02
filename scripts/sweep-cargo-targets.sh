@@ -135,6 +135,9 @@ sweep_aged() {
   local t="$1" deps inc bins_kb=0 bins=0 inc_kb=0 incs=0 x kb paths
   local bmin=$((SWEEP_BINARY_AGE_HOURS * 60)) imin=$((SWEEP_INCREMENTAL_AGE_HOURS * 60))
   while IFS= read -r deps; do
+    # Release builds carry no loose objects and few variants, and their binary
+    # (`make release`) is slow to relink and often goes days between builds.
+    case "$deps" in */release/deps) continue ;; esac
     while IFS= read -r x; do
       x=${x#./}
       case "$x" in *[!A-Za-z0-9_+-]*|'') continue ;; esac
@@ -364,7 +367,9 @@ if [ -n "$low_disk" ] && command -v perl >/dev/null 2>&1; then
       credit=$((credit + kb))
     else
       with_locks "$t" "$BASH" "$SELF" --_locked evict "$t"
-      [ $? -eq 0 ] || { echo "  $t: building right now; not evicted"; continue; }
+      rc=$?
+      if [ $rc -eq 75 ]; then echo "  $t: building right now; not evicted"; continue; fi
+      if [ $rc -ne 0 ]; then echo "  $t: could not evict (exit $rc)"; continue; fi
     fi
     echo "  evicted $t (-$(gb "$kb"), idle ${idle}h; low disk: $(gb "$free") free < $MIN_FREE_GB GB)"
   done < <(printf '%s\n' "$TARGETS" | while IFS= read -r t; do

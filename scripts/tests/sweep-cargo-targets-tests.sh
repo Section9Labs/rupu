@@ -73,6 +73,8 @@ fixture() {
   mkdir -p "$d/old-ffff.dSYM/Contents"
   # binaries: built 3 days ago but run an hour ago
   art "$d/ran-gggg" "$day" 60
+  # release binaries are never age-swept
+  art "$1/release/deps/rel-kkkk" "$day"
   # libraries are never age-swept
   art "$d/libold-hhhh.rlib" "$day"
   # incremental: stale and fresh
@@ -100,6 +102,7 @@ assert_gone   "stale binary's .dSYM deleted" "$D/old-ffff.dSYM"
 assert_exists "recently run binary kept" "$D/ran-gggg"
 assert_exists "live binary kept" "$D/foo-aaaa"
 assert_exists "old library kept" "$D/libold-hhhh.rlib"
+assert_exists "old release binary kept" "$T/release/deps/rel-kkkk"
 assert_gone   "stale incremental cache deleted" "$I/foo-iiii"
 assert_exists "fresh incremental cache kept" "$I/foo-jjjj"
 assert_contains "reports objects" "$out" "objects -"
