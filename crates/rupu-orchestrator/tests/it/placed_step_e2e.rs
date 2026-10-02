@@ -114,6 +114,13 @@ impl RecordingDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for RecordingDispatcher {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn dispatch_unit(
         &self,
         unit: UnitDispatch,
@@ -349,6 +356,13 @@ struct CodenameDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for CodenameDispatcher {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn dispatch_unit(
         &self,
         unit: UnitDispatch,

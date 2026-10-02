@@ -143,7 +143,7 @@ fn stage_tar(payload: &Payload, scratch_dir: &Path) -> Result<Baseline, SyncErro
 /// 2026-09-30-rupu-remote-findings-transport-design.md §A4). Collection still
 /// carries them — the host cannot know whether the coordinator ingests that
 /// stream (an older one does not, and the delta is then its only copy) — and
-/// a coordinator that merged the stream drops them with
+/// a coordinator that merged the unit's complete stream drops them with
 /// [`Delta::without_coverage`]: carried through, they would land under a
 /// target id derived from the host's scratch path.
 const DELTA_EXCLUDED_PREFIX: &str = ".rupu/coverage/";
@@ -163,9 +163,10 @@ impl Delta {
     /// This delta without its `.rupu/coverage/` entries (see
     /// [`excluded_from_delta`]): changes and deletions, in the path lists and
     /// in the payload (tar entries; git file patches, re-printed from the
-    /// parsed patch). The coordinator calls this for a unit whose coverage
-    /// stream it merged — the stream is then that unit's coverage, and the
-    /// delta's copy would only duplicate it under a scratch-path target.
+    /// parsed patch). The coordinator calls this for a unit whose complete
+    /// coverage stream it merged — the stream is then that unit's coverage,
+    /// and the delta's copy would only duplicate it under a scratch-path
+    /// target.
     pub fn without_coverage(&self) -> Result<Delta, SyncError> {
         let keep = |paths: &[String]| -> Vec<String> {
             paths

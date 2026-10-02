@@ -47,6 +47,13 @@ struct TerminatingDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for TerminatingDispatcher {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn dispatch_unit(
         &self,
         unit: UnitDispatch,

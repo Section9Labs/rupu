@@ -84,6 +84,10 @@ struct Scripted {
 
 #[async_trait]
 impl UnitDispatcher for Scripted {
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn dispatch_unit(
         &self,
         _unit: UnitDispatch,
@@ -456,6 +460,42 @@ async fn a_placed_units_merged_stream_replaces_its_delta_coverage() {
         "the stream won: the delta's coverage must not be applied"
     );
     assert_eq!(findings_in(tmp.path())[0].id, "f_stream");
+}
+
+/// A Partial stream (begin line seen, but possibly short) merges AND the
+/// delta keeps its coverage: the synced copy may hold the findings the short
+/// stream lacks — a duplicate under the host's workspace target beats a loss.
+#[tokio::test]
+async fn a_placed_units_partial_stream_keeps_its_delta_coverage() {
+    let (tmp, sink) = run_with(
+        PLACED_SYNC,
+        Arc::new(SyncByIndex {
+            results: Mutex::new(
+                [(
+                    0,
+                    synced_ok(
+                        "src.txt",
+                        UnitCoverage::Partial {
+                            bytes: stream_with_finding("f_partial_sync"),
+                            reason: "the host's final copy of the stream did not arrive".into(),
+                        },
+                    ),
+                )]
+                .into(),
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(findings_in(tmp.path())[0].id, "f_partial_sync");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(SCRATCH_COVERAGE)).unwrap(),
+        "{}\n",
+        "a Partial stream must not strip the delta's coverage"
+    );
+    let w = warnings(&sink);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("may be missing"), "{w:?}");
+    assert!(w[0].contains("synced copy"), "{w:?}");
 }
 
 /// No stream arrived (an older host): the delta's coverage is the only copy,

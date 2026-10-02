@@ -74,6 +74,11 @@ impl PlacedSyncDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for PlacedSyncDispatcher {
+    // Its deltas never carry `.rupu/coverage/`: nothing to drop.
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn prepare_workspace(
         &self,
         _workspace_path: &Path,
@@ -247,6 +252,11 @@ impl FanoutSyncDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for FanoutSyncDispatcher {
+    // Its deltas never carry `.rupu/coverage/`: nothing to drop.
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn prepare_workspace(
         &self,
         _workspace_path: &Path,
