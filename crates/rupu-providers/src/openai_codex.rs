@@ -5240,4 +5240,26 @@ mod outcome_tests {
         assert_eq!(r.stop.reason, StopReason::ToolUse);
         assert!(r.stop.wire.value.is_none());
     }
+
+    /// The Responses API's flat `error` event with no code: no kind, so it
+    /// is retried; with a code it classifies by the code.
+    #[test]
+    fn flat_error_event_without_a_code_is_retried() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "error", "code": null, "message": "stream reset", "param": null}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.kind, None);
+        assert_eq!(body.class, ErrorClass::Unrecognized);
+        assert!(body.is_retryable());
+
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "error", "code": "rate_limit_exceeded", "message": "slow down"}),
+        ]);
+        let body = reply_of(r.unwrap_err());
+        assert_eq!(body.kind.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(body.class, ErrorClass::RateLimited);
+    }
 }

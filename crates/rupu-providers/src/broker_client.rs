@@ -279,25 +279,25 @@ impl BrokerStreamAccumulator {
 /// Parse the broker's `response` object. The broker relays the upstream
 /// stop string, so it is parsed tolerantly: a value this build does not know
 /// is `Unrecognized` (keeping the raw string), and an absent one is
-/// `Unreported`, or `ToolUse` when the content carries tool blocks.
+/// `Unreported`. `EndTurn` and `Unreported` become `ToolUse` when the content
+/// carries tool blocks (the rule every provider shares), keeping the wire
+/// value.
 fn parse_broker_response(resp: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
     let content: Vec<ContentBlock> = serde_json::from_value(resp["content"].clone())
         .map_err(|e| ProviderError::Json(e.to_string()))?;
-    let stop = match resp["stop_reason"].as_str() {
-        Some(v) => Stop::from_wire(
-            serde_json::from_value(serde_json::Value::String(v.to_string()))
-                .unwrap_or(StopReason::Unrecognized),
-            "broker",
-            Some(v),
-        ),
-        None if content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. })) =>
-        {
-            Stop::from_wire(StopReason::ToolUse, "broker", None)
-        }
-        None => Stop::from_wire(StopReason::Unreported, "broker", None),
+    let wire = resp["stop_reason"].as_str();
+    let reason = match wire {
+        Some(v) => serde_json::from_value(serde_json::Value::String(v.to_string()))
+            .unwrap_or(StopReason::Unrecognized),
+        None => StopReason::Unreported,
     };
+    let mut stop = Stop::from_wire(reason, "broker", wire);
+    let has_tool_use = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    if has_tool_use && matches!(stop.reason, StopReason::EndTurn | StopReason::Unreported) {
+        stop.reason = StopReason::ToolUse;
+    }
     Ok(LlmResponse {
         id: resp["id"].as_str().unwrap_or_default().to_string(),
         model: resp["model"].as_str().unwrap_or_default().to_string(),
@@ -554,5 +554,44 @@ mod tests {
         assert_eq!(body.origin, ErrorOrigin::Stream);
         assert_eq!(body.class, crate::reply_error::ErrorClass::Overloaded);
         assert!(body.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn stream_flat_error_event_without_a_kind_is_retried() {
+        let err =
+            stream_events(&[serde_json::json!({"type": "error", "message": "broker hiccup"})])
+                .await
+                .unwrap_err();
+        let body = err.reply().expect("a typed reply error");
+        assert_eq!(body.kind, None);
+        assert_eq!(body.class, crate::reply_error::ErrorClass::Unrecognized);
+        assert!(body.is_retryable());
+
+        let err = stream_events(&[serde_json::json!({
+            "type": "error", "code": "rate_limit_exceeded", "message": "slow"})])
+        .await
+        .unwrap_err();
+        let body = err.reply().expect("a typed reply error");
+        assert_eq!(body.kind.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(body.class, crate::reply_error::ErrorClass::RateLimited);
+    }
+
+    /// The shared promotion rule: `EndTurn` or `Unreported` with tool blocks
+    /// is `ToolUse`, and the wire value is kept; any other reason stays.
+    #[test]
+    fn broker_end_turn_with_tool_blocks_is_tool_use() {
+        let tool = |stop: &str| {
+            serde_json::json!({"content": [
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}
+            ], "stop_reason": stop})
+        };
+        let r = parse_broker_response(&tool("end_turn")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("end_turn"));
+
+        let r = parse_broker_response(&tool("brand_new")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
+        let r = parse_broker_response(&tool("max_tokens")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
     }
 }

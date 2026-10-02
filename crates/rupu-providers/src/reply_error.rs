@@ -165,7 +165,8 @@ pub fn parse_error_value(
         serde_json::Value::Array(items) if !items.is_empty() => &items[0],
         other => other,
     };
-    let err = v.get("error").unwrap_or(v);
+    let wrapped = v.get("error");
+    let err = wrapped.unwrap_or(v);
     let str_at =
         |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string);
     // Every kind candidate is tried against the kind table, in this order: an
@@ -174,9 +175,14 @@ pub fn parse_error_value(
     let (kinds, full_message, details) = match err {
         serde_json::Value::String(s) => (Vec::new(), s.clone(), None),
         serde_json::Value::Object(_) => {
+            // A flat stream error event (no `error` wrapper) is its own
+            // error object; its `"type": "error"` names the event, not a
+            // kind. A real `code` or `status` on it still counts.
+            let flat_event_type =
+                |key: &str, kind: &str| wrapped.is_none() && key == "type" && kind == "error";
             let kinds: Vec<String> = ["code", "status", "type"]
                 .iter()
-                .filter_map(|k| str_at(err, k))
+                .filter_map(|k| str_at(err, k).filter(|kind| !flat_event_type(k, kind)))
                 .collect();
             let message = str_at(err, "message")
                 .or_else(|| str_at(err, "detail"))
@@ -521,5 +527,28 @@ mod tests {
         let small = serde_json::json!({"error": {"type": "api_error", "message": "x"}});
         let b = parse_error_value("anthropic", ErrorOrigin::Stream, &small);
         assert_eq!(b.raw, small);
+    }
+
+    /// A flat stream error event (no `error` wrapper): its own
+    /// `"type":"error"` is the event's type, not a kind.
+    #[test]
+    fn a_flat_error_event_s_type_is_not_a_kind() {
+        let v = serde_json::json!({"type": "error", "code": null, "message": "upstream hiccup"});
+        let b = parse_error_value("openai-codex", ErrorOrigin::Stream, &v);
+        assert_eq!(b.kind, None);
+        assert_eq!(b.class, ErrorClass::Unrecognized);
+        assert!(b.is_retryable());
+        assert_eq!(b.message, "upstream hiccup");
+
+        let v =
+            serde_json::json!({"type": "error", "code": "rate_limit_exceeded", "message": "slow"});
+        let b = parse_error_value("openai-codex", ErrorOrigin::Stream, &v);
+        assert_eq!(b.kind.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(b.class, ErrorClass::RateLimited);
+
+        // A wrapped error's own `type` still counts.
+        let v = serde_json::json!({"type": "error", "error": {"type": "overloaded_error", "message": "x"}});
+        let b = parse_error_value("anthropic", ErrorOrigin::Stream, &v);
+        assert_eq!(b.kind.as_deref(), Some("overloaded_error"));
     }
 }
