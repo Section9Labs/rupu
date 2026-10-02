@@ -4657,6 +4657,7 @@ dependencies = [
  "insta",
  "jsonschema",
  "quick-xml 0.36.2",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serde_path_to_error",

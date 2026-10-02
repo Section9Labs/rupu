@@ -79,6 +79,18 @@ pub struct ArtifactStore {
     root: PathBuf,
 }
 
+/// One file a report's artifacts expand to, as [`ArtifactStore::check`]
+/// found it: what [`ArtifactStore::ingest`] would record for it, but its
+/// hash (and a `size` taken from the file's metadata, where `ingest` records
+/// the bytes it actually read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedArtifact {
+    pub path: String,
+    pub size: u64,
+    pub kind: ArtifactKind,
+    pub stored: ArtifactStorage,
+}
+
 const CHUNK: usize = 64 * 1024;
 
 fn hex(bytes: &[u8]) -> String {
@@ -146,6 +158,32 @@ fn sha256_reader_counted<R: Read>(r: &mut R) -> std::io::Result<(String, u64)> {
 /// SHA-256 of a file's contents plus the number of bytes actually hashed.
 fn sha256_file_counted(p: &Path) -> std::io::Result<(String, u64)> {
     sha256_reader_counted(&mut File::open(p)?)
+}
+
+/// The total-bytes bound over the files `resolve` found. Only files that
+/// will be copied count toward it: a file over the per-file cap is hashed and
+/// recorded external, so it consumes no store space and must not get the
+/// finding rejected.
+fn check_total(
+    files: &[(String, PathBuf, u64)],
+    limits: IngestLimits,
+) -> Result<(), ArtifactError> {
+    let mut total = 0u64;
+    let mut copied = 0usize;
+    for (_, _, size) in files {
+        if *size <= limits.max_file_bytes {
+            total = total.saturating_add(*size);
+            copied += 1;
+        }
+    }
+    if total > limits.max_total_bytes {
+        return Err(ArtifactError::TooLarge {
+            total,
+            files: copied,
+            max: limits.max_total_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn sniff_kind(p: &Path) -> std::io::Result<ArtifactKind> {
@@ -250,27 +288,46 @@ impl ArtifactStore {
         limits: IngestLimits,
     ) -> Result<Vec<ArtifactRef>, ArtifactError> {
         let files = self.resolve(workspace, requested, limits.max_files)?;
-        // Only files that will be copied count toward the total: a file over
-        // the per-file cap is hashed and recorded external, so it consumes no
-        // store space and must not get the finding rejected.
-        let mut total = 0u64;
-        let mut copied = 0usize;
-        for (_, _, size) in &files {
-            if *size <= limits.max_file_bytes {
-                total = total.saturating_add(*size);
-                copied += 1;
-            }
-        }
-        if total > limits.max_total_bytes {
-            return Err(ArtifactError::TooLarge {
-                total,
-                files: copied,
-                max: limits.max_total_bytes,
-            });
-        }
+        check_total(&files, limits)?;
         files
             .iter()
             .map(|(rel, abs, size)| self.ingest_file(rel, abs, *size, limits.max_file_bytes))
+            .collect()
+    }
+
+    /// What [`ingest`](Self::ingest) would record, short of each file's hash,
+    /// or what it would refuse: every requested path must exist inside the
+    /// workspace and be a file or a directory, and the set they expand to
+    /// must be within `limits`. Each file's first 8 KiB is read to tell text
+    /// from binary, as `ingest` does. Nothing is hashed, copied or created
+    /// (the store need not exist), so a file that cannot be read in full, or
+    /// a store that cannot be written, is only found by a real `ingest`.
+    pub fn check(
+        &self,
+        workspace: &Path,
+        requested: &[ArtifactRef],
+        limits: IngestLimits,
+    ) -> Result<Vec<PlannedArtifact>, ArtifactError> {
+        let files = self.resolve(workspace, requested, limits.max_files)?;
+        check_total(&files, limits)?;
+        files
+            .into_iter()
+            .map(|(path, abs, size)| {
+                let kind = sniff_kind(&abs).map_err(|source| ArtifactError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                Ok(PlannedArtifact {
+                    stored: if size > limits.max_file_bytes {
+                        ArtifactStorage::External
+                    } else {
+                        ArtifactStorage::Copied
+                    },
+                    path,
+                    size,
+                    kind,
+                })
+            })
             .collect()
     }
 

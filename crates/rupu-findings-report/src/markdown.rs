@@ -89,7 +89,7 @@ fn code_block_ranges(md: &str) -> Vec<Range<usize>> {
 /// every HTML block start has a tag name (letters, digits, `-`) followed by
 /// whitespace, `/`, `>` or the end of the line, and here it is followed by
 /// `+ . _ % : @` instead. So it is left alone and stays a link.
-fn starts_autolink(rest: &str) -> bool {
+pub(crate) fn starts_autolink(rest: &str) -> bool {
     let run = rest
         .bytes()
         .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b'_' | b'%'))

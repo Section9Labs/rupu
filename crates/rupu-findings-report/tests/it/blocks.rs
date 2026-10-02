@@ -242,6 +242,7 @@ fn patch_ci_and_regression_blocks_have_the_specified_shape() {
         after_heading(&blocks, "Regression Test"),
         [
             Block::Prose("Two users.".into()),
+            Block::Prose("**Command:**".into()),
             Block::Code {
                 lang: Some("sh".into()),
                 text: "cargo test x".into()

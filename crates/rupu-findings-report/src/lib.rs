@@ -4,12 +4,15 @@
 //! PDF needs the `pdf` cargo feature (on by default); it embeds Typst and its
 //! fonts. Built without it, everything else works and `Format::Pdf` returns
 //! [`ExportError::PdfUnavailable`].
+//!
+//! Also: a best-effort Markdown → FindingReport parser for `rupu findings import` ([`import`]).
 
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
 pub mod blocks;
 pub mod html;
+pub mod import;
 pub mod markdown;
 pub mod model;
 pub mod number;

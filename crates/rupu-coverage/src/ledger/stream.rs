@@ -157,7 +157,9 @@ pub(crate) fn stream_json(paths: &CoveragePaths, ledger: Ledger, record_json: &s
     }
 }
 
-/// Write `record` to its ledger under `paths`, then to the run stream.
+/// Write `record` to its ledger under `paths`, then to the run stream. A
+/// findings record is appended under the findings ledger lock
+/// ([`lock_findings`]), the one ledger an import rewrites.
 pub fn append_record(
     paths: &CoveragePaths,
     ledger: Ledger,
@@ -177,9 +179,114 @@ pub fn append_record(
         }
     };
     let json = serde_json::to_string(record)?;
-    append_line(file, &json)?;
+    if ledger == Ledger::Findings {
+        findings_locked(paths, std::fs::File::lock, || append_line(file, &json))?;
+    } else {
+        append_line(file, &json)?;
+    }
     stream_json(paths, ledger, &json);
     Ok(())
+}
+
+/// Run `append`, an append to the findings ledger, holding the ledger lock
+/// (taken with `lock`) so it cannot interleave with an import's rewrite
+/// (`tools::attach_report`).
+///
+/// Where the filesystem cannot lock at all (some network and FUSE mounts:
+/// see [`lock_unsupported`]), where the lock file cannot be opened (a
+/// directory this user may not create files in), or where it could only be
+/// opened read-only and an exclusive lock needs it writable (`EBADF`, as
+/// NFS's locks do), the line is appended without the lock and a warning is
+/// logged, as before the lock existed: losing the finding would be worse.
+/// An import needs the same lock, so it either cannot run there or runs as a
+/// user who can take it; its length check then almost always catches the
+/// unlocked append (not one that lands between that check and its rename).
+/// Any other lock failure is an error, and nothing is appended.
+fn findings_locked(
+    paths: &CoveragePaths,
+    lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    append: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let lock_file = match open_lock_file(paths) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                ledger = ?paths.findings,
+                "cannot open the findings ledger's lock file; appending without the lock"
+            );
+            None
+        }
+    };
+    if let Some((Err(e), read_only)) = lock_file.as_ref().map(|(f, ro)| (lock(f), *ro)) {
+        let needs_write =
+            read_only && e.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error());
+        if !(lock_unsupported(&e) || needs_write) {
+            return Err(e);
+        }
+        tracing::warn!(
+            error = %e,
+            ledger = ?paths.findings,
+            "this filesystem cannot lock the findings ledger; appending without the lock"
+        );
+    }
+    let appended = append();
+    // Released after the append.
+    drop(lock_file);
+    appended
+}
+
+/// Whether a lock error means the filesystem cannot lock at all, rather than
+/// a failure to report: `ErrorKind::Unsupported` (`ENOSYS`, `EOPNOTSUPP`),
+/// or one of [`no_lock_errnos`].
+fn lock_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+        || e.raw_os_error()
+            .is_some_and(|n| no_lock_errnos().contains(&n))
+}
+
+/// `ENOLCK`, `ENOTSUP` and `EOPNOTSUPP` on this platform (the last two are
+/// the same number on Linux).
+fn no_lock_errnos() -> [i32; 3] {
+    use rustix::io::Errno;
+    [
+        Errno::NOLCK.raw_os_error(),
+        Errno::NOTSUP.raw_os_error(),
+        Errno::OPNOTSUPP.raw_os_error(),
+    ]
+}
+
+/// Serializes the writers of one target's findings ledger. The lock is a
+/// sidecar file, not the ledger itself: `attach_reports` replaces the ledger
+/// by rename, and a lock held on the replaced file would not exclude the
+/// next writer. Released when the returned handle drops.
+pub(crate) fn lock_findings(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
+    let (f, _) = open_lock_file(paths)?;
+    f.lock()?;
+    Ok(f)
+}
+
+/// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing,
+/// and whether it was opened read-only.
+///
+/// A lock needs only a handle on the file on most filesystems, so one this
+/// user may not write (created by another user, say an import run with
+/// `sudo`) is opened read-only instead.
+fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<(std::fs::File, bool)> {
+    paths.ensure_dir()?;
+    let path = paths.root.join("findings.jsonl.lock");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => Ok((f, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::File::open(&path).map(|f| (f, true)).map_err(|_| e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Stream the catalog snapshot a run writes at start. No-op without a stream.
@@ -214,6 +321,118 @@ mod tests {
     };
     use crate::ledger::paths::CoveragePaths;
     use chrono::Utc;
+
+    /// An append to the findings ledger through its lock, as
+    /// `append_record` makes one.
+    fn append_line_locked(
+        paths: &CoveragePaths,
+        line: &str,
+        lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        findings_locked(paths, lock, || append_line(&paths.findings, line))
+    }
+
+    #[test]
+    fn an_append_goes_ahead_unlocked_only_where_the_filesystem_cannot_lock() {
+        use std::io::{Error, ErrorKind};
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        // A filesystem that cannot lock: the finding is still recorded.
+        append_line_locked(&paths, "{\"n\":1}", |_| {
+            Err(Error::from(ErrorKind::Unsupported))
+        })
+        .expect("unsupported locking falls back to an unlocked append");
+        let mut expected = "{\"n\":1}\n".to_string();
+        for errno in no_lock_errnos() {
+            append_line_locked(&paths, "{\"n\":2}", |_| {
+                Err(Error::from_raw_os_error(errno))
+            })
+            .unwrap_or_else(|e| panic!("errno {errno}: {e}"));
+            expected.push_str("{\"n\":2}\n");
+        }
+        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), expected);
+        // Any other lock failure is an error, and nothing is appended.
+        let err = append_line_locked(&paths, "{\"n\":3}", |_| {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), expected);
+        // And the real lock is taken when it can be.
+        append_line_locked(&paths, "{\"n\":4}", std::fs::File::lock).unwrap();
+        assert!(std::fs::read_to_string(&paths.findings)
+            .unwrap()
+            .ends_with("{\"n\":4}\n"));
+    }
+
+    #[test]
+    fn an_append_goes_ahead_unlocked_when_the_lock_file_cannot_be_opened() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        // Something that cannot be opened as the lock file.
+        std::fs::create_dir_all(paths.root.join("findings.jsonl.lock")).unwrap();
+        append_line_locked(&paths, "{\"n\":1}", std::fs::File::lock)
+            .expect("the finding is still recorded");
+        assert_eq!(
+            std::fs::read_to_string(&paths.findings).unwrap(),
+            "{\"n\":1}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_this_user_cannot_write_is_locked_through_a_read_only_handle() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root can write any file: nothing to fall back from
+        }
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        paths.ensure_dir().unwrap();
+        let sidecar = paths.root.join("findings.jsonl.lock");
+        std::fs::write(&sidecar, "").unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let held = lock_findings(&paths).expect("locked through a read-only handle");
+        let other = std::fs::File::open(&sidecar).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the read-only handle's lock excludes other writers"
+        );
+        drop(held);
+        append_line_locked(&paths, "{\"n\":1}", std::fs::File::lock).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&paths.findings).unwrap(),
+            "{\"n\":1}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_lock_handle_refused_as_unwritable_appends_unlocked() {
+        use std::io::{Error, ErrorKind};
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root opens the lock file writable: no read-only handle
+        }
+        let ebadf = || Error::from_raw_os_error(rustix::io::Errno::BADF.raw_os_error());
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        paths.ensure_dir().unwrap();
+        // A writable handle refused with EBADF is a real error.
+        let err = append_line_locked(&paths, "{\"n\":1}", |_| Err(ebadf())).unwrap_err();
+        assert_ne!(err.kind(), ErrorKind::Unsupported);
+        assert!(!paths.findings.exists());
+        // A read-only one (the lock file is another user's) is NFS refusing
+        // an exclusive lock it cannot take: the finding is still recorded.
+        let sidecar = paths.root.join("findings.jsonl.lock");
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+        append_line_locked(&paths, "{\"n\":1}", |_| Err(ebadf())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&paths.findings).unwrap(),
+            "{\"n\":1}\n"
+        );
+    }
 
     fn attribution() -> Attribution {
         Attribution {

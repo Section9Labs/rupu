@@ -4,6 +4,7 @@
 //! below, not as a new `tests/*.rs` — `rupu-cli`'s `tests/it/test_layout.rs`
 //! enforces this.
 
+mod attach_report;
 mod cwe_index_mode_end_to_end;
 mod determinism;
 mod end_to_end;

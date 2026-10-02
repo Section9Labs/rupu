@@ -102,7 +102,7 @@ pub fn report_finding(
     input: ReportFindingInput,
     opts: &crate::report::FindingWriteOptions,
 ) -> Result<ReportFindingOutput, ReportFindingError> {
-    use crate::report::{FindingProfile, ValidateCtx};
+    use crate::report::FindingProfile;
 
     validate_locator(&input)?;
     let (summary, severity, evidence, report) = match opts.profile {
@@ -127,81 +127,14 @@ pub fn report_finding(
             if input.summary.is_some() || input.severity.is_some() || input.evidence.is_some() {
                 return Err(ReportFindingError::DerivedFieldsSupplied);
             }
-            let mut report = input.report.ok_or(ReportFindingError::ReportRequired)?;
+            let report = input.report.ok_or(ReportFindingError::ReportRequired)?;
             let known: Vec<String> = crate::ledger::read_findings(paths)?
                 .into_iter()
                 .map(|f| f.id)
                 .collect();
-            // `verification` is part of a stored record, but it is the
-            // verdict of a later verification run: the agent that wrote the
-            // finding cannot confirm its own work. Reported alongside every
-            // other problem so the agent still fixes them all in one retry.
-            let mut problems = Vec::new();
-            if report.verification.is_some() {
-                problems.push(crate::report::FieldError {
-                    path: "report.verification".into(),
-                    message: "set by verification runs, not by the reporting agent; omit it".into(),
-                });
-            }
-            if let Err(crate::report::ReportValidationError(errors)) =
-                crate::report::validate_report(
-                    &report,
-                    &ValidateCtx {
-                        known_finding_ids: &known,
-                        max_bytes: opts.report_max_bytes,
-                    },
-                )
-            {
-                problems.extend(errors);
-            }
-            if !problems.is_empty() {
-                return Err(ReportFindingError::Report(
-                    crate::report::ReportValidationError(problems),
-                ));
-            }
-            // A claim's hash is rupu's record of the file at write time, not
-            // something the agent can assert: drop whatever it sent, then
-            // hash what is actually there (or leave it unset).
-            for claim in &mut report.evidence {
-                claim.sha256 = None;
-            }
-            if !report.artifacts.is_empty() {
-                let store = opts
-                    .artifact_root
-                    .as_ref()
-                    .map(crate::report::ArtifactStore::new)
-                    .ok_or(crate::report::ArtifactError::NoStore)?;
-                report.artifacts =
-                    store.ingest(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
-            }
-            hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
-            // Directory artifacts expand to one entry per file, so the report
-            // can grow far past the budget `validate_report` checked. Re-check
-            // before anything reaches the ledger.
-            let size = serde_json::to_vec(&report)?.len();
-            if size > opts.report_max_bytes {
-                return Err(ReportFindingError::Report(
-                    crate::report::ReportValidationError(vec![crate::report::FieldError {
-                        path: "report.artifacts".into(),
-                        message: format!(
-                            "after expanding directories the report is {size} bytes, over the {} byte budget ({} artifact files); list specific files instead of large directories",
-                            opts.report_max_bytes,
-                            report.artifacts.len()
-                        ),
-                    }]),
-                ));
-            }
-            let evidence = FindingEvidence {
-                code_excerpt: report.evidence.iter().find_map(|c| c.excerpt.clone()),
-                rationale: report.root_cause.clone(),
-                references: Vec::new(),
-            };
-            (
-                report.title.clone(),
-                Severity::from(report.rating.risk_rating),
-                evidence,
-                Some(report),
-            )
+            let report = prepare_full_report(paths, report, &known, opts, ClaimHashes::Record)?;
+            let (summary, severity, evidence) = derived_fields(&report);
+            (summary, severity, evidence, Some(report))
         }
     };
 
@@ -287,9 +220,135 @@ pub fn report_finding(
         report,
     };
     paths.ensure_dir()?;
-    // One write per line, then the run stream — see `ledger::stream::append_line`.
+    // One write per line, under the ledger lock, then the run stream — see
+    // `ledger::stream::append_record`.
     crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Findings, &record)?;
     Ok(ReportFindingOutput { id })
+}
+
+/// Whether [`prepare_full_report`] records the SHA-256 of each evidence
+/// claim's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimHashes {
+    /// Hash each claim's file as it is now: a new finding, whose claims were
+    /// just made against this code.
+    Record,
+    /// Leave every claim unhashed: an imported report, whose claims were made
+    /// against the code as it was when the report was written. Hashing today's
+    /// file would present old evidence as current.
+    Skip,
+}
+
+/// Everything `validate_report` checks, plus the rule that a report may not
+/// carry its own `verification`: all problems at once, no I/O. The dry-run
+/// half of [`prepare_full_report`].
+pub(crate) fn check_full_report(
+    report: &crate::report::FindingReport,
+    known: &[String],
+    opts: &crate::report::FindingWriteOptions,
+) -> Result<(), ReportFindingError> {
+    // `verification` is part of a stored record, but it is the
+    // verdict of a later verification run: the agent that wrote the
+    // finding cannot confirm its own work. Reported alongside every
+    // other problem so the agent still fixes them all in one retry.
+    let mut problems = Vec::new();
+    if report.verification.is_some() {
+        problems.push(crate::report::FieldError {
+            path: "report.verification".into(),
+            message: "set by verification runs, not by the reporting agent; omit it".into(),
+        });
+    }
+    if let Err(crate::report::ReportValidationError(errors)) = crate::report::validate_report(
+        report,
+        &crate::report::ValidateCtx {
+            known_finding_ids: known,
+            max_bytes: opts.report_max_bytes,
+        },
+    ) {
+        problems.extend(errors);
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ReportFindingError::Report(
+            crate::report::ReportValidationError(problems),
+        ))
+    }
+}
+
+/// Validate a full-profile report and turn it into what the ledger stores:
+/// claim hashes recomputed (or, with [`ClaimHashes::Skip`], left unset),
+/// artifacts ingested into the store, the size budget re-checked. Shared by
+/// `report_finding` (a new finding, [`ClaimHashes::Record`]) and
+/// `attach_reports` (a report imported onto an existing finding,
+/// [`ClaimHashes::Skip`]).
+pub(crate) fn prepare_full_report(
+    paths: &CoveragePaths,
+    mut report: crate::report::FindingReport,
+    known: &[String],
+    opts: &crate::report::FindingWriteOptions,
+    hashes: ClaimHashes,
+) -> Result<crate::report::FindingReport, ReportFindingError> {
+    check_full_report(&report, known, opts)?;
+    // A claim's hash is rupu's record of the file at write time, not
+    // something the agent can assert: drop whatever it sent, then
+    // hash what is actually there (or leave it unset).
+    for claim in &mut report.evidence {
+        claim.sha256 = None;
+    }
+    if !report.artifacts.is_empty() {
+        let store = opts
+            .artifact_root
+            .as_ref()
+            .map(crate::report::ArtifactStore::new)
+            .ok_or(crate::report::ArtifactError::NoStore)?;
+        report.artifacts =
+            store.ingest(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
+    }
+    if hashes == ClaimHashes::Record {
+        hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
+    }
+    check_stored_size(&report, opts)?;
+    Ok(report)
+}
+
+/// The size budget, re-checked on the report as it will be stored. Directory
+/// artifacts expand to one entry per file, and every artifact gains its hash,
+/// size, kind and storage, so the report can grow far past the budget
+/// `validate_report` checked.
+pub(crate) fn check_stored_size(
+    report: &crate::report::FindingReport,
+    opts: &crate::report::FindingWriteOptions,
+) -> Result<(), ReportFindingError> {
+    let size = serde_json::to_vec(report)?.len();
+    if size > opts.report_max_bytes {
+        return Err(ReportFindingError::Report(
+            crate::report::ReportValidationError(vec![crate::report::FieldError {
+                path: "report.artifacts".into(),
+                message: format!(
+                    "after expanding directories the report is {size} bytes, over the {} byte budget ({} artifact files); list specific files instead of large directories",
+                    opts.report_max_bytes,
+                    report.artifacts.len()
+                ),
+            }]),
+        ));
+    }
+    Ok(())
+}
+
+/// The record fields a full-profile finding derives from its report.
+pub(crate) fn derived_fields(
+    report: &crate::report::FindingReport,
+) -> (String, Severity, FindingEvidence) {
+    (
+        report.title.clone(),
+        Severity::from(report.rating.risk_rating),
+        FindingEvidence {
+            code_excerpt: report.evidence.iter().find_map(|c| c.excerpt.clone()),
+            rationale: report.root_cause.clone(),
+            references: Vec::new(),
+        },
+    )
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
@@ -1209,6 +1268,26 @@ mod tests {
             "{err}"
         );
         assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn claim_hashes_are_skipped_on_request() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(ws.path().join("src/routes/notes.rs"), "fn get_note() {}\n").unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut r = fixture_report();
+        r.evidence[0].sha256 = Some("0".repeat(64));
+        let opts = crate::report::FindingWriteOptions::default();
+        let recorded =
+            prepare_full_report(&paths, r.clone(), &[], &opts, ClaimHashes::Record).unwrap();
+        assert_eq!(
+            recorded.evidence[0].sha256.as_ref().map(String::len),
+            Some(64)
+        );
+        assert_ne!(recorded.evidence[0].sha256, r.evidence[0].sha256);
+        let skipped = prepare_full_report(&paths, r, &[], &opts, ClaimHashes::Skip).unwrap();
+        assert_eq!(skipped.evidence[0].sha256, None, "not hashed, and not kept");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use crate::model::{ExportFinding, ReportMeta};
 use crate::number;
-use crate::text::{longest_backtick_run, one_line};
+use crate::text::{escape_semicolons, longest_backtick_run, one_line, unescape_semicolons};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::report::{
     ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, EvidenceBlock, FindingReport, HopRole,
@@ -83,11 +83,11 @@ fn nonblank(s: &Option<String>) -> Option<&str> {
     s.as_deref().filter(|s| !s.trim().is_empty())
 }
 
-/// An inline code span holding `s` verbatim: the delimiter is longer than
-/// any backtick run inside, padded when the text starts or ends with one.
 /// Map one typed engagement [`EvidenceBlock`] onto the renderer-neutral
 /// [`Block`] model the emitters already draw. No emitter changes are needed —
-/// every block lowers to Prose / Code / Table / Note.
+/// every block lowers to Prose / Code / Table / Note. A code block always
+/// follows a line saying what it is, so it never reads as the excerpt of the
+/// evidence claim printed before it.
 fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
     match blk {
         EvidenceBlock::Text { text } => out.push(prose(text.clone())),
@@ -96,12 +96,16 @@ fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
             excerpt,
             lang,
         } => {
-            if let Some(f) = nonblank(file) {
-                out.push(prose(format!("**{}**", code_span(f))));
+            match nonblank(file) {
+                Some(f) => out.push(prose(format!("**{}**", code_span(f)))),
+                None => out.push(prose("**Code**".to_string())),
             }
             out.push(code(lang.as_deref(), excerpt));
         }
-        EvidenceBlock::Diff { diff } => out.push(code(Some("diff"), diff)),
+        EvidenceBlock::Diff { diff } => {
+            out.push(prose("**Diff**".to_string()));
+            out.push(code(Some("diff"), diff));
+        }
         EvidenceBlock::Table { headers, rows } => out.push(Block::Table {
             headers: headers.clone(),
             rows: rows.clone(),
@@ -142,7 +146,10 @@ fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
                 .join("\n");
             out.push(code(None, &text));
         }
-        EvidenceBlock::Decompile { lang, listing } => out.push(code(Some(lang), listing)),
+        EvidenceBlock::Decompile { lang, listing } => {
+            out.push(prose(format!("**Decompiled** ({lang})")));
+            out.push(code(Some(lang), listing));
+        }
         EvidenceBlock::HttpExchange { request, response } => {
             out.push(prose("**HTTP request**".to_string()));
             out.push(code(Some("http"), request));
@@ -162,6 +169,8 @@ fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
     }
 }
 
+/// An inline code span holding `s` verbatim: the delimiter is longer than
+/// any backtick run inside, padded when the text starts or ends with one.
 fn code_span(s: &str) -> String {
     let s = one_line(s);
     let ticks = "`".repeat(longest_backtick_run(&s) + 1);
@@ -277,6 +286,22 @@ fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// The field holding the ticket references. Its value joins the tickets with
+/// `; `, a `;` in a ticket's own text escaped as `\;` (Markdown shows `;`;
+/// the HTML and Typst emitters unescape it for this field), so `import` can
+/// split it back into the same tickets.
+pub(crate) const TICKETS_LABEL: &str = "Existing Ticket References";
+
+/// A `Fields` value as plain text, for the emitters that do not read it as
+/// Markdown: the ticket references field's `\;` escapes undone.
+pub(crate) fn field_text<'a>(label: &str, value: &'a str) -> std::borrow::Cow<'a, str> {
+    if label == TICKETS_LABEL {
+        unescape_semicolons(value).into()
+    } else {
+        value.into()
+    }
+}
+
 fn tickets_text(t: &OrSentinel<Vec<Ticket>>) -> String {
     match t {
         OrSentinel::Sentinel(s) => sentinel_text(s),
@@ -291,7 +316,7 @@ fn tickets_text(t: &OrSentinel<Vec<Ticket>>) -> String {
                 if let Some(n) = nonblank(&t.notes) {
                     s.push_str(&format!(" — {}", one_line(n)));
                 }
-                s
+                escape_semicolons(&s)
             })
             .collect::<Vec<_>>()
             .join("; "),
@@ -444,7 +469,7 @@ fn full_blocks(
         kv("Product", r.ownership.product.clone()),
         kv("Affected Component", r.ownership.affected_component.clone()),
         kv("Source Repository", r.ownership.source_repository.clone()),
-        kv("Existing Ticket References", tickets_text(&r.tickets)),
+        kv(TICKETS_LABEL, tickets_text(&r.tickets)),
         kv("Impact", risk(r.rating.impact)),
         kv("Category", r.category.clone()),
     ];
@@ -531,6 +556,7 @@ fn full_blocks(
         out.push(prose(format!("**Stage:** {}", c.stage)));
         out.push(prose(c.body.clone()));
         if let Some(cmd) = nonblank(&c.command) {
+            out.push(prose("**Command:**".to_string()));
             out.push(code(Some("sh"), cmd));
         }
         out.push(prose(format!("**Fails when:** {}", c.expect)));
@@ -539,6 +565,7 @@ fn full_blocks(
     b.push(heading("Regression Test"));
     value_or_note(&r.regression_test, &mut b, |t, out| {
         out.push(prose(t.body.clone()));
+        out.push(prose("**Command:**".to_string()));
         out.push(code(Some("sh"), &t.command));
         out.push(Block::Fields(vec![
             kv("Vulnerable build", t.expect_vulnerable.clone()),

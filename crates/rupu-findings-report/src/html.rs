@@ -51,7 +51,8 @@ pub fn render(title: &str, blocks: &[Block]) -> String {
                 }
                 body.push_str("<dl>");
                 for (k, v) in rows {
-                    body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(k), esc(v)));
+                    let v = crate::blocks::field_text(k, v);
+                    body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(k), esc(&v)));
                 }
                 body.push_str("</dl>\n");
             }

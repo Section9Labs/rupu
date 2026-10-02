@@ -227,6 +227,8 @@ fall back to the CP's compiled defaults.
 
 Limits and hints for recorded findings; see [coverage.md](coverage.md#finding-reports)
 for what a finding report contains and how artifacts are stored.
+`rupu findings import` reads the size limits below from the global `config.toml`
+only.
 
 | Key                  | Type            | Default                     | Notes |
 |----------------------|-----------------|-----------------------------|-------|

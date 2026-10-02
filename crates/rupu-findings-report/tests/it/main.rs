@@ -8,5 +8,6 @@ mod blocks;
 mod common;
 mod exports;
 mod html_typst;
+mod import;
 mod markdown;
 mod pdf;
