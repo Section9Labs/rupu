@@ -25,7 +25,8 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            ArtifactFile, FeaturesReport, RunSpec, RunSpecKind, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
+            ArtifactFile, RunSpec, RunSpecKind, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
+            FEATURES_SUBCOMMAND,
         },
         NodeMirror,
     },
@@ -59,20 +60,11 @@ pub(crate) fn build_remote_command(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// `rupu __features`, made unable to fail on the remote `rupu`'s account: a
-/// remote predating the command (clap: unrecognized subcommand), or with no
-/// `rupu` on its PATH, exits 0 with empty stdout — no features. Only a
-/// failure of the ssh session itself makes the probe fail.
-fn features_probe_command() -> String {
-    format!(
-        "{} 2>/dev/null || true",
-        build_remote_command(&["rupu".to_string(), "__features".to_string()])
-    )
-}
-
 /// The `rupu workflow resume` argv [`SshHostConnector::resume_run`] sends.
 /// `if_unfinished` adds `--if-unfinished`, which only a remote advertising
-/// [`CAP_WORKFLOW_RESUME_IF_UNFINISHED`] accepts.
+/// [`CAP_WORKFLOW_RESUME_IF_UNFINISHED`] accepts. Public so `rupu-cli` can
+/// check its own clap accepts exactly this argv.
+#[doc(hidden)]
 pub fn resume_argv(run_id: &str, if_unfinished: bool) -> Vec<String> {
     let mut argv = vec![
         "rupu".to_string(),
@@ -84,6 +76,52 @@ pub fn resume_argv(run_id: &str, if_unfinished: bool) -> Vec<String> {
         argv.push("--if-unfinished".to_string());
     }
     argv
+}
+
+/// Printed by [`resume_command`] when it dispatched `--if-unfinished`.
+const RESUME_GUARDED: &str = "rupu-resume: if-unfinished";
+/// Printed by [`resume_command`] when it dispatched the bare resume.
+const RESUME_BARE: &str = "rupu-resume: bare";
+
+/// The one remote command [`SshHostConnector::resume_run`] sends: ask the
+/// remote `rupu` for its features, then dispatch the detached resume —
+/// with `--if-unfinished` when the report lists
+/// [`CAP_WORKFLOW_RESUME_IF_UNFINISHED`], bare otherwise — and print which
+/// one ([`RESUME_GUARDED`] / [`RESUME_BARE`]):
+///
+/// ```text
+/// if 'rupu' '__features' 2>/dev/null | grep -qF '"workflow.resume_if_unfinished"'; then
+///   echo '<guarded>'; <detached resume --if-unfinished>;
+/// else
+///   echo '<bare>'; <detached resume>;
+/// fi
+/// ```
+///
+/// - **One session.** The variant is chosen by the binary that then runs
+///   it, and a resume costs the host no extra ssh connection.
+/// - **The bare branch is the fallback.** A remote predating `__features`
+///   (clap: unrecognized subcommand), one with no `rupu` on its PATH, and
+///   one whose report doesn't list the feature all take it: their clap
+///   would reject the flag, and the detached resume would fail without a
+///   trace.
+/// - **The report is matched as the quoted JSON string**, which only an
+///   element of its `features` array can contain.
+///
+/// Both branches end in a backgrounding detach, so only an ssh failure
+/// makes the command fail.
+fn resume_command(run_id: &str) -> String {
+    let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
+    let feature = shell_escape(&format!("\"{CAP_WORKFLOW_RESUME_IF_UNFINISHED}\""));
+    let resume = |if_unfinished| {
+        SshHostConnector::detach(&build_remote_command(&resume_argv(run_id, if_unfinished)))
+    };
+    format!(
+        "if {probe} 2>/dev/null | grep -qF {feature}; then echo {}; {}; else echo {}; {}; fi",
+        shell_escape(RESUME_GUARDED),
+        resume(true),
+        shell_escape(RESUME_BARE),
+        resume(false),
+    )
 }
 
 /// Whether `id` is shaped like a locally-minted rupu run id (`run_<ULID>`):
@@ -1878,35 +1916,6 @@ impl SshHostConnector {
         Ok(())
     }
 
-    /// The remote `rupu`'s feature report ([`features_probe_command`]), read
-    /// fresh on every call: the remote binary can be upgraded or downgraded
-    /// at any time, and a stale "supported" would send a flag its clap
-    /// rejects. A remote predating `__features` reports no features; a
-    /// report that does not parse is treated the same, logged. Only an ssh
-    /// failure is an error.
-    async fn remote_features(&self) -> Result<FeaturesReport, HostConnectorError> {
-        let out = self
-            .exec
-            .run(&features_probe_command())
-            .await
-            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
-        if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
-        }
-        let stdout = out.stdout.trim();
-        if stdout.is_empty() {
-            return Ok(FeaturesReport::default());
-        }
-        Ok(serde_json::from_str(stdout).unwrap_or_else(|e| {
-            tracing::warn!(
-                host_id = %self.host_id,
-                error = %e,
-                "remote `rupu __features` printed an unreadable report; treating it as no features"
-            );
-            FeaturesReport::default()
-        }))
-    }
-
     /// Issue a one-shot `rupu session <tail...>` command on the remote host.
     /// The `rupu workflow`-prefixed sibling of [`remote_workflow`]; used by
     /// the session archive/restore/delete overrides.
@@ -2523,26 +2532,31 @@ impl HostConnector for SshHostConnector {
     /// the remote command loading it, and a bare `workflow resume` takes a
     /// failed/rejected/cancelled run as an operator retry and runs it
     /// again. So a remote advertising [`CAP_WORKFLOW_RESUME_IF_UNFINISHED`]
-    /// gets `--if-unfinished`, which refuses a finished run. An older
-    /// remote's clap would reject the flag, failing the detached resume
-    /// without a trace, so it gets the bare command and keeps the window;
-    /// the API's `paused` check before this call narrows it.
+    /// gets `--if-unfinished`, which refuses a finished run; the remote
+    /// checks its own features in the same command ([`resume_command`]).
+    /// An older remote's clap would reject the flag, failing the detached
+    /// resume without a trace, so it gets the bare command and keeps the
+    /// window — logged here; the API's `paused` check before this call
+    /// narrows it.
     async fn resume_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         let _clear = self.listings.clear_on_drop();
-        let if_unfinished = self
-            .remote_features()
-            .await?
-            .supports(CAP_WORKFLOW_RESUME_IF_UNFINISHED);
-        let argv = resume_argv(run_id, if_unfinished);
-        let remote_cmd = build_remote_command(&argv);
-        let detached = Self::detach(&remote_cmd);
         let out = self
             .exec
-            .run(&detached)
+            .run(&resume_command(run_id))
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if !out.success {
             return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        if out.stdout.lines().any(|line| line.trim() == RESUME_BARE) {
+            tracing::warn!(
+                host_id = %self.host_id,
+                run_id,
+                "the host's rupu does not advertise `{CAP_WORKFLOW_RESUME_IF_UNFINISHED}` \
+                 (it predates the flag, or `rupu {FEATURES_SUBCOMMAND}` failed there); resumed \
+                 without `--if-unfinished`, so a run that finishes before the resume loads it \
+                 is retried — upgrade rupu on the host"
+            );
         }
         Ok(())
     }
@@ -5605,190 +5619,105 @@ mod tests {
         );
     }
 
-    /// A remote whose feature probe prints `features_stdout` (`None`: the
-    /// ssh session for the probe fails) and whose every other command
-    /// succeeds. Records each command, in order.
-    struct FeaturesExec {
-        features_stdout: Option<String>,
-        commands: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl FeaturesExec {
-        fn new(features_stdout: Option<&str>) -> std::sync::Arc<Self> {
-            std::sync::Arc::new(Self {
-                features_stdout: features_stdout.map(str::to_string),
-                commands: Default::default(),
-            })
-        }
-
-        fn commands(&self) -> Vec<String> {
-            self.commands.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl RemoteExec for FeaturesExec {
-        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
-            self.commands.lock().unwrap().push(remote.to_string());
-            if remote.contains("'__features'") {
-                return Ok(match &self.features_stdout {
-                    Some(stdout) => RemoteOutput {
-                        stdout: stdout.clone(),
-                        stderr: String::new(),
-                        success: true,
-                    },
-                    None => RemoteOutput {
-                        stdout: String::new(),
-                        stderr: "ssh: connect to host h port 22: Connection refused".into(),
-                        success: false,
-                    },
-                });
-            }
-            Ok(RemoteOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                success: true,
-            })
-        }
-        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
-            unimplemented!()
-        }
-        async fn run_bytes(
-            &self,
-            _c: &str,
-            _s: Option<Vec<u8>>,
-        ) -> Result<Vec<u8>, RemoteExecError> {
-            unimplemented!()
-        }
-    }
-
-    /// The detached `workflow resume` command among `cmds`, asserting there
-    /// is exactly one.
-    fn the_resume_command(cmds: &[String], run_id: &str) -> String {
-        let resumes: Vec<&String> = cmds
-            .iter()
-            .filter(|c| {
-                c.contains("'workflow'")
-                    && c.contains("'resume'")
-                    && c.contains(&format!("'{run_id}'"))
-                    && (c.contains("setsid") || c.contains("nohup"))
-            })
-            .collect();
-        assert_eq!(resumes.len(), 1, "one detached resume expected: {cmds:?}");
-        resumes[0].clone()
-    }
-
+    /// One ssh session per resume: the feature check and the dispatch are a
+    /// single remote command, so the variant is chosen by the binary that
+    /// then runs it, and a click costs no extra connection to the host.
     #[tokio::test]
-    async fn ssh_resume_run_passes_if_unfinished_when_the_remote_advertises_it() {
-        let report =
-            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
-        let fake = FeaturesExec::new(Some(&report));
+    async fn ssh_resume_run_checks_features_and_dispatches_in_one_command() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
-        let run_id = "run_01TESTRESUMEGUARDED";
+        let run_id = "run_01TESTRESUMEONECMD";
 
         conn.resume_run(run_id).await.unwrap();
 
-        let cmds = fake.commands();
-        assert!(
-            cmds.first().is_some_and(|c| c.contains("'__features'")),
-            "the remote's features are probed before it is asked to resume: {cmds:?}"
-        );
-        let resume = the_resume_command(&cmds, run_id);
-        assert!(resume.contains("'--if-unfinished'"), "{resume}");
+        let cmds = fake.commands.lock().unwrap();
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert!(cmds[0].contains("'__features'"), "{}", cmds[0]);
     }
 
-    /// An older remote `rupu` rejects `__features` (clap: unrecognized
-    /// subcommand). The probe swallows that, so the host answers with no
-    /// features — and gets the bare command its clap accepts, rather than
-    /// a flag that would fail the detached resume without a trace.
-    #[tokio::test]
-    async fn ssh_resume_run_omits_if_unfinished_for_a_remote_predating_it() {
-        for (why, stdout) in [
-            ("no __features command", ""),
-            (
-                "features without the flag",
-                r#"{"features":["agent.findings_profile"]}"#,
-            ),
-            ("unreadable report", "not json"),
-        ] {
-            let fake = FeaturesExec::new(Some(stdout));
-            let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
-            let run_id = "run_01TESTRESUMEOLDREMOTE";
-
-            conn.resume_run(run_id)
-                .await
-                .unwrap_or_else(|e| panic!("{why}: {e:?}"));
-
-            let resume = the_resume_command(&fake.commands(), run_id);
-            assert!(!resume.contains("--if-unfinished"), "{why}: {resume}");
-        }
-    }
-
-    #[tokio::test]
-    async fn ssh_resume_run_dispatches_nothing_when_the_feature_probe_cannot_reach_the_host() {
-        let fake = FeaturesExec::new(None);
-        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
-
-        let err = conn
-            .resume_run("run_01TESTRESUMEPROBEDOWN")
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(err, HostConnectorError::Unreachable(_)),
-            "expected Unreachable, got {err:?}"
-        );
-        let cmds = fake.commands();
-        assert!(
-            !cmds.iter().any(|c| c.contains("'resume'")),
-            "no resume is sent to a host whose features could not be read: {cmds:?}"
-        );
-    }
-
-    /// The probe's contract, through a real shell: a remote `rupu` that
-    /// fails the command (or is missing) still exits 0 with empty stdout,
-    /// so only an ssh failure makes the probe fail; a current `rupu`'s
-    /// report comes through verbatim.
+    /// The resume command's contract, through a real shell, against a fake
+    /// remote `rupu` that records the argv it is resumed with: only a
+    /// remote whose `rupu __features` lists the feature is sent
+    /// `--if-unfinished`. An older remote (clap rejects `__features`), one
+    /// listing other features, one printing an unreadable report, and one
+    /// with no `rupu` at all each get the bare command — and the shell
+    /// says which it ran.
     #[test]
-    fn features_probe_reports_nothing_rather_than_failing_on_an_old_remote() {
+    fn resume_command_sends_if_unfinished_only_to_a_remote_advertising_it() {
         let report =
             serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
-        let cases = [
-            (
-                "old rupu",
-                Some(
-                    "#!/bin/sh\necho \"error: unrecognized subcommand '__features'\" >&2\nexit 2\n"
-                        .to_string(),
-                ),
-                "",
-            ),
-            ("no rupu", None, ""),
+        let run_id = "run_01E2ERESUMEFEATURES";
+        let old_clap = "echo \"error: unrecognized subcommand '__features'\" >&2; exit 2";
+        let cases: [(&str, Option<String>, Option<&str>); 5] = [
             (
                 "current rupu",
-                Some(format!("#!/bin/sh\necho '{report}'\n")),
-                report.as_str(),
+                Some(format!("echo '{report}'; exit 0")),
+                Some("workflow resume run_01E2ERESUMEFEATURES --if-unfinished"),
             ),
+            (
+                "rupu predating __features",
+                Some(old_clap.to_string()),
+                Some("workflow resume run_01E2ERESUMEFEATURES"),
+            ),
+            (
+                "rupu listing other features",
+                Some(r#"echo '{"features":["agent.findings_profile"]}'; exit 0"#.to_string()),
+                Some("workflow resume run_01E2ERESUMEFEATURES"),
+            ),
+            (
+                "unreadable report",
+                Some("echo 'not json'; exit 0".to_string()),
+                Some("workflow resume run_01E2ERESUMEFEATURES"),
+            ),
+            ("no rupu", None, None),
         ];
-        for (why, script, expected) in cases {
+        for (why, features, expected_argv) in cases {
             let bin = tempfile::tempdir().unwrap();
-            if let Some(script) = script {
+            let log = bin.path().join("resumed.log");
+            if let Some(features) = &features {
                 use std::os::unix::fs::PermissionsExt;
                 let rupu = bin.path().join("rupu");
-                std::fs::write(&rupu, script).unwrap();
+                std::fs::write(
+                    &rupu,
+                    format!(
+                        "#!/bin/sh\nif [ \"$1\" = __features ]; then {features}; fi\necho \"$*\" >> '{}'\n",
+                        log.display()
+                    ),
+                )
+                .unwrap();
                 std::fs::set_permissions(&rupu, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let out = std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(features_probe_command())
-                .env("PATH", bin.path())
+                .arg(resume_command(run_id))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
                 .output()
-                .expect("the probe shell itself must run");
+                .expect("the resume shell itself must run");
             assert!(out.status.success(), "{why}: {out:?}");
+            let marker = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let guarded = expected_argv.is_some_and(|a| a.ends_with("--if-unfinished"));
             assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim(),
-                expected,
+                marker,
+                if guarded { RESUME_GUARDED } else { RESUME_BARE },
                 "{why}"
             );
+            let Some(expected_argv) = expected_argv else {
+                continue;
+            };
+            // The resume is detached: wait for the fake to record it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let got = std::fs::read_to_string(&log).unwrap_or_default();
+                if got.ends_with('\n') {
+                    assert_eq!(got, format!("{expected_argv}\n"), "{why}");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{why}: the detached resume never ran (log: {got:?})"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
     }
 

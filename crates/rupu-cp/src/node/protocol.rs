@@ -110,9 +110,12 @@ pub fn host_features() -> Vec<String> {
     ]
 }
 
-/// What `rupu __features` prints (one JSON object on stdout), and what the
-/// SSH connector parses from it. A remote predating the command prints
-/// nothing, which reads as no features.
+/// The hidden `rupu` subcommand that prints this build's [`FeaturesReport`]
+/// — what an SSH coordinator runs on a remote to learn its features.
+pub const FEATURES_SUBCOMMAND: &str = "__features";
+
+/// What `rupu __features` prints: one JSON object on stdout. A remote
+/// predating the command prints nothing, which reads as no features.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct FeaturesReport {
     #[serde(default)]

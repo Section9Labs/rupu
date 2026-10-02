@@ -1,7 +1,8 @@
 //! Hidden `rupu __features` helper — prints this build's host features
-//! (`rupu_cp::node::protocol::FeaturesReport`) as one JSON object. The SSH
-//! connector reads it before building a command a remote may predate (e.g.
-//! `workflow resume --if-unfinished`); `/api/host/info` serves the same list.
+//! (`rupu_cp::node::protocol::FeaturesReport`) as one JSON object. An SSH
+//! coordinator runs it on the remote before a command the remote may predate
+//! (e.g. `workflow resume --if-unfinished`, chosen in the same remote
+//! command); `/api/host/info` serves the same list.
 
 use std::process::ExitCode;
 

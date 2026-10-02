@@ -1,15 +1,17 @@
 use assert_cmd::Command;
-use rupu_cp::node::protocol::{FeaturesReport, CAP_WORKFLOW_RESUME_IF_UNFINISHED};
+use rupu_cp::node::protocol::{
+    FeaturesReport, CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
+};
 
 /// `rupu __features` is how an SSH coordinator learns what this binary
-/// honours before it builds a command for it: stdout is the report the
-/// coordinator parses, nothing else.
+/// honours before it builds a command for it: stdout is the report, and
+/// nothing else.
 #[test]
 fn prints_this_builds_features_report() {
     let home = tempfile::tempdir().unwrap();
     let out = Command::cargo_bin("rupu")
         .unwrap()
-        .arg("__features")
+        .arg(FEATURES_SUBCOMMAND)
         .env("RUPU_HOME", home.path())
         .output()
         .unwrap();

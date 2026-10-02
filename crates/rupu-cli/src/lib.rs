@@ -724,9 +724,13 @@ mod arg_parse_tests {
         }
     }
 
+    /// The subcommand an SSH coordinator runs to read this build's features
+    /// is this one — renamed on one side only, every remote would look like
+    /// it predates the features it has.
     #[test]
-    fn features_helper_parses() {
-        let cli = Cli::try_parse_from(["rupu", "__features"]).unwrap();
+    fn features_helper_parses_under_the_name_coordinators_run() {
+        let cli =
+            Cli::try_parse_from(["rupu", rupu_cp::node::protocol::FEATURES_SUBCOMMAND]).unwrap();
         assert!(matches!(cli.command, Cmd::Features), "{:?}", cli.command);
     }
 

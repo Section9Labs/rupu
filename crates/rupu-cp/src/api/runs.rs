@@ -384,8 +384,9 @@ async fn pause_run(
 /// `run_workflow` with the persisted checkpoint (+ mid-step seed, when
 /// present). Any other status yields 409.
 ///
-/// With `?host=<remote-id>`: the same `paused` rule, against the status the
-/// run detail shows ([`get_run_from_host`]); then proxies via
+/// With `?host=<remote-id>`: the same `paused` rule, against the host's own
+/// status for the run ([`get_run_from_host`]: the host first, its local
+/// mirror when the host can't answer); then proxies via
 /// [`HostConnector::resume_run`] and returns `{ "ok": true, "host_id":
 /// "<id>" }`. A run the page still offered "Resume" for but that finished
 /// (or was cancelled) since is refused here — the host's resume would take
@@ -2428,11 +2429,15 @@ pub(crate) mod tests {
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
-    /// A remote host whose `get_run` reports `status` (`None`: no such
-    /// run) and which records every `resume_run` it is asked for. Methods
+    /// A remote host whose `get_run` reports `status` and which records
+    /// every `resume_run` it is asked for. With `status: None` the host has
+    /// no such run — or, with `mirror`, can't answer (a remote predating
+    /// `rupu run show`), so its runs are read from the local mirror. Methods
     /// these tests never reach panic rather than no-op.
+    #[derive(Default)]
     struct ResumeHostConnector {
         status: Option<&'static str>,
+        mirror: bool,
         resumed: std::sync::Mutex<Vec<String>>,
     }
 
@@ -2478,8 +2483,14 @@ pub(crate) mod tests {
                     "steps": [],
                     "usage": {},
                 })),
+                None if self.mirror => Err(HostConnectorError::Unsupported(
+                    "remote host does not support `rupu run show`".into(),
+                )),
                 None => Err(HostConnectorError::NotFound(run_id.to_string())),
             }
+        }
+        fn serves_runs_from_local_mirror(&self) -> bool {
+            self.mirror
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!("not exercised by this test")
@@ -2568,7 +2579,7 @@ pub(crate) mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let conn = Arc::new(ResumeHostConnector {
                 status: Some(status),
-                resumed: Default::default(),
+                ..Default::default()
             });
             let s = state_with_remote(&tmp, Arc::clone(&conn));
 
@@ -2589,7 +2600,7 @@ pub(crate) mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = Arc::new(ResumeHostConnector {
             status: Some("paused"),
-            resumed: Default::default(),
+            ..Default::default()
         });
         let s = state_with_remote(&tmp, Arc::clone(&conn));
 
@@ -2608,10 +2619,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resume_remote_unknown_run_is_not_found_and_never_sent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = Arc::new(ResumeHostConnector {
-            status: None,
-            resumed: Default::default(),
-        });
+        let conn = Arc::new(ResumeHostConnector::default());
         let s = state_with_remote(&tmp, Arc::clone(&conn));
 
         let err = resume_on_remote(s, "ghost")
@@ -2620,6 +2628,41 @@ pub(crate) mod tests {
 
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
         assert!(conn.resumed.lock().unwrap().is_empty());
+    }
+
+    /// A host that can't report the run (one predating `rupu run show`)
+    /// is checked against the local mirror — and those hosts are exactly
+    /// the ones too old for `--if-unfinished`, so this check is all that
+    /// stands between a finished run and its retry.
+    #[tokio::test]
+    async fn resume_remote_run_is_checked_against_the_mirror_when_the_host_cannot_report() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = Arc::new(ResumeHostConnector {
+            mirror: true,
+            ..Default::default()
+        });
+        let s = state_with_remote(&tmp, Arc::clone(&conn));
+        s.run_store
+            .create(terminal_record("run_mirrored_done"), "name: x\n")
+            .unwrap();
+        s.run_store
+            .create(paused_record("run_mirrored_paused", "gate"), "name: x\n")
+            .unwrap();
+
+        let err = resume_on_remote(s.clone(), "run_mirrored_done")
+            .await
+            .expect_err("a mirrored run that finished does not resume");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        assert!(conn.resumed.lock().unwrap().is_empty());
+
+        let resp = resume_on_remote(s, "run_mirrored_paused")
+            .await
+            .expect("a mirrored paused run resumes");
+        assert_eq!(resp.0["ok"], true);
+        assert_eq!(
+            *conn.resumed.lock().unwrap(),
+            vec!["run_mirrored_paused".to_string()]
+        );
     }
 
     /// A completed run record suitable for archive / delete tests.
