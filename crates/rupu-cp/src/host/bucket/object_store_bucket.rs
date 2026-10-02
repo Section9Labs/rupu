@@ -21,7 +21,7 @@ use object_store::{
 
 use super::{
     BucketError, Bucket,
-    key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
+    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
     prefix_control, prefix_results,
 };
 
@@ -288,6 +288,101 @@ impl Bucket for ObjectStoreBucket {
         }
         Ok(out)
     }
+
+    async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+        self.exists(&self.path(&key_artifact(sha256))).await
+    }
+
+    async fn put_artifact_file(
+        &self,
+        sha256: &str,
+        src: &std::path::Path,
+    ) -> Result<(), BucketError> {
+        use tokio::io::AsyncReadExt;
+        let io = |e: std::io::Error| BucketError::Io(format!("reading artifact {sha256}: {e}"));
+        // Open BEFORE starting the upload, so a source that can't be read
+        // leaves nothing half-created in the bucket. The store is a
+        // directory the run's agents can influence: a FIFO swapped in for a
+        // blob must not park the worker's drain loop on the open, so this
+        // refuses anything but a regular file (the tunnel's pull opens its
+        // blobs the same way).
+        let owned = src.to_path_buf();
+        let file =
+            tokio::task::spawn_blocking(move || crate::api::fs_open::open_regular_file(&owned))
+                .await
+                .map_err(|e| BucketError::Io(format!("opening artifact {sha256}: {e}")))?
+                .map_err(io)?;
+        let mut f = tokio::fs::File::from_std(file);
+
+        let path = self.path(&key_artifact(sha256));
+        let upload = self
+            .store
+            .put_multipart(&path)
+            .await
+            .map_err(|e| BucketError::Io(e.to_string()))?;
+        let mut w = object_store::WriteMultipart::new(upload);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = match f.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // Don't leave an unfinished multipart upload behind.
+                    let _ = w.abort().await;
+                    return Err(io(e));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            w.write(&buf[..n]);
+        }
+        w.finish()
+            .await
+            .map_err(|e| BucketError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_artifact_to_file(
+        &self,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<(), BucketError> {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt;
+        let io = |e: std::io::Error| BucketError::Io(format!("local write failed: {e}"));
+        let too_big = || {
+            BucketError::Io(format!(
+                "artifact {sha256} exceeds its recorded {max_bytes} bytes"
+            ))
+        };
+        let path = self.path(&key_artifact(sha256));
+        let got = match self.store.get(&path).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(BucketError::NotFound(key_artifact(sha256)))
+            }
+            Err(e) => return Err(BucketError::Io(e.to_string())),
+        };
+        // A stored size over the cap is refused before anything is written;
+        // the stream below is still held to the cap as it arrives.
+        if got.meta.size > max_bytes {
+            return Err(too_big());
+        }
+        let mut stream = got.into_stream();
+        let mut file = tokio::fs::File::create(dest).await.map_err(io)?;
+        let mut total: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| BucketError::Io(e.to_string()))?;
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(too_big());
+            }
+            file.write_all(&chunk).await.map_err(io)?;
+        }
+        file.flush().await.map_err(io)?;
+        Ok(())
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -349,6 +444,98 @@ mod tests {
         );
         // Worker markers are not jobs.
         assert!(b.list_jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifact_put_exists_get_roundtrip_and_cap() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, b"artifact!").unwrap();
+        let sha = "ab".repeat(32);
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+        b.put_artifact_file(&sha, &src).await.unwrap();
+        assert!(b.artifact_exists(&sha).await.unwrap());
+        let dest = tmp.path().join("out");
+        b.get_artifact_to_file(&sha, &dest, 9).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"artifact!");
+        assert!(b.get_artifact_to_file(&sha, &dest, 8).await.is_err());
+        assert!(matches!(
+            b.get_artifact_to_file(&"cd".repeat(32), &dest, 9).await,
+            Err(BucketError::NotFound(_))
+        ));
+    }
+
+    /// A blob bigger than one read buffer round-trips byte-for-byte (the
+    /// upload is streamed in pieces, not read whole).
+    #[tokio::test]
+    async fn artifact_larger_than_one_buffer_roundtrips() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let body: Vec<u8> = (0..(3 << 20) + 17).map(|i| (i % 251) as u8).collect();
+        let src = tmp.path().join("big");
+        std::fs::write(&src, &body).unwrap();
+        let sha = "12".repeat(32);
+        b.put_artifact_file(&sha, &src).await.unwrap();
+        let dest = tmp.path().join("big.out");
+        b.get_artifact_to_file(&sha, &dest, body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // Exactly one byte under the real size is over the cap.
+        assert!(b
+            .get_artifact_to_file(&sha, &dest, body.len() as u64 - 1)
+            .await
+            .is_err());
+    }
+
+    /// Artifacts live under `artifacts/`, not under jobs/results/nodes, so
+    /// they don't show up in any of the run-scoped listings.
+    #[tokio::test]
+    async fn artifacts_do_not_pollute_other_listings() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, b"x").unwrap();
+        b.put_artifact_file(&"ab".repeat(32), &src).await.unwrap();
+        assert!(b.list_jobs().await.unwrap().is_empty());
+        assert!(b.list_worker_info().await.unwrap().is_empty());
+        assert!(b.list_results("run_1").await.unwrap().is_empty());
+    }
+
+    /// The upload opens its source without ever parking the worker: a FIFO
+    /// where a blob should be is refused, and no upload is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_upload_refuses_a_fifo_source_without_blocking() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("fifo");
+        if !crate::api::fs_open::test_support::mkfifo(&fifo) {
+            return;
+        }
+        let sha = "fe".repeat(32);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            b.put_artifact_file(&sha, &fifo),
+        )
+        .await
+        .expect("opening a FIFO blocked the upload");
+        assert!(matches!(res, Err(BucketError::Io(_))), "{res:?}");
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+    }
+
+    /// A source that isn't there is an error, not an empty upload.
+    #[tokio::test]
+    async fn artifact_upload_of_a_missing_source_fails_and_uploads_nothing() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "ee".repeat(32);
+        assert!(b
+            .put_artifact_file(&sha, &tmp.path().join("absent"))
+            .await
+            .is_err());
+        assert!(!b.artifact_exists(&sha).await.unwrap());
     }
 
     #[tokio::test]

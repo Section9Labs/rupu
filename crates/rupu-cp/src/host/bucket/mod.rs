@@ -10,6 +10,7 @@
 //! runs/<run_id>/<key>         — result objects uploaded by the node
 //! runs/<run_id>/finished      — terminal status string written by the node
 //! nodes/<worker_id>.json      — a pull worker's self-description (version + capabilities)
+//! artifacts/<sha256>          — finding-artifact blobs a worker uploaded at run end
 //! ```
 
 use async_trait::async_trait;
@@ -120,6 +121,28 @@ pub trait Bucket: Send + Sync {
     /// Every worker self-description under `nodes/`, in key order. Empty when
     /// no worker has written one.
     async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError>;
+
+    /// Whether `artifacts/<sha256>` exists.
+    async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError>;
+
+    /// Upload the file at `src` to `artifacts/<sha256>` (streamed multipart).
+    /// `src` is opened without ever blocking on it and must be a regular
+    /// file; nothing is uploaded when it can't be read.
+    async fn put_artifact_file(
+        &self,
+        sha256: &str,
+        src: &std::path::Path,
+    ) -> Result<(), BucketError>;
+
+    /// Stream `artifacts/<sha256>` into `dest`, failing once MORE than
+    /// `max_bytes` have arrived. `NotFound` when no worker uploaded it. On any
+    /// error after `dest` was created it is left for the caller to remove.
+    async fn get_artifact_to_file(
+        &self,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<(), BucketError>;
 }
 
 // ── key-layout helpers ────────────────────────────────────────────────────────
@@ -162,4 +185,9 @@ pub(crate) fn key_finished(run_id: &str) -> String {
 /// `nodes/<worker_id>.json`
 pub(crate) fn key_worker_info(worker_id: &str) -> String {
     format!("nodes/{worker_id}.json")
+}
+
+/// `artifacts/<sha256>`
+pub(crate) fn key_artifact(sha256: &str) -> String {
+    format!("artifacts/{sha256}")
 }

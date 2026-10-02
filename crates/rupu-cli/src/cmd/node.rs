@@ -1378,31 +1378,108 @@ async fn upload_usage_ledger(
     upload_new_lines(bucket, rid, "usage", &usage_path(run_dir), usage).await
 }
 
+/// sha256s of the `stored: copied` artifacts that findings in a run's
+/// coverage stream reference. A torn trailing line, an unparseable line, or
+/// an entry whose hash isn't a store key is skipped, never an error.
+fn referenced_artifacts(stream: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(stream) else {
+        return Default::default();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<rupu_coverage::StreamLine>(l).ok())
+        .filter_map(|l| match l {
+            rupu_coverage::StreamLine::Findings { record, .. } => record.report,
+            _ => None,
+        })
+        .flat_map(|r| r.artifacts)
+        .filter(|a| {
+            a.stored == Some(rupu_coverage::report::ArtifactStorage::Copied)
+                && rupu_coverage::report::is_sha256_hex(&a.sha256)
+        })
+        .map(|a| a.sha256)
+        .collect()
+}
+
+/// Upload every blob this run's findings reference to `artifacts/<sha256>`,
+/// so the coordinator can pull them later without this worker online (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §B1). A bucket worker
+/// may never be polled again once its run finishes, so this is the only
+/// chance — which makes the blobs part of what [`finish_bucket_run`] holds
+/// the terminal run for. Returns `true` when nothing is left to upload.
+///
+/// A bucket error (the existence check or the upload) returns `false`: the
+/// caller keeps the run active and retries next tick, and a blob that landed
+/// meanwhile is skipped by its existence check. A blob this worker's store
+/// does not hold as a regular file can never land, so it is logged and
+/// skipped rather than holding the run forever — the coordinator reports it
+/// unavailable.
+async fn upload_referenced_artifacts(bucket: &dyn Bucket, global: &Path, run_dir: &Path) -> bool {
+    let mut landed = true;
+    for sha in referenced_artifacts(&run_dir.join(rupu_coverage::STREAM_FILE)) {
+        match bucket.artifact_exists(&sha).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                warn!(sha = %sha, error = %e, "node pull: artifact existence check failed; holding the run to retry");
+                landed = false;
+                continue;
+            }
+        }
+        let Ok(src) = crate::cmd::findings_helper::blob_path(global, &sha) else {
+            continue;
+        };
+        // Not followed: the store only ever holds regular files, and a FIFO
+        // or a dangling link would fail every retry.
+        let in_store = std::fs::symlink_metadata(&src).is_ok_and(|m| m.file_type().is_file());
+        if !in_store {
+            warn!(
+                sha = %sha, path = %src.display(),
+                "node pull: a referenced artifact is not in this worker's store; the coordinator will report it unavailable"
+            );
+            continue;
+        }
+        if let Err(e) = bucket.put_artifact_file(&sha, &src).await {
+            warn!(sha = %sha, error = %e, "node pull: artifact upload failed; holding the run to retry");
+            landed = false;
+        }
+    }
+    landed
+}
+
 /// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
-/// upload whatever every stream still holds, then the terminal `run.json`, and
-/// only then write the `finished` marker. Returns `true` when the marker
-/// landed.
+/// upload whatever every stream still holds, then the artifact blobs the
+/// run's findings reference, then the terminal `run.json`, and only then write
+/// the `finished` marker. Returns `true` when the marker landed. Every terminal
+/// outcome (completed / failed / rejected / cancelled) comes through here.
 ///
 /// A row the runner appended after the routine drain would otherwise never be
 /// uploaded — the run leaves `active` once this returns `true` — and the CP
 /// would finish the run short. The CP finishes a run on the terminal
 /// `run.json` body and stops polling it from then on, so that body and the
 /// marker are the CP's "nothing more is coming" signals: each is written ONLY
-/// after everything before it landed. If any stream fails, nothing after it is
-/// attempted (no `run.json`, no marker); if `run.json` or the marker fails, the
-/// marker is not written / reported. Either way this returns `false` and the
-/// caller keeps the run active, retrying next tick (a failed chunk retries
-/// byte-exact under its own key). Every stream is still attempted when one
-/// fails.
+/// after everything before it landed — so a CP that sees the run terminal can
+/// already pull every artifact blob its findings reference (a bucket worker
+/// may never be polled again). The blobs go after the final coverage drain,
+/// so the references are read from the run's complete stream. If any stream
+/// or blob upload fails, nothing after it is attempted (no `run.json`, no
+/// marker); if `run.json` or the marker fails, the marker is not written /
+/// reported. Either way this returns `false` and the caller keeps the run
+/// active, retrying next tick (a failed chunk retries byte-exact under its own
+/// key; a blob that already landed is not re-uploaded). Every stream is still
+/// attempted when one fails.
 async fn finish_bucket_run(
     bucket: &dyn Bucket,
     rid: &str,
     run_dir: &Path,
+    global: &Path,
     streams: &mut BucketStreams,
     run_json: &[u8],
     status: &str,
 ) -> bool {
     if !streams.upload_all(bucket, rid, run_dir).await {
+        return false;
+    }
+    if !upload_referenced_artifacts(bucket, global, run_dir).await {
         return false;
     }
     // The routine pass withholds a terminal run.json (see `upload_routine`), so
@@ -1458,10 +1535,20 @@ async fn finish_if_terminal(
     bucket: &dyn Bucket,
     rid: &str,
     run_dir: &Path,
+    global: &Path,
     streams: &mut BucketStreams,
 ) -> Option<(String, bool)> {
     let (status, body) = read_terminal_status(&run_dir.join("run.json"))?;
-    let landed = finish_bucket_run(bucket, rid, run_dir, streams, body.as_bytes(), &status).await;
+    let landed = finish_bucket_run(
+        bucket,
+        rid,
+        run_dir,
+        global,
+        streams,
+        body.as_bytes(),
+        &status,
+    )
+    .await;
     Some((status, landed))
 }
 
@@ -1539,6 +1626,7 @@ async fn bucket_tick(
     exe: &Path,
     host_id: &str,
     runs_root: &Path,
+    global: &Path,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
 ) -> ClaimOutcome {
@@ -1546,7 +1634,7 @@ async fn bucket_tick(
     // First attempt right away; a marker that did not land is retried on
     // every later tick until it does.
     flush_failed_markers(bucket, &mut pending.failed_unmarked).await;
-    drain_active_runs(bucket, exe, runs_root, active).await;
+    drain_active_runs(bucket, exe, runs_root, global, active).await;
     outcome
 }
 
@@ -1660,6 +1748,7 @@ async fn drain_active_runs(
     bucket: &dyn Bucket,
     exe: &Path,
     runs_root: &Path,
+    global: &Path,
     active: &mut HashMap<String, BucketRunState>,
 ) {
     let run_ids: Vec<String> = active.keys().cloned().collect();
@@ -1762,7 +1851,7 @@ async fn drain_active_runs(
 
         // Check for terminal status → the terminal pass (final drain of
         // every stream, run.json, then the `finished` marker).
-        match finish_if_terminal(bucket, rid, &run_dir, &mut state.streams).await {
+        match finish_if_terminal(bucket, rid, &run_dir, global, &mut state.streams).await {
             Some((status, true)) => {
                 info!(run_id = %rid, status = %status, "node pull: run finished");
                 finished.push(rid.clone());
@@ -1827,6 +1916,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             &exe,
             &host_id,
             &runs_root,
+            &global,
             &mut active,
             &mut pending,
         )
@@ -2093,6 +2183,8 @@ mod tests {
         ops: std::sync::Mutex<Vec<(String, String)>>,
         attempts: std::sync::Mutex<Vec<(String, String)>>,
         fail_prefix: std::sync::Mutex<Option<String>>,
+        /// `artifacts/<sha256>` objects, in memory.
+        artifacts: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
     }
 
     impl RecordingBucket {
@@ -2190,6 +2282,51 @@ mod tests {
         async fn probe(&self) -> Result<(), BucketError> {
             unreachable!()
         }
+        async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+            Ok(self.artifacts.lock().unwrap().contains_key(sha256))
+        }
+        /// Stored under `artifacts/<sha256>`; logged as an `artifact:<sha256>`
+        /// op (body = the blob) so a test sees where it falls relative to the
+        /// `finished` marker.
+        async fn put_artifact_file(
+            &self,
+            sha256: &str,
+            src: &std::path::Path,
+        ) -> Result<(), BucketError> {
+            let key = format!("artifact:{sha256}");
+            let body = std::fs::read(src).map_err(|e| BucketError::Io(e.to_string()))?;
+            let entry = (key.clone(), String::from_utf8_lossy(&body).into_owned());
+            self.attempts.lock().unwrap().push(entry.clone());
+            if self.fails(&key) {
+                return Err(BucketError::Io(format!("injected failure for {key}")));
+            }
+            self.ops.lock().unwrap().push(entry);
+            self.artifacts
+                .lock()
+                .unwrap()
+                .insert(sha256.to_string(), body);
+            Ok(())
+        }
+        async fn get_artifact_to_file(
+            &self,
+            sha256: &str,
+            dest: &std::path::Path,
+            max_bytes: u64,
+        ) -> Result<(), BucketError> {
+            let body = self
+                .artifacts
+                .lock()
+                .unwrap()
+                .get(sha256)
+                .cloned()
+                .ok_or_else(|| BucketError::NotFound(format!("artifacts/{sha256}")))?;
+            if body.len() as u64 > max_bytes {
+                return Err(BucketError::Io(format!(
+                    "artifact {sha256} exceeds its recorded {max_bytes} bytes"
+                )));
+            }
+            std::fs::write(dest, body).map_err(|e| BucketError::Io(e.to_string()))
+        }
     }
 
     const RUN_JSON: &[u8] = b"{\"status\":\"completed\"}";
@@ -2215,6 +2352,7 @@ mod tests {
             finish_bucket_run(
                 &bucket,
                 "run_BKT",
+                dir.path(),
                 dir.path(),
                 &mut streams,
                 RUN_JSON,
@@ -2251,6 +2389,7 @@ mod tests {
                 &quiet,
                 "run_QUIET",
                 dir.path(),
+                dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "failed",
@@ -2282,6 +2421,7 @@ mod tests {
             &bucket,
             "run_T",
             dir.path(),
+            dir.path(),
             &mut streams,
             RUN_JSON,
             "completed",
@@ -2305,6 +2445,7 @@ mod tests {
         let done = finish_bucket_run(
             &bucket,
             "run_T",
+            dir.path(),
             dir.path(),
             &mut streams,
             RUN_JSON,
@@ -2357,6 +2498,7 @@ mod tests {
                 &bucket,
                 "run_M",
                 dir.path(),
+                dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "completed",
@@ -2370,6 +2512,7 @@ mod tests {
             finish_bucket_run(
                 &bucket,
                 "run_M",
+                dir.path(),
                 dir.path(),
                 &mut streams,
                 RUN_JSON,
@@ -2397,6 +2540,7 @@ mod tests {
                 &bucket,
                 "run_J",
                 dir.path(),
+                dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "completed",
@@ -2422,6 +2566,7 @@ mod tests {
                 &fb.bucket,
                 "run_1",
                 run_dir.path(),
+                run_dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "completed",
@@ -2439,6 +2584,7 @@ mod tests {
             finish_bucket_run(
                 &fb.bucket,
                 "run_1",
+                run_dir.path(),
                 run_dir.path(),
                 &mut streams,
                 RUN_JSON,
@@ -2480,7 +2626,7 @@ mod tests {
 
         for _tick in 0..3 {
             upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
-            let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), &mut streams).await;
+            let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), run_dir.path(), &mut streams).await;
             assert_eq!(outcome, Some(("completed".to_string(), false)));
             assert!(
                 bucket.landed().is_empty(),
@@ -2492,7 +2638,7 @@ mod tests {
         bucket.set_failing(None);
         upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
         assert_eq!(bucket.landed_keys(), ["events.0000.jsonl"], "streams first");
-        let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), &mut streams).await;
+        let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), run_dir.path(), &mut streams).await;
         assert_eq!(outcome, Some(("completed".to_string(), true)));
         assert_eq!(
             bucket.landed_keys(),
@@ -2517,7 +2663,7 @@ mod tests {
         upload_routine(&bucket, "run_P", run_dir.path(), &mut streams).await;
         assert_eq!(bucket.landed_keys(), ["run.json"]);
         assert_eq!(
-            finish_if_terminal(&bucket, "run_P", run_dir.path(), &mut streams).await,
+            finish_if_terminal(&bucket, "run_P", run_dir.path(), run_dir.path(), &mut streams).await,
             None
         );
         assert_eq!(
@@ -2642,6 +2788,24 @@ mod tests {
         async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
             self.inner.list_worker_info().await
         }
+        async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+            self.inner.artifact_exists(sha256).await
+        }
+        async fn put_artifact_file(
+            &self,
+            sha256: &str,
+            src: &std::path::Path,
+        ) -> Result<(), BucketError> {
+            self.inner.put_artifact_file(sha256, src).await
+        }
+        async fn get_artifact_to_file(
+            &self,
+            sha256: &str,
+            dest: &std::path::Path,
+            max_bytes: u64,
+        ) -> Result<(), BucketError> {
+            self.inner.get_artifact_to_file(sha256, dest, max_bytes).await
+        }
     }
 
     /// A harmless stand-in for the `rupu` executable: exits at once, ignoring
@@ -2673,6 +2837,9 @@ mod tests {
             Path::new(TRUE_EXE),
             "host_1",
             runs_root,
+            // The worker's global dir (its artifact store's root); these runs
+            // reference no artifacts.
+            runs_root.parent().unwrap_or(runs_root),
             active,
             pending,
         )
@@ -2882,6 +3049,267 @@ mod tests {
         }
         // Nothing pending: nothing written, nothing to do.
         flush_failed_markers(&fb.bucket, &mut pending).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Artifact upload at run end
+    // ------------------------------------------------------------------
+
+    /// A `ledger:"findings"` stream line whose full report references
+    /// `artifacts`.
+    fn findings_stream_line(
+        id: &str,
+        artifacts: Vec<(&str, rupu_coverage::report::ArtifactStorage)>,
+    ) -> String {
+        use rupu_coverage::report::{ArtifactKind, ArtifactRef, FindingReport};
+        let mut report: FindingReport = serde_json::from_str(include_str!(
+            "../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap();
+        report.artifacts = artifacts
+            .into_iter()
+            .map(|(sha, stored)| ArtifactRef {
+                path: "poc/x".into(),
+                sha256: sha.into(),
+                size: 1,
+                kind: Some(ArtifactKind::Binary),
+                stored: Some(stored),
+                host: None,
+            })
+            .collect();
+        let record = rupu_coverage::FindingRecord {
+            id: id.into(),
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: rupu_coverage::FindingScope::File,
+            summary: "s".into(),
+            severity: rupu_coverage::Severity::High,
+            concern_id: None,
+            evidence: rupu_coverage::FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".into(),
+                references: vec![],
+            },
+            declared_by: rupu_coverage::Attribution {
+                run_id: "r".into(),
+                model: "m".into(),
+                surface: rupu_coverage::Surface::Agent,
+                codename: None,
+                agent: None,
+                provider: None,
+            },
+            declared_at: chrono::Utc::now(),
+            profile: rupu_coverage::FindingProfile::Full,
+            report: Some(report),
+        };
+        serde_json::to_string(&rupu_coverage::StreamLine::Findings {
+            scope_name: "sec".into(),
+            record,
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    fn begin_stream_line() -> String {
+        serde_json::to_string(&rupu_coverage::StreamLine::Begin {
+            v: 1,
+            run_id: "r".into(),
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    #[test]
+    fn referenced_artifacts_lists_only_copied_blobs_from_findings() {
+        use rupu_coverage::report::ArtifactStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let copied = "ab".repeat(32);
+        let external = "cd".repeat(32);
+        std::fs::write(
+            &stream,
+            begin_stream_line()
+                + &findings_stream_line(
+                    "f1",
+                    vec![
+                        (&copied, ArtifactStorage::Copied),
+                        (&external, ArtifactStorage::External),
+                    ],
+                ),
+        )
+        .unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([copied])
+        );
+        assert!(referenced_artifacts(&tmp.path().join("absent")).is_empty());
+    }
+
+    /// The same blob referenced by two findings is listed once; a blob with
+    /// a malformed hash (never a store key) and a torn trailing line are
+    /// ignored rather than failing the scan.
+    #[test]
+    fn referenced_artifacts_dedups_and_skips_malformed_entries_and_torn_lines() {
+        use rupu_coverage::report::ArtifactStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let a = "ab".repeat(32);
+        let b = "ef".repeat(32);
+        let body = begin_stream_line()
+            + &findings_stream_line("f1", vec![(&a, ArtifactStorage::Copied)])
+            + &findings_stream_line(
+                "f2",
+                vec![
+                    (&a, ArtifactStorage::Copied),
+                    (&b, ArtifactStorage::Copied),
+                    ("../../etc/passwd", ArtifactStorage::Copied),
+                    (&"AB".repeat(32), ArtifactStorage::Copied),
+                ],
+            )
+            + "{\"ledger\":\"findings\",\"scope_na";
+        std::fs::write(&stream, body).unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([a, b])
+        );
+    }
+
+    /// The terminal pass uploads each `stored: copied` blob its run's findings
+    /// reference from the worker's store to `artifacts/<sha>` after the final
+    /// coverage drain and BEFORE the terminal `run.json` and the `finished`
+    /// marker (a coordinator that sees the run terminal can already pull),
+    /// even for a failed run; one the bucket already holds is not re-uploaded;
+    /// one the store lacks is skipped without blocking `finished`.
+    #[tokio::test]
+    async fn bucket_terminal_pass_uploads_referenced_blobs_before_finished() {
+        use rupu_coverage::report::ArtifactStorage;
+        let global = tempdir().unwrap();
+        let run_dir = tempdir().unwrap();
+        let fresh = "ab".repeat(32);
+        let already = "cd".repeat(32);
+        let absent = "ee".repeat(32);
+        let external = "f0".repeat(32);
+        store_blob(global.path(), &fresh, b"fresh poc");
+        store_blob(global.path(), &already, b"already uploaded");
+        store_blob(global.path(), &external, b"never uploaded");
+        std::fs::write(
+            run_dir.path().join(rupu_coverage::STREAM_FILE),
+            begin_stream_line()
+                + &findings_stream_line(
+                    "f1",
+                    vec![
+                        (&fresh, ArtifactStorage::Copied),
+                        (&already, ArtifactStorage::Copied),
+                        (&absent, ArtifactStorage::Copied),
+                        (&external, ArtifactStorage::External),
+                    ],
+                ),
+        )
+        .unwrap();
+
+        let bucket = RecordingBucket::default();
+        bucket
+            .artifacts
+            .lock()
+            .unwrap()
+            .insert(already.clone(), b"already uploaded".to_vec());
+        let mut streams = BucketStreams::default();
+        assert!(
+            finish_bucket_run(
+                &bucket,
+                "run_ART",
+                run_dir.path(),
+                global.path(),
+                &mut streams,
+                br#"{"status":"failed"}"#,
+                "failed",
+            )
+            .await
+        );
+
+        let keys = bucket.landed_keys();
+        assert_eq!(
+            keys,
+            vec![
+                result_key("coverage", 0),
+                format!("artifact:{fresh}"),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ],
+            "{keys:?}"
+        );
+        assert_eq!(
+            bucket.landed_body(&format!("artifact:{fresh}")).as_deref(),
+            Some("fresh poc")
+        );
+        assert_eq!(bucket.landed_body("finished").as_deref(), Some("failed"));
+        let stored = bucket.artifacts.lock().unwrap();
+        assert_eq!(
+            stored.get(&fresh).map(Vec::as_slice),
+            Some(&b"fresh poc"[..])
+        );
+        assert!(!stored.contains_key(&absent) && !stored.contains_key(&external));
+    }
+
+    /// A blob upload that fails is part of what the terminal pass holds the
+    /// run for: neither the terminal `run.json` nor the `finished` marker is
+    /// written (the CP would stop polling the run and never learn the blob is
+    /// there), and the next tick retries — the blob, then `run.json`, then
+    /// `finished`, with the coverage chunk that already landed not re-sent.
+    #[tokio::test]
+    async fn a_failed_blob_upload_holds_the_terminal_run_until_it_lands() {
+        use rupu_coverage::report::ArtifactStorage;
+        let global = tempdir().unwrap();
+        let run_dir = tempdir().unwrap();
+        let sha = "ab".repeat(32);
+        store_blob(global.path(), &sha, b"poc");
+        std::fs::write(
+            run_dir.path().join(rupu_coverage::STREAM_FILE),
+            begin_stream_line()
+                + &findings_stream_line("f1", vec![(&sha, ArtifactStorage::Copied)]),
+        )
+        .unwrap();
+        let bucket = RecordingBucket::failing("artifact:");
+        let mut streams = BucketStreams::default();
+
+        assert!(
+            !finish_bucket_run(
+                &bucket,
+                "run_HOLD",
+                run_dir.path(),
+                global.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await,
+            "an unlanded blob means the run is not finished"
+        );
+        assert_eq!(bucket.landed_keys(), vec![result_key("coverage", 0)]);
+
+        bucket.set_failing(None);
+        assert!(
+            finish_bucket_run(
+                &bucket,
+                "run_HOLD",
+                run_dir.path(),
+                global.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                format!("artifact:{sha}"),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
     }
 
     /// A run with no usage ledger yet (or never) drains to nothing.
