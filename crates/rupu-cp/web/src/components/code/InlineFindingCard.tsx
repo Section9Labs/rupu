@@ -13,8 +13,8 @@
  *               field doesn't exist on `FindingRecord` yet).
  *
  * Full-profile findings (`profile === 'full'`) additionally get a tabbed
- * report view in the expanded body — Root cause / Call chain / Evidence /
- * Patch / Repro — backed by `GET /api/findings/:id`. The detail is fetched
+ * report view in the expanded body — Root cause / Call chain / Evidence
+ * (claims, then any evidence blocks) / Patch / Repro — backed by `GET /api/findings/:id`. The detail is fetched
  * lazily, only once the card is expanded (the list rows are slim), and
  * summary-profile findings never fetch and render exactly as before.
  *
@@ -29,6 +29,7 @@ import { api, apiErrorMessage, type FindingDetail, type FindingOut, type Finding
 import { isSentinel, sentinelLabel, UNREADABLE_REPORT_NOTE } from '../../lib/findingReport';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
 import CallChain from '../findings/report/CallChain';
+import EvidenceBlocks from '../findings/report/EvidenceBlocks';
 import EvidenceClaims from '../findings/report/EvidenceClaims';
 import ReplicationSteps from '../findings/report/ReplicationSteps';
 import DiffView from '../transcript/DiffView';
@@ -54,6 +55,8 @@ function ReportTabs({ detail, wsId }: { detail: FindingDetail; wsId?: string }) 
     return <p className={EMPTY_NOTE}>{UNREADABLE_REPORT_NOTE}</p>;
   }
   const patch = report.recommended_patch;
+  const blocks = report.blocks ?? [];
+  const hasClaims = report.evidence.length > 0;
   return (
     <div>
       <div role="tablist" aria-label="Finding report" className="flex flex-wrap gap-1 border-b border-border">
@@ -89,10 +92,17 @@ function ReportTabs({ detail, wsId }: { detail: FindingDetail; wsId?: string }) 
         )}
         {tab === 'Call chain' && <CallChain chain={report.call_chain} wsId={wsId} />}
         {tab === 'Evidence' &&
-          (report.evidence.length > 0 ? (
-            <EvidenceClaims claims={report.evidence} states={detail.evidence_status} wsId={wsId} />
+          (hasClaims || blocks.length > 0 ? (
+            <div className="space-y-2">
+              {hasClaims && (
+                <EvidenceClaims claims={report.evidence} states={detail.evidence_status} wsId={wsId} />
+              )}
+              {/* Blocks reuse the report page's renderer: a remote-host image
+                  is still only fetched after a click. */}
+              {blocks.length > 0 && <EvidenceBlocks findingId={detail.id} blocks={blocks} compact />}
+            </div>
           ) : (
-            <p className={EMPTY_NOTE}>No evidence claims recorded.</p>
+            <p className={EMPTY_NOTE}>No evidence recorded.</p>
           ))}
         {tab === 'Patch' &&
           (isSentinel(patch) ? (

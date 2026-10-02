@@ -12,7 +12,14 @@ function hex(n: number, exact?: string): string {
   return Number.isSafeInteger(n) ? s : `${s} ≈ (imprecise)`;
 }
 
-const PRE = 'max-h-96 overflow-auto px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre';
+const PRE = 'overflow-auto px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre';
+
+/** Scroll caps. `compact` is the Code tab's inline finding card, which sits
+ *  between source lines and must stay short; the report page uses the full
+ *  caps. */
+const SCROLL_CAP = { full: 'max-h-96', compact: 'max-h-48' } as const;
+const IMAGE_CAP = { full: 'max-h-[32rem]', compact: 'max-h-48' } as const;
+type Density = keyof typeof SCROLL_CAP;
 
 function Frame({ label, children }: { label?: ReactNode; children: ReactNode }) {
   return (
@@ -23,8 +30,8 @@ function Frame({ label, children }: { label?: ReactNode; children: ReactNode }) 
   );
 }
 
-function Code({ text }: { text: string }) {
-  return <pre className={PRE}>{text}</pre>;
+function Code({ text, density }: { text: string; density: Density }) {
+  return <pre className={`${SCROLL_CAP[density]} ${PRE}`}>{text}</pre>;
 }
 
 /** True when rupu verified and stored this file. Before evidence-block files
@@ -66,7 +73,7 @@ function ArtifactMeta({ findingId, artifact }: { findingId: string; artifact: Ar
 /** An image artifact. A remote one (`host` set) is pulled by the CP on first
  *  request, so it is never requested on render, only after a click. An
  *  unrecorded one is never requested at all. */
-function ImageBlock({ findingId, artifact, caption }: { findingId: string; artifact: ArtifactRef; caption?: string }) {
+function ImageBlock({ findingId, artifact, caption, density }: { findingId: string; artifact: ArtifactRef; caption?: string; density: Density }) {
   if (!isRecorded(artifact)) {
     return (
       <figure className="overflow-hidden rounded-md border border-border bg-panel">
@@ -77,10 +84,10 @@ function ImageBlock({ findingId, artifact, caption }: { findingId: string; artif
       </figure>
     );
   }
-  return <RecordedImage findingId={findingId} artifact={artifact} caption={caption} />;
+  return <RecordedImage findingId={findingId} artifact={artifact} caption={caption} density={density} />;
 }
 
-function RecordedImage({ findingId, artifact, caption }: { findingId: string; artifact: ArtifactRef; caption?: string }) {
+function RecordedImage({ findingId, artifact, caption, density }: { findingId: string; artifact: ArtifactRef; caption?: string; density: Density }) {
   const [show, setShow] = useState(!artifact.host);
   const [broken, setBroken] = useState(false);
   const url = findingArtifactUrl(findingId, artifact.sha256);
@@ -94,7 +101,7 @@ function RecordedImage({ findingId, artifact, caption }: { findingId: string; ar
             src={url}
             alt={caption ?? artifact.path}
             loading="lazy"
-            className="max-h-[32rem] max-w-full rounded border border-border"
+            className={`${IMAGE_CAP[density]} max-w-full rounded border border-border`}
             onError={() => setBroken(true)}
           />
         ) : (
@@ -115,10 +122,10 @@ function RecordedImage({ findingId, artifact, caption }: { findingId: string; ar
   );
 }
 
-function Disasm({ arch, listing }: { arch: string; listing: DisasmLine[] }) {
+function Disasm({ arch, listing, density }: { arch: string; listing: DisasmLine[]; density: Density }) {
   return (
     <Frame label={`disassembly (${arch})`}>
-      <div className="max-h-96 overflow-auto">
+      <div className={`${SCROLL_CAP[density]} overflow-auto`}>
         <table className="w-full border-collapse font-mono text-note text-ink">
           <tbody>
             {listing.map((l, i) => (
@@ -136,9 +143,9 @@ function Disasm({ arch, listing }: { arch: string; listing: DisasmLine[] }) {
   );
 }
 
-function Table({ headers, rows }: { headers: string[]; rows: string[][] }) {
+function Table({ headers, rows, density }: { headers: string[]; rows: string[][]; density: Density }) {
   return (
-    <div className="overflow-auto rounded-md border border-border bg-panel">
+    <div className={`${density === 'compact' ? SCROLL_CAP.compact : ''} overflow-auto rounded-md border border-border bg-panel`}>
       <table className="w-full border-collapse text-ui text-ink">
         <thead>
           <tr className="border-b border-border text-left text-note text-ink-mute">
@@ -157,23 +164,23 @@ function Table({ headers, rows }: { headers: string[]; rows: string[][] }) {
   );
 }
 
-function Block({ findingId, block }: { findingId: string; block: EvidenceBlock }) {
+function Block({ findingId, block, density }: { findingId: string; block: EvidenceBlock; density: Density }) {
   switch (block.kind) {
     case 'text':
       return <div className="text-ink-dim"><Markdown text={block.text} /></div>;
     case 'code_slice':
-      return <Frame label={[block.file, block.lang].filter(Boolean).join(' · ') || undefined}><Code text={block.excerpt} /></Frame>;
+      return <Frame label={[block.file, block.lang].filter(Boolean).join(' · ') || undefined}><Code text={block.excerpt} density={density} /></Frame>;
     case 'diff':
-      return <Frame label="diff"><Code text={block.diff} /></Frame>;
+      return <Frame label="diff"><Code text={block.diff} density={density} /></Frame>;
     case 'table':
-      return <Table headers={block.headers} rows={block.rows} />;
+      return <Table headers={block.headers} rows={block.rows} density={density} />;
     case 'image':
-      return <ImageBlock findingId={findingId} artifact={block.artifact} caption={block.caption} />;
+      return <ImageBlock findingId={findingId} artifact={block.artifact} caption={block.caption} density={density} />;
     case 'hexdump':
       return (
         <Frame label={<span className="flex flex-wrap items-center justify-between gap-2"><span>hexdump · base {hex(block.base, block.base_hex)}</span><ArtifactMeta findingId={findingId} artifact={block.artifact} /></span>}>
           {block.rendered ? (
-            <Code text={block.rendered} />
+            <Code text={block.rendered} density={density} />
           ) : (
             <p className="px-3 py-2 text-ui text-ink-mute">
               {isRecorded(block.artifact) ? 'No rendered preview. Use Download.' : 'No rendered preview.'}
@@ -182,20 +189,20 @@ function Block({ findingId, block }: { findingId: string; block: EvidenceBlock }
         </Frame>
       );
     case 'disasm':
-      return <Disasm arch={block.arch} listing={block.listing} />;
+      return <Disasm arch={block.arch} listing={block.listing} density={density} />;
     case 'decompile':
-      return <Frame label={`decompiled (${block.lang})`}><Code text={block.listing} /></Frame>;
+      return <Frame label={`decompiled (${block.lang})`}><Code text={block.listing} density={density} /></Frame>;
     case 'http_exchange':
       return (
         <Frame label="HTTP exchange">
           <div className="text-note text-ink-mute px-3 pt-1.5">Request</div>
-          <Code text={block.request} />
+          <Code text={block.request} density={density} />
           <div className="border-t border-border px-3 pt-1.5 text-note text-ink-mute">Response</div>
-          <Code text={block.response} />
+          <Code text={block.response} density={density} />
         </Frame>
       );
     case 'scan_output':
-      return <Frame label={block.tool}><Code text={block.output} /></Frame>;
+      return <Frame label={block.tool}><Code text={block.output} density={density} /></Frame>;
     case 'pcap_ref':
       return (
         <Frame label={<ArtifactMeta findingId={findingId} artifact={block.artifact} />}>
@@ -214,10 +221,20 @@ function Block({ findingId, block }: { findingId: string; block: EvidenceBlock }
   }
 }
 
-export default function EvidenceBlocks({ findingId, blocks }: { findingId: string; blocks: EvidenceBlock[] }) {
+export default function EvidenceBlocks({
+  findingId,
+  blocks,
+  compact = false,
+}: {
+  findingId: string;
+  blocks: EvidenceBlock[];
+  /** Tighter spacing and smaller image / scroll caps, for the inline card. */
+  compact?: boolean;
+}) {
+  const density: Density = compact ? 'compact' : 'full';
   return (
-    <div className="space-y-3">
-      {blocks.map((b, i) => <Block key={i} findingId={findingId} block={b} />)}
+    <div className={compact ? 'space-y-2' : 'space-y-3'}>
+      {blocks.map((b, i) => <Block key={i} findingId={findingId} block={b} density={density} />)}
     </div>
   );
 }
