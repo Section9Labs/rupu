@@ -934,7 +934,8 @@ async fn pump_catch_up_usage_ledger(
 /// mirrored coverage stream with the host's file, which is complete by then.
 /// An older host has no file: the `cat` fails and whatever the tail delivered
 /// (nothing) stays, so the coordinator reports that unit's coverage as not
-/// collected.
+/// collected. An EMPTY successful answer is treated the same way — never a
+/// reason to truncate the tailed copy.
 async fn pump_catch_up_coverage(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
@@ -943,7 +944,10 @@ async fn pump_catch_up_coverage(
 ) {
     let cmd = format!("cat $HOME/.rupu/runs/{run_id}/coverage.jsonl");
     if let Ok(out) = exec.run(&cmd).await {
-        if out.success {
+        // Non-empty only, like the transcript catch-up: a `cat` that succeeds
+        // with nothing (the file vanished or raced) must not truncate what
+        // the tail already delivered.
+        if out.success && !out.stdout.is_empty() {
             let _ = mirror.replace_coverage(run_id, host_id, &out.stdout);
         }
     }
@@ -1663,10 +1667,12 @@ impl SshHostConnector {
                 // and calls mirror.finish.  Used below to skip the fallback cat.
                 let mut terminal_seen = false;
                 // Set to true the first time the host shows ANY sign that this
-                // run exists: a `==>` header from `tail` (the file is there) or
-                // a readable `run.json`. Until then the pump is bounded by
-                // PUMP_STARTUP_DEADLINE — see that constant for why a pump with
-                // no such bound spins forever on a launch that died.
+                // run exists: a `==>` header from `tail` (the file is there) —
+                // except the coverage stream's, which a launch that died before
+                // doing anything else already leaves behind — or a readable
+                // `run.json`, or an `Alive` probe. Until then the pump is
+                // bounded by PUMP_STARTUP_DEADLINE — see that constant for why
+                // a pump with no such bound spins forever on a launch that died.
                 let mut run_seen_on_host = false;
                 let pump_started = tokio::time::Instant::now();
                 // Set once the transcript's first `==>` header is seen. `tail -n +1`
@@ -2208,9 +2214,7 @@ impl HostConnector for SshHostConnector {
         // behind). `None` ⇒ this connector mints one, as before.
         let run_id = match req.run_id.as_deref() {
             Some(id) => {
-                let ok = id.starts_with("run_")
-                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                if !ok {
+                if !crate::host::connector::valid_run_id(id) {
                     return Err(HostConnectorError::Invalid(format!(
                         "supplied run id {id:?} is not a valid run id"
                     )));
@@ -2627,7 +2631,7 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id)
+        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
@@ -6121,6 +6125,56 @@ mod tests {
         let cmds = fake.commands.lock().unwrap();
         assert!(cmds.iter().any(|c| c.starts_with("tail ")
             && c.contains(&format!("$HOME/.rupu/runs/{run_id}/coverage.jsonl"))));
+    }
+
+    /// A terminal catch-up whose `cat` SUCCEEDS with nothing (the file
+    /// vanished between the tail and the pull, or raced a rotation) must not
+    /// replace the tailed copy with an empty file — the transcript catch-up
+    /// next to it has the same non-empty rule.
+    #[test]
+    fn coverage_catch_up_never_truncates_the_tailed_copy_with_an_empty_cat() {
+        let run_id = "run_01COVEMPTY";
+        let tailed = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVEMPTY\"}\n";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_coverage_stdout = Some(String::new());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "sec".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some(run_id.into()),
+                findings_profile: None,
+                codename: None,
+            })
+            .await
+            .unwrap();
+            // The pump task is spawned but has not run yet (current-thread
+            // runtime, no await since): seed what the tail would already have
+            // delivered, deterministically, before its terminal catch-up.
+            std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+            conn.await_run_mirror(run_id).await;
+            let body = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                tailed,
+                "an empty successful cat must leave the tailed copy intact"
+            );
+        });
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.starts_with("cat ") && c.contains("/coverage.jsonl")),
+            "the catch-up must have run for this to prove anything: {cmds:?}"
+        );
     }
 
     /// Wait, on the PAUSED virtual clock, for the pump to move `run_id` out of

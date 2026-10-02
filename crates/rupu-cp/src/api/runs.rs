@@ -46,8 +46,9 @@ async fn get_run_coverage(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let bytes =
-        crate::host::connector::mirror_unit_coverage(&s.run_store, &id).map_err(|e| match e {
+    let bytes = crate::host::connector::mirror_unit_coverage(&s.run_store, &id)
+        .await
+        .map_err(|e| match e {
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             other => ApiError::internal(other.to_string()),
         })?;

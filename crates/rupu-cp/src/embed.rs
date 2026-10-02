@@ -1,5 +1,7 @@
 //! Embeds the built web UI (`web/dist/`) into the binary at compile time and
 //! serves it with an SPA fallback so client-side routes resolve to `index.html`.
+//! The fallback never covers the API: an unmatched `/api` or `/api/*` path is a
+//! JSON 404 ([`static_handler`]).
 
 use crate::state::AppState;
 use axum::extract::State;

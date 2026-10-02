@@ -167,10 +167,26 @@ impl HttpHostConnector {
             }
             Err(e) => return Err(e),
         };
-        let body: HostInfoBody = resp
-            .json()
+        // Read, then parse (as `proxy_get_json` does): a body that failed to
+        // ARRIVE is a transport failure, but a 200 whose body is not the info
+        // JSON is a remote that has no such route and answered with its SPA —
+        // the signature of a rupu older than `/api/host/info`. That cannot
+        // advertise a feature, so it is the same refusal as a 404.
+        let bytes = resp
+            .bytes()
             .await
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+        let body: HostInfoBody = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(_) => {
+                return Err(HostConnectorError::Unsupported(format!(
+                    "{what}: remote host {} did not answer /api/host/info with JSON \
+                     (an older rupu serves its web UI there), so it cannot \
+                     advertise support; upgrade rupu there",
+                    self.base_url
+                )))
+            }
+        };
         if body.features.iter().any(|f| f == feature) {
             return Ok(());
         }
@@ -476,11 +492,7 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        let valid = run_id.starts_with("run_")
-            && run_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid {
+        if !crate::host::connector::valid_run_id(run_id) {
             return Err(HostConnectorError::Invalid(format!(
                 "{run_id:?} is not a valid run id"
             )));

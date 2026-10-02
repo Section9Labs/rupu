@@ -53,10 +53,7 @@ pub enum MirrorError {
 /// - Contains only ASCII alphanumeric characters and `_`
 ///   (no `/`, `\`, `.`, or other characters that could enable path traversal).
 fn validate_run_id(id: &str) -> Result<(), MirrorError> {
-    if id.is_empty()
-        || !id.starts_with("run_")
-        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !crate::host::connector::valid_run_id(id) {
         return Err(MirrorError::InvalidRunId(id.to_string()));
     }
     Ok(())
@@ -369,9 +366,13 @@ impl NodeMirror {
             return Err(MirrorError::WrongNode(run_id.to_string()));
         }
         let path = self.coverage_path(run_id);
-        let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)?;
+        // A per-call temp name (two replaces for one run can overlap) removed
+        // on any failure, like `replace_usage_ledger`.
+        let tmp = path.with_file_name(format!("coverage.jsonl.{}.tmp", ulid::Ulid::new()));
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -552,5 +553,84 @@ mod tests {
             mirror.replace_coverage("run_C1", "node-2", "x"),
             Err(MirrorError::WrongNode(_))
         ));
+    }
+
+    #[test]
+    fn replace_coverage_leaves_no_temp_file_and_rejects_an_invalid_run_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "a".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        mirror.create_run("run_C2", "node-1", &spec).unwrap();
+        mirror.replace_coverage("run_C2", "node-1", "a\n").unwrap();
+        mirror.replace_coverage("run_C2", "node-1", "b\n").unwrap();
+        let run_dir = mirror
+            .coverage_path("run_C2")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let leftovers: Vec<_> = std::fs::read_dir(&run_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        assert!(matches!(
+            mirror.replace_coverage("../escape", "node-1", "x"),
+            Err(MirrorError::InvalidRunId(_))
+        ));
+        assert!(matches!(
+            mirror.replace_coverage("not_a_run", "node-1", "x"),
+            Err(MirrorError::InvalidRunId(_))
+        ));
+    }
+
+    /// A failed rename must not leave its temp file behind.
+    #[test]
+    fn replace_coverage_removes_its_temp_file_when_the_rename_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "a".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        mirror.create_run("run_C3", "node-1", &spec).unwrap();
+        // A directory where the stream file belongs: the write of the temp
+        // file succeeds, the rename over a non-empty directory fails.
+        let dest = mirror.coverage_path("run_C3");
+        std::fs::create_dir_all(dest.join("occupied")).unwrap();
+        assert!(mirror.replace_coverage("run_C3", "node-1", "a\n").is_err());
+        let run_dir = dest.parent().unwrap().to_path_buf();
+        let leftovers: Vec<_> = std::fs::read_dir(&run_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }

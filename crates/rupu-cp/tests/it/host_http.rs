@@ -824,6 +824,44 @@ async fn unmatched_api_paths_are_a_json_404_not_the_spa() {
     assert!(body["error"].as_str().unwrap().contains("/api/definitely"));
 }
 
+/// The `/api` boundary: the bare prefix and its trailing-slash form are API
+/// paths (JSON 404); a look-alike sibling such as `/apiary` is not, and still
+/// gets the SPA fallback.
+#[tokio::test]
+async fn api_prefix_boundary_is_a_json_404_but_a_lookalike_path_gets_the_spa() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    );
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    for path in ["/api", "/api/"] {
+        #[allow(clippy::disallowed_methods)]
+        let resp = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        assert_eq!(resp.status(), 404, "{path} must be a JSON 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("no API route"),
+            "{path}: {body}"
+        );
+    }
+    #[allow(clippy::disallowed_methods)]
+    let resp = reqwest::get(format!("http://{addr}/apiary")).await.unwrap();
+    assert_eq!(resp.status(), 200, "/apiary is a client route, not the API");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(ct.starts_with("text/html"), "SPA fallback, got {ct}");
+}
+
 #[tokio::test]
 async fn coverage_endpoint_serves_ndjson_and_rejects_a_malformed_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -866,4 +904,92 @@ async fn coverage_endpoint_serves_ndjson_and_rejects_a_malformed_id() {
         .await
         .unwrap();
     assert_eq!(bad.status(), 400);
+}
+
+/// A stream that exists but cannot be read is the server's problem, not the
+/// client's: 500, not the 400 a malformed id earns.
+#[tokio::test]
+async fn coverage_endpoint_reports_an_unreadable_stream_as_a_server_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    );
+    // `coverage.jsonl` is a directory: it exists, `read` fails, NotFound it is not.
+    let p = rupu_coverage::stream_path(&state.run_store.root, "run_H3");
+    std::fs::create_dir_all(&p).unwrap();
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    #[allow(clippy::disallowed_methods)]
+    let unreadable = reqwest::get(format!("http://{addr}/api/runs/run_H3/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(unreadable.status(), 500);
+    #[allow(clippy::disallowed_methods)]
+    let missing = reqwest::get(format!("http://{addr}/api/runs/run_NONE/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        200,
+        "no stream written is empty, not an error"
+    );
+    #[allow(clippy::disallowed_methods)]
+    let malformed = reqwest::get(format!("http://{addr}/api/runs/run_a.b/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+}
+
+// ── Older-remote feature gate (Plan A review triage, G) ──────────────────────
+
+/// A remote older than `/api/host/info` answers it with its SPA — HTML with a
+/// 200. The feature gate must fail closed with `Unsupported`, never leak the
+/// decode failure as `Remote(0, ..)`, and never go on to fetch the stream.
+#[tokio::test]
+async fn unit_coverage_refuses_a_remote_whose_host_info_is_the_spa() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .header("content-type", "text/html")
+            .body("<!doctype html><html></html>");
+    });
+    let stream = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/coverage");
+        then.status(200).body("{}\n");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m) if m.contains("coverage")),
+        "{err:?}"
+    );
+    stream.assert_hits(0);
+}
+
+/// A remote with no `/api/host/info` route at all (404) fails the same way.
+#[tokio::test]
+async fn unit_coverage_refuses_a_remote_with_no_host_info_route() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(404);
+    });
+    let stream = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/coverage");
+        then.status(200).body("{}\n");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m) if m.contains("predates /api/host/info")),
+        "{err:?}"
+    );
+    stream.assert_hits(0);
 }
