@@ -125,8 +125,28 @@ pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
                 rupu_transcript::Severity::Info => Line::new().dim(text),
             })
         }
-        Event::Recovery { .. } => crate::output::outcome_row::outcome_event_row(ev)
-            .map(|(_, _, text)| Line::new().dim(squash(&text))),
+        // The feed draws no status glyph of its own, so it takes the
+        // glyph-bearing one-line forms.
+        Event::Recovery {
+            rung,
+            action,
+            attempt,
+            budget,
+            provider,
+            model,
+            reason,
+            ..
+        } => Some(
+            Line::new().dim(squash(&rupu_transcript::outcome::recovery_line(
+                *action,
+                *rung,
+                provider.as_deref(),
+                model.as_deref(),
+                *attempt,
+                *budget,
+                reason.as_deref(),
+            ))),
+        ),
         _ => None,
     }?;
 

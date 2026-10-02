@@ -82,6 +82,15 @@ impl RecoveryAction {
     }
 }
 
+/// The glyph-free body of an outcome row, `title — detail`, for renderers
+/// that print their own status glyph.
+pub fn outcome_body(o: &OutcomeRecord) -> String {
+    match o.detail.as_deref().filter(|d| !d.is_empty()) {
+        Some(detail) => format!("{} — {detail}", o.title),
+        None => o.title.clone(),
+    }
+}
+
 /// One-line rendering of an outcome: `✗ title — detail` (`✗` error, `!`
 /// warning, `·` info). Plan 3 replaces this with the full presentation module.
 pub fn outcome_line(o: &OutcomeRecord) -> String {
@@ -90,14 +99,12 @@ pub fn outcome_line(o: &OutcomeRecord) -> String {
         Severity::Warning => '!',
         Severity::Info => '·',
     };
-    match o.detail.as_deref().filter(|d| !d.is_empty()) {
-        Some(detail) => format!("{glyph} {} — {detail}", o.title),
-        None => format!("{glyph} {}", o.title),
-    }
+    format!("{glyph} {}", outcome_body(o))
 }
 
-/// One-line rendering of a recovery action: `↺ rung 1 · fell back to p/m`.
-pub fn recovery_line(
+/// The glyph-free body of a recovery row, `rung 1 · fell back to p/m`, for
+/// renderers that print their own status glyph.
+pub fn recovery_body(
     action: RecoveryAction,
     rung: u8,
     provider: Option<&str>,
@@ -131,7 +138,23 @@ pub fn recovery_line(
         RecoveryAction::Failed => "no recovery left".to_string(),
         other => other.name().to_string(),
     };
-    format!("↺ rung {rung} · {phrase}")
+    format!("rung {rung} · {phrase}")
+}
+
+/// One-line rendering of a recovery action: `↺ rung 1 · fell back to p/m`.
+pub fn recovery_line(
+    action: RecoveryAction,
+    rung: u8,
+    provider: Option<&str>,
+    model: Option<&str>,
+    attempt: Option<u32>,
+    budget: Option<u32>,
+    reason: Option<&str>,
+) -> String {
+    format!(
+        "↺ {}",
+        recovery_body(action, rung, provider, model, attempt, budget, reason)
+    )
 }
 
 /// Cap on the JSON payload shown for an unrecognized event.

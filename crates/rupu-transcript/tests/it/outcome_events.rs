@@ -1,4 +1,6 @@
-use rupu_transcript::outcome::{outcome_line, recovery_line, unknown_line};
+use rupu_transcript::outcome::{
+    outcome_body, outcome_line, recovery_body, recovery_line, unknown_line,
+};
 use rupu_transcript::{Event, OutcomeRecord, RecoveryAction, Severity, StopRecord};
 use serde_json::json;
 
@@ -252,4 +254,33 @@ fn unknown_line_names_the_tag_and_truncates_data() {
     let data = s.strip_prefix("unrecognized event · t ").unwrap();
     assert_eq!(data.chars().count(), 200);
     assert!(data.ends_with('…'));
+}
+
+#[test]
+fn bodies_are_the_lines_without_their_leading_glyph() {
+    let o = outcome_with(Severity::Error, "refused · cyber", Some("Declined."));
+    assert_eq!(outcome_body(&o), "refused · cyber — Declined.");
+    assert_eq!(outcome_line(&o), format!("✗ {}", outcome_body(&o)));
+    let body = recovery_body(
+        RecoveryAction::FellBack,
+        1,
+        Some("anthropic"),
+        Some("claude-opus-4-8"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(body, "rung 1 · fell back to anthropic/claude-opus-4-8");
+    assert_eq!(
+        recovery_line(
+            RecoveryAction::FellBack,
+            1,
+            Some("anthropic"),
+            Some("claude-opus-4-8"),
+            None,
+            None,
+            None
+        ),
+        format!("↺ {body}")
+    );
 }

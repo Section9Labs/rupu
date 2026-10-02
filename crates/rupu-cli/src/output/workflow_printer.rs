@@ -3532,10 +3532,8 @@ fn process_event(
                 }
             }
         }
-        ev @ (TxEvent::Outcome { .. } | TxEvent::Recovery { .. }) => {
-            if let Some((status, label, text)) = super::outcome_row::outcome_event_row(&ev) {
-                printer.sideband_event(status, label, Some(&text));
-            }
+        ev @ (TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::Unknown { .. }) => {
+            super::outcome_row::print_outcome_event(printer, &ev);
         }
         _ => {}
     }

@@ -1667,11 +1667,7 @@ pub(crate) fn render_pretty_transcript_event(
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
         | TranscriptEvent::Unknown { .. } => {
-            if let Some((status, label, text)) =
-                crate::output::outcome_row::outcome_event_row(event)
-            {
-                printer.sideband_event(status, label, Some(&text));
-            }
+            crate::output::outcome_row::print_outcome_event(printer, event);
         }
     }
 }
