@@ -319,6 +319,55 @@ describe('useUsageData', () => {
     });
   });
 
+  describe('a host list that cannot be read', () => {
+    it('is a notice, not an error: local still loads and shows', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockRejectedValue(new Error('boom'));
+      const local = deferred<UsageResponse>();
+      vi.spyOn(api, 'getUsage').mockReturnValue(local.promise);
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+      await waitFor(() => expect(result.current.notice).toMatch(/Could not list hosts \(boom\)/));
+      // Local is still loading: no error claim meanwhile.
+      expect(result.current.error).toBeNull();
+      expect(result.current.data).toBeNull();
+
+      await act(async () => local.resolve(resp('local', 3)));
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(3));
+      expect(result.current.error).toBeNull();
+      expect(result.current.notice).not.toBeNull();
+    });
+
+    it('is re-read on the 60s poll; when it answers, the notice clears and new hosts load', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      const reg = vi.spyOn(api, 'getRegisteredHosts').mockRejectedValueOnce(new Error('boom'));
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) => Promise.resolve(resp(host ?? 'local', 1)));
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+      await until(() => expect(result.current.notice).not.toBeNull());
+      await until(() => expect(result.current.data?.summary.runs).toBe(1));
+      expect(usageCallsFor('host_prod')).toHaveLength(0);
+
+      reg.mockResolvedValue([REG_LOCAL, REG_PROD]);
+      vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+      await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+      await until(() => expect(result.current.notice).toBeNull());
+      await until(() => expect(result.current.data?.summary.runs).toBe(2)); // local + prod
+      expect(usageCallsFor('host_prod')).toHaveLength(1);
+      expect(result.current.hosts.map((h) => h.host_id)).toEqual(['local', 'host_prod']);
+      expect(reg).toHaveBeenCalledTimes(2);
+
+      // The list is known now: later polls do not re-read it.
+      await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+      expect(reg).toHaveBeenCalledTimes(2);
+    });
+
+    it('still reads as an error once every known host has failed', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockRejectedValue(new Error('boom'));
+      vi.spyOn(api, 'getUsage').mockRejectedValue(new ApiError(502, 'x', '{"error":"down"}'));
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+      await waitFor(() => expect(result.current.error?.message).toMatch(/Local: down/));
+      expect(result.current.notice).not.toBeNull();
+    });
+  });
+
   it('drops a remote host the CP no longer knows (404); local is never dropped', async () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
     vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>

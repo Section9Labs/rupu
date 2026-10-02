@@ -253,4 +253,21 @@ describe('Usage page — background refreshes are quiet', () => {
     await flush();
     expect(screen.getByRole('status', { name: 'updating' })).toBeInTheDocument();
   });
+
+  it('shows the "updating" cue while the last good headline stands in for a window no host has answered', async () => {
+    vi.mocked(api.getUsageRuns).mockResolvedValue([runRow()]);
+    vi.mocked(api.getUsage)
+      .mockResolvedValueOnce(usageResponse())
+      // The new window's headline never answers; its run rows do.
+      .mockImplementation(() => new Promise(() => {}));
+    renderUsage();
+    await flush();
+    expect(screen.queryByRole('status', { name: 'updating' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await flush();
+    await flush();
+    expect(api.getUsageRuns).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('status', { name: 'updating' })).toBeInTheDocument();
+  });
 });

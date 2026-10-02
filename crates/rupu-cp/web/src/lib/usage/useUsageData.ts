@@ -37,6 +37,12 @@
 // one, and unmount aborts everything still in flight. A hung remote would
 // otherwise hold one of the browser's six connections per origin for as long as
 // it lives, and enough of them starve every other request the page makes.
+//
+// A host list that cannot be read is not a failed page: local still loads, and
+// the failure is a `notice` (which hosts are left out is unknown). The list is
+// re-read on the 60 s remote poll while the notice stands; when it answers, new
+// hosts are added as `loading` and fetched, and the notice clears. `error` is
+// set only when every known host has failed.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, apiErrorMessage, type UsageResponse, type UsageWindow } from '../api';
@@ -65,7 +71,10 @@ interface HostUsage {
 export interface UseUsageDataResult {
   data: (MergedUsage & { excluded: string[] }) | null;
   hosts: HostFreshnessEntry[];
+  /** Every known host failed for the current window. */
   error: Error | null;
+  /** Non-fatal: the host list could not be read, so other hosts may be missing. */
+  notice: string | null;
 }
 
 const seedOf = (h: HostSeed): HostUsage => ({
@@ -82,7 +91,11 @@ const seedOf = (h: HostSeed): HostUsage => ({
 
 export function useUsageData(usageWindow: UsageWindow, windowKey: string, windowSource: 'user' | 'tick'): UseUsageDataResult {
   const [hosts, setHosts] = useState<HostUsage[]>([]);
-  const [listError, setListError] = useState<Error | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeRef = useRef(notice);
+  noticeRef.current = notice;
+  /** A host-list re-read is in flight (the 60 s poll never stacks a second one). */
+  const relistingRef = useRef(false);
   const windowRef = useRef(usageWindow);
   windowRef.current = usageWindow;
   const keyRef = useRef(windowKey);
@@ -189,7 +202,7 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
       },
       (e: unknown) => {
         if (cancelled) return;
-        setListError(new Error(`Could not list hosts (${apiErrorMessage(e)}); showing this host only.`));
+        setNotice(`Could not list hosts (${apiErrorMessage(e)}); showing this host only.`);
         setHosts([seedOf({ id: 'local', name: 'Local', transport_kind: 'local' })]);
         fetchHost('local');
       },
@@ -198,6 +211,29 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
       cancelled = true;
     };
   }, [fetchHost]);
+
+  /** Re-read the host list after it failed: add (and fetch) hosts not known yet, clear the notice. */
+  const relist = () => {
+    if (relistingRef.current) return;
+    relistingRef.current = true;
+    api.getRegisteredHosts().then(
+      (hs) => {
+        relistingRef.current = false;
+        if (disposedRef.current) return;
+        const known = new Set(statesRef.current.map((h) => h.hostId));
+        const added = hs.filter((h) => !known.has(h.id));
+        if (added.length) {
+          setHosts((prev) => [...prev, ...added.filter((a) => !prev.some((h) => h.hostId === a.id)).map(seedOf)]);
+        }
+        setNotice(null);
+        for (const h of added) fetchHost(h.id);
+      },
+      () => {
+        // Still unreadable: the notice stands, and the next poll tries again.
+        relistingRef.current = false;
+      },
+    );
+  };
 
   // A user window change (preset button, drag-select, clear): every host, now.
   const firstKey = useRef(true);
@@ -223,7 +259,9 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     const idle = (h: HostUsage) => !controllersRef.current.has(h.hostId);
     const remote = (h: HostUsage) => h.hostId !== 'local' && h.state !== 'unavailable' && idle(h);
     const t = setInterval(() => {
-      if (document.visibilityState === 'visible') fetchWhere(remote);
+      if (document.visibilityState !== 'visible') return;
+      fetchWhere(remote);
+      if (noticeRef.current) relist();
     }, USAGE_REMOTE_POLL_MS);
     const onVisible = () => {
       if (document.visibilityState === 'visible') fetchWhere((h) => h.state !== 'unavailable' && idle(h));
@@ -266,8 +304,7 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
 
   const allFailed =
     hosts.length > 0 && hosts.every((h) => h.state === 'offline' || h.state === 'unavailable' || staleFailed(h));
-  const error =
-    listError ?? (allFailed ? new Error(hosts.map((h) => `${h.name}: ${h.reason ?? h.state}`).join(' · ')) : null);
+  const error = allFailed ? new Error(hosts.map((h) => `${h.name}: ${h.reason ?? h.state}`).join(' · ')) : null;
 
-  return { data, hosts: entries, error };
+  return { data, hosts: entries, error, notice };
 }

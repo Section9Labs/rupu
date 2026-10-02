@@ -220,6 +220,19 @@ describe('Usage page', () => {
     await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW)));
   });
 
+  it('names an unreadable host list in a muted notice, not an error, while local loads', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockRejectedValue(new Error('boom'));
+    vi.spyOn(api, 'getUsage').mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
+    vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
+
+    renderUsage();
+
+    expect(await screen.findByText('Could not list hosts (boom); showing this host only.')).toBeInTheDocument();
+    expect(screen.queryByText(/Could not load usage/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/refresh failed/)).not.toBeInTheDocument();
+  });
+
   it('shows an error state without a prior successful load', async () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
     vi.spyOn(api, 'getUsage').mockRejectedValue(new Error('boom'));

@@ -104,7 +104,7 @@ export default function Usage() {
   // identity is the preset (its `until` ticks every 30s without changing what
   // the operator is looking at); a custom window's is its exact bounds.
   const windowKey = isCustomWindow ? `${usageWindow.since}|${usageWindow.until}` : `preset:${range}`;
-  const { data: current, hosts, error } = useUsageData(usageWindow, windowKey, windowSource);
+  const { data: current, hosts, error, notice } = useUsageData(usageWindow, windowKey, windowSource);
   // `current` is null from a user window change until the first host answers for
   // the NEW window (the hook never mixes an old window's figures into a new
   // one). Keep the last good headline on screen meanwhile, as the page did when
@@ -115,6 +115,8 @@ export default function Usage() {
   const lastGood = useRef(current);
   if (current) lastGood.current = current;
   const data = current ?? lastGood.current;
+  // The last good headline is standing in for a window no host has answered yet.
+  const headlineStale = current === null && data !== null;
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   // Task loading-ux: pivot switches and filter-exclusion toggles trigger a
@@ -253,6 +255,7 @@ export default function Usage() {
               <HostFreshnessStrip hosts={hosts} />
             </div>
           )}
+          {notice && <p className="mt-1 text-xs text-ink-mute">{notice}</p>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {error && data && (
@@ -309,7 +312,7 @@ export default function Usage() {
             onReset={resetExclusions}
             onRunsLoaded={setRuns}
             onSelectRange={handleSelectRange}
-            pending={isPending}
+            pending={isPending || headlineStale}
             background={windowSource === 'tick'}
             hosts={hosts}
             headline={{
