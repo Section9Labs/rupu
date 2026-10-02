@@ -833,6 +833,35 @@ pub struct UnitCheckpoint {
     pub codename: Option<String>,
 }
 
+/// One agent-attempt ledger row, appended to `attempts.jsonl` at the
+/// moment an agent run *starts* (not when it finishes — that is what
+/// makes the ledger useful for an interrupted run). On resume the
+/// ledger is read to find the most recent attempt for a step / unit /
+/// sub-run so its transcript can be continued instead of restarted.
+///
+/// `unit_index` is the 0-based position inside a `for_each` fan-out and
+/// `sub_id` names a panel/parallel sub-step; both are `None` for a plain
+/// linear step. `continued_from` is the `agent_run_id` of the attempt
+/// this one picks up from, when it is a continuation. `host` is `None`
+/// for a local attempt, `Some(name)` for a remote fleet host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    /// Ledger row schema version.
+    pub v: u32,
+    pub step_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_id: Option<String>,
+    pub agent_run_id: String,
+    pub transcript_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
 impl From<&StepResult> for StepResultRecord {
     fn from(sr: &StepResult) -> Self {
         Self {
@@ -1184,6 +1213,10 @@ impl RunStore {
         self.run_dir(run_id).join("unit_checkpoints.jsonl")
     }
 
+    fn attempts_log(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("attempts.jsonl")
+    }
+
     /// Sub-run directory: lives under the parent's run dir so cleanup
     /// follows parent lifecycle. See spec § 5.1.
     /// The `sub/` directory a given id's own sub-runs live under —
@@ -1236,10 +1269,11 @@ impl RunStore {
         }
         std::fs::create_dir_all(&dir)?;
         std::fs::write(self.workflow_snapshot(&record.id), workflow_yaml)?;
-        // Touch the step-results + unit-checkpoint logs so subsequent
-        // appends don't need to create+open.
+        // Touch the step-results + unit-checkpoint + attempts logs so
+        // subsequent appends don't need to create+open.
         File::create(self.step_results_log(&record.id))?;
         File::create(self.unit_checkpoints_log(&record.id))?;
+        File::create(self.attempts_log(&record.id))?;
         write_atomic(
             &self.run_json(&record.id),
             &serde_json::to_vec_pretty(&record)?,
@@ -2055,6 +2089,52 @@ impl RunStore {
                 continue;
             }
             if let Ok(rec) = serde_json::from_str::<UnitCheckpoint>(&line) {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Append one agent-attempt row to `attempts.jsonl`. Called as an
+    /// agent run *starts*, so an interrupted run still leaves a record of
+    /// the transcript to continue from. Append-mode + a single
+    /// `write_all` (a crash mid-write leaves the line fully present or
+    /// absent), serialized behind this fn's own mutex because concurrent
+    /// units / parallel sub-steps start attempts at the same instant and a
+    /// multi-KB line is not guaranteed to land in one write. The mutex is
+    /// deliberately separate from `append_unit_checkpoint`'s: the two logs
+    /// are independent files and shouldn't contend.
+    pub fn append_attempt(&self, run_id: &str, a: &AttemptRecord) -> Result<(), RunStoreError> {
+        static APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let mut line = serde_json::to_vec(a)?;
+        line.push(b'\n');
+        let _serialized = APPEND.lock().unwrap_or_else(|p| p.into_inner());
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.attempts_log(run_id))?;
+        f.write_all(&line)?;
+        Ok(())
+    }
+
+    /// Read every attempt row for a run, in append order. A missing file
+    /// yields an empty vec (a run that never started an agent attempt, or
+    /// one that predates the ledger). Malformed lines are skipped,
+    /// mirroring `read_unit_checkpoints`.
+    pub fn read_attempts(&self, run_id: &str) -> Result<Vec<AttemptRecord>, RunStoreError> {
+        let path = self.attempts_log(run_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let f = File::open(path)?;
+        let reader = BufReader::new(f);
+        let mut out = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(rec) = serde_json::from_str::<AttemptRecord>(&line) {
                 out.push(rec);
             }
         }
@@ -3669,8 +3749,9 @@ impl RunStore {
 
     /// Finalize `record` as `Failed` when it is stuck: `Pending` or
     /// `Running` with a recorded `runner_pid` whose process is no
-    /// longer alive on this machine. This is the gate sweep's
-    /// counterpart to [`cancel`](Self::cancel) — cancel is an
+    /// longer alive on this machine. This is the counterpart to
+    /// [`cancel`](Self::cancel) for `cp serve`'s gate sweep and an
+    /// operator's `workflow resume` — cancel is an
     /// operator-initiated terminal transition, this is a
     /// crash-recovery one (the process that was supposed to run the
     /// workflow died — killed, OOM'd, machine rebooted — without ever
@@ -3719,8 +3800,9 @@ impl RunStore {
             *record = current;
             return Ok(false);
         };
-        let error =
-            format!("runner process {pid} is no longer alive; run marked failed by the gate sweep");
+        // Called by both `cp serve`'s gate sweep and an operator's `workflow
+        // resume`, so the reason names neither.
+        let error = format!("runner process {pid} is no longer alive; run marked failed");
         self.finalize_failed(&mut current, error, now)?;
         *record = current;
         Ok(true)
@@ -4713,6 +4795,36 @@ mod tests {
         // No run created, no file on disk.
         let rows = store.read_unit_checkpoints("never_ran").unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn attempts_round_trip_in_append_order() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let rec = sample_record("run_att");
+        store.create(rec.clone(), "x").unwrap();
+        for (i, idx) in [Some(0usize), Some(1), None].into_iter().enumerate() {
+            store
+                .append_attempt(
+                    &rec.id,
+                    &AttemptRecord {
+                        v: 1,
+                        step_id: "s".into(),
+                        unit_index: idx,
+                        sub_id: None,
+                        agent_run_id: format!("run_a{i}"),
+                        transcript_path: format!("/t/{i}.jsonl").into(),
+                        host: None,
+                        continued_from: None,
+                        started_at: Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+        let got = store.read_attempts(&rec.id).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[2].unit_index, None);
+        assert!(store.read_attempts("run_missing").unwrap().is_empty());
     }
 
     #[test]
@@ -7681,6 +7793,10 @@ mod tests {
         assert_eq!(reloaded.finished_at, Some(now));
         let err = reloaded.error_message.expect("error message set");
         assert!(err.contains(&dead_pid.to_string()), "error: {err}");
+        // The reaper is called by both the gate sweep and an operator's
+        // `workflow resume`; the reason must not name either actor.
+        assert!(err.contains("no longer alive"), "error: {err}");
+        assert!(!err.contains("gate sweep"), "error names an actor: {err}");
         assert!(reloaded.runner_pid.is_none());
         assert!(reloaded.active_step_id.is_none());
         assert!(reloaded.active_step_agent.is_none());

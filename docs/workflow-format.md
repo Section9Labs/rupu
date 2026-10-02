@@ -1147,6 +1147,35 @@ A non-empty `actions:` allowlist on a `host:`/`distribute:` step is rejected at 
 
 ---
 
+## Resuming an interrupted run
+
+`rupu workflow resume <run-id>` (also `rupu run resume`) takes a failed, cancelled, rejected or paused run back and re-runs only what did not finish. Steps with a recorded result are skipped, and `for_each` units that already succeeded are replayed from their checkpoints.
+
+An agent the interrupted process was in the middle of — killed, crashed, `SIGTERM`ed — is **continued, not started over**. For each linear step and each `for_each` unit that has no recorded result, resume reads the latest agent attempt's transcript and picks one of three outcomes:
+
+| the attempt's transcript | outcome | what runs |
+|---|---|---|
+| it stopped mid-run (killed, crashed, paused) | **continued** | a new agent run is seeded from the transcript (replayed, with a continuation note) and carries on from where it stopped |
+| it had in fact finished — only its result was lost | **recovered** | its final answer is the step's / unit's result; no agent runs and no model call is made |
+| it ended in failure, or the transcript is missing or unreadable | **restarted** | a fresh agent run from the rendered prompt, exactly as resume always did |
+
+Resume prints one line per step it planned something for (`each: 1 continued · 1 recovered · 1 restarted`) before dispatching. In the live view a continued or recovered step or unit carries a `↩ continued` / `↩ recovered` mark (a restarted one looks like any fresh start). The run's `events.jsonl` records each one as an `attempt_resumed` event, naming the interrupted agent run it picked up.
+
+This is the default. Pass `--restart-interrupted` to skip it and start every interrupted step and unit over from its prompt, as resume did before.
+
+Every agent attempt is recorded in a per-run `attempts.jsonl` ledger as it starts. A run interrupted before the ledger existed is still covered: resume derives the same attempts from the run's `events.jsonl`.
+
+A run left `Running` by a runner that has since died (`SIGKILL`, an out-of-memory kill, a reboot) is marked `Failed` first — the same transition `rupu cp serve`'s sweep makes — so the CLI alone can recover it. A run whose recorded runner is still alive is refused.
+
+What still restarts (follow-ups, not yet continued from a transcript):
+
+- `parallel:` sub-steps and `panel:` members.
+- steps that are members of a `loops:` subgraph.
+- a step or unit placed on a remote host (`host:` / `distribute:`) — a remote transcript can't be continued from here.
+- the CP web UI's resume has no "restart interrupted" option yet; it always continues.
+
+---
+
 ## Template context
 
 Workflow templates use minijinja. Missing variables render as empty strings.

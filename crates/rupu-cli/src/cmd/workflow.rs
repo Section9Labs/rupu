@@ -529,7 +529,9 @@ pub enum Action {
         run_id: String,
     },
     /// Resume a failed/cancelled run, re-running only the agent runs
-    /// that didn't succeed.
+    /// that didn't succeed. An agent run the interrupted process left
+    /// mid-flight is picked up where it stopped (or its finished answer
+    /// reused) rather than started over.
     Resume {
         /// Full run id (`run_<ULID>`) of the terminal run to resume.
         run_id: String,
@@ -549,6 +551,10 @@ pub enum Action {
         /// run is an operator's call, made without this flag.
         #[arg(long, hide = true)]
         if_unfinished: bool,
+        /// Start every interrupted step and `for_each` unit over from its
+        /// prompt instead of continuing it from its transcript.
+        #[arg(long)]
+        restart_interrupted: bool,
     },
     /// Archive a terminal run (move it out of the active list; reversible).
     ArchiveRun {
@@ -714,7 +720,17 @@ pub async fn handle(
             mode,
             plain,
             if_unfinished,
-        } => resume_run(&run_id, mode.as_deref(), plain, if_unfinished).await,
+            restart_interrupted,
+        } => {
+            resume_run(
+                &run_id,
+                mode.as_deref(),
+                plain,
+                if_unfinished,
+                restart_interrupted,
+            )
+            .await
+        }
         Action::ArchiveRun { run_id } => archive_run(&run_id).await,
         Action::RestoreRun { run_id } => restore_run(&run_id).await,
         Action::DeleteRun { run_id, force } => delete_run(&run_id, force).await,
@@ -3375,11 +3391,21 @@ fn mark_resumed(record: &mut rupu_orchestrator::runs::RunRecord, pid: u32) {
     record.clear_resume_marker();
 }
 
+/// `rupu workflow resume` / `rupu run resume`: take a failed, cancelled,
+/// rejected or paused run back (see the notes above on what is replayed). A
+/// run left `Running` by a runner that has since died is reaped first.
+///
+/// Whatever agent attempt the dead runner left mid-flight is picked up rather
+/// than started over — `recovery::discover` plans each interrupted step and
+/// `for_each` unit as continued / recovered / restarted (recover-on-interrupt
+/// spec §§3-4). `restart_interrupted` (`--restart-interrupted`) skips that
+/// discovery, so every interrupted step and unit starts again from its prompt.
 pub(crate) async fn resume_run(
     run_id: &str,
     mode: Option<&str>,
     plain: bool,
     if_unfinished: bool,
+    restart_interrupted: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -3388,7 +3414,7 @@ pub(crate) async fn resume_run(
     let run_id = resolve_run_fragment(&store, run_id)?;
     let run_id = run_id.as_str();
 
-    let record = store.load(run_id).map_err(|e| match e {
+    let mut record = store.load(run_id).map_err(|e| match e {
         rupu_orchestrator::RunStoreError::NotFound(id) => {
             anyhow::anyhow!("run not found: {id}\n  hint: list runs with `rupu workflow runs`")
         }
@@ -3398,7 +3424,6 @@ pub(crate) async fn resume_run(
     // Guard: don't double-run an in-flight run, and don't re-run a
     // run that already completed.
     use rupu_orchestrator::RunStatus;
-    let original_status = record.status;
     // Gate decisions recorded on the run but not applied yet (spec §7) — a
     // web approve/reject the cp-serve resume worker hands here, or a
     // decision whose runner stopped before applying it. The runner applies
@@ -3414,6 +3439,33 @@ pub(crate) async fn resume_run(
         report_resumed_run(&result, "to apply its recorded gate decisions");
         return Ok(());
     }
+    // A run still `Running`/`Pending` whose recorded runner process is dead
+    // was killed mid-run (SIGKILL, OOM, a reboot) before it could mark itself
+    // terminal. Nothing but `cp serve`'s sweep would, and the in-flight guard
+    // below would refuse it until then — so reap it here, the same transition
+    // the sweep makes (`Failed`, with its terminal event), and resume it. A
+    // run whose runner is still alive is left alone and refused below. A
+    // request's runner (`--if-unfinished`) leaves it be too: it would end the
+    // run only to refuse it as finished, so it is refused as in flight,
+    // untouched, for the operator's plain resume or the sweep to take over.
+    if !if_unfinished && matches!(record.status, RunStatus::Running | RunStatus::Pending) {
+        let now = chrono::Utc::now();
+        let mut listed = record.clone();
+        let (reaped, current) = store
+            .blocking(move |s| {
+                let reaped = s.reap_if_orphaned(&mut listed, now)?;
+                Ok::<_, rupu_orchestrator::RunStoreError>((reaped, listed))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("reap crashed run: {e}"))?;
+        if reaped {
+            println!(
+                "rupu: run {run_id} was left running by a runner that is no longer alive; marked it failed, resuming"
+            );
+        }
+        record = current;
+    }
+    let original_status = record.status;
     match record.status {
         // A request's runner (`--if-unfinished`, spawned by `cp serve`)
         // that finds the run finished since the request never retries it.
@@ -3521,6 +3573,41 @@ pub(crate) async fn resume_run(
         replayed_units += units.len();
         !units.is_empty()
     });
+
+    // What the interrupted run left mid-flight: for every step and `for_each`
+    // unit without a recorded result, look at its latest agent attempt's
+    // transcript and plan to *continue* it, *recover* its finished answer, or
+    // *restart* it (spec §3). `--restart-interrupted` skips this, so everything
+    // restarts as resume always did. `completed_units` now holds only SUCCESS
+    // checkpoints, which is exactly what discovery treats as settled: a unit
+    // whose checkpoint failed is planned from its transcript (a unit killed by
+    // SIGTERM checkpoints `success: false` yet is continuable).
+    let recovery = if restart_interrupted {
+        rupu_orchestrator::recovery::RecoveryPlans::default()
+    } else {
+        let settled_units: BTreeMap<String, BTreeMap<usize, ()>> = completed_units
+            .iter()
+            .map(|(step_id, units)| (step_id.clone(), units.keys().map(|i| (*i, ())).collect()))
+            .collect();
+        let (store, run_id, workflow, done_step_ids) = (
+            Arc::clone(&store),
+            run_id.to_string(),
+            workflow.clone(),
+            done_step_ids.clone(),
+        );
+        // Reads transcripts: off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            rupu_orchestrator::recovery::discover(
+                &store,
+                &run_id,
+                &workflow,
+                &done_step_ids,
+                &settled_units,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("discover interrupted attempts: {e}"))?
+    };
 
     // Restore inputs, event, issue, workspace path from the record.
     let inputs_map: BTreeMap<String, String> = record.inputs.clone();
@@ -3740,6 +3827,7 @@ pub(crate) async fn resume_run(
         reason,
         paused_steps,
         rejected_reason: None,
+        recovery,
         ..Default::default()
     };
 
@@ -3794,6 +3882,17 @@ pub(crate) async fn resume_run(
         println!(
             "      replaying {replayed_units} already-succeeded fan-out unit(s) from disk; only failed/missing units re-run"
         );
+    }
+    // One line per step discovery planned something for, e.g.
+    // `each: 1 continued · 1 recovered · 1 restarted`.
+    if let Some(plans) = opts.resume_from.as_ref().map(|r| &r.recovery) {
+        let summary = plans.summary();
+        for (step_id, counts) in &summary {
+            println!("      {step_id}: {counts}");
+        }
+        if !summary.is_empty() {
+            println!("      (resume with --restart-interrupted to start these over instead)");
+        }
     }
 
     // Open the same live three-zone view on resume (same gate as `run`).
@@ -6783,7 +6882,8 @@ mod tests {
         rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
 
         let run_id = record.id.clone();
-        let resume = tokio::spawn(async move { resume_run(&run_id, None, true, false).await });
+        let resume =
+            tokio::spawn(async move { resume_run(&run_id, None, true, false, false).await });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while store.pause_marker_exists(&record.id) {
@@ -6868,7 +6968,8 @@ mod tests {
         rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
 
         let run_id = record.id.clone();
-        let resume = tokio::spawn(async move { resume_run(&run_id, None, true, false).await });
+        let resume =
+            tokio::spawn(async move { resume_run(&run_id, None, true, false, false).await });
 
         // Once the marker is gone, the resume has loaded the run as
         // `Paused` and passed its guards; its flip is next, and waits on
@@ -6973,7 +7074,7 @@ mod tests {
 
             let resume = {
                 let run_id = run_id.clone();
-                tokio::spawn(async move { resume_run(&run_id, None, true, true).await })
+                tokio::spawn(async move { resume_run(&run_id, None, true, true, false).await })
             };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !store.events_path(&run_id).exists() {
@@ -7016,7 +7117,7 @@ mod tests {
         store
             .request_resume_approval("run_not_late", "web", None, Utc::now(), None)
             .unwrap();
-        resume_run("run_not_late", None, true, true)
+        resume_run("run_not_late", None, true, true, false)
             .await
             .expect("an unfinished run's decision is applied");
         assert_eq!(
@@ -7059,7 +7160,7 @@ mod tests {
             store.update(&rec).unwrap();
             let finished = std::fs::read(store.run_json_path(&run_id)).unwrap();
 
-            let err = resume_run(&run_id, None, true, true)
+            let err = resume_run(&run_id, None, true, true, false)
                 .await
                 .expect_err("a requested resume never retries a finished run");
             let status = status.as_str();
@@ -7076,7 +7177,7 @@ mod tests {
             );
 
             if status != RunStatus::Completed.as_str() {
-                resume_run(&run_id, None, true, false)
+                resume_run(&run_id, None, true, false, false)
                     .await
                     .expect("the operator's retry takes the run back");
                 let retried = store.load(&run_id).unwrap();
@@ -7475,7 +7576,7 @@ mod tests {
         // Step 2: the resume worker's spawned `workflow resume`, simulated
         // in-process (see `resume_one_run`'s own test for the argv half).
         std::env::set_var("RUPU_HOME", &home);
-        let result = resume_run(&rec.id, None, true, false).await;
+        let result = resume_run(&rec.id, None, true, false, false).await;
         std::env::remove_var("RUPU_HOME");
         result.expect("the web-approved run resumes");
 

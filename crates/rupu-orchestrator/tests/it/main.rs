@@ -9,6 +9,7 @@
 //! never cleared and would make every other run here stop as terminating.
 
 mod action_step;
+mod attempts_ledger;
 mod branch_runner;
 mod cancel_vs_completion;
 mod dispatch_agent;
@@ -24,6 +25,7 @@ mod multi_gate_path_scoped;
 mod pause_resume_e2e;
 mod placed_step_e2e;
 mod remote_coverage_ingest;
+mod recovery;
 mod remote_findings_profile;
 mod run_step_workflow;
 mod runner_events;

@@ -176,6 +176,9 @@ pub enum RunAction {
         mode: Option<String>,
         /// Use the plain line printer instead of the live graph view.
         plain: bool,
+        /// Start every interrupted step and `for_each` unit over from its
+        /// prompt instead of continuing it from its transcript.
+        restart_interrupted: bool,
     },
     /// One-shot agent run: `rupu run <agent> [target] [prompt] …` (the
     /// default `rupu run` behavior — see [`Args`] for the full flag set).
@@ -227,6 +230,8 @@ struct ResumeArgsParser {
     mode: Option<String>,
     #[arg(long)]
     plain: bool,
+    #[arg(long)]
+    restart_interrupted: bool,
 }
 
 /// Classify the raw argv captured by `Cmd::Run` (everything after the
@@ -260,6 +265,7 @@ pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
                 run_id: parsed.run_id,
                 mode: parsed.mode,
                 plain: parsed.plain,
+                restart_interrupted: parsed.restart_interrupted,
             })
         }
         Some("list") => {
@@ -318,8 +324,17 @@ pub async fn handle(
             run_id,
             mode,
             plain,
+            restart_interrupted,
         }) => {
-            match crate::cmd::workflow::resume_run(&run_id, mode.as_deref(), plain, false).await {
+            match crate::cmd::workflow::resume_run(
+                &run_id,
+                mode.as_deref(),
+                plain,
+                false,
+                restart_interrupted,
+            )
+            .await
+            {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => crate::output::diag::fail(e),
             }

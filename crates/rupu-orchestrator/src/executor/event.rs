@@ -10,7 +10,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::runs::{RunStatus, StepKind};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// How an interrupted attempt was picked back up (see
+/// [`Event::AttemptResumed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptResumeMode {
+    /// The interrupted agent run's transcript was replayed and the new run
+    /// carries on from where it stopped.
+    Continued,
+    /// The interrupted attempt's transcript turned out to be a finished run:
+    /// its output was recovered from that transcript without re-running the
+    /// agent.
+    Recovered,
+    /// The attempt was started again from scratch (nothing usable to
+    /// continue from).
+    Restarted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     RunStarted {
@@ -201,6 +218,25 @@ pub enum Event {
         tokens_in: u64,
         tokens_out: u64,
     },
+    /// A resumed run picked an interrupted attempt back up. Emitted once per
+    /// interrupted attempt (a linear step, or one fan-out unit when
+    /// `unit_index` is `Some`) before its agent is re-dispatched, so the live
+    /// view can show that the attempt is a resumption rather than a fresh
+    /// start (a `Recovered` attempt is folded in without a new dispatch).
+    /// `from_agent_run_id` is the interrupted agent run being
+    /// continued/recovered (`None` for a plain restart); `reason` is a short
+    /// operator-facing note on why this mode was chosen.
+    AttemptResumed {
+        run_id: String,
+        step_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit_index: Option<usize>,
+        mode: AttemptResumeMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_agent_run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 impl Event {
@@ -225,7 +261,8 @@ impl Event {
             | Event::StepPaused { run_id, .. }
             | Event::StepResumed { run_id, .. }
             | Event::DispatchStarted { run_id, .. }
-            | Event::DispatchCompleted { run_id, .. } => run_id,
+            | Event::DispatchCompleted { run_id, .. }
+            | Event::AttemptResumed { run_id, .. } => run_id,
         }
     }
 }
@@ -528,5 +565,49 @@ mod tests {
         assert_eq!(ev.run_id(), "run_W");
         let legacy = r#"{"type":"unit_started","run_id":"r","step_id":"s","index":0,"unit_key":"k","agent":null,"transcript_path":"/t"}"#;
         assert!(serde_json::from_str::<Event>(legacy).is_ok());
+    }
+
+    #[test]
+    fn attempt_resumed_round_trips() {
+        let e = Event::AttemptResumed {
+            run_id: "r".into(),
+            step_id: "s".into(),
+            unit_index: Some(3),
+            mode: AttemptResumeMode::Continued,
+            from_agent_run_id: Some("run_prev".into()),
+            reason: None,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["type"], "attempt_resumed");
+        assert_eq!(j["mode"], "continued");
+        assert!(j.get("reason").is_none(), "None reason is skipped");
+        assert_eq!(e.run_id(), "r");
+        assert_eq!(serde_json::from_value::<Event>(j).unwrap(), e);
+    }
+
+    #[test]
+    fn attempt_resumed_modes_serialize_snake_case_and_optionals_default() {
+        for (mode, wire) in [
+            (AttemptResumeMode::Continued, "continued"),
+            (AttemptResumeMode::Recovered, "recovered"),
+            (AttemptResumeMode::Restarted, "restarted"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+        }
+        // A minimal line (no unit_index / from_agent_run_id / reason)
+        // still deserializes: the optionals are `serde(default)`.
+        let minimal = r#"{"type":"attempt_resumed","run_id":"r","step_id":"s","mode":"restarted"}"#;
+        let ev: Event = serde_json::from_str(minimal).unwrap();
+        assert_eq!(
+            ev,
+            Event::AttemptResumed {
+                run_id: "r".into(),
+                step_id: "s".into(),
+                unit_index: None,
+                mode: AttemptResumeMode::Restarted,
+                from_agent_run_id: None,
+                reason: None,
+            }
+        );
     }
 }

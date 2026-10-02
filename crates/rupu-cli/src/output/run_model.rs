@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use rupu_config::PricingConfig;
-use rupu_orchestrator::executor::Event;
+use rupu_orchestrator::executor::{AttemptResumeMode, Event};
 use rupu_orchestrator::runs::{RunStatus, StepKind};
 use rupu_orchestrator::RunStore;
 
@@ -32,6 +32,37 @@ pub struct UnitCounts {
     pub total: usize,
 }
 
+/// How a resumed run picked an interrupted step / unit back up, for the live
+/// view to mark it. Only the two modes that are *not* a fresh start have a
+/// mark: a restarted attempt looks like any other start, so
+/// [`AttemptResumeMode::Restarted`] has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumedMark {
+    /// A new agent run carries on from the interrupted one's transcript.
+    Continued,
+    /// The interrupted attempt had finished; its answer was reused, no agent ran.
+    Recovered,
+}
+
+impl ResumedMark {
+    /// The mark for `mode`, if it earns one.
+    pub fn of(mode: AttemptResumeMode) -> Option<Self> {
+        match mode {
+            AttemptResumeMode::Continued => Some(Self::Continued),
+            AttemptResumeMode::Recovered => Some(Self::Recovered),
+            AttemptResumeMode::Restarted => None,
+        }
+    }
+
+    /// The word the live view shows beside the row.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continued => "continued",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UnitView {
     pub index: usize,
@@ -42,6 +73,9 @@ pub struct UnitView {
     pub model: Option<String>,
     pub host: Option<String>,
     pub status: UnitStatus,
+    /// Set when this unit's current attempt resumes an interrupted one
+    /// (`AttemptResumed`); cleared by the next `UnitStarted`.
+    pub resumed: Option<ResumedMark>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +129,10 @@ pub struct StepView {
     /// `StepWarning` messages for this step (step-level and per-unit), in
     /// arrival order. Information only — never part of `state`.
     pub warnings: Vec<String>,
+    /// Set when a linear step's current attempt resumes an interrupted one
+    /// (`AttemptResumed` with no `unit_index`); cleared by the next
+    /// `StepStarted`. A fan-out step's units carry their own.
+    pub resumed: Option<ResumedMark>,
     /// First-seen order, for stable rendering.
     pub order: usize,
 }
@@ -175,6 +213,7 @@ impl RunView {
             panel_max: None,
             loop_iteration: None,
             warnings: Vec::new(),
+            resumed: None,
             order,
         });
         self.steps.last_mut().unwrap()
@@ -205,6 +244,9 @@ impl RunView {
                 s.agent = agent.clone();
                 s.host = host.clone();
                 s.codename = codename.clone();
+                // A new attempt: any earlier resumption mark described the
+                // last one (`events.jsonl` spans every resume).
+                s.resumed = None;
                 self.last_active_step = Some(step_id.clone());
             }
             Event::StepWorking { step_id, .. } => {
@@ -307,9 +349,13 @@ impl RunView {
                     model: None,
                     host: host.clone(),
                     status: UnitStatus::Queued,
+                    resumed: None,
                 });
                 u.unit_key = unit_key.clone();
                 u.status = UnitStatus::Running;
+                // Every start is a new attempt; `AttemptResumed` follows it
+                // when that attempt is a resumption.
+                u.resumed = None;
                 // The runner re-emits `UnitStarted` for the same (step, index)
                 // when a unit is retried onto a fallback host, carrying the new
                 // host/codename. Overwrite (latest wins) rather than back-fill,
@@ -443,6 +489,28 @@ impl RunView {
                 s.panel_round = Some(*round);
                 s.panel_max = Some(*max_iterations);
             }
+            // A resumed attempt is announced right after its `StepStarted` /
+            // `UnitStarted`, so its row exists to take the mark. `Restarted`
+            // is a plain fresh start and earns none; a unit whose start was
+            // never seen is not conjured up for a mark.
+            Event::AttemptResumed {
+                step_id,
+                unit_index,
+                mode,
+                ..
+            } => {
+                if let Some(mark) = ResumedMark::of(*mode) {
+                    let s = self.step_mut(step_id);
+                    match unit_index {
+                        Some(i) => {
+                            if let Some(u) = s.units.get_mut(i) {
+                                u.resumed = Some(mark);
+                            }
+                        }
+                        None => s.resumed = Some(mark),
+                    }
+                }
+            }
         }
     }
 }
@@ -567,7 +635,7 @@ pub fn step_status(state: StepState) -> Status {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use rupu_orchestrator::executor::Event;
+    use rupu_orchestrator::executor::{AttemptResumeMode, Event};
     use rupu_orchestrator::runs::{RunStatus, StepKind};
 
     fn started(step: &str, kind: StepKind) -> Event {
@@ -1144,6 +1212,134 @@ mod tests {
         assert_eq!(v.run_id, "run_GONE");
         assert!(v.steps.is_empty());
         assert_eq!(v.usage.unwrap().total_tokens, 0);
+    }
+
+    fn unit_started(step: &str, index: usize) -> Event {
+        Event::UnitStarted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            unit_key: format!("svc-{index}"),
+            agent: Some("breaker".into()),
+            transcript_path: format!("t{index}").into(),
+            host: None,
+            codename: None,
+        }
+    }
+
+    fn unit_completed(step: &str, index: usize) -> Event {
+        Event::UnitCompleted {
+            run_id: "r".into(),
+            step_id: step.into(),
+            index,
+            unit_key: format!("svc-{index}"),
+            success: true,
+            tokens_in: 0,
+            tokens_out: 0,
+            host: None,
+        }
+    }
+
+    fn resumed(step: &str, unit_index: Option<usize>, mode: AttemptResumeMode) -> Event {
+        Event::AttemptResumed {
+            run_id: "r".into(),
+            step_id: step.into(),
+            unit_index,
+            mode,
+            from_agent_run_id: Some("run_old".into()),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn a_resumed_unit_keeps_its_mark_through_its_lifecycle() {
+        let mut v = RunView::default();
+        v.apply(&started("hunt", StepKind::ForEach));
+        for i in 0..3 {
+            v.apply(&unit_started("hunt", i));
+        }
+        // Unit 0 is continued, unit 2 recovered (its answer was reused);
+        // unit 1 is a plain fresh start.
+        v.apply(&resumed("hunt", Some(0), AttemptResumeMode::Continued));
+        v.apply(&resumed("hunt", Some(2), AttemptResumeMode::Recovered));
+        v.apply(&unit_completed("hunt", 0));
+        v.apply(&unit_completed("hunt", 2));
+
+        let units = &v.steps[0].units;
+        assert_eq!(units[&0].resumed, Some(ResumedMark::Continued));
+        assert_eq!(
+            units[&0].status,
+            UnitStatus::Done,
+            "the mark is not a status"
+        );
+        assert_eq!(units[&1].resumed, None);
+        assert_eq!(units[&2].resumed, Some(ResumedMark::Recovered));
+        assert_eq!(
+            v.steps[0].resumed, None,
+            "the marks are the units', not the step's"
+        );
+    }
+
+    #[test]
+    fn a_resumed_linear_step_is_marked_and_its_units_are_not() {
+        let mut v = RunView::default();
+        v.apply(&started("only", StepKind::Linear));
+        v.apply(&resumed("only", None, AttemptResumeMode::Continued));
+        v.apply(&Event::StepCompleted {
+            run_id: "r".into(),
+            step_id: "only".into(),
+            success: true,
+            duration_ms: 1_000,
+            host: None,
+        });
+
+        let step = &v.steps[0];
+        assert_eq!(step.resumed, Some(ResumedMark::Continued));
+        assert_eq!(step.state, StepState::Complete);
+        assert!(step.units.is_empty());
+    }
+
+    #[test]
+    fn a_restarted_attempt_is_not_marked() {
+        let mut v = RunView::default();
+        v.apply(&started("only", StepKind::Linear));
+        v.apply(&resumed("only", None, AttemptResumeMode::Restarted));
+        v.apply(&started("hunt", StepKind::ForEach));
+        v.apply(&unit_started("hunt", 0));
+        v.apply(&resumed("hunt", Some(0), AttemptResumeMode::Restarted));
+
+        assert_eq!(v.steps[0].resumed, None);
+        assert_eq!(v.steps[1].units[&0].resumed, None);
+    }
+
+    #[test]
+    fn a_unit_start_ends_the_previous_attempts_mark() {
+        // events.jsonl spans every resume: the same unit is started again by
+        // a later one (or retried onto a fallback host), and that new attempt
+        // is not the continuation the earlier mark described.
+        let mut v = RunView::default();
+        v.apply(&started("hunt", StepKind::ForEach));
+        v.apply(&unit_started("hunt", 0));
+        v.apply(&resumed("hunt", Some(0), AttemptResumeMode::Continued));
+        assert_eq!(v.steps[0].units[&0].resumed, Some(ResumedMark::Continued));
+
+        v.apply(&unit_started("hunt", 0));
+        assert_eq!(v.steps[0].units[&0].resumed, None);
+
+        // Same for a linear step started again.
+        v.apply(&started("only", StepKind::Linear));
+        v.apply(&resumed("only", None, AttemptResumeMode::Recovered));
+        assert_eq!(v.steps[1].resumed, Some(ResumedMark::Recovered));
+        v.apply(&started("only", StepKind::Linear));
+        assert_eq!(v.steps[1].resumed, None);
+    }
+
+    #[test]
+    fn a_resumption_of_a_unit_never_seen_start_makes_no_phantom_unit() {
+        let mut v = RunView::default();
+        v.apply(&started("hunt", StepKind::ForEach));
+        v.apply(&resumed("hunt", Some(4), AttemptResumeMode::Continued));
+        assert!(v.steps[0].units.is_empty());
     }
 
     #[test]

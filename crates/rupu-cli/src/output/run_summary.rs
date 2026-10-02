@@ -306,6 +306,7 @@ mod tests {
             model: None,
             host: None,
             status,
+            resumed: None,
         }
     }
 
