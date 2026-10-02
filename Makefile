@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release cp-codename-palette
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release cp-codename-palette sweep-targets sweep-targets-install sweep-targets-uninstall
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -101,6 +101,22 @@ gates: fmt lint test
 clean:
 	cargo clean
 
+# Cargo never garbage-collects target/, and every worktree has its own, so
+# they grow by tens of GB a day (scripts/sweep-cargo-targets.sh says why and
+# what goes). sweep-targets sweeps every worktree plus Claude Code scratch
+# builds once (ARGS=--dry-run to preview); sweep-targets-install runs it
+# hourly from a launchd agent (macOS) that outlives this checkout.
+SWEEP_ARGS = --repo "$(CURDIR)" --scan /tmp/claude-$$(id -u)
+
+sweep-targets:
+	scripts/sweep-cargo-targets.sh $(SWEEP_ARGS) $(ARGS)
+
+sweep-targets-install:
+	scripts/sweep-cargo-targets.sh --install $(SWEEP_ARGS) $(ARGS)
+
+sweep-targets-uninstall:
+	scripts/sweep-cargo-targets.sh --uninstall
+
 # rupu.app (macOS, Swift) — XcodeGen scaffold under apps/rupu-macos/.
 # macos-gen regenerates the gitignored .xcodeproj from project.yml;
 # macos-build/-run depend on it so the project is always fresh.
@@ -162,6 +178,9 @@ help:
 	@echo "  test           cargo test --workspace"
 	@echo "  gates          fmt + lint + test (same as the release-ready check)"
 	@echo "  clean          cargo clean"
+	@echo "  sweep-targets  reclaim disk from every worktree's target/ (ARGS=--dry-run to preview)"
+	@echo "  sweep-targets-install    run sweep-targets hourly via launchd (macOS)"
+	@echo "  sweep-targets-uninstall  remove that launchd agent"
 	@echo ""
 	@echo "  macos-gen      xcodegen generate apps/rupu-macos/project.yml"
 	@echo "  macos-build    macos-gen + xcodebuild the rupu scheme (Debug, ad-hoc signed)"
