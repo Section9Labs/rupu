@@ -262,7 +262,7 @@ pub enum ErrorClass {
   - OpenAI codes: `rate_limit_exceeded`, `server_error`, `context_length_exceeded` → `ContextOverflow`, `insufficient_quota` → `Quota`, policy codes → `Policy`.
   - Copilot `model_max_prompt_tokens_exceeded` → `ContextOverflow`.
   - Gemini status: `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `INVALID_ARGUMENT`, `PERMISSION_DENIED`, `UNAUTHENTICATED`, `NOT_FOUND`, `DEADLINE_EXCEEDED`.
-- **Retry classification** reads `ErrorClass`: `RateLimited`, `Overloaded`, `Server`, `Timeout` and stream-origin errors retry. This applies to `tuned::is_retryable`, the runner's `is_retryable_provider_error`, and `ProviderRouter` failover.
+- **Retry classification** reads `ErrorClass`: `RateLimited`, `Overloaded`, `Server` and `Timeout` retry. A stream-origin error retries when its class is one of those, or when it carried no kind or code at all (an unknown kind or code may name a permanent condition, so it does not retry; a flat error event's own `"type": "error"` is not a kind). Any kind containing `policy` (case-insensitive) is `Policy`, which is permanent. This applies to `tuned::is_retryable`, the runner's `is_retryable_provider_error`, and `ProviderRouter` failover.
 - Errors that aren't from a body are unchanged: `Http`, `SseParse`, `UnexpectedEndOfStream`, `IncompleteStream`, `MissingAuth`, `LongContextUnavailable`, `Terminating`. Each maps to a class through a fixed table. The never-constructed variants (`Unauthorized`, `QuotaExceeded`, `ModelUnavailable`, `BadRequest`) are removed in favor of the class.
 - **`parse_context_overflow`** (`runner.rs`) takes the `ProviderError`, not its `Display` string:
   - `ErrorClass::ContextOverflow` is an overflow even when no numbers parse.
