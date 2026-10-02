@@ -401,6 +401,35 @@ fn replace_ledger(
     Ok(backup)
 }
 
+/// Give the replacement the ledger's owner and group. Replaced by another
+/// user (an import run with `sudo`), the ledger would otherwise become that
+/// user's, and its owner's agents could no longer append to it; where that
+/// cannot be done (an importer who is neither the owner nor root), the
+/// import is refused rather than taking the ledger over.
+#[cfg(unix)]
+fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let now = f.metadata()?;
+    let uid = (now.uid() != ledger.uid()).then(|| rustix::fs::Uid::from_raw(ledger.uid()));
+    let gid = (now.gid() != ledger.gid()).then(|| rustix::fs::Gid::from_raw(ledger.gid()));
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+    rustix::fs::fchown(f, uid, gid).map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot keep the ledger's owner and group ({}:{}) on its replacement: {}; run the import as the ledger's owner",
+            ledger.uid(),
+            ledger.gid(),
+            std::io::Error::from(e)
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn keep_owner(_: &std::fs::File, _: &std::fs::Metadata) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn stage_and_swap(
     paths: &CoveragePaths,
     segments: &[Vec<u8>],
@@ -408,11 +437,12 @@ fn stage_and_swap(
     tmp: &Path,
     before_rename: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
-    let permissions = std::fs::metadata(&paths.findings)?.permissions();
+    let ledger = std::fs::metadata(&paths.findings)?;
     let mut f = std::fs::File::create(tmp)?;
     // Before any content is written, so it is never readable at a looser
     // mode than the ledger it replaces.
-    f.set_permissions(permissions)?;
+    f.set_permissions(ledger.permissions())?;
+    keep_owner(&f, &ledger)?;
     for segment in segments {
         f.write_all(segment)?;
     }
@@ -585,6 +615,45 @@ mod tests {
             try_lock().is_ok(),
             "the lock is released when the import returns"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_rewritten_ledger_keeps_its_group() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let id = seed_summary(&paths);
+        let created = std::fs::metadata(&paths.findings).unwrap().gid();
+        // Another group this user belongs to: a file it creates does not get
+        // that one, so keeping it takes the chown.
+        let groups = std::process::Command::new("id").arg("-G").output().unwrap();
+        let other = String::from_utf8(groups.stdout)
+            .unwrap()
+            .split_whitespace()
+            .filter_map(|g| g.parse::<u32>().ok())
+            .find(|g| *g != created);
+        let Some(other) = other else {
+            return; // one group only: nothing to keep
+        };
+        std::os::unix::fs::chown(&paths.findings, None, Some(other)).unwrap();
+        let batch = attach_reports(
+            &paths,
+            vec![AttachItem {
+                finding_id: id,
+                report: report(),
+            }],
+            &FindingWriteOptions::default().with_profile(FindingProfile::Full),
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(batch.outcomes.as_slice(), [AttachOutcome::Attached]),
+            "{:?} {:?}",
+            batch.outcomes,
+            batch.write_error
+        );
+        assert_eq!(std::fs::metadata(&paths.findings).unwrap().gid(), other);
     }
 
     #[test]

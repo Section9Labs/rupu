@@ -211,13 +211,15 @@ pub fn report_finding(
 /// across the append so it cannot interleave with an import's rewrite.
 ///
 /// Where the filesystem cannot lock at all (some network and FUSE mounts:
-/// see [`lock_unsupported`]), or the lock file cannot be opened (a directory
-/// this user may not create files in), the line is appended without the lock
-/// and a warning is logged, as before the lock existed: losing the finding
-/// would be worse. An import cannot run there without the same lock file, so
-/// it either cannot run at all or runs as a user who can open it, and then
-/// its length check catches the unlocked append. Any other lock failure is an
-/// error.
+/// see [`lock_unsupported`]), where the lock file cannot be opened (a
+/// directory this user may not create files in), or where it could only be
+/// opened read-only and an exclusive lock needs it writable (`EBADF`, as
+/// NFS's locks do), the line is appended without the lock and a warning is
+/// logged, as before the lock existed: losing the finding would be worse.
+/// An import needs the same lock, so it either cannot run there or runs as a
+/// user who can take it; its length check then almost always catches the
+/// unlocked append (not one that lands between that check and its rename).
+/// Any other lock failure is an error.
 fn append_line(
     paths: &CoveragePaths,
     line: &[u8],
@@ -235,8 +237,10 @@ fn append_line(
             None
         }
     };
-    if let Some(Err(e)) = lock_file.as_ref().map(lock) {
-        if !lock_unsupported(&e) {
+    if let Some((Err(e), read_only)) = lock_file.as_ref().map(|(f, ro)| (lock(f), *ro)) {
+        let needs_write =
+            read_only && e.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error());
+        if !(lock_unsupported(&e) || needs_write) {
             return Err(e);
         }
         tracing::warn!(
@@ -405,17 +409,18 @@ pub(crate) fn derived_fields(
 /// by rename, and a lock held on the replaced file would not exclude the
 /// next writer. Released when the returned handle drops.
 pub(crate) fn lock_findings(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
-    let f = open_lock_file(paths)?;
+    let (f, _) = open_lock_file(paths)?;
     f.lock()?;
     Ok(f)
 }
 
-/// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing.
+/// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing,
+/// and whether it was opened read-only.
 ///
-/// A lock needs only a handle on the file, so one this user may not write
-/// (created by another user, say an import run with `sudo`) is opened
-/// read-only instead.
-fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
+/// A lock needs only a handle on the file on most filesystems, so one this
+/// user may not write (created by another user, say an import run with
+/// `sudo`) is opened read-only instead.
+fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<(std::fs::File, bool)> {
     paths.ensure_dir()?;
     let path = paths.root.join("findings.jsonl.lock");
     match std::fs::OpenOptions::new()
@@ -424,10 +429,11 @@ fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
         .write(true)
         .open(&path)
     {
+        Ok(f) => Ok((f, false)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            std::fs::File::open(&path).map_err(|_| e)
+            std::fs::File::open(&path).map(|f| (f, true)).map_err(|_| e)
         }
-        opened => opened,
+        Err(e) => Err(e),
     }
 }
 

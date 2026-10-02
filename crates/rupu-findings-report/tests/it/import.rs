@@ -2033,3 +2033,202 @@ fn a_claim_of_several_paragraphs_comes_back_as_one_per_paragraph() {
         ]
     );
 }
+
+// ---- verification review fixes -------------------------------------------------
+
+#[test]
+fn a_hand_written_provenance_section_does_not_make_an_export() {
+    // Read as an export, the CI command line would be left in the body and
+    // the CWE fallback skipped.
+    let (want, _) = report_of(MARKDOWN);
+    let (r, _) = report_of(&format!(
+        "{MARKDOWN}\n## Provenance\n\nFound in the Q2 manual review.\n"
+    ));
+    assert_eq!(r.ci_cd_detection, want.ci_cd_detection);
+    let OrSentinel::Value(ci) = &r.ci_cd_detection else {
+        panic!()
+    };
+    assert_eq!(
+        ci.command.as_deref(),
+        Some("cargo test --test share_expiry")
+    );
+
+    let (want, _) = report_of(PLAIN);
+    let (r, _) = report_of(&format!("{PLAIN}\nProvenance\nRun: run_7\n"));
+    assert_eq!(r.cwe, ["CWE-639", "CWE-862"]);
+    assert_eq!(r.regression_test, want.regression_test);
+}
+
+#[test]
+fn a_path_with_an_at_sign_in_a_directory_keeps_its_location() {
+    let mut original = full_report();
+    original.evidence[0].file = Some("pkg/mod/golang.org/x/net@v0.17.0/http2/server.go".into());
+    original.evidence[0].lines = Some([120, 140]);
+    let (r, _) = report_of(&exported(original.clone()));
+    let mut want = original.evidence.clone();
+    want[0].sha256 = None;
+    assert_eq!(r.evidence, want);
+
+    let md = PLAIN.replace(
+        "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+        "The typings allow it (`node_modules/@types/node/index.d.ts:10-20`):",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.evidence[0].file.as_deref(),
+        Some("node_modules/@types/node/index.d.ts")
+    );
+}
+
+#[test]
+fn file_names_with_several_dots_or_a_leading_dot_are_files() {
+    for (claim, file) in [
+        (
+            "The test is missing (`notes.test.ts:10-20`).",
+            "notes.test.ts",
+        ),
+        ("The secret is committed (`.env:3`).", ".env"),
+    ] {
+        let md = PLAIN.replace(
+            "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+            claim,
+        );
+        let (r, _) = report_of(&md);
+        assert_eq!(r.evidence[0].file.as_deref(), Some(file), "{claim}");
+    }
+}
+
+#[test]
+fn a_dash_and_a_level_word_in_a_note_are_not_a_range() {
+    let md = PLAIN.replace(
+        "Impact: High",
+        "Impact: High - critical customer data exposed",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.impact, RiskLevel::High);
+    assert!(other_text(&r).contains("critical customer data exposed"));
+    for range in ["Impact: Medium - High", "Impact: Medium-High risk"] {
+        assert!(
+            matches!(
+                parse_report(&PLAIN.replace("Impact: High", range)).unwrap_err(),
+                ImportError::BadValue { .. }
+            ),
+            "{range}"
+        );
+    }
+}
+
+#[test]
+fn listed_steps_keep_the_text_before_the_first_item_as_a_step() {
+    let start = PLAIN.find("Replication Steps\n").unwrap();
+    let md = format!(
+        "{}Replication Steps\nSign up as user A and request user A's note as user B.\n\nExpected:\n- 200 with user A's note\n",
+        &PLAIN[..start]
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.replication_steps,
+        [
+            "Sign up as user A and request user A's note as user B.\n\nExpected:",
+            "200 with user A's note"
+        ]
+    );
+}
+
+#[test]
+fn listed_claims_with_their_own_places_stay_claims_of_their_own() {
+    let md = PLAIN.replace(
+        "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+        "Two code paths confirm it:\n- `src/routes/notes.rs:40-58` reads by id alone\n- `src/store/notes.rs:88-97` never filters by owner\n\nThe handler, in full:",
+    );
+    let (r, _) = report_of(&md);
+    let claims: Vec<(&str, Option<&str>)> = r
+        .evidence
+        .iter()
+        .map(|c| (c.claim.as_str(), c.file.as_deref()))
+        .collect();
+    assert_eq!(
+        claims[..3],
+        [
+            ("Two code paths confirm it:", None),
+            (
+                "`src/routes/notes.rs:40-58` reads by id alone",
+                Some("src/routes/notes.rs")
+            ),
+            (
+                "`src/store/notes.rs:88-97` never filters by owner",
+                Some("src/store/notes.rs")
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_rating_section_of_its_own_and_step_headings_still_read() {
+    let md = MARKDOWN
+        .replace(
+            "**CVSS v3 Base Score:** 6.5\n**Risk Factor:** Medium\n",
+            "",
+        )
+        .replace(
+            "## Replication Steps\n\nStep 1: As user A, share a note and copy the link.\nStep 2: Stop sharing the note.\nStep 3:",
+            "## Scoring\n\n**CVSS v3 Base Score:** 6.5\n**Risk Factor:** Medium\n\n## Replication Steps\n\n## Step 1\n\nAs user A, share a note and copy the link.\n\n## Step 2: Stop sharing the note.\n\n## Step 3\n\n",
+        );
+    assert!(md.contains("## Scoring"), "the fixture changed");
+    assert_eq!(
+        md.matches("**Risk Factor:**").count(),
+        1,
+        "moved, not copied"
+    );
+    let (want, _) = report_of(MARKDOWN);
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating, want.rating);
+    assert_eq!(r.replication_steps, want.replication_steps);
+}
+
+#[test]
+fn an_export_s_command_is_its_own_last_command_block() {
+    use rupu_coverage::report::CiDetection;
+    let mut original = full_report();
+    // The author's own `Command:` and block in the body, then the
+    // exporter's: the exporter's is the command.
+    original.ci_cd_detection = OrSentinel::Value(CiDetection {
+        stage: "pre-merge".into(),
+        body: "Integration test.\n\n**Command:**\n\n```sh\nmake probe\n```".into(),
+        command: Some("cargo test --test notes_access".into()),
+        expect: "a 200".into(),
+    });
+    let (r, _) = report_of(&exported(original.clone()));
+    let OrSentinel::Value(ci) = &r.ci_cd_detection else {
+        panic!()
+    };
+    assert_eq!(
+        ci.command.as_deref(),
+        Some("cargo test --test notes_access")
+    );
+    assert!(ci.body.contains("make probe"), "{}", ci.body);
+    // No command, and the body ends in an `sh` block: still none.
+    original.ci_cd_detection = OrSentinel::Value(CiDetection {
+        stage: "pre-merge".into(),
+        body: "Integration test.\n\n```sh\nmake probe\n```".into(),
+        command: None,
+        expect: "a 200".into(),
+    });
+    let (r, _) = report_of(&exported(original.clone()));
+    assert_eq!(r.ci_cd_detection, original.ci_cd_detection);
+}
+
+#[test]
+fn a_bold_file_name_with_prose_after_it_keeps_its_text() {
+    let md = MARKDOWN.replace(
+        "- The token claims have no expiry (`src/share/token.rs:5-9`).",
+        "**`src/share/token.rs`**\n\nThe claims struct has no expiry field.",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.evidence[0].claim, "**`src/share/token.rs`**");
+    assert_eq!(r.evidence[0].file.as_deref(), Some("src/share/token.rs"));
+    assert_eq!(
+        r.evidence[1].claim,
+        "The claims struct has no expiry field."
+    );
+}
