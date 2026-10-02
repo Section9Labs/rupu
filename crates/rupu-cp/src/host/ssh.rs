@@ -904,17 +904,55 @@ const LEDGER_PULL_PREFIX: &str = "for f in usage.jsonl coverage.jsonl;";
 
 /// The pump's terminal ledger pull: the run's `usage.jsonl` AND
 /// `coverage.jsonl` in ONE ssh invocation, framed like [`batch_cat_command`]
-/// (`==> <label> <==`, body, synthetic newline, `==> end <==`) so
-/// [`split_batched_cat`] reads it. The labels are the bare file names: the
-/// paths need `$HOME` expanded remotely, so they cannot go through
-/// `shell_escape`, and the label is all the split needs. Callers guarantee
-/// [`is_safe_run_id`].
+/// (`==> <label> <==`, body, synthetic newline) but with `cat`'s exit status
+/// in each trailer (`==> end <status> <==`), so [`split_ledger_pull`] can
+/// tell a whole file from one whose read failed part-way. The labels are the
+/// bare file names: the paths need `$HOME` expanded remotely, so they cannot
+/// go through `shell_escape`, and the label is all the split needs. Callers
+/// guarantee [`is_safe_run_id`].
 fn ledger_pull_command(run_id: &str) -> String {
     format!(
         "{LEDGER_PULL_PREFIX} do printf '==> %s <==\\n' \"$f\"; cat \"{}/$f\" 2>/dev/null; \
-         printf '\\n==> end <==\\n'; done",
+         printf '\\n==> end %s <==\\n' \"$?\"; done",
         remote_run_dir(run_id)
     )
+}
+
+/// Inverse of [`ledger_pull_command`]: `label → body` for every file whose
+/// trailer arrived carrying exit status `0`. A file whose `cat` failed (an
+/// absent file, or a read error mid-file that leaves a truncated body), a
+/// trailer with no status, or a section cut off before its trailer is
+/// absent from the map: it did not arrive.
+fn split_ledger_pull(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.split('\n') {
+        match parse_tail_marker(line) {
+            Some(marker) if marker == "end" || marker.starts_with("end ") => {
+                let status = marker.strip_prefix("end").map(str::trim);
+                if let Some((label, mut lines)) = current.take() {
+                    if status == Some("0") {
+                        // Drop the ONE synthetic empty line the command appended.
+                        if lines.last() == Some(&"") {
+                            lines.pop();
+                        }
+                        let mut body = lines.join("\n");
+                        if !body.is_empty() {
+                            body.push('\n');
+                        }
+                        out.insert(label, body);
+                    }
+                }
+            }
+            Some(label) => current = Some((label.to_string(), Vec::new())),
+            None => {
+                if let Some((_, lines)) = current.as_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One-shot terminal pull of the run's two ledgers for the tail pump, in a
@@ -943,10 +981,10 @@ fn ledger_pull_command(run_id: &str) -> String {
 /// the transcript catch-up, whose `cat` of a large transcript can outlast
 /// [`PUMP_FINALIZE_TIMEOUT`].
 ///
-/// A section that did not arrive whole (the pull failed or was cut off), or
-/// that is empty (no file — an older host — or a race with a rotation),
-/// leaves that mirrored copy as the tail built it, unmarked. An unsafe
-/// `run_id` pulls nothing.
+/// A section that did not arrive whole (the pull failed or was cut off, or
+/// the host's `cat` failed — an absent file, or a read error part-way), or
+/// that is empty, leaves that mirrored copy as the tail built it, unmarked.
+/// An unsafe `run_id` pulls nothing.
 async fn pump_catch_up_ledgers(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
@@ -978,9 +1016,9 @@ async fn pump_catch_up_ledgers(
             "terminal ledger pull failed; mirrored ledgers it did not deliver stay as tailed"
         );
     }
-    // Sections are whole only when their end marker arrived, whatever the
-    // exit status says about the rest of the output.
-    let sections = split_batched_cat(&out.stdout);
+    // A section is whole only when its trailer arrived with `cat`'s exit
+    // status 0, whatever the ssh exit status says about the rest.
+    let sections = split_ledger_pull(&out.stdout);
     if let Some(usage) = sections.get(LEDGER_USAGE).filter(|b| !b.is_empty()) {
         let _ = mirror.replace_usage_ledger(run_id, host_id, usage);
     }
@@ -3541,6 +3579,9 @@ mod tests {
         /// When set, the ledger pull fails in the ssh transport (no stdout,
         /// exit 255) — a throttled or dropped connection.
         ledger_pull_fails: bool,
+        /// The exit status each section's `cat` reports in its trailer
+        /// (`usage`, `coverage`); nonzero is a host-side read error mid-file.
+        ledger_cat_status: (i32, i32),
         /// If set, returned as stdout for the pump's batched terminal pull
         /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
         batch_cat_stdout: Option<String>,
@@ -3574,6 +3615,7 @@ mod tests {
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
                 ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3595,6 +3637,7 @@ mod tests {
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
                 ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3618,6 +3661,7 @@ mod tests {
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
                 ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3641,6 +3685,7 @@ mod tests {
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
                 ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3663,6 +3708,7 @@ mod tests {
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
                 ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3695,13 +3741,21 @@ mod tests {
                     });
                 }
                 let mut stdout = String::new();
-                for (label, body) in [
-                    (LEDGER_USAGE, &self.cat_usage_stdout),
-                    (LEDGER_COVERAGE, &self.cat_coverage_stdout),
+                for (label, body, status) in [
+                    (
+                        LEDGER_USAGE,
+                        &self.cat_usage_stdout,
+                        self.ledger_cat_status.0,
+                    ),
+                    (
+                        LEDGER_COVERAGE,
+                        &self.cat_coverage_stdout,
+                        self.ledger_cat_status.1,
+                    ),
                 ] {
                     stdout.push_str(&format!("==> {label} <==\n"));
                     stdout.push_str(body.as_deref().unwrap_or(""));
-                    stdout.push_str("\n==> end <==\n");
+                    stdout.push_str(&format!("\n==> end {status} <==\n"));
                 }
                 Ok(RemoteOutput {
                     stdout,
@@ -6244,6 +6298,47 @@ mod tests {
         assert!(pull < transcript, "{cmds:?}");
     }
 
+    /// The pull arrives, but `cat` failed reading both files part-way (a
+    /// host-side read error): the framed sections are truncated, so neither
+    /// is used — the usage ledger is not replaced, and the coverage copy is
+    /// not replaced or marked complete even though the run is terminal.
+    #[test]
+    fn a_ledger_section_whose_cat_failed_is_not_used() {
+        let run_id = "run_01COVCATFAIL";
+        let tailed = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVCATFAIL\"}\n";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_coverage_stdout = Some(format!("{tailed}{{\"trunc"));
+        fake.cat_usage_stdout = Some(format!("{USAGE_ROW_1}\n"));
+        fake.ledger_cat_status = (1, 1);
+        let fake = std::sync::Arc::new(fake);
+        let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .unwrap();
+        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+        conn.mirror
+            .append(run_id, &conn.host_id, ArtifactFile::Usage, USAGE_ROW_LATE)
+            .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.spawn_tail_pump(run_id.to_string());
+            conn.await_run_mirror(run_id).await;
+            let read = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(String::from_utf8(read.bytes).unwrap(), tailed);
+            assert!(!read.complete, "a cat that failed mid-file is not complete");
+        });
+        assert_eq!(
+            std::fs::read_to_string(store.usage_ledger_path(run_id)).unwrap(),
+            format!("{USAGE_ROW_LATE}\n"),
+            "a usage section whose cat failed must not replace the ledger"
+        );
+    }
+
     /// The terminal pull fails in the ssh transport (throttled or dropped
     /// connection): the mirror keeps what the tail delivered, and the read
     /// says it is NOT known complete, so the coordinator warns instead of
@@ -8213,16 +8308,29 @@ mod tests {
         assert_eq!(
             cmd,
             "for f in usage.jsonl coverage.jsonl; do printf '==> %s <==\\n' \"$f\"; \
-             cat \"$HOME/.rupu/runs/run_01LEDGER/$f\" 2>/dev/null; printf '\\n==> end <==\\n'; done"
+             cat \"$HOME/.rupu/runs/run_01LEDGER/$f\" 2>/dev/null; \
+             printf '\\n==> end %s <==\\n' \"$?\"; done"
         );
-        let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end <==\n\
-                      ==> coverage.jsonl <==\n\n==> end <==\n";
-        let sections = split_batched_cat(framed);
+        let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end 0 <==\n\
+                      ==> coverage.jsonl <==\n\n==> end 0 <==\n";
+        let sections = split_ledger_pull(framed);
         assert_eq!(
             sections.get(LEDGER_USAGE).map(String::as_str),
             Some("{\"u\":1}\n")
         );
         assert_eq!(sections.get(LEDGER_COVERAGE).map(String::as_str), Some(""));
+    }
+
+    /// A section counts only when its trailer carries `cat`'s exit status 0:
+    /// a read that failed mid-file (nonzero), a trailer without a status, or
+    /// a section cut off before its trailer all read as "did not arrive".
+    #[test]
+    fn split_ledger_pull_drops_a_section_whose_cat_did_not_exit_zero() {
+        let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end 1 <==\n\
+                      ==> coverage.jsonl <==\n{\"c\":1}\n\n==> end <==\n";
+        assert!(split_ledger_pull(framed).is_empty());
+        let cut = "==> usage.jsonl <==\n{\"u\":1}\n";
+        assert!(split_ledger_pull(cut).is_empty());
     }
 
     #[test]
