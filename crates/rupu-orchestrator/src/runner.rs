@@ -1557,12 +1557,9 @@ impl RunEnd {
         rec.active_step_agent = None;
         rec.active_step_transcript_path = None;
         if served_decisions && rec.gate_decisions.is_empty() {
-            rec.resume_requested_at = None;
+            rec.clear_resume_marker();
             rec.resume_claimed_at = None;
             rec.resume_claimed_by = None;
-            rec.resume_mode = None;
-            rec.resume_gate_id = None;
-            rec.resume_approver = None;
         }
     }
 }
