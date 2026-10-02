@@ -54,7 +54,7 @@ fn a_gemini_sso_login_stores_the_code_assist_project() {
     let port_file = tmp.path().join("oauth-port");
     let state_file = tmp.path().join("oauth-state");
 
-    let child = Command::new(assert_cmd::cargo::cargo_bin("rupu"))
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin("rupu"))
         .env("RUPU_HOME", tmp.path())
         .env_remove("RUPU_AUTH_FILE")
         .env_remove("GOOGLE_CLOUD_PROJECT")
@@ -66,16 +66,26 @@ fn a_gemini_sso_login_stores_the_code_assist_project() {
         .env("RUPU_CODE_ASSIST_ENDPOINT_OVERRIDE", server.url(""))
         .args(["auth", "login", "--provider", "gemini", "--mode", "sso"])
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drained as it is written, so the child never stalls on a full pipe.
+    let stderr_reader = {
+        let mut pipe = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = pipe.read_to_string(&mut out);
+            out
+        })
+    };
     // Killed on any early return or failed assertion below.
     struct KillOnDrop(Option<std::process::Child>);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
             if let Some(child) = self.0.as_mut() {
                 let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -84,6 +94,9 @@ fn a_gemini_sso_login_stores_the_code_assist_project() {
     let port: u16 = wait_for_file(&port_file, "port").parse().unwrap();
     let state = wait_for_file(&state_file, "state");
     let mut redirect = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    redirect
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     write!(
         redirect,
         "GET /callback?code=stub-code&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
@@ -100,16 +113,8 @@ fn a_gemini_sso_login_stores_the_code_assist_project() {
         assert!(Instant::now() < deadline, "the login never finished");
         std::thread::sleep(Duration::from_millis(25));
     };
-    let mut stderr = String::new();
-    child
-        .0
-        .take()
-        .unwrap()
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    child.0.take();
+    let stderr = stderr_reader.join().unwrap();
 
     assert!(status.success(), "{stderr}");
     token.assert_hits(1);
