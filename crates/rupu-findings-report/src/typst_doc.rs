@@ -5,10 +5,50 @@
 //! and table cells are plain text, so nothing agent-written can execute as
 //! Typst code. Only `Prose` and `Steps` go through the Markdown converter,
 //! which itself emits nothing but string literals and fixed markup.
+//!
+//! A `Block::Image` is the one file the document reads: its bytes travel
+//! beside the markup in [`TypstDoc::files`] under a fixed virtual path built
+//! from its (validated) sha256 and its sniffed type, and the PDF world
+//! serves only those.
 
 use crate::blocks::Block;
 use crate::prose::{md_to_typst, typst_str};
 use crate::text::safe_lang;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// A complete Typst document: its markup, and the image files it references
+/// by virtual path (`/evidence/<sha256>.<ext>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypstDoc {
+    pub markup: String,
+    pub files: BTreeMap<String, Arc<[u8]>>,
+}
+
+impl From<String> for TypstDoc {
+    /// Markup that reads no files.
+    fn from(markup: String) -> Self {
+        TypstDoc {
+            markup,
+            files: BTreeMap::new(),
+        }
+    }
+}
+
+/// The virtual path an image is served under. `mime` is one of the four
+/// raster types `Block::Image` carries; Typst picks the decoder by extension.
+fn image_path(sha256: &str, mime: &str) -> String {
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        _ => "webp",
+    };
+    // `sha256` was checked to be 64 lowercase hex before the bytes were read,
+    // so the path is a plain file name; filtering again costs nothing.
+    let name: String = sha256.chars().filter(char::is_ascii_hexdigit).collect();
+    format!("/evidence/{name}.{ext}")
+}
 
 const PREAMBLE: &str = "#set page(paper: \"a4\", margin: (x: 2cm, y: 2cm), numbering: \"1\")\n\
 #set text(font: \"Libertinus Serif\", size: 10pt)\n\
@@ -22,8 +62,15 @@ fn content(s: &str) -> String {
     format!("[#{}]", typst_str(s))
 }
 
-/// Render `blocks` as a complete Typst document.
+/// Render `blocks` as complete Typst markup (see [`render_doc`] for the
+/// files an image block needs).
 pub fn render(blocks: &[Block]) -> String {
+    render_doc(blocks).markup
+}
+
+/// Render `blocks` as a complete Typst document with its image files.
+pub fn render_doc(blocks: &[Block]) -> TypstDoc {
+    let mut files = BTreeMap::new();
     let mut out = String::from(PREAMBLE);
     for b in blocks {
         match b {
@@ -107,7 +154,23 @@ pub fn render(blocks: &[Block]) -> String {
                 out.push_str(")\n\n");
             }
             Block::PageBreak => out.push_str("#pagebreak()\n\n"),
+            Block::Image {
+                caption,
+                sha256,
+                mime,
+                bytes,
+                ..
+            } => {
+                let path = image_path(sha256, mime);
+                out.push_str(&format!(
+                    "#figure(image({}, alt: {}), caption: {})\n\n",
+                    typst_str(&path),
+                    typst_str(caption),
+                    content(caption)
+                ));
+                files.insert(path, Arc::clone(bytes));
+            }
         }
     }
-    out
+    TypstDoc { markup: out, files }
 }

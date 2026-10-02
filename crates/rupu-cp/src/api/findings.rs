@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use rupu_coverage::report::{
-    summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
+    raster_image_type, summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
 };
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
 use rupu_findings_report::model::{ExportFinding, ExportInput, ReportMeta};
@@ -20,7 +20,9 @@ use rupu_findings_report::number::{
     DEFAULT_PREFIX,
 };
 use rupu_findings_report::select::{describe, parse_cwe, select, Selection};
-use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
+use rupu_findings_report::{
+    render_finding, render_project, render_split_zip, Blobs, ExportError, Format,
+};
 use rupu_orchestrator::runs::RunStore;
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -1020,18 +1022,6 @@ async fn pull_into_store(
     }
 }
 
-/// The `image/*` type of a raster image, by its magic bytes — never by name
-/// or by anything an agent wrote. SVG (text) is never an image here.
-fn raster_image_type(head: &[u8]) -> Option<&'static str> {
-    match head {
-        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
-        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
-        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
-        _ => None,
-    }
-}
-
 /// The one way artifact bytes leave this CP: streamed from `file`, never
 /// renderable as HTML. Text is `text/plain; charset=utf-8` inline; a binary
 /// (or unknown-kind) file whose leading bytes are a PNG / JPEG / GIF / WebP
@@ -1417,6 +1407,16 @@ fn report_file_stem(title: &str) -> String {
     }
 }
 
+/// Renders an export against this machine's finding-artifact store: an
+/// `image` evidence block's file is embedded from it when it was copied
+/// there, verified and within the renderer's cap. Nothing is fetched from
+/// another host to do so.
+fn with_local_blobs<T>(global: &std::path::Path, render: impl FnOnce(Blobs<'_>) -> T) -> T {
+    let store = ArtifactStore::new(global.join("findings").join("artifacts"));
+    let read = |sha256: &str, max_bytes: u64| store.read_verified(sha256, max_bytes);
+    render(Blobs::new(&read))
+}
+
 /// One finding rendered as a stand-alone report, numbered within its own
 /// project (so it carries the number it has in the project's full report).
 pub fn export_finding_report(
@@ -1446,7 +1446,9 @@ pub fn export_finding_report(
         .ok_or_else(|| ReportError::Internal(format!("finding {id} was not numbered")))?;
     let mut finding = numbered.swap_remove(pos);
     attach_workflow_names(runs, std::slice::from_mut(&mut finding));
-    let bytes = render_finding(&finding, &numbers, fmt)?;
+    let bytes = with_local_blobs(global, |blobs| {
+        render_finding(&finding, &numbers, fmt, blobs)
+    })?;
     Ok(ExportedReport {
         bytes,
         content_type: fmt.content_type(),
@@ -1591,7 +1593,9 @@ pub fn export_project_report(
     };
     let stem = report_file_stem(&meta.title);
     if req.split {
-        let bytes = render_split_zip(&meta, &chosen, &numbers, fmt)?;
+        let bytes = with_local_blobs(global, |blobs| {
+            render_split_zip(&meta, &chosen, &numbers, fmt, blobs)
+        })?;
         Ok(ExportedReport {
             bytes,
             content_type: "application/zip",
@@ -1599,7 +1603,9 @@ pub fn export_project_report(
             html: false,
         })
     } else {
-        let bytes = render_project(&meta, &chosen, &numbers, fmt)?;
+        let bytes = with_local_blobs(global, |blobs| {
+            render_project(&meta, &chosen, &numbers, fmt, blobs)
+        })?;
         Ok(ExportedReport {
             bytes,
             content_type: fmt.content_type(),
@@ -2933,26 +2939,6 @@ mod tests {
     // ---- raster images served inline; evidence-block files servable ----
 
     const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-
-    #[test]
-    fn raster_image_type_is_decided_by_magic_bytes() {
-        assert_eq!(raster_image_type(PNG_MAGIC), Some("image/png"));
-        assert_eq!(
-            raster_image_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]),
-            Some("image/jpeg")
-        );
-        assert_eq!(raster_image_type(b"GIF87a\x01\x00"), Some("image/gif"));
-        assert_eq!(raster_image_type(b"GIF89a\x01\x00"), Some("image/gif"));
-        assert_eq!(
-            raster_image_type(b"RIFF\x10\0\0\0WEBPVP8 "),
-            Some("image/webp")
-        );
-        assert_eq!(raster_image_type(b"<svg xmlns"), None);
-        assert_eq!(raster_image_type(b"%PDF-1.7"), None);
-        assert_eq!(raster_image_type(b"GIF8"), None);
-        assert_eq!(raster_image_type(b"RIFF\0\0\0\0WAVE"), None);
-        assert_eq!(raster_image_type(b""), None);
-    }
 
     #[tokio::test]
     async fn a_png_artifact_is_served_inline_as_an_image() {
@@ -4391,5 +4377,63 @@ mod tests {
             export_finding_report(tmp.path(), &runs, "fnd_a", "SEC", Format::Markdown).unwrap();
         assert!(ok.name.ends_with(".md"));
         assert!(String::from_utf8(ok.bytes).unwrap().contains("SEC-001"));
+    }
+
+    #[test]
+    fn an_exported_image_block_is_embedded_from_the_local_store_only() {
+        use base64::Engine as _;
+        use rupu_coverage::report::EvidenceBlock;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut png = PNG_MAGIC.to_vec();
+        png.extend_from_slice(b"pretend pixels");
+        let sha = store_blob(tmp.path(), &png);
+        let image = |path: &str, stored, host: Option<&str>, caption: &str| EvidenceBlock::Image {
+            artifact: artifact_ref(path, &sha, png.len() as u64, None, Some(stored), host),
+            caption: Some(caption.into()),
+        };
+        let mut rec = full_record("fnd_img");
+        rec.report.as_mut().unwrap().blocks = vec![
+            image(
+                "shots/local.png",
+                ArtifactStorage::Copied,
+                None,
+                "Local screenshot",
+            ),
+            // The same bytes, recorded as living on another host: shown by
+            // reference even though this store happens to hold the blob.
+            image(
+                "shots/remote.png",
+                ArtifactStorage::External,
+                Some("node-7"),
+                "Remote screenshot",
+            ),
+        ];
+        seed_workspace_findings(tmp.path(), &[rec]);
+        let runs = RunStore::new(tmp.path().join("runs"));
+
+        let html = export_finding_report(tmp.path(), &runs, "fnd_img", "SEC", Format::Html)
+            .unwrap()
+            .bytes;
+        let html = String::from_utf8(html).unwrap();
+        let data_uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        assert_eq!(html.matches(&data_uri).count(), 1, "{html}");
+        assert!(
+            html.contains("<figcaption>Local screenshot</figcaption>"),
+            "{html}"
+        );
+        assert!(html.contains("not embedded: the file is on host"), "{html}");
+
+        let md = export_finding_report(tmp.path(), &runs, "fnd_img", "SEC", Format::Markdown)
+            .unwrap()
+            .bytes;
+        let md = String::from_utf8(md).unwrap();
+        assert!(
+            md.contains("![Local screenshot](<shots/local.png>)"),
+            "{md}"
+        );
+        assert!(!md.contains("base64"), "{md}");
     }
 }

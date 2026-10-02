@@ -6,6 +6,7 @@
 
 mod blocks;
 mod common;
+mod evidence_files;
 mod exports;
 mod html_typst;
 mod import;

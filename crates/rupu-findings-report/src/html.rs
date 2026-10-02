@@ -4,13 +4,17 @@
 //! text and are escaped, never parsed as Markdown. Only `Prose` and `Steps`
 //! go through the Markdown → HTML converter, which neutralises raw HTML and
 //! script-ish URLs and turns images into alt text, so the markup itself loads
-//! nothing. A Content-Security-Policy `<meta>` (first in `<head>`, ahead of
-//! the title and styles) is defence in depth against an escaping bug: it
-//! forbids scripts, network loads, `<base>` and form posts outright.
+//! nothing. The one image the document shows is a `Block::Image`: a raster
+//! image the block builder read from the local artifact store and checked by
+//! its magic bytes, inlined as a `data:` URI. A Content-Security-Policy
+//! `<meta>` (first in `<head>`, ahead of the title and styles) is defence in
+//! depth against an escaping bug: it forbids scripts, network loads (images
+//! only from `data:`), `<base>` and form posts outright.
 
 use crate::blocks::Block;
 use crate::prose::md_to_html;
 use crate::text::safe_lang;
+use base64::Engine as _;
 
 /// HTML-escape text for element content or a quoted attribute value.
 pub fn esc(s: &str) -> String {
@@ -34,6 +38,7 @@ h1{font-size:22px;margin:.2em 0 .6em}h2{font-size:15px;text-transform:uppercase;
 dt{color:#807b92}dd{margin:0}dd,td{overflow-wrap:anywhere}pre{background:#f4f3f8;padding:.6rem .8rem;border-radius:4px;overflow-x:auto;font:12px/1.5 ui-monospace,Menlo,monospace}\
 code{font-family:ui-monospace,Menlo,monospace}ol.steps li{margin:.25rem 0}.note{color:#807b92;font-style:italic}\
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #dedbe7;text-align:left;padding:.3rem .5rem}\
+figure{margin:1rem 0}figure img{max-width:100%;height:auto}figcaption{color:#807b92;font-size:13px}\
 .pb{page-break-before:always;border-top:1px dashed #dedbe7;margin:2rem 0}@media print{.pb{border:0;margin:0}}";
 
 /// Render `blocks` as a complete HTML document titled `title`.
@@ -96,6 +101,18 @@ pub fn render(title: &str, blocks: &[Block]) -> String {
                 body.push_str("</tbody></table>\n");
             }
             Block::PageBreak => body.push_str("<div class=\"pb\"></div>\n"),
+            Block::Image {
+                caption,
+                mime,
+                bytes,
+                ..
+            } => body.push_str(&format!(
+                "<figure><img src=\"data:{};base64,{}\" alt=\"{}\"><figcaption>{}</figcaption></figure>\n",
+                esc(mime),
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                esc(caption),
+                esc(caption)
+            )),
         }
     }
     format!(

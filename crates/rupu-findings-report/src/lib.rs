@@ -24,4 +24,5 @@ pub mod select;
 mod text;
 pub mod typst_doc;
 
+pub use model::Blobs;
 pub use render::{render_finding, render_project, render_split_zip, ExportError, Format};

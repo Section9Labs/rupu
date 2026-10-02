@@ -7,6 +7,7 @@ use rupu_findings_report::model::{ExportFinding, ReportMeta};
 use rupu_findings_report::number::number_map;
 use rupu_findings_report::pdf::render_pdf;
 use rupu_findings_report::typst_doc;
+use rupu_findings_report::Blobs;
 use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
 use std::collections::HashMap;
 use std::io::Read;
@@ -41,7 +42,7 @@ fn is_pdf(bytes: &[u8]) -> bool {
 #[test]
 fn a_full_finding_renders_a_pdf() {
     let f = full_finding();
-    let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf).unwrap();
+    let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf, Blobs::NONE).unwrap();
     assert!(is_pdf(&pdf), "not a pdf: {:?}", &pdf[..pdf.len().min(16)]);
 }
 
@@ -53,7 +54,7 @@ fn a_summary_finding_renders_a_pdf() {
         summary_record("fnd_sum", Severity::High),
     )])
     .remove(0);
-    let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf).unwrap();
+    let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf, Blobs::NONE).unwrap();
     assert!(is_pdf(&pdf));
 }
 
@@ -61,8 +62,8 @@ fn a_summary_finding_renders_a_pdf() {
 fn a_project_pdf_is_bigger_than_one_finding() {
     let all = two();
     let numbers = number_map(&all);
-    let single = render_finding(&all[0], &numbers, Format::Pdf).unwrap();
-    let project = render_project(&meta(), &all, &HashMap::new(), Format::Pdf).unwrap();
+    let single = render_finding(&all[0], &numbers, Format::Pdf, Blobs::NONE).unwrap();
+    let project = render_project(&meta(), &all, &HashMap::new(), Format::Pdf, Blobs::NONE).unwrap();
     assert!(is_pdf(&project));
     assert!(
         project.len() > single.len(),
@@ -74,7 +75,7 @@ fn a_project_pdf_is_bigger_than_one_finding() {
 
 #[test]
 fn an_empty_project_still_renders_a_pdf() {
-    let pdf = render_project(&meta(), &[], &HashMap::new(), Format::Pdf).unwrap();
+    let pdf = render_project(&meta(), &[], &HashMap::new(), Format::Pdf, Blobs::NONE).unwrap();
     assert!(is_pdf(&pdf));
 }
 
@@ -88,7 +89,7 @@ fn typst_looking_text_is_data_not_code() {
     let mut rec = full_record("fnd_x", Severity::High, r);
     rec.summary = "#panic(\"summary\")".into();
     let f = numbered(vec![input("notebin", Some("#panic(\"wf\")"), rec)]).remove(0);
-    let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf)
+    let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf, Blobs::NONE)
         .expect("escaped Typst-looking text must compile");
     assert!(is_pdf(&pdf));
 }
@@ -96,7 +97,7 @@ fn typst_looking_text_is_data_not_code() {
 #[test]
 fn pdf_split_zip_holds_real_pdfs() {
     let all = two();
-    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Pdf).unwrap();
+    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Pdf, Blobs::NONE).unwrap();
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
     assert_eq!(z.len(), 3);
     for i in 0..z.len() {
@@ -353,11 +354,11 @@ fn hostile_report_fields_compile_end_to_end() {
     ]);
     let numbers = number_map(&all);
     for f in &all {
-        let blocks = finding_blocks(f, &numbers);
+        let blocks = finding_blocks(f, &numbers, Blobs::NONE);
         compiles(&f.number, &blocks);
     }
-    let pdf =
-        render_project(&meta(), &all, &HashMap::new(), Format::Pdf).expect("project compiles");
+    let pdf = render_project(&meta(), &all, &HashMap::new(), Format::Pdf, Blobs::NONE)
+        .expect("project compiles");
     assert!(is_pdf(&pdf));
 }
 

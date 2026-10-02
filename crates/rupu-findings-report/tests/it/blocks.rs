@@ -6,6 +6,7 @@ use rupu_coverage::report::{
 use rupu_coverage::Severity;
 use rupu_findings_report::blocks::{finding_blocks, Block};
 use rupu_findings_report::model::ExportFinding;
+use rupu_findings_report::Blobs;
 use std::collections::HashMap;
 
 fn with_report(edit: impl FnOnce(&mut rupu_coverage::FindingReport)) -> Vec<Block> {
@@ -17,7 +18,7 @@ fn with_report(edit: impl FnOnce(&mut rupu_coverage::FindingReport)) -> Vec<Bloc
         full_record("fnd_x", Severity::High, report),
     )])
     .remove(0);
-    finding_blocks(&f, &HashMap::new())
+    finding_blocks(&f, &HashMap::new(), Blobs::NONE)
 }
 
 fn after_heading<'a>(blocks: &'a [Block], name: &str) -> &'a [Block] {
@@ -42,7 +43,7 @@ fn fields<'a>(blocks: &'a [Block], key: &str) -> Option<&'a str> {
 #[test]
 fn the_first_blocks_are_filename_title_then_the_identity_fields_in_order() {
     let f = full_finding();
-    let blocks = finding_blocks(&f, &HashMap::new());
+    let blocks = finding_blocks(&f, &HashMap::new(), Blobs::NONE);
     assert_eq!(
         blocks[0],
         Block::Filename("SEC-001 - Notes API returns another user's note by id.pdf".into())
@@ -356,7 +357,7 @@ fn provenance_carries_surface_and_for_full_findings_the_record_and_verification(
         rec
     })])
     .remove(0);
-    let blocks = finding_blocks(&f, &HashMap::new());
+    let blocks = finding_blocks(&f, &HashMap::new(), Blobs::NONE);
     let Block::Fields(rows) = after_heading(&blocks, "Provenance")[0].clone() else {
         panic!("expected Fields");
     };
@@ -497,7 +498,7 @@ fn a_full_record_whose_report_did_not_load_says_so_and_a_summary_says_it_is_one(
     let mut rec = summary_record("fnd_broken", Severity::High);
     rec.profile = rupu_coverage::FindingProfile::Full;
     let f = numbered(vec![input("notebin", None, rec)]).remove(0);
-    let blocks = finding_blocks(&f, &HashMap::new());
+    let blocks = finding_blocks(&f, &HashMap::new(), Blobs::NONE);
     assert_eq!(
         note_of(&blocks),
         "Full report could not be loaded by this build — summary record shown."
@@ -513,7 +514,7 @@ fn a_full_record_whose_report_did_not_load_says_so_and_a_summary_says_it_is_one(
     )])
     .remove(0);
     assert_eq!(
-        note_of(&finding_blocks(&f, &HashMap::new())),
+        note_of(&finding_blocks(&f, &HashMap::new(), Blobs::NONE)),
         "Summary finding — no full report was recorded."
     );
 }
