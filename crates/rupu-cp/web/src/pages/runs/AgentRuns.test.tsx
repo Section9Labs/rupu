@@ -434,6 +434,40 @@ describe('AgentRuns — Source filter', () => {
   });
 });
 
+describe('AgentRuns — the Source filter while hosts are still loading or paging', () => {
+  /** `n` session-turn rows, newest first, one a minute, starting `from` minutes before noon. */
+  const sessionRows = (n: number, from = 0): AgentRunRow[] =>
+    Array.from({ length: n }, (_, i) => ({
+      ...SESSION_ROW,
+      run_id: `run-sess-${from + i}`,
+      started_at: new Date(Date.parse('2026-06-02T12:00:00Z') - (from + i) * 60_000).toISOString(),
+    }));
+
+  it('says it is still waiting, not "no match", when the default Standalone filter empties what loaded so far', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve(sessionRows(3)) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No agent runs match this filter')).not.toBeInTheDocument();
+  });
+
+  it('keeps paging while the filter hides every loaded row, so a later page can match', async () => {
+    stubDeps();
+    // Page 0 is a full page of session turns; the first standalone run is further down.
+    const local = [...sessionRows(22), { ...REMOTE_ROW, host_id: 'local', started_at: '2026-06-01T00:00:00Z' }];
+    const spy = vi
+      .spyOn(api, 'getAgentRuns')
+      .mockImplementation((p) =>
+        Promise.resolve(p?.host === 'local' ? local.slice(p.offset ?? 0, (p.offset ?? 0) + (p.limit ?? 20)) : []),
+      );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    expect(callsFor(spy, 'local').some((c) => ((c[0] as { offset?: number }).offset ?? 0) > 0)).toBe(true);
+  });
+});
+
 // ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
 
 describe('AgentRuns — Find', () => {

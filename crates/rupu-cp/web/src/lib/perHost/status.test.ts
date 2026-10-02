@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../api';
 import { emptySlice, type HostSlice } from './types';
-import { classifyFailure, notIncluded, pagingFailedHosts, toFreshnessEntries, waitingLabel } from './status';
+import { classifyFailure, noHostAnswered, notIncluded, pagingFailedHosts, toFreshnessEntries, waitingLabel } from './status';
 
 const s = (id: string, over: Partial<HostSlice<unknown>> = {}): HostSlice<unknown> => ({
   ...emptySlice({ id, name: id, transport_kind: 'ssh' }),
@@ -36,6 +36,13 @@ describe('labels', () => {
       'a (offline), b (unavailable)',
     );
     expect(notIncluded([s('c', { state: 'ok' })])).toBeNull();
+  });
+
+  it('says when no host answered at all', () => {
+    expect(noHostAnswered([s('a', { state: 'offline' }), s('b', { state: 'unavailable' })])).toBe(true);
+    expect(noHostAnswered([s('a', { state: 'offline' }), s('b', { state: 'ok' })])).toBe(false);
+    expect(noHostAnswered([s('a', { state: 'offline' }), s('b')])).toBe(false); // b is still loading
+    expect(noHostAnswered([])).toBe(false);
   });
 
   it('lists paging failures', () => {

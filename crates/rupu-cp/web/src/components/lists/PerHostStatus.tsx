@@ -28,7 +28,36 @@ export function perHostFooterText<T>(p: {
   const waiting = waitingOn(p.slices);
   if (!p.ended && waiting.length) return `waiting on ${waiting.join(', ')}…`;
   const missing = notIncluded(p.slices);
-  return `— end of ${p.count} —${missing ? ` · not included: ${missing}` : ''}`;
+  const suffix = missing ? ` · not included: ${missing}` : '';
+  // A host whose older rows could not load has not ended: no "end of" claim (PagingFailures says why).
+  if (pagingFailedHosts(p.slices).length) return `${p.count} loaded${suffix}`;
+  return `— end of ${p.count} —${suffix}`;
+}
+
+/**
+ * The sentinel line plus per-host paging failures under a per-host list. Pages keep it mounted
+ * whenever rows have loaded, even while their own filters or Find hide every one of them, so
+ * scrolling keeps loading (a later page may match) and the user sees what is still coming.
+ */
+export function PerHostFooter<T>({
+  sentinelRef,
+  text,
+  slices,
+  onRetry,
+}: {
+  sentinelRef: (el: HTMLDivElement | null) => void;
+  text: string;
+  slices: HostSlice<T>[];
+  onRetry: (hostId: string) => void;
+}) {
+  return (
+    <>
+      <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+        {text}
+      </div>
+      <PagingFailures slices={slices} onRetry={onRetry} />
+    </>
+  );
 }
 
 export function PagingFailures<T>({ slices, onRetry }: { slices: HostSlice<T>[]; onRetry: (hostId: string) => void }) {

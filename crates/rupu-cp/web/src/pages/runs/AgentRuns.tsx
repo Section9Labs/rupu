@@ -43,8 +43,8 @@ import { relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PagingFailures, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
+import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -288,6 +288,16 @@ export default function AgentRuns() {
       )
     : sorted;
 
+  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
+  // keep the sentinel mounted whenever rows have loaded, even if the Source pill (default
+  // Standalone) or Find hides all of them, so scrolling keeps loading (a later page may match).
+  const waiting = waitingLabel(slices);
+  const missing = notIncluded(slices);
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: sorted.length });
+  const footer = (text: string) => (
+    <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />
+  );
+
   return (
     <div className="p-8">
       <header className="flex items-center justify-between mb-6">
@@ -337,29 +347,41 @@ export default function AgentRuns() {
           <div className="py-16 flex items-center justify-center">
             <Spinner label="Loading agent runs…" />
           </div>
-        ) : rows.length === 0 && waitingLabel(slices) ? (
+        ) : rows.length === 0 && waiting ? (
           <div className="py-16 flex items-center justify-center">
-            <Spinner label={waitingLabel(slices) ?? ''} />
+            <Spinner label={waiting} />
           </div>
-        ) : sorted.length === 0 ? (
+        ) : rows.length === 0 ? (
           <EmptyState
             title={
-              rows.length > 0
-                ? 'No agent runs match this filter'
-                : notIncluded(slices)
+              noHostAnswered(slices)
+                ? 'No hosts answered'
+                : missing
                   ? 'No agent runs on the hosts that answered'
                   : 'No agent runs yet'
             }
             hint={
-              rows.length > 0
-                ? 'Try a different lifecycle, source, or host filter above.'
-                : notIncluded(slices)
-                  ? `Not included: ${notIncluded(slices)}.`
-                  : 'Standalone and session-bound agent invocations will appear here once they run.'
+              missing
+                ? `Not included: ${missing}.`
+                : 'Standalone and session-bound agent invocations will appear here once they run.'
             }
           />
         ) : visible.length === 0 ? (
-          <EmptyState title="No matches" hint={`No agent runs match "${query}".`} />
+          <>
+            {waiting ? (
+              <div className="py-16 flex items-center justify-center">
+                <Spinner label={`No matches yet · ${waiting}`} />
+              </div>
+            ) : sorted.length === 0 ? (
+              <EmptyState
+                title="No agent runs match this filter"
+                hint="Try a different lifecycle, source, or host filter above."
+              />
+            ) : (
+              <EmptyState title="No matches" hint={`No agent runs match "${query}".`} />
+            )}
+            {footer(listFooter)}
+          </>
         ) : (
           <section>
             <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
@@ -378,12 +400,7 @@ export default function AgentRuns() {
               rowHref={agentRunHref}
               initialSort={{ key: 'started', dir: 'desc' }}
             />
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {q
-                ? `${visible.length} matches of ${sorted.length} loaded`
-                : perHostFooterText({ slices, loading, hasMore, ended, count: sorted.length })}
-            </div>
-            <PagingFailures slices={slices} onRetry={retryPaging} />
+            {footer(q ? `${visible.length} matches of ${sorted.length} loaded` : listFooter)}
           </section>
         )}
       </div>

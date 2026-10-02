@@ -35,8 +35,8 @@ import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PagingFailures, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
+import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -255,6 +255,15 @@ export default function WorkflowRuns() {
   // around, or the operator sees the wrong banner for what just happened.
   const bannerError = actionError ?? error;
 
+  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
+  // keep the sentinel mounted whenever rows have loaded, even if the trigger pill or Find hides
+  // all of them, so scrolling keeps loading (a later page may match).
+  const waiting = waitingLabel(slices);
+  const missing = notIncluded(slices);
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: filtered.length });
+  const footer = (text: string) =>
+    !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
+
   return (
     <div className="p-8">
       <header className="flex items-center justify-between mb-6">
@@ -313,29 +322,38 @@ export default function WorkflowRuns() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading runs…" />
         </div>
-      ) : rows.length === 0 && waitingLabel(slices) ? (
+      ) : rows.length === 0 && waiting ? (
         <div className="py-16 flex items-center justify-center">
-          <Spinner label={waitingLabel(slices) ?? ''} />
+          <Spinner label={waiting} />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : rows.length === 0 ? (
         <EmptyState
           title={
-            rows.length > 0
-              ? 'No runs match this filter'
-              : notIncluded(slices)
+            noHostAnswered(slices)
+              ? 'No hosts answered'
+              : missing
                 ? 'No workflow runs on the hosts that answered'
                 : 'No workflow runs yet'
           }
           hint={
-            rows.length > 0
-              ? 'Try selecting a different trigger or host filter above.'
-              : notIncluded(slices)
-                ? `Not included: ${notIncluded(slices)}.`
-                : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
+            missing
+              ? `Not included: ${missing}.`
+              : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
           }
         />
       ) : visible.length === 0 ? (
-        <EmptyState title="No matches" hint={`No runs match "${query}".`} />
+        <>
+          {waiting ? (
+            <div className="py-16 flex items-center justify-center">
+              <Spinner label={`No matches yet · ${waiting}`} />
+            </div>
+          ) : filtered.length === 0 ? (
+            <EmptyState title="No runs match this filter" hint="Try selecting a different trigger or host filter above." />
+          ) : (
+            <EmptyState title="No matches" hint={`No runs match "${query}".`} />
+          )}
+          {footer(listFooter)}
+        </>
       ) : (
         <div className="space-y-6">
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
@@ -352,16 +370,7 @@ export default function WorkflowRuns() {
             rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
-          {!archived && (
-            <>
-              <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-                {q
-                  ? `${visible.length} matches of ${filtered.length} loaded`
-                  : perHostFooterText({ slices, loading, hasMore, ended, count: filtered.length })}
-              </div>
-              <PagingFailures slices={slices} onRetry={retryPaging} />
-            </>
-          )}
+          {footer(q ? `${visible.length} matches of ${filtered.length} loaded` : listFooter)}
         </div>
       )}
     </div>

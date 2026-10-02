@@ -38,8 +38,8 @@ import { SessionStatusPill } from '../components/StatusPill';
 import { AgentName } from '../components/codename/AgentName';
 import { memberLabel } from '../lib/codename';
 import { usePerHostPagedList, type PerHostFetchParams } from '../lib/perHost/usePerHostPagedList';
-import { PagingFailures, PerHostStrip, perHostFooterText } from '../components/lists/PerHostStatus';
-import { notIncluded, waitingLabel } from '../lib/perHost/status';
+import { PerHostFooter, PerHostStrip, perHostFooterText } from '../components/lists/PerHostStatus';
+import { noHostAnswered, notIncluded, waitingLabel } from '../lib/perHost/status';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -100,6 +100,13 @@ export default function Sessions() {
           .some((v) => v.toLowerCase().includes(q)),
       )
     : rows;
+
+  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
+  // keep the sentinel mounted whenever rows have loaded, even if Find hides all of them, so
+  // scrolling keeps loading (a later page may match).
+  const waiting = waitingLabel(slices);
+  const missing = notIncluded(slices);
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: rows.length });
 
   // Row-level archive / restore / delete — each drops the row and re-syncs
   // just its host after success.
@@ -190,29 +197,41 @@ export default function Sessions() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading sessions…" />
         </div>
-      ) : rows.length === 0 && waitingLabel(slices) ? (
+      ) : rows.length === 0 && waiting ? (
         <div className="py-16 flex items-center justify-center">
-          <Spinner label={waitingLabel(slices) ?? ''} />
+          <Spinner label={waiting} />
         </div>
       ) : rows.length === 0 ? (
         <EmptyState
           icon={<MessageSquare size={20} />}
           title={
-            notIncluded(slices)
-              ? 'No sessions on the hosts that answered'
-              : tab === 'active'
-                ? 'No active sessions'
-                : 'No archived sessions'
+            noHostAnswered(slices)
+              ? 'No hosts answered'
+              : missing
+                ? 'No sessions on the hosts that answered'
+                : tab === 'active'
+                  ? 'No active sessions'
+                  : 'No archived sessions'
           }
           hint={
-            (tab === 'active'
-              ? 'Active sessions appear here once an agent conversation is started against this control plane.'
-              : 'Archived sessions appear here once an active conversation is closed.') +
-            (notIncluded(slices) ? ` Not included: ${notIncluded(slices)}.` : '')
+            missing
+              ? `Not included: ${missing}.`
+              : tab === 'active'
+                ? 'Active sessions appear here once an agent conversation is started against this control plane.'
+                : 'Archived sessions appear here once an active conversation is closed.'
           }
         />
       ) : visible.length === 0 ? (
-        <EmptyState title="No matches" hint={`No sessions match "${query}".`} />
+        <>
+          {waiting ? (
+            <div className="py-16 flex items-center justify-center">
+              <Spinner label={`No matches yet · ${waiting}`} />
+            </div>
+          ) : (
+            <EmptyState title="No matches" hint={`No sessions match "${query}".`} />
+          )}
+          <PerHostFooter sentinelRef={sentinelRef} text={listFooter} slices={slices} onRetry={retryPaging} />
+        </>
       ) : (
         <div className="space-y-6">
           {visible.some((s) => s.usage) && (
@@ -239,12 +258,12 @@ export default function Sessions() {
             rowKey={(s) => `${s.host_id ?? 'local'}:${s.session_id}`}
             rowHref={sessionHref}
           />
-          <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-            {q
-              ? `${visible.length} matches of ${rows.length} loaded`
-              : perHostFooterText({ slices, loading, hasMore, ended, count: rows.length })}
-          </div>
-          <PagingFailures slices={slices} onRetry={retryPaging} />
+          <PerHostFooter
+            sentinelRef={sentinelRef}
+            text={q ? `${visible.length} matches of ${rows.length} loaded` : listFooter}
+            slices={slices}
+            onRetry={retryPaging}
+          />
         </div>
       )}
     </div>

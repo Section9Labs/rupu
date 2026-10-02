@@ -36,6 +36,19 @@ describe('perHostFooterText', () => {
       'waiting on kuki…',
     );
   });
+  it('does not claim the end while a host\'s older rows could not load', () => {
+    expect(perHostFooterText({ ...base, slices: [s('local'), s('mini', { pagingFailed: true })] })).toBe('7 loaded');
+    expect(
+      perHostFooterText({
+        ...base,
+        slices: [s('local', { pagingFailed: true }), s('kuki', { state: 'offline' })],
+      }),
+    ).toBe('7 loaded · not included: kuki (offline)');
+    // Another host can still page: scrolling is still the honest cue.
+    expect(perHostFooterText({ ...base, hasMore: true, ended: false, slices: [s('mini', { pagingFailed: true })] })).toBe(
+      'scroll for more',
+    );
+  });
   it('keeps the existing loading / scroll copy', () => {
     expect(perHostFooterText({ ...base, loading: true, slices: [] })).toBe('loading more…');
     expect(perHostFooterText({ ...base, hasMore: true, ended: false, slices: [] })).toBe('scroll for more');

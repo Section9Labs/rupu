@@ -291,6 +291,62 @@ describe('WorkflowRuns — per-host empty states', () => {
   });
 });
 
+describe('WorkflowRuns — the trigger filter while hosts are still loading or paging', () => {
+  /** `n` manual runs, newest first, one a minute. */
+  const manualRuns = (n: number): RunListRow[] =>
+    Array.from({ length: n }, (_, i) =>
+      makeRun({
+        id: `run_m${i}`,
+        workflow_name: `wf-manual-${i}`,
+        trigger: 'manual',
+        started_at: new Date(Date.parse('2026-07-20T12:00:00Z') - i * 60_000).toISOString(),
+      }),
+    );
+
+  it('says it is still waiting, not "no match", when the filter empties what loaded so far', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve(manualRuns(2)) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('wf-manual-0')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Cron' }));
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No runs match this filter')).not.toBeInTheDocument();
+  });
+
+  it('keeps paging while the filter hides every loaded row, so a later page can match', async () => {
+    stubDeps();
+    const local = [
+      ...manualRuns(22),
+      makeRun({ id: 'run_cron', workflow_name: 'wf-nightly', trigger: 'cron', started_at: '2026-07-19T00:00:00Z' }),
+    ];
+    let releaseFirstPage!: () => void;
+    const firstPage = new Promise<void>((r) => (releaseFirstPage = r));
+    const spy = vi.spyOn(api, 'getWorkflowRuns').mockImplementation(async (p) => {
+      if (p?.host !== 'local') return [];
+      const offset = p.offset ?? 0;
+      if (offset === 0) await firstPage;
+      return local.slice(offset, offset + (p.limit ?? 20));
+    });
+    renderPage();
+    // Pick Cron before anything has loaded: page 0 (all manual) lands straight in the filter-empty state.
+    fireEvent.click(screen.getByRole('button', { name: 'Cron' }));
+    releaseFirstPage();
+    await waitFor(() => expect(screen.getByText('wf-nightly')).toBeInTheDocument());
+    expect(callsFor(spy, 'local').some((c) => ((c[0] as { offset?: number }).offset ?? 0) > 0)).toBe(true);
+  });
+
+  it('says no host answered when every host failed', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockRejectedValue(new ApiError(502, 'x', '{"error":"down"}'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No hosts answered')).toBeInTheDocument());
+    expect(screen.queryByText('No workflow runs on the hosts that answered')).not.toBeInTheDocument();
+    expect(screen.getByText('Not included: Local (offline), prod (offline).')).toBeInTheDocument();
+  });
+});
+
 describe('WorkflowRuns — table rules (fit columns)', () => {
   it('the Status column is a fit (nowrap) column and renders via StatusPill', async () => {
     stubDeps();

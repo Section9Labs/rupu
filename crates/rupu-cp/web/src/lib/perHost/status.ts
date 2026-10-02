@@ -38,6 +38,11 @@ export function notIncluded<T>(slices: readonly HostSlice<T>[]): string | null {
   return out.length ? out.join(', ') : null;
 }
 
+/** No host answered: every one is offline or unavailable. Empty states must not say "the hosts that answered". */
+export function noHostAnswered<T>(slices: readonly HostSlice<T>[]): boolean {
+  return slices.length > 0 && slices.every((s) => s.state === 'offline' || s.state === 'unavailable');
+}
+
 export function pagingFailedHosts<T>(slices: readonly HostSlice<T>[]): { hostId: string; name: string }[] {
   return slices.filter((s) => s.pagingFailed).map((s) => ({ hostId: s.hostId, name: s.name }));
 }

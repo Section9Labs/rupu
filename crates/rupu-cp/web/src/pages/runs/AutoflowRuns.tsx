@@ -44,8 +44,8 @@ import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { RUN_STATUS_STYLES, StatusPill } from '../../components/StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
 import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PagingFailures, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
+import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -553,7 +553,7 @@ export default function AutoflowRuns() {
   // Claims tab: lazily fetched on selection, same as before — the endpoint
   // has no offset/limit (a single full-list fetch), so any page beyond the
   // first returns `[]` (mirrors the WorkflowRuns Archived-tab precedent) and
-  // the hook settles as `ended` after that one page. No poll (the default).
+  // the hook settles as `ended` after that one page. usePagedList never polls.
   const claims = usePagedList<AutoflowClaim>({
     fetch: ({ offset }) => {
       if (tab !== 'claims') return Promise.resolve([]);
@@ -782,6 +782,16 @@ export default function AutoflowRuns() {
     matchesAutoflowQuery(q, [c.issue_display_ref, c.issue_ref, c.workflow, c.repo_ref, c.claim_owner]),
   );
 
+  // Honest per-host states (spec §8), per feed: never claim "nothing" while a host is still
+  // loading, and keep the sentinel mounted whenever rows have loaded, even if Find hides all of
+  // them, so scrolling keeps loading (a later page may match).
+  const eventsWaiting = waitingLabel(events.slices);
+  const eventsMissing = notIncluded(events.slices);
+  const eventsFooter = perHostFooterText({ slices: events.slices, loading: events.loading, hasMore: events.hasMore, ended: events.ended, count: events.rows.length });
+  const cyclesWaiting = waitingLabel(cycles.slices);
+  const cyclesMissing = notIncluded(cycles.slices);
+  const cyclesFooter = perHostFooterText({ slices: cycles.slices, loading: cycles.loading, hasMore: cycles.hasMore, ended: cycles.ended, count: cycles.rows.length });
+
   return (
     <div className="p-8">
       <header className="flex items-center justify-between mb-6">
@@ -842,19 +852,36 @@ export default function AutoflowRuns() {
           <div className="py-16 flex items-center justify-center">
             <Spinner label="Loading autoflow activity…" />
           </div>
-        ) : events.rows.length === 0 && waitingLabel(events.slices) ? (
+        ) : events.rows.length === 0 && eventsWaiting ? (
           <div className="py-16 flex items-center justify-center">
-            <Spinner label={waitingLabel(events.slices) ?? ''} />
+            <Spinner label={eventsWaiting} />
           </div>
         ) : events.rows.length === 0 ? (
           <EmptyState
-            title="No autoflow activity yet"
-            hint={`Runs launched by the autoflow worker will appear here, each linking to its run graph.${
-              notIncluded(events.slices) ? ` Not included: ${notIncluded(events.slices)}.` : ''
-            }`}
+            title={
+              noHostAnswered(events.slices)
+                ? 'No hosts answered'
+                : eventsMissing
+                  ? 'No autoflow activity on the hosts that answered'
+                  : 'No autoflow activity yet'
+            }
+            hint={
+              eventsMissing
+                ? `Not included: ${eventsMissing}.`
+                : 'Runs launched by the autoflow worker will appear here, each linking to its run graph.'
+            }
           />
         ) : visibleEvents.length === 0 ? (
-          <EmptyState title="No matches" hint={`No autoflow activity matches "${query}".`} />
+          <>
+            {eventsWaiting ? (
+              <div className="py-16 flex items-center justify-center">
+                <Spinner label={`No matches yet · ${eventsWaiting}`} />
+              </div>
+            ) : (
+              <EmptyState title="No matches" hint={`No autoflow activity matches "${query}".`} />
+            )}
+            <PerHostFooter sentinelRef={events.sentinelRef} text={eventsFooter} slices={events.slices} onRetry={events.retryPaging} />
+          </>
         ) : (
           <section>
             <SortableTable<AutoflowEventRow>
@@ -865,12 +892,12 @@ export default function AutoflowRuns() {
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={EventDetail}
             />
-            <div ref={events.sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {q
-                ? `${visibleEvents.length} matches of ${events.rows.length} loaded`
-                : perHostFooterText({ slices: events.slices, loading: events.loading, hasMore: events.hasMore, ended: events.ended, count: events.rows.length })}
-            </div>
-            <PagingFailures slices={events.slices} onRetry={events.retryPaging} />
+            <PerHostFooter
+              sentinelRef={events.sentinelRef}
+              text={q ? `${visibleEvents.length} matches of ${events.rows.length} loaded` : eventsFooter}
+              slices={events.slices}
+              onRetry={events.retryPaging}
+            />
           </section>
         )
       ) : tab === 'cycles' ? (
@@ -878,19 +905,36 @@ export default function AutoflowRuns() {
           <div className="py-16 flex items-center justify-center">
             <Spinner label="Loading autoflow cycles…" />
           </div>
-        ) : cycles.rows.length === 0 && waitingLabel(cycles.slices) ? (
+        ) : cycles.rows.length === 0 && cyclesWaiting ? (
           <div className="py-16 flex items-center justify-center">
-            <Spinner label={waitingLabel(cycles.slices) ?? ''} />
+            <Spinner label={cyclesWaiting} />
           </div>
         ) : cycles.rows.length === 0 ? (
           <EmptyState
-            title="No autoflow cycles yet"
-            hint={`Autoflow scheduling cycles will appear here once the autoflow worker runs.${
-              notIncluded(cycles.slices) ? ` Not included: ${notIncluded(cycles.slices)}.` : ''
-            }`}
+            title={
+              noHostAnswered(cycles.slices)
+                ? 'No hosts answered'
+                : cyclesMissing
+                  ? 'No autoflow cycles on the hosts that answered'
+                  : 'No autoflow cycles yet'
+            }
+            hint={
+              cyclesMissing
+                ? `Not included: ${cyclesMissing}.`
+                : 'Autoflow scheduling cycles will appear here once the autoflow worker runs.'
+            }
           />
         ) : visibleCycles.length === 0 ? (
-          <EmptyState title="No matches" hint={`No autoflow cycles match "${query}".`} />
+          <>
+            {cyclesWaiting ? (
+              <div className="py-16 flex items-center justify-center">
+                <Spinner label={`No matches yet · ${cyclesWaiting}`} />
+              </div>
+            ) : (
+              <EmptyState title="No matches" hint={`No autoflow cycles match "${query}".`} />
+            )}
+            <PerHostFooter sentinelRef={cycles.sentinelRef} text={cyclesFooter} slices={cycles.slices} onRetry={cycles.retryPaging} />
+          </>
         ) : (
           <section>
             <SortableTable<AutoflowCycleRow>
@@ -900,12 +944,12 @@ export default function AutoflowRuns() {
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={CycleDetail}
             />
-            <div ref={cycles.sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {q
-                ? `${visibleCycles.length} matches of ${cycles.rows.length} loaded`
-                : perHostFooterText({ slices: cycles.slices, loading: cycles.loading, hasMore: cycles.hasMore, ended: cycles.ended, count: cycles.rows.length })}
-            </div>
-            <PagingFailures slices={cycles.slices} onRetry={cycles.retryPaging} />
+            <PerHostFooter
+              sentinelRef={cycles.sentinelRef}
+              text={q ? `${visibleCycles.length} matches of ${cycles.rows.length} loaded` : cyclesFooter}
+              slices={cycles.slices}
+              onRetry={cycles.retryPaging}
+            />
           </section>
         )
       ) : claims.loading && claims.rows.length === 0 ? (
