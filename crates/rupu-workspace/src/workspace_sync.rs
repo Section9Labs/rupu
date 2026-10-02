@@ -952,6 +952,41 @@ mod git_sync_tests {
         assert!(!ws.path().join(".rupu/coverage").exists());
     }
 
+    /// Git-mode counterpart of the tar baseline-deletion test: the baseline
+    /// commit carries `.rupu/coverage/` files (the pack snapshots untracked
+    /// ones too), and one the host removes is no coordinator-side deletion.
+    #[test]
+    fn git_baseline_coverage_file_deleted_on_the_host_is_not_a_deletion() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        write(ws.path(), ".rupu/coverage/tool-mappings.yaml", "m: 1\n");
+        let payload = pack(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage(&payload, scratch.path()).unwrap();
+        assert!(
+            scratch
+                .path()
+                .join(".rupu/coverage/tool-mappings.yaml")
+                .exists(),
+            "the baseline must carry the coverage file for this test to mean anything"
+        );
+
+        fs::remove_file(scratch.path().join(".rupu/coverage/tool-mappings.yaml")).unwrap();
+        fs::remove_file(scratch.path().join("a.txt")).unwrap();
+        let delta = collect_delta(scratch.path(), &baseline).unwrap();
+
+        assert_eq!(delta.deleted, vec!["a.txt".to_string()]);
+        assert!(delta.changed.is_empty(), "{:?}", delta.changed);
+        let patch = String::from_utf8_lossy(&delta.bytes);
+        assert!(!patch.contains(".rupu/coverage"), "{patch}");
+        apply_deltas(ws.path(), &[delta]).unwrap();
+        assert!(!ws.path().join("a.txt").exists());
+        assert!(
+            ws.path().join(".rupu/coverage/tool-mappings.yaml").exists(),
+            "the coordinator's coverage file must survive"
+        );
+    }
+
     /// Excluded on COLLECT, never ignored on APPLY (git mode): an older
     /// host's patch carries `.rupu/coverage/` hunks, and applying it writes
     /// the file.

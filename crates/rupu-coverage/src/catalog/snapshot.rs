@@ -19,11 +19,14 @@ pub enum SnapshotError {
 /// call in the target's own directory, then `rename` swaps it over `path`;
 /// the temp file is removed if either step fails.
 pub fn write_snapshot(catalog: &FlatCatalog, path: &Path) -> Result<(), SnapshotError> {
+    // The path string is built only if the operation fails.
+    fn io_err(p: &Path) -> impl FnOnce(std::io::Error) -> SnapshotError + '_ {
+        move |source| SnapshotError::Io {
+            path: p.display().to_string(),
+            source,
+        }
+    }
     let yaml = serde_yaml::to_string(catalog)?;
-    let io_err = |p: &Path| {
-        let path = p.display().to_string();
-        move |source| SnapshotError::Io { path, source }
-    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_err(parent))?;
     }
@@ -130,11 +133,16 @@ mod tests {
                     })
                 })
                 .collect();
-            for w in writers {
-                w.join().unwrap();
-            }
+            // Join EVERY writer and release the reader before unwrapping any
+            // result: a panicking writer must fail the test, not leave the
+            // reader spinning (and `scope` never returning) until a CI timeout.
+            let writer_results: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
             done.store(true, std::sync::atomic::Ordering::Relaxed);
-            reader.join().unwrap();
+            let reader_result = reader.join();
+            for r in writer_results {
+                r.unwrap();
+            }
+            reader_result.unwrap();
         });
 
         let loaded = read_snapshot(&path).expect("the snapshot must parse");

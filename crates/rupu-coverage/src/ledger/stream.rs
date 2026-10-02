@@ -8,11 +8,10 @@
 //! `target_id`: the target id hashes the host's workspace path, so the
 //! coordinator recomputes it for its own workspace.
 //!
-//! The async file-touch writer (`ledger::writer`) keeps the ledger-first
-//! rule — it streams a line only after its ledger write was accepted — but
-//! not the on-disk ordering: its ledger handle is buffered (flushed on
-//! `shutdown`) while the stream line is appended immediately, so the stream
-//! can reach the disk before the ledger line it mirrors.
+//! The async file-touch writer (`ledger::writer`) keeps the same ledger-first
+//! rule: it writes AND flushes each ledger line (a buffered file reports a
+//! failed write only on a later write or flush) and streams the line only if
+//! both succeeded. A ledger failure is logged and the line is not streamed.
 
 use crate::asset::Asset;
 use crate::catalog::types::FlatCatalog;
@@ -138,9 +137,10 @@ pub(crate) fn envelope(
 }
 
 /// Mirror an already-serialized record into the run stream, if any. The
-/// ledger line is the primary record and has already landed, so a stream
-/// failure is logged loudly and not returned: returning it would make a
-/// caller retry — and duplicate — a record that was written.
+/// ledger line is the primary record and has already been written (flushed,
+/// for the async writer's buffered handle), so a stream failure is logged
+/// loudly and not returned: returning it would make a caller retry — and
+/// duplicate — a record that was written.
 pub(crate) fn stream_json(paths: &CoveragePaths, ledger: Ledger, record_json: &str) {
     let Some(rs) = &paths.run_stream else {
         return;
