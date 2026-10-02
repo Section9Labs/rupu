@@ -149,6 +149,37 @@ fn continue_refuses_a_run_of_a_different_agent() {
 }
 
 #[test]
+fn continue_refuses_to_reuse_the_continued_runs_id() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    first_run(dir.path());
+    interrupt_first_run(dir.path());
+    let before = std::fs::read_to_string(transcript(dir.path(), "run_first")).unwrap();
+
+    // An empty script: any model call would fail the run.
+    rupu(dir.path(), "[]")
+        .args([
+            "run",
+            "hello",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_first",
+            "--continue",
+            "run_first",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs a new run id"));
+
+    let after = std::fs::read_to_string(transcript(dir.path(), "run_first")).unwrap();
+    assert_eq!(
+        before, after,
+        "the interrupted transcript must be untouched"
+    );
+}
+
+#[test]
 fn continue_refuses_an_unknown_run() {
     let dir = tempfile::tempdir().unwrap();
     make_agent(dir.path(), "hello");

@@ -608,6 +608,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     prepare_continuation, transcript_agent, Continuation,
                 };
                 let prev_path = transcripts.join(format!("{prev}.jsonl"));
+                // The continued run seeds from `prev_path`; reusing its id
+                // would append to the transcript it reads and make its `Seed`
+                // reference itself (a cycle replay rejects).
+                if transcript_path == prev_path {
+                    anyhow::bail!(
+                        "--continue {prev} needs a new run id; --run-id {prev} would overwrite the run being continued"
+                    );
+                }
                 let prev_agent = transcript_agent(&prev_path)?;
                 if prev_agent != spec.name {
                     anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
