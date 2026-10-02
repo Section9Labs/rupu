@@ -22,6 +22,8 @@ pub mod fd_budget;
 pub mod loader;
 // Tasks 17+18: MCP tool adapter + runner wiring
 pub mod mcp_tool;
+// Classifies every reply and provider error into an outcome (response-outcomes plan 2).
+pub mod outcome;
 // implemented in Task 4
 pub mod permission;
 // Task 3 (transcript fidelity plan 1): reconstructs the exact provider
