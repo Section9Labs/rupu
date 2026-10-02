@@ -427,6 +427,7 @@ impl StepFactory for DefaultStepFactory {
 
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: spec.name,
             agent_system_prompt,
             agent_tools: narrow_agent_tools(spec.tools, &step.actions),

@@ -341,4 +341,15 @@ mod tests {
         let out = pipe.run(&ctx());
         assert!(out.once.is_empty() && out.every_turn.is_empty());
     }
+
+    #[test]
+    fn empty_pipeline_run_is_a_noop_assembly() {
+        // Mirrors the loop's `opts.collectors.is_empty()` fast path contract:
+        // an empty pipeline contributes no once/every_turn messages, so the
+        // turn's messages equal the base messages unchanged.
+        let pipe = CollectorPipeline::new(vec![], INJECTION_TOKEN_BUDGET);
+        let out = pipe.run(&ctx());
+        assert!(out.once.is_empty());
+        assert!(out.every_turn.is_empty());
+    }
 }

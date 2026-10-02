@@ -12,6 +12,7 @@ fn opts(
 ) -> AgentRunOpts {
     AgentRunOpts {
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: "test".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

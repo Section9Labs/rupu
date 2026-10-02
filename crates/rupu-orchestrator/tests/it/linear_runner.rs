@@ -50,6 +50,7 @@ impl StepFactory for FakeFactory {
         }]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
@@ -522,6 +523,7 @@ impl StepFactory for FailingFactory {
         let provider = MockProvider::new(vec![turn]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
@@ -1328,6 +1330,7 @@ impl StepFactory for PanelFactory {
         }]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "review".into(),
             agent_tools: None,
@@ -1592,6 +1595,7 @@ impl StepFactory for LoopingPanelFactory {
         }]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "x".into(),
             agent_tools: None,
@@ -2139,6 +2143,7 @@ impl StepFactory for RecordingFailingFactory {
         let provider = MockProvider::new(vec![turn]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,

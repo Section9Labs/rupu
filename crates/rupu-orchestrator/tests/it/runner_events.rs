@@ -45,6 +45,7 @@ impl StepFactory for FakeFactory {
         }]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
@@ -371,6 +372,7 @@ impl StepFactory for GatePanelFactory {
         }]);
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "panel".into(),
             agent_tools: None,

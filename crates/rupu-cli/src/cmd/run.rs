@@ -1014,6 +1014,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 
         let mut opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: spec.name.clone(),
             agent_system_prompt,
             agent_tools: spec.tools.clone(),

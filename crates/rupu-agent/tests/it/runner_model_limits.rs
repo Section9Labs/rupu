@@ -122,6 +122,7 @@ fn build_opts(
     AgentRunOpts {
         codename: None,
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: "noop".into(),
         agent_system_prompt: "You are a noop agent.".into(),
         agent_tools: None,
