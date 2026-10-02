@@ -674,7 +674,18 @@ impl OpenAiCodexClient {
                         if let (Some(id), Some(name)) =
                             (acc.current_tool_id.take(), acc.current_tool_name.take())
                         {
-                            let input_str = std::mem::take(&mut acc.current_tool_input);
+                            // A zero-argument call may stream no argument deltas:
+                            // fall back to the done item's own `arguments`, then
+                            // to an empty object (as the Anthropic path does).
+                            let streamed = std::mem::take(&mut acc.current_tool_input);
+                            let input_str = if !streamed.trim().is_empty() {
+                                streamed
+                            } else {
+                                match item["arguments"].as_str() {
+                                    Some(a) if !a.trim().is_empty() => a.to_string(),
+                                    _ => "{}".to_string(),
+                                }
+                            };
                             match serde_json::from_str::<serde_json::Value>(&input_str) {
                                 Ok(input) => acc.content_blocks.push(ContentBlock::ToolUse {
                                     id,
@@ -720,12 +731,21 @@ impl OpenAiCodexClient {
             }
             "response.completed" | "response.incomplete" => {
                 acc.terminal_seen = true;
+                let incomplete_event = event_type == "response.incomplete";
                 if let Some(resp) = data.get("response") {
                     absorb_terminal_response(acc, resp, on_event);
                     acc.stop = Some(responses_stop(
                         resp,
-                        event_type == "response.incomplete",
-                        output_has_function_call(resp),
+                        incomplete_event,
+                        has_function_call(resp, &acc.content_blocks),
+                    ));
+                } else if incomplete_event {
+                    // The event itself says the reply is incomplete even
+                    // though it carries no reason.
+                    acc.stop = Some(Stop::from_wire(
+                        StopReason::Incomplete,
+                        "openai-codex",
+                        Some("incomplete"),
                     ));
                 }
             }
@@ -1401,15 +1421,21 @@ fn refusal_in_parts(parts: &[serde_json::Value]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether a terminal response's `output` carries a `function_call` item.
-fn output_has_function_call(resp: &serde_json::Value) -> bool {
-    resp.get("output")
-        .and_then(|o| o.as_array())
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|i| i["type"].as_str() == Some("function_call"))
-        })
+/// Whether a terminal response called a function: a `function_call` item in
+/// its `output`, or a `ToolUse` block already streamed into `content` (some
+/// backends send `output: []` on the terminal event).
+fn has_function_call(resp: &serde_json::Value, content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        || resp
+            .get("output")
+            .and_then(|o| o.as_array())
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|i| i["type"].as_str() == Some("function_call"))
+            })
 }
 
 /// Token usage off a Responses `usage` object.
@@ -1474,12 +1500,16 @@ fn responses_stop(
     if status == Some("cancelled") {
         return Stop::from_wire(StopReason::Incomplete, "openai-codex", Some("cancelled"));
     }
+    // `failed`, `queued` and `in_progress` are not a finished answer.
+    if let Some(other) = status.filter(|s| *s != "completed") {
+        return Stop::from_wire(StopReason::Incomplete, "openai-codex", Some(other));
+    }
     let reason = if has_function_call {
         StopReason::ToolUse
     } else {
         StopReason::EndTurn
     };
-    Stop::from_wire(reason, "openai-codex", Some(status.unwrap_or("completed")))
+    Stop::from_wire(reason, "openai-codex", Some("completed"))
 }
 
 /// Apply the refusal override, then the bad-tool rule, to a reply's stop.
@@ -1584,9 +1614,12 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
         content.insert(0, block);
     }
 
-    let has_function_call = output_has_function_call(json);
     let stop = finalize_stop(
-        Some(responses_stop(json, false, has_function_call)),
+        Some(responses_stop(
+            json,
+            false,
+            has_function_call(json, &content),
+        )),
         &refusal,
         bad_tool,
     );
@@ -4924,6 +4957,145 @@ mod outcome_tests {
         .unwrap();
         assert_eq!(r.stop.reason, StopReason::MalformedToolCall);
         assert!(r.stop.wire.details.as_ref().unwrap()["malformed_tool"].is_object());
+    }
+
+    fn tool_input(r: &LlmResponse) -> serde_json::Value {
+        match r.tool_calls().as_slice() {
+            [ContentBlock::ToolUse { id, name, input }] => {
+                assert_eq!((id.as_str(), name.as_str()), ("call_0", "list_files"));
+                input.clone()
+            }
+            other => panic!("expected one tool call, got {other:?}"),
+        }
+    }
+
+    fn zero_arg_call(item_arguments: Option<&str>) -> Result<LlmResponse, ProviderError> {
+        let mut item = serde_json::json!({
+            "type": "function_call", "call_id": "call_0", "name": "list_files"});
+        if let Some(a) = item_arguments {
+            item["arguments"] = serde_json::json!(a);
+        }
+        run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_0", "name": "list_files"}}),
+            serde_json::json!({"type": "response.output_item.done", "item": item}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_0"}]}}),
+        ])
+        .0
+    }
+
+    #[test]
+    fn zero_arg_call_without_deltas_uses_item_arguments() {
+        let r = zero_arg_call(Some("{}")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(tool_input(&r), serde_json::json!({}));
+        // Whitespace-only arguments count as empty too.
+        let r = zero_arg_call(Some("  ")).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn zero_arg_call_without_deltas_or_arguments_is_empty_object() {
+        let r = zero_arg_call(None).unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(tool_input(&r), serde_json::json!({}));
+    }
+
+    #[test]
+    fn incomplete_event_without_response_is_incomplete() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.incomplete"}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Incomplete);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("incomplete"));
+    }
+
+    #[test]
+    fn bare_completed_event_without_response_stays_unreported() {
+        let (r, _) = run(&[created(), serde_json::json!({"type": "response.completed"})]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unreported);
+        assert!(r.stop.wire.value.is_none());
+    }
+
+    #[test]
+    fn unfinished_terminal_statuses_are_incomplete() {
+        for status in ["failed", "queued", "in_progress"] {
+            let (r, _) = run(&[
+                created(),
+                serde_json::json!({"type": "response.completed",
+                    "response": {"status": status, "output": []}}),
+            ]);
+            let r = r.unwrap();
+            assert_eq!(r.stop.reason, StopReason::Incomplete, "{status}");
+            assert_eq!(r.stop.wire.value.as_deref(), Some(status));
+        }
+    }
+
+    #[test]
+    fn streamed_tool_use_counts_when_output_is_empty() {
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_5", "name": "f"}}),
+            serde_json::json!({"type": "response.function_call_arguments.delta", "delta": "{}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_5", "name": "f", "arguments": "{}"}}),
+            serde_json::json!({"type": "response.completed", "response": {
+                "status": "completed", "output": []}}),
+        ]);
+        let r = r.unwrap();
+        assert_eq!(r.stop.reason, StopReason::ToolUse);
+        assert_eq!(r.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn streamed_tool_use_does_not_override_incomplete_or_refusal() {
+        let call = |terminal: serde_json::Value| {
+            run(&[
+                created(),
+                serde_json::json!({"type": "response.output_item.added", "item": {
+                    "type": "function_call", "call_id": "call_6", "name": "f"}}),
+                serde_json::json!({"type": "response.function_call_arguments.delta",
+                    "delta": "{}"}),
+                serde_json::json!({"type": "response.output_item.done", "item": {
+                    "type": "function_call", "call_id": "call_6", "name": "f",
+                    "arguments": "{}"}}),
+                serde_json::json!({"type": "response.refusal.done", "refusal": "No."}),
+                terminal,
+            ])
+            .0
+            .unwrap()
+        };
+        let r = call(
+            serde_json::json!({"type": "response.incomplete", "response": {
+            "status": "incomplete", "incomplete_details": {"reason": "content_filter"},
+            "output": []}}),
+        );
+        // Refusal is applied after the incomplete mapping.
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["incomplete_details"]["reason"],
+            "content_filter"
+        );
+
+        let (r, _) = run(&[
+            created(),
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "call_id": "call_7", "name": "f"}}),
+            serde_json::json!({"type": "response.function_call_arguments.delta", "delta": "{}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_7", "name": "f", "arguments": "{}"}}),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+                "output": []}}),
+        ]);
+        assert_eq!(r.unwrap().stop.reason, StopReason::MaxTokens);
     }
 
     #[test]
