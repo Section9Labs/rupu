@@ -54,6 +54,17 @@ pub fn resolver_for(cfg: &rupu_config::Config) -> KeychainResolver {
     KeychainResolver::new().with_accounts(account_specs(cfg))
 }
 
+/// [`resolver_for`] over the auth file under `global`, the rupu home the
+/// caller already resolved (`paths::global_dir()`; a temporary directory
+/// in tests): `KeychainResolver::for_home` reads `<global>/auth.json`
+/// (or `RUPU_AUTH_FILE`, the same override `new` honours) and never looks
+/// the home up on its own, so a caller that keeps every path under one
+/// `global` — the resume / reject-cleanup rebuild, and its tests — stays
+/// there. In production the two resolve the same file.
+pub fn resolver_for_home(cfg: &rupu_config::Config, global: &std::path::Path) -> KeychainResolver {
+    KeychainResolver::for_home(global).with_accounts(account_specs(cfg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

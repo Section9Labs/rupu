@@ -504,22 +504,35 @@ fn decide_gate(
 
 /// Run a decided gate's follow-up in this process: the resume for an approve,
 /// the `on_reject` chain for a reject. `Err` is the message for the notice
-/// row.
+/// row. The rupu home every follow-up rebuilds its runtime under is the one
+/// `runs_dir` lives in (`<home>/runs`), the same for the resume and the
+/// cleanup — never resolved from `$RUPU_HOME` by one of them.
 async fn run_follow_up(
     runs_dir: &Path,
     run_id: &str,
     follow_up: GateFollowUp,
 ) -> Result<(), String> {
     let store = RunStore::new(runs_dir.to_path_buf());
+    let global = runs_dir
+        .parent()
+        .ok_or_else(|| "gate follow-up unavailable: no rupu home".to_string())?;
     match follow_up {
         GateFollowUp::Resume {
             step_id,
             approver,
             via_timeout,
-        } => crate::resume::resume_run(&store, run_id, &step_id, None, &approver, via_timeout)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("resume failed: {e:#}")),
+        } => crate::resume::resume_run(
+            &store,
+            global,
+            run_id,
+            &step_id,
+            None,
+            &approver,
+            via_timeout,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("resume failed: {e:#}")),
         GateFollowUp::Cleanup {
             step_id,
             reason,
@@ -534,14 +547,11 @@ async fn run_follow_up(
                 .load(run_id)
                 .is_ok_and(|r| r.pending_decision(&step_id).is_some())
             {
-                return crate::resume::resume_decided(&store, run_id, None)
+                return crate::resume::resume_decided(&store, global, run_id, None)
                     .await
                     .map(|_| ())
                     .map_err(|e| format!("resume failed: {e:#}"));
             }
-            let global = runs_dir
-                .parent()
-                .ok_or_else(|| "on_reject cleanup unavailable: no rupu home".to_string())?;
             let (opts, _chain_len) = crate::resume::build_reject_cleanup_opts(
                 &store, global, run_id, &step_id, &reason, None,
             )
@@ -1753,6 +1763,76 @@ mod tests {
         assert!(
             matches!(&out, GateFollowUp::Cleanup { via: "timeout", .. }),
             "{out:?}"
+        );
+    }
+
+    /// The reject follow-up on a legacy (single-cursor) run runs the gate's
+    /// `on_reject` chain in this process, under the rupu home `runs_dir`
+    /// lives in: the gate's rejected result is recorded with the operator's
+    /// decision — the run's `events.jsonl` under that home gets the gate's
+    /// events — and the cleanup-pending marker `reject_gate` left for `cp
+    /// serve`'s sweep is cleared, so the sweep does not run the chain again.
+    #[tokio::test]
+    async fn the_reject_follow_up_runs_the_cleanup_and_clears_the_sweep_s_marker() {
+        // The cleanup's opts rebuild builds SCM connectors: TLS client
+        // construction needs the process-level crypto provider.
+        crate::test_support::ensure_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let runs_dir = home.join("runs");
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = RunStore::new(runs_dir.clone());
+        let mut rec = record("run_t", "awaiting_approval", &[("gate_a", None)]);
+        rec.workspace_path = workspace.clone();
+        rec.transcript_dir = workspace.join(".rupu/transcripts");
+        store.create(rec, GATES_YAML).unwrap();
+        let wf = parse(GATES_YAML);
+
+        let follow_up = decide_gate(
+            &store,
+            &wf,
+            "run_t",
+            &gate_view("gate_a", None),
+            GateVerb::Reject,
+            "op",
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&follow_up, GateFollowUp::Cleanup { .. }),
+            "{follow_up:?}"
+        );
+        let rejected = store.load("run_t").unwrap();
+        assert_eq!(rejected.status, RunStatus::Rejected);
+        assert!(
+            rejected.reject_cleanup_pending.is_some(),
+            "left for the sweep until the follow-up runs the chain"
+        );
+
+        run_follow_up(&runs_dir, "run_t", follow_up).await.unwrap();
+
+        let rows = store.read_step_results("run_t").unwrap();
+        let gate_rows: Vec<_> = rows.iter().filter(|r| r.step_id == "gate_a").collect();
+        assert_eq!(gate_rows.len(), 1, "{rows:?}");
+        let output: serde_json::Value = serde_json::from_str(&gate_rows[0].output).unwrap();
+        assert_eq!(output["decision"], "rejected");
+        assert_eq!(output["via"], "human");
+        assert_eq!(output["approver"], "op");
+        assert_eq!(output["reason"], REJECT_REASON);
+        assert!(
+            store
+                .load("run_t")
+                .unwrap()
+                .reject_cleanup_pending
+                .is_none(),
+            "the chain ran here; nothing is left for the sweep"
+        );
+        let events = std::fs::read_to_string(runs_dir.join("run_t").join("events.jsonl"))
+            .expect("the follow-up rebuilt its runtime under runs_dir's home");
+        assert!(
+            events.contains("step_completed") && events.contains("gate_a"),
+            "the gate's events landed under that home: {events}"
         );
     }
 

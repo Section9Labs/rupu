@@ -884,14 +884,21 @@ mod tests {
 
     #[test]
     fn ui_prefs_no_color_env_overrides_config() {
+        // The crate-wide lock: `NO_COLOR` is process-wide, and every other
+        // env-mutating test in this binary serializes on it.
+        let _guard = crate::test_support::ENV_LOCK.blocking_lock();
+        let before = std::env::var_os("NO_COLOR");
         std::env::set_var("NO_COLOR", "1");
         let cfg = UiConfig {
             color: Some("always".into()),
             ..Default::default()
         };
         let prefs = UiPrefs::resolve(&cfg, false, None, None, None);
+        match before {
+            Some(v) => std::env::set_var("NO_COLOR", v),
+            None => std::env::remove_var("NO_COLOR"),
+        }
         assert_eq!(prefs.color, ColorMode::Never);
-        std::env::remove_var("NO_COLOR");
     }
 
     #[test]

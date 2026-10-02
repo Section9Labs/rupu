@@ -60,11 +60,25 @@ pub fn init(cfg_level: Option<&str>) {
         .try_init();
 }
 
+/// Where the live commands' log file lives ([`init_to_file`]):
+/// `<RUPU_HOME>/cache/rupu.log` when `rupu_home` (the `RUPU_HOME`
+/// variable) names the rupu home — a redirected home keeps its log, as
+/// it keeps its runs, cache and crash logs, so a test's temporary home
+/// is never left for the real one — else the OS cache directory's
+/// `rupu/rupu.log` (`~/Library/Caches/rupu` on macOS, `~/.cache/rupu` on
+/// Linux). `None` when neither resolves.
+fn log_dir_for(rupu_home: Option<&str>) -> Option<PathBuf> {
+    match rupu_home {
+        Some(home) => Some(PathBuf::from(home).join("cache")),
+        None => dirs::cache_dir().map(|d| d.join("rupu")),
+    }
+}
+
 /// File-writing init for live interactive commands. The live view
 /// owns the terminal, so writing tracing lines anywhere on
-/// stdout/stderr corrupts it; route them to `~/.rupu/cache/rupu.log`
-/// instead. Caller is responsible for telling the user where the log
-/// file lives if they need to debug.
+/// stdout/stderr corrupts it; route them to the log file under
+/// [`log_dir_for`] instead. Caller is responsible for telling the user
+/// where the log file lives if they need to debug.
 ///
 /// Returns the resolved log file path on success so the caller can
 /// surface it (e.g. in a help overlay or a `RUPU_LOG_FILE` echo).
@@ -72,7 +86,8 @@ pub fn init(cfg_level: Option<&str>) {
 /// created — that's worse than ideal but better than silently
 /// dropping logs.
 pub fn init_to_file(cfg_level: Option<&str>) -> Option<PathBuf> {
-    let Some(cache_dir) = dirs::cache_dir().map(|d| d.join("rupu")) else {
+    let rupu_home = std::env::var("RUPU_HOME").ok();
+    let Some(cache_dir) = log_dir_for(rupu_home.as_deref()) else {
         init(cfg_level);
         return None;
     };
@@ -129,6 +144,17 @@ mod tests {
     fn blank_values_are_treated_as_unset() {
         assert_eq!(filter_directive(Some("info"), Some("   ")), "info");
         assert_eq!(filter_directive(Some(""), None), "warn");
+    }
+
+    /// A redirected rupu home keeps the live commands' log file; without
+    /// one it goes to the OS cache directory.
+    #[test]
+    fn the_log_file_follows_a_redirected_rupu_home() {
+        assert_eq!(
+            log_dir_for(Some("/tmp/rupu-home")),
+            Some(PathBuf::from("/tmp/rupu-home/cache"))
+        );
+        assert_eq!(log_dir_for(None), dirs::cache_dir().map(|d| d.join("rupu")));
     }
 
     /// A typo in either source must not take the binary down at startup.

@@ -98,9 +98,12 @@ pub struct ResumeOutcome {
 /// returned by `RunStore::approve_gate`), reported back on the outcome.
 ///
 /// The `store` reference is used for the disk reads; the runtime store
-/// `Arc` is rebuilt internally from the global dir (identical to the CLI's
-/// inline path), so this is safe to call from a context that holds only a
-/// borrow.
+/// `Arc` is rebuilt internally from `global` — the rupu home `store` lives
+/// under (`<global>/runs`), named by the caller like
+/// [`build_reject_cleanup_opts`]'s rather than resolved from `$RUPU_HOME`
+/// here, so one caller's approve-resume and reject-cleanup read and write
+/// the same home — identical to the CLI's inline path, so this is safe to
+/// call from a context that holds only a borrow.
 ///
 /// `mode` overrides the permission mode for the resumed run (`ask` /
 /// `bypass` / `readonly`). `None` falls back through
@@ -116,6 +119,7 @@ pub struct ResumeOutcome {
 /// `cp serve` sweep-driven `on_timeout: approve` (`via: "timeout"`).
 pub async fn resume_run(
     store: &RunStore,
+    global: &Path,
     run_id: &str,
     awaited_step_id: &str,
     mode: Option<&str>,
@@ -123,9 +127,8 @@ pub async fn resume_run(
     via_timeout: bool,
 ) -> anyhow::Result<ResumeOutcome> {
     let awaited_step_id = awaited_step_id.to_string();
-    let global = paths::global_dir()?;
     let (mut opts, prior_step_results) =
-        rebuild_opts_from_disk(store, &global, run_id, mode).await?;
+        rebuild_opts_from_disk(store, global, run_id, mode).await?;
     opts.resume_from = Some(rupu_orchestrator::ResumeState::from_approval_with_actor(
         run_id.to_string(),
         prior_step_results,
@@ -148,15 +151,17 @@ pub async fn resume_run(
 /// reject` on a path-scoped run and by `rupu workflow resume` (which the
 /// cp-serve resume worker spawns after a web decision). When a runner is
 /// already executing the run, nothing runs here: the result's
-/// `handed_off_to` names it, and it applies the decisions itself.
+/// `handed_off_to` names it, and it applies the decisions itself. `global`
+/// is the rupu home `store` lives under, named by the caller (see
+/// [`resume_run`]).
 pub async fn resume_decided(
     store: &RunStore,
+    global: &Path,
     run_id: &str,
     mode: Option<&str>,
 ) -> anyhow::Result<OrchestratorRunResult> {
-    let global = paths::global_dir()?;
     let (mut opts, prior_step_results) =
-        rebuild_opts_from_disk(store, &global, run_id, mode).await?;
+        rebuild_opts_from_disk(store, global, run_id, mode).await?;
     opts.resume_from = Some(rupu_orchestrator::ResumeState::from_decisions(
         run_id.to_string(),
         prior_step_results,
@@ -307,7 +312,9 @@ async fn rebuild_opts_from_disk(
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
+    // Rooted at `global` like everything else here: the resolver reads
+    // `<global>/auth.json` and never resolves the home on its own.
+    let resolver = Arc::new(crate::accounts::resolver_for_home(&cfg, &global));
 
     // Netflow capture for this resumed run. This run's own linear steps
     // write to the SAME `<transcripts>/<run_id>.jsonl` file (mirrors

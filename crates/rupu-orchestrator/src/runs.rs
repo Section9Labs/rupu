@@ -324,7 +324,12 @@ pub struct RunRecord {
     /// `on_timeout: reject` auto-expiry branch inside `reject_gate` (that
     /// path is already covered — the CLI's `via: "timeout"` handling and
     /// the sweep's own proactive `expire_gate_if_overdue` arm both run the
-    /// chain synchronously without needing a marker).
+    /// chain synchronously without needing a marker) — except that the
+    /// sweep sets it itself when that chain cannot be built (a config
+    /// that does not parse), having recorded the gate's rejected row on
+    /// its own, so its `Rejected` arm retries the chain on a later tick
+    /// (`run_reject_cleanup` writes no second row for a gate result
+    /// already on disk).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_cleanup_pending: Option<RejectCleanupMarker>,
     /// The effective permission mode (`ask` / `bypass` / `readonly`) this
@@ -1638,9 +1643,10 @@ impl RunStore {
     /// a short sleep), so the methods that take it (`cancel`, `pause`,
     /// `reap_if_orphaned`, `expire_if_overdue`, `expire_gate_if_overdue`,
     /// `approve_gate`, `reject_gate`, `request_resume_approval`,
-    /// `claim_resume`, `clear_resume`, `clear_reject_cleanup`,
-    /// `update_unless_cancelled`, `modify_unless_cancelled`,
-    /// `modify_if_status`, `modify_fields`) are called from an async
+    /// `claim_resume`, `release_resume_claim`, `clear_resume`,
+    /// `clear_reject_cleanup`, `update_unless_cancelled`,
+    /// `modify_unless_cancelled`, `modify_if_status`, `modify_fields`) are
+    /// called from an async
     /// context through [`RunStore::blocking`], never directly on a runtime
     /// worker. Not re-entrant: a holder calls the `_locked` variants, never
     /// a method that takes it again.
@@ -3249,6 +3255,47 @@ impl RunStore {
         self.update(&record)
     }
 
+    /// Ask the resume worker for a runner for a run whose recorded gate
+    /// decisions no runner is applying: the `workflow resume` a spawner
+    /// started for them died before it claimed the run (its own rebuild
+    /// failed — a config that does not parse), or a live runner crashed on
+    /// a run still parked at a sibling. The decisions are durable; the
+    /// marker a spawner consumes at its spawn is not, so nothing else
+    /// retries them. Under the run lock, on the record as it is now: when
+    /// the run is `Running` or `AwaitingApproval` with a decision recorded,
+    /// has no live runner ([`live_runner`](Self::live_runner)), no marker
+    /// and no live claim, and its newest decision is older than
+    /// [`RESUME_LEASE`](Self::RESUME_LEASE) — the time a spawned runner is
+    /// given to claim the run — the marker is set (approver `"sweep"`, no
+    /// gate and no mode: the decisions carry their own) and this is
+    /// `Ok(true)`; otherwise nothing is written and it is `Ok(false)`. A
+    /// `Paused` run is never re-requested: the operator paused it. The
+    /// wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn request_runner_for_stranded_decisions(
+        &self,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let record = self.load(run_id)?;
+        let newest_decision = record.gate_decisions.iter().map(|d| d.decided_at).max();
+        let stranded = matches!(
+            record.status,
+            RunStatus::Running | RunStatus::AwaitingApproval
+        ) && record.resume_requested_at.is_none()
+            && record
+                .resume_claimed_at
+                .is_none_or(|at| now - at > Self::RESUME_LEASE)
+            && newest_decision.is_some_and(|at| now - at > Self::RESUME_LEASE)
+            && self.live_runner(&record).is_none();
+        if !stranded {
+            return Ok(false);
+        }
+        self.mark_resume_requested(record, "sweep", None, None, now)?;
+        Ok(true)
+    }
+
     /// Runs that a web/delegated gate decision OR manual-pause resume
     /// request marked for resume and that no worker currently holds a live
     /// lease on. A run is pending when it has a `resume_requested_at`
@@ -3313,6 +3360,24 @@ impl RunStore {
         Ok(claimed.get())
     }
 
+    /// Release the resume claim ([`claim_resume`](Self::claim_resume))
+    /// and nothing else: the gate sweep's approve hand-off, once its
+    /// child is spawned, when the pending marker is not its gate's — a
+    /// web approve of a sibling gate the resume worker has yet to consume
+    /// — gives the lease back and leaves that marker
+    /// (`resume_requested_at`, gate, approver, mode) for the worker. Under
+    /// the run lock, on the record as it is now; a cancel is left alone.
+    /// The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn release_resume_claim(&self, run_id: &str) -> Result<(), RunStoreError> {
+        self.modify_unless_cancelled(run_id, |record| {
+            record.resume_claimed_at = None;
+            record.resume_claimed_by = None;
+            true
+        })?;
+        Ok(())
+    }
+
     /// Clear the pending-resume marker + claim after a worker finishes
     /// (or abandons) a resume. `now` is accepted for signature symmetry
     /// with the other resume methods even though it isn't used.
@@ -3336,6 +3401,40 @@ impl RunStore {
             true
         })?;
         Ok(())
+    }
+
+    /// [`clear_resume`](Self::clear_resume) for the marker a spawner looked
+    /// at, and that one only: the resume worker and the gate sweep read the
+    /// marker (its gate, mode, approver) without the lock, spawn the child
+    /// that consumes it, and only then clear — and a web decision recorded
+    /// in between overwrote the marker with one the child was not spawned
+    /// for. `marked_at` is the `resume_requested_at` the spawner read
+    /// (`None` when it read no marker). Under the run lock, on the record
+    /// as it is now: while the marker is still the one read, the marker and
+    /// the claim are cleared (`Ok(true)`); otherwise only the claim is given
+    /// back ([`release_resume_claim`](Self::release_resume_claim)) and the
+    /// newer marker stays for the resume worker (`Ok(false)`). A cancel is
+    /// left alone. The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn clear_resume_if_marked_at(
+        &self,
+        run_id: &str,
+        marked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, RunStoreError> {
+        let cleared = std::cell::Cell::new(false);
+        self.modify_unless_cancelled(run_id, |record| {
+            record.resume_claimed_at = None;
+            record.resume_claimed_by = None;
+            if marked_at.is_some() && record.resume_requested_at == marked_at {
+                record.resume_requested_at = None;
+                record.resume_mode = None;
+                record.resume_gate_id = None;
+                record.resume_approver = None;
+                cleared.set(true);
+            }
+            true
+        })?;
+        Ok(cleared.get())
     }
 
     /// Runs the `cp serve` gate sweep must still run an `on_reject`
@@ -6634,6 +6733,256 @@ mod tests {
 
         assert!(matches!(
             store.modify_if_status("run_missing", RunStatus::Paused, |_| {}),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// `release_resume_claim` gives the lease back and touches nothing
+    /// else: the pending marker (request, gate, approver, mode) stays for
+    /// the resume worker, which can claim it again.
+    #[test]
+    fn release_resume_claim_gives_the_lease_back_and_keeps_the_marker() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_release_claim");
+        rec.resume_requested_at = Some(now);
+        rec.resume_gate_id = Some("gate_b".into());
+        rec.resume_approver = Some("web".into());
+        rec.resume_mode = Some("bypass".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store.claim_resume(&rec.id, "sweep", now).unwrap());
+        assert!(store.load(&rec.id).unwrap().resume_claimed_at.is_some());
+
+        store.release_resume_claim(&rec.id).unwrap();
+
+        let released = store.load(&rec.id).unwrap();
+        assert_eq!(released.resume_claimed_at, None);
+        assert_eq!(released.resume_claimed_by, None);
+        assert_eq!(released.resume_requested_at, Some(now), "the marker stays");
+        assert_eq!(released.resume_gate_id.as_deref(), Some("gate_b"));
+        assert_eq!(released.resume_approver.as_deref(), Some("web"));
+        assert_eq!(released.resume_mode.as_deref(), Some("bypass"));
+        assert!(
+            store.claim_resume(&rec.id, "worker", now).unwrap(),
+            "the resume worker claims it next"
+        );
+        assert!(matches!(
+            store.release_resume_claim("run_missing"),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// `clear_resume_if_marked_at` clears the marker the spawner read and
+    /// no other: a marker written since the spawner's look (a web approve
+    /// of another gate, overwriting request time, gate, approver and mode)
+    /// is kept, and only the claim is given back.
+    #[test]
+    fn clear_resume_if_marked_at_clears_only_the_marker_that_was_read() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let read_at = Utc::now();
+        let mut rec = sample_record("run_clear_if_marked");
+        rec.resume_requested_at = Some(read_at);
+        rec.resume_gate_id = Some("gate_a".into());
+        rec.resume_approver = Some("web".into());
+        rec.resume_mode = Some("ask".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store.claim_resume(&rec.id, "worker", read_at).unwrap());
+
+        // Overwritten since the spawner read it: kept, claim released.
+        let since = read_at + chrono::Duration::seconds(1);
+        let mut current = store.load(&rec.id).unwrap();
+        current.resume_requested_at = Some(since);
+        current.resume_gate_id = Some("gate_b".into());
+        current.resume_approver = Some("web".into());
+        current.resume_mode = Some("bypass".into());
+        store.update(&current).unwrap();
+        assert!(!store
+            .clear_resume_if_marked_at(&rec.id, Some(read_at))
+            .unwrap());
+        let kept = store.load(&rec.id).unwrap();
+        assert_eq!(
+            kept.resume_requested_at,
+            Some(since),
+            "the newer marker stays"
+        );
+        assert_eq!(kept.resume_gate_id.as_deref(), Some("gate_b"));
+        assert_eq!(kept.resume_approver.as_deref(), Some("web"));
+        assert_eq!(kept.resume_mode.as_deref(), Some("bypass"));
+        assert_eq!(kept.resume_claimed_at, None, "the claim is given back");
+        assert_eq!(kept.resume_claimed_by, None);
+
+        // A spawner that read no marker clears none either.
+        assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
+        assert!(!store.clear_resume_if_marked_at(&rec.id, None).unwrap());
+        let kept = store.load(&rec.id).unwrap();
+        assert_eq!(kept.resume_requested_at, Some(since));
+        assert_eq!(kept.resume_claimed_at, None);
+
+        // Still the marker that was read: marker and claim cleared.
+        assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
+        assert!(store
+            .clear_resume_if_marked_at(&rec.id, Some(since))
+            .unwrap());
+        let cleared = store.load(&rec.id).unwrap();
+        assert_eq!(cleared.resume_requested_at, None);
+        assert_eq!(cleared.resume_gate_id, None);
+        assert_eq!(cleared.resume_approver, None);
+        assert_eq!(cleared.resume_mode, None);
+        assert_eq!(cleared.resume_claimed_at, None);
+        assert_eq!(cleared.resume_claimed_by, None);
+
+        // Nothing to clear: the claim alone is given back.
+        assert!(store.claim_resume(&rec.id, "worker", since).unwrap());
+        assert!(!store
+            .clear_resume_if_marked_at(&rec.id, Some(since))
+            .unwrap());
+        assert_eq!(store.load(&rec.id).unwrap().resume_claimed_at, None);
+
+        assert!(matches!(
+            store.clear_resume_if_marked_at("run_missing", Some(since)),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    /// A cancel that landed is left alone by the conditional clear too:
+    /// its marker fields are not touched and the record is not rewritten.
+    #[test]
+    fn clear_resume_if_marked_at_leaves_a_cancelled_run_alone() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_clear_if_marked_cancelled");
+        rec.status = RunStatus::Cancelled;
+        rec.finished_at = Some(now);
+        rec.resume_requested_at = Some(now);
+        rec.resume_claimed_at = Some(now);
+        rec.resume_claimed_by = Some("worker".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(!store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap());
+        let untouched = store.load(&rec.id).unwrap();
+        assert_eq!(untouched.status, RunStatus::Cancelled);
+        assert_eq!(untouched.resume_requested_at, Some(now));
+        assert_eq!(untouched.resume_claimed_at, Some(now));
+        assert_eq!(untouched.resume_claimed_by.as_deref(), Some("worker"));
+    }
+
+    /// A recorded decision with no runner, no marker and no live claim,
+    /// older than a runner's grace, gets the resume marker set again (the
+    /// sweep's re-request); the marker is then there for the resume worker
+    /// and a second call writes nothing. Anything that means a runner is
+    /// on its way or at work — a fresh decision, a marker, a live claim, a
+    /// live runner — or a pause leaves the record alone.
+    #[test]
+    fn request_runner_for_stranded_decisions_marks_only_a_decision_nobody_is_applying() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let stale = now - RunStore::RESUME_LEASE - chrono::Duration::seconds(1);
+        let decided = |at| GateDecision {
+            step_id: "gate".into(),
+            verdict: GateVerdict::Approved,
+            via: "human".into(),
+            approver: Some("web".into()),
+            reason: None,
+            decided_at: at,
+        };
+        let mut rec = sample_record("run_stranded");
+        rec.status = RunStatus::Running;
+        rec.gate_decisions = vec![decided(stale)];
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(store
+            .request_runner_for_stranded_decisions(&rec.id, now)
+            .unwrap());
+        let marked = store.load(&rec.id).unwrap();
+        assert_eq!(marked.resume_requested_at, Some(now));
+        assert_eq!(marked.resume_approver.as_deref(), Some("sweep"));
+        assert_eq!(marked.resume_gate_id, None);
+        assert_eq!(marked.resume_mode, None);
+        assert_eq!(marked.status, RunStatus::Running);
+        assert_eq!(marked.gate_decisions.len(), 1);
+        assert_eq!(store.list_pending_resume(now).unwrap().len(), 1);
+        // The marker is there: a second call writes nothing.
+        assert!(!store
+            .request_runner_for_stranded_decisions(&rec.id, now)
+            .unwrap());
+        assert_eq!(store.load(&rec.id).unwrap().resume_requested_at, Some(now));
+
+        // Parked at a sibling with a stranded decision: re-requested too.
+        let mut parked = awaiting_record("run_stranded_parked");
+        parked.gate_decisions = vec![decided(stale)];
+        store.create(parked.clone(), SAMPLE_YAML).unwrap();
+        assert!(store
+            .request_runner_for_stranded_decisions(&parked.id, now)
+            .unwrap());
+        assert_eq!(
+            store.load(&parked.id).unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+
+        // Left alone: a fresh decision (its runner is on its way).
+        let mut fresh = sample_record("run_fresh");
+        fresh.status = RunStatus::Running;
+        fresh.gate_decisions = vec![decided(now - chrono::Duration::seconds(5))];
+        store.create(fresh.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store
+            .request_runner_for_stranded_decisions(&fresh.id, now)
+            .unwrap());
+        // Left alone: a live claim (a spawner is mid-flight, or backing off).
+        let mut claimed = sample_record("run_claimed");
+        claimed.status = RunStatus::Running;
+        claimed.gate_decisions = vec![decided(stale)];
+        claimed.resume_claimed_at = Some(now - chrono::Duration::seconds(5));
+        claimed.resume_claimed_by = Some("worker".into());
+        store.create(claimed.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store
+            .request_runner_for_stranded_decisions(&claimed.id, now)
+            .unwrap());
+        // ... until that claim is stale.
+        assert!(store
+            .request_runner_for_stranded_decisions(
+                &claimed.id,
+                now + RunStore::RESUME_LEASE + chrono::Duration::seconds(1)
+            )
+            .unwrap());
+        // Left alone: a live runner.
+        let mut live = sample_record("run_live");
+        live.status = RunStatus::Running;
+        live.gate_decisions = vec![decided(stale)];
+        live.runner_pid = Some(std::process::id());
+        store.create(live.clone(), SAMPLE_YAML).unwrap();
+        let _guard = store.register_runner(&live.id);
+        assert!(!store
+            .request_runner_for_stranded_decisions(&live.id, now)
+            .unwrap());
+        // Left alone: no decision, a pause, a terminal run.
+        let mut none = sample_record("run_no_decision");
+        none.status = RunStatus::Running;
+        store.create(none.clone(), SAMPLE_YAML).unwrap();
+        assert!(!store
+            .request_runner_for_stranded_decisions(&none.id, now)
+            .unwrap());
+        for (id, status) in [
+            ("run_paused_decision", RunStatus::Paused),
+            ("run_done_decision", RunStatus::Completed),
+        ] {
+            let mut rec = sample_record(id);
+            rec.status = status;
+            rec.gate_decisions = vec![decided(stale)];
+            store.create(rec.clone(), SAMPLE_YAML).unwrap();
+            assert!(
+                !store
+                    .request_runner_for_stranded_decisions(id, now)
+                    .unwrap(),
+                "{id}"
+            );
+            assert_eq!(store.load(id).unwrap().resume_requested_at, None);
+        }
+        assert!(matches!(
+            store.request_runner_for_stranded_decisions("run_missing", now),
             Err(RunStoreError::NotFound(_))
         ));
     }

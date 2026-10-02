@@ -124,6 +124,25 @@ impl KeychainResolver {
         let path = std::env::var("RUPU_AUTH_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_auth_json_path());
+        Self::at(path)
+    }
+
+    /// The resolver over the auth file under `home`: `<home>/auth.json`,
+    /// unless `RUPU_AUTH_FILE` names the file outright — the same override
+    /// [`KeychainResolver::new`] honours. For a caller that already holds
+    /// the rupu home (`$RUPU_HOME`, else `~/.rupu`, in production — the
+    /// same directory `new` resolves; a temporary one in tests) and must
+    /// not have the resolver look the home up again on its own.
+    pub fn for_home(home: &std::path::Path) -> Self {
+        let path = std::env::var("RUPU_AUTH_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join("auth.json"));
+        Self::at(path)
+    }
+
+    /// The resolver over exactly this auth file.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
         tracing::debug!(path = %path.display(), "credential store");
         Self {
             path,
@@ -1262,7 +1281,10 @@ mod resolver_named_tests {
         }
     }
 
+    // `#[serial]`: sets `RUPU_AUTH_FILE`, which `new` / `with_service` /
+    // `for_home` read.
     #[tokio::test]
+    #[serial_test::serial]
     async fn named_provider_reads_from_json_file() {
         let _lock = ENV_LOCK.lock().await;
         let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND"]);
@@ -1284,7 +1306,9 @@ mod resolver_named_tests {
         }
     }
 
+    // `#[serial]`: sets `RUPU_AUTH_FILE` and an `RUPU_*_API_KEY`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn named_provider_falls_back_to_env() {
         let _lock = ENV_LOCK.lock().await;
         let _guard = EnvGuard(vec![
@@ -1382,6 +1406,51 @@ mod parse_stored_credential_tests {
 mod tests {
     use super::*;
     use rupu_providers::auth::AuthCredentials;
+
+    /// `for_home` reads the auth file under that home and nowhere else:
+    /// a credential stored at `<home>/auth.json` (through `at`) resolves
+    /// there, and the same account under another home resolves to nothing
+    /// — with no file created there, and no look-up of `$RUPU_HOME` or
+    /// `~/.rupu`. `#[serial]`: `for_home` honours `RUPU_AUTH_FILE`, which
+    /// other tests of this module set.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn for_home_reads_the_auth_file_under_that_home_only() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let account = crate::account::AccountSpec::new("rooted-probe", "github");
+        KeychainResolver::at(home.path().join("auth.json"))
+            .with_accounts(vec![account.clone()])
+            .store_named(
+                "rooted-probe",
+                AuthMode::ApiKey,
+                &StoredCredential::api_key("home-token"),
+            )
+            .await
+            .unwrap();
+        assert!(home.path().join("auth.json").is_file());
+
+        let (mode, creds) = KeychainResolver::for_home(home.path())
+            .with_accounts(vec![account.clone()])
+            .get("rooted-probe", None)
+            .await
+            .unwrap();
+        assert_eq!(mode, AuthMode::ApiKey);
+        assert!(matches!(creds, AuthCredentials::ApiKey { key } if key == "home-token"));
+
+        let elsewhere = KeychainResolver::for_home(other.path())
+            .with_accounts(vec![account])
+            .get("rooted-probe", None)
+            .await;
+        assert!(
+            elsewhere.is_err(),
+            "another home holds no credential: {elsewhere:?}"
+        );
+        assert!(
+            !other.path().join("auth.json").exists(),
+            "a read creates nothing"
+        );
+    }
 
     /// Two accounts of the same vendor store and read back independently.
     /// This is the core capability the whole arc exists to deliver.

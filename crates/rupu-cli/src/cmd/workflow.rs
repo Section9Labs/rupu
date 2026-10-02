@@ -3054,7 +3054,7 @@ async fn approve(
             // runner to apply (spec §7): prune its path, run its
             // `on_reject` chain, carry on with every other path.
             if pending_gate_decision(&store, run_id, &step_id) {
-                let result = crate::resume::resume_decided(&store, run_id, mode).await?;
+                let result = crate::resume::resume_decided(&store, &global, run_id, mode).await?;
                 report_resumed_run(&result, &format!("applied gate `{step_id}`'s rejection"));
                 return Ok(());
             }
@@ -3105,6 +3105,7 @@ async fn approve(
     // hands off instead of starting a second runner.
     let outcome = crate::resume::resume_run(
         &store,
+        &global,
         run_id,
         &awaited_step_id,
         mode,
@@ -3287,7 +3288,7 @@ pub(crate) async fn resume_run(
         RunStatus::AwaitingApproval | RunStatus::Running
     ) && !record.gate_decisions.is_empty()
     {
-        let result = crate::resume::resume_decided(&store, run_id, mode).await?;
+        let result = crate::resume::resume_decided(&store, &global, run_id, mode).await?;
         report_resumed_run(&result, "to apply its recorded gate decisions");
         return Ok(());
     }
@@ -3887,7 +3888,7 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
     // runner does that now (or hand it to the runner already executing it).
     if pending_gate_decision(&store, run_id, &rejected_step_id) {
         println!("rupu: gate `{rejected_step_id}` rejected on run {run_id}");
-        let result = crate::resume::resume_decided(&store, run_id, None).await?;
+        let result = crate::resume::resume_decided(&store, &global, run_id, None).await?;
         report_resumed_run(
             &result,
             &format!("to apply gate `{rejected_step_id}`'s rejection"),
@@ -5408,10 +5409,11 @@ async fn execute_workflow_invocation(
             if matches!(outcome, AttachOutcome::Cancelled) {
                 current_runner.abort();
                 let _ = current_runner.await;
-                cancel_with_store(
+                let summary = finish_operator_cancel(
                     run_store_for_resume.as_ref(),
+                    &prepared_run,
+                    run_envelope.trigger.wake_id.as_deref(),
                     &current_run_id,
-                    "cancelled by operator",
                 )
                 .await?;
                 // The retained view is already torn down; this early return
@@ -5419,24 +5421,19 @@ async fn execute_workflow_invocation(
                 if print_summary {
                     print_completion_summary(&runs_dir, &current_run_id, &cfg.pricing);
                 }
-                return Ok(RunOutcomeSummary {
-                    run_id: current_run_id,
-                    awaiting_step_id: None,
-                    artifact_manifest_path: None,
-                    backend_id: Some(prepared_run.backend_id.clone()),
-                    worker_id: prepared_run.worker_id.clone(),
-                });
+                return Ok(summary);
             }
 
-            let result = match current_runner
-                .await
-                .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-            {
-                Ok(result) => result,
+            let result = match current_runner.await {
+                Ok(Ok(result)) => result,
                 // The printer has finished; the shared summary below still
                 // prints before the runner's error propagates (the printer's
                 // own failure line above keeps the `error:` text).
-                Err(e) => break Err(to_anyhow_with_input_snippet(e, &path, &body)),
+                Ok(Err(e)) => break Err(to_anyhow_with_input_snippet(e, &path, &body)),
+                // A panicked runner ends the invocation like any other
+                // runner error: through the shared summary and the
+                // portable-metadata persist below, as the live view's does.
+                Err(e) => break Err(anyhow::anyhow!("workflow task panicked: {e}")),
             };
 
             match outcome {
@@ -5462,9 +5459,15 @@ async fn execute_workflow_invocation(
                         AttachOutcome::Approved { awaited_step_id } => awaited_step_id,
                         _ => String::new(),
                     };
-                    let prior_records = run_store_for_resume
+                    // Unreadable step results end the invocation like a
+                    // runner error — through the summary and the
+                    // portable-metadata persist below, not an early return.
+                    let prior_records = match run_store_for_resume
                         .read_step_results(&current_run_id)
-                        .map_err(|e| anyhow::anyhow!("read step results for resume: {e}"))?;
+                    {
+                        Ok(records) => records,
+                        Err(e) => break Err(anyhow::anyhow!("read step results for resume: {e}")),
+                    };
                     let prior_count = prior_records.len();
                     let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
                         .iter()
@@ -5591,6 +5594,41 @@ async fn execute_workflow_invocation(
         run_outcome,
     )
     .await
+}
+
+/// The operator's `x` from the retained attach (`--plain` /
+/// `RUPU_LIVE_VIEW=0`): the run is cancelled on disk ([`cancel_with_store`])
+/// and, the run being over, its portable metadata (backend, worker, wake,
+/// manifest path) is persisted like any other ending's — a cancelled run
+/// carries it too — before the summary is returned, with the manifest path
+/// it got. The metadata is persisted whatever the cancel returned: a run
+/// that finished, or was cancelled by another process, between the
+/// printer's last poll and the key is refused as already terminal, and is
+/// over just the same — without its wake it would be labelled `manual`. The
+/// cancel's own error is then what the caller gets; a metadata failure on
+/// that path is logged, never masks it.
+async fn finish_operator_cancel(
+    run_store: &rupu_orchestrator::RunStore,
+    prepared: &PreparedRun,
+    source_wake_id: Option<&str>,
+    run_id: &str,
+) -> anyhow::Result<RunOutcomeSummary> {
+    let cancelled = cancel_with_store(run_store, run_id, "cancelled by operator").await;
+    let persisted = persist_portable_run_metadata(run_store, prepared, source_wake_id).await;
+    if let Err(e) = cancelled {
+        if let Err(pe) = persisted {
+            tracing::warn!(run_id = %run_id, error = %pe, "portable run metadata not persisted after the refused cancel");
+        }
+        return Err(e);
+    }
+    let artifact_manifest_path = persisted?.map(|(path, _)| path);
+    Ok(RunOutcomeSummary {
+        run_id: run_id.to_string(),
+        awaiting_step_id: None,
+        artifact_manifest_path,
+        backend_id: Some(prepared.backend_id.clone()),
+        worker_id: prepared.worker_id.clone(),
+    })
 }
 
 /// `execute_workflow_invocation`'s last step, run whatever the run
@@ -6081,6 +6119,73 @@ mod tests {
         assert_eq!(
             on_disk.artifact_manifest_path.as_deref(),
             Some(path.as_path())
+        );
+    }
+
+    /// The operator's cancel from the attached live view ends the run
+    /// `Cancelled` on disk and persists its portable metadata like any
+    /// other ending: the four fields and the manifest are there, and the
+    /// summary names the manifest.
+    #[tokio::test]
+    async fn the_operator_s_cancel_persists_the_metadata_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = sample_run_record(RunStatus::Running, None);
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
+        let summary = finish_operator_cancel(&store, &prepared_for(&rec), Some("wake_42"), &rec.id)
+            .await
+            .unwrap();
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Cancelled);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_42"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+        assert_eq!(on_disk.worker_id.as_deref(), Some("worker-1"));
+        let manifest = on_disk
+            .artifact_manifest_path
+            .expect("the manifest path is recorded");
+        assert!(manifest.is_file(), "the manifest was written");
+        assert_eq!(
+            summary.artifact_manifest_path.as_deref(),
+            Some(manifest.as_path())
+        );
+        assert_eq!(summary.run_id, rec.id);
+        assert_eq!(summary.awaiting_step_id, None);
+    }
+
+    /// The operator's `x` landing on a run that is already over — it
+    /// completed, or another process cancelled it, between the printer's
+    /// last poll and the key — is refused as already terminal, and the run
+    /// still gets its portable metadata: it is persisted whatever the cancel
+    /// returned, and the cancel's own error is what the caller gets. Before,
+    /// the refused cancel returned first, so the finished run had no
+    /// `source_wake_id` and was labelled `manual`.
+    #[tokio::test]
+    async fn the_operator_s_cancel_persists_the_metadata_even_when_the_cancel_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let mut rec = sample_run_record(RunStatus::Completed, None);
+        rec.finished_at = Some(Utc::now());
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
+        let err = finish_operator_cancel(&store, &prepared_for(&rec), Some("wake_42"), &rec.id)
+            .await
+            .expect_err("the cancel is refused: the run is already terminal");
+        assert!(
+            err.to_string().contains("already terminal (completed)"),
+            "the cancel's own error, not a metadata one: {err:#}"
+        );
+        let on_disk = store.load(&rec.id).unwrap();
+        assert_eq!(on_disk.status, RunStatus::Completed, "the ending is kept");
+        assert_eq!(on_disk.finished_at, rec.finished_at);
+        assert_eq!(on_disk.source_wake_id.as_deref(), Some("wake_42"));
+        assert_eq!(on_disk.backend_id.as_deref(), Some("local_worktree"));
+        assert_eq!(on_disk.worker_id.as_deref(), Some("worker-1"));
+        assert!(
+            on_disk.artifact_manifest_path.is_some_and(|p| p.is_file()),
+            "the manifest was written and recorded"
         );
     }
 
