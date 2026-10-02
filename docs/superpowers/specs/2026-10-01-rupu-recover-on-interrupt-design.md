@@ -84,8 +84,9 @@ pub enum Continuation {
     Finished { output: String },
     /// Rebuild and continue.
     Resume { messages: Vec<Message>, seed_source: PathBuf },
-    /// The attempt ended in failure — not an interruption.
-    Failed { error: Option<String> },
+    /// The attempt ended in failure — not an interruption. `seeded_from` is the
+    /// transcript it was seeded from when it was itself a continuation.
+    Failed { error: Option<String>, seeded_from: Option<PathBuf> },
 }
 
 pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, ContinuationError>;
@@ -96,10 +97,18 @@ Classification by how the transcript ends:
 | Transcript ends with | Outcome |
 |---|---|
 | `RunComplete { status: ok }` | `Finished` — output = final assistant text |
-| `RunComplete { status: aborted }` (pause or shutdown signal) | `Resume` |
-| no `RunComplete` (process died) | `Resume` |
 | `RunComplete { status: error }` | `Failed` |
-| missing, unreadable, malformed, seed-chain/hash error | `Err(ContinuationError)` → caller restarts, flagged, with the error as the reason |
+| `RunComplete { status: aborted }` (pause or shutdown signal), or no `RunComplete` (process died) — and the rebuilt conversation ends in a **user** message | `Resume` |
+| the same, but the rebuilt conversation ends in an **assistant answer with no tool call** (the final turn completed; only `RunComplete` was lost) | `Finished` — output read the same way as for `ok`, so it never depends on whether the last flush landed |
+| the same, but the rebuilt conversation ends in an assistant message **with a tool call and no result** | `Err(DanglingToolCall)` |
+| no `RunStart`, or nothing rebuilds (empty conversation) | `Err(NotAnAgentRun)` |
+| missing, unreadable, malformed, seed-chain/hash error | `Err(Read)` / `Err(Replay)` → caller restarts, flagged, with the error as the reason |
+
+Replay now applies the role-alternation merge below. A session transcript chain
+written *before* this change recorded its `Seed` hashes over the *unmerged* history
+(two consecutive user messages), so one that crosses a compaction may now fail replay
+with `SeedHashMismatch` — loud, not silent, and nothing replays sessions in
+production today.
 
 `Resume.messages` is `reconstruct_transcript(transcript)`. Because the trailing
 incomplete turn is dropped, the conversation always ends on a **user** message (the
@@ -112,6 +121,10 @@ attempt, then sets `initial_messages = messages`, `seed_source = Some(transcript
 > This session was interrupted and has been resumed. Work from the step you were in
 > the middle of was lost and may be partially applied — check the current state, then
 > continue the task.
+
+If the rebuilt conversation *already ends with that note* (the attempt being continued
+was itself a continuation that died before finishing its first turn), the new run is
+seed-only — empty `user_message` — so the note is never stacked twice.
 
 **Role-alternation rule (runtime + replay, lockstep).** Today `run_agent` appends a
 non-empty `user_message` as a new user message. When `initial_messages` already ends in
@@ -132,7 +145,13 @@ standalone agent runs (and is what remote hosts execute, §5): it resolves
 different agent, builds the run from that agent's *current* definition, and runs
 `prepare_continuation`. `Finished` prints the recovered output without calling the
 model; `Failed` exits non-zero with the recorded error. `--continue` takes no
-prompt or target.
+prompt or target, and refuses any `--run-id` that already has a transcript (the
+runner truncates its transcript at start, so reusing an id would wipe that run —
+the one being continued, or an ancestor in its chain).
+
+A continued run's coverage manifest records `continued_from` (the seed source
+transcript); its `user_prompt` is only the note, so `rupu coverage rerun` refuses
+it and points at the run it continued.
 
 ### 2. The attempts ledger (`rupu-orchestrator`)
 
@@ -210,6 +229,16 @@ the CP, the resume request records the choice on the run's resume marker (next t
   run id on that host. Connectors launch `rupu run <agent> --run-id <new> --continue <old> …`.
   The coordinator still mints the new run id up front, so the mirror path is known
   before dispatch.
+- **Contract gap — assigned to PR 3.** The coordinator reads a placed unit's
+  `final_output` from the *new* run's record
+  (`fleet_unit_dispatcher.rs`, the `final_output` read on the terminal `get_run`).
+  PR 1's `rupu run --continue` does not produce one on `Finished`: it prints the
+  recovered answer to stdout, returns, and writes no run record for `<new>`. So a
+  remote unit that had in fact finished would surface as a missing run. PR 3 must
+  close this: on `Finished` under `--run-id <new>`, the host has to produce a
+  completed run record for `<new>` carrying the recovered output (or the coordinator
+  must accept the recovered output another way, e.g. from the `--continue` process's
+  stdout). No code change in PR 1.
 - Hosts advertise a new **`agent.continue`** capability exactly like
   `agent.findings_profile` (HTTP `/api/host/info` `features`, tunnel
   `Hello.capabilities`, bucket `nodes/<worker>.json` markers). A connector refuses
