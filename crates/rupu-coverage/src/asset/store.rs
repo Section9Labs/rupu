@@ -37,6 +37,12 @@ pub fn from_assets<I: IntoIterator<Item = Asset>>(assets: I) -> Vec<Asset> {
 
 /// Read and fold the asset store at `path`. A missing file is an empty set.
 pub fn read_assets(path: &Path) -> Result<Vec<Asset>, AssetStoreError> {
+    Ok(from_assets(read_asset_lines(path)?))
+}
+
+/// Every line recorded at `path`, in order and unfolded — the superseded
+/// states [`read_assets`] folds away. A missing file is empty.
+pub(crate) fn read_asset_lines(path: &Path) -> Result<Vec<Asset>, AssetStoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -53,7 +59,7 @@ pub fn read_assets(path: &Path) -> Result<Vec<Asset>, AssetStoreError> {
         })?;
         parsed.push(asset);
     }
-    Ok(from_assets(parsed))
+    Ok(parsed)
 }
 
 /// Append one asset as a JSON line, creating the parent directory and file as
@@ -118,5 +124,9 @@ mod tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].depth.as_deref(), Some("tested"));
         assert!(read.iter().any(|x| x.id == b.id && x.depth.is_none()));
+
+        // The unfolded reader keeps the superseded line the fold drops.
+        let lines = read_asset_lines(&path).unwrap();
+        assert_eq!(lines, vec![a1, b, a2]);
     }
 }

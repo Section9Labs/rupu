@@ -239,13 +239,15 @@ pub fn report_finding(
                 });
             }
         }
-        // Stamp the asset into the graph.
+        // Stamp the asset into the graph (and the run stream, so a
+        // coordinator collecting this run sees it).
         let label = asset_ref
             .label
             .clone()
             .unwrap_or_else(|| asset_ref.kind.clone());
         let asset = crate::asset::Asset::new(asset_ref.kind.clone(), locator, label, None);
-        crate::asset::upsert_asset(&paths.assets, &asset)?;
+        crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
+            .map_err(crate::asset::AssetStoreError::Io)?;
     }
 
     let id = format!("fnd_{}", Ulid::new());
@@ -645,6 +647,60 @@ mod tests {
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].kind, "code:file");
         assert_eq!(assets[0].label, "src/a.rs");
+    }
+
+    #[test]
+    fn engagement_stamp_streams_the_asset_before_the_finding() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let stream = tmp.path().join("runs/run_1/coverage.jsonl");
+        let paths = CoveragePaths::new(tmp.path(), "t").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "sec".into(),
+        }));
+        let mut opts = full_opts(&store);
+        opts.engagement = Some(Arc::new(
+            crate::profile::builtin_registry()
+                .unwrap()
+                .active_set(&["code".into()])
+                .unwrap(),
+        ));
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "code:file".into(),
+            coordinates: vec![crate::asset::Coordinate::Path("src/a.rs".into())],
+            label: Some("src/a.rs".into()),
+        });
+
+        let out = report_finding(&paths, attribution(), inp, &opts).unwrap();
+
+        let streamed: Vec<StreamLine> = std::fs::read_to_string(&stream)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        match streamed.as_slice() {
+            [StreamLine::Assets {
+                scope_name: a_scope,
+                record: asset,
+            }, StreamLine::Findings {
+                scope_name: f_scope,
+                record: finding,
+            }] => {
+                assert_eq!((a_scope.as_str(), f_scope.as_str()), ("sec", "sec"));
+                assert_eq!(asset.kind, "code:file");
+                assert_eq!(asset.label, "src/a.rs");
+                assert_eq!(finding.id, out.id);
+                // The streamed asset is the one the ledger holds.
+                assert_eq!(
+                    crate::asset::read_assets(&paths.assets).unwrap(),
+                    vec![asset.clone()]
+                );
+            }
+            other => panic!("expected an assets line then a findings line, got {other:?}"),
+        }
     }
 
     #[test]

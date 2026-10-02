@@ -3,10 +3,14 @@
 //!
 //! Pure file I/O over one workspace: each line is re-keyed to
 //! `target_id(workspace, scope_name)`, de-duplicated (findings by id, every
-//! other ledger by exact record equality), and — when the unit ran on another
-//! machine — its finding artifacts are recorded `stored: external` with that
-//! host, since their blobs live in the host's store, not this one.
+//! other ledger by exact record equality — an asset line against the lines the
+//! target's `assets.jsonl` held before this merge, since the store folds
+//! last-line-wins and a state may legitimately recur), and — when the unit ran
+//! on another machine — its finding artifacts are recorded `stored: external`
+//! with that host, since their blobs live in the host's store, not this one.
 
+use crate::asset::store::read_asset_lines;
+use crate::asset::AssetStoreError;
 use crate::catalog::snapshot::write_snapshot;
 use crate::ledger::events::FindingRecord;
 use crate::ledger::manifest::read_manifests;
@@ -15,6 +19,7 @@ use crate::ledger::stream::{append_record, Ledger, StreamLine};
 use crate::ledger::target_id::target_id;
 use crate::ledger::views::{read_concern_assertions, read_file_events, read_findings};
 use crate::report::ArtifactStorage;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
@@ -45,6 +50,8 @@ pub enum IngestError {
     Io(#[from] std::io::Error),
     #[error("coverage ingest encode: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error("coverage ingest asset ledger: {0}")]
+    Assets(#[from] AssetStoreError),
     #[error("coverage ingest catalog snapshot: {0}")]
     Catalog(String),
 }
@@ -56,6 +63,12 @@ struct Seen {
     runs: HashSet<String>,
     files: HashSet<String>,
     concerns: HashSet<String>,
+    /// The serialized `assets.jsonl` lines as they were before this merge. Not
+    /// grown as lines are merged: the store folds last-line-wins, so a state a
+    /// unit re-asserts after another (mark, stamp without a depth, stamp
+    /// again) must be appended again to stay the last word. Re-merging the
+    /// same stream is still a no-op because every line is already here.
+    assets: HashSet<String>,
 }
 
 fn load_seen(paths: &CoveragePaths) -> Result<Seen, IngestError> {
@@ -72,7 +85,25 @@ fn load_seen(paths: &CoveragePaths) -> Result<Seen, IngestError> {
     for a in read_concern_assertions(paths)? {
         s.concerns.insert(serde_json::to_string(&a)?);
     }
+    for a in read_asset_lines(&paths.assets)? {
+        s.assets.insert(serde_json::to_string(&a)?);
+    }
     Ok(s)
+}
+
+/// Append `record` to `ledger` unless an identical line is already in `seen`
+/// (which then remembers it). Whether the record was new.
+fn append_unseen(
+    paths: &CoveragePaths,
+    ledger: Ledger,
+    seen: &mut HashSet<String>,
+    record: &impl Serialize,
+) -> Result<bool, IngestError> {
+    let fresh = seen.insert(serde_json::to_string(record)?);
+    if fresh {
+        append_record(paths, ledger, record)?;
+    }
+    Ok(fresh)
 }
 
 fn mark_external(record: &mut FindingRecord, host: &str) {
@@ -115,6 +146,7 @@ pub fn ingest_unit_stream(
             | StreamLine::Files { scope_name, .. }
             | StreamLine::Concerns { scope_name, .. }
             | StreamLine::Findings { scope_name, .. }
+            | StreamLine::Assets { scope_name, .. }
             | StreamLine::Catalog { scope_name, .. } => scope_name.clone(),
         };
         if !targets.contains_key(&scope) {
@@ -129,25 +161,13 @@ pub fn ingest_unit_stream(
         let fresh = match line {
             StreamLine::Begin { .. } => continue,
             StreamLine::Runs { record, .. } => {
-                let fresh = seen.runs.insert(serde_json::to_string(&record)?);
-                if fresh {
-                    append_record(paths, Ledger::Runs, &record)?;
-                }
-                fresh
+                append_unseen(paths, Ledger::Runs, &mut seen.runs, &record)?
             }
             StreamLine::Files { record, .. } => {
-                let fresh = seen.files.insert(serde_json::to_string(&record)?);
-                if fresh {
-                    append_record(paths, Ledger::Files, &record)?;
-                }
-                fresh
+                append_unseen(paths, Ledger::Files, &mut seen.files, &record)?
             }
             StreamLine::Concerns { record, .. } => {
-                let fresh = seen.concerns.insert(serde_json::to_string(&record)?);
-                if fresh {
-                    append_record(paths, Ledger::Concerns, &record)?;
-                }
-                fresh
+                append_unseen(paths, Ledger::Concerns, &mut seen.concerns, &record)?
             }
             StreamLine::Findings { mut record, .. } => {
                 let fresh = seen.findings.insert(record.id.clone());
@@ -156,6 +176,14 @@ pub fn ingest_unit_stream(
                         mark_external(&mut record, host);
                     }
                     append_record(paths, Ledger::Findings, &record)?;
+                }
+                fresh
+            }
+            StreamLine::Assets { record, .. } => {
+                // Checked, not inserted: see `Seen::assets`.
+                let fresh = !seen.assets.contains(&serde_json::to_string(&record)?);
+                if fresh {
+                    append_record(paths, Ledger::Assets, &record)?;
                 }
                 fresh
             }
@@ -351,6 +379,85 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let rep = ingest_unit_stream(ws.path(), &remote(), b"").unwrap();
         assert!(!rep.begin_seen);
+    }
+
+    fn asset(host: &str, depth: Option<&str>) -> crate::asset::Asset {
+        let mut a = crate::asset::Asset::new(
+            "network:host",
+            crate::asset::Locator(vec![crate::asset::Coordinate::Host(host.into())]),
+            host,
+            None,
+        );
+        a.depth = depth.map(str::to_string);
+        a
+    }
+
+    fn assets_line(scope: &str, a: crate::asset::Asset) -> StreamLine {
+        StreamLine::Assets {
+            scope_name: scope.into(),
+            record: a,
+        }
+    }
+
+    #[test]
+    fn asset_lines_land_in_the_coordinator_targets_asset_ledger() {
+        let ws = tempfile::tempdir().unwrap();
+        let a = asset("10.0.0.7", Some("discovered"));
+        let s = stream(&[begin(), assets_line("net", a.clone())]);
+        let rep = ingest_unit_stream(ws.path(), &remote(), &s).unwrap();
+        assert_eq!((rep.appended, rep.duplicates), (1, 0));
+        let tid = target_id(ws.path(), "net");
+        assert!(rep.targets.contains(&tid));
+        let paths = CoveragePaths::new(ws.path(), &tid);
+        assert_eq!(crate::asset::read_assets(&paths.assets).unwrap(), vec![a]);
+        assert!(
+            paths.run_stream.is_none(),
+            "an ingest never re-streams what it merges"
+        );
+    }
+
+    #[test]
+    fn reingesting_an_asset_stream_leaves_the_ledger_byte_identical() {
+        let ws = tempfile::tempdir().unwrap();
+        let s = stream(&[
+            begin(),
+            assets_line("net", asset("10.0.0.7", Some("discovered"))),
+            assets_line("net", asset("10.0.0.8", None)),
+        ]);
+        ingest_unit_stream(ws.path(), &remote(), &s).unwrap();
+        let tid = target_id(ws.path(), "net");
+        let file = CoveragePaths::new(ws.path(), &tid).assets;
+        let before = std::fs::read(&file).unwrap();
+        let rep = ingest_unit_stream(ws.path(), &remote(), &s).unwrap();
+        assert_eq!((rep.appended, rep.duplicates), (0, 2));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    #[test]
+    fn a_repeated_asset_state_keeps_the_streams_last_line_wins_fold() {
+        // The unit marked the host, stamped it again with no depth (a later
+        // finding about it), and the store folds last-line-wins: no depth.
+        // The merge must preserve that order, not drop the repeat as a
+        // duplicate of the first line and leave the mark as the last word.
+        let ws = tempfile::tempdir().unwrap();
+        let s = stream(&[
+            begin(),
+            assets_line("net", asset("10.0.0.7", None)),
+            assets_line("net", asset("10.0.0.7", Some("tested"))),
+            assets_line("net", asset("10.0.0.7", None)),
+        ]);
+        let rep = ingest_unit_stream(ws.path(), &remote(), &s).unwrap();
+        assert_eq!((rep.appended, rep.duplicates), (3, 0));
+        let tid = target_id(ws.path(), "net");
+        let paths = CoveragePaths::new(ws.path(), &tid);
+        let folded = crate::asset::read_assets(&paths.assets).unwrap();
+        assert_eq!(folded, vec![asset("10.0.0.7", None)]);
+
+        // And re-merging is still idempotent against the unfolded lines: the
+        // already-superseded first state is not re-appended on top.
+        let again = ingest_unit_stream(ws.path(), &remote(), &s).unwrap();
+        assert_eq!((again.appended, again.duplicates), (0, 3));
+        assert_eq!(crate::asset::read_assets(&paths.assets).unwrap(), folded);
     }
 
     #[test]

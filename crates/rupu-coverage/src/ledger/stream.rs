@@ -8,6 +8,7 @@
 //! `target_id`: the target id hashes the host's workspace path, so the
 //! coordinator recomputes it for its own workspace.
 
+use crate::asset::Asset;
 use crate::catalog::types::FlatCatalog;
 use crate::ledger::events::{ConcernAssertion, FileTouchEvent, FindingRecord};
 use crate::ledger::manifest::RunManifest;
@@ -35,6 +36,9 @@ pub enum Ledger {
     Files,
     Concerns,
     Findings,
+    /// The engagement asset graph (`assets.jsonl`, folded last-line-wins on
+    /// read, so a streamed line is the append, never a rewrite).
+    Assets,
     /// The catalog snapshot (`catalog.yaml`); streamed, never appended.
     Catalog,
 }
@@ -46,6 +50,7 @@ impl Ledger {
             Ledger::Files => "files",
             Ledger::Concerns => "concerns",
             Ledger::Findings => "findings",
+            Ledger::Assets => "assets",
             Ledger::Catalog => "catalog",
         }
     }
@@ -76,6 +81,10 @@ pub enum StreamLine {
     Findings {
         scope_name: String,
         record: FindingRecord,
+    },
+    Assets {
+        scope_name: String,
+        record: Asset,
     },
     Catalog {
         scope_name: String,
@@ -153,6 +162,7 @@ pub fn append_record(
         Ledger::Files => &paths.files,
         Ledger::Concerns => &paths.concerns,
         Ledger::Findings => &paths.findings,
+        Ledger::Assets => &paths.assets,
         Ledger::Catalog => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -259,6 +269,42 @@ mod tests {
             }
             other => panic!("expected a findings line, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn append_record_streams_an_asset_line_that_parses_back() {
+        use crate::asset::{read_assets, Asset, Coordinate, Locator};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join("runs/run_S1/coverage.jsonl");
+        let paths = CoveragePaths::new(tmp.path(), "t1").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "net".into(),
+        }));
+        let asset = Asset::new(
+            "network:host",
+            Locator(vec![Coordinate::Host("10.0.0.7".into())]),
+            "10.0.0.7",
+            None,
+        );
+
+        append_record(&paths, Ledger::Assets, &asset).unwrap();
+
+        assert_eq!(read_assets(&paths.assets).unwrap(), vec![asset.clone()]);
+        let streamed = lines(&stream);
+        assert_eq!(streamed.len(), 1);
+        assert!(
+            streamed[0].starts_with(r#"{"ledger":"assets","scope_name":"net","record":"#),
+            "got {}",
+            streamed[0]
+        );
+        assert_eq!(
+            serde_json::from_str::<StreamLine>(&streamed[0]).unwrap(),
+            StreamLine::Assets {
+                scope_name: "net".into(),
+                record: asset
+            }
+        );
     }
 
     #[test]

@@ -79,7 +79,8 @@ pub fn asset_mark(
     let label = input.label.clone().unwrap_or_else(|| input.kind.clone());
     let mut asset = Asset::new(input.kind.clone(), locator, label, None);
     asset.depth = Some(effective_depth.clone());
-    crate::asset::upsert_asset(&paths.assets, &asset)?;
+    crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
+        .map_err(crate::asset::AssetStoreError::Io)?;
 
     Ok(AssetMarkOutput {
         id,
@@ -134,6 +135,42 @@ mod tests {
             ),
             Err(AssetMarkError::UnknownDepth { .. })
         ));
+    }
+
+    #[test]
+    fn a_mark_is_streamed_as_an_assets_line() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join("runs/run_1/coverage.jsonl");
+        let p = CoveragePaths::new(tmp.path(), "t").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "sec".into(),
+        }));
+        let out = asset_mark(
+            &p,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![Coordinate::Path("a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &active(),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&stream).unwrap();
+        let lines: Vec<StreamLine> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        match lines.as_slice() {
+            [StreamLine::Assets { scope_name, record }] => {
+                assert_eq!(scope_name, "sec");
+                assert_eq!(record.id, out.id);
+                assert_eq!(record.depth.as_deref(), Some("reviewed"));
+            }
+            other => panic!("expected one assets line, got {other:?}"),
+        }
     }
 
     #[test]
