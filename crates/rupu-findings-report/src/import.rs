@@ -28,10 +28,12 @@
 //!
 //! The engagement-profile additions read back as far as the exporter lets
 //! them: its `Classifications:` line becomes `classifications` (without a
-//! vector, which it does not print), and its typed evidence blocks are read
-//! like any other Evidence text, so their text and code become evidence
-//! claims rather than `blocks` (the exporter labels each block's code, so it
-//! never becomes the excerpt of the claim before it).
+//! vector, which it does not print), and the Evidence section's typed blocks
+//! in the shapes the exporter writes them (`blocks.rs`) become `blocks` again:
+//! every kind but `text`, which is prose like a claim and comes back as one
+//! (see `typed_block`). An image written `![caption](path)` is one too. A
+//! block's file must be a workspace-relative path, or the block is read as
+//! a claim; attaching the report verifies and stores the file.
 //!
 //! Known limit: a claim of several paragraphs comes back as one claim per
 //! paragraph (the exporter prints claims one paragraph after another), the
@@ -47,9 +49,9 @@
 use crate::markdown::starts_autolink;
 use crate::text::{split_semicolons_outside_code, split_unescaped_semicolons, unescape_semicolons};
 use rupu_coverage::report::{
-    ArtifactRef, ChainHop, CiDetection, Classification, CrossRef, EvidenceClaim, FindingReport,
-    HopRole, Likelihood, OrSentinel, Ownership, Patch, Rating, RegressionTest, Relation,
-    ReportLocation, RiskLevel, Ticket, NOT_PROVIDED_PREFIX,
+    ArtifactRef, ChainHop, CiDetection, Classification, CrossRef, DisasmLine, EvidenceBlock,
+    EvidenceClaim, FindingReport, HopRole, Likelihood, OrSentinel, Ownership, Patch, Rating,
+    RegressionTest, Relation, ReportLocation, RiskLevel, Ticket, NOT_PROVIDED_PREFIX,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -312,7 +314,7 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
     let location = location(&required(Sec::Location)?);
     let root_cause = required(Sec::RootCause)?.text();
     let (call_chain, chain_claims) = call_chain(section(&doc, Sec::CallChain).as_ref());
-    let mut evidence = evidence(&required(Sec::Evidence)?, doc.exported);
+    let (mut evidence, blocks) = evidence(&required(Sec::Evidence)?, doc.exported);
     if evidence.is_empty() {
         return Err(ImportError::MissingSection(Sec::Evidence.name()));
     }
@@ -418,7 +420,7 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
             references,
             artifacts,
             verification: None,
-            blocks: Vec::new(),
+            blocks,
             classifications,
         },
         own_ids,
@@ -2469,35 +2471,351 @@ fn file_label(claim: &str) -> bool {
         .is_some_and(|(loc, rest)| rest == "**" && exported_location(loc).is_some())
 }
 
-fn evidence(body: &Body, exported: bool) -> Vec<EvidenceClaim> {
-    if unwrap_emphasis(body.text().trim()) == NO_EVIDENCE {
-        return Vec::new();
-    }
-    let mut claims: Vec<EvidenceClaim> = Vec::new();
+/// One piece of the Evidence section, in order: a paragraph of text (a claim,
+/// unless it is a typed block's), or a code block.
+enum Piece {
+    Para(String),
+    Fence { info: String, content: String },
+}
+
+fn pieces(body: &Body, exported: bool) -> Vec<Piece> {
+    let mut out = Vec::new();
     for b in &body.0 {
         match b {
             Block::Text(lines) => {
-                claims.extend(paragraphs(lines, exported).iter().map(|p| claim_from(p)))
+                out.extend(paragraphs(lines, exported).into_iter().map(Piece::Para))
             }
-            Block::Fence { info, content, .. } => match claims.last_mut() {
-                Some(c) if c.excerpt.is_none() => {
+            Block::Fence { info, content, .. } => out.push(Piece::Fence {
+                info: info.clone(),
+                content: content.clone(),
+            }),
+        }
+    }
+    out
+}
+
+/// The evidence claims and typed evidence blocks of the Evidence section.
+/// A typed block is read only in a shape the exporter writes for it (and
+/// `![caption](path)` for an image); see [`typed_block`]. The schema needs
+/// at least one claim: when every piece of the section reads as a typed
+/// block, it is read as claims instead, as it was before blocks were read.
+fn evidence(body: &Body, exported: bool) -> (Vec<EvidenceClaim>, Vec<EvidenceBlock>) {
+    if unwrap_emphasis(body.text().trim()) == NO_EVIDENCE {
+        return (Vec::new(), Vec::new());
+    }
+    let pieces = pieces(body, exported);
+    let (claims, blocks) = read_evidence(&pieces, Some(exported));
+    if claims.is_empty() && !blocks.is_empty() {
+        return (read_evidence(&pieces, None).0, Vec::new());
+    }
+    (claims, blocks)
+}
+
+/// `typed` is `Some(exported)` to read typed blocks, `None` to read every
+/// piece as claims.
+fn read_evidence(
+    pieces: &[Piece],
+    typed: Option<bool>,
+) -> (Vec<EvidenceClaim>, Vec<EvidenceBlock>) {
+    let mut claims: Vec<EvidenceClaim> = Vec::new();
+    let mut blocks = Vec::new();
+    // Whether the piece before was a claim's paragraph: a code block right
+    // after one is its excerpt. One after a typed block is not.
+    let mut after_claim = false;
+    let mut i = 0;
+    while i < pieces.len() {
+        if let Some((blk, used)) = typed.and_then(|exported| typed_block(&pieces[i..], exported)) {
+            blocks.push(blk);
+            i += used;
+            after_claim = false;
+            continue;
+        }
+        match &pieces[i] {
+            Piece::Para(p) => {
+                claims.push(claim_from(p));
+                after_claim = true;
+            }
+            Piece::Fence { info, content } => match claims.last_mut() {
+                Some(c) if after_claim && c.excerpt.is_none() => {
                     // `**`file`**` alone, then code: the code at that file.
                     if file_label(&c.claim) {
                         c.claim = EXCERPT_ONLY.to_string();
                     }
                     c.excerpt = Some(content.clone());
                     c.lang = fence_lang(info);
+                    after_claim = false;
                 }
                 _ => {
                     let mut c = claim(EXCERPT_ONLY.to_string());
                     c.excerpt = Some(content.clone());
                     c.lang = fence_lang(info);
                     claims.push(c);
+                    after_claim = false;
                 }
             },
         }
+        i += 1;
     }
-    claims
+    (claims, blocks)
+}
+
+/// The typed evidence block `pieces` starts with, and how many pieces it
+/// takes, when they are in the shape the exporter writes for one
+/// (`blocks.rs`): a bold label paragraph, then its code for the kinds that
+/// have code; an image or packet capture as a note; a table. A `text` block
+/// is prose like a claim, so it is never read as one. A block whose file is
+/// not a workspace-relative path is not read either. The image note
+/// (`_caption — `path`_`) and the code slice's `**`file`**` label are read
+/// only in an export: in an author's report, an italic line naming a file is
+/// a claim, and so is a bold place with code after it.
+fn typed_block(pieces: &[Piece], exported: bool) -> Option<(EvidenceBlock, usize)> {
+    let Piece::Para(p) = pieces.first()? else {
+        return None;
+    };
+    let p = p.as_str();
+    // The code block right after the label, if there is one.
+    let fence = |k: usize| match pieces.get(k) {
+        Some(Piece::Fence { info, content }) => Some((info.as_str(), content.clone())),
+        _ => None,
+    };
+    let paren = |label: &str| {
+        p.strip_prefix(label)
+            .and_then(|r| r.strip_prefix(" ("))
+            .and_then(|r| r.strip_suffix(')'))
+            .map(str::to_string)
+    };
+
+    if let Some(blk) = table_block(p) {
+        return Some((blk, 1));
+    }
+    if let Some(blk) = image_link(p) {
+        return Some((blk, 1));
+    }
+    if let Some(note) = note_text(p) {
+        if let Some(rest) = note.strip_prefix("Packet capture: ") {
+            let (summary, path) = with_file(rest)?;
+            return Some((
+                EvidenceBlock::PcapRef {
+                    artifact: block_file(path),
+                    summary: summary.to_string(),
+                },
+                1,
+            ));
+        }
+        if exported {
+            let (caption, path) = with_file(note)?;
+            return Some((
+                EvidenceBlock::Image {
+                    artifact: block_file(path),
+                    caption: (caption != "Image").then(|| caption.to_string()),
+                },
+                1,
+            ));
+        }
+        return None;
+    }
+    if let Some(rest) = p.strip_prefix("**Hexdump** (base ") {
+        let (base, file) = rest.split_once(") — ")?;
+        let base = u64::from_str_radix(base.strip_prefix("0x")?, 16).ok()?;
+        let (path, after) = split_code_span(file)?;
+        if !after.is_empty() || !workspace_file(path) {
+            return None;
+        }
+        // The rendered dump is an untagged code block; with none, the block
+        // is the label alone.
+        let rendered = fence(1).filter(|(info, _)| info.trim().is_empty());
+        let used = 1 + usize::from(rendered.is_some());
+        return Some((
+            EvidenceBlock::Hexdump {
+                base,
+                artifact: block_file(path),
+                rendered: rendered.map(|(_, c)| c),
+            },
+            used,
+        ));
+    }
+    if p == "**HTTP request**" {
+        let (_, request) = fence(1)?;
+        if !matches!(pieces.get(2), Some(Piece::Para(r)) if r == "**HTTP response**") {
+            return None;
+        }
+        let (_, response) = fence(3)?;
+        return Some((EvidenceBlock::HttpExchange { request, response }, 4));
+    }
+    let (_, code) = fence(1)?;
+    let blk = if let Some(arch) = paren("**Disassembly**") {
+        EvidenceBlock::Disasm {
+            arch,
+            listing: disasm_listing(&code)?,
+        }
+    } else if let Some(lang) = paren("**Decompiled**") {
+        EvidenceBlock::Decompile {
+            lang,
+            listing: code,
+        }
+    } else if let Some(tool) = paren("**Scan output**") {
+        EvidenceBlock::ScanOutput { tool, output: code }
+    } else if p == "**Diff**" {
+        EvidenceBlock::Diff { diff: code }
+    } else if p == "**Code**" {
+        EvidenceBlock::CodeSlice {
+            file: None,
+            excerpt: code,
+            lang: fence(1).and_then(|(info, _)| fence_lang(info)),
+        }
+    } else if exported {
+        // `**`file`**` alone: a code slice's file. (A claim the exporter
+        // places is always followed by ` — ` and its text.) In an author's
+        // report it is a claim at that place, its lines read.
+        let (file, rest) = p.strip_prefix("**").and_then(split_code_span)?;
+        if rest != "**" || file.trim().is_empty() {
+            return None;
+        }
+        EvidenceBlock::CodeSlice {
+            file: Some(file.to_string()),
+            excerpt: code,
+            lang: fence(1).and_then(|(info, _)| fence_lang(info)),
+        }
+    } else {
+        return None;
+    };
+    Some((blk, 2))
+}
+
+/// The text of a note the exporter prints, `_text_`.
+fn note_text(p: &str) -> Option<&str> {
+    if p.starts_with("__") || p.contains('\n') {
+        return None;
+    }
+    p.strip_prefix('_')?.strip_suffix('_')
+}
+
+/// `text — `path``, with a workspace-relative path, as (text, path).
+fn with_file(s: &str) -> Option<(&str, &str)> {
+    let (text, span) = s.rsplit_once(" — ")?;
+    let (path, rest) = split_code_span(span)?;
+    (rest.is_empty() && workspace_file(path)).then_some((text, path))
+}
+
+/// `![caption](path)` alone, with a workspace-relative path (`<path>` when it
+/// has spaces). One with a title, or naming a URL, is not read.
+fn image_link(p: &str) -> Option<EvidenceBlock> {
+    let (alt, dest) = p.strip_prefix("![")?.strip_suffix(')')?.split_once("](")?;
+    let path = match dest.strip_prefix('<') {
+        Some(d) => d.strip_suffix('>')?,
+        None if dest.contains(char::is_whitespace) => return None,
+        None => dest,
+    };
+    if !workspace_file(path) || alt.contains(['[', ']']) {
+        return None;
+    }
+    let alt = alt.trim();
+    Some(EvidenceBlock::Image {
+        artifact: block_file(path),
+        caption: (!alt.is_empty()).then(|| alt.to_string()),
+    })
+}
+
+/// A path the attach step can take as a workspace file: not empty, not
+/// absolute, no `..`, not the workspace root, and not a URL (`scheme:` before
+/// any `/`). The attach step checks it again, against the disk.
+fn workspace_file(p: &str) -> bool {
+    let p = p.trim();
+    let first = p.split(['/', '\\']).next().unwrap_or("");
+    !p.is_empty()
+        && !p.starts_with(['/', '\\'])
+        && !first.contains(':')
+        && !p.split(['/', '\\']).any(|c| c == "..")
+        && p.split(['/', '\\']).any(|c| !c.is_empty() && c != ".")
+}
+
+/// A block's file as the agent would name it: the path only; rupu records
+/// the rest when the report is attached.
+fn block_file(path: &str) -> ArtifactRef {
+    ArtifactRef {
+        path: path.trim().to_string(),
+        sha256: String::new(),
+        size: 0,
+        kind: None,
+        stored: None,
+        host: None,
+    }
+}
+
+/// A paragraph that is a GFM table and nothing else, every line starting
+/// with `|`, as a table block.
+fn table_block(p: &str) -> Option<EvidenceBlock> {
+    let lines: Vec<&str> = p.lines().collect();
+    if lines.len() < 2 || !lines.iter().all(|l| l.trim_start().starts_with('|')) {
+        return None;
+    }
+    let headers = table_cells(lines[0]);
+    let delim = table_cells(lines[1]);
+    let is_delim = |c: &String| {
+        let d = c.trim_start_matches(':').trim_end_matches(':');
+        !d.is_empty() && d.bytes().all(|b| b == b'-')
+    };
+    if headers.is_empty() || delim.len() != headers.len() || !delim.iter().all(is_delim) {
+        return None;
+    }
+    Some(EvidenceBlock::Table {
+        headers,
+        rows: lines[2..].iter().map(|l| table_cells(l)).collect(),
+    })
+}
+
+/// The exporter's disassembly listing (`{address:#010x}  {bytes:<12}
+/// {mnemonic} {ops}`, trailing space trimmed), one instruction per line.
+/// `None` when any line does not read back to exactly itself.
+fn disasm_listing(code: &str) -> Option<Vec<DisasmLine>> {
+    code.lines().map(disasm_line).collect()
+}
+
+fn disasm_line(line: &str) -> Option<DisasmLine> {
+    let (addr, rest) = line.split_once("  ")?;
+    let hex = addr.strip_prefix("0x")?;
+    if hex.len() < 8 {
+        return None;
+    }
+    let address = u64::from_str_radix(hex, 16).ok()?;
+    // Bytes narrower than the 12-column pad end in spaces up to it, then the
+    // separator. Wider ones are followed by one space: they are the run of
+    // hex words, each as wide as the first, before the mnemonic. (A mnemonic
+    // that is itself such a word, which disassemblers do not print, would
+    // read as one more byte.)
+    let (bytes, tail) = match (rest.get(11..12), rest.get(12..13), rest.get(13..)) {
+        (Some(" "), Some(" "), Some(tail)) => (rest[..12].trim_end().to_string(), tail),
+        _ => {
+            let toks: Vec<&str> = rest.split(' ').collect();
+            let word = |w: &&str| {
+                !w.is_empty()
+                    && w.len() == toks[0].len()
+                    && w.bytes().all(|b| b.is_ascii_hexdigit())
+            };
+            let k = toks.iter().take_while(|w| word(w)).count();
+            if k == 0 || k == toks.len() {
+                return None;
+            }
+            let bytes = toks[..k].join(" ");
+            let tail = &rest[bytes.len() + 1..];
+            (bytes, tail)
+        }
+    };
+    let (mnemonic, ops) = tail.split_once(' ').unwrap_or((tail, ""));
+    if mnemonic.is_empty() {
+        return None;
+    }
+    let l = DisasmLine {
+        address,
+        bytes,
+        mnemonic: mnemonic.to_string(),
+        ops: ops.to_string(),
+    };
+    let again = format!(
+        "{:#010x}  {:<12} {} {}",
+        l.address, l.bytes, l.mnemonic, l.ops
+    );
+    (again.trim_end() == line).then_some(l)
 }
 
 fn is_diff(info: &str, content: &str) -> bool {

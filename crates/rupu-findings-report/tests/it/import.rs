@@ -1492,7 +1492,7 @@ fn only_an_id_the_label_starts_with_names_the_finding() {
 // ---- engagement-profile additions --------------------------------------------
 
 #[test]
-fn exported_classifications_read_back_and_typed_blocks_keep_their_text() {
+fn exported_classifications_and_typed_blocks_read_back() {
     use rupu_coverage::report::{Classification, EvidenceBlock};
     let mut original = full_report();
     original.classifications = vec![
@@ -1543,15 +1543,10 @@ fn exported_classifications_read_back_and_typed_blocks_keep_their_text() {
         "{}",
         r.references
     );
-    // Typed blocks come back as evidence claims: nothing dropped.
-    assert!(r.blocks.is_empty());
-    assert_eq!(r.evidence.len(), original.evidence.len() + 2);
-    let scan = &r.evidence[original.evidence.len()];
-    assert_eq!(scan.claim, "**Scan output** (notescan)");
-    assert_eq!(
-        scan.excerpt.as_deref(),
-        Some("GET /api/notes/2 -> 200 (owner: user-a)")
-    );
+    // The scan output comes back as a typed block; the text block, prose
+    // like a claim, as a claim.
+    assert_eq!(r.blocks, original.blocks[..1]);
+    assert_eq!(r.evidence.len(), original.evidence.len() + 1);
     assert_eq!(
         r.evidence.last().unwrap().claim,
         "The share page reads the same store."
@@ -1740,21 +1735,21 @@ fn a_semicolon_in_a_ticket_keeps_the_ticket_whole() {
     assert!(html.contains("Fix in 3.1; backport to 3.0"), "{html}");
 }
 
-#[test]
-fn every_typed_block_keeps_its_text_and_takes_no_claim_s_excerpt() {
-    use rupu_coverage::report::{ArtifactRef, DisasmLine, EvidenceBlock};
-    let art = |p: &str| ArtifactRef {
+fn art(p: &str) -> rupu_coverage::report::ArtifactRef {
+    rupu_coverage::report::ArtifactRef {
         path: p.into(),
         sha256: String::new(),
         size: 0,
         kind: None,
         stored: None,
         host: None,
-    };
-    let mut original = full_report();
-    original.evidence[0].excerpt = None;
-    original.evidence[0].lang = None;
-    original.blocks = vec![
+    }
+}
+
+/// One block of every kind, the file-bearing ones naming workspace files.
+fn every_kind_of_block() -> Vec<rupu_coverage::report::EvidenceBlock> {
+    use rupu_coverage::report::{DisasmLine, EvidenceBlock};
+    vec![
         EvidenceBlock::Diff {
             diff: "-find_by_id(id)\n+find_by_id_for_owner(id, user)".into(),
         },
@@ -1809,37 +1804,245 @@ fn every_typed_block_keeps_its_text_and_takes_no_claim_s_excerpt() {
         EvidenceBlock::Text {
             text: "The share page reads the same store.".into(),
         },
-    ];
+    ]
+}
+
+#[test]
+fn every_typed_block_round_trips_through_an_export() {
+    use rupu_coverage::report::EvidenceBlock;
+    let mut original = full_report();
+    original.evidence[0].excerpt = None;
+    original.evidence[0].lang = None;
+    original.blocks = every_kind_of_block();
     let (r, _) = report_of(&exported(original.clone()));
     let mut first = original.evidence[0].clone();
     first.sha256 = None;
     assert_eq!(r.evidence[0], first, "no block's code became its excerpt");
-    let text = evidence_text(&r);
-    for kept in [
-        "+find_by_id_for_owner(id, user)",
-        "int lookup(int id)",
-        "let note = store.get(id);",
-        "pub fn verify(t: &str) -> Claims",
-        "note-of-user-a",
-        "out/screenshot.png",
-        "00001000  6e 6f 74 65",
-        "mov rax, [rdi]",
-        "GET /api/notes/2 HTTP/1.1",
-        "HTTP/1.1 200 OK",
-        "2 notes readable across users",
-        "out/capture.pcap",
-        "The share page reads the same store.",
-    ] {
-        assert!(text.contains(kept), "{kept} missing from:\n{text}");
-    }
-    // A code slice's file is read back as its claim's file.
-    let slice = r
-        .evidence
+    // Every block but `text` comes back typed, in order. A text block is
+    // prose like a claim, so it comes back as one.
+    let typed: Vec<EvidenceBlock> = original
+        .blocks
         .iter()
-        .find(|c| c.excerpt.as_deref() == Some("pub fn verify(t: &str) -> Claims"))
-        .unwrap();
-    assert_eq!(slice.file.as_deref(), Some("src/share/token.rs"));
-    assert!(r.blocks.is_empty());
+        .filter(|b| !matches!(b, EvidenceBlock::Text { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(r.blocks, typed);
+    assert_eq!(r.evidence.len(), original.evidence.len() + 1);
+    assert_eq!(
+        r.evidence.last().unwrap().claim,
+        "The share page reads the same store."
+    );
+    assert_valid(&r, &[]);
+    // And again: an export of the import reads the same blocks.
+    let (again, _) = report_of(&exported(r.clone()));
+    assert_eq!(again.blocks, r.blocks);
+}
+
+#[test]
+fn the_edges_of_each_block_shape_round_trip() {
+    use rupu_coverage::report::{DisasmLine, EvidenceBlock};
+    let line = |address: u64, bytes: &str, mnemonic: &str, ops: &str| DisasmLine {
+        address,
+        bytes: bytes.into(),
+        mnemonic: mnemonic.into(),
+        ops: ops.into(),
+    };
+    let mut original = full_report();
+    original.blocks = vec![
+        // No caption: the exporter prints `Image`.
+        EvidenceBlock::Image {
+            artifact: art("out/no-caption.png"),
+            caption: None,
+        },
+        // A caption with the separator in it.
+        EvidenceBlock::Image {
+            artifact: art("out/a b.png"),
+            caption: Some("Before — after".into()),
+        },
+        // No rendered dump: the label alone, and the next block is its own.
+        EvidenceBlock::Hexdump {
+            base: 0,
+            artifact: art("out/zero.bin"),
+            rendered: None,
+        },
+        EvidenceBlock::CodeSlice {
+            file: None,
+            excerpt: "untagged".into(),
+            lang: None,
+        },
+        // Bytes as wide as the column, wider, none at all, and no operands.
+        EvidenceBlock::Disasm {
+            arch: "x86_64".into(),
+            listing: vec![
+                line(0x401000, "48 81 c4 08 01 00 00", "add", "rsp, 0x108"),
+                line(0x401007, "4889e5c3aabb", "mov", "rbp, rsp"),
+                line(0x40100d, "", "nop", ""),
+                line(0x1_0000_0000, "c3", "ret", ""),
+            ],
+        },
+        EvidenceBlock::Disasm {
+            arch: "aarch64".into(),
+            listing: vec![],
+        },
+        EvidenceBlock::Table {
+            headers: vec!["a | b".into(), "c\\".into()],
+            rows: vec![vec!["x\\|y".into(), "".into()], vec![]],
+        },
+        EvidenceBlock::HttpExchange {
+            request: "POST /api/notes HTTP/1.1\nHost: notebin.test\n\n{\"title\":\"t\"}".into(),
+            response: "HTTP/1.1 201 Created".into(),
+        },
+    ];
+    let (r, _) = report_of(&exported(original.clone()));
+    // A row with no cells prints as `|  |`, one empty cell.
+    let mut expected = original.blocks.clone();
+    if let EvidenceBlock::Table { rows, .. } = &mut expected[6] {
+        rows[1] = vec![String::new()];
+    }
+    assert_eq!(r.blocks, expected);
+    assert_eq!(r.evidence.len(), original.evidence.len());
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_disassembly_that_does_not_read_back_exactly_stays_text() {
+    // A line with no mnemonic prints its operands where the mnemonic goes:
+    // read back, it would not print the same, so the listing is not typed.
+    // Its text is kept.
+    use rupu_coverage::report::{DisasmLine, EvidenceBlock};
+    let mut original = full_report();
+    original.blocks = vec![EvidenceBlock::Disasm {
+        arch: "x86_64".into(),
+        listing: vec![
+            DisasmLine {
+                address: 0x10,
+                bytes: "c3".into(),
+                mnemonic: "ret".into(),
+                ops: String::new(),
+            },
+            DisasmLine {
+                address: 0x11,
+                bytes: "90".into(),
+                mnemonic: String::new(),
+                ops: "x".into(),
+            },
+        ],
+    }];
+    let (r, _) = report_of(&exported(original.clone()));
+    assert!(r.blocks.is_empty(), "{:?}", r.blocks);
+    assert!(evidence_text(&r).contains("**Disassembly** (x86_64)"));
+    let printed = format!("0x00000011  {:<12}  x", "90");
+    assert!(
+        evidence_text(&r).contains(&printed),
+        "{}",
+        evidence_text(&r)
+    );
+}
+
+/// The plain fixture with `extra` added to the end of its Evidence section.
+fn plain_with_evidence(extra: &str) -> String {
+    let md = PLAIN.replace("\nRemediation\n", &format!("\n{extra}\n\nRemediation\n"));
+    assert!(md.contains(extra));
+    md
+}
+
+#[test]
+fn an_image_link_with_a_workspace_path_is_an_image_block() {
+    use rupu_coverage::report::EvidenceBlock;
+    let (r, _) = report_of(&plain_with_evidence(
+        "![The leaked note](out/leak.png)\n\n![](<out/with space.png>)",
+    ));
+    assert_eq!(
+        r.blocks,
+        vec![
+            EvidenceBlock::Image {
+                artifact: art("out/leak.png"),
+                caption: Some("The leaked note".into()),
+            },
+            EvidenceBlock::Image {
+                artifact: art("out/with space.png"),
+                caption: None,
+            },
+        ]
+    );
+    assert_eq!(r.evidence.len(), 1, "{:?}", r.evidence);
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn a_block_whose_file_is_not_a_workspace_path_stays_a_claim() {
+    for shape in [
+        "![shot](https://notebin.test/leak.png)",
+        "![shot](/tmp/leak.png)",
+        "![shot](../leak.png)",
+        "![shot](C:/leak.png)",
+        "![shot](./)",
+        "![shot](out/leak.png \"title\")",
+        "_Packet capture: the 200 — `/tmp/c.pcap`_",
+        "**Hexdump** (base 0x10) — `../dump.bin`",
+    ] {
+        let (r, _) = report_of(&plain_with_evidence(shape));
+        assert!(r.blocks.is_empty(), "{shape}: {:?}", r.blocks);
+        assert!(
+            evidence_text(&r).contains(shape),
+            "{shape}: {:?}",
+            r.evidence
+        );
+        assert_valid(&r, &[]);
+    }
+}
+
+#[test]
+fn an_italic_line_naming_a_file_is_an_image_only_in_an_export() {
+    use rupu_coverage::report::EvidenceBlock;
+    let note = "_The handler — `src/routes/notes.rs`_";
+    let (r, _) = report_of(&plain_with_evidence(note));
+    assert!(r.blocks.is_empty(), "{:?}", r.blocks);
+    // A packet capture's note is told by its own words in any report.
+    let (r, _) = report_of(&plain_with_evidence(
+        "_Packet capture: the request and its 200 — `out/c.pcap`_",
+    ));
+    assert_eq!(
+        r.blocks,
+        vec![EvidenceBlock::PcapRef {
+            artifact: art("out/c.pcap"),
+            summary: "the request and its 200".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_bold_place_with_code_is_a_code_slice_only_in_an_export() {
+    // An author's bold place with code after it is a claim there, its
+    // lines read; the exporter's is a code slice (covered above).
+    let (r, _) = report_of(&plain_with_evidence(
+        "**`src/store/notes.rs:88-97`**\n\n```rust\nfn find_by_id(id: u64)\n```",
+    ));
+    assert!(r.blocks.is_empty(), "{:?}", r.blocks);
+    let c = r.evidence.last().unwrap();
+    assert_eq!(c.file.as_deref(), Some("src/store/notes.rs"));
+    assert_eq!(c.lines, Some([88, 97]));
+    assert_eq!(c.excerpt.as_deref(), Some("fn find_by_id(id: u64)"));
+}
+
+#[test]
+fn an_evidence_section_of_only_blocks_is_read_as_claims() {
+    // The schema needs a claim: an author's Evidence that is all block
+    // shapes reads as it did before blocks were read.
+    let md = plain_with_evidence("x");
+    let start = md.find("\nEvidence\n").unwrap() + "\nEvidence\n".len();
+    let end = md.find("\nRemediation\n").unwrap();
+    let md = format!(
+        "{}![The leaked note](out/leak.png)\n\n**Diff**\n\n```diff\n-a\n+b\n```\n{}",
+        &md[..start],
+        &md[end..]
+    );
+    let (r, _) = report_of(&md);
+    assert!(r.blocks.is_empty(), "{:?}", r.blocks);
+    assert_eq!(r.evidence.len(), 2, "{:?}", r.evidence);
+    assert_eq!(r.evidence[0].claim, "![The leaked note](out/leak.png)");
+    assert_eq!(r.evidence[1].claim, "**Diff**");
+    assert_eq!(r.evidence[1].excerpt.as_deref(), Some("-a\n+b"));
     assert_valid(&r, &[]);
 }
 

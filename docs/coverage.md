@@ -728,10 +728,28 @@ A Recommended Patch section with a diff block is a patch, whatever its text
 says; the text becomes the patch's notes. A report `rupu findings export`
 wrote reads back field for field, with these exceptions: its Classifications
 come back without their vectors (not printed), and a classification whose id
-holds a space or a comma does not read (the field is kept as other text); its
-typed evidence blocks (scan output, HTTP exchanges, disassembly, …) come back as
-evidence claims, text and code kept, type not; and a claim of several
-paragraphs comes back as several claims. An export made by a rupu that predates
+holds a space or a comma does not read (the field is kept as other text); a
+`text` evidence block comes back as an evidence claim (it is prose, like a
+claim); and a claim of several paragraphs comes back as several claims.
+
+**Evidence blocks.** The Evidence section's typed blocks are read back in the
+shapes the exporter writes them, in any report: a code slice (`**Code**`, or
+in an exported report `` **`file`** ``, then a code block; in any other report
+a bold place with code after it is a claim at that place), `**Diff**`, `**Decompiled** (lang)`,
+`**Disassembly** (arch)` (its listing must read back to exactly what was
+printed, or the block stays text), `**Scan output** (tool)`, `**HTTP request**`
+and `**HTTP response**` each followed by its code block; `**Hexdump** (base
+0x…) — `` `path` ``, with the untagged code block after it as its rendered dump;
+`` _Packet capture: summary — `path`_ ``; a table; and an image, as the
+exporter's `` _caption — `path`_ `` (in an exported report only: elsewhere an
+italic line naming a file is a claim) or as `![caption](path)` (`<path>` when
+it has spaces; one with a title is not read). A block's file must be a
+workspace-relative path — not absolute, no `..`, not a URL — or the block is
+read as a claim; like an artifact, the file must exist in the finding's
+workspace, where it is verified and stored when the report is attached
+(see [Evidence-block files](#evidence-block-files)). The schema needs at least
+one evidence claim, so an Evidence section that is all blocks is read as claims,
+as it was before blocks were read. An export made by a rupu that predates
 `rupu findings import`, whose exporter printed its command blocks without a
 `Command:` line, is told apart by its Regression Test (which always has a
 command) and reads back too: each section's last `sh` block is its command (so
