@@ -3444,8 +3444,11 @@ pub(crate) async fn resume_run(
     // terminal. Nothing but `cp serve`'s sweep would, and the in-flight guard
     // below would refuse it until then — so reap it here, the same transition
     // the sweep makes (`Failed`, with its terminal event), and resume it. A
-    // run whose runner is still alive is left alone and refused below.
-    if matches!(record.status, RunStatus::Running | RunStatus::Pending) {
+    // run whose runner is still alive is left alone and refused below. A
+    // request's runner (`--if-unfinished`) leaves it be too: it would end the
+    // run only to refuse it as finished, so it is refused as in flight,
+    // untouched, for the operator's plain resume or the sweep to take over.
+    if !if_unfinished && matches!(record.status, RunStatus::Running | RunStatus::Pending) {
         let now = chrono::Utc::now();
         let mut listed = record.clone();
         let (reaped, current) = store
@@ -6879,7 +6882,8 @@ mod tests {
         rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
 
         let run_id = record.id.clone();
-        let resume = tokio::spawn(async move { resume_run(&run_id, None, true, false).await });
+        let resume =
+            tokio::spawn(async move { resume_run(&run_id, None, true, false, false).await });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while store.pause_marker_exists(&record.id) {
@@ -6964,7 +6968,8 @@ mod tests {
         rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
 
         let run_id = record.id.clone();
-        let resume = tokio::spawn(async move { resume_run(&run_id, None, true, false).await });
+        let resume =
+            tokio::spawn(async move { resume_run(&run_id, None, true, false, false).await });
 
         // Once the marker is gone, the resume has loaded the run as
         // `Paused` and passed its guards; its flip is next, and waits on
@@ -7069,7 +7074,7 @@ mod tests {
 
             let resume = {
                 let run_id = run_id.clone();
-                tokio::spawn(async move { resume_run(&run_id, None, true, true).await })
+                tokio::spawn(async move { resume_run(&run_id, None, true, true, false).await })
             };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !store.events_path(&run_id).exists() {
@@ -7112,7 +7117,7 @@ mod tests {
         store
             .request_resume_approval("run_not_late", "web", None, Utc::now(), None)
             .unwrap();
-        resume_run("run_not_late", None, true, true)
+        resume_run("run_not_late", None, true, true, false)
             .await
             .expect("an unfinished run's decision is applied");
         assert_eq!(
@@ -7155,7 +7160,7 @@ mod tests {
             store.update(&rec).unwrap();
             let finished = std::fs::read(store.run_json_path(&run_id)).unwrap();
 
-            let err = resume_run(&run_id, None, true, true)
+            let err = resume_run(&run_id, None, true, true, false)
                 .await
                 .expect_err("a requested resume never retries a finished run");
             let status = status.as_str();
@@ -7172,7 +7177,7 @@ mod tests {
             );
 
             if status != RunStatus::Completed.as_str() {
-                resume_run(&run_id, None, true, false)
+                resume_run(&run_id, None, true, false, false)
                     .await
                     .expect("the operator's retry takes the run back");
                 let retried = store.load(&run_id).unwrap();
@@ -7571,7 +7576,7 @@ mod tests {
         // Step 2: the resume worker's spawned `workflow resume`, simulated
         // in-process (see `resume_one_run`'s own test for the argv half).
         std::env::set_var("RUPU_HOME", &home);
-        let result = resume_run(&rec.id, None, true, false).await;
+        let result = resume_run(&rec.id, None, true, false, false).await;
         std::env::remove_var("RUPU_HOME");
         result.expect("the web-approved run resumes");
 

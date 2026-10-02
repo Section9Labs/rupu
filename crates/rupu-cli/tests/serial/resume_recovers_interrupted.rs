@@ -290,3 +290,32 @@ async fn resume_refuses_a_run_whose_runner_is_still_alive() {
     assert_eq!(record.status, RunStatus::Running, "left alone");
     assert_eq!(fx.attempts().len(), 1, "nothing was dispatched");
 }
+
+/// `--if-unfinished` — how `cp serve` spawns a resume to serve a request made
+/// while a run was unfinished — never retries a run that finished since, so it
+/// must not *end* a crashed run only to refuse it as finished: the run is
+/// refused as still in flight, untouched, and left to the operator's plain
+/// `workflow resume` (which does reap it) or the sweep.
+#[tokio::test]
+async fn a_requested_resume_leaves_a_crashed_run_unreaped() {
+    let _guard = ENV_LOCK.lock().await;
+    let fx = Fixture::crashed(DEAD_PID);
+
+    let assert = fx.resume("never sent", &["--if-unfinished"]).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+
+    assert!(stderr.contains("in-flight"), "got: {stderr}");
+    assert_eq!(
+        fx.store.load(RUN_ID).unwrap().status,
+        RunStatus::Running,
+        "not reaped"
+    );
+    assert!(
+        !fx.events()
+            .iter()
+            .any(|e| matches!(e, Event::RunFailed { .. })),
+        "no terminal event was appended: {:?}",
+        fx.events()
+    );
+    assert_eq!(fx.attempts().len(), 1, "nothing was dispatched");
+}
