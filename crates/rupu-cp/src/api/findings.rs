@@ -583,12 +583,26 @@ fn open_verified(
 /// finding's report references.
 ///
 /// Only artifacts listed in the finding's own `report.artifacts` are served, so
-/// a request can reach only a blob some finding in the ledger references. That
-/// limits exposure, but it is not a hard boundary: the ledger lives in the
-/// agent-writable workspace, so a forged ledger line can list any blob in the
-/// store whose sha256 is already known. Artifacts are never rendered as HTML:
-/// text is `text/plain` inline, anything else an `application/octet-stream`
-/// attachment, always `nosniff` and `Content-Security-Policy: sandbox`.
+/// a request to THIS endpoint can reach only a blob some finding in the ledger
+/// references (the host blob endpoint, `get_artifact_blob`, serves any stored
+/// blob by hash behind the CP token, for coordinator pulls). That limits
+/// exposure, but it is not a hard boundary: the ledger lives in the
+/// agent-writable workspace, so a forged ledger line can list any blob whose
+/// sha256 is already known — in this store, or in the store of the registered
+/// host it names. Artifacts are never rendered as HTML: text is `text/plain`
+/// inline, anything else an `application/octet-stream` attachment, always
+/// `nosniff` and `Content-Security-Policy: sandbox`.
+///
+/// Where the bytes come from (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §B2):
+/// - `copied`: this CP's content-addressed store.
+/// - `external` with a `host` (a remote unit's artifact): this CP's store
+///   once pulled; on first view, ONE shared pull from exactly that host —
+///   resolved through the host registry, capped at the recorded size,
+///   verified by size and sha256 before it enters the store. Any failure is
+///   a 404 `{"unavailable": "<reason>"}`.
+/// - `external` with no `host` (a local over-cap file): the workspace file,
+///   from one verified handle; 404 once gone, 409 once changed.
 async fn get_artifact(
     State(s): State<AppState>,
     Path((id, sha)): Path<(String, String)>,
@@ -613,9 +627,10 @@ async fn get_artifact(
 
     let file = match (artifact.stored, artifact.host.as_deref()) {
         (Some(ArtifactStorage::External), Some(host)) => {
-            return Err(ApiError::not_found(format!(
-                "artifact is stored on host {host}; remote fetch is not supported yet"
-            )));
+            match remote_artifact(&s, &blob, host, &sha, artifact.size).await {
+                Ok(file) => file,
+                Err(reason) => return Ok(unavailable(reason)),
+            }
         }
         (Some(ArtifactStorage::External), None) => {
             let ws = crate::api::code::load_workspace(&s, &finding.ws_id)?;
@@ -648,7 +663,263 @@ async fn get_artifact(
         })?,
     };
 
-    Ok(artifact_response(file, artifact.kind, &artifact.path))
+    Ok(artifact_response(file, artifact.kind, &artifact.path).await)
+}
+
+/// A 404 saying why an artifact cannot be had (spec B2.5):
+/// `{"unavailable": "<reason>"}`. Never a stored blob, never a 200.
+fn unavailable(reason: impl Into<String>) -> Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "unavailable": reason.into() })),
+    )
+        .into_response()
+}
+
+/// Blob `path` from this CP's store, or `Ok(None)` when there is none. The
+/// open is non-blocking and refuses anything but a regular file, so a FIFO
+/// or directory squatting on the address reads as absent rather than parking
+/// a blocking-pool thread.
+async fn open_store_blob(path: &std::path::Path) -> Result<Option<tokio::fs::File>, String> {
+    let p = path.to_path_buf();
+    let opened = tokio::task::spawn_blocking(move || crate::api::fs_open::open_regular_file(&p))
+        .await
+        .map_err(|e| format!("opening this control plane's stored copy failed: {e}"))?;
+    match opened {
+        Ok(f) => Ok(Some(tokio::fs::File::from_std(f))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(format!(
+            "this control plane's stored copy is unreadable: {e}"
+        )),
+    }
+}
+
+/// An artifact recorded `external` on `host`: this CP's stored copy when it
+/// has one (blobs only ever enter the store verified, so a hit never contacts
+/// any host), otherwise pulled from `host` — and only `host`, resolved
+/// through the host registry — into the store first. `Err` is the
+/// `unavailable` reason.
+async fn remote_artifact(
+    s: &AppState,
+    blob: &std::path::Path,
+    host: &str,
+    sha256: &str,
+    size: u64,
+) -> Result<tokio::fs::File, String> {
+    if let Some(file) = open_store_blob(blob).await? {
+        return Ok(file);
+    }
+    let conn = s.hosts.resolve(host).map_err(|e| match e {
+        crate::host::connector::HostConnectorError::NotFound(_) => {
+            format!("host {host} is not registered with this control plane")
+        }
+        other => format!("host {host}: {other}"),
+    })?;
+    let store = ArtifactStore::new(s.global_dir.join("findings").join("artifacts"));
+    let (host_owned, sha_owned) = (host.to_string(), sha256.to_string());
+    shared_pull(blob.to_path_buf(), move || {
+        pull_into_store(conn, store, host_owned, sha_owned, size)
+    })
+    .await?;
+    open_store_blob(blob).await?.ok_or_else(|| {
+        "the pulled blob left this control plane's store before it could be served".to_string()
+    })
+}
+
+/// What one remote artifact pull came to: `Err` is the `unavailable` reason.
+type PullOutcome = Result<(), String>;
+
+/// One pull in flight, as every request for its blob awaits it.
+struct InFlightPull {
+    /// Never reused, so a finished pull retires only its own entry.
+    id: u64,
+    outcome: futures_util::future::Shared<futures_util::future::BoxFuture<'static, PullOutcome>>,
+}
+
+#[derive(Default)]
+struct InFlightPulls {
+    next_id: u64,
+    /// Keyed by the destination blob path (store root + sha), not the bare
+    /// sha: one process may serve several stores (tests run many `AppState`s).
+    by_dest: HashMap<std::path::PathBuf, InFlightPull>,
+}
+
+/// Every remote artifact pull in flight in this process. Holds IN-FLIGHT
+/// pulls only: each pull's task removes its own entry when it ends, so the
+/// map never outgrows the pulls running right now, and a failed pull is not
+/// remembered (the next view tries again).
+fn in_flight_pulls() -> std::sync::MutexGuard<'static, InFlightPulls> {
+    static PULLS: std::sync::OnceLock<std::sync::Mutex<InFlightPulls>> = std::sync::OnceLock::new();
+    PULLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+#[cfg(test)]
+fn pull_in_flight(dest: &std::path::Path) -> bool {
+    in_flight_pulls().by_dest.contains_key(dest)
+}
+
+/// Owned by a pull's task: removes the pull's entry when the task ends,
+/// however it ends — finished, panicked, or dropped by a shutting-down
+/// runtime.
+struct RetireOnDrop {
+    dest: std::path::PathBuf,
+    id: u64,
+}
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        let retired = {
+            let mut pulls = in_flight_pulls();
+            if pulls
+                .by_dest
+                .get(&self.dest)
+                .is_some_and(|p| p.id == self.id)
+            {
+                pulls.by_dest.remove(&self.dest)
+            } else {
+                None
+            }
+        };
+        // The entry holds this pull's shared outcome; let it go unlocked.
+        drop(retired);
+    }
+}
+
+/// Run `pull` as THE pull into `dest`, or join the one already in flight.
+///
+/// Cancel-safe: the pull runs in its own spawned task, to completion,
+/// whether or not anyone still waits on it. A request whose client goes away
+/// (axum drops the handler future) only stops awaiting the shared outcome:
+/// the pull other requests share keeps going, its temp file is cleaned up by
+/// the task itself, and its entry is retired by the task. The entry is
+/// inserted under the lock and the task spawned right after it is released,
+/// with no `.await` in between (so no cancellation point): the task's retire
+/// guard takes the same lock, and a runtime that is shutting down drops a
+/// newly spawned future synchronously, inside `spawn`.
+async fn shared_pull<F, Fut>(dest: std::path::PathBuf, pull: F) -> PullOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = PullOutcome> + Send + 'static,
+{
+    use futures_util::FutureExt as _;
+    let (outcome, start) = {
+        let mut pulls = in_flight_pulls();
+        if let Some(p) = pulls.by_dest.get(&dest) {
+            (p.outcome.clone(), None)
+        } else {
+            pulls.next_id += 1;
+            let id = pulls.next_id;
+            let (tx, rx) = tokio::sync::oneshot::channel::<PullOutcome>();
+            let outcome = rx
+                .map(|r| {
+                    r.unwrap_or_else(|_| {
+                        Err(
+                            "the artifact pull did not finish (it panicked or was shut down)"
+                                .to_string(),
+                        )
+                    })
+                })
+                .boxed()
+                .shared();
+            pulls.by_dest.insert(
+                dest.clone(),
+                InFlightPull {
+                    id,
+                    outcome: outcome.clone(),
+                },
+            );
+            (outcome, Some((id, tx)))
+        }
+    };
+    if let Some((id, tx)) = start {
+        // Armed before `pull()` runs, so even a panic building the future
+        // retires the entry (and drops `tx`, failing its waiters).
+        let retire = RetireOnDrop { dest, id };
+        let fut = pull();
+        tokio::spawn(async move {
+            let _retire = retire;
+            let _ = tx.send(fut.await);
+        });
+    }
+    outcome.await
+}
+
+/// Removes a pull's temp file when the pull ends, however it ends. After a
+/// successful install the file was renamed away and there is nothing left.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The body of one pull's task: blob `sha256` from `host` into a temp file in
+/// `store`, capped at the recorded `size`, then installed at its content
+/// address only if it is exactly `size` bytes hashing to `sha256` (the
+/// transports only bound the size; a short transfer can return `Ok`).
+async fn pull_into_store(
+    conn: Arc<dyn crate::host::connector::HostConnector>,
+    store: ArtifactStore,
+    host: String,
+    sha256: String,
+    size: u64,
+) -> PullOutcome {
+    let interrupted = |e: tokio::task::JoinError| format!("the artifact pull was interrupted: {e}");
+    // A pull that finished between this request's store check and its
+    // joining the in-flight map has already installed the blob.
+    if tokio::fs::metadata(store.blob_path(&sha256))
+        .await
+        .is_ok_and(|m| m.is_file())
+    {
+        return Ok(());
+    }
+    let tmp = {
+        let (store, sha) = (store.clone(), sha256.clone());
+        tokio::task::spawn_blocking(move || store.pull_temp_path(&sha))
+            .await
+            .map_err(interrupted)?
+            .map_err(|e| format!("this control plane's artifact store is not writable: {e}"))?
+    };
+    let _cleanup = RemoveOnDrop(tmp.clone());
+    // The recorded size caps the transfer, 0 included: an ingested remote
+    // artifact always carries its real size, so 0 is a genuinely empty file.
+    // The error variant for one cause differs by transport, so the reason is
+    // the connector's own message, not a branch on the variant.
+    conn.pull_finding_artifact(&sha256, &tmp, size)
+        .await
+        .map_err(|e| format!("host {host}: {e}"))?;
+    let installed = {
+        let (store, sha, tmp) = (store, sha256.clone(), tmp.clone());
+        tokio::task::spawn_blocking(move || store.install_verified(&tmp, &sha, size))
+            .await
+            .map_err(interrupted)?
+    };
+    match installed {
+        Ok(_) => Ok(()),
+        Err(rupu_coverage::report::ArtifactInstallError::Mismatch {
+            got_size,
+            got_sha256,
+            ..
+        }) => Err(format!(
+            "hash mismatch: host {host} returned {got_size} bytes hashing to {got_sha256}, \
+             but the finding recorded {size} bytes hashing to {sha256}"
+        )),
+        Err(e) => Err(format!(
+            "could not store the artifact pulled from host {host}: {e}"
+        )),
+    }
 }
 
 /// The one way artifact bytes leave this CP: streamed from `file`, never
@@ -657,15 +928,28 @@ async fn get_artifact(
 /// ALWAYS `X-Content-Type-Options: nosniff` and
 /// `Content-Security-Policy: sandbox`. `name` (a recorded path or any label)
 /// becomes the download's `filename`, reduced to a safe basename.
-pub(crate) fn artifact_response(
+///
+/// `Content-Length` is the served handle's own length (never the path's, which
+/// may have been re-pointed), so a client can refuse an oversize body before
+/// reading it — a coordinator pulling CP-to-CP does — and the body is cut at
+/// that length should the file grow while it streams.
+pub(crate) async fn artifact_response(
     file: tokio::fs::File,
     kind: Option<ArtifactKind>,
     name: &str,
 ) -> Response {
-    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
-        file,
-        STREAM_CHUNK_BYTES,
-    ));
+    use tokio::io::AsyncReadExt as _;
+    let len = file.metadata().await.ok().map(|m| m.len());
+    let body = match len {
+        Some(len) => Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+            file.take(len),
+            STREAM_CHUNK_BYTES,
+        )),
+        None => Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+            file,
+            STREAM_CHUNK_BYTES,
+        )),
+    };
     let name = safe_filename(name);
     let (ctype, disposition) = match kind {
         Some(ArtifactKind::Text) => (
@@ -695,6 +979,9 @@ pub(crate) fn artifact_response(
         HeaderValue::from_str(&disposition)
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
+    if let Some(len) = len {
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
     resp
 }
 
@@ -728,11 +1015,7 @@ async fn get_artifact_blob(
             std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => absent(),
             _ => ApiError::internal(e.to_string()),
         })?;
-    Ok(artifact_response(
-        tokio::fs::File::from_std(file),
-        None,
-        &sha,
-    ))
+    Ok(artifact_response(tokio::fs::File::from_std(file), None, &sha).await)
 }
 
 // ── report exports ──────────────────────────────────────────────────────────
@@ -2270,8 +2553,14 @@ mod tests {
         assert_eq!(error_of(&bytes), "artifact blob missing from the store");
     }
 
+    fn unavailable_of(body: &[u8]) -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["unavailable"].as_str().map(str::to_string))
+    }
+
     #[tokio::test]
-    async fn artifact_external_on_a_remote_host_is_404_naming_the_host() {
+    async fn artifact_external_on_an_unregistered_host_is_404_unavailable_naming_it() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sha = "b".repeat(64);
         seed_artifact_finding(
@@ -2285,18 +2574,268 @@ mod tests {
                 Some("build-box-7"),
             )],
         );
-        let (status, _, bytes) = get_raw(
+        let (status, headers, bytes) = get_raw(
             app_for(tmp.path()),
             &format!("/api/findings/fnd_art/artifacts/{sha}"),
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
-        let msg = error_of(&bytes);
-        assert!(msg.contains("build-box-7"), "message: {msg}");
-        assert!(
-            msg.contains("remote fetch is not supported yet"),
-            "message: {msg}"
+        let reason = unavailable_of(&bytes).expect("an `unavailable` body");
+        assert!(reason.contains("build-box-7"), "reason: {reason}");
+        assert!(reason.contains("not registered"), "reason: {reason}");
+        assert_eq!(error_of(&bytes), "", "not a plain `error` body");
+        assert!(header_str(&headers, "content-type").starts_with("application/json"));
+        // Nothing was pulled, so nothing was stored or left behind.
+        let store = tmp.path().join("findings").join("artifacts");
+        assert!(!store.exists() || std::fs::read_dir(&store).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_external_on_a_host_already_in_the_store_is_served_without_contacting_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body: &[u8] = &[0, 1, 2, 0xfe, 0xff];
+        let sha = store_blob(tmp.path(), body);
+        // `build-box-7` is not registered: any attempt to reach it would be an
+        // `unavailable` 404, so a 200 proves the store answered alone.
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "out/dump.bin",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::External),
+                Some("build-box-7"),
+            )],
         );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert_eq!(
+            header_str(&headers, "content-type"),
+            "application/octet-stream"
+        );
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
+        assert_eq!(
+            header_str(&headers, "content-disposition"),
+            "attachment; filename=\"dump.bin\""
+        );
+        assert_eq!(header_str(&headers, "content-length"), "5");
+    }
+
+    #[tokio::test]
+    async fn artifact_responses_declare_the_served_handles_length() {
+        // A store blob.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = b"twelve bytes";
+        let sha = store_blob(tmp.path(), body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "a.txt",
+                &sha,
+                12,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, _) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&headers, "content-length"), "12");
+
+        // A local external file, whose length comes off the verified handle.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("big.log"), b"seventeen bytes!\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("big.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "big.log",
+                &sha,
+                17,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        let (status, headers, _) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&headers, "content-length"), "17");
+
+        // The host blob endpoint, too (a coordinator's HTTP pull refuses an
+        // oversize blob off this header before writing a byte).
+        let (status, headers, _) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/artifacts/{}", store_blob(tmp.path(), b"abc")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&headers, "content-length"), "3");
+    }
+
+    // ---- the shared, cancel-safe in-flight pull ----
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A pull that counts its runs, parks until `release` fires, then
+    /// returns `out`.
+    fn gated_pull(
+        runs: &Arc<AtomicU32>,
+        release: &Arc<tokio::sync::Notify>,
+        out: PullOutcome,
+    ) -> impl FnOnce() -> futures_util::future::BoxFuture<'static, PullOutcome> {
+        let (runs, release) = (Arc::clone(runs), Arc::clone(release));
+        move || {
+            Box::pin(async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                out
+            })
+        }
+    }
+
+    /// Poll (bounded) until `dest` has no in-flight pull.
+    async fn until_retired(dest: &std::path::Path) {
+        for _ in 0..500 {
+            if !pull_in_flight(dest) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the pull into {} never retired", dest.display());
+    }
+
+    fn unique_dest(tag: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!(
+            "/nonexistent/test-pulls/{tag}-{}",
+            ulid::Ulid::new()
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_pull_concurrent_callers_share_one_pull() {
+        let dest = unique_dest("share");
+        let runs = Arc::new(AtomicU32::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let a = tokio::spawn(shared_pull(
+            dest.clone(),
+            gated_pull(&runs, &release, Ok(())),
+        ));
+        // `a` is in flight before `b` asks.
+        while !pull_in_flight(&dest) {
+            tokio::task::yield_now().await;
+        }
+        let b = tokio::spawn(shared_pull(
+            dest.clone(),
+            gated_pull(&runs, &release, Err("a second pull ran".into())),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.notify_one();
+        assert_eq!(a.await.unwrap(), Ok(()));
+        assert_eq!(b.await.unwrap(), Ok(()), "b joined a's pull");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        until_retired(&dest).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_pull_outlives_every_caller_and_retires_itself() {
+        let dest = unique_dest("cancel");
+        let runs = Arc::new(AtomicU32::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicU32::new(0));
+        let make = {
+            let (runs, release, finished) = (
+                Arc::clone(&runs),
+                Arc::clone(&release),
+                Arc::clone(&finished),
+            );
+            move || -> futures_util::future::BoxFuture<'static, PullOutcome> {
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        };
+        // The only caller gives up (a browser disconnecting drops the
+        // handler's future the same way).
+        let caller = tokio::spawn(shared_pull(dest.clone(), make));
+        while runs.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(pull_in_flight(&dest), "the pull keeps running");
+        // A request arriving now joins it rather than starting another.
+        let late = tokio::spawn(shared_pull(
+            dest.clone(),
+            gated_pull(&runs, &release, Err("a second pull ran".into())),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.notify_one();
+        assert_eq!(late.await.unwrap(), Ok(()));
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "ran to completion");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        until_retired(&dest).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_pull_holds_in_flight_pulls_only() {
+        let dest = unique_dest("again");
+        let runs = Arc::new(AtomicU32::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first = tokio::spawn(shared_pull(
+            dest.clone(),
+            gated_pull(&runs, &release, Err("host offline".into())),
+        ));
+        while runs.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+        assert_eq!(first.await.unwrap(), Err("host offline".to_string()));
+        until_retired(&dest).await;
+        // A failure is not remembered: the next view pulls again.
+        let again = shared_pull(
+            dest.clone(),
+            || -> futures_util::future::BoxFuture<'static, PullOutcome> {
+                Box::pin(async { Ok(()) })
+            },
+        )
+        .await;
+        assert_eq!(again, Ok(()));
+        until_retired(&dest).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_pull_a_panicking_pull_fails_its_waiters_and_retires() {
+        let dest = unique_dest("panic");
+        let out = shared_pull(
+            dest.clone(),
+            || -> futures_util::future::BoxFuture<'static, PullOutcome> {
+                Box::pin(async { panic!("the pull blew up") })
+            },
+        )
+        .await;
+        let reason = out.unwrap_err();
+        assert!(reason.contains("did not finish"), "{reason}");
+        until_retired(&dest).await;
     }
 
     #[tokio::test]
