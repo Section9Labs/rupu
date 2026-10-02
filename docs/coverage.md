@@ -514,6 +514,61 @@ of run-to-run variance, which is exactly what `diff` measures. The harness does
 **not** claim byte-identical model output: prompt *construction* is
 deterministic; sampling is not.
 
+## Engagement profiles
+
+A finding is about an **asset**, and the asset has a **kind**. Code
+(`file`/`function`) is one kind; a binary `function@address`, a network
+`host`/`service`, a cloud `resource`, a web `route` are others. An **engagement
+profile** is a pure-data package (TOML) that declares a domain's asset kinds and
+their locator coordinates, the evidence blocks and taxonomies it uses, a
+completeness checklist, and a coverage depth ladder. Adding a new engagement
+type is authoring a profile, not writing Rust.
+
+This governs how a finding is **validated and routed** — it is not a sandbox and
+does not run, gate, or scope your tools. Agents reach binaries, hosts and
+services with bash and whatever tooling they want (nmap, curl, radare2, …); rupu
+records and validates the resulting *findings*, not the traffic.
+
+### Selecting a profile
+
+```bash
+rupu run --engagement-profile binary  my-agent "reverse this blob"
+rupu run --engagement-profile network my-agent "assess 10.0.0.0/24"
+rupu run --engagement-profiles pentest my-agent "..."   # a composite = network + web
+```
+
+An empty selection is the native `code` path — byte-identical to before. A
+finding whose asset kind no active profile owns, or an unknown profile id, is a
+loud error, never a silent default.
+
+### Built-in catalog
+
+`code` · `binary` · `firmware` · `network` · `web` · `api` · `cloud` · `sca` ·
+`iac` · `secrets` · `container` · `redteam` · `threat-model`, plus the composites
+`mobile` (= `binary` + `web` + MASVS) and `pentest` (= `network` + `web`).
+Composites activate each member as its own routing target, so a `pentest` run
+files a `network:service` finding and a `web:route` finding side by side, each
+validated against its own profile — never a merged union.
+
+Operators and projects override or add profiles by dropping a `*.toml` under
+`~/.rupu/profiles/` (global) or `.rupu/profiles/` (project); a later source wins
+by id (built-in < global < project). A profile that fails to parse fails the
+launch rather than running under the wrong rules.
+
+### Recording an asset
+
+Under an active engagement, `report_finding` (and `findings.record`) take an
+optional `asset { kind, coordinates }`: the kind routes the finding to its
+owning profile, the profile's **required completeness checks** must pass (e.g.
+`network` requires the service pinned to a host + port), and the asset is stamped
+into the engagement asset graph (`assets.jsonl`). The `asset_mark` tool — offered
+only under an active engagement — records how deeply an asset was examined along
+its profile's depth ladder (`discovered → enumerated → tested → exploited` for
+`network`); depth is **monotonic**, so a shallower mark after a deeper one keeps
+the deeper rung.
+
+Spec: `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-asset-model-design.md`.
+
 ## See also
 
 - `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:` and `findingsProfile`)

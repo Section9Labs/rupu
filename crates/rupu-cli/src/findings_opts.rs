@@ -82,4 +82,20 @@ mod tests {
         assert_eq!(o.artifact_max_files, 3);
         assert_eq!(o.artifact_total_max_bytes, 99);
     }
+
+    #[test]
+    fn resolve_engagement_empty_is_code_path_and_unknown_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        let ws = tmp.path();
+        // empty selection = the native code path
+        assert!(resolve_engagement(g, ws, &[]).unwrap().is_none());
+        // a built-in resolves (profile dirs need not exist)
+        let set = resolve_engagement(g, ws, &["network".to_string()])
+            .unwrap()
+            .expect("network resolves");
+        assert!(set.profile_for_kind("network:service").is_some());
+        // an unknown id fails loudly
+        assert!(resolve_engagement(g, ws, &["nope".to_string()]).is_err());
+    }
 }
