@@ -185,11 +185,51 @@ describe('ArtifactBrowser', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it('says where an external artifact is stored', () => {
+  it('offers a host binary artifact as a download that names its host, and never fetches', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
     render(<ArtifactBrowser findingId="fnd_1" artifacts={[extArt]} />);
     fireEvent.click(screen.getByRole('button', { name: /poc\/huge\.bin/ }));
-    expect(screen.getByText(/on host kuki/)).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: 'Download' })).toBeNull();
+    const link = screen.getByRole('link', { name: 'Download' });
+    expect(link).toHaveAttribute('href', findingArtifactUrl('fnd_1', extArt.sha256));
+    expect(link).toHaveAttribute('download');
+    expect(screen.getByText('from host kuki')).toBeInTheDocument();
+    expect(screen.getByText('Binary file. Use Download.')).toBeInTheDocument();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('fetches a small host text artifact on click and previews it in a <pre>', async () => {
+    const hostText: ArtifactRef = { path: 'poc/trace.txt', sha256: 'd'.repeat(64), size: 30, kind: 'text', stored: 'external', host: 'kuki' };
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('probe reply: 204 no content'));
+    const { container } = render(<ArtifactBrowser findingId="fnd_1" artifacts={[hostText]} />);
+    // Never on render: a remote pull can cost an SSH invocation at the host.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /poc\/trace\.txt/ }));
+    await waitFor(() => expect(container.querySelector('pre')).toHaveTextContent('probe reply: 204 no content'));
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(findingArtifactUrl('fnd_1', hostText.sha256), expect.anything());
+    expect(screen.getByText('from host kuki')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Download' })).toHaveAttribute('href', findingArtifactUrl('fnd_1', hostText.sha256));
+  });
+
+  it('does not preview a host text artifact over the limit, and does not fetch', () => {
+    const bigHostText: ArtifactRef = { path: 'poc/dump.log', sha256: 'e'.repeat(64), size: 300 * 1024, kind: 'text', stored: 'external', host: 'kuki' };
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    render(<ArtifactBrowser findingId="fnd_1" artifacts={[bigHostText]} />);
+    fireEvent.click(screen.getByRole('button', { name: /poc\/dump\.log/ }));
+    expect(screen.getByRole('alert')).toHaveTextContent(/Too large to preview/);
+    expect(screen.getByRole('link', { name: 'Download' })).toBeInTheDocument();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('shows the unavailable reason when the host pull fails with a 404 {"unavailable"}', async () => {
+    const hostText: ArtifactRef = { path: 'poc/trace.txt', sha256: 'd'.repeat(64), size: 30, kind: 'text', stored: 'external', host: 'kuki' };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ unavailable: 'host kuki: node offline' }), { status: 404 }),
+    );
+    render(<ArtifactBrowser findingId="fnd_1" artifacts={[hostText]} />);
+    fireEvent.click(screen.getByRole('button', { name: /poc\/trace\.txt/ }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('host kuki: node offline');
+    expect(screen.queryByText(/"unavailable"/)).toBeNull();
   });
 
   describe('robustness', () => {
