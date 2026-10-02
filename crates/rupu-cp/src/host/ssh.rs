@@ -948,7 +948,7 @@ async fn pump_catch_up_coverage(
         // with nothing (the file vanished or raced) must not truncate what
         // the tail already delivered.
         if out.success && !out.stdout.is_empty() {
-            let _ = mirror.replace_coverage(run_id, host_id, &out.stdout);
+            let _ = mirror.replace_coverage(run_id, host_id, &out.stdout).await;
         }
     }
 }
@@ -1598,6 +1598,22 @@ impl SshHostConnector {
     /// (or unreadable), the run is finished as `"failed"` so it is never stuck
     /// in `Running` indefinitely.
     fn spawn_tail_pump(&self, run_id: String) {
+        // Every remote command below interpolates `run_id` UNQUOTED (so `$HOME`
+        // expands remotely): the id must be shell-safe, whatever the caller
+        // did. The launch paths mint or validate theirs; this is the single
+        // check that covers all of the pump's commands (tail, run.json cat,
+        // transcript cat, usage and coverage catch-ups) should one ever not.
+        // Nothing is spawned for an unsafe id; the mirror run (if one exists)
+        // is finished as failed so it is not left `Running` with no pump.
+        if !is_safe_run_id(&run_id) {
+            tracing::error!(
+                run_id = %run_id,
+                host_id = %self.host_id,
+                "refusing to spawn a tail pump for an unsafe run id"
+            );
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            return;
+        }
         let exec = Arc::clone(&self.exec);
         let mirror = Arc::clone(&self.mirror);
         // The pump's terminal pull needs to know which cache files a viewer is
@@ -1610,8 +1626,9 @@ impl SshHostConnector {
         // rather than through build_remote_command / shell_escape. Single-quoting
         // every token (as build_remote_command does) would prevent $HOME from
         // expanding, producing a literal path that never exists on the remote.
-        // run_id contains only [A-Za-z0-9_] (ULID prefix), so unquoted
-        // concatenation is safe. That invariant covers ALL SIX tailed paths
+        // run_id contains only [A-Za-z0-9_] (checked at the top of this
+        // function), so unquoted concatenation is safe. That invariant covers
+        // ALL SIX tailed paths
         // and both cat commands below: run_id is their only variable component.
         //
         // The last path is the run's agent transcript, which lives OUTSIDE
@@ -6131,6 +6148,10 @@ mod tests {
     /// vanished between the tail and the pull, or raced a rotation) must not
     /// replace the tailed copy with an empty file — the transcript catch-up
     /// next to it has the same non-empty rule.
+    ///
+    /// The "tailed copy" is seeded BEFORE the pump is spawned (the mirror run
+    /// is created by hand, as the dead-launch test does), so the ordering does
+    /// not depend on when a spawned task first runs.
     #[test]
     fn coverage_catch_up_never_truncates_the_tailed_copy_with_an_empty_cat() {
         let run_id = "run_01COVEMPTY";
@@ -6140,27 +6161,32 @@ mod tests {
         fake.cat_coverage_stdout = Some(String::new());
         let fake = std::sync::Arc::new(fake);
         let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "sec".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+        let stream = rupu_coverage::stream_path(&store.root, run_id);
+        std::fs::write(&stream, tailed).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stream).unwrap(),
+            tailed,
+            "precondition: the tailed copy is on disk before the pump exists"
+        );
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
-                agent: "sec".into(),
-                prompt: None,
-                mode: None,
-                target: None,
-                working_dir: None,
-                run_id: Some(run_id.into()),
-                findings_profile: None,
-                codename: None,
-            })
-            .await
-            .unwrap();
-            // The pump task is spawned but has not run yet (current-thread
-            // runtime, no await since): seed what the tail would already have
-            // delivered, deterministically, before its terminal catch-up.
-            std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+            conn.spawn_tail_pump(run_id.to_string());
             conn.await_run_mirror(run_id).await;
             let body = conn.unit_coverage(run_id).await.unwrap();
             assert_eq!(
@@ -6174,6 +6200,38 @@ mod tests {
             cmds.iter()
                 .any(|c| c.starts_with("cat ") && c.contains("/coverage.jsonl")),
             "the catch-up must have run for this to prove anything: {cmds:?}"
+        );
+    }
+
+    /// `spawn_tail_pump` interpolates the run id unquoted into every remote
+    /// command it builds, so an unsafe id must spawn nothing at all: no remote
+    /// command, no registered pump, and the (validated-elsewhere) mirror run
+    /// is not left `Running`.
+    #[test]
+    fn spawn_tail_pump_refuses_an_unsafe_run_id() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for bad in ["", "run_x; rm -rf ~", "run_$(id)", "run_a/../b", "run_a\nb"] {
+                conn.spawn_tail_pump(bad.to_string());
+            }
+            // Let anything that WAS spawned run.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(
+            fake.commands.lock().unwrap().is_empty(),
+            "no remote command may be built from an unsafe id: {:?}",
+            fake.commands.lock().unwrap()
+        );
+        assert!(
+            conn.pumps.lock().unwrap().is_empty(),
+            "no pump may be registered for an unsafe id"
         );
     }
 

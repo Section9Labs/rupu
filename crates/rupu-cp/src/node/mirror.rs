@@ -45,13 +45,8 @@ pub enum MirrorError {
     WrongNode(String),
 }
 
-/// Validates a `run_id` before allowing any store operation.
-///
-/// A valid run ID:
-/// - Is non-empty.
-/// - Starts with `run_`.
-/// - Contains only ASCII alphanumeric characters and `_`
-///   (no `/`, `\`, `.`, or other characters that could enable path traversal).
+/// Validates a `run_id` before allowing any store operation, by the one rule
+/// [`crate::host::connector::valid_run_id`] owns.
 fn validate_run_id(id: &str) -> Result<(), MirrorError> {
     if !crate::host::connector::valid_run_id(id) {
         return Err(MirrorError::InvalidRunId(id.to_string()));
@@ -354,7 +349,11 @@ impl NodeMirror {
     /// Replace the mirrored stream with `body` — the host's complete file,
     /// read once the run is terminal (the tail may still have been behind).
     /// Same ownership check as [`Self::append`].
-    pub fn replace_coverage(
+    ///
+    /// Async because the stream can be large and the caller is the SSH tail
+    /// pump on the async runtime: the whole-file write and the rename go
+    /// through `tokio::fs`, not a blocking `std::fs` call.
+    pub async fn replace_coverage(
         &self,
         run_id: &str,
         node_id: &str,
@@ -369,8 +368,13 @@ impl NodeMirror {
         // A per-call temp name (two replaces for one run can overlap) removed
         // on any failure, like `replace_usage_ledger`.
         let tmp = path.with_file_name(format!("coverage.jsonl.{}.tmp", ulid::Ulid::new()));
-        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
-            let _ = std::fs::remove_file(&tmp);
+        let written = async {
+            tokio::fs::write(&tmp, body).await?;
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        if let Err(e) = written {
+            let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e.into());
         }
         Ok(())
@@ -518,8 +522,8 @@ fn parse_status(s: &str) -> RunStatus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn coverage_lines_append_and_replace_is_authoritative() {
+    #[tokio::test]
+    async fn coverage_lines_append_and_replace_is_authoritative() {
         let tmp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
             tmp.path().join("runs"),
@@ -544,19 +548,20 @@ mod tests {
         );
         mirror
             .replace_coverage("run_C1", "node-1", "a\nb\n")
+            .await
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(mirror.coverage_path("run_C1")).unwrap(),
             "a\nb\n"
         );
         assert!(matches!(
-            mirror.replace_coverage("run_C1", "node-2", "x"),
+            mirror.replace_coverage("run_C1", "node-2", "x").await,
             Err(MirrorError::WrongNode(_))
         ));
     }
 
-    #[test]
-    fn replace_coverage_leaves_no_temp_file_and_rejects_an_invalid_run_id() {
+    #[tokio::test]
+    async fn replace_coverage_leaves_no_temp_file_and_rejects_an_invalid_run_id() {
         let tmp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
             tmp.path().join("runs"),
@@ -572,8 +577,14 @@ mod tests {
             findings_profile: None,
         };
         mirror.create_run("run_C2", "node-1", &spec).unwrap();
-        mirror.replace_coverage("run_C2", "node-1", "a\n").unwrap();
-        mirror.replace_coverage("run_C2", "node-1", "b\n").unwrap();
+        mirror
+            .replace_coverage("run_C2", "node-1", "a\n")
+            .await
+            .unwrap();
+        mirror
+            .replace_coverage("run_C2", "node-1", "b\n")
+            .await
+            .unwrap();
         let run_dir = mirror
             .coverage_path("run_C2")
             .parent()
@@ -590,18 +601,18 @@ mod tests {
         );
 
         assert!(matches!(
-            mirror.replace_coverage("../escape", "node-1", "x"),
+            mirror.replace_coverage("../escape", "node-1", "x").await,
             Err(MirrorError::InvalidRunId(_))
         ));
         assert!(matches!(
-            mirror.replace_coverage("not_a_run", "node-1", "x"),
+            mirror.replace_coverage("not_a_run", "node-1", "x").await,
             Err(MirrorError::InvalidRunId(_))
         ));
     }
 
     /// A failed rename must not leave its temp file behind.
-    #[test]
-    fn replace_coverage_removes_its_temp_file_when_the_rename_fails() {
+    #[tokio::test]
+    async fn replace_coverage_removes_its_temp_file_when_the_rename_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
             tmp.path().join("runs"),
@@ -621,7 +632,10 @@ mod tests {
         // file succeeds, the rename over a non-empty directory fails.
         let dest = mirror.coverage_path("run_C3");
         std::fs::create_dir_all(dest.join("occupied")).unwrap();
-        assert!(mirror.replace_coverage("run_C3", "node-1", "a\n").is_err());
+        assert!(mirror
+            .replace_coverage("run_C3", "node-1", "a\n")
+            .await
+            .is_err());
         let run_dir = dest.parent().unwrap().to_path_buf();
         let leftovers: Vec<_> = std::fs::read_dir(&run_dir)
             .unwrap()

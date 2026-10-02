@@ -487,6 +487,9 @@ pub(crate) fn resolve_host(
 /// - `Unsupported` / `Invalid` → 501: the host cannot serve this listing (an
 ///   old remote rupu, a transport with no such surface). The web shows the
 ///   host as *unavailable*, with this reason.
+/// - `Internal` → 500: a failure on THIS side (a local I/O error reading the
+///   coordinator's own run store), not a bad gateway — the remote did nothing
+///   wrong.
 /// - everything else, `NotFound` included → 502: the host gave no usable
 ///   answer. The web shows it as *offline*, with this reason.
 ///
@@ -502,6 +505,7 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
         HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
             ApiError::not_available(e.to_string())
         }
+        HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
         other => ApiError::bad_gateway(other.to_string()),
     }
 }
@@ -3457,6 +3461,10 @@ pub(crate) mod tests {
             (
                 HostConnectorError::NotJson("x".into()),
                 StatusCode::BAD_GATEWAY,
+            ),
+            (
+                HostConnectorError::Internal("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
         ];
         for (err, want) in cases {
