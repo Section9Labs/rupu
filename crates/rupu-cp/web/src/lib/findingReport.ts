@@ -29,6 +29,20 @@ export interface ArtifactRef {
 export type VerificationStatus = 'unverified' | 'confirmed' | 'disputed' | 'inconclusive';
 export interface Verification { status: VerificationStatus; by_run?: string; notes?: string }
 
+export interface DisasmLine { address: number; bytes: string; mnemonic: string; ops?: string }
+export type EvidenceBlock =
+  | { kind: 'text'; text: string }
+  | { kind: 'code_slice'; file?: string; excerpt: string; lang?: string }
+  | { kind: 'diff'; diff: string }
+  | { kind: 'table'; headers: string[]; rows: string[][] }
+  | { kind: 'image'; artifact: ArtifactRef; caption?: string }
+  | { kind: 'hexdump'; base: number; artifact: ArtifactRef; rendered?: string }
+  | { kind: 'disasm'; arch: string; listing: DisasmLine[] }
+  | { kind: 'decompile'; lang: string; listing: string }
+  | { kind: 'http_exchange'; request: string; response: string }
+  | { kind: 'scan_output'; tool: string; output: string }
+  | { kind: 'pcap_ref'; artifact: ArtifactRef; summary: string };
+
 export interface FindingReport {
   title: string;
   ownership: Ownership;
@@ -51,6 +65,7 @@ export interface FindingReport {
   cross_references: OrSentinel<CrossRef[]>;
   references: string;
   artifacts?: ArtifactRef[];
+  blocks?: EvidenceBlock[];
   verification?: Verification;
 }
 

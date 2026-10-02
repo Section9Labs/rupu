@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import fixture from '../../../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
-import { codeHref, type ArtifactRef, type FindingReport } from '../../../lib/findingReport';
+import { codeHref, type ArtifactRef, type EvidenceBlock, type FindingReport } from '../../../lib/findingReport';
 import { findingArtifactUrl, type FindingOut } from '../../../lib/api';
 import CallChain from './CallChain';
 import EvidenceClaims from './EvidenceClaims';
@@ -13,6 +13,7 @@ import CommandBlock from './CommandBlock';
 import ArtifactBrowser from './ArtifactBrowser';
 import ReportHeader from './ReportHeader';
 import CrossReferences from './CrossReferences';
+import EvidenceBlocks from './EvidenceBlocks';
 
 afterEach(() => {
   cleanup();
@@ -406,5 +407,88 @@ describe('CrossReferences', () => {
     );
     expect(screen.getByRole('link', { name: 'fnd_9' })).toHaveAttribute('href', '/findings/fnd_9');
     expect(screen.getByText(/same handler/)).toBeInTheDocument();
+  });
+});
+
+describe('EvidenceBlocks', () => {
+  const sha = 'c'.repeat(64);
+  const art = (over: Partial<ArtifactRef> = {}): ArtifactRef => ({
+    path: 'shots/panel.png', sha256: sha, size: 2048, kind: 'binary', stored: 'copied', ...over,
+  });
+  const show = (blocks: EvidenceBlock[]) => render(<EvidenceBlocks findingId="fnd_1" blocks={blocks} />);
+
+  it('renders the text kinds', () => {
+    const { container } = show([
+      { kind: 'text', text: 'Observed a stray **widget** handle' },
+      { kind: 'code_slice', file: 'src/widget.c', excerpt: 'int widget_open(void);', lang: 'c' },
+      { kind: 'diff', diff: '-old_call()\n+new_call()' },
+      { kind: 'table', headers: ['Offset', 'Meaning'], rows: [['0x10', 'length'], ['0x14', 'flags']] },
+      { kind: 'disasm', arch: 'x86_64', listing: [{ address: 0x401000, bytes: '55', mnemonic: 'push', ops: 'rbp' }] },
+      { kind: 'decompile', lang: 'c', listing: 'void frob_gadget(int n) {}' },
+      { kind: 'http_exchange', request: 'GET /widgets/7 HTTP/1.1', response: 'HTTP/1.1 200 OK' },
+      { kind: 'scan_output', tool: 'gadgetscan', output: '3 hits in module' },
+    ]);
+    expect(container).toHaveTextContent('stray');
+    expect(container).toHaveTextContent('int widget_open(void);');
+    expect(container).toHaveTextContent('src/widget.c');
+    expect(container).toHaveTextContent('+new_call()');
+    expect(screen.getByText('Offset')).toBeInTheDocument();
+    expect(screen.getByText('Meaning')).toBeInTheDocument();
+    expect(screen.getByText('0x14')).toBeInTheDocument();
+    expect(container).toHaveTextContent('0x401000');
+    expect(container).toHaveTextContent('push');
+    expect(container).toHaveTextContent('rbp');
+    expect(container).toHaveTextContent('frob_gadget');
+    expect(container).toHaveTextContent('GET /widgets/7 HTTP/1.1');
+    expect(container).toHaveTextContent('HTTP/1.1 200 OK');
+    expect(container).toHaveTextContent('gadgetscan');
+    expect(container).toHaveTextContent('3 hits in module');
+  });
+
+  it('renders a local image inline with a download link', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const { container } = show([{ kind: 'image', artifact: art(), caption: 'Panel after the crash' }]);
+    const img = container.querySelector('img')!;
+    expect(img).toHaveAttribute('src', findingArtifactUrl('fnd_1', sha));
+    expect(img).toHaveAttribute('alt', 'Panel after the crash');
+    expect(screen.getByRole('link', { name: /download/i })).toHaveAttribute('href', findingArtifactUrl('fnd_1', sha));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not load a remote image until clicked', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const { container } = show([{ kind: 'image', artifact: art({ host: 'kuki' }), caption: 'Remote shot' }]);
+    expect(container.querySelector('img')).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /Load image \(from host kuki\)/ }));
+    expect(container.querySelector('img')).toHaveAttribute('src', findingArtifactUrl('fnd_1', sha));
+  });
+
+  it('renders a hexdump with its base and a download link', () => {
+    const { container } = show([
+      { kind: 'hexdump', base: 0x7ffe0000, artifact: art({ path: 'dumps/heap.bin' }), rendered: '00000000  de ad be ef  |....|' },
+    ]);
+    expect(container.querySelector('pre')).toHaveTextContent('de ad be ef');
+    expect(container).toHaveTextContent('0x7ffe0000');
+    expect(screen.getByRole('link', { name: /download/i })).toHaveAttribute('href', findingArtifactUrl('fnd_1', sha));
+  });
+
+  it('renders a pcap_ref summary with a download link', () => {
+    show([{ kind: 'pcap_ref', artifact: art({ path: 'net/session.pcap' }), summary: 'Handshake then malformed frame' }]);
+    expect(screen.getByText('Handshake then malformed frame')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /download/i })).toHaveAttribute('href', findingArtifactUrl('fnd_1', sha));
+  });
+
+  it('falls back for an unknown block kind without throwing', () => {
+    const { container } = show([{ kind: 'hologram', payload: 1 } as unknown as EvidenceBlock]);
+    expect(container).toHaveTextContent('hologram');
+  });
+
+  it('swaps a broken image for a message and the download link', () => {
+    const { container } = show([{ kind: 'image', artifact: art(), caption: 'Gone' }]);
+    fireEvent.error(container.querySelector('img')!);
+    expect(container.querySelector('img')).toBeNull();
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /download/i })).toBeInTheDocument();
   });
 });
