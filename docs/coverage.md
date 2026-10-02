@@ -286,8 +286,9 @@ old to serve it, or the bytes failed the size or hash check. Nothing is stored
 for a failed pull, and the next view tries again.
 
 The web finding page's artifact browser uses the same endpoint. It previews
-text up to 256 KiB when you open it and offers a download for every artifact; a
-remote artifact is fetched from its host the first time it is viewed.
+text up to 256 KiB when you open it and offers a download for every artifact. A
+remote artifact is fetched from its host the first time it is previewed or
+downloaded; a binary one only when you download it.
 
 ### Configuration
 
@@ -366,20 +367,16 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
   64 MiB reports `unknown` (a much lower limit than the artifact copy cap,
   because every detail request re-hashes every claim's file).
 - `GET /api/findings/:id/artifacts/:sha256` serves an artifact only if that
-  finding lists it; `:sha256` must be 64 lowercase hex characters. Text is
-  served inline as `text/plain`; anything else is an attachment. Every response
-  carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy:
-  sandbox`. A copied artifact is read from the content-addressed store. An
-  external artifact on this machine is opened once and hashed from that same
-  handle: `409` if it no longer matches the recorded hash, `404` if it is gone.
-  An artifact recorded by a remote or placed unit (`external` with a `host`) is
-  pulled from that host on first request and kept in the store; a pull that
-  fails answers `404 {"unavailable": "<reason>"}` (see
-  [Downloading artifacts](#downloading-artifacts)).
+  finding lists it; `:sha256` must be 64 lowercase hex characters. Every
+  response carries `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`. Where the bytes come from, how text and
+  other kinds are served, and what a missing, changed or unpullable artifact
+  answers are under [Downloading artifacts](#downloading-artifacts).
 - `GET /api/findings/artifacts/:sha256` is the host-side half of that pull: it
-  serves any blob in this control plane's own artifact store by hash, to a
-  bearer-token holder. It is not finding-scoped, so the token is the access
-  boundary; browsers use the finding-scoped endpoint above.
+  serves any blob in this control plane's own artifact store by hash. It sits
+  behind the CP's bearer token when one is configured, and is open to anyone
+  who can reach the CP otherwise. It is not finding-scoped, so that access
+  control is its only boundary; browsers use the finding-scoped endpoint above.
 
 ### Exporting reports
 
