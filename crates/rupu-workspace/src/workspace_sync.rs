@@ -146,6 +146,10 @@ fn stage_tar(payload: &Payload, scratch_dir: &Path) -> Result<Baseline, SyncErro
 /// the host, so an older host's delta still carries (and still applies) them.
 const DELTA_EXCLUDED_PREFIX: &str = ".rupu/coverage/";
 
+/// Whether `rel` (a workspace-relative, `/`-separated path) is left out of a
+/// collected delta: `.rupu/coverage/` at the workspace root and everything
+/// under it, nothing else — a `.rupu/coverage/` nested under a subdirectory,
+/// or a sibling like `.rupu/coverage-old/`, is ordinary workspace content.
 pub(crate) fn excluded_from_delta(rel: &str) -> bool {
     rel.starts_with(DELTA_EXCLUDED_PREFIX)
 }
@@ -366,6 +370,16 @@ fn stage_git(payload: &Payload, scratch_dir: &Path) -> Result<Baseline, SyncErro
     })
 }
 
+/// The workspace-relative, `/`-separated path a diff delta is about (the new
+/// path, or the old one for a deletion). The paths loop and the patch printer
+/// both filter on this, so they cannot disagree about which delta is which.
+fn delta_rel_path(d: &git2::DiffDelta<'_>) -> Option<String> {
+    d.new_file()
+        .path()
+        .or_else(|| d.old_file().path())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+}
+
 fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, SyncError> {
     let repo = git2::Repository::open(scratch_dir).map_err(git_err)?;
     let oid = git2::Oid::from_str(
@@ -399,12 +413,7 @@ fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
     for d in diff.deltas() {
-        let path = d
-            .new_file()
-            .path()
-            .or_else(|| d.old_file().path())
-            .map(|p| p.to_string_lossy().replace('\\', "/"));
-        if let Some(p) = path {
+        if let Some(p) = delta_rel_path(&d) {
             if excluded_from_delta(&p) {
                 continue;
             }
@@ -420,12 +429,7 @@ fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
     // file/hunk-header lines already carry their full text.
     let mut patch: Vec<u8> = Vec::new();
     diff.print(git2::DiffFormat::Patch, |d, _h, line| {
-        let excluded = d
-            .new_file()
-            .path()
-            .or_else(|| d.old_file().path())
-            .is_some_and(|p| excluded_from_delta(&p.to_string_lossy().replace('\\', "/")));
-        if excluded {
+        if delta_rel_path(&d).is_some_and(|p| excluded_from_delta(&p)) {
             return true;
         }
         if matches!(line.origin(), '+' | '-' | ' ') {
@@ -528,7 +532,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn write(dir: &std::path::Path, rel: &str, body: &str) {
+    pub(super) fn write(dir: &std::path::Path, rel: &str, body: &str) {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -715,10 +719,72 @@ mod tests {
         assert!(ws.path().join("b.txt").exists());
         assert!(!ws.path().join(".rupu/coverage").exists());
     }
+
+    #[test]
+    fn excluded_from_delta_matches_only_the_root_coverage_dir() {
+        for (rel, excluded) in [
+            (".rupu/coverage/x", true),
+            (".rupu/coverage/a/b.jsonl", true),
+            (".rupu/coverage-old/x", false),
+            (".rupu/coveragefoo", false),
+            ("sub/.rupu/coverage/x", false),
+            (".rupu/other/x", false),
+        ] {
+            assert_eq!(excluded_from_delta(rel), excluded, "{rel}");
+        }
+    }
+
+    /// The baseline carries `.rupu/coverage/` files (they pack like any other
+    /// file). One the host removes must not surface as a coordinator-side
+    /// deletion: the coverage dir is out of the delta in both directions.
+    #[test]
+    fn tar_baseline_coverage_file_deleted_on_the_host_is_not_a_deletion() {
+        let ws = tempfile::tempdir().unwrap();
+        write(ws.path(), "gone.txt", "remove me");
+        write(ws.path(), ".rupu/coverage/tool-mappings.yaml", "m: 1\n");
+        let payload = pack_tar(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage_tar(&payload, scratch.path()).unwrap();
+        assert!(baseline
+            .tar_manifest
+            .contains_key(".rupu/coverage/tool-mappings.yaml"));
+
+        fs::remove_file(scratch.path().join(".rupu/coverage/tool-mappings.yaml")).unwrap();
+        fs::remove_file(scratch.path().join("gone.txt")).unwrap();
+        let delta = collect_delta_tar(scratch.path(), &baseline).unwrap();
+
+        assert_eq!(delta.deleted, vec!["gone.txt".to_string()]);
+        apply_deltas_tar(ws.path(), &[delta]).unwrap();
+        assert!(!ws.path().join("gone.txt").exists());
+        assert!(
+            ws.path().join(".rupu/coverage/tool-mappings.yaml").exists(),
+            "the coordinator's coverage file must survive"
+        );
+    }
+
+    /// Excluded on COLLECT, never ignored on APPLY: an older host's delta
+    /// still carries `.rupu/coverage/` files, and applying it writes them.
+    #[test]
+    fn tar_apply_still_writes_a_coverage_file_an_older_host_sent() {
+        let ws = tempfile::tempdir().unwrap();
+        let rel = ".rupu/coverage/t1/findings.jsonl";
+        let delta = Delta {
+            mode: SyncMode::Tar,
+            changed: vec![rel.into()],
+            deleted: vec![],
+            bytes: tar_one(rel, "{\"x\":1}\n"),
+        };
+        apply_deltas_tar(ws.path(), &[delta]).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join(rel)).unwrap(),
+            "{\"x\":1}\n"
+        );
+    }
 }
 
 #[cfg(test)]
 mod git_sync_tests {
+    use super::tests::write;
     use super::*;
     use std::fs;
 
@@ -867,22 +933,46 @@ mod git_sync_tests {
         let payload = pack(ws.path()).unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let baseline = stage(&payload, scratch.path()).unwrap();
-        let write = |dir: &std::path::Path, rel: &str, body: &str| {
-            let p = dir.join(rel);
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(p, body).unwrap();
-        };
         write(scratch.path(), "b.txt", "b\n");
-        write(scratch.path(), ".rupu/coverage/t1/findings.jsonl", "{\"x\":1}\n");
+        write(
+            scratch.path(),
+            ".rupu/coverage/t1/findings.jsonl",
+            "{\"x\":1}\n",
+        );
         let delta = collect_delta(scratch.path(), &baseline).unwrap();
         assert!(delta.changed.contains(&"b.txt".to_string()));
-        assert!(!delta.changed.iter().any(|p| p.starts_with(".rupu/coverage/")));
+        assert!(!delta
+            .changed
+            .iter()
+            .any(|p| p.starts_with(".rupu/coverage/")));
         let patch = String::from_utf8_lossy(&delta.bytes);
         assert!(!patch.contains(".rupu/coverage"), "{patch}");
         apply_deltas(ws.path(), &[delta]).unwrap();
         assert_eq!(fs::read_to_string(ws.path().join("b.txt")).unwrap(), "b\n");
         assert!(!ws.path().join(".rupu/coverage").exists());
+    }
+
+    /// Excluded on COLLECT, never ignored on APPLY (git mode): an older
+    /// host's patch carries `.rupu/coverage/` hunks, and applying it writes
+    /// the file.
+    #[test]
+    fn git_apply_still_writes_a_coverage_file_an_older_host_sent() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        let rel = ".rupu/coverage/t1/findings.jsonl";
+        let patch = format!(
+            "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1 @@\n+{{\"x\":1}}\n"
+        );
+        let delta = Delta {
+            mode: SyncMode::Git,
+            changed: vec![rel.into()],
+            deleted: vec![],
+            bytes: patch.into_bytes(),
+        };
+        apply_deltas(ws.path(), &[delta]).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join(rel)).unwrap(),
+            "{\"x\":1}\n"
+        );
     }
 }
