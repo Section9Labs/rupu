@@ -221,7 +221,7 @@ Every row below is pinned by an invented fixture test, on both the stream path a
 
 **Broker / local**
 - Parse whatever the wire carries through the same tolerant constructors.
-- `ProviderId` gains `Local` and `Broker`. Both clients and the runner's `MockProvider` stop claiming `Anthropic`.
+- `ProviderId` gains `Local` and `Broker`. Both clients stop claiming `Anthropic`. `MockProvider` defaults to `ProviderId::Anthropic` (mock-based tests exercise Anthropic-shaped limits) and is configurable with `with_provider_id` for cross-provider tests.
 - `router.rs`'s model-prefix routing and the `fetch_models` message read the id, so they now see the truth.
 
 ### 4.3 Truncated and malformed tool input
