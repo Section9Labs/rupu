@@ -30,7 +30,12 @@ pub enum Continuation {
         seed_source: PathBuf,
     },
     /// The run ended in failure — not an interruption. Start fresh.
-    Failed { error: Option<String> },
+    /// `seeded_from` is the transcript it was seeded from, when it was itself
+    /// a continuation (that run may still be continued).
+    Failed {
+        error: Option<String>,
+        seeded_from: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -97,7 +102,12 @@ pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, Continuat
                 output: final_assistant_text(&events),
             })
         }
-        Some((RunStatus::Error, error)) => return Ok(Continuation::Failed { error }),
+        Some((RunStatus::Error, error)) => {
+            return Ok(Continuation::Failed {
+                error,
+                seeded_from: seeded_from(&events),
+            })
+        }
         Some((RunStatus::Aborted, _)) | None => {}
     }
     let messages =
@@ -129,6 +139,17 @@ pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, Continuat
             seed_source: transcript.to_path_buf(),
         }),
     }
+}
+
+/// The transcript this run was seeded from by reference, if any.
+fn seeded_from(events: &[Event]) -> Option<PathBuf> {
+    events.iter().find_map(|e| match e {
+        Event::Seed {
+            source_transcript: Some(path),
+            ..
+        } => Some(PathBuf::from(path)),
+        _ => None,
+    })
 }
 
 /// The run's answer: the last assistant text event with anything in it.
@@ -421,8 +442,9 @@ mod tests {
         all[i]["data"]["error"] = "max turns (5) reached".into();
         write_lines(&t, &all);
         match prepare_continuation(&t).unwrap() {
-            Continuation::Failed { error } => {
-                assert_eq!(error.as_deref(), Some("max turns (5) reached"))
+            Continuation::Failed { error, seeded_from } => {
+                assert_eq!(error.as_deref(), Some("max turns (5) reached"));
+                assert_eq!(seeded_from, None, "an ordinary run was seeded from nothing");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -721,6 +743,25 @@ mod tests {
                 assert!(matches!(source, ReplayError::SeedHashMismatch { .. }))
             }
             other => panic!("expected Replay(SeedHashMismatch), got {other:?}"),
+        }
+    }
+
+    /// A failed continuation says which run it was seeded from — that run
+    /// may still be continued.
+    #[tokio::test]
+    async fn a_failed_continuation_names_the_run_it_was_seeded_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = finished_transcript(tmp.path()).await;
+        write_lines(&a, &through_first_turn_end(&lines(&a)));
+        let b = tmp.path().join("b.jsonl");
+        continue_run(&a, &b, "from b").await;
+        let mut all = lines(&b);
+        let i = all.iter().position(|v| kind(v) == "run_complete").unwrap();
+        all[i]["data"]["status"] = "error".into();
+        write_lines(&b, &all);
+        match prepare_continuation(&b).unwrap() {
+            Continuation::Failed { seeded_from, .. } => assert_eq!(seeded_from, Some(a)),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 }

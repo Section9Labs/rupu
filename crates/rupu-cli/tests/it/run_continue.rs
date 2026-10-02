@@ -179,6 +179,151 @@ fn continue_refuses_to_reuse_the_continued_runs_id() {
     );
 }
 
+/// The runner truncates its transcript when it starts, so `--run-id` naming
+/// ANY existing run — not just the one being continued — would wipe it.
+#[test]
+fn continue_refuses_a_run_id_that_already_has_a_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    first_run(dir.path());
+    interrupt_first_run(dir.path());
+    // A second, unrelated run that finished.
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"other answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--mode",
+        "bypass",
+        "--run-id",
+        "run_other",
+        "say hi again",
+    ])
+    .assert()
+    .success();
+    let before = std::fs::read_to_string(transcript(dir.path(), "run_other")).unwrap();
+
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"continued answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--mode",
+        "bypass",
+        "--run-id",
+        "run_other",
+        "--continue",
+        "run_first",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("needs a new run id"))
+    .stderr(predicate::str::contains("run_other"));
+
+    let after = std::fs::read_to_string(transcript(dir.path(), "run_other")).unwrap();
+    assert_eq!(
+        before, after,
+        "the other run's transcript must be untouched"
+    );
+}
+
+/// Mark `run_id`'s transcript as ended in failure.
+fn fail_run(dir: &Path, run_id: &str) {
+    let path = transcript(dir, run_id);
+    let body: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            if v["type"] == "run_complete" {
+                v["data"]["status"] = "error".into();
+                v["data"]["error"] = "max turns (5) reached".into();
+            }
+            format!("{v}\n")
+        })
+        .collect();
+    std::fs::write(&path, body).unwrap();
+}
+
+#[test]
+fn continue_on_a_failed_run_names_it_and_the_run_it_continued() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    first_run(dir.path());
+    interrupt_first_run(dir.path());
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"continued answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--mode",
+        "bypass",
+        "--run-id",
+        "run_second",
+        "--continue",
+        "run_first",
+    ])
+    .assert()
+    .success();
+    fail_run(dir.path(), "run_second");
+
+    rupu(dir.path(), "[]")
+        .args([
+            "run",
+            "hello",
+            "--mode",
+            "bypass",
+            "--continue",
+            "run_second",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "run run_second ended in failure (max turns (5) reached)",
+        ))
+        .stderr(predicate::str::contains("start a fresh run instead"))
+        .stderr(predicate::str::contains(
+            "run run_first, which it continued, may still be continued with `--continue run_first`",
+        ));
+
+    // An ordinary failed run has no such run to point at.
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"plain answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--mode",
+        "bypass",
+        "--run-id",
+        "run_plain",
+        "say hi",
+    ])
+    .assert()
+    .success();
+    fail_run(dir.path(), "run_plain");
+    rupu(dir.path(), "[]")
+        .args([
+            "run",
+            "hello",
+            "--mode",
+            "bypass",
+            "--continue",
+            "run_plain",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("run run_plain ended in failure"))
+        .stderr(predicate::str::contains("which it continued").not());
+}
+
 #[test]
 fn continue_refuses_an_unknown_run() {
     let dir = tempfile::tempdir().unwrap();

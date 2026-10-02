@@ -478,4 +478,5 @@ on). The new run's transcript links back to the old one rather than copying
 it. If the run had actually finished, its recorded answer is printed without
 calling the model; a run that failed can't be continued — start it fresh.
 Run the command from the same project as the original run. The new run needs
-its own run id, so don't pass `--run-id` equal to the run being continued.
+its own run id: a `--run-id` that already has a transcript (the run being
+continued, or any other run) is refused rather than overwritten.

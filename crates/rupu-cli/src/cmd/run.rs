@@ -608,12 +608,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     prepare_continuation, transcript_agent, Continuation,
                 };
                 let prev_path = transcripts.join(format!("{prev}.jsonl"));
-                // The continued run seeds from `prev_path`; reusing its id
-                // would append to the transcript it reads and make its `Seed`
-                // reference itself (a cycle replay rejects).
-                if transcript_path == prev_path {
+                // The runner truncates its transcript when it starts, so a
+                // `--run-id` that already has one would wipe it — the run
+                // being continued (which the continued run seeds from, and
+                // whose `Seed` would then reference itself) or any other
+                // run, such as an ancestor further up a continuation chain.
+                if transcript_path.exists() {
                     anyhow::bail!(
-                        "--continue {prev} needs a new run id; --run-id {prev} would overwrite the run being continued"
+                        "--continue {prev} needs a new run id; --run-id {run_id} already has a transcript and the new run would overwrite it"
                     );
                 }
                 let prev_agent = transcript_agent(&prev_path)?;
@@ -628,10 +630,22 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                         );
                         return Ok(());
                     }
-                    Continuation::Failed { error } => anyhow::bail!(
-                        "run {prev} ended in failure{} — start it fresh instead",
-                        error.map(|e| format!(" ({e})")).unwrap_or_default()
-                    ),
+                    Continuation::Failed { error, seeded_from } => {
+                        // A failed continuation's source run may still be
+                        // continuable; name it so the user can.
+                        let source = seeded_from
+                            .as_deref()
+                            .and_then(|p| p.file_stem())
+                            .and_then(|s| s.to_str())
+                            .map(|src| {
+                                format!("; run {src}, which it continued, may still be continued with `--continue {src}`")
+                            })
+                            .unwrap_or_default();
+                        anyhow::bail!(
+                            "run {prev} ended in failure{} — that is not an interruption, so there is nothing to pick up; start a fresh run instead{source}",
+                            error.map(|e| format!(" ({e})")).unwrap_or_default()
+                        )
+                    }
                     Continuation::Resume {
                         messages,
                         seed_source,
