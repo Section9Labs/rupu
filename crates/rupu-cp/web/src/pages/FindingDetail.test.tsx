@@ -73,6 +73,30 @@ describe('FindingDetail page', () => {
     expect(within(rail).queryByText(/Unknown:/)).toBeNull();
   });
 
+  it('never fetches a Markdown image from an agent-written report field', async () => {
+    const img = (n: string) => `![${n}](https://example.invalid/${n}.png)`;
+    vi.spyOn(api, 'getFinding').mockResolvedValue(
+      base({
+        profile: 'full',
+        evidence_status: ['current'],
+        report: {
+          ...report,
+          description: img('desc'),
+          impact: img('impact'),
+          root_cause: `${img('root')} <img src="https://example.invalid/raw.png" onerror="alert(1)">`,
+          remediation: img('fix'),
+        },
+      }),
+    );
+    const { container } = renderAt();
+    await screen.findByRole('heading', { level: 1 });
+    expect(container.querySelector('img')).toBeNull();
+    expect(container.querySelector('[onerror]')).toBeNull();
+    for (const n of ['desc', 'impact', 'root', 'fix']) {
+      expect(screen.getByRole('link', { name: `[image: ${n}]` })).toHaveAttribute('href', `https://example.invalid/${n}.png`);
+    }
+  });
+
   it('shows a compact completeness line that is hidden at lg and up (where the rail shows the meter)', async () => {
     vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
     renderAt();
