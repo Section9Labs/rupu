@@ -3022,9 +3022,11 @@ pub(crate) mod tests {
     }
 
     /// Fake `HostConnector` used only to exercise the `Host` proxy branch
-    /// without any real network. Only `get_run`/`proxy_get_json` are
-    /// exercised by these tests; every other method panics loudly if
-    /// accidentally called, rather than silently no-opping.
+    /// without any real network. `get_run`/`proxy_get_json` answer
+    /// `run_json` itself and the list methods answer rows from its keys
+    /// (`runs`, `agent_runs`, `sessions`, `autoflow_runs`,
+    /// `autoflow_events`); every other method panics loudly if accidentally
+    /// called, rather than silently no-opping.
     pub(crate) struct FakeHostConnector {
         pub(crate) run_json: serde_json::Value,
     }
@@ -3080,6 +3082,45 @@ pub(crate) mod tests {
             match self.run_json.get("agent_runs").and_then(|v| v.as_array()) {
                 Some(rows) => Ok(rows.clone()),
                 None => Err(HostConnectorError::Unsupported("agent-run listing".into())),
+            }
+        }
+        /// Rows for session listing come from `run_json["sessions"]` when
+        /// present (else `Unsupported`, as the trait default answers).
+        async fn list_sessions(
+            &self,
+            _scope: Option<&str>,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            match self.run_json.get("sessions").and_then(|v| v.as_array()) {
+                Some(rows) => Ok(rows.clone()),
+                None => Err(HostConnectorError::Unsupported("session listing".into())),
+            }
+        }
+        /// Rows for autoflow-cycle listing come from
+        /// `run_json["autoflow_runs"]` when present (else `Unsupported`).
+        async fn list_autoflow_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            match self
+                .run_json
+                .get("autoflow_runs")
+                .and_then(|v| v.as_array())
+            {
+                Some(rows) => Ok(rows.clone()),
+                None => Err(HostConnectorError::Unsupported(
+                    "autoflow-run listing".into(),
+                )),
+            }
+        }
+        /// Rows for autoflow-event listing come from
+        /// `run_json["autoflow_events"]` when present (else `Unsupported`).
+        async fn list_autoflow_events(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            match self
+                .run_json
+                .get("autoflow_events")
+                .and_then(|v| v.as_array())
+            {
+                Some(rows) => Ok(rows.clone()),
+                None => Err(HostConnectorError::Unsupported(
+                    "autoflow-event listing".into(),
+                )),
             }
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {

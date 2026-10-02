@@ -422,10 +422,14 @@ async fn list_sessions(
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured session listing — works for SSH hosts (which can't serve
         // the generic `proxy_get_json` GET) by shelling `rupu session list`.
-        let rows = conn
+        let mut rows = conn
             .list_sessions(q.scope.as_deref())
             .await
             .map_err(crate::api::runs::host_list_error)?;
+        // Newest-first before paging: the connector returns the host's whole
+        // list in CLI / mirror order, and the web's per-host merge relies on
+        // each host's pages arriving ordered by `updated_at`.
+        sort_values_newest_first(&mut rows, "updated_at");
         let page = crate::pagination::PageQuery {
             offset: q.offset,
             limit: q.limit,
@@ -469,6 +473,10 @@ async fn list_sessions(
         }
         let range = q.range();
         sessions.retain(|v| range.contains_str(v.get("created_at").and_then(|x| x.as_str())));
+        // `collect_sessions` walks the session dirs in `read_dir` order; page
+        // newest-first by `updated_at`, the order the fan-out path uses and the
+        // web's per-host merge relies on.
+        sort_values_newest_first(&mut sessions, "updated_at");
         let paged: Vec<serde_json::Value> = crate::pagination::paginate(sessions, &page)
             .into_iter()
             .map(|mut v| {
@@ -1619,6 +1627,106 @@ mod tests {
 
         assert_eq!(rows.len(), 1, "only sess_mid falls in [Aug 5, Aug 15]");
         assert_eq!(rows[0]["session_id"], serde_json::json!("sess_mid"));
+    }
+
+    // ── Per-host time order (the web's per-host merge relies on it) ──────────
+
+    fn write_session_updated_at(root: &std::path::Path, session_id: &str, updated_at: &str) {
+        let dir = root.join("sessions").join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "session_id": session_id,
+            "agent_name": "agent",
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": updated_at,
+        });
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn session_ids(rows: &[serde_json::Value]) -> Vec<&str> {
+        rows.iter()
+            .map(|r| r["session_id"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn local_session_list_pages_newest_first_by_updated_at() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Names and times deliberately disagree, so `read_dir` order (by name
+        // or by anything else) is not the time order.
+        for (id, at) in [
+            ("sess_a", "2026-08-03T00:00:00Z"),
+            ("sess_b", "2026-08-01T00:00:00Z"),
+            ("sess_c", "2026-08-05T00:00:00Z"),
+            ("sess_d", "2026-08-02T00:00:00Z"),
+            ("sess_e", "2026-08-04T00:00:00Z"),
+        ] {
+            write_session_updated_at(tmp.path(), id, at);
+        }
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let page = |offset, limit| {
+            list_sessions(
+                State(s.clone()),
+                Query(SessionsQuery {
+                    offset: Some(offset),
+                    limit: Some(limit),
+                    scope: None,
+                    host: Some("local".into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+        };
+        let Json(all) = page(0, 20).await.expect("ok");
+        assert_eq!(
+            session_ids(&all),
+            ["sess_c", "sess_e", "sess_a", "sess_d", "sess_b"]
+        );
+        // Sorted BEFORE paging: page 0 is the newest two, page 1 the next.
+        let Json(p0) = page(0, 2).await.expect("ok");
+        assert_eq!(session_ids(&p0), ["sess_c", "sess_e"]);
+        let Json(p1) = page(2, 2).await.expect("ok");
+        assert_eq!(session_ids(&p1), ["sess_a", "sess_d"]);
+    }
+
+    #[tokio::test]
+    async fn single_remote_session_list_pages_newest_first_by_updated_at() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The connector hands back the host's whole list unsorted.
+        let s = crate::api::runs::tests::state_with_fake_host(
+            &tmp,
+            serde_json::json!({ "sessions": [
+                {"session_id": "sess_a", "agent_name": "x", "updated_at": "2026-08-03T00:00:00Z"},
+                {"session_id": "sess_b", "agent_name": "x", "updated_at": "2026-08-01T00:00:00Z"},
+                {"session_id": "sess_c", "agent_name": "x", "updated_at": "2026-08-05T00:00:00Z"},
+                {"session_id": "sess_d", "agent_name": "x", "updated_at": "2026-08-02T00:00:00Z"},
+            ]}),
+        );
+        let page = |offset, limit| {
+            list_sessions(
+                State(s.clone()),
+                Query(SessionsQuery {
+                    offset: Some(offset),
+                    limit: Some(limit),
+                    scope: None,
+                    host: Some("host_fake".into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+        };
+        let Json(p0) = page(0, 2).await.expect("ok");
+        assert_eq!(session_ids(&p0), ["sess_c", "sess_a"]);
+        let Json(p1) = page(2, 2).await.expect("ok");
+        assert_eq!(session_ids(&p1), ["sess_d", "sess_b"]);
+        assert!(p0.iter().all(|r| r["host_id"] == "host_fake"));
     }
 
     #[tokio::test]
