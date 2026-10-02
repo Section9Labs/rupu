@@ -74,6 +74,8 @@ pub struct Config {
     pub findings: crate::findings_config::FindingsConfig,
     #[serde(default)]
     pub runtime: crate::runtime_config::RuntimeConfig,
+    #[serde(default)]
+    pub recovery: crate::recovery_config::RecoveryConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

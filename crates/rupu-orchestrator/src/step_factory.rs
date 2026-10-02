@@ -201,6 +201,7 @@ fn resolve_step_agent_spec(
         Err(e) => (
             rupu_agent::AgentSpec {
                 findings_profile: None,
+                fallbacks: None,
                 name: agent_name.to_string(),
                 description: None,
                 provider: None,

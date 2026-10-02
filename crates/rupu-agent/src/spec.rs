@@ -149,6 +149,10 @@ struct Frontmatter {
     /// it: `full` (a complete report) or `summary`. Absent => `full`.
     #[serde(default, rename = "findingsProfile")]
     findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Ordered fallback chain tried when this agent's model cannot be used.
+    /// Wins over the `[recovery].fallbacks` config table. Absent → the table.
+    #[serde(default)]
+    fallbacks: Option<Vec<rupu_config::FallbackEntry>>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -190,6 +194,8 @@ pub struct AgentSpec {
     pub compact_at_percent: Option<u8>,
     /// Findings contract for this agent. See `findingsProfile` frontmatter.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Fallback chain from the `fallbacks:` frontmatter key.
+    pub fallbacks: Option<Vec<rupu_config::FallbackEntry>>,
     pub system_prompt: String,
     /// The full original file text (frontmatter + body) verbatim. Lets the CP
     /// render the definition source with syntax highlighting; agents are
@@ -242,6 +248,7 @@ impl AgentSpec {
             context_window_tokens: fm.context_window_tokens,
             compact_at_percent: fm.compact_at_percent,
             findings_profile: fm.findings_profile,
+            fallbacks: fm.fallbacks,
             system_prompt: body.to_string(),
             raw,
         })
@@ -294,6 +301,29 @@ You are a test agent.
         );
         let s = "---\nname: a\n---\nbody\n";
         assert_eq!(AgentSpec::parse(s).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn parses_fallbacks() {
+        let s = "---\nname: a\nfallbacks:\n  - model: claude-opus-4-8\n  - provider: openai-codex\n    model: gpt-5.6-cyber\n---\nbody\n";
+        let spec = AgentSpec::parse(s).unwrap();
+        assert_eq!(
+            spec.fallbacks,
+            Some(vec![
+                rupu_config::FallbackEntry {
+                    provider: None,
+                    model: "claude-opus-4-8".into()
+                },
+                rupu_config::FallbackEntry {
+                    provider: Some("openai-codex".into()),
+                    model: "gpt-5.6-cyber".into()
+                },
+            ])
+        );
+        let s = "---\nname: a\n---\nbody\n";
+        assert_eq!(AgentSpec::parse(s).unwrap().fallbacks, None);
+        let s = "---\nname: a\nfallbacks:\n  - model: m\n    bogus: 1\n---\nbody\n";
+        assert!(AgentSpec::parse(s).is_err());
     }
 
     #[test]
