@@ -6,11 +6,13 @@ import {
   autoflowItems,
   findingItems,
   issueItems,
+  sessionItems,
   workerItems,
   type PaletteItem,
 } from './paletteSources';
 import type {
   RunListRow,
+  SessionSummary,
   AgentSummary,
   AutoflowDefRow,
   FindingOut,
@@ -109,6 +111,29 @@ describe('mappers', () => {
     expect(it0.to).toBe('/runs/ABC123XYZ');
     expect(it0.title).toBe('deploy');
     expect(it0.subtitle).toBe('ABC123XY · completed');
+  });
+
+  it('runItems links a remote run with its host (and keeps the id unique per host)', () => {
+    const base = { id: 'ABC123XYZ', workflow_name: 'deploy', status: 'completed' } as RunListRow;
+    const [remote] = runItems([{ ...base, id: 'run_r', host_id: 'host_prod' }]);
+    expect(remote.to).toBe('/runs/run_r?host=host_prod');
+    expect(remote.id).toBe('host_prod:run_r');
+    expect(remote.subtitle).toContain('host_prod');
+    const [local] = runItems([{ ...base, id: 'run_l', host_id: 'local' }]);
+    expect(local.to).toBe('/runs/run_l');
+    expect(local.id).toBe('run_l');
+  });
+
+  it('sessionItems links a remote session with its host (and keeps the id unique per host)', () => {
+    const base = { session_id: 'sess_ABCDEFGHIJ', agent_name: 'triage', status: 'active' } as SessionSummary;
+    const [remote] = sessionItems([{ ...base, host_id: 'host_prod' }]);
+    expect(remote.to).toBe('/sessions/sess_ABCDEFGHIJ?host=host_prod');
+    expect(remote.id).toBe('host_prod:sess_ABCDEFGHIJ');
+    expect(remote.subtitle).toBe('sess_ABC · active · host_prod');
+    const [local] = sessionItems([{ ...base, host_id: 'local' }]);
+    expect(local.to).toBe('/sessions/sess_ABCDEFGHIJ');
+    expect(local.id).toBe('sess_ABCDEFGHIJ');
+    expect(local.subtitle).toBe('sess_ABC · active');
   });
 
   it('agentItems → /agents/:name with provider/model subtitle', () => {

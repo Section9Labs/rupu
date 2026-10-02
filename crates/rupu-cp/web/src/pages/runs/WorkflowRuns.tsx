@@ -5,11 +5,13 @@
 // in Archived mode, same as the old code hid its trigger chips + host
 // select together) + a host scope select (hidden in Archived mode too).
 //
-// Fetch/paginate/poll is owned by `usePagedList`: the active/Running
-// lifecycle is the only one that polls (5 s, page-0 only — matches today).
+// Fetch/paginate/poll is owned by `usePerHostPagedList` (per-host progressive
+// loading, spec 2026-10-01): All hosts by default, local paints at once and
+// each remote merges in as it answers. The active/Running lifecycle is the
+// only one that polls (local every 5 s, remotes every 60 s, page-0 only).
 // Archived has no server-side pagination (`/api/runs/archived` returns
 // everything in one shot); the fetcher returns `[]` for any offset > 0 so
-// the hook settles as `ended` after that single page.
+// the list settles as `ended` after that single page.
 //
 // Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
 // FilterBar's search slot narrows the loaded rows client-side, live per
@@ -32,7 +34,9 @@ import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
-import { usePagedList } from '../../lib/usePagedList';
+import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
+import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -95,33 +99,38 @@ export default function WorkflowRuns() {
   const [tab, setTab] = useState<Tab>('active');
   const [archived, setArchived] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
-  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
-  const [hostFilter, setHostFilter] = useState<string>('local');
+  // All hosts by default: local paints at once, each remote merges in as it
+  // answers (usePerHostPagedList). A picked host lists only that host.
+  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
   const fetchRows = useCallback(
-    ({ offset, limit }: { offset: number; limit: number }): Promise<RunListRow[]> => {
+    ({ host, offset, limit, signal }: PerHostFetchParams): Promise<RunListRow[]> => {
       if (archived) {
         // /api/runs/archived has no offset/limit — it's a single fetch.
-        // Any page beyond the first returns empty so the hook settles.
+        // Any page beyond the first returns empty so the host settles.
         return offset === 0 ? api.getArchivedRuns('workflow') : Promise.resolve([]);
       }
-      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host });
+      return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal });
     },
-    [archived, tab, hostFilter],
+    [archived, tab],
   );
 
-  const { rows, loading, error, hasMore, sentinelRef, refresh, ended } = usePagedList<RunListRow>({
-    fetch: fetchRows,
-    deps: [archived, tab, hostFilter],
-    poll: !archived && tab === 'active',
-  });
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
+    usePerHostPagedList<RunListRow>({
+      // Archived is a local-only endpoint (`/api/runs/archived`).
+      host: archived ? 'local' : hostFilter === ALL_HOSTS ? null : hostFilter,
+      fetch: fetchRows,
+      timeField: 'started_at',
+      idField: 'id',
+      deps: [archived, tab],
+      poll: !archived && tab === 'active',
+    });
 
-  // Trigger filter is still client-side (cheap; host filter is server-side).
+  // Trigger filter is client-side (cheap); the host filter picks which hosts load.
   const filtered = rows.filter((r) => {
     if (!archived && filter !== 'all' && r.trigger !== filter) return false;
     return true;
@@ -149,7 +158,8 @@ export default function WorkflowRuns() {
     }
   }
 
-  // Row-level archive / restore / delete — each refetches after success.
+  // Row-level archive / restore / delete — each drops the row and re-syncs
+  // just its host after success.
   // `host` is the row's own `host_id` (undefined/`"local"` → local store,
   // any other id → proxied through that host's connector) so a fanned-out
   // remote-host row's action lands on the host that actually owns the run.
@@ -157,7 +167,9 @@ export default function WorkflowRuns() {
     try {
       await api.archiveRun(id, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', id);
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
@@ -167,7 +179,9 @@ export default function WorkflowRuns() {
     try {
       await api.restoreRun(id, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', id);
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Restore failed');
     }
@@ -178,7 +192,9 @@ export default function WorkflowRuns() {
     try {
       await api.deleteRun(id, host);
       setActionError(null);
-      refresh();
+      // The row left this list; drop it now, then re-sync just its host.
+      removeRow(host ?? 'local', id);
+      refreshHost(host ?? 'local');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
@@ -239,6 +255,17 @@ export default function WorkflowRuns() {
   // around, or the operator sees the wrong banner for what just happened.
   const bannerError = actionError ?? error;
 
+  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
+  // keep the sentinel mounted whenever rows have loaded, even if the trigger pill or Find hides
+  // all of them, so scrolling keeps loading (a later page may match).
+  const waiting = waitingLabel(slices);
+  const missing = notIncluded(slices);
+  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
+  // the footer (still mounted, to keep paging) does not repeat it.
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: filtered.length, waitingShown: visible.length === 0 });
+  const footer = (text: string) =>
+    !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
+
   return (
     <div className="p-8">
       <header className="flex items-center justify-between mb-6">
@@ -289,6 +316,7 @@ export default function WorkflowRuns() {
           }
         />
       </div>
+      {!archived && <PerHostStrip slices={slices} />}
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -296,17 +324,38 @@ export default function WorkflowRuns() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading runs…" />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : rows.length === 0 && waiting ? (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label={waiting} />
+        </div>
+      ) : rows.length === 0 ? (
         <EmptyState
-          title={rows.length > 0 ? 'No runs match this filter' : 'No workflow runs yet'}
+          title={
+            noHostAnswered(slices)
+              ? 'No hosts answered'
+              : missing
+                ? 'No workflow runs on the hosts that answered'
+                : 'No workflow runs yet'
+          }
           hint={
-            rows.length > 0
-              ? 'Try selecting a different trigger or host filter above.'
+            missing
+              ? `Not included: ${missing}.`
               : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
           }
         />
       ) : visible.length === 0 ? (
-        <EmptyState title="No matches" hint={`No runs match "${query}".`} />
+        <>
+          {waiting ? (
+            <div className="py-16 flex items-center justify-center">
+              <Spinner label={`No matches yet · ${waiting}`} />
+            </div>
+          ) : filtered.length === 0 ? (
+            <EmptyState title="No runs match this filter" hint="Try selecting a different trigger or host filter above." />
+          ) : (
+            <EmptyState title="No matches" hint={`No runs match "${query}".`} />
+          )}
+          {footer(listFooter)}
+        </>
       ) : (
         <div className="space-y-6">
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
@@ -319,21 +368,11 @@ export default function WorkflowRuns() {
           <SortableTable<RunListRow>
             columns={columns}
             rows={visible}
-            rowKey={(r) => r.id}
+            rowKey={(r) => `${r.host_id ?? 'local'}:${r.id}`}
             rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
-          {!archived && (loading || hasMore || ended) && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {q
-                ? `${visible.length} matches of ${filtered.length} loaded`
-                : loading
-                  ? 'loading more…'
-                  : hasMore
-                    ? 'scroll for more'
-                    : `— end of ${filtered.length} —`}
-            </div>
-          )}
+          {footer(q ? `${visible.length} matches of ${filtered.length} loaded` : listFooter)}
         </div>
       )}
     </div>

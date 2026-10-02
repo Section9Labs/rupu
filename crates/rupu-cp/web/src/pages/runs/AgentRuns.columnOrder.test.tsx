@@ -11,21 +11,14 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../lib/api';
-import type { AgentRunRow, HostView } from '../../lib/api';
+import type { AgentRunRow } from '../../lib/api';
+import { REG_LOCAL } from '../../lib/perHost/testUtils';
 import AgentRuns from './AgentRuns';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
-
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
 
 const ROW: AgentRunRow = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
@@ -49,7 +42,7 @@ const ROW: AgentRunRow = {
 
 describe('AgentRuns — canonical column order', () => {
   it('renders headers as Status, Agent, Run, Source, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([ROW]);
 
     const { container } = render(

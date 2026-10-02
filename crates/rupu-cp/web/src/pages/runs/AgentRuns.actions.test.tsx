@@ -22,29 +22,14 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError } from '../../lib/api';
-import type { AgentRunRow, HostView } from '../../lib/api';
+import type { AgentRunRow } from '../../lib/api';
+import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import AgentRuns from './AgentRuns';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
-
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
-
-const REMOTE_HOST: HostView = {
-  id: 'host_prod',
-  name: 'prod',
-  transport_kind: 'http_cp',
-  status: 'online',
-  active_run_count: 1,
-};
 
 const STANDALONE_ROW: AgentRunRow = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
@@ -89,7 +74,7 @@ const SESSION_ROW: AgentRunRow = {
 };
 
 function stubDeps() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
 }
 
 function renderPage() {
@@ -122,6 +107,26 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     await waitFor(() =>
       expect(archiveSpy).toHaveBeenCalledWith(SESSION_ROW.session_id, SESSION_ROW.host_id),
     );
+  });
+
+  it('Archive re-syncs only the session row host, not every host', async () => {
+    stubDeps();
+    const runsSpy = vi
+      .spyOn(api, 'getAgentRuns')
+      .mockImplementation(onlyHost('local', [SESSION_ROW]));
+    vi.spyOn(api, 'archiveSession').mockResolvedValue(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    renderPage();
+    await showAll();
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
+    expect(callsFor(runsSpy, 'local')).toHaveLength(1);
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
+
+    fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
+
+    await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(2));
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
   });
 
   it('Archive confirm copy names the session and says it covers all its turns', async () => {
@@ -273,6 +278,25 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
     fireEvent.click(screen.getByLabelText(`Delete run ${STANDALONE_ROW.run_id}`));
 
     expect(deleteSpy).not.toHaveBeenCalled();
+  });
+
+  it('Archive on a remote-host row re-syncs only that host, not every host', async () => {
+    stubDeps();
+    const runsSpy = vi
+      .spyOn(api, 'getAgentRuns')
+      .mockImplementation(onlyHost('host_prod', [STANDALONE_ROW]));
+    vi.spyOn(api, 'archiveTranscript').mockResolvedValue(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    expect(callsFor(runsSpy, 'local')).toHaveLength(1);
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
+
+    fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
+
+    await waitFor(() => expect(callsFor(runsSpy, 'host_prod')).toHaveLength(2));
+    expect(callsFor(runsSpy, 'local')).toHaveLength(1);
   });
 
   it('renders NO Restore control for a standalone row', async () => {

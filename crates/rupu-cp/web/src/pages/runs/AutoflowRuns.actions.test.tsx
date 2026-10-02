@@ -66,7 +66,7 @@ const AWAITING_EVENT: AutoflowEventRow = {
 };
 
 function stubPage(events: AutoflowEventRow[]) {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
   vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue(events);
   vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 }

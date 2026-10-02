@@ -28,7 +28,7 @@ import { Area, AreaChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YA
 import type { UsageTimelineBucket } from '../../lib/usage';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { useThemeColors } from '../../lib/useThemeColors';
-import type { HostFreshness, Pivot } from '../../lib/api';
+import type { Pivot } from '../../lib/api';
 import { assignModelColors, pivotLabel } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
 import { useDragSelection } from './useDragSelection';
@@ -96,11 +96,11 @@ export default function UsageTimelineStacked({
    *  preserving this component's original model-only behavior for callers
    *  that don't pass one. */
   pivot?: Pivot;
-  /** `data.hosts` from `/api/usage` — maps a `host` pivot's raw `host_id`
+  /** Per-host name refs (from `useUsageData`) — maps a `host` pivot's raw `host_id`
    *  series keys to their friendly `name` for the legend/tooltip. Optional;
    *  falls back to the raw id when absent or unmatched. Ignored for every
    *  other pivot. */
-  hosts?: HostFreshness[];
+  hosts?: { host_id: string; name: string }[];
   /**
    * Marquee drag-select (Task W3) — called with the ordered `(startDay,
    * endDay)` day-bucket labels once a real drag (not a plain click)

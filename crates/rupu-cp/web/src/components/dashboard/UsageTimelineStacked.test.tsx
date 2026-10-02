@@ -173,9 +173,7 @@ describe('UsageTimelineStacked', () => {
         buckets={buckets}
         metric="cost"
         pivot="host"
-        hosts={[
-          { host_id: 'host_01KWREMOTE', name: 'staging-box', transport_kind: 'http_cp', state: 'ok', captured_at: null, reason: null },
-        ]}
+        hosts={[{ host_id: 'host_01KWREMOTE', name: 'staging-box' }]}
       />,
     );
     expect(getByText('staging-box')).toBeInTheDocument();

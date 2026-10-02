@@ -14,6 +14,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, presetWindow, windowFromDayRange, type UsageResponse, type UsageRunRow } from '../lib/api';
+import { REG_LOCAL } from '../lib/perHost/testUtils';
 
 vi.mock('../components/dashboard/UsageTimelineStacked', () => ({
   default: (props: { onSelectRange?: (startDay: string, endDay: string) => void }) => (
@@ -43,7 +44,7 @@ function usageResponse(overrides: Partial<UsageResponse> = {}): UsageResponse {
     summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: 0, priced: true, runs: 0 },
     breakdown: [],
     unpriced: { models: [], rows: 0 },
-    hosts: [],
+    hosts: [{ host_id: 'local', name: 'Local', transport_kind: 'local', state: 'ok', captured_at: '2026-09-30T00:00:00Z', reason: null }],
     ...overrides,
   };
 }
@@ -69,6 +70,7 @@ function runRow(overrides: Partial<UsageRunRow> = {}): UsageRunRow {
 }
 
 function mockAll() {
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
   vi.spyOn(api, 'getUsage').mockResolvedValue(usageResponse());
   vi.spyOn(api, 'getUsageRuns').mockResolvedValue([runRow()]);
   vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
@@ -86,12 +88,12 @@ describe('Usage page — drag-select a custom window (Task W3)', () => {
   it('a drag-select narrows the whole page to the selected window', async () => {
     mockAll();
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
 
     fireEvent.click(await screen.findByText('trigger-select'));
 
     const custom = windowFromDayRange('2026-07-10', '2026-07-12');
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(custom, 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(custom, 'model', 'local', expect.any(AbortSignal)));
     await waitFor(() => expect(api.getUsageOutliers).toHaveBeenCalledWith(custom));
     await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith(custom));
   });
@@ -99,7 +101,7 @@ describe('Usage page — drag-select a custom window (Task W3)', () => {
   it('shows a "custom" chip once a drag-select is active', async () => {
     mockAll();
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
 
     expect(screen.queryByText(/custom/i)).not.toBeInTheDocument();
 
@@ -111,7 +113,7 @@ describe('Usage page — drag-select a custom window (Task W3)', () => {
   it('clicking the custom chip\'s clear (×) restores the active preset window', async () => {
     mockAll();
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
 
     fireEvent.click(await screen.findByText('trigger-select'));
     await screen.findByText(/custom/i);
@@ -119,7 +121,7 @@ describe('Usage page — drag-select a custom window (Task W3)', () => {
     fireEvent.click(screen.getByRole('button', { name: /clear custom|×/i }));
 
     await waitFor(() =>
-      expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('30d', FIXED_NOW), 'model'),
+      expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)),
     );
     expect(screen.queryByText(/custom/i)).not.toBeInTheDocument();
   });
@@ -127,14 +129,14 @@ describe('Usage page — drag-select a custom window (Task W3)', () => {
   it('clicking a preset range button also clears the custom window', async () => {
     mockAll();
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
 
     fireEvent.click(await screen.findByText('trigger-select'));
     await screen.findByText(/custom/i);
 
     fireEvent.click(screen.getByRole('button', { name: '7d' }));
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('7d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenLastCalledWith(presetWindow('7d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal)));
     expect(screen.queryByText(/custom/i)).not.toBeInTheDocument();
   });
 });

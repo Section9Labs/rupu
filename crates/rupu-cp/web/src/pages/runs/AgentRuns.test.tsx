@@ -8,8 +8,9 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { api } from '../../lib/api';
-import type { AgentRunRow, HostView } from '../../lib/api';
+import { api, ApiError } from '../../lib/api';
+import type { AgentRunRow } from '../../lib/api';
+import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import AgentRuns from './AgentRuns';
 
 function LocationProbe() {
@@ -21,21 +22,6 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
-
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
-const REMOTE_HOST: HostView = {
-  id: 'host_prod',
-  name: 'prod',
-  transport_kind: 'http_cp',
-  status: 'online',
-  active_run_count: 1,
-};
 
 const REMOTE_ROW: AgentRunRow = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
@@ -64,7 +50,7 @@ const SESSION_ROW: AgentRunRow = {
 };
 
 function stubDeps() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
 }
 
 function renderPage() {
@@ -142,59 +128,82 @@ describe('AgentRuns — lifecycle filter drives fetch params', () => {
   });
 });
 
-describe('AgentRuns host filter — server-driven', () => {
-  it('default fetch is called with host: "local" (fast path, not fan-out)', async () => {
+describe('AgentRuns host filter — per-host loading (spec 2026-10-01)', () => {
+  it('defaults to All hosts and fetches every registered host with its own host param', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
     renderPage();
-
-    await waitFor(() =>
-      expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' })),
-    );
+    await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
+    expect(screen.getByLabelText('Host filter')).toHaveValue('__all__');
   });
 
-  it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
+  it('renders This host, All hosts, then registered (non-local) hosts', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
     renderPage();
     await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-
     const options = screen.getAllByRole('option') as HTMLOptionElement[];
     expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
   });
 
-  it('"All hosts" option fetches without a host param (fan-out branch, restored)', async () => {
+  it('This host fetches only local', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
     renderPage();
-    await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: '__all__' } });
-
-    await waitFor(() => {
-      const calls = runsSpy.mock.calls;
-      const lastParams = calls[calls.length - 1]?.[0];
-      expect(lastParams?.host).toBeUndefined();
-    });
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
+    runsSpy.mockClear();
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'local' } });
+    await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(0);
   });
 
   it('remote host option fetches with that host id', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
     renderPage();
-    await waitFor(() =>
-      expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument(),
-    );
-
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'host_prod' } });
-
     await waitFor(() =>
       expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })),
     );
+  });
+
+  it('paints local rows while a remote host is still loading, naming it in the strip', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([{ ...REMOTE_ROW, host_id: 'local' }]) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    expect(screen.getByText('loading…')).toBeInTheDocument();
+  });
+
+  it('shows an offline remote honestly without hiding local rows', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([{ ...REMOTE_ROW, host_id: 'local' }])
+        : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/not included: prod \(offline\)/)).toBeInTheDocument());
+    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('names the hosts left out when every answering host has no agent runs', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([])
+        : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByText('No agent runs on the hosts that answered')).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/Not included: prod/)).toBeInTheDocument();
   });
 
   it('Host column renders host_id from the row', async () => {
@@ -209,7 +218,9 @@ describe('AgentRuns host filter — server-driven', () => {
   it('Host column falls back to "local" when host_id is absent', async () => {
     stubDeps();
     const localRow: AgentRunRow = { ...REMOTE_ROW, host_id: undefined };
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([localRow]);
+    // Only local answers with the row — under All hosts a mock that answered
+    // every host would legitimately yield one row per host.
+    vi.spyOn(api, 'getAgentRuns').mockImplementation(onlyHost('local', [localRow]));
 
     renderPage();
 
@@ -420,6 +431,42 @@ describe('AgentRuns — Source filter', () => {
     await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
     // One header row + exactly one data row.
     expect(screen.getAllByRole('row')).toHaveLength(2);
+  });
+});
+
+describe('AgentRuns — the Source filter while hosts are still loading or paging', () => {
+  /** `n` session-turn rows, newest first, one a minute, starting `from` minutes before noon. */
+  const sessionRows = (n: number, from = 0): AgentRunRow[] =>
+    Array.from({ length: n }, (_, i) => ({
+      ...SESSION_ROW,
+      run_id: `run-sess-${from + i}`,
+      started_at: new Date(Date.parse('2026-06-02T12:00:00Z') - (from + i) * 60_000).toISOString(),
+    }));
+
+  it('says it is still waiting, not "no match", when the default Standalone filter empties what loaded so far', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve(sessionRows(3)) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No agent runs match this filter')).not.toBeInTheDocument();
+    // Said once: the footer below does not repeat who it is waiting on.
+    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+  });
+
+  it('keeps paging while the filter hides every loaded row, so a later page can match', async () => {
+    stubDeps();
+    // Page 0 is a full page of session turns; the first standalone run is further down.
+    const local = [...sessionRows(22), { ...REMOTE_ROW, host_id: 'local', started_at: '2026-06-01T00:00:00Z' }];
+    const spy = vi
+      .spyOn(api, 'getAgentRuns')
+      .mockImplementation((p) =>
+        Promise.resolve(p?.host === 'local' ? local.slice(p.offset ?? 0, (p.offset ?? 0) + (p.limit ?? 20)) : []),
+      );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    expect(callsFor(spy, 'local').some((c) => ((c[0] as { offset?: number }).offset ?? 0) > 0)).toBe(true);
   });
 });
 

@@ -57,7 +57,7 @@ const EVENT: AutoflowEventRow = {
 
 describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => {
   it('renders headers as Status, Started, Workflow, Run, Event, Issue Ref, Worker, Host, In, Out, Cached, Cost, Turns, Duration', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([EVENT]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 
@@ -96,7 +96,7 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
   });
 
   it('renders Turns and Duration for a run-bearing event, blank (not zero) when absent', async () => {
-    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([
       EVENT,
       { ...EVENT, event_id: 'evt-2', run_id: 'run-10', turns: null, duration_ms: null },

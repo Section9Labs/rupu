@@ -554,6 +554,17 @@ pub(crate) trait RemoteExec: Send + Sync {
     /// Run `remote_command` to completion and collect its output.
     async fn run(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError>;
 
+    /// [`run`](Self::run), except that dropping the returned future kills the
+    /// remote command (`SshExec`: `kill_on_drop(true)` on the `ssh` child).
+    /// Only for side-effect-free reads that may be abandoned: the cached
+    /// listing path, whose fetches the listing cache drops on its
+    /// `LISTING_MAX_INFLIGHT` bound. Mutations use `run`, so a dropped caller
+    /// never cuts one short. The default is `run`, for fakes that hold no
+    /// child.
+    async fn run_cancellable(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+        self.run(remote_command).await
+    }
+
     /// Spawn `remote_command` and return a stream of its stdout lines.
     ///
     /// The ssh child is kept alive for the stream's duration. When the stream
@@ -603,9 +614,10 @@ pub(crate) struct SshExec {
     pub identity_file: Option<std::path::PathBuf>,
 }
 
-#[async_trait::async_trait]
-impl RemoteExec for SshExec {
-    async fn run(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+impl SshExec {
+    /// The `ssh` command for a one-shot `remote_command` (shared by `run` and
+    /// `run_cancellable`).
+    fn short_call(&self, remote_command: &str) -> tokio::process::Command {
         let argv = ssh_argv(
             &self.host,
             self.port,
@@ -613,8 +625,14 @@ impl RemoteExec for SshExec {
             remote_command,
             SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
-        let out = tokio::process::Command::new("ssh")
-            .args(&argv)
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv);
+        cmd
+    }
+
+    /// Run `cmd` to completion and collect its output.
+    async fn collect(mut cmd: tokio::process::Command) -> Result<RemoteOutput, RemoteExecError> {
+        let out = cmd
             .output()
             .await
             .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
@@ -623,6 +641,19 @@ impl RemoteExec for SshExec {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             success: out.status.success(),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteExec for SshExec {
+    async fn run(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+        Self::collect(self.short_call(remote_command)).await
+    }
+
+    async fn run_cancellable(&self, remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+        let mut cmd = self.short_call(remote_command);
+        cmd.kill_on_drop(true);
+        Self::collect(cmd).await
     }
 
     fn spawn_lines(&self, remote_command: &str) -> Result<LineStream, RemoteExecError> {
@@ -1063,6 +1094,39 @@ fn classify_remote_cli_failure(stderr: &str) -> HostConnectorError {
     }
 }
 
+/// Whether a failed remote command failed in the ssh TRANSPORT (connect,
+/// resolve, auth, host key, or the ssh binary itself) rather than in the
+/// remote `rupu`. ssh reports these itself on stderr (exit 255) before the
+/// remote command ever runs; `RemoteOutput` carries no exit code, so the
+/// markers are what tells "this host is down" from "this host's rupu is too
+/// old to answer". The listing cache's own bound counts too: a listing with
+/// no answer after `LISTING_MAX_INFLIGHT` is a hung host, not an old rupu
+/// (which fails fast).
+fn is_ssh_transport_failure(stderr: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "ssh: ", // "ssh: connect to host …", "ssh: Could not resolve hostname …"
+        "ssh spawn failed",
+        "connection closed by",
+        "connection reset by",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "no route to host",
+        "kex_exchange_identification",
+        "permission denied (publickey",
+        "host key verification failed",
+        // Mid-session drops (the connection came up, then died):
+        "closed by remote host", // "Connection to <host> closed by remote host."
+        "not responding",        // "Timeout, server <host> not responding."
+        "broken pipe",           // "client_loop: send disconnect: Broken pipe"
+        "received disconnect",   // "Received disconnect from <ip> port 22:…"
+        // `listing_cache::LISTING_MAX_INFLIGHT` fired: no answer at all.
+        "listing took longer than",
+    ];
+    let lower = stderr.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 // ── SshHostConnector ──────────────────────────────────────────────────────────
 
 /// [`HostConnector`] backed by SSH transport.
@@ -1088,6 +1152,10 @@ pub(crate) struct SshHostConnector {
     /// Shared registry of live `tail -F` feeds into the transcript cache
     /// (spec §5.1) — see [`ensure_transcript_feed`].
     lazy: Arc<crate::host::lazy_tail::LazyTailRegistry>,
+    /// Short-lived single-flight cache of listing commands (`run list`,
+    /// `autoflow history`, `transcript list`, `session list`) — see
+    /// [`crate::host::listing_cache`]. Cleared by every mutating method.
+    listings: crate::host::listing_cache::ListingCache,
 }
 
 /// The dispatcher-facing side of one tail pump.
@@ -1139,6 +1207,52 @@ fn session_item_to_api_shape(item: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(map.clone())
 }
 
+/// How [`exec_rupu_json`] runs its remote command.
+#[derive(Clone, Copy)]
+enum ExecMode {
+    /// [`RemoteExec::run`]: the command runs to completion even if the caller
+    /// goes away. Everything except the cached listings.
+    ToCompletion,
+    /// [`RemoteExec::run_cancellable`]: dropping the call kills the `ssh`
+    /// child. Only [`SshHostConnector::cached_rows`] (side-effect-free
+    /// listings the listing cache may abandon).
+    Cancellable,
+}
+
+/// Run `rupu <argv…>` over `exec` and parse its JSON stdout. A free function
+/// (owned `exec` and argv) so the listing cache can hold the future as
+/// `'static`. [`SshHostConnector::remote_json`] delegates here.
+async fn exec_rupu_json(
+    exec: Arc<dyn RemoteExec>,
+    argv: Vec<String>,
+    mode: ExecMode,
+) -> Result<serde_json::Value, HostConnectorError> {
+    let owned: Vec<String> = std::iter::once("rupu".to_string())
+        .chain(argv.iter().cloned())
+        .collect();
+    let cmd = build_remote_command(&owned);
+    let out = match mode {
+        ExecMode::ToCompletion => exec.run(&cmd).await,
+        ExecMode::Cancellable => exec.run_cancellable(&cmd).await,
+    }
+    .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+    if !out.success {
+        return Err(HostConnectorError::Unreachable(out.stderr));
+    }
+    serde_json::from_str(out.stdout.trim()).map_err(|e| {
+        HostConnectorError::Remote(0, format!("parse `rupu {}` output: {e}", argv.join(" ")))
+    })
+}
+
+/// The `rows` array of a CLI `--format json` report (empty when absent).
+fn json_rows(parsed: &serde_json::Value) -> Vec<serde_json::Value> {
+    parsed
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
 impl SshHostConnector {
     /// Construct a new connector.
     ///
@@ -1162,6 +1276,7 @@ impl SshHostConnector {
             run_store,
             pumps: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             lazy,
+            listings: Default::default(),
         }
     }
 
@@ -1718,6 +1833,8 @@ impl SshHostConnector {
     /// Used by [`cancel_run`], [`approve_run`], [`reject_run`], and the
     /// run archive/restore/delete overrides.
     async fn remote_workflow(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        // Every caller mutates the remote: drop listings on return (spec §7.2).
+        let _clear = self.listings.clear_on_drop();
         let mut argv: Vec<String> = vec!["rupu".into(), "workflow".into()];
         argv.extend(tail.iter().map(|s| s.to_string()));
         let cmd = build_remote_command(&argv);
@@ -1736,6 +1853,7 @@ impl SshHostConnector {
     /// The `rupu workflow`-prefixed sibling of [`remote_workflow`]; used by
     /// the session archive/restore/delete overrides.
     async fn remote_session(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        let _clear = self.listings.clear_on_drop();
         let mut argv: Vec<String> = vec!["rupu".into(), "session".into()];
         argv.extend(tail.iter().map(|s| s.to_string()));
         let cmd = build_remote_command(&argv);
@@ -1754,6 +1872,8 @@ impl SshHostConnector {
     /// host. The `rupu session`-prefixed sibling of [`remote_session`]; used
     /// by the transcript archive/delete overrides.
     async fn remote_transcript(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        // Archive/delete change what the cached `transcript list` returns.
+        let _clear = self.listings.clear_on_drop();
         let mut argv: Vec<String> = vec!["rupu".into(), "transcript".into()];
         argv.extend(tail.iter().map(|s| s.to_string()));
         let cmd = build_remote_command(&argv);
@@ -1774,21 +1894,36 @@ impl SshHostConnector {
     /// (extracts `.rows`) and [`remote_json_item`](Self::remote_json_item)
     /// (extracts `.item`).
     async fn remote_json(&self, argv: &[&str]) -> Result<serde_json::Value, HostConnectorError> {
-        let owned: Vec<String> = std::iter::once("rupu".to_string())
-            .chain(argv.iter().map(|s| s.to_string()))
-            .collect();
-        let cmd = build_remote_command(&owned);
-        let out = self
-            .exec
-            .run(&cmd)
-            .await
-            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
-        if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
-        }
-        serde_json::from_str(out.stdout.trim()).map_err(|e| {
-            HostConnectorError::Remote(0, format!("parse `rupu {}` output: {e}", argv.join(" ")))
-        })
+        exec_rupu_json(
+            Arc::clone(&self.exec),
+            argv.iter().map(|s| s.to_string()).collect(),
+            ExecMode::ToCompletion,
+        )
+        .await
+    }
+
+    /// [`remote_json_rows`](Self::remote_json_rows) through [`Self::listings`]:
+    /// one remote run per argv per [`crate::host::listing_cache::LISTING_TTL`],
+    /// shared by every concurrent caller. The remote command runs through
+    /// [`RemoteExec::run_cancellable`], so when the cache abandons a fetch at
+    /// [`crate::host::listing_cache::LISTING_MAX_INFLIGHT`] the `ssh` child is
+    /// killed rather than left running.
+    async fn cached_rows(
+        &self,
+        argv: &[&str],
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let key = argv.join("\u{1f}");
+        let exec = Arc::clone(&self.exec);
+        let rows = self
+            .listings
+            .get(&key, move || async move {
+                exec_rupu_json(exec, argv, ExecMode::Cancellable)
+                    .await
+                    .map(|v| json_rows(&v))
+            })
+            .await?;
+        Ok(rows.as_ref().clone())
     }
 
     /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
@@ -1797,12 +1932,7 @@ impl SshHostConnector {
         &self,
         argv: &[&str],
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        let parsed = self.remote_json(argv).await?;
-        Ok(parsed
-            .get("rows")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default())
+        Ok(json_rows(&self.remote_json(argv).await?))
     }
 
     /// Whether a failed remote CLI call means "that session does not exist"
@@ -1916,6 +2046,7 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn launch_run(&self, req: LaunchRequest) -> Result<String, HostConnectorError> {
+        let _clear = self.listings.clear_on_drop();
         let run_id = format!("run_{}", Ulid::new());
 
         let spec = RunSpec {
@@ -1961,6 +2092,7 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
+        let _clear = self.listings.clear_on_drop();
         // A coordinator dispatching a placed unit already minted this run's
         // id (see `UnitDispatch::run_id`) so it can know the child run's
         // mirrored transcript path before dispatch — validate it BEFORE
@@ -2020,6 +2152,7 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
+        let _clear = self.listings.clear_on_drop();
         Err(HostConnectorError::Invalid(
             "sessions not supported over ssh (slice 2c)".into(),
         ))
@@ -2029,6 +2162,7 @@ impl HostConnector for SshHostConnector {
         &self,
         _req: SendMessageRequest,
     ) -> Result<String, HostConnectorError> {
+        let _clear = self.listings.clear_on_drop();
         Err(HostConnectorError::Invalid(
             "sessions not supported over ssh (slice 2c)".into(),
         ))
@@ -2054,16 +2188,29 @@ impl HostConnector for SshHostConnector {
     ///
     /// `stream_run_events` still reads the mirror, deliberately: tailing a
     /// known path on a live run is a different problem from enumerating.
+    ///
+    /// Errors split on WHO failed. An ssh transport failure (host down,
+    /// connection dropped; see [`is_ssh_transport_failure`]) passes through
+    /// as [`HostConnectorError::Unreachable`], which the web renders as
+    /// offline. A failure in the remote rupu itself (an old rupu with no
+    /// `run list`) maps to [`HostConnectorError::Unsupported`] ("needs a
+    /// newer rupu").
     async fn list_runs(
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let rows = match self
-            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
+            .cached_rows(&["--format", "json", "run", "list", "--limit", "10000"])
             .await
         {
             Ok(r) => r,
             Err(e) => {
+                // A host that is DOWN is not a host that predates `run list`.
+                if let HostConnectorError::Unreachable(msg) = &e {
+                    if is_ssh_transport_failure(msg) {
+                        return Err(e);
+                    }
+                }
                 // An old remote rupu has no `run list`; it parses as "launch an
                 // agent named list" and errors. Surface it as Unsupported so the
                 // freshness strip renders "needs a newer rupu" rather than
@@ -2314,6 +2461,7 @@ impl HostConnector for SshHostConnector {
     /// through `remote_workflow`'s blocking exec, which would otherwise tie
     /// up this call until the entire resumed workflow finished.
     async fn resume_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        let _clear = self.listings.clear_on_drop();
         let argv = vec![
             "rupu".to_string(),
             "workflow".to_string(),
@@ -2471,35 +2619,13 @@ impl HostConnector for SshHostConnector {
         &self,
         scope: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        let mut argv: Vec<String> = vec![
-            "rupu".into(),
-            "session".into(),
-            "list".into(),
-            "--format".into(),
-            "json".into(),
-        ];
         // The CLI lists active sessions by default; `--archived` restricts
         // to the archived scope. "active"/None → default (no flag).
+        let mut argv = vec!["session", "list", "--format", "json"];
         if let Some("archived") = scope {
-            argv.push("--archived".into());
+            argv.push("--archived");
         }
-        let cmd = build_remote_command(&argv);
-        let out = self
-            .exec
-            .run(&cmd)
-            .await
-            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
-        if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
-        }
-        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
-            HostConnectorError::Remote(0, format!("parse `rupu session list` output: {e}"))
-        })?;
-        Ok(parsed
-            .get("rows")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default())
+        self.cached_rows(&argv).await
     }
 
     /// Archive an active remote session via `rupu session archive <id>`.
@@ -2667,7 +2793,7 @@ impl HostConnector for SshHostConnector {
     /// does not include session-owned runs (which the local view merges in).
     async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let rows = self
-            .remote_json_rows(&["transcript", "list", "--format", "json"])
+            .cached_rows(&["transcript", "list", "--format", "json"])
             .await?;
         Ok(rows.iter().map(transcript_row_to_agent_run).collect())
     }
@@ -2675,7 +2801,7 @@ impl HostConnector for SshHostConnector {
     /// Autoflow cycle summaries aggregated from `rupu autoflow history`.
     async fn list_autoflow_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let rows = self
-            .remote_json_rows(&["autoflow", "history", "--format", "json"])
+            .cached_rows(&["autoflow", "history", "--format", "json"])
             .await?;
         Ok(history_rows_to_autoflow_cycles(&rows))
     }
@@ -2684,7 +2810,7 @@ impl HostConnector for SshHostConnector {
     /// the `AutoflowEventRow` wire shape.
     async fn list_autoflow_events(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let rows = self
-            .remote_json_rows(&["autoflow", "history", "--format", "json"])
+            .cached_rows(&["autoflow", "history", "--format", "json"])
             .await?;
         Ok(rows.iter().map(history_row_to_autoflow_event).collect())
     }
@@ -2695,9 +2821,13 @@ impl HostConnector for SshHostConnector {
     /// ControlMaster multiplexing), so this deliberately stays coarse — no
     /// per-panel round-trips.
     ///
-    /// An old remote rupu without `run list` yields
-    /// [`HostConnectorError::Unsupported`], never zeroed data: a host that
-    /// cannot report is not a host with no runs.
+    /// Errors split on WHO failed. An ssh transport failure (host down,
+    /// connection dropped; see [`is_ssh_transport_failure`]) passes through
+    /// as [`HostConnectorError::Unreachable`], rendered as offline. A failure
+    /// in the remote rupu itself (an old rupu without `run list`) yields
+    /// [`HostConnectorError::Unsupported`] ("needs a newer rupu"). Neither
+    /// ever produces zeroed data: a host that cannot report is not a host
+    /// with no runs.
     async fn dashboard_summary(
         &self,
         range: crate::host::dashboard_summary::DashboardRange,
@@ -2705,9 +2835,14 @@ impl HostConnector for SshHostConnector {
         use crate::host::dashboard_summary::*;
 
         let run_rows = self
-            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
+            .cached_rows(&["--format", "json", "run", "list", "--limit", "10000"])
             .await
             .map_err(|e| {
+                if let HostConnectorError::Unreachable(msg) = &e {
+                    if is_ssh_transport_failure(msg) {
+                        return e;
+                    }
+                }
                 tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: run list failed");
                 HostConnectorError::Unsupported(format!(
                     "remote host {} does not support `rupu run list`: {e}",
@@ -3401,6 +3536,340 @@ mod tests {
         let conn =
             SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
         (conn, run_store, tmp)
+    }
+
+    // ── Listing cache (spec 2026-10-01 §7.2) ─────────────────────────────────
+
+    /// Answers every listing with one run row (or fails), recording each
+    /// remote command so tests can count how many actually ran.
+    struct ListingExec {
+        commands: std::sync::Mutex<Vec<String>>,
+        fail: std::sync::atomic::AtomicBool,
+        delay: std::time::Duration,
+    }
+
+    impl ListingExec {
+        fn new(delay_ms: u64) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                commands: Default::default(),
+                fail: Default::default(),
+                delay: std::time::Duration::from_millis(delay_ms),
+            })
+        }
+        fn count(&self, needle: &str) -> usize {
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.contains(needle))
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for ListingExec {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.commands.lock().unwrap().push(remote.to_string());
+            tokio::time::sleep(self.delay).await;
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "ssh: connect to host host-a port 22: Operation timed out".into(),
+                    success: false,
+                });
+            }
+            Ok(RemoteOutput {
+                stdout: r#"{"rows":[{"id":"run_1","workflow_name":"wf","status":"completed","started_at":"2026-09-01T00:00:00Z","trigger":"manual"}]}"#.into(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+            unimplemented!("not used by the listing-cache tests")
+        }
+        async fn run_bytes(
+            &self,
+            _c: &str,
+            _s: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            unimplemented!("not used by the listing-cache tests")
+        }
+    }
+
+    fn all_runs() -> RunListQuery {
+        RunListQuery {
+            kind: RunKind::All,
+            offset: 0,
+            limit: 20,
+            lifecycle: None,
+        }
+    }
+
+    const RUN_LIST: &str = "'run' 'list'";
+    const AUTOFLOW_HISTORY: &str = "'autoflow' 'history'";
+    const SESSION_LIST: &str = "'session' 'list'";
+
+    #[tokio::test]
+    async fn concurrent_list_runs_share_one_remote_listing() {
+        let exec = ListingExec::new(30);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        let (a, b) = tokio::join!(conn.list_runs(all_runs()), conn.list_runs(all_runs()));
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(exec.count(RUN_LIST), 1);
+    }
+
+    #[tokio::test]
+    async fn list_runs_and_dashboard_summary_share_the_run_list() {
+        let exec = ListingExec::new(0);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        conn.list_runs(all_runs()).await.unwrap();
+        conn.dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap();
+        assert_eq!(exec.count(RUN_LIST), 1);
+    }
+
+    #[tokio::test]
+    async fn autoflow_cycles_and_events_share_one_history_listing() {
+        let exec = ListingExec::new(0);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        conn.list_autoflow_runs().await.unwrap();
+        conn.list_autoflow_events().await.unwrap();
+        assert_eq!(exec.count(AUTOFLOW_HISTORY), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_is_not_cached() {
+        let exec = ListingExec::new(0);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        exec.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(conn.list_runs(all_runs()).await.is_err());
+        exec.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        conn.list_runs(all_runs()).await.unwrap();
+        assert_eq!(exec.count(RUN_LIST), 2);
+    }
+
+    #[tokio::test]
+    async fn session_scopes_are_cached_separately() {
+        let exec = ListingExec::new(0);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        conn.list_sessions(Some("active")).await.unwrap();
+        conn.list_sessions(Some("active")).await.unwrap();
+        conn.list_sessions(Some("archived")).await.unwrap();
+        assert_eq!(exec.count(SESSION_LIST), 2);
+    }
+
+    /// Records whether each remote command went through `run` or
+    /// `run_cancellable`, and answers every command with one run row.
+    #[derive(Default)]
+    struct ModeExec {
+        calls: std::sync::Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl ModeExec {
+        fn count(&self, method: &str, needle: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, c)| *m == method && c.contains(needle))
+                .count()
+        }
+        fn answer() -> RemoteOutput {
+            RemoteOutput {
+                stdout: r#"{"rows":[{"id":"run_1","status":"completed","started_at":"2026-09-01T00:00:00Z","trigger":"manual"}]}"#.into(),
+                stderr: String::new(),
+                success: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for ModeExec {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.calls.lock().unwrap().push(("run", remote.to_string()));
+            Ok(Self::answer())
+        }
+        async fn run_cancellable(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("run_cancellable", remote.to_string()));
+            Ok(Self::answer())
+        }
+        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+            unimplemented!("not used by this test")
+        }
+        async fn run_bytes(
+            &self,
+            _c: &str,
+            _s: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            unimplemented!("not used by this test")
+        }
+    }
+
+    /// The cached listings run through `run_cancellable` (so an abandoned
+    /// listing's `ssh` child is killed); everything else keeps `run`, so a
+    /// dropped caller never cuts a mutation short.
+    #[tokio::test]
+    async fn cached_listings_use_run_cancellable_and_everything_else_run() {
+        let exec = std::sync::Arc::new(ModeExec::default());
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        conn.list_runs(all_runs()).await.unwrap();
+        conn.list_sessions(None).await.unwrap();
+        conn.list_autoflow_runs().await.unwrap();
+        assert_eq!(exec.count("run_cancellable", RUN_LIST), 1);
+        assert_eq!(exec.count("run_cancellable", SESSION_LIST), 1);
+        assert_eq!(exec.count("run_cancellable", AUTOFLOW_HISTORY), 1);
+        assert_eq!(exec.count("run", ""), 0, "no listing went through run");
+
+        let _ = conn.get_run("run_1").await;
+        let _ = conn.archive_run("run_1").await;
+        assert_eq!(exec.count("run", "'run' 'show'"), 1);
+        assert_eq!(exec.count("run", "'archive-run'"), 1);
+        assert_eq!(
+            exec.count("run_cancellable", ""),
+            3,
+            "only the three listings were cancellable"
+        );
+    }
+
+    /// A hung host's listing is abandoned at the cache's in-flight bound and
+    /// reads as offline (`Unreachable`), not as an old rupu (`Unsupported`).
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_listing_times_out_as_unreachable() {
+        let exec = ListingExec::new(
+            (crate::host::listing_cache::LISTING_MAX_INFLIGHT + std::time::Duration::from_secs(30))
+                .as_millis() as u64,
+        );
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m == "listing took longer than 60s"),
+            "{err}"
+        );
+        assert_eq!(exec.count(RUN_LIST), 1);
+    }
+
+    #[tokio::test]
+    async fn every_mutation_clears_the_listing_cache() {
+        let exec = ListingExec::new(0);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        let mut expected = 1;
+        conn.list_runs(all_runs()).await.unwrap();
+        assert_eq!(exec.count(RUN_LIST), expected);
+
+        // Each mutation, followed by a listing that must hit the remote again.
+        macro_rules! after {
+            ($label:literal, $call:expr) => {{
+                let _ = $call.await;
+                conn.list_runs(all_runs()).await.unwrap();
+                expected += 1;
+                assert_eq!(
+                    exec.count(RUN_LIST),
+                    expected,
+                    "{} must clear the cache",
+                    $label
+                );
+            }};
+        }
+        after!("approve_run", conn.approve_run("run_1", ""));
+        after!("reject_run", conn.reject_run("run_1", None));
+        after!("cancel_run", conn.cancel_run("run_1"));
+        after!("pause_run", conn.pause_run("run_1"));
+        after!("resume_run", conn.resume_run("run_1"));
+        after!("archive_run", conn.archive_run("run_1"));
+        after!("restore_run", conn.restore_run("run_1"));
+        after!("delete_run", conn.delete_run("run_1"));
+        after!("archive_session", conn.archive_session("ses_1"));
+        after!("restore_session", conn.restore_session("ses_1"));
+        after!("delete_session", conn.delete_session("ses_1"));
+        // `transcript list` is cached too (`list_agent_runs`), so the
+        // transcript mutations must clear it as well.
+        after!(
+            "archive_transcript",
+            conn.archive_transcript("run_1", false)
+        );
+        after!("delete_transcript", conn.delete_transcript("run_1", false));
+    }
+
+    /// `list_runs` / `dashboard_summary` used to report EVERY `run list`
+    /// failure as `Unsupported` ("host may predate the command"). That
+    /// included a host that is simply down, which then rendered as
+    /// "unavailable" (501 → retried only on manual Refresh) instead of
+    /// offline. Only a failure in the remote rupu itself means "too old".
+    #[tokio::test]
+    async fn list_runs_reports_a_down_host_as_unreachable_not_unsupported() {
+        let exec = ListingExec::new(0);
+        exec.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err}");
+        let err = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_runs_still_reports_an_old_remote_rupu_as_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dashboard_summary_still_reports_an_old_remote_rupu_as_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
+    }
+
+    #[test]
+    fn ssh_transport_failures_are_told_apart_from_remote_cli_failures() {
+        // Each marker is hit by at least one case that matches no OTHER
+        // marker, so dropping any single marker fails this test.
+        for stderr in [
+            // `ssh: ` prefix
+            "ssh: Could not resolve hostname host-a: nodename nor servname provided, or not known",
+            // `ssh spawn failed` (the real inner message of a spawn error)
+            "ssh spawn failed: No such file or directory",
+            "connect to host host-a port 22: Connection refused",
+            "connect to host host-a port 22: Connection timed out",
+            "connect to host host-a port 22: Operation timed out",
+            "connect to host host-a port 22: No route to host",
+            "Connection closed by 10.0.0.9 port 22",
+            "Connection reset by 10.0.0.9 port 22",
+            "kex_exchange_identification: banner line contains invalid characters",
+            "user@host-a: Permission denied (publickey).",
+            "Host key verification failed.",
+            // Mid-session drops.
+            "Connection to host-a closed by remote host.",
+            "Timeout, server host-a not responding.",
+            "client_loop: send disconnect: Broken pipe",
+            "Received disconnect from 10.0.0.9 port 22:2: Too many authentication failures",
+            // The listing cache's in-flight bound.
+            "listing took longer than 60s",
+            // The real shape ssh prints for the common case.
+            "ssh: connect to host host-a port 22: Connection refused",
+        ] {
+            assert!(is_ssh_transport_failure(stderr), "{stderr}");
+        }
+        for stderr in [
+            "error: agent 'list' not found",
+            "unrecognized subcommand 'show'",
+            "run does not support `--format json` (supported: `table`)",
+        ] {
+            assert!(!is_ssh_transport_failure(stderr), "{stderr}");
+        }
     }
 
     #[tokio::test]

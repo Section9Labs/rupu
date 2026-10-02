@@ -9,7 +9,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { api } from '../lib/api';
-import type { FindingOut } from '../lib/api';
+import type { FindingOut, RunListRow, SessionSummary } from '../lib/api';
 
 // Stub useNavigate — keep the rest of react-router-dom intact.
 const navigateMock = vi.fn();
@@ -34,6 +34,40 @@ function mockEmptyApi() {
   });
   vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);
   vi.spyOn(api, 'getWorkers').mockResolvedValue([]);
+}
+
+// A minimal run row for the per-host palette tests. `usage` is never read by
+// the palette mappers, so a cast keeps the fixture small.
+function runRow(over: Partial<RunListRow> & { id: string; workflow_name: string }): RunListRow {
+  return {
+    codename: 'cobalt-harbor/heron',
+    codename_derived: false,
+    status: 'completed',
+    started_at: '2026-10-01T00:00:00Z',
+    trigger: 'manual',
+    turns: 1,
+    usage: {} as never,
+    ...over,
+  };
+}
+
+// A minimal session row for the per-host palette tests (the mapper reads
+// only id, agent name, status and host).
+function sessionRow(over: Partial<SessionSummary> & { session_id: string; agent_name: string }): SessionSummary {
+  return { status: 'active', ...over } as SessionSummary;
+}
+
+function stubHosts() {
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([
+    { id: 'local', name: 'Local', transport_kind: 'local' },
+    { id: 'host_prod', name: 'prod', transport_kind: 'ssh' },
+  ]);
+}
+
+async function openPalette() {
+  render(<CommandPalette />);
+  openCommandPalette();
+  return screen.findByPlaceholderText('Search runs, agents, workflows, sessions…');
 }
 
 afterEach(() => {
@@ -116,5 +150,144 @@ describe('CommandPalette v2', () => {
     fireEvent.click(result as HTMLElement);
 
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/findings/f-1'));
+  });
+
+  it('lists local runs without waiting on a hung remote host', async () => {
+    mockEmptyApi();
+    stubHosts();
+    vi.spyOn(api, 'getRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([runRow({ id: 'run_local_1', workflow_name: 'local-wf', host_id: 'local' })])
+        : new Promise(() => {}),
+    );
+    await openPalette();
+    await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
+  });
+
+  it('appends a remote host\'s runs when it answers and opens them with ?host=', async () => {
+    mockEmptyApi();
+    stubHosts();
+    let answerRemote: (rows: RunListRow[]) => void = () => {};
+    vi.spyOn(api, 'getRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([runRow({ id: 'run_local_1', workflow_name: 'local-wf', host_id: 'local' })])
+        : new Promise<RunListRow[]>((resolve) => { answerRemote = resolve; }),
+    );
+    await openPalette();
+    await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
+    expect(screen.queryByText('remote-wf')).not.toBeInTheDocument();
+
+    answerRemote([runRow({ id: 'run_remote_1', workflow_name: 'remote-wf', host_id: 'host_prod' })]);
+    const remote = await screen.findByText('remote-wf');
+    // Both sources survive: the remote append must not displace the local
+    // batch that `Promise.all` committed first.
+    expect(screen.getByText('local-wf')).toBeInTheDocument();
+
+    fireEvent.click(remote.closest('[role="option"]') as HTMLElement);
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith('/runs/run_remote_1?host=host_prod'),
+    );
+  });
+
+  it('keeps a remote host\'s runs when they land before the local batch commits', async () => {
+    mockEmptyApi();
+    stubHosts();
+    let answerLocal: (rows: RunListRow[]) => void = () => {};
+    vi.spyOn(api, 'getRuns').mockImplementation((p) =>
+      p?.host === 'local'
+        ? new Promise<RunListRow[]>((resolve) => { answerLocal = resolve; })
+        : Promise.resolve([runRow({ id: 'run_remote_1', workflow_name: 'remote-wf', host_id: 'host_prod' })]),
+    );
+    await openPalette();
+    await screen.findByText('remote-wf');
+
+    answerLocal([runRow({ id: 'run_local_1', workflow_name: 'local-wf', host_id: 'local' })]);
+    await screen.findByText('local-wf');
+    // The Promise.all commit (setItems) must not have overwritten the remote.
+    expect(screen.getByText('remote-wf')).toBeInTheDocument();
+  });
+
+  it('falls back to local-only runs when the host list cannot be read', async () => {
+    mockEmptyApi();
+    vi.spyOn(api, 'getRegisteredHosts').mockRejectedValue(new Error('boom'));
+    const getRuns = vi.spyOn(api, 'getRuns').mockResolvedValue([
+      runRow({ id: 'run_local_1', workflow_name: 'local-wf', host_id: 'local' }),
+    ]);
+    await openPalette();
+    await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
+    expect(getRuns).toHaveBeenCalledTimes(1);
+    expect(getRuns).toHaveBeenCalledWith(expect.objectContaining({ host: 'local', limit: 200 }));
+  });
+
+  it('lists local sessions and drops its spinner without waiting on a hung remote host', async () => {
+    mockEmptyApi();
+    stubHosts();
+    const getSessions = vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([sessionRow({ session_id: 'sess_local_1', agent_name: 'local-agent', host_id: 'local' })])
+        : new Promise(() => {}),
+    );
+    await openPalette();
+    await waitFor(() => expect(screen.getByText('local-agent')).toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(getSessions).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod', limit: 200 }));
+    // The same per-open signal as the run requests.
+    expect(getSessions.mock.calls.every((c) => c[0]?.signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it('appends a remote host\'s sessions when it answers and opens them with ?host=', async () => {
+    mockEmptyApi();
+    stubHosts();
+    let answerRemote: (rows: SessionSummary[]) => void = () => {};
+    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([])
+        : new Promise<SessionSummary[]>((resolve) => { answerRemote = resolve; }),
+    );
+    await openPalette();
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+
+    answerRemote([sessionRow({ session_id: 'sess_remote_1', agent_name: 'remote-agent', host_id: 'host_prod' })]);
+    const remote = await screen.findByText('remote-agent');
+    fireEvent.click(remote.closest('[role="option"]') as HTMLElement);
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith('/sessions/sess_remote_1?host=host_prod'),
+    );
+  });
+
+  it('aborts every per-host run request when the palette closes', async () => {
+    mockEmptyApi();
+    stubHosts();
+    const signals: Record<string, AbortSignal | undefined> = {};
+    vi.spyOn(api, 'getRuns').mockImplementation((p) => {
+      signals[p?.host ?? '?'] = p?.signal;
+      // Remote hangs until aborted, then rejects like a real fetch would.
+      return p?.host === 'local'
+        ? Promise.resolve([runRow({ id: 'run_local_1', workflow_name: 'local-wf', host_id: 'local' })])
+        : new Promise<RunListRow[]>((_, reject) => {
+            p?.signal?.addEventListener('abort', () =>
+              reject(new DOMException('aborted', 'AbortError')),
+            );
+          });
+    });
+    await openPalette();
+    await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
+    await waitFor(() => expect(signals.host_prod).toBeDefined());
+    expect(signals.local).toBeDefined();
+    expect(signals.host_prod?.aborted).toBe(false);
+    expect(signals.local?.aborted).toBe(false);
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    expect(signals.host_prod?.aborted).toBe(true);
+    expect(signals.local?.aborted).toBe(true);
+    // The aborted remote's rejection is swallowed: nothing is rendered for
+    // it, and re-opening works from a clean slate with a fresh signal.
+    openCommandPalette();
+    await screen.findByRole('dialog');
+    await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
+    expect(screen.queryByText(/error|failed/i)).not.toBeInTheDocument();
+    expect(signals.host_prod?.aborted).toBe(false);
   });
 });

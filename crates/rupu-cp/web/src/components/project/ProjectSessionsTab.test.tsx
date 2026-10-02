@@ -214,8 +214,8 @@ describe('ProjectSessionsTab — Task 3: canonical column order + shared pill', 
   });
 
   it('renders a Started cell with relativeTime(created_at)', async () => {
-    // Real timers throughout — usePagedList's polling + testing-library's
-    // waitFor both rely on real timers, so fake system time would hang them.
+    // Real timers throughout — testing-library's waitFor relies on real
+    // timers, so fake system time would hang it.
     // Instead pin `created_at` a known 3 minutes before the real "now".
     const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
     mockSessions([{ ...ROWS[0], created_at: threeMinAgo }]);

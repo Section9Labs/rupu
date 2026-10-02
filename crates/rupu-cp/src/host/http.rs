@@ -500,7 +500,10 @@ impl HostConnector for HttpHostConnector {
         &self,
         scope: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        let mut path = "/api/sessions?host=local".to_string();
+        // The remote's own session list defaults to 20 rows and clamps any
+        // `limit` at its `MAX_LIMIT` (200); ask for everything it will give,
+        // as `list_agent_runs` / `list_autoflow_runs` do.
+        let mut path = "/api/sessions?host=local&limit=10000".to_string();
         if let Some(sc) = scope {
             path.push_str("&scope=");
             path.push_str(sc);
@@ -794,6 +797,48 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Without a `limit` the remote answered its default 20 sessions, so a
+    /// host's list was silently cut at 20 on every path that reads it.
+    #[tokio::test]
+    async fn list_sessions_asks_the_remote_for_its_whole_list() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = head_tx.send(String::from_utf8_lossy(&head).into_owned());
+                let body = "[]";
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let conn = HttpHostConnector::new(format!("http://{addr}"), None);
+        conn.list_sessions(Some("archived")).await.unwrap();
+        let head = head_rx.await.unwrap();
+        let request_line = head.lines().next().unwrap();
+        assert_eq!(
+            request_line,
+            "GET /api/sessions?host=local&limit=10000&scope=archived HTTP/1.1"
+        );
     }
 
     /// A 2xx whose complete body is not JSON (an older CP's SPA fallback) is

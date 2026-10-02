@@ -854,9 +854,13 @@ async fn list_agent_runs(
         let mut rows = conn
             .list_agent_runs()
             .await
-            .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
         let lifecycle = q.lifecycle.as_deref();
         rows.retain(|r| agent_in_lifecycle(r.get("status").and_then(|v| v.as_str()), lifecycle));
+        // Newest-first before paging: the connector returns the host's whole
+        // list in CLI / mirror order, and the web's per-host merge relies on
+        // each host's pages arriving ordered by `started_at`.
+        sort_values_newest_first(&mut rows, "started_at");
         return Ok(Json(
             crate::pagination::paginate(rows, &q.page())
                 .into_iter()
@@ -1015,10 +1019,12 @@ async fn list_autoflow_runs(
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured autoflow-cycle listing — SSH hosts aggregate cycles from
         // `rupu autoflow history` instead of the generic proxy.
-        let rows = conn
+        let mut rows = conn
             .list_autoflow_runs()
             .await
-            .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
+        // Newest-first before paging — see `list_agent_runs`' remote branch.
+        sort_values_newest_first(&mut rows, "started_at");
         return Ok(Json(
             crate::pagination::paginate(rows, &q.page())
                 .into_iter()
@@ -1220,10 +1226,12 @@ async fn list_autoflow_events(
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured autoflow-event listing — SSH hosts source events from
         // `rupu autoflow history` instead of the generic proxy.
-        let rows = conn
+        let mut rows = conn
             .list_autoflow_events()
             .await
-            .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
+            .map_err(crate::api::runs::host_list_error)?;
+        // Newest-first before paging — see `list_agent_runs`' remote branch.
+        sort_values_newest_first(&mut rows, "at");
         return Ok(Json(
             crate::pagination::paginate(rows, &q.page())
                 .into_iter()
@@ -2459,6 +2467,170 @@ mod tests {
         .await
         .expect("a malformed since must degrade, never error");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_remote_host_autoflow_and_agent_lists_report_unsupported_as_501() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // FakeHostConnector has no autoflow overrides (trait default:
+        // Unsupported) and no "agent_runs" key (its own Unsupported branch).
+        let s = crate::api::runs::tests::state_with_fake_host(&tmp, serde_json::json!({}));
+        let err = list_autoflow_runs(
+            State(s.clone()),
+            Query(AutoflowRunsQuery {
+                offset: None,
+                limit: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let err = list_autoflow_events(
+            State(s.clone()),
+            Query(AutoflowEventsQuery {
+                offset: None,
+                limit: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let err = list_agent_runs(
+            State(s),
+            Query(AgentRunsQuery {
+                offset: None,
+                limit: None,
+                lifecycle: None,
+                host: Some("host_fake".into()),
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// The web's per-host merge relies on each host's pages arriving
+    /// newest-first. A single-remote branch pages whatever the connector
+    /// returned (SSH / tunnel / bucket hand back whole lists in CLI or mirror
+    /// order), so it must sort first. The fake host hands each list back
+    /// unsorted: `a`=Aug 3, `b`=Aug 1, `c`=Aug 5, `d`=Aug 2.
+    fn state_with_unsorted_remote_lists(tmp: &tempfile::TempDir) -> AppState {
+        crate::api::runs::tests::state_with_fake_host(
+            tmp,
+            serde_json::json!({
+                "agent_runs": [
+                    {"run_id": "run_a", "agent": "x", "started_at": "2026-08-03T00:00:00Z", "status": "ok"},
+                    {"run_id": "run_b", "agent": "x", "started_at": "2026-08-01T00:00:00Z", "status": "ok"},
+                    {"run_id": "run_c", "agent": "x", "started_at": "2026-08-05T00:00:00Z", "status": "ok"},
+                    {"run_id": "run_d", "agent": "x", "started_at": "2026-08-02T00:00:00Z", "status": "ok"},
+                ],
+                "autoflow_runs": [
+                    {"cycle_id": "afc_a", "started_at": "2026-08-03T00:00:00Z"},
+                    {"cycle_id": "afc_b", "started_at": "2026-08-01T00:00:00Z"},
+                    {"cycle_id": "afc_c", "started_at": "2026-08-05T00:00:00Z"},
+                    {"cycle_id": "afc_d", "started_at": "2026-08-02T00:00:00Z"},
+                ],
+                "autoflow_events": [
+                    {"event_id": "evt_a", "at": "2026-08-03T00:00:00Z"},
+                    {"event_id": "evt_b", "at": "2026-08-01T00:00:00Z"},
+                    {"event_id": "evt_c", "at": "2026-08-05T00:00:00Z"},
+                    {"event_id": "evt_d", "at": "2026-08-02T00:00:00Z"},
+                ],
+            }),
+        )
+    }
+
+    fn row_ids(rows: &[serde_json::Value], field: &str) -> Vec<String> {
+        rows.iter()
+            .map(|r| r[field].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Sorted BEFORE paging: page 0 is the newest two, page 1 the next two.
+    const NEWEST_FIRST_PAGES: [(usize, [&str; 2]); 2] = [(0, ["c", "a"]), (2, ["d", "b"])];
+
+    fn prefixed(prefix: &str, ids: [&str; 2]) -> Vec<String> {
+        ids.iter().map(|w| format!("{prefix}_{w}")).collect()
+    }
+
+    #[tokio::test]
+    async fn single_remote_agent_run_list_pages_newest_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state_with_unsorted_remote_lists(&tmp);
+        for (offset, want) in NEWEST_FIRST_PAGES {
+            let Json(rows) = list_agent_runs(
+                State(s.clone()),
+                Query(AgentRunsQuery {
+                    offset: Some(offset),
+                    limit: Some(2),
+                    lifecycle: None,
+                    host: Some("host_fake".into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+            .await
+            .expect("ok");
+            assert_eq!(row_ids(&rows, "run_id"), prefixed("run", want), "@{offset}");
+        }
+    }
+
+    #[tokio::test]
+    async fn single_remote_autoflow_cycle_list_pages_newest_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state_with_unsorted_remote_lists(&tmp);
+        for (offset, want) in NEWEST_FIRST_PAGES {
+            let Json(rows) = list_autoflow_runs(
+                State(s.clone()),
+                Query(AutoflowRunsQuery {
+                    offset: Some(offset),
+                    limit: Some(2),
+                    host: Some("host_fake".into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+            .await
+            .expect("ok");
+            assert_eq!(
+                row_ids(&rows, "cycle_id"),
+                prefixed("afc", want),
+                "@{offset}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_remote_autoflow_event_list_pages_newest_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state_with_unsorted_remote_lists(&tmp);
+        for (offset, want) in NEWEST_FIRST_PAGES {
+            let Json(rows) = list_autoflow_events(
+                State(s.clone()),
+                Query(AutoflowEventsQuery {
+                    offset: Some(offset),
+                    limit: Some(2),
+                    host: Some("host_fake".into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+            .await
+            .expect("ok");
+            assert_eq!(
+                row_ids(&rows, "event_id"),
+                prefixed("evt", want),
+                "@{offset}"
+            );
+        }
     }
 
     #[tokio::test]

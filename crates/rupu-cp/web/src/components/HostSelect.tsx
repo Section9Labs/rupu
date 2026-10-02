@@ -1,19 +1,21 @@
-// HostSelect — a small dropdown that lists registered hosts via api.getHosts()
-// and emits the chosen host_id. Defaults to "local". Falls back to a single
-// "Local" option when the hosts fetch fails or has not resolved yet.
+// HostSelect — a small dropdown of hosts that emits the chosen host_id. The
+// allowAll (list-filter) variant reads the probe-free api.getRegisteredHosts();
+// the launcher variant reads api.getHosts(), whose status it shows. The
+// launcher variant falls back to a single "Local" option while the hosts fetch
+// is pending or when it fails; the allowAll variant to "This host" + "All hosts".
 //
 // Restyled internally onto `ui/Select`'s shared chrome (visual parity — same
 // classes, now sourced from one place) per the One Control Language kit.
 //
 // `allowAll` switches on the fan-out variant the run-list pages need: "This
-// host" (local) + registered non-local hosts + a trailing "All hosts"
-// (value = ALL_HOSTS) option, absorbing what used to be page-local
+// host" (local) + "All hosts" (value = ALL_HOSTS) + the registered non-local
+// hosts, absorbing what used to be page-local
 // host-listing logic duplicated across WorkflowRuns/AgentRuns. Default false
 // keeps the launcher-sheet consumers (LauncherSheet, AgentLauncherSheet)
 // unchanged.
 
 import { useEffect, useState } from 'react';
-import { api, type HostView } from '../lib/api';
+import { api, type HostView, type RegisteredHostView } from '../lib/api';
 import { Select } from './ui/Select';
 
 /** Sentinel host-id meaning "fetch all hosts" (fan-out / no `?host=` param).
@@ -26,8 +28,9 @@ interface Props {
   onChange: (hostId: string) => void;
   disabled?: boolean;
   className?: string;
-  /** Render the "This host" / registered hosts / "All hosts" fan-out list
-   *  instead of the plain registered-hosts list. Default false. */
+  /** Render the fan-out list instead of the plain host list: "This host",
+   *  "All hosts" (value = ALL_HOSTS), then the registered non-local hosts.
+   *  Reads the probe-free `api.getRegisteredHosts()`. Default false. */
   allowAll?: boolean;
   /** Override the default `aria-label` ("Host"). WorkflowRuns passes
    *  "Host filter" to keep its pre-migration label unchanged. */
@@ -42,22 +45,37 @@ export default function HostSelect({
   allowAll = false,
   ariaLabel = 'Host',
 }: Props) {
+  // The All-hosts filter only needs ids and names — the probe-free
+  // `/api/hosts/registered` (spec 2026-10-01 §6.4). The launcher variant keeps
+  // `/api/hosts`: its "(offline)" suffix matters when choosing where to launch.
   const [hosts, setHosts] = useState<HostView[] | null>(null);
+  const [registered, setRegistered] = useState<RegisteredHostView[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .getHosts()
-      .then((hs) => {
-        if (!cancelled) setHosts(hs);
-      })
-      .catch(() => {
-        if (!cancelled) setHosts([]);
-      });
+    if (allowAll) {
+      api
+        .getRegisteredHosts()
+        .then((hs) => {
+          if (!cancelled) setRegistered(hs);
+        })
+        .catch(() => {
+          if (!cancelled) setRegistered([]);
+        });
+    } else {
+      api
+        .getHosts()
+        .then((hs) => {
+          if (!cancelled) setHosts(hs);
+        })
+        .catch(() => {
+          if (!cancelled) setHosts([]);
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [allowAll]);
 
   if (allowAll) {
     return (
@@ -70,7 +88,7 @@ export default function HostSelect({
       >
         <option value="local">This host</option>
         <option value={ALL_HOSTS}>All hosts</option>
-        {(hosts ?? [])
+        {(registered ?? [])
           .filter((h) => h.transport_kind !== 'local')
           .map((h) => (
             <option key={h.id} value={h.id}>

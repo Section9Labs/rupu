@@ -9,7 +9,8 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from '../lib/api';
-import type { SessionSummary, HostView } from '../lib/api';
+import type { SessionSummary } from '../lib/api';
+import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../lib/perHost/testUtils';
 import Sessions from './Sessions';
 
 function LocationProbe() {
@@ -21,21 +22,6 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
-
-const LOCAL_HOST: HostView = {
-  id: 'local',
-  name: 'Local',
-  transport_kind: 'local',
-  status: 'online',
-  active_run_count: 0,
-};
-const REMOTE_HOST: HostView = {
-  id: 'host_prod',
-  name: 'prod',
-  transport_kind: 'http_cp',
-  status: 'online',
-  active_run_count: 1,
-};
 
 const REMOTE_SESSION: SessionSummary = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
@@ -51,7 +37,7 @@ const REMOTE_SESSION: SessionSummary = {
 };
 
 function stubDeps() {
-  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
 }
 
 function renderPage() {
@@ -116,15 +102,13 @@ describe('Sessions — Active/Archived drives fetch', () => {
 });
 
 describe('Sessions host filter — server-driven', () => {
-  it('default fetch is called with host: "local" (fast path, not fan-out)', async () => {
+  it('defaults to All hosts and fetches every registered host with its own host param', async () => {
     stubDeps();
     const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
     renderPage();
-
-    await waitFor(() =>
-      expect(sessionsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' })),
-    );
+    await waitFor(() => expect(callsFor(sessionsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(sessionsSpy, 'host_prod')).toHaveLength(1);
+    expect(screen.getByLabelText('Host filter')).toHaveValue('__all__');
   });
 
   it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
@@ -138,20 +122,15 @@ describe('Sessions host filter — server-driven', () => {
     expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
   });
 
-  it('"All hosts" option fetches without a host param (fan-out branch)', async () => {
+  it('This host fetches only local', async () => {
     stubDeps();
     const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
     renderPage();
-    await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: '__all__' } });
-
-    await waitFor(() => {
-      const calls = sessionsSpy.mock.calls;
-      const lastParams = calls[calls.length - 1]?.[0];
-      expect(lastParams?.host).toBeUndefined();
-    });
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
+    sessionsSpy.mockClear();
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'local' } });
+    await waitFor(() => expect(callsFor(sessionsSpy, 'local')).toHaveLength(1));
+    expect(callsFor(sessionsSpy, 'host_prod')).toHaveLength(0);
   });
 
   it('remote host option fetches with that host id', async () => {
@@ -182,7 +161,10 @@ describe('Sessions host filter — server-driven', () => {
   it('Host column falls back to "local" when host_id is absent', async () => {
     stubDeps();
     const localSession: SessionSummary = { ...REMOTE_SESSION, host_id: undefined };
-    vi.spyOn(api, 'getSessions').mockResolvedValue([localSession]);
+    // Only the local host answers with it: the loader tags a row that lacks
+    // host_id with the slice it came from, so answering every host would
+    // render one copy per host.
+    vi.spyOn(api, 'getSessions').mockImplementation(onlyHost('local', [localSession]));
 
     renderPage();
 
@@ -299,7 +281,7 @@ describe('Sessions — canonical run-table column order', () => {
   });
 
   it('renders a Started cell with relativeTime(created_at)', async () => {
-    // Real timers throughout — usePagedList's polling + testing-library's
+    // Real timers throughout — the per-host list's poll timers + testing-library's
     // waitFor both rely on real timers, so fake system time would hang them.
     // Instead pin `created_at` a known 3 minutes before the real "now".
     const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
@@ -482,5 +464,21 @@ describe('Sessions — codenames', () => {
     fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'cobalt' } });
     await waitFor(() => expect(screen.queryByText('amber-fjord')).not.toBeInTheDocument());
     expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
+  });
+});
+
+describe('Sessions — Find while a host is still loading', () => {
+  it('says who it is waiting on once, not again in the footer', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([{ ...REMOTE_SESSION, host_id: 'local' }]) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
+
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
   });
 });
