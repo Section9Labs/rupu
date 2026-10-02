@@ -13,6 +13,8 @@
 
 **Tech Stack:** Rust (axum, tokio, futures-util `Shared`), React 18 + TypeScript, vitest + @testing-library/react.
 
+**Status:** complete — executed and merged via Section9Labs/rupu#718. Execution deviations are recorded in the spec's §13.
+
 **Spec:** `docs/superpowers/specs/2026-10-01-rupu-cp-progressive-per-host-loading-design.md`. Read it before starting any task. Section numbers below (§N) refer to it.
 
 ## Global Constraints

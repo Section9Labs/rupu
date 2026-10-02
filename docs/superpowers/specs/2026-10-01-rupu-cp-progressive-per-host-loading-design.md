@@ -1,7 +1,7 @@
 # rupu CP — progressive per-host loading for Activity, Usage and ⌘K
 
 - **Date:** 2026-10-01
-- **Status:** design approved in brainstorm; awaiting spec review; implemented on branch `claude/cp-progressive-per-host-loading`
+- **Status:** complete — implemented and merged via Section9Labs/rupu#718 (branch `claude/cp-progressive-per-host-loading`)
 - **Branch:** `claude/cp-progressive-per-host-loading`
 - **Prior art:** the dashboard's per-host load (`web/src/lib/dashboard/useDashboardData.ts`,
   spec `2026-07-30-rupu-dashboard-fleet-strip-design.md`); the `/api/hosts` probe cache

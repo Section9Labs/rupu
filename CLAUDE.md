@@ -34,7 +34,7 @@
 - Finding reports Plan 1 (contract: model, schema, validator, profiles, artifact store, `rupu findings schema`): `docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-1-contract.md`
 - Finding reports Plan 2 (web UI: `/findings/:id` report page, list triage card, Code-tab tabs, workflow-editor `findings_profile`): `docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-2-web-ui.md`
 - Finding reports Plan 3 (exports: `rupu-findings-report` crate, `rupu findings export`, CP download endpoints + web export dialog): `docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-3-exports.md`
-- CP progressive per-host loading spec + plan (Activity/Usage/⌘K load each host independently): `docs/superpowers/specs/2026-10-01-rupu-cp-progressive-per-host-loading-design.md`, `docs/superpowers/plans/2026-10-01-rupu-cp-progressive-per-host-loading.md`
+- CP progressive per-host loading spec + plan (Activity/Usage/⌘K load each host independently; complete, PR #718): `docs/superpowers/specs/2026-10-01-rupu-cp-progressive-per-host-loading-design.md`, `docs/superpowers/plans/2026-10-01-rupu-cp-progressive-per-host-loading.md`
 - Model-limits discovery spec + plan: `docs/superpowers/specs/2026-09-30-rupu-model-limits-discovery-design.md`, `docs/superpowers/plans/2026-09-30-rupu-model-limits-discovery.md`
 - Release-gated CI spec (CI runs once per release, not per PR): `docs/superpowers/specs/2026-10-01-rupu-release-gated-ci-design.md`
 
