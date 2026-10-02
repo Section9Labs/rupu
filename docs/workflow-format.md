@@ -388,8 +388,9 @@ Rules:
   run's coverage stream. The `workspace: sync` delta still carries
   `.rupu/coverage/`, since a coordinator that predates coverage streaming
   gets them no other way; this release's coordinator drops them from a unit's
-  delta when that unit's complete stream arrived and merged, and applies them
-  otherwise (an older host, or a stream that may be incomplete). A stream that
+  delta when that unit's complete stream arrived and merged every line, and
+  applies them otherwise (an older host, or a stream that may be incomplete
+  or had lines it could not read). A stream that
   can't be delivered or merged, or one that may be incomplete, shows a
   `StepWarning` on the step and the unit is not failed; see
   `docs/coverage.md`.
@@ -1136,7 +1137,7 @@ steps:
 
 ### `workspace:`
 
-`workspace: sync` makes the coordinator's workspace available on the remote host and brings file changes back afterward. The default — `workspace:` omitted, or `workspace: none` — keeps the step self-contained: the remote step sees only its rendered prompt plus prior steps' string outputs, no files. Coverage ledgers under `.rupu/coverage/` travel in the run's coverage stream: the coordinator drops them from a unit's returned delta when that unit's complete stream arrived and merged, and applies them from the delta otherwise (an older host, or a stream that may be incomplete).
+`workspace: sync` makes the coordinator's workspace available on the remote host and brings file changes back afterward. The default — `workspace:` omitted, or `workspace: none` — keeps the step self-contained: the remote step sees only its rendered prompt plus prior steps' string outputs, no files. Coverage ledgers under `.rupu/coverage/` travel in the run's coverage stream: the coordinator drops them from a unit's returned delta when that unit's complete stream arrived and merged every line, and applies them from the delta otherwise (an older host, or a stream that may be incomplete or had lines it could not read).
 
 `workspace:` is only meaningful on a remote step (one with `host:` or `distribute:`); setting `sync` on a purely local step is rejected at parse time as author confusion. A workflow-level `defaults.workspace:` sets the fallback used by every remote step that doesn't set its own.
 

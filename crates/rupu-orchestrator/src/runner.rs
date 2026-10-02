@@ -280,12 +280,12 @@ pub trait UnitDispatcher: Send + Sync {
 
     /// `delta` without its `.rupu/coverage/` entries. The runner asks for
     /// this only for a unit whose complete coverage stream arrived with its
-    /// begin line and merged (spec
+    /// begin line and merged every line (spec
     /// 2026-09-30-rupu-remote-findings-transport-design.md §A4): the stream
     /// is then that unit's coverage, and the delta's copy — collected under
     /// the host's scratch path, so keyed to a target the coordinator never
-    /// uses — would only duplicate it. A unit whose stream did not arrive, or
-    /// arrived `Partial`, keeps its delta whole. An `Err` keeps the whole
+    /// uses — would only duplicate it. A unit whose stream did not arrive,
+    /// arrived `Partial`, or had malformed lines keeps its delta whole. An `Err` keeps the whole
     /// delta too: its coverage then lands twice, never lost.
     ///
     /// Deliberately no default (like `HostConnector::unit_coverage`): a
@@ -7290,28 +7290,52 @@ fn take_coverage(r: &mut Result<UnitOutcome, UnitFailure>) -> UnitCoverage {
     std::mem::replace(slot, UnitCoverage::NotLaunched)
 }
 
+/// What a warning adds when the unit returned a workspace-sync delta, which
+/// then keeps its own copy of the unit's coverage.
+const SYNCED_COPY_KEPT: &str = "the unit's workspace-sync delta keeps its own copy";
+/// What a no-stream warning adds when that delta is the only copy.
+const SYNCED_COPY_ONLY: &str =
+    "its findings and coverage arrive only through the unit's workspace-sync delta";
+
+/// Whether a remote unit's result carries a workspace-sync delta — the only
+/// case in which a warning may speak of a synced copy. A failure carries none
+/// (the dispatcher drops a failed unit's delta).
+fn carries_delta(result: &Result<UnitOutcome, UnitFailure>) -> bool {
+    matches!(result, Ok(o) if o.workspace_delta.is_some())
+}
+
 /// Merge a remote unit's coverage into the coordinator workspace (spec
 /// 2026-09-30-rupu-remote-findings-transport-design.md §A4) and surface
 /// anything that went wrong as a `StepWarning`. Never fails the unit.
+/// `synced_delta` ([`carries_delta`]) says whether the unit returned a
+/// workspace-sync delta; only then does a warning mention its copy.
 ///
 /// Returns whether the stream is now the source of truth for the unit's
 /// coverage: a complete [`UnitCoverage::Stream`] that arrived with its begin
-/// line and merged without an error. Only then does the unit's workspace-sync
-/// delta drop its `.rupu/coverage/` ([`delta_to_apply`]). Otherwise the
-/// delta's copy applies as it did before coverage streaming: it is the only
-/// copy when no stream merged, and for a [`UnitCoverage::Partial`] stream it
-/// may hold the findings the short stream lacks — a duplicate under the
-/// host's workspace target is preferred to a loss.
+/// line and merged every line — no error, nothing malformed. Only then does
+/// the unit's workspace-sync delta drop its `.rupu/coverage/`
+/// ([`delta_to_apply`]). Otherwise the delta's copy applies as it did before
+/// coverage streaming: it is the only copy when no stream merged, and for a
+/// [`UnitCoverage::Partial`] stream, or one with lines this coordinator could
+/// not read (a newer host's line kind counts), it may hold what the stream
+/// lacks — a duplicate under the host's workspace target is preferred to a
+/// loss.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_remote_unit_coverage(
     workspace: &Path,
     host: &str,
     coverage: UnitCoverage,
+    synced_delta: bool,
     sink: Option<&Arc<dyn crate::executor::EventSink>>,
     workflow_run_id: &str,
     step_id: &str,
     index: Option<usize>,
 ) -> bool {
-    let warn = |message: String| {
+    let warn = |mut message: String, synced_clause: &str| {
+        if synced_delta {
+            message.push_str("; ");
+            message.push_str(synced_clause);
+        }
         warn!(step = %step_id, host, %message, "remote unit coverage");
         if let Some(sink) = sink {
             sink.emit(
@@ -7328,9 +7352,10 @@ async fn ingest_remote_unit_coverage(
     let (bytes, partial) = match coverage {
         UnitCoverage::NotLaunched => return false,
         UnitCoverage::Unavailable(reason) => {
-            warn(format!(
-                "coverage from host {host} was not collected: {reason}"
-            ));
+            warn(
+                format!("coverage from host {host} was not collected: {reason}"),
+                SYNCED_COPY_ONLY,
+            );
             return false;
         }
         UnitCoverage::Stream(bytes) => (bytes, None),
@@ -7352,13 +7377,12 @@ async fn ingest_remote_unit_coverage(
             let mut message = format!(
                 "no coverage stream arrived from host {host} (no begin line: the host may \
                  predate coverage streaming, or its stream failed to start or was lost in \
-                 transport); its findings and coverage arrive only through the \
-                 workspace-sync delta, when the step syncs"
+                 transport)"
             );
             if let Some(reason) = partial {
                 message.push_str(&format!("; {reason}"));
             }
-            warn(message);
+            warn(message, SYNCED_COPY_ONLY);
             false
         }
         Ok(Ok(r)) => {
@@ -7372,28 +7396,36 @@ async fn ingest_remote_unit_coverage(
                 if r.malformed > 0 {
                     message.push_str(&format!(", {} malformed line(s) skipped", r.malformed));
                 }
-                message.push_str(
-                    "); when the step syncs, its synced copy is kept too, under the host's \
-                     workspace target",
-                );
-                warn(message);
+                message.push(')');
+                warn(message, SYNCED_COPY_KEPT);
                 // Not the source of truth: the delta keeps its coverage.
                 return false;
             }
             if r.malformed > 0 {
-                warn(format!(
-                    "{} malformed coverage line(s) from host {host} were skipped ({} merged)",
-                    r.malformed, r.appended
-                ));
+                warn(
+                    format!(
+                        "{} malformed coverage line(s) from host {host} were skipped ({} merged)",
+                        r.malformed, r.appended
+                    ),
+                    SYNCED_COPY_KEPT,
+                );
+                // What was skipped may be in the delta's copy: keep it.
+                return false;
             }
             true
         }
         Ok(Err(e)) => {
-            warn(format!("merging coverage from host {host} failed: {e}"));
+            warn(
+                format!("merging coverage from host {host} failed: {e}"),
+                SYNCED_COPY_KEPT,
+            );
             false
         }
         Err(e) => {
-            warn(format!("merging coverage from host {host} panicked: {e}"));
+            warn(
+                format!("merging coverage from host {host} panicked: {e}"),
+                SYNCED_COPY_KEPT,
+            );
             false
         }
     }
@@ -7401,7 +7433,7 @@ async fn ingest_remote_unit_coverage(
 
 /// The delta a synced unit contributes to the coordinator workspace: whole,
 /// or without `.rupu/coverage/` when `stream_whole` (the unit's complete
-/// coverage stream merged with its begin line — see
+/// coverage stream merged with its begin line and every line — see
 /// [`ingest_remote_unit_coverage`]). A strip that fails keeps the whole
 /// delta: its coverage then lands a second time under the host's scratch-path
 /// target, which loses nothing.
@@ -7499,11 +7531,14 @@ async fn dispatch_placed_step(
     );
     let mut result = dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await;
     // Merge BEFORE the delta applies: whether a complete stream merged decides
-    // whether the delta keeps its `.rupu/coverage/`.
+    // whether the delta keeps its `.rupu/coverage/`. Only a success's delta
+    // applies here.
+    let synced_delta = matches!(&result, Ok(o) if o.success) && carries_delta(&result);
     let stream_whole = ingest_remote_unit_coverage(
         &opts.workspace_path,
         host,
         take_coverage(&mut result),
+        synced_delta,
         opts.event_sink.as_ref(),
         workflow_run_id,
         &step.id,
@@ -8383,10 +8418,12 @@ async fn run_fanout_step(
                                 .await;
                                 // Merged here, before the step applies its
                                 // units' deltas after the join.
+                                let synced_delta = carries_delta(&result);
                                 let stream_whole = ingest_remote_unit_coverage(
                                     &workspace_path,
                                     &host,
                                     take_coverage(&mut result),
+                                    synced_delta,
                                     event_sink.as_ref(),
                                     &workflow_run_id,
                                     &step_id,
@@ -8515,10 +8552,12 @@ async fn run_fanout_step(
                                             retry_host,
                                         )
                                         .await;
+                                        let retry_synced_delta = carries_delta(&retry_result);
                                         let retry_stream_whole = ingest_remote_unit_coverage(
                                             &workspace_path,
                                             retry_host,
                                             take_coverage(&mut retry_result),
+                                            retry_synced_delta,
                                             event_sink.as_ref(),
                                             &workflow_run_id,
                                             &step_id,

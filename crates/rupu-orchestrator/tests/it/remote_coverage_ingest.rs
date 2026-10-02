@@ -231,12 +231,11 @@ async fn a_stream_without_a_begin_line_is_a_warning() {
         })],
     )
     .await;
-    let events = sink.0.lock().unwrap();
-    assert!(events.iter().any(|e| matches!(
-        e,
-        Event::StepWarning { message, .. }
-            if message.contains("no coverage stream") && message.contains("workspace-sync delta")
-    )));
+    let w = warnings(&sink);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("no coverage stream"), "{w:?}");
+    // No delta came back, so the warning promises none.
+    assert!(!w[0].contains("delta"), "{w:?}");
 }
 
 #[tokio::test]
@@ -495,7 +494,7 @@ async fn a_placed_units_partial_stream_keeps_its_delta_coverage() {
     let w = warnings(&sink);
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(w[0].contains("may be missing"), "{w:?}");
-    assert!(w[0].contains("synced copy"), "{w:?}");
+    assert!(w[0].contains(SYNCED_COPY), "{w:?}");
 }
 
 /// No stream arrived (an older host): the delta's coverage is the only copy,
@@ -669,4 +668,95 @@ async fn a_local_units_artifact_stays_copied() {
         Some(rupu_coverage::report::ArtifactStorage::Copied)
     );
     assert_eq!(a.host, None);
+}
+
+// ── Warnings promise a synced copy only when the unit returned one ──────────
+
+/// What a warning says when the unit's delta keeps its own coverage.
+const SYNCED_COPY: &str = "the unit's workspace-sync delta keeps its own copy";
+/// What a no-stream warning says when the delta is the only copy.
+const DELTA_ONLY: &str = "arrive only through the unit's workspace-sync delta";
+
+fn failed_with(coverage: UnitCoverage) -> Result<UnitOutcome, UnitFailure> {
+    Err(UnitFailure {
+        error: RunError::Provider("poll failed".into()),
+        coverage,
+    })
+}
+
+async fn one_warning(result: Result<UnitOutcome, UnitFailure>) -> (tempfile::TempDir, String) {
+    let (tmp, sink) = run_with(
+        "name: w\nsteps:\n  - id: s\n    agent: sec\n    prompt: p\n    host: host_01R\n    workspace: sync\n    continue_on_error: true\n",
+        Arc::new(SyncByIndex {
+            results: Mutex::new([(0, result)].into()),
+        }),
+    )
+    .await;
+    let w = warnings(&sink);
+    assert_eq!(w.len(), 1, "{w:?}");
+    (tmp, w[0].clone())
+}
+
+/// A failed unit carries no delta (a poll-error or timeout snapshot, or a
+/// terminal failure), so its Partial and no-stream warnings must not promise
+/// a synced copy; a synced success's must.
+#[tokio::test]
+async fn warnings_mention_a_synced_copy_only_when_the_unit_returned_a_delta() {
+    let partial = || UnitCoverage::Partial {
+        bytes: stream_with_finding("f_p"),
+        reason: "read while the unit may still have been running".into(),
+    };
+
+    let (_t, failed_partial) = one_warning(failed_with(partial())).await;
+    assert!(
+        failed_partial.contains("may be missing"),
+        "{failed_partial}"
+    );
+    assert!(!failed_partial.contains("delta"), "{failed_partial}");
+
+    let (_t, synced_partial) = one_warning(synced_ok("src.txt", partial())).await;
+    assert!(synced_partial.contains(SYNCED_COPY), "{synced_partial}");
+
+    let (_t, failed_none) = one_warning(failed_with(UnitCoverage::Stream(Vec::new()))).await;
+    assert!(failed_none.contains("no coverage stream"), "{failed_none}");
+    assert!(!failed_none.contains("delta"), "{failed_none}");
+
+    let (_t, synced_none) =
+        one_warning(synced_ok("src.txt", UnitCoverage::Stream(Vec::new()))).await;
+    assert!(synced_none.contains(DELTA_ONLY), "{synced_none}");
+
+    let (_t, failed_unavailable) =
+        one_warning(failed_with(UnitCoverage::Unavailable("down".into()))).await;
+    assert!(
+        !failed_unavailable.contains("delta"),
+        "{failed_unavailable}"
+    );
+
+    let (_t, synced_unavailable) = one_warning(synced_ok(
+        "src.txt",
+        UnitCoverage::Unavailable("down".into()),
+    ))
+    .await;
+    assert!(
+        synced_unavailable.contains(DELTA_ONLY),
+        "{synced_unavailable}"
+    );
+}
+
+/// A complete stream with malformed lines (a newer host's unknown line kind
+/// counts as one) merged only part of the unit's coverage: the delta keeps
+/// its copy, and the malformed warning says so.
+#[tokio::test]
+async fn a_stream_with_malformed_lines_keeps_its_delta_coverage() {
+    let mut bytes = stream_with_finding("f_malformed");
+    bytes.extend_from_slice(b"{\"ledger\":\"from_the_future\",\"scope_name\":\"sec\"}\n");
+    let (tmp, w) = one_warning(synced_ok("src.txt", UnitCoverage::Stream(bytes))).await;
+    assert_eq!(findings_in(tmp.path())[0].id, "f_malformed");
+    assert!(w.contains("1 malformed coverage line(s)"), "{w}");
+    assert!(w.contains(SYNCED_COPY), "{w}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(SCRATCH_COVERAGE)).unwrap(),
+        "{}\n",
+        "malformed lines: the delta's coverage must not be stripped"
+    );
 }

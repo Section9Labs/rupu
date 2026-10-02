@@ -143,7 +143,7 @@ fn stage_tar(payload: &Payload, scratch_dir: &Path) -> Result<Baseline, SyncErro
 /// 2026-09-30-rupu-remote-findings-transport-design.md §A4). Collection still
 /// carries them — the host cannot know whether the coordinator ingests that
 /// stream (an older one does not, and the delta is then its only copy) — and
-/// a coordinator that merged the unit's complete stream drops them with
+/// a coordinator that merged the unit's complete stream in full drops them with
 /// [`Delta::without_coverage`]: carried through, they would land under a
 /// target id derived from the host's scratch path.
 const DELTA_EXCLUDED_PREFIX: &str = ".rupu/coverage/";

@@ -230,13 +230,15 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
     been running (the coordinator's poll failed after it saw the run, or its
     wall-clock budget ran out), or an SSH host's final copy of it did not
     arrive. It is merged, and the warning says findings recorded after it was
-    collected may be missing — and, for a synced step, that the delta's copy
-    was kept too, under the host's workspace target.
+    collected may be missing.
 
   With `workspace: sync` the unit's returned delta still carries its
   `.rupu/coverage/`: the coordinator drops it when the unit's complete stream
-  arrived and merged, and applies it when no stream arrived or the stream may
-  be incomplete (a duplicate beats a loss). A standalone run that
+  arrived and merged every line, and applies it otherwise — no stream, a
+  stream that may be incomplete, or one with lines it could not read (a
+  duplicate beats a loss). A failed unit returns no delta. When a unit did
+  return one, the warning says whether the delta keeps its own copy or is
+  the only one. A standalone run that
   never finished (no `run.json`) leaves `runs/<run_id>/` holding only its
   stream; it follows the run's transcript — `rupu transcript archive` moves
   it to `runs-archive/`, and `transcript delete`, `transcript prune` and
