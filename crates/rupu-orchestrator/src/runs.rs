@@ -305,6 +305,18 @@ pub struct RunRecord {
     /// Cleared by [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_approver: Option<String>,
+    /// When the gate sweep last asked the resume worker for a runner for
+    /// gate decisions recorded on this run that no runner was applying
+    /// ([`RunStore::request_runner_for_stranded_decisions`]). The marker
+    /// that request sets is consumed at the worker's spawn, so this is the
+    /// one durable trace of the attempt: the next re-request waits a
+    /// [`RunStore::RESUME_LEASE`] from the later of this and the newest
+    /// decision — at most one spawned runner per lease per stranded run,
+    /// however long the config stays broken. Never cleared: once the
+    /// decisions are applied it is moot, and a decision recorded later is
+    /// newer than it. `None` for every record that was never re-requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_rerequested_at: Option<DateTime<Utc>>,
     /// Cleanup-pending marker (I-35): set by [`RunStore::reject_gate`]'s
     /// explicit-reject branch whenever it finalizes the run `Rejected`,
     /// naming the gate whose `on_reject` chain still needs to run. Mirrors
@@ -3264,34 +3276,44 @@ impl RunStore {
     /// retries them. Under the run lock, on the record as it is now: when
     /// the run is `Running` or `AwaitingApproval` with a decision recorded,
     /// has no live runner ([`live_runner`](Self::live_runner)), no marker
-    /// and no live claim, and its newest decision is older than
-    /// [`RESUME_LEASE`](Self::RESUME_LEASE) — the time a spawned runner is
-    /// given to claim the run — the marker is set (approver `"sweep"`, no
-    /// gate and no mode: the decisions carry their own) and this is
-    /// `Ok(true)`; otherwise nothing is written and it is `Ok(false)`. A
-    /// `Paused` run is never re-requested: the operator paused it. The
-    /// wait blocks its thread: async callers go through
-    /// [`RunStore::blocking`].
+    /// and no live claim, and a [`RESUME_LEASE`](Self::RESUME_LEASE) — the
+    /// time a spawned runner is given to claim the run — has passed since
+    /// the later of its newest decision and its last re-request
+    /// (`resume_rerequested_at`), the marker is set (approver `"sweep"`, no
+    /// gate and no mode: the decisions carry their own), the attempt is
+    /// stamped on the record, and this is `Ok(true)`; otherwise nothing is
+    /// written and it is `Ok(false)`. So a run is re-requested at most once
+    /// per lease: the worker consumes the marker at its spawn, and a child
+    /// that dies again is not retried until the next lease. A `Paused` run
+    /// is never re-requested: the operator paused it. The wait blocks its
+    /// thread: async callers go through [`RunStore::blocking`].
     pub fn request_runner_for_stranded_decisions(
         &self,
         run_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, RunStoreError> {
         let _lock = self.lock_run_json(run_id);
-        let record = self.load(run_id)?;
-        let newest_decision = record.gate_decisions.iter().map(|d| d.decided_at).max();
+        let mut record = self.load(run_id)?;
+        let last_activity = record
+            .gate_decisions
+            .iter()
+            .map(|d| d.decided_at)
+            .chain(record.resume_rerequested_at)
+            .max();
         let stranded = matches!(
             record.status,
             RunStatus::Running | RunStatus::AwaitingApproval
-        ) && record.resume_requested_at.is_none()
+        ) && !record.gate_decisions.is_empty()
+            && record.resume_requested_at.is_none()
             && record
                 .resume_claimed_at
                 .is_none_or(|at| now - at > Self::RESUME_LEASE)
-            && newest_decision.is_some_and(|at| now - at > Self::RESUME_LEASE)
+            && last_activity.is_some_and(|at| now - at > Self::RESUME_LEASE)
             && self.live_runner(&record).is_none();
         if !stranded {
             return Ok(false);
         }
+        record.resume_rerequested_at = Some(now);
         self.mark_resume_requested(record, "sweep", None, None, now)?;
         Ok(true)
     }
@@ -4063,6 +4085,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             final_output: None,
@@ -6985,6 +7008,74 @@ mod tests {
             store.request_runner_for_stranded_decisions("run_missing", now),
             Err(RunStoreError::NotFound(_))
         ));
+    }
+
+    /// A re-request stamps the attempt on the record, and the next one
+    /// waits a lease from the later of that stamp and the newest decision:
+    /// after the worker consumed the marker and its child died, calls
+    /// within the lease write nothing; a call after it re-requests again —
+    /// and a decision older than the last attempt does not shorten the
+    /// wait.
+    #[test]
+    fn request_runner_for_stranded_decisions_waits_a_lease_from_the_last_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let lease = RunStore::RESUME_LEASE;
+        let mut rec = sample_record("run_stranded_backoff");
+        rec.status = RunStatus::Running;
+        rec.gate_decisions = vec![GateDecision {
+            step_id: "gate".into(),
+            verdict: GateVerdict::Rejected,
+            via: "timeout".into(),
+            approver: None,
+            reason: Some("timed out".into()),
+            decided_at: now - lease - chrono::Duration::seconds(1),
+        }];
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(store
+            .request_runner_for_stranded_decisions(&rec.id, now)
+            .unwrap());
+        let first = store.load(&rec.id).unwrap();
+        assert_eq!(
+            first.resume_rerequested_at,
+            Some(now),
+            "the attempt is stamped"
+        );
+        assert_eq!(first.resume_requested_at, Some(now));
+
+        // The worker consumes the marker; the child dies without claiming.
+        assert!(store.claim_resume(&rec.id, "worker", now).unwrap());
+        assert!(store.clear_resume_if_marked_at(&rec.id, Some(now)).unwrap());
+
+        // Within the lease of the attempt: nothing, however old the decision.
+        for later in [
+            now + chrono::Duration::seconds(1),
+            now + chrono::Duration::minutes(1),
+            now + lease,
+        ] {
+            assert!(
+                !store
+                    .request_runner_for_stranded_decisions(&rec.id, later)
+                    .unwrap(),
+                "{later}"
+            );
+            let kept = store.load(&rec.id).unwrap();
+            assert_eq!(kept.resume_requested_at, None);
+            assert_eq!(kept.resume_rerequested_at, Some(now), "the stamp stays");
+        }
+
+        // Past the lease: re-requested, and the stamp moves.
+        let retry_at = now + lease + chrono::Duration::seconds(1);
+        assert!(store
+            .request_runner_for_stranded_decisions(&rec.id, retry_at)
+            .unwrap());
+        let second = store.load(&rec.id).unwrap();
+        assert_eq!(second.resume_rerequested_at, Some(retry_at));
+        assert_eq!(second.resume_requested_at, Some(retry_at));
+        assert_eq!(second.resume_approver.as_deref(), Some("sweep"));
+        assert_eq!(second.gate_decisions.len(), 1, "the decision is untouched");
     }
 
     /// `modify_fields` writes its fields onto the record whatever its

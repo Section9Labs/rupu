@@ -273,6 +273,7 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         resume_mode: None,
         resume_gate_id: None,
         resume_approver: None,
+        resume_rerequested_at: None,
         reject_cleanup_pending: None,
         permission_mode: None,
         active_step_transcript_path: None,
