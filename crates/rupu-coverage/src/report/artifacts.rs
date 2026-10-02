@@ -33,7 +33,7 @@ pub enum ArtifactError {
         #[source]
         source: std::io::Error,
     },
-    #[error("the report lists artifacts but no artifact store is configured for this run")]
+    #[error("the report names artifact or evidence-block files but no artifact store is configured for this run")]
     NoStore,
     #[error("the requested artifacts expand to more than {max} files (`[findings].artifact_max_files` = {max}); list specific files instead of large directories")]
     TooManyFiles { max: usize },

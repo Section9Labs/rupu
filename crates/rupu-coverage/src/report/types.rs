@@ -310,7 +310,16 @@ impl EvidenceBlock {
             EvidenceBlock::Image { artifact, .. }
             | EvidenceBlock::Hexdump { artifact, .. }
             | EvidenceBlock::PcapRef { artifact, .. } => Some(artifact),
-            _ => None,
+            // Listed, not `_`: a new file-bearing kind must fail to compile
+            // here rather than silently skip verification.
+            EvidenceBlock::Text { .. }
+            | EvidenceBlock::CodeSlice { .. }
+            | EvidenceBlock::Diff { .. }
+            | EvidenceBlock::Table { .. }
+            | EvidenceBlock::Disasm { .. }
+            | EvidenceBlock::Decompile { .. }
+            | EvidenceBlock::HttpExchange { .. }
+            | EvidenceBlock::ScanOutput { .. } => None,
         }
     }
 
@@ -319,7 +328,16 @@ impl EvidenceBlock {
             EvidenceBlock::Image { artifact, .. }
             | EvidenceBlock::Hexdump { artifact, .. }
             | EvidenceBlock::PcapRef { artifact, .. } => Some(artifact),
-            _ => None,
+            // Listed, not `_`: a new file-bearing kind must fail to compile
+            // here rather than silently skip verification.
+            EvidenceBlock::Text { .. }
+            | EvidenceBlock::CodeSlice { .. }
+            | EvidenceBlock::Diff { .. }
+            | EvidenceBlock::Table { .. }
+            | EvidenceBlock::Disasm { .. }
+            | EvidenceBlock::Decompile { .. }
+            | EvidenceBlock::HttpExchange { .. }
+            | EvidenceBlock::ScanOutput { .. } => None,
         }
     }
 }
