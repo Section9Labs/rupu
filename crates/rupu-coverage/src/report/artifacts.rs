@@ -8,9 +8,14 @@
 //! One report's artifacts are bounded ([`IngestLimits`]): every requested
 //! path is resolved and expanded first, and the whole set is refused if it
 //! is too many files, or if the files that would be copied into the store add
-//! up to too many bytes, before a single byte is copied. A file over the
-//! per-file cap is only hashed and recorded by reference, so it never counts
-//! toward the total and never causes a refusal.
+//! up to too many bytes, before a single byte is copied by that call. A file
+//! over the per-file cap is only hashed and recorded by reference, so it
+//! never counts toward the total and never causes a refusal.
+//!
+//! The guarantee is per call: `report.artifacts` goes through one call, and
+//! each evidence-block file through its own against what is left, so a later
+//! block file can still be refused after earlier files were copied. Those
+//! blobs are content-addressed and unreferenced; a retry reuses them.
 
 use crate::report::types::{ArtifactKind, ArtifactRef, ArtifactStorage};
 use crate::report::validate::rel_path_problem;

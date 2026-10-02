@@ -649,10 +649,12 @@ fn open_verified(
     Ok(file)
 }
 
-/// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact the
-/// finding's report references.
+/// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact or
+/// evidence-block file the finding's report references.
 ///
-/// Only artifacts listed in the finding's own `report.artifacts` are served, so
+/// Only artifacts or evidence-block files the finding itself references
+/// (`FindingReport::artifact_refs`: `report.artifacts` plus the files its
+/// `image`/`hexdump`/`pcap_ref` blocks name) are served, so
 /// a request to THIS endpoint can reach only a blob some finding in the ledger
 /// references (the host blob endpoint, `get_artifact_blob`, serves any stored
 /// blob by hash behind the CP token, for coordinator pulls). That limits
@@ -660,8 +662,10 @@ fn open_verified(
 /// agent-writable workspace, so a forged ledger line can list any blob whose
 /// sha256 is already known — in this store, or in the store of the registered
 /// host it names. Artifacts are never rendered as HTML: text is `text/plain`
-/// inline, anything else an `application/octet-stream` attachment, always
-/// `nosniff` and `Content-Security-Policy: sandbox`.
+/// inline, a raster image (PNG/JPEG/GIF/WebP, recognised by its magic bytes,
+/// never by name) is inline as its `image/*` type, anything else an
+/// `application/octet-stream` attachment; always `nosniff` and
+/// `Content-Security-Policy: sandbox`.
 ///
 /// Where the bytes come from (spec
 /// 2026-09-30-rupu-remote-findings-transport-design.md §B2):

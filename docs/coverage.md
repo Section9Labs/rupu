@@ -204,14 +204,18 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A larger file is recorded `stored: external` with its path, size, and sha256.
 - A directory expands to the files inside it, each handled by the same rule.
   Symlinks inside a directory are skipped.
-- One report's artifacts are bounded before anything is copied: at most
+- One report's `artifacts` are bounded before any of them is copied: at most
   `[findings].artifact_max_files` files (default 500), and the files that
   will be copied into the store may add up to at most
   `[findings].artifact_total_max_bytes` bytes (default 2 GiB). A file over
   `artifact_max_bytes` is recorded by reference and does not count toward
   that total, so it never rejects the finding. A larger set rejects the
   finding with the count or total named; list specific files instead of
-  large directories.
+  large directories. The check is per call: files named by evidence blocks
+  are ingested afterwards, against what is left of the same limits, so a
+  later block file can still be refused after earlier files were copied.
+  Those copies are unreferenced, content-addressed blobs; a retry reuses
+  them rather than storing them again.
 - A path that escapes the workspace, names the workspace root itself (`.`),
   does not exist, or names something other than a regular file (a device,
   socket, or the like) rejects the finding, so a typo is not silently dropped.
@@ -259,7 +263,7 @@ stored without a hash.
 #### Downloading artifacts
 
 `GET /api/findings/:id/artifacts/:sha256` returns an artifact's bytes. The sha
-must be one of that finding's artifacts. A blob already in this control plane's
+must be one of that finding's artifacts or evidence-block files. A blob already in this control plane's
 store is served directly. An `external` artifact with a `host` is pulled from
 that host on first download and then kept in this store. How the host delivers
 it depends on the transport:
