@@ -4740,6 +4740,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-fleet"
+version = "0.81.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rupu-mcp"
 version = "0.81.0"
 dependencies = [
