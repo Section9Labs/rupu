@@ -229,6 +229,26 @@ mod tests {
         async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
             self.inner.list_worker_info().await
         }
+        async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+            self.inner.artifact_exists(sha256).await
+        }
+        async fn put_artifact_file(
+            &self,
+            sha256: &str,
+            src: &std::path::Path,
+        ) -> Result<(), BucketError> {
+            self.inner.put_artifact_file(sha256, src).await
+        }
+        async fn get_artifact_to_file(
+            &self,
+            sha256: &str,
+            dest: &std::path::Path,
+            max_bytes: u64,
+        ) -> Result<(), BucketError> {
+            self.inner
+                .get_artifact_to_file(sha256, dest, max_bytes)
+                .await
+        }
     }
 
     /// The node writes its last result object and then the finished marker. A

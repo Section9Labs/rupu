@@ -21,9 +21,23 @@ use object_store::{
 
 use super::{
     BucketError, Bucket,
-    key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
+    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
     prefix_control, prefix_results,
 };
+
+// ── artifact transfer tuning ──────────────────────────────────────────────────
+
+/// Size of one multipart upload part (S3's minimum for all but the last).
+const ARTIFACT_PART_BYTES: usize = 5 << 20;
+
+/// Upload parts in flight at once. Reading local disk outruns any uplink, so
+/// without a bound the whole blob is buffered and every part starts at once —
+/// each then racing the HTTP client's per-request timeout on a slow link.
+const ARTIFACT_UPLOAD_IN_FLIGHT: usize = 4;
+
+/// Size of one ranged read when downloading. Each range is its own request
+/// with its own timeout, so a large blob on a slow link still completes.
+const ARTIFACT_RANGE_BYTES: u64 = 8 << 20;
 
 // ── struct ────────────────────────────────────────────────────────────────────
 
@@ -106,6 +120,183 @@ impl ObjectStoreBucket {
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(BucketError::Io(e.to_string())),
         }
+    }
+
+    /// Stream `src` to `artifacts/<sha256>` as a multipart upload of
+    /// `part_bytes` parts, at most `max_in_flight` of them uploading at once.
+    ///
+    /// Driven through [`object_store::MultipartUpload`] directly rather than
+    /// `WriteMultipart`: its `finish` drops the upload without aborting when a
+    /// part failed, which leaves orphaned parts in the bucket. Here every
+    /// failure — a read, a part, the completion — aborts the upload (the
+    /// abort's own error is ignored) and returns the original error.
+    async fn upload_artifact_file(
+        &self,
+        sha256: &str,
+        src: &std::path::Path,
+        part_bytes: usize,
+        max_in_flight: usize,
+    ) -> Result<(), BucketError> {
+        let read_err =
+            |e: std::io::Error| BucketError::Io(format!("reading artifact {sha256}: {e}"));
+        let store_err = |e: object_store::Error| BucketError::Io(e.to_string());
+        // Open BEFORE starting the upload, so a source that can't be read
+        // leaves nothing half-created in the bucket. The store is a
+        // directory the run's agents can influence: a FIFO swapped in for a
+        // blob must not park the worker's drain loop on the open, so this
+        // refuses anything but a regular file (the tunnel's pull opens its
+        // blobs the same way).
+        let owned = src.to_path_buf();
+        let file =
+            tokio::task::spawn_blocking(move || crate::api::fs_open::open_regular_file(&owned))
+                .await
+                .map_err(|e| BucketError::Io(format!("opening artifact {sha256}: {e}")))?
+                .map_err(read_err)?;
+        let mut f = tokio::fs::File::from_std(file);
+
+        // Up to one part off the file; shorter than `part_bytes` means EOF.
+        let first = Self::read_part(&mut f, part_bytes)
+            .await
+            .map_err(read_err)?;
+        let path = self.path(&key_artifact(sha256));
+        if first.len() < part_bytes {
+            // The whole blob (possibly none of it) fits one part: a plain PUT.
+            // No multipart to orphan, and S3 can't complete a zero-part one.
+            self.store
+                .put(&path, PutPayload::from(Bytes::from(first)))
+                .await
+                .map_err(store_err)?;
+            return Ok(());
+        }
+
+        let mut upload = self.store.put_multipart(&path).await.map_err(store_err)?;
+        let mut parts: tokio::task::JoinSet<object_store::Result<()>> = Default::default();
+        let sent = async {
+            let mut chunk = first;
+            loop {
+                let last = chunk.len() < part_bytes;
+                // Back pressure: wait for a slot before starting another part,
+                // so the file is read no faster than the uplink takes it.
+                while parts.len() >= max_in_flight.max(1) {
+                    Self::join_part(&mut parts).await?;
+                }
+                parts.spawn(upload.put_part(PutPayload::from(Bytes::from(chunk))));
+                if last {
+                    return Ok(());
+                }
+                chunk = Self::read_part(&mut f, part_bytes)
+                    .await
+                    .map_err(read_err)?;
+                if chunk.is_empty() {
+                    // The file ended exactly on a part boundary.
+                    return Ok(());
+                }
+            }
+        }
+        .await;
+        // Every outstanding part, then the completion.
+        let sent = match sent {
+            Ok(()) => {
+                let mut done = Ok(());
+                while !parts.is_empty() {
+                    if let Err(e) = Self::join_part(&mut parts).await {
+                        done = Err(e);
+                        break;
+                    }
+                }
+                match done {
+                    Ok(()) => upload.complete().await.map(|_| ()).map_err(store_err),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
+            // Stop the parts still uploading, then drop what was uploaded.
+            parts.shutdown().await;
+            let _ = upload.abort().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Up to `part_bytes` from `f`: fewer only at end of file.
+    async fn read_part(f: &mut tokio::fs::File, part_bytes: usize) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(part_bytes);
+        f.take(part_bytes as u64).read_to_end(&mut buf).await?;
+        Ok(buf)
+    }
+
+    /// Wait for the next upload part to finish.
+    async fn join_part(
+        parts: &mut tokio::task::JoinSet<object_store::Result<()>>,
+    ) -> Result<(), BucketError> {
+        match parts.join_next().await {
+            None | Some(Ok(Ok(()))) => Ok(()),
+            Some(Ok(Err(e))) => Err(BucketError::Io(e.to_string())),
+            Some(Err(e)) => Err(BucketError::Io(format!("artifact upload part: {e}"))),
+        }
+    }
+
+    /// Download `artifacts/<sha256>` into `dest` as ranged reads of at most
+    /// `range_bytes` each (one request per range, so a slow link never trips
+    /// the whole-request timeout a single big GET would), refusing an object
+    /// over `max_bytes` before anything is read or `dest` is created.
+    async fn download_artifact_to_file(
+        &self,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+        range_bytes: u64,
+    ) -> Result<(), BucketError> {
+        use tokio::io::AsyncWriteExt;
+        let io = |e: std::io::Error| BucketError::Io(format!("local write failed: {e}"));
+        let too_big = || {
+            BucketError::Io(format!(
+                "artifact {sha256} exceeds its recorded {max_bytes} bytes"
+            ))
+        };
+        let not_found = || BucketError::NotFound(key_artifact(sha256));
+        let path = self.path(&key_artifact(sha256));
+        let size = match self.store.head(&path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Err(not_found()),
+            Err(e) => return Err(BucketError::Io(e.to_string())),
+        };
+        if size > max_bytes {
+            return Err(too_big());
+        }
+        let mut file = tokio::fs::File::create(dest).await.map_err(io)?;
+        let mut written: u64 = 0;
+        while written < size {
+            let end = size.min(written + range_bytes.max(1));
+            let chunk = match self.store.get_range(&path, written..end).await {
+                Ok(c) => c,
+                Err(object_store::Error::NotFound { .. }) => return Err(not_found()),
+                Err(e) => return Err(BucketError::Io(e.to_string())),
+            };
+            if chunk.len() as u64 != end - written {
+                return Err(BucketError::Io(format!(
+                    "artifact {sha256}: short read of bytes {written}..{end} \
+                     (got {} bytes)",
+                    chunk.len()
+                )));
+            }
+            written += chunk.len() as u64;
+            if written > max_bytes {
+                return Err(too_big());
+            }
+            file.write_all(&chunk).await.map_err(io)?;
+        }
+        file.flush().await.map_err(io)?;
+        // Every byte the object holds, no fewer.
+        if written != size {
+            return Err(BucketError::Io(format!(
+                "artifact {sha256}: wrote {written} of {size} bytes"
+            )));
+        }
+        Ok(())
     }
 
     /// List all objects under `dir_path` and collect into a `Vec<object_store::ObjectMeta>`.
@@ -288,6 +479,29 @@ impl Bucket for ObjectStoreBucket {
         }
         Ok(out)
     }
+
+    async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+        self.exists(&self.path(&key_artifact(sha256))).await
+    }
+
+    async fn put_artifact_file(
+        &self,
+        sha256: &str,
+        src: &std::path::Path,
+    ) -> Result<(), BucketError> {
+        self.upload_artifact_file(sha256, src, ARTIFACT_PART_BYTES, ARTIFACT_UPLOAD_IN_FLIGHT)
+            .await
+    }
+
+    async fn get_artifact_to_file(
+        &self,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<(), BucketError> {
+        self.download_artifact_to_file(sha256, dest, max_bytes, ARTIFACT_RANGE_BYTES)
+            .await
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -352,6 +566,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_put_exists_get_roundtrip_and_cap() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, b"artifact!").unwrap();
+        let sha = "ab".repeat(32);
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+        b.put_artifact_file(&sha, &src).await.unwrap();
+        assert!(b.artifact_exists(&sha).await.unwrap());
+        let dest = tmp.path().join("out");
+        b.get_artifact_to_file(&sha, &dest, 9).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"artifact!");
+        // Over the cap is refused up front: nothing is written, and `dest`
+        // is not even created.
+        let capped = tmp.path().join("capped");
+        assert!(matches!(
+            b.get_artifact_to_file(&sha, &capped, 8).await,
+            Err(BucketError::Io(m)) if m.contains("exceeds its recorded 8 bytes")
+        ));
+        assert!(!capped.exists(), "the early size refusal created dest");
+        let absent = tmp.path().join("absent");
+        assert!(matches!(
+            b.get_artifact_to_file(&"cd".repeat(32), &absent, 9).await,
+            Err(BucketError::NotFound(_))
+        ));
+        assert!(!absent.exists());
+    }
+
+    /// A blob bigger than one read buffer round-trips byte-for-byte (the
+    /// upload is streamed in pieces, not read whole).
+    #[tokio::test]
+    async fn artifact_larger_than_one_buffer_roundtrips() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let body: Vec<u8> = (0..(3 << 20) + 17).map(|i| (i % 251) as u8).collect();
+        let src = tmp.path().join("big");
+        std::fs::write(&src, &body).unwrap();
+        let sha = "12".repeat(32);
+        b.put_artifact_file(&sha, &src).await.unwrap();
+        let dest = tmp.path().join("big.out");
+        b.get_artifact_to_file(&sha, &dest, body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // Exactly one byte under the real size is over the cap.
+        assert!(b
+            .get_artifact_to_file(&sha, &dest, body.len() as u64 - 1)
+            .await
+            .is_err());
+    }
+
+    /// Artifacts live under `artifacts/`, not under jobs/results/nodes, so
+    /// they don't show up in any of the run-scoped listings.
+    #[tokio::test]
+    async fn artifacts_do_not_pollute_other_listings() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, b"x").unwrap();
+        b.put_artifact_file(&"ab".repeat(32), &src).await.unwrap();
+        assert!(b.list_jobs().await.unwrap().is_empty());
+        assert!(b.list_worker_info().await.unwrap().is_empty());
+        assert!(b.list_results("run_1").await.unwrap().is_empty());
+    }
+
+    /// The upload opens its source without ever parking the worker: a FIFO
+    /// where a blob should be is refused, and no upload is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_upload_refuses_a_fifo_source_without_blocking() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("fifo");
+        if !crate::api::fs_open::test_support::mkfifo(&fifo) {
+            return;
+        }
+        let sha = "fe".repeat(32);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            b.put_artifact_file(&sha, &fifo),
+        )
+        .await
+        .expect("opening a FIFO blocked the upload");
+        assert!(matches!(res, Err(BucketError::Io(_))), "{res:?}");
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+    }
+
+    /// A source that isn't there is an error, not an empty upload.
+    #[tokio::test]
+    async fn artifact_upload_of_a_missing_source_fails_and_uploads_nothing() {
+        let b = mem_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "ee".repeat(32);
+        assert!(b
+            .put_artifact_file(&sha, &tmp.path().join("absent"))
+            .await
+            .is_err());
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn finished_marker_roundtrip() {
         let b = mem_bucket();
         assert_eq!(b.get_finished("run_1").await.unwrap(), None);
@@ -359,6 +674,398 @@ mod tests {
         assert_eq!(
             b.get_finished("run_1").await.unwrap().as_deref(),
             Some("completed")
+        );
+    }
+
+    // ── instrumented store: concurrency, abort, ranged reads ─────────────────
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    /// What a [`SpyStore`] saw, and what it should break.
+    #[derive(Debug)]
+    struct Spy {
+        /// `put_part` futures currently running / the most at once.
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        parts: AtomicUsize,
+        completed: AtomicUsize,
+        aborted: AtomicUsize,
+        /// The Nth `put_part` (0-based) fails; `usize::MAX` = none.
+        fail_part: AtomicUsize,
+        fail_complete: AtomicBool,
+        /// Ranged reads asked for, in order, and whole-object reads.
+        ranges: std::sync::Mutex<Vec<std::ops::Range<u64>>>,
+        full_gets: AtomicUsize,
+        /// Answer every ranged read one byte short.
+        short_reads: AtomicBool,
+    }
+
+    impl Spy {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                parts: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+                aborted: AtomicUsize::new(0),
+                fail_part: AtomicUsize::new(usize::MAX),
+                fail_complete: AtomicBool::new(false),
+                ranges: Default::default(),
+                full_gets: AtomicUsize::new(0),
+                short_reads: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SpyStore {
+        inner: object_store::memory::InMemory,
+        spy: Arc<Spy>,
+    }
+
+    impl std::fmt::Display for SpyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SpyStore")
+        }
+    }
+
+    #[derive(Debug)]
+    struct SpyUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        spy: Arc<Spy>,
+    }
+
+    fn spy_err(what: &'static str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "spy",
+            source: what.into(),
+        }
+    }
+
+    #[async_trait]
+    impl object_store::MultipartUpload for SpyUpload {
+        fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+            let n = self.spy.parts.fetch_add(1, SeqCst);
+            let spy = Arc::clone(&self.spy);
+            let part = self.inner.put_part(data);
+            Box::pin(async move {
+                let now = spy.in_flight.fetch_add(1, SeqCst) + 1;
+                spy.max_in_flight.fetch_max(now, SeqCst);
+                // Long enough that unbounded parts would overlap.
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                let r = if n == spy.fail_part.load(SeqCst) {
+                    Err(spy_err("part failed"))
+                } else {
+                    part.await
+                };
+                spy.in_flight.fetch_sub(1, SeqCst);
+                r
+            })
+        }
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            if self.spy.fail_complete.load(SeqCst) {
+                return Err(spy_err("complete failed"));
+            }
+            self.spy.completed.fetch_add(1, SeqCst);
+            self.inner.complete().await
+        }
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.spy.aborted.fetch_add(1, SeqCst);
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for SpyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            let inner = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(SpyUpload {
+                inner,
+                spy: Arc::clone(&self.spy),
+            }))
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            mut options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            match &options.range {
+                Some(object_store::GetRange::Bounded(r)) => {
+                    self.spy.ranges.lock().unwrap().push(r.clone());
+                    if self.spy.short_reads.load(SeqCst) && r.end - r.start > 1 {
+                        options.range = Some(object_store::GetRange::Bounded(r.start..r.end - 1));
+                    }
+                }
+                None if !options.head => {
+                    self.spy.full_gets.fetch_add(1, SeqCst);
+                }
+                _ => {}
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn spy_bucket() -> (ObjectStoreBucket, Arc<Spy>) {
+        let spy = Spy::new();
+        let store = SpyStore {
+            inner: object_store::memory::InMemory::new(),
+            spy: Arc::clone(&spy),
+        };
+        (
+            ObjectStoreBucket::new(Arc::new(store), "test-prefix/host_1"),
+            spy,
+        )
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Upload parts are produced no faster than the uplink takes them: with
+    /// many parts in the blob, never more than the limit are in flight (an
+    /// unbounded writer would buffer the whole blob and start every part at
+    /// once, each then racing the client's per-request timeout).
+    #[tokio::test]
+    async fn artifact_upload_bounds_in_flight_parts() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let body = patterned(24 * 1024);
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, &body).unwrap();
+        let sha = "34".repeat(32);
+
+        b.upload_artifact_file(&sha, &src, 1024, 3).await.unwrap();
+
+        assert_eq!(spy.parts.load(SeqCst), 24);
+        let max = spy.max_in_flight.load(SeqCst);
+        assert!((2..=3).contains(&max), "max in flight {max}");
+        assert_eq!(spy.completed.load(SeqCst), 1);
+        assert_eq!(spy.aborted.load(SeqCst), 0);
+        let dest = tmp.path().join("out");
+        b.get_artifact_to_file(&sha, &dest, body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    /// A failed part aborts the multipart upload (no orphaned parts, nothing
+    /// visible at the key) and surfaces the part's error.
+    #[tokio::test]
+    async fn artifact_upload_aborts_when_a_part_fails() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, patterned(16 * 1024)).unwrap();
+        let sha = "56".repeat(32);
+        spy.fail_part.store(5, SeqCst);
+
+        let err = b
+            .upload_artifact_file(&sha, &src, 1024, 3)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("part failed"), "{err}");
+        assert_eq!(spy.aborted.load(SeqCst), 1, "the upload was not aborted");
+        assert_eq!(spy.completed.load(SeqCst), 0);
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+    }
+
+    /// A failed completion aborts too, exactly once.
+    #[tokio::test]
+    async fn artifact_upload_aborts_when_completion_fails() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, patterned(4 * 1024)).unwrap();
+        let sha = "78".repeat(32);
+        spy.fail_complete.store(true, SeqCst);
+
+        let err = b
+            .upload_artifact_file(&sha, &src, 1024, 3)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("complete failed"), "{err}");
+        assert_eq!(spy.aborted.load(SeqCst), 1);
+        assert!(!b.artifact_exists(&sha).await.unwrap());
+    }
+
+    /// How a blob maps onto parts: under one part is a plain PUT (no
+    /// multipart), exactly N parts is N parts (no empty trailing part), one
+    /// byte over is N+1. Every shape reads back byte-exact.
+    #[tokio::test]
+    async fn artifact_upload_part_boundaries() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        for (i, (len, parts)) in [
+            (1023usize, 0usize),
+            (1024, 1),
+            (3 * 1024, 3),
+            (3 * 1024 + 1, 4),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = patterned(len);
+            let src = tmp.path().join(format!("blob{i}"));
+            std::fs::write(&src, &body).unwrap();
+            let sha = format!("{i:02x}").repeat(32);
+            let before = spy.parts.load(SeqCst);
+            b.upload_artifact_file(&sha, &src, 1024, 2).await.unwrap();
+            assert_eq!(spy.parts.load(SeqCst) - before, parts, "{len} bytes");
+            let dest = tmp.path().join(format!("out{i}"));
+            b.get_artifact_to_file(&sha, &dest, len as u64)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), body, "{len} bytes");
+        }
+        assert_eq!(spy.aborted.load(SeqCst), 0);
+    }
+
+    /// An empty blob uploads (as a plain PUT — S3 can't complete a multipart
+    /// with no parts) and reads back empty.
+    #[tokio::test]
+    async fn empty_artifact_roundtrips() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("empty");
+        std::fs::write(&src, b"").unwrap();
+        let sha = "9a".repeat(32);
+        b.upload_artifact_file(&sha, &src, 1024, 3).await.unwrap();
+        assert!(b.artifact_exists(&sha).await.unwrap());
+        let dest = tmp.path().join("out");
+        b.download_artifact_to_file(&sha, &dest, 0, 1024)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"");
+        assert!(spy.ranges.lock().unwrap().is_empty());
+        assert_eq!(spy.parts.load(SeqCst), 0, "an empty blob used a multipart");
+    }
+
+    /// The download is a series of bounded ranged reads (each its own
+    /// request, so a slow link never hits the whole-request timeout), never
+    /// one whole-object GET, and reassembles byte-exact.
+    #[tokio::test]
+    async fn artifact_download_is_ranged_and_byte_exact() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let body = patterned((3 << 20) + 17);
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, &body).unwrap();
+        let sha = "bc".repeat(32);
+        b.put_artifact_file(&sha, &src).await.unwrap();
+
+        let dest = tmp.path().join("out");
+        let size = body.len() as u64;
+        b.download_artifact_to_file(&sha, &dest, size, 1 << 20)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(spy.full_gets.load(SeqCst), 0, "a whole-object GET was used");
+        assert_eq!(
+            *spy.ranges.lock().unwrap(),
+            vec![
+                0..(1 << 20),
+                (1 << 20)..(2 << 20),
+                (2 << 20)..(3 << 20),
+                (3 << 20)..size,
+            ]
+        );
+    }
+
+    /// The trait method uses the production range size: a blob smaller than
+    /// one range is one ranged read.
+    #[tokio::test]
+    async fn artifact_download_through_the_trait_uses_ranged_reads() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, b"small").unwrap();
+        let sha = "de".repeat(32);
+        b.put_artifact_file(&sha, &src).await.unwrap();
+        let dest = tmp.path().join("out");
+        b.get_artifact_to_file(&sha, &dest, 5).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"small");
+        assert_eq!(*spy.ranges.lock().unwrap(), vec![0..5]);
+        assert_eq!(spy.full_gets.load(SeqCst), 0);
+    }
+
+    /// A store that answers a range short is an error (never a silent
+    /// truncated `Ok`), and an over-cap object is refused before any read.
+    #[tokio::test]
+    async fn artifact_download_rejects_a_short_read_and_an_over_cap_object() {
+        let (b, spy) = spy_bucket();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, patterned(4096)).unwrap();
+        let sha = "f0".repeat(32);
+        b.put_artifact_file(&sha, &src).await.unwrap();
+
+        spy.short_reads.store(true, SeqCst);
+        let err = b
+            .download_artifact_to_file(&sha, &tmp.path().join("short"), 4096, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BucketError::Io(ref m) if m.contains("short")),
+            "{err:?}"
+        );
+        spy.short_reads.store(false, SeqCst);
+
+        spy.ranges.lock().unwrap().clear();
+        let over = tmp.path().join("over");
+        let err = b
+            .download_artifact_to_file(&sha, &over, 4095, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BucketError::Io(ref m) if m.contains("exceeds its recorded 4095 bytes")),
+            "{err:?}"
+        );
+        assert!(!over.exists());
+        assert!(
+            spy.ranges.lock().unwrap().is_empty(),
+            "read before refusing"
         );
     }
 }

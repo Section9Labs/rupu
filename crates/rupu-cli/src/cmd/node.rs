@@ -8,8 +8,10 @@
 //! support to use it).  Sends `Hello`, awaits `Welcome`, then processes
 //! inbound frames: `Run` → spawn `rupu workflow run` / `rupu run`, tail
 //! artifact files, stream `Artifact` frames back; `Cancel` → kill
-//! child; `Ping` → `Pong`.  Reconnects with exponential backoff
-//! (1 s … 60 s cap) on disconnect.
+//! child; `Ping` → `Pong`; `ArtifactPull` → stream a finding-artifact blob
+//! from this node's store, one chunk per loop turn, round-robin across
+//! concurrent pulls.  Reconnects with exponential backoff (1 s … 60 s cap)
+//! on disconnect.
 //!
 //! **Enroll mode** (`rupu node enroll <name>`):
 //! Mints a tunnel host + one-time token in the local host store and
@@ -24,16 +26,18 @@
 
 #![deny(clippy::all)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
 use rupu_cp::host::bucket::{Bucket, BucketError, ControlEnvelope, ObjectStoreBucket};
-use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, CAP_USAGE_LEDGER};
+use rupu_cp::node::protocol::{
+    ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, ARTIFACT_CHUNK_BYTES, CAP_USAGE_LEDGER,
+};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -163,7 +167,8 @@ struct BucketStream {
     pending_end: Option<u64>,
 }
 
-/// The cursors for every file the bucket worker ships for a run.
+/// The cursors for every file the bucket worker ships for a run, plus the
+/// failure budget of the artifact blobs its terminal pass uploads.
 #[derive(Debug, Default)]
 struct BucketStreams {
     events: BucketStream,
@@ -171,6 +176,9 @@ struct BucketStreams {
     unit_checkpoints: BucketStream,
     usage: BucketStream,
     coverage: BucketStream,
+    /// Terminal passes each referenced artifact blob (by sha256) has failed;
+    /// see [`upload_referenced_artifacts`].
+    artifact_failures: HashMap<String, u32>,
 }
 
 impl BucketStreams {
@@ -366,6 +374,7 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
     }
 
     let exe = std::env::current_exe().context("resolve current executable path")?;
+    let global = crate::paths::global_dir()?;
     let mut backoff_secs: u64 = 1;
 
     loop {
@@ -374,7 +383,7 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
         // tracing — without these a successful connect is silent.
         eprintln!("connecting to {cp_url} as {node_id} …");
         info!(url = %cp_url, node_id = %node_id, "node: connecting");
-        match connect_and_run(cp_url, token, node_id, &exe).await {
+        match connect_and_run(cp_url, token, node_id, &exe, &global).await {
             Ok(()) => {
                 // Clean close: reset backoff so the next attempt is prompt.
                 backoff_secs = 1;
@@ -474,11 +483,16 @@ fn enroll_commands(
 // Single connection lifetime
 // ---------------------------------------------------------------------------
 
+/// How often the connection loop polls active runs' artifact files when no
+/// inbound frame wakes it.
+const RUN_FILE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 async fn connect_and_run(
     cp_url: &str,
     token: &str,
     node_id: &str,
     exe: &Path,
+    global: &Path,
 ) -> anyhow::Result<()> {
     // Dial the CP.
     let (ws_stream, _) = tokio_tungstenite::connect_async(cp_url)
@@ -525,26 +539,49 @@ async fn connect_and_run(
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 
     // Runs root: <global>/runs/<run_id>/
-    let global = crate::paths::global_dir()?;
     let runs_root = global.join("runs");
 
     let mut active: HashMap<String, RunState> = HashMap::new();
+    // Artifact pulls being answered; each loop turn the front one sends one
+    // frame and goes to the back (round-robin).
+    let mut pulls: VecDeque<ArtifactPullStream> = VecDeque::new();
+    let mut last_drain = tokio::time::Instant::now();
 
     loop {
-        // Interleave: poll artifact files every 250 ms, or process a WS frame immediately.
-        let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(250));
-        tokio::pin!(sleep_fut);
+        // Interleave: poll artifact files every RUN_FILE_POLL, or process a
+        // WS frame immediately. While pulls are queued the wait is zero-length
+        // so their chunks flow back-to-back — yet every turn still takes an
+        // inbound frame first (`biased`), so a large blob never holds up a
+        // Cancel, Run or Ping.
+        let pulling = !pulls.is_empty();
+        let wait = async move {
+            if pulling {
+                tokio::task::yield_now().await
+            } else {
+                tokio::time::sleep(RUN_FILE_POLL).await
+            }
+        };
+        tokio::pin!(wait);
 
         let maybe_msg = tokio::select! {
+            biased;
             msg = stream.next() => match msg {
                 None => break,                            // server closed cleanly
                 Some(m) => Some(m.context("recv frame")?),
             },
-            _ = &mut sleep_fut => None,
+            _ = &mut wait => None,
         };
 
-        // Drain artifact files for all active runs.
-        let run_ids: Vec<String> = active.keys().cloned().collect();
+        // Drain artifact files for all active runs — on an inbound frame or
+        // once per poll interval, not on every back-to-back pull turn (which
+        // would re-read every active run's files once per chunk).
+        let drain_due = maybe_msg.is_some() || last_drain.elapsed() >= RUN_FILE_POLL;
+        let run_ids: Vec<String> = if drain_due {
+            last_drain = tokio::time::Instant::now();
+            active.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
         let mut finished: Vec<String> = Vec::new();
 
         for rid in &run_ids {
@@ -617,6 +654,20 @@ async fn connect_and_run(
         }
         for rid in finished {
             active.remove(&rid);
+        }
+
+        // Answer ONE frame of one artifact pull per turn (R11): a blob of up
+        // to hundreds of MiB streamed inline would stall inbound frames and
+        // run-file drains for the whole transfer. Pulls take turns
+        // round-robin, so a small pull queued behind a large blob still
+        // starts — and finishes — within the CP's idle timeout.
+        if let Some(mut pull) = pulls.pop_front() {
+            if let Some(frame) = pull.next_frame().await {
+                send_frame(&mut sink, &frame).await;
+            }
+            if !pull.is_done() {
+                pulls.push_back(pull);
+            }
         }
 
         // Process incoming WS frame (if one arrived).
@@ -723,11 +774,17 @@ async fn connect_and_run(
                     warn!(run_id = %run_id, "node: Reject for unknown run_id (ignored)");
                 }
             }
+            Frame::ArtifactPull { req, sha256 } => {
+                info!(req = %req, sha256 = %sha256, "node: ArtifactPull received");
+                pulls.push_back(ArtifactPullStream::new(global, req, sha256));
+            }
             Frame::Hello { .. }
             | Frame::Welcome { .. }
             | Frame::Pong {}
             | Frame::Artifact { .. }
-            | Frame::RunFinished { .. } => {
+            | Frame::RunFinished { .. }
+            | Frame::ArtifactChunk { .. }
+            | Frame::ArtifactPullDone { .. } => {
                 warn!(
                     frame = %serde_json::to_string(&frame).unwrap_or_else(|_| "?".into()),
                     "node: unexpected server-sent frame type (ignored)"
@@ -1020,6 +1077,142 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Artifact pulls (unit-testable)
+// ---------------------------------------------------------------------------
+
+/// The answer to one `ArtifactPull`: the blob
+/// `<global>/findings/artifacts/<aa>/<sha256>` as ordered `ArtifactChunk`
+/// frames (`seq` from 0, each a whole [`ARTIFACT_CHUNK_BYTES`] decoded except
+/// the last), then exactly one `ArtifactPullDone` — carrying the error when
+/// the blob can't be found, opened or read — then `None`.
+///
+/// `connect_and_run` takes one frame per loop turn from its pull queue,
+/// round-robin across pulls, so a large blob streams between inbound frames,
+/// run-file drains and other pulls instead of holding them up. The blob is
+/// opened on the first frame, so a pull that hasn't started holds no file
+/// handle.
+struct ArtifactPullStream {
+    req: String,
+    sha256: String,
+    /// The blob's store path, or why there is none (a malformed sha).
+    path: Result<PathBuf, String>,
+    file: Option<tokio::fs::File>,
+    seq: u64,
+    done: bool,
+}
+
+impl ArtifactPullStream {
+    fn new(global: &Path, req: String, sha256: String) -> Self {
+        let path =
+            crate::cmd::findings_helper::blob_path(global, &sha256).map_err(|e| e.to_string());
+        Self {
+            req,
+            sha256,
+            path,
+            file: None,
+            seq: 0,
+            done: false,
+        }
+    }
+
+    /// Whether the closing `ArtifactPullDone` has been yielded.
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// The pull's next frame, or `None` once `ArtifactPullDone` has gone.
+    async fn next_frame(&mut self) -> Option<Frame> {
+        use base64::Engine as _;
+        if self.done {
+            return None;
+        }
+        let frame = match self.next_chunk().await {
+            Ok(Some(data)) => {
+                let seq = self.seq;
+                self.seq += 1;
+                return Some(Frame::ArtifactChunk {
+                    req: self.req.clone(),
+                    seq,
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
+                });
+            }
+            Ok(None) => Frame::ArtifactPullDone {
+                req: self.req.clone(),
+                error: None,
+            },
+            Err(error) => {
+                warn!(req = %self.req, sha256 = %self.sha256, %error, "node: artifact pull failed");
+                Frame::ArtifactPullDone {
+                    req: self.req.clone(),
+                    error: Some(error),
+                }
+            }
+        };
+        self.done = true;
+        self.file = None;
+        Some(frame)
+    }
+
+    /// The next chunk's bytes — a whole [`ARTIFACT_CHUNK_BYTES`] unless the
+    /// blob ends first — or `None` at the end of the blob.
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use tokio::io::AsyncReadExt as _;
+        if self.file.is_none() {
+            self.file = Some(self.open().await?);
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(format!("artifact {} was not opened", self.sha256));
+        };
+        let mut buf = vec![0u8; ARTIFACT_CHUNK_BYTES];
+        let mut n = 0;
+        // Fill a whole chunk: a read may return less.
+        while n < buf.len() {
+            let got = file
+                .read(&mut buf[n..])
+                .await
+                .map_err(|e| format!("reading artifact {}: {e}", self.sha256))?;
+            if got == 0 {
+                break;
+            }
+            n += got;
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.truncate(n);
+        Ok(Some(buf))
+    }
+
+    /// Open the blob without ever parking the caller: refuses anything but a
+    /// regular file (a FIFO swapped into the store would otherwise block
+    /// the open — and with it the node's frame loop — until a writer came).
+    async fn open(&self) -> Result<tokio::fs::File, String> {
+        let path = self.path.clone()?;
+        let sha256 = self.sha256.clone();
+        let opened =
+            tokio::task::spawn_blocking(move || rupu_cp::api::fs_open::open_regular_file(&path))
+                .await
+                .map_err(|e| format!("opening artifact {sha256}: {e}"))?;
+        let file = opened
+            .map_err(|e| format!("artifact {} is not in this node's store: {e}", self.sha256))?;
+        Ok(tokio::fs::File::from_std(file))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket worker marker
+// ---------------------------------------------------------------------------
+
+/// The `nodes/<worker>.json` marker a bucket worker writes at startup.
+fn bucket_worker_info(worker_id: &str) -> rupu_cp::host::bucket::WorkerInfo {
+    rupu_cp::host::bucket::WorkerInfo {
+        worker_id: worker_id.to_string(),
+        rupu_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: rupu_cp::node::protocol::bucket_worker_capabilities(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Read terminal status from run.json
 // ---------------------------------------------------------------------------
 
@@ -1189,31 +1382,164 @@ async fn upload_usage_ledger(
     upload_new_lines(bucket, rid, "usage", &usage_path(run_dir), usage).await
 }
 
+/// sha256s of the `stored: copied` artifacts that findings in a run's
+/// coverage stream reference. A torn trailing line, an unparseable line, or
+/// an entry whose hash isn't a store key is skipped, never an error.
+///
+/// The file is read as bytes and decoded lossily: a run that was killed
+/// mid-write can leave its last line cut inside a multi-byte character, and a
+/// strict UTF-8 read would fail the WHOLE stream — losing every reference on
+/// the valid lines before it. The torn line just fails to parse and is skipped.
+fn referenced_artifacts(stream: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(bytes) = std::fs::read(stream) else {
+        return Default::default();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<rupu_coverage::StreamLine>(l).ok())
+        .filter_map(|l| match l {
+            rupu_coverage::StreamLine::Findings { record, .. } => record.report,
+            _ => None,
+        })
+        .flat_map(|r| r.artifacts)
+        .filter(|a| {
+            a.stored == Some(rupu_coverage::report::ArtifactStorage::Copied)
+                && rupu_coverage::report::is_sha256_hex(&a.sha256)
+        })
+        .map(|a| a.sha256)
+        .collect()
+}
+
+/// Terminal passes a referenced artifact blob may fail (its existence check,
+/// its upload, or reading it from the store) before the bucket worker stops
+/// holding the run for it. Passes, not wall-clock, so `--once`'s iteration
+/// window always reaches the give-up.
+const ARTIFACT_UPLOAD_ATTEMPTS: u32 = 3;
+
+/// Upload every blob this run's findings reference to `artifacts/<sha256>`,
+/// so the coordinator can pull them later without this worker online (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §B1). A bucket worker
+/// may never be polled again once its run finishes, so this is the only
+/// chance — which makes the blobs part of what [`finish_bucket_run`] holds
+/// the terminal run for, within a budget. Returns `true` when nothing is left
+/// to upload.
+///
+/// A failed blob (its existence check, its upload, or reading it from the
+/// store — they all surface as a bucket error) returns `false`: the caller
+/// keeps the run active and retries next tick, and a blob that landed
+/// meanwhile is skipped by its existence check. Each blob gets
+/// [`ARTIFACT_UPLOAD_ATTEMPTS`] failed passes (counted in `failures`); then
+/// it is logged and released, never tried again for this run, and the
+/// terminal `run.json` and `finished` land without it — the coordinator
+/// reports it unavailable. Without that budget a blob that can never upload
+/// (a bucket that keeps rejecting it, an uplink too slow for its size) would
+/// hold the run non-terminal on the coordinator forever and re-upload every
+/// tick, stalling the worker's other runs. A blob this worker's store does
+/// not hold as a regular file can never land, so it is logged and skipped at
+/// once.
+async fn upload_referenced_artifacts(
+    bucket: &dyn Bucket,
+    rid: &str,
+    global: &Path,
+    run_dir: &Path,
+    failures: &mut HashMap<String, u32>,
+) -> bool {
+    let mut landed = true;
+    for sha in referenced_artifacts(&run_dir.join(rupu_coverage::STREAM_FILE)) {
+        if failures
+            .get(&sha)
+            .is_some_and(|n| *n >= ARTIFACT_UPLOAD_ATTEMPTS)
+        {
+            continue;
+        }
+        let Err(e) = upload_one_artifact(bucket, global, &sha).await else {
+            continue;
+        };
+        let failed = failures.entry(sha.clone()).or_insert(0);
+        *failed += 1;
+        if *failed >= ARTIFACT_UPLOAD_ATTEMPTS {
+            warn!(
+                run_id = %rid, sha = %sha, passes = *failed, error = %e,
+                "node pull: artifact upload still failing; releasing the run without it — the coordinator will report it unavailable"
+            );
+        } else {
+            warn!(
+                run_id = %rid, sha = %sha, passes = *failed, error = %e,
+                "node pull: artifact upload failed; holding the run to retry"
+            );
+            landed = false;
+        }
+    }
+    landed
+}
+
+/// One referenced blob's upload: `Ok` once it is in the bucket (already, or
+/// now) or when this worker's store does not hold it (logged — it can never
+/// land); `Err` for a bucket error, which the caller retries within budget.
+async fn upload_one_artifact(
+    bucket: &dyn Bucket,
+    global: &Path,
+    sha: &str,
+) -> Result<(), BucketError> {
+    if bucket.artifact_exists(sha).await? {
+        return Ok(());
+    }
+    let Ok(src) = crate::cmd::findings_helper::blob_path(global, sha) else {
+        return Ok(());
+    };
+    // Not followed: the store only ever holds regular files, and a FIFO or a
+    // dangling link would fail every retry.
+    let in_store = std::fs::symlink_metadata(&src).is_ok_and(|m| m.file_type().is_file());
+    if !in_store {
+        warn!(
+            sha = %sha, path = %src.display(),
+            "node pull: a referenced artifact is not in this worker's store; the coordinator will report it unavailable"
+        );
+        return Ok(());
+    }
+    bucket.put_artifact_file(sha, &src).await
+}
+
 /// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
-/// upload whatever every stream still holds, then the terminal `run.json`, and
-/// only then write the `finished` marker. Returns `true` when the marker
-/// landed.
+/// upload whatever every stream still holds, then the artifact blobs the
+/// run's findings reference, then the terminal `run.json`, and only then write
+/// the `finished` marker. Returns `true` when the marker landed. Every terminal
+/// outcome (completed / failed / rejected / cancelled) comes through here.
 ///
 /// A row the runner appended after the routine drain would otherwise never be
 /// uploaded — the run leaves `active` once this returns `true` — and the CP
 /// would finish the run short. The CP finishes a run on the terminal
 /// `run.json` body and stops polling it from then on, so that body and the
 /// marker are the CP's "nothing more is coming" signals: each is written ONLY
-/// after everything before it landed. If any stream fails, nothing after it is
-/// attempted (no `run.json`, no marker); if `run.json` or the marker fails, the
-/// marker is not written / reported. Either way this returns `false` and the
-/// caller keeps the run active, retrying next tick (a failed chunk retries
-/// byte-exact under its own key). Every stream is still attempted when one
-/// fails.
+/// after everything before it landed. The artifact blobs go after the final
+/// coverage drain, so the references are read from the run's complete stream,
+/// and before `run.json`, so a CP view right after the run finishes can
+/// already pull them (the CP fetches `artifacts/<sha>` by key on a view; a
+/// bucket worker may never be polled again). If any stream upload fails, or a
+/// blob upload fails within its [`ARTIFACT_UPLOAD_ATTEMPTS`] budget, nothing
+/// after it is attempted (no `run.json`, no marker); if `run.json` or the
+/// marker fails, the marker is not written / reported. Either way this
+/// returns `false` and the caller keeps the run active, retrying next tick (a
+/// failed chunk retries byte-exact under its own key; a blob that already
+/// landed is not re-uploaded). A stream chunk holds the run for as long as it
+/// takes — its lines would be lost for good — while a blob past its budget is
+/// released and reported unavailable by the CP. Every stream is still
+/// attempted when one fails.
 async fn finish_bucket_run(
     bucket: &dyn Bucket,
     rid: &str,
     run_dir: &Path,
+    global: &Path,
     streams: &mut BucketStreams,
     run_json: &[u8],
     status: &str,
 ) -> bool {
     if !streams.upload_all(bucket, rid, run_dir).await {
+        return false;
+    }
+    if !upload_referenced_artifacts(bucket, rid, global, run_dir, &mut streams.artifact_failures)
+        .await
+    {
         return false;
     }
     // The routine pass withholds a terminal run.json (see `upload_routine`), so
@@ -1269,10 +1595,20 @@ async fn finish_if_terminal(
     bucket: &dyn Bucket,
     rid: &str,
     run_dir: &Path,
+    global: &Path,
     streams: &mut BucketStreams,
 ) -> Option<(String, bool)> {
     let (status, body) = read_terminal_status(&run_dir.join("run.json"))?;
-    let landed = finish_bucket_run(bucket, rid, run_dir, streams, body.as_bytes(), &status).await;
+    let landed = finish_bucket_run(
+        bucket,
+        rid,
+        run_dir,
+        global,
+        streams,
+        body.as_bytes(),
+        &status,
+    )
+    .await;
     Some((status, landed))
 }
 
@@ -1350,6 +1686,7 @@ async fn bucket_tick(
     exe: &Path,
     host_id: &str,
     runs_root: &Path,
+    global: &Path,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
 ) -> ClaimOutcome {
@@ -1357,7 +1694,7 @@ async fn bucket_tick(
     // First attempt right away; a marker that did not land is retried on
     // every later tick until it does.
     flush_failed_markers(bucket, &mut pending.failed_unmarked).await;
-    drain_active_runs(bucket, exe, runs_root, active).await;
+    drain_active_runs(bucket, exe, runs_root, global, active).await;
     outcome
 }
 
@@ -1471,6 +1808,7 @@ async fn drain_active_runs(
     bucket: &dyn Bucket,
     exe: &Path,
     runs_root: &Path,
+    global: &Path,
     active: &mut HashMap<String, BucketRunState>,
 ) {
     let run_ids: Vec<String> = active.keys().cloned().collect();
@@ -1573,7 +1911,7 @@ async fn drain_active_runs(
 
         // Check for terminal status → the terminal pass (final drain of
         // every stream, run.json, then the `finished` marker).
-        match finish_if_terminal(bucket, rid, &run_dir, &mut state.streams).await {
+        match finish_if_terminal(bucket, rid, &run_dir, global, &mut state.streams).await {
             Some((status, true)) => {
                 info!(run_id = %rid, status = %status, "node pull: run finished");
                 finished.push(rid.clone());
@@ -1619,11 +1957,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
     // CP reads these markers before putting a job that needs a newer worker
     // (e.g. one carrying `findings_profile`). A worker that can't write here
     // can't upload results either, so fail startup rather than run unseen.
-    let info = rupu_cp::host::bucket::WorkerInfo {
-        worker_id: host_id.clone(),
-        rupu_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: rupu_cp::node::protocol::node_capabilities(),
-    };
+    let info = bucket_worker_info(&host_id);
     bucket
         .put_worker_info(&host_id, &serde_json::to_vec(&info)?)
         .await
@@ -1642,6 +1976,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             &exe,
             &host_id,
             &runs_root,
+            &global,
             &mut active,
             &mut pending,
         )
@@ -1901,13 +2236,16 @@ mod tests {
     /// - `attempts`: every `put_result` tried, failed ones included. A failed
     ///   put is recorded as an attempt because a real one can have landed
     ///   before it errored (a timeout).
-    /// - `fail_prefix`: a `put_result` whose key starts with it fails, and
-    ///   `"finished"` fails the marker.
+    /// - `fail_prefix`: a `put_result` whose key starts with it fails,
+    ///   `"finished"` fails the marker, `"artifact:"` fails a blob upload and
+    ///   `"exists:"` fails a blob's existence check (HEAD).
     #[derive(Default)]
     struct RecordingBucket {
         ops: std::sync::Mutex<Vec<(String, String)>>,
         attempts: std::sync::Mutex<Vec<(String, String)>>,
         fail_prefix: std::sync::Mutex<Option<String>>,
+        /// `artifacts/<sha256>` objects, in memory.
+        artifacts: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
     }
 
     impl RecordingBucket {
@@ -2005,6 +2343,57 @@ mod tests {
         async fn probe(&self) -> Result<(), BucketError> {
             unreachable!()
         }
+        /// Fails (the HEAD) when the fail prefix matches `exists:<sha256>`.
+        async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+            if self.fails(&format!("exists:{sha256}")) {
+                return Err(BucketError::Io(format!(
+                    "injected HEAD failure for {sha256}"
+                )));
+            }
+            Ok(self.artifacts.lock().unwrap().contains_key(sha256))
+        }
+        /// Stored under `artifacts/<sha256>`; logged as an `artifact:<sha256>`
+        /// op (body = the blob) so a test sees where it falls relative to the
+        /// `finished` marker.
+        async fn put_artifact_file(
+            &self,
+            sha256: &str,
+            src: &std::path::Path,
+        ) -> Result<(), BucketError> {
+            let key = format!("artifact:{sha256}");
+            let body = std::fs::read(src).map_err(|e| BucketError::Io(e.to_string()))?;
+            let entry = (key.clone(), String::from_utf8_lossy(&body).into_owned());
+            self.attempts.lock().unwrap().push(entry.clone());
+            if self.fails(&key) {
+                return Err(BucketError::Io(format!("injected failure for {key}")));
+            }
+            self.ops.lock().unwrap().push(entry);
+            self.artifacts
+                .lock()
+                .unwrap()
+                .insert(sha256.to_string(), body);
+            Ok(())
+        }
+        async fn get_artifact_to_file(
+            &self,
+            sha256: &str,
+            dest: &std::path::Path,
+            max_bytes: u64,
+        ) -> Result<(), BucketError> {
+            let body = self
+                .artifacts
+                .lock()
+                .unwrap()
+                .get(sha256)
+                .cloned()
+                .ok_or_else(|| BucketError::NotFound(format!("artifacts/{sha256}")))?;
+            if body.len() as u64 > max_bytes {
+                return Err(BucketError::Io(format!(
+                    "artifact {sha256} exceeds its recorded {max_bytes} bytes"
+                )));
+            }
+            std::fs::write(dest, body).map_err(|e| BucketError::Io(e.to_string()))
+        }
     }
 
     const RUN_JSON: &[u8] = b"{\"status\":\"completed\"}";
@@ -2030,6 +2419,7 @@ mod tests {
             finish_bucket_run(
                 &bucket,
                 "run_BKT",
+                dir.path(),
                 dir.path(),
                 &mut streams,
                 RUN_JSON,
@@ -2066,6 +2456,7 @@ mod tests {
                 &quiet,
                 "run_QUIET",
                 dir.path(),
+                dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "failed",
@@ -2097,6 +2488,7 @@ mod tests {
             &bucket,
             "run_T",
             dir.path(),
+            dir.path(),
             &mut streams,
             RUN_JSON,
             "completed",
@@ -2120,6 +2512,7 @@ mod tests {
         let done = finish_bucket_run(
             &bucket,
             "run_T",
+            dir.path(),
             dir.path(),
             &mut streams,
             RUN_JSON,
@@ -2172,6 +2565,7 @@ mod tests {
                 &bucket,
                 "run_M",
                 dir.path(),
+                dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "completed",
@@ -2185,6 +2579,7 @@ mod tests {
             finish_bucket_run(
                 &bucket,
                 "run_M",
+                dir.path(),
                 dir.path(),
                 &mut streams,
                 RUN_JSON,
@@ -2212,6 +2607,7 @@ mod tests {
                 &bucket,
                 "run_J",
                 dir.path(),
+                dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "completed",
@@ -2237,6 +2633,7 @@ mod tests {
                 &fb.bucket,
                 "run_1",
                 run_dir.path(),
+                run_dir.path(),
                 &mut streams,
                 RUN_JSON,
                 "completed",
@@ -2254,6 +2651,7 @@ mod tests {
             finish_bucket_run(
                 &fb.bucket,
                 "run_1",
+                run_dir.path(),
                 run_dir.path(),
                 &mut streams,
                 RUN_JSON,
@@ -2295,7 +2693,14 @@ mod tests {
 
         for _tick in 0..3 {
             upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
-            let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), &mut streams).await;
+            let outcome = finish_if_terminal(
+                &bucket,
+                "run_H",
+                run_dir.path(),
+                run_dir.path(),
+                &mut streams,
+            )
+            .await;
             assert_eq!(outcome, Some(("completed".to_string(), false)));
             assert!(
                 bucket.landed().is_empty(),
@@ -2307,7 +2712,14 @@ mod tests {
         bucket.set_failing(None);
         upload_routine(&bucket, "run_H", run_dir.path(), &mut streams).await;
         assert_eq!(bucket.landed_keys(), ["events.0000.jsonl"], "streams first");
-        let outcome = finish_if_terminal(&bucket, "run_H", run_dir.path(), &mut streams).await;
+        let outcome = finish_if_terminal(
+            &bucket,
+            "run_H",
+            run_dir.path(),
+            run_dir.path(),
+            &mut streams,
+        )
+        .await;
         assert_eq!(outcome, Some(("completed".to_string(), true)));
         assert_eq!(
             bucket.landed_keys(),
@@ -2332,7 +2744,14 @@ mod tests {
         upload_routine(&bucket, "run_P", run_dir.path(), &mut streams).await;
         assert_eq!(bucket.landed_keys(), ["run.json"]);
         assert_eq!(
-            finish_if_terminal(&bucket, "run_P", run_dir.path(), &mut streams).await,
+            finish_if_terminal(
+                &bucket,
+                "run_P",
+                run_dir.path(),
+                run_dir.path(),
+                &mut streams
+            )
+            .await,
             None
         );
         assert_eq!(
@@ -2457,6 +2876,26 @@ mod tests {
         async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
             self.inner.list_worker_info().await
         }
+        async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+            self.inner.artifact_exists(sha256).await
+        }
+        async fn put_artifact_file(
+            &self,
+            sha256: &str,
+            src: &std::path::Path,
+        ) -> Result<(), BucketError> {
+            self.inner.put_artifact_file(sha256, src).await
+        }
+        async fn get_artifact_to_file(
+            &self,
+            sha256: &str,
+            dest: &std::path::Path,
+            max_bytes: u64,
+        ) -> Result<(), BucketError> {
+            self.inner
+                .get_artifact_to_file(sha256, dest, max_bytes)
+                .await
+        }
     }
 
     /// A harmless stand-in for the `rupu` executable: exits at once, ignoring
@@ -2488,6 +2927,9 @@ mod tests {
             Path::new(TRUE_EXE),
             "host_1",
             runs_root,
+            // The worker's global dir (its artifact store's root); these runs
+            // reference no artifacts.
+            runs_root.parent().unwrap_or(runs_root),
             active,
             pending,
         )
@@ -2697,6 +3139,409 @@ mod tests {
         }
         // Nothing pending: nothing written, nothing to do.
         flush_failed_markers(&fb.bucket, &mut pending).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Artifact upload at run end
+    // ------------------------------------------------------------------
+
+    /// A `ledger:"findings"` stream line whose full report references
+    /// `artifacts`.
+    fn findings_stream_line(
+        id: &str,
+        artifacts: Vec<(&str, rupu_coverage::report::ArtifactStorage)>,
+    ) -> String {
+        use rupu_coverage::report::{ArtifactKind, ArtifactRef, FindingReport};
+        let mut report: FindingReport = serde_json::from_str(include_str!(
+            "../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap();
+        report.artifacts = artifacts
+            .into_iter()
+            .map(|(sha, stored)| ArtifactRef {
+                path: "poc/x".into(),
+                sha256: sha.into(),
+                size: 1,
+                kind: Some(ArtifactKind::Binary),
+                stored: Some(stored),
+                host: None,
+            })
+            .collect();
+        let record = rupu_coverage::FindingRecord {
+            id: id.into(),
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: rupu_coverage::FindingScope::File,
+            summary: "s".into(),
+            severity: rupu_coverage::Severity::High,
+            concern_id: None,
+            evidence: rupu_coverage::FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".into(),
+                references: vec![],
+            },
+            declared_by: rupu_coverage::Attribution {
+                run_id: "r".into(),
+                model: "m".into(),
+                surface: rupu_coverage::Surface::Agent,
+                codename: None,
+                agent: None,
+                provider: None,
+            },
+            declared_at: chrono::Utc::now(),
+            profile: rupu_coverage::FindingProfile::Full,
+            report: Some(report),
+        };
+        serde_json::to_string(&rupu_coverage::StreamLine::Findings {
+            scope_name: "sec".into(),
+            record,
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    fn begin_stream_line() -> String {
+        serde_json::to_string(&rupu_coverage::StreamLine::Begin {
+            v: 1,
+            run_id: "r".into(),
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    #[test]
+    fn referenced_artifacts_lists_only_copied_blobs_from_findings() {
+        use rupu_coverage::report::ArtifactStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let copied = "ab".repeat(32);
+        let external = "cd".repeat(32);
+        std::fs::write(
+            &stream,
+            begin_stream_line()
+                + &findings_stream_line(
+                    "f1",
+                    vec![
+                        (&copied, ArtifactStorage::Copied),
+                        (&external, ArtifactStorage::External),
+                    ],
+                ),
+        )
+        .unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([copied])
+        );
+        assert!(referenced_artifacts(&tmp.path().join("absent")).is_empty());
+    }
+
+    /// The same blob referenced by two findings is listed once; a blob with
+    /// a malformed hash (never a store key) and a torn trailing line are
+    /// ignored rather than failing the scan.
+    #[test]
+    fn referenced_artifacts_dedups_and_skips_malformed_entries_and_torn_lines() {
+        use rupu_coverage::report::ArtifactStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let a = "ab".repeat(32);
+        let b = "ef".repeat(32);
+        let body = begin_stream_line()
+            + &findings_stream_line("f1", vec![(&a, ArtifactStorage::Copied)])
+            + &findings_stream_line(
+                "f2",
+                vec![
+                    (&a, ArtifactStorage::Copied),
+                    (&b, ArtifactStorage::Copied),
+                    ("../../etc/passwd", ArtifactStorage::Copied),
+                    (&"AB".repeat(32), ArtifactStorage::Copied),
+                ],
+            )
+            + "{\"ledger\":\"findings\",\"scope_na";
+        std::fs::write(&stream, body).unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([a, b])
+        );
+    }
+
+    /// A run killed mid-write can leave the stream's last line cut inside a
+    /// multi-byte UTF-8 character. That torn tail is skipped like any other
+    /// unparseable line; it must not lose the references on the valid lines
+    /// before it.
+    #[test]
+    fn referenced_artifacts_survive_a_tail_torn_mid_utf8_character() {
+        use rupu_coverage::report::ArtifactStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let a = "ab".repeat(32);
+        let mut body = (begin_stream_line()
+            + &findings_stream_line("f1", vec![(&a, ArtifactStorage::Copied)]))
+            .into_bytes();
+        // `{"ledger":"findings","scope_name":"caf` + the first byte of "é".
+        body.extend_from_slice(b"{\"ledger\":\"findings\",\"scope_name\":\"caf");
+        body.push(0xC3);
+        assert!(
+            String::from_utf8(body.clone()).is_err(),
+            "tail must be invalid UTF-8"
+        );
+        std::fs::write(&stream, body).unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([a])
+        );
+    }
+
+    /// The terminal pass uploads each `stored: copied` blob its run's findings
+    /// reference from the worker's store to `artifacts/<sha>` after the final
+    /// coverage drain and BEFORE the terminal `run.json` and the `finished`
+    /// marker (a coordinator that sees the run terminal can already pull),
+    /// even for a failed run; one the bucket already holds is not re-uploaded;
+    /// one the store lacks is skipped without blocking `finished`.
+    #[tokio::test]
+    async fn bucket_terminal_pass_uploads_referenced_blobs_before_finished() {
+        use rupu_coverage::report::ArtifactStorage;
+        let global = tempdir().unwrap();
+        let run_dir = tempdir().unwrap();
+        let fresh = "ab".repeat(32);
+        let already = "cd".repeat(32);
+        let absent = "ee".repeat(32);
+        let external = "f0".repeat(32);
+        store_blob(global.path(), &fresh, b"fresh poc");
+        store_blob(global.path(), &already, b"already uploaded");
+        store_blob(global.path(), &external, b"never uploaded");
+        std::fs::write(
+            run_dir.path().join(rupu_coverage::STREAM_FILE),
+            begin_stream_line()
+                + &findings_stream_line(
+                    "f1",
+                    vec![
+                        (&fresh, ArtifactStorage::Copied),
+                        (&already, ArtifactStorage::Copied),
+                        (&absent, ArtifactStorage::Copied),
+                        (&external, ArtifactStorage::External),
+                    ],
+                ),
+        )
+        .unwrap();
+
+        let bucket = RecordingBucket::default();
+        bucket
+            .artifacts
+            .lock()
+            .unwrap()
+            .insert(already.clone(), b"already uploaded".to_vec());
+        let mut streams = BucketStreams::default();
+        assert!(
+            finish_bucket_run(
+                &bucket,
+                "run_ART",
+                run_dir.path(),
+                global.path(),
+                &mut streams,
+                br#"{"status":"failed"}"#,
+                "failed",
+            )
+            .await
+        );
+
+        let keys = bucket.landed_keys();
+        assert_eq!(
+            keys,
+            vec![
+                result_key("coverage", 0),
+                format!("artifact:{fresh}"),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ],
+            "{keys:?}"
+        );
+        assert_eq!(
+            bucket.landed_body(&format!("artifact:{fresh}")).as_deref(),
+            Some("fresh poc")
+        );
+        assert_eq!(bucket.landed_body("finished").as_deref(), Some("failed"));
+        let stored = bucket.artifacts.lock().unwrap();
+        assert_eq!(
+            stored.get(&fresh).map(Vec::as_slice),
+            Some(&b"fresh poc"[..])
+        );
+        assert!(!stored.contains_key(&absent) && !stored.contains_key(&external));
+    }
+
+    /// A run dir whose coverage stream references one copied blob `sha`, and a
+    /// global dir whose store holds it.
+    fn run_referencing_one_blob(sha: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+        use rupu_coverage::report::ArtifactStorage;
+        let global = tempdir().unwrap();
+        let run_dir = tempdir().unwrap();
+        store_blob(global.path(), sha, b"poc");
+        std::fs::write(
+            run_dir.path().join(rupu_coverage::STREAM_FILE),
+            begin_stream_line() + &findings_stream_line("f1", vec![(sha, ArtifactStorage::Copied)]),
+        )
+        .unwrap();
+        (global, run_dir)
+    }
+
+    /// One terminal pass for `rid` (the run.json body is [`RUN_JSON`]).
+    async fn terminal_pass(
+        bucket: &RecordingBucket,
+        rid: &str,
+        run_dir: &Path,
+        global: &Path,
+        streams: &mut BucketStreams,
+    ) -> bool {
+        finish_bucket_run(bucket, rid, run_dir, global, streams, RUN_JSON, "completed").await
+    }
+
+    /// A blob upload that fails holds the terminal run for up to
+    /// [`ARTIFACT_UPLOAD_ATTEMPTS`] passes: neither the terminal `run.json` nor
+    /// the `finished` marker is written meanwhile. The coordinator fetches
+    /// `artifacts/<sha>` by key whenever someone views it, so the order only
+    /// matters for a view right after `finished` — holding the run a few
+    /// passes lets a blob that lands late still be there for that view. Here
+    /// it fails twice, then lands on the third pass: the blob, then
+    /// `run.json`, then `finished`, with the coverage chunk that already
+    /// landed not re-sent.
+    #[tokio::test]
+    async fn a_failed_blob_upload_holds_the_terminal_run_until_it_lands_within_its_budget() {
+        let sha = "ab".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("artifact:");
+        let mut streams = BucketStreams::default();
+
+        for pass in 1..ARTIFACT_UPLOAD_ATTEMPTS {
+            assert!(
+                !terminal_pass(&bucket, "run_HOLD", r, g, &mut streams).await,
+                "pass {pass}: an unlanded blob within its budget holds the run"
+            );
+            assert_eq!(bucket.landed_keys(), vec![result_key("coverage", 0)]);
+        }
+
+        bucket.set_failing(None);
+        assert!(terminal_pass(&bucket, "run_HOLD", r, g, &mut streams).await);
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                format!("artifact:{sha}"),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
+    }
+
+    /// A blob that never uploads (a bucket that keeps rejecting it, an uplink
+    /// too slow for it) cannot hold the run forever: after
+    /// [`ARTIFACT_UPLOAD_ATTEMPTS`] failed passes the worker gives up on it
+    /// and the terminal `run.json` and `finished` land without it — the
+    /// coordinator reports that artifact unavailable. A later pass (were one
+    /// needed) does not try the given-up blob again.
+    #[tokio::test]
+    async fn a_blob_that_never_uploads_is_released_after_its_budget() {
+        let sha = "ab".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("artifact:");
+        let mut streams = BucketStreams::default();
+
+        for pass in 1..ARTIFACT_UPLOAD_ATTEMPTS {
+            assert!(
+                !terminal_pass(&bucket, "run_GIVEUP", r, g, &mut streams).await,
+                "pass {pass} holds the run"
+            );
+        }
+        assert!(
+            terminal_pass(&bucket, "run_GIVEUP", r, g, &mut streams).await,
+            "the last budgeted pass releases the run"
+        );
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
+        assert!(bucket.artifacts.lock().unwrap().is_empty(), "no artifact");
+        let tries = |b: &RecordingBucket| {
+            b.attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with("artifact:"))
+                .count()
+        };
+        assert_eq!(tries(&bucket), ARTIFACT_UPLOAD_ATTEMPTS as usize);
+
+        // Released for good: another pass does not upload the blob again.
+        assert!(terminal_pass(&bucket, "run_GIVEUP", r, g, &mut streams).await);
+        assert_eq!(tries(&bucket), ARTIFACT_UPLOAD_ATTEMPTS as usize);
+    }
+
+    /// A failing existence check (HEAD) spends the same budget as a failing
+    /// upload: the run is released after [`ARTIFACT_UPLOAD_ATTEMPTS`] passes.
+    #[tokio::test]
+    async fn a_blob_whose_existence_check_keeps_failing_is_released_after_its_budget() {
+        let sha = "cd".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("exists:");
+        let mut streams = BucketStreams::default();
+
+        for pass in 1..ARTIFACT_UPLOAD_ATTEMPTS {
+            assert!(
+                !terminal_pass(&bucket, "run_HEAD", r, g, &mut streams).await,
+                "pass {pass} holds the run"
+            );
+        }
+        assert!(terminal_pass(&bucket, "run_HEAD", r, g, &mut streams).await);
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
+    }
+
+    /// The artifact budget is for blobs only: a coverage chunk that keeps
+    /// failing still holds the terminal run however many passes it takes (the
+    /// lines would be lost for good once the CP stops reading the run).
+    #[tokio::test]
+    async fn a_failing_coverage_chunk_holds_the_run_past_the_artifact_budget() {
+        let sha = "ab".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("coverage");
+        let mut streams = BucketStreams::default();
+
+        for pass in 0..ARTIFACT_UPLOAD_ATTEMPTS + 3 {
+            assert!(
+                !terminal_pass(&bucket, "run_COV", r, g, &mut streams).await,
+                "pass {pass}: an unlanded coverage chunk holds the run"
+            );
+        }
+        assert!(
+            bucket.landed_keys().is_empty(),
+            "{:?}",
+            bucket.landed_keys()
+        );
+
+        bucket.set_failing(None);
+        assert!(terminal_pass(&bucket, "run_COV", r, g, &mut streams).await);
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                format!("artifact:{sha}"),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
     }
 
     /// A run with no usage ledger yet (or never) drains to nothing.
@@ -3507,5 +4352,460 @@ mod tests {
     fn next_control_seq_multiple_items_returns_max_plus_one() {
         let items = vec![(1u64, vec![]), (3u64, vec![]), (2u64, vec![])];
         assert_eq!(next_control_seq(&items), 4, "should be max(1,3,2)+1=4");
+    }
+
+    // ------------------------------------------------------------------
+    // ArtifactPullStream: one ArtifactPull answered frame by frame
+    // ------------------------------------------------------------------
+
+    /// Every frame `stream` yields, in order, until it ends.
+    async fn collect_pull(stream: &mut ArtifactPullStream) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(f) = stream.next_frame().await {
+            frames.push(f);
+            assert!(frames.len() < 1000, "the pull stream never ended");
+        }
+        frames
+    }
+
+    /// Put `body` in `global`'s artifact store under `sha`.
+    fn store_blob(global: &Path, sha: &str, body: &[u8]) {
+        let p = crate::cmd::findings_helper::blob_path(global, sha).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    }
+
+    fn decode_b64(data_b64: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn artifact_blob_is_streamed_as_ordered_chunks_then_done() {
+        let global = tempdir().unwrap();
+        let sha = "cd".repeat(32);
+        let body: Vec<u8> = (0..ARTIFACT_CHUNK_BYTES + 5)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        store_blob(global.path(), &sha, &body);
+
+        let mut stream = ArtifactPullStream::new(global.path(), "req1".into(), sha);
+        let frames = collect_pull(&mut stream).await;
+        assert_eq!(frames.len(), 3, "{} frames", frames.len());
+        let mut got = Vec::new();
+        for (i, f) in frames[..2].iter().enumerate() {
+            match f {
+                Frame::ArtifactChunk { req, seq, data_b64 } => {
+                    assert_eq!(req, "req1");
+                    assert_eq!(*seq, i as u64);
+                    got.extend(decode_b64(data_b64));
+                }
+                other => panic!("expected a chunk, got {other:?}"),
+            }
+        }
+        // A chunk is a whole ARTIFACT_CHUNK_BYTES, never a short read.
+        assert_eq!(got.len(), body.len());
+        assert_eq!(got, body);
+        assert_eq!(
+            frames[2],
+            Frame::ArtifactPullDone {
+                req: "req1".into(),
+                error: None
+            }
+        );
+        assert!(stream.is_done());
+        assert!(stream.next_frame().await.is_none(), "nothing after Done");
+    }
+
+    #[tokio::test]
+    async fn a_missing_blob_is_one_done_frame_with_an_error() {
+        let global = tempdir().unwrap();
+        let mut stream = ArtifactPullStream::new(global.path(), "req2".into(), "ef".repeat(32));
+        let frames = collect_pull(&mut stream).await;
+        assert!(
+            matches!(
+                &frames[..],
+                [Frame::ArtifactPullDone { req, error: Some(e) }]
+                    if req == "req2" && e.contains("not in this node's store")
+            ),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_sha_is_one_done_frame_with_an_error() {
+        let global = tempdir().unwrap();
+        let mut stream =
+            ArtifactPullStream::new(global.path(), "req3".into(), "../../etc/passwd".into());
+        let frames = collect_pull(&mut stream).await;
+        assert!(
+            matches!(
+                &frames[..],
+                [Frame::ArtifactPullDone { error: Some(e), .. }] if e.contains("not a sha256")
+            ),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_blob_is_just_done() {
+        let global = tempdir().unwrap();
+        let sha = "0e".repeat(32);
+        store_blob(global.path(), &sha, b"");
+        let mut stream = ArtifactPullStream::new(global.path(), "req4".into(), sha);
+        assert_eq!(
+            collect_pull(&mut stream).await,
+            vec![Frame::ArtifactPullDone {
+                req: "req4".into(),
+                error: None
+            }]
+        );
+    }
+
+    /// The pull runs inside the node's frame loop, so opening the blob must
+    /// never park it: a FIFO swapped into the store is refused at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_in_the_store_is_refused_without_blocking() {
+        let global = tempdir().unwrap();
+        let sha = "f1".repeat(32);
+        let p = crate::cmd::findings_helper::blob_path(global.path(), &sha).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&p).status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+        let mut stream = ArtifactPullStream::new(global.path(), "req5".into(), sha);
+        let frames =
+            tokio::time::timeout(std::time::Duration::from_secs(5), collect_pull(&mut stream))
+                .await
+                .expect("opening a FIFO blocked the pull");
+        assert!(
+            matches!(
+                &frames[..],
+                [Frame::ArtifactPullDone { error: Some(_), .. }]
+            ),
+            "{frames:?}"
+        );
+    }
+
+    type CpWs = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    /// The next text frame from a test CP's socket.
+    async fn next_cp_frame(ws: &mut CpWs) -> Frame {
+        loop {
+            let msg = ws
+                .next()
+                .await
+                .expect("node closed the tunnel")
+                .expect("ws read");
+            if let Message::Text(_) = msg {
+                return parse_frame(&msg).unwrap();
+            }
+        }
+    }
+
+    fn cp_text(f: &Frame) -> Message {
+        Message::Text(serde_json::to_string(f).unwrap())
+    }
+
+    /// Play a CP: accept the node's tunnel, check its Hello advertises
+    /// artifact pulls, and welcome it.
+    async fn accept_node(listener: tokio::net::TcpListener) -> CpWs {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let hello = next_cp_frame(&mut ws).await;
+        assert!(
+            matches!(&hello, Frame::Hello { capabilities, .. }
+                if capabilities.iter().any(|c| c == rupu_cp::node::protocol::CAP_FINDINGS_ARTIFACT_PULL)),
+            "{hello:?}"
+        );
+        ws.send(cp_text(&Frame::Welcome {
+            capabilities: vec![],
+        }))
+        .await
+        .unwrap();
+        ws
+    }
+
+    /// Run a node's connection loop against `url`, rooted at `global`.
+    fn spawn_node(
+        url: String,
+        global: &Path,
+        exe: &Path,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let (global, exe) = (global.to_path_buf(), exe.to_path_buf());
+        tokio::spawn(
+            async move { connect_and_run(&url, "tok", "node-pull-test", &exe, &global).await },
+        )
+    }
+
+    /// A blob of `chunks` whole chunks in `global`'s store; returns its sha
+    /// and bytes.
+    fn store_chunks(global: &Path, sha: &str, chunks: usize) -> Vec<u8> {
+        let body: Vec<u8> = (0..chunks * ARTIFACT_CHUNK_BYTES)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        store_blob(global, sha, &body);
+        body
+    }
+
+    /// R11: while a node streams a multi-chunk pull it still answers inbound
+    /// frames between chunks — not only after the whole blob has gone.
+    #[tokio::test]
+    async fn a_streaming_pull_does_not_hold_up_inbound_frames() {
+        const CHUNKS: usize = 8;
+        let global = tempdir().unwrap();
+        let sha = "a1".repeat(32);
+        let body = store_chunks(global.path(), &sha, CHUNKS);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let cp = tokio::spawn(async move {
+            let mut ws = accept_node(listener).await;
+            ws.send(cp_text(&Frame::ArtifactPull {
+                req: "r1".into(),
+                sha256: sha,
+            }))
+            .await
+            .unwrap();
+            let mut frames = Vec::new();
+            loop {
+                let f = next_cp_frame(&mut ws).await;
+                let done = matches!(f, Frame::ArtifactPullDone { .. });
+                frames.push(f);
+                // The node is mid-pull once its first chunk arrives: ask it
+                // something then.
+                if frames.len() == 1 {
+                    ws.send(cp_text(&Frame::Ping {})).await.unwrap();
+                }
+                if done {
+                    return frames;
+                }
+            }
+        });
+        let node = spawn_node(url, global.path(), Path::new("/nonexistent/rupu"));
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(60), cp)
+            .await
+            .expect("the pull never finished")
+            .unwrap();
+        node.abort();
+
+        let pong_at = frames
+            .iter()
+            .position(|f| matches!(f, Frame::Pong {}))
+            .expect("the Ping went unanswered until after the whole blob");
+        assert!(
+            pong_at + 2 < frames.len(),
+            "Pong at {pong_at} of {} frames: the Ping waited for the blob",
+            frames.len()
+        );
+        // The pull itself is intact: ordered chunks reassembling the blob.
+        let (mut got, mut next_seq) = (Vec::new(), 0u64);
+        for f in &frames {
+            match f {
+                Frame::ArtifactChunk { req, seq, data_b64 } => {
+                    assert_eq!(req, "r1");
+                    assert_eq!(*seq, next_seq);
+                    next_seq += 1;
+                    got.extend(decode_b64(data_b64));
+                }
+                Frame::Pong {} | Frame::ArtifactPullDone { error: None, .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(next_seq, CHUNKS as u64);
+        assert!(got == body, "reassembled blob differs");
+    }
+
+    /// Concurrent pulls share the loop round-robin: a small pull requested
+    /// behind a large blob finishes first instead of waiting out the whole
+    /// blob (and the CP's idle timeout for its first frame).
+    #[tokio::test]
+    async fn concurrent_pulls_are_served_round_robin() {
+        const CHUNKS: usize = 8;
+        let global = tempdir().unwrap();
+        let (big, small) = ("c3".repeat(32), "d4".repeat(32));
+        store_chunks(global.path(), &big, CHUNKS);
+        store_blob(global.path(), &small, b"small blob");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let cp = tokio::spawn(async move {
+            let mut ws = accept_node(listener).await;
+            for (req, sha256) in [("big", big), ("small", small)] {
+                ws.send(cp_text(&Frame::ArtifactPull {
+                    req: req.into(),
+                    sha256,
+                }))
+                .await
+                .unwrap();
+            }
+            let (mut frames, mut done) = (Vec::new(), 0);
+            while done < 2 {
+                let f = next_cp_frame(&mut ws).await;
+                if matches!(f, Frame::ArtifactPullDone { .. }) {
+                    done += 1;
+                }
+                frames.push(f);
+            }
+            frames
+        });
+        let node = spawn_node(url, global.path(), Path::new("/nonexistent/rupu"));
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(60), cp)
+            .await
+            .expect("the pulls never finished")
+            .unwrap();
+        node.abort();
+
+        let done_at = |want: &str| {
+            frames
+                .iter()
+                .position(
+                    |f| matches!(f, Frame::ArtifactPullDone { req, error: None } if req == want),
+                )
+                .unwrap_or_else(|| panic!("no clean Done for {want}: {frames:?}"))
+        };
+        assert!(
+            done_at("small") < done_at("big"),
+            "the small pull waited behind the big blob"
+        );
+        let small_bytes: Vec<u8> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ArtifactChunk { req, data_b64, .. } if req == "small" => {
+                    Some(decode_b64(data_b64))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(small_bytes, b"small blob");
+        let big_seqs: Vec<u64> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ArtifactChunk { req, seq, .. } if req == "big" => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(big_seqs, (0..CHUNKS as u64).collect::<Vec<_>>());
+    }
+
+    // ------------------------------------------------------------------
+    // Bucket worker marker
+    // ------------------------------------------------------------------
+
+    /// A bucket worker advertises what holds over a bucket — never the
+    /// tunnel-only artifact pull, which it has no frames to answer.
+    #[test]
+    fn the_bucket_worker_does_not_advertise_the_tunnel_artifact_pull() {
+        let info = bucket_worker_info("worker-1");
+        assert_eq!(info.worker_id, "worker-1");
+        assert_eq!(info.rupu_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            info.capabilities,
+            vec![rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string()]
+        );
+    }
+
+    /// R11's other half: an active run's files keep draining while a pull
+    /// streams (at the poll cadence, not once per chunk).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_streaming_pull_still_drains_active_runs() {
+        // More chunks than loopback socket buffers hold, so the node is still
+        // mid-pull when the CP resumes reading after its pause.
+        const CHUNKS: usize = 16;
+        // The node tracks a run by its files, not its child, so any
+        // spawnable no-op executable stands in for `rupu`.
+        let Some(exe) = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            eprintln!("no `true` executable; skipping");
+            return;
+        };
+        let global = tempdir().unwrap();
+        let sha = "b2".repeat(32);
+        store_chunks(global.path(), &sha, CHUNKS);
+        let events = global
+            .path()
+            .join("runs")
+            .join("run_drain")
+            .join("events.jsonl");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let cp = tokio::spawn(async move {
+            let mut ws = accept_node(listener).await;
+            ws.send(cp_text(&Frame::Run {
+                run_id: "run_drain".into(),
+                spec: RunSpec {
+                    kind: RunSpecKind::Workflow,
+                    name: "wf".into(),
+                    inputs: BTreeMap::new(),
+                    prompt: None,
+                    mode: None,
+                    target: None,
+                    findings_profile: None,
+                },
+            }))
+            .await
+            .unwrap();
+            ws.send(cp_text(&Frame::ArtifactPull {
+                req: "r2".into(),
+                sha256: sha,
+            }))
+            .await
+            .unwrap();
+            let mut frames = vec![next_cp_frame(&mut ws).await];
+            assert!(
+                matches!(frames[0], Frame::ArtifactChunk { seq: 0, .. }),
+                "{:?}",
+                frames[0]
+            );
+            // Mid-pull, the run writes an event; stop reading for longer than
+            // the poll interval, then take everything up to the pull's end.
+            std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+            std::fs::write(&events, "{\"e\":1}\n").unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            loop {
+                let f = next_cp_frame(&mut ws).await;
+                let done = matches!(f, Frame::ArtifactPullDone { .. });
+                frames.push(f);
+                if done {
+                    return frames;
+                }
+            }
+        });
+        let node = spawn_node(url, global.path(), exe);
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(60), cp)
+            .await
+            .expect("the pull never finished")
+            .unwrap();
+        node.abort();
+
+        let event_at = frames
+            .iter()
+            .position(|f| {
+                matches!(f, Frame::Artifact { run_id, file: ArtifactFile::Events, line }
+                    if run_id == "run_drain" && line == "{\"e\":1}")
+            })
+            .expect("the run's event was not drained during the pull");
+        let last_chunk_at = frames
+            .iter()
+            .rposition(|f| matches!(f, Frame::ArtifactChunk { .. }))
+            .unwrap();
+        assert!(
+            event_at < last_chunk_at,
+            "event at {event_at}, last chunk at {last_chunk_at}: drained only after the blob"
+        );
     }
 }

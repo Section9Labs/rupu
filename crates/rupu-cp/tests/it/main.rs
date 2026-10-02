@@ -14,6 +14,7 @@ mod dashboard;
 mod embed;
 mod endpoints;
 mod federation_e2e;
+mod finding_artifacts;
 mod graph;
 mod host_http;
 mod host_launch_control;

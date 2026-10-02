@@ -21,7 +21,7 @@ So an artifact pull built on its own would be reachable only for synced, success
 1. **Build the full chain, as two plans.**
    - **Plan A:** coverage transport, plus artifacts recorded as `external` + `host`.
    - **Plan B:** the pull, plus the serving endpoint.
-   - Web UI rendering of artifacts stays in the parent spec's Plan 2.
+   - Web UI rendering of artifacts stays in the parent spec's Plan 2 (Plan B only un-gates remote artifacts in its browser).
 2. **Carry the unit's whole coverage record, not only findings.** That's every ledger line attributed to the unit's run, so `.rupu/coverage/` can leave the sync delta without regressing the coverage harness.
 3. **Transport the stream on the existing mirror channels.** The host copies each coverage write into a run-scoped stream. SSH, tunnel and bucket already ship `runs/<run_id>/*.jsonl` to the coordinator, and HTTP fetches the stream at unit end. The alternative, a connector pull at unit end, needed new request/response plumbing on tunnel and bucket, and lost coverage when a host dropped offline right after a run.
 4. **Bucket hosts upload referenced blobs at run end.** The worker may never poll again, so on-demand requests aren't used; the coordinator's pull is a plain bucket download.
@@ -112,7 +112,7 @@ This is a required method with no default. It streams the host-store blob `<aa>/
 |---|---|
 | local | Copies from the shared store (normally never reached, because local artifacts stay `copied`), or returns `NotFound`. |
 | SSH | A hidden `rupu __findings artifact <sha256>` on the host streams the blob from its store to stdout, and exits nonzero with a message if it's absent. A new `RemoteExec::run_to_file(cmd, dest, max_bytes)` streams stdout straight to disk and aborts once it passes `max_bytes` (the recorded size). That's one SSH invocation per pull, never a burst. |
-| HTTP | Streams `GET /api/findings/artifacts/:sha256` (new on the remote CP: the blob by hash from its own store, bearer-authenticated). Gated on the `findings.artifact_blob` feature. |
+| HTTP | Streams `GET /api/findings/artifacts/:sha256` (new on the remote CP: the blob by hash from its own store, behind the CP's bearer token when one is configured). Gated on the `findings.artifact_blob` feature. |
 | tunnel | Sends `Frame::ArtifactPull { req, sha256 }`. The node answers with `Frame::ArtifactChunk { req, seq, data_b64 }` frames (1 MiB decoded each) and then `Frame::ArtifactPullDone { req, error: Option<String> }`. `NodeConn` routes chunks to per-request channels. Requires the node to be online and to have advertised the `findings.artifact_pull` capability in `Hello`. A per-request idle timeout applies. |
 | bucket | Streams `artifacts/<sha256>` from the bucket. At run end, before `finished`, the worker uploads every blob its run's findings reference (from its own coverage stream: `stored: copied` artifacts) to `artifacts/<sha256>`, skipping ones that already exist. |
 
@@ -130,6 +130,7 @@ This is a required method with no default. It streams the host-store blob `<aa>/
 
 - **Response headers:** artifacts of a text kind are served `text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`, never as HTML. Everything else gets `Content-Disposition: attachment; filename="<basename of path>"`.
 - **Bodies stream from disk.**
+- **Security.** The endpoint serves only artifacts a finding's ledger record lists, and the ledger lives in the agent-writable workspace. A forged ledger line that names a registered host and a known sha can therefore make the coordinator pull that blob from that host. The pull is bounded by the recorded size, verified by sha256, and only happens when an operator views the artifact. No URL is ever taken from the ledger: host ids resolve through the CP's registry. The host-side blob endpoint `GET /api/findings/artifacts/:sha256` is not finding-scoped: it serves any stored blob by hash (the host-to-coordinator channel), behind the CP's bearer token when one is configured and to anyone who can reach the CP otherwise.
 
 ## Error handling summary
 
@@ -199,7 +200,7 @@ This is a required method with no default. It streams the host-store blob `<aa>/
 
 ## Out of scope
 
-- Web UI rendering of `report.artifacts`. The parent spec's Plan 2 consumes B2.
+- Web UI rendering of `report.artifacts`: the parent spec's Plan 2 renders it, and Plan B only un-gates remote artifacts in that browser (see Deviations as built).
 - Merging coverage live, mid-unit. It merges when the unit ends.
 - Artifact garbage collection.
 - macOS.
@@ -207,7 +208,7 @@ This is a required method with no default. It streams the host-store blob `<aa>/
 
 ## Changes to the parent spec
 
-§Artifacts's placed-unit rule is implemented as written. §CP API's `GET /api/findings/:id/artifacts/:sha256` is delivered by Plan B, ahead of the parent's Plan 2, which renders it. It adds one reason for the `unavailable` body: the local external workspace file has changed.
+§Artifacts's placed-unit rule is implemented as written. §CP API's `GET /api/findings/:id/artifacts/:sha256` shipped with the parent's Plan 2 (#677); Plan B extends it to pull remote artifacts. The `unavailable` body is used for those only: a gone or changed local workspace file keeps its `{"error"}` 404/409 (see Deviations as built).
 
 ## As built (Plan A)
 
@@ -231,3 +232,11 @@ Where Plan A differs from the text above (the body is left as designed):
 - **A workflow's remote units and its in-process steps record under different scopes.** The host's `rupu run` uses the agent's name as `scope_name`, and an in-process step uses the workflow's, so one workflow's findings can land in two targets.
 - **`mark_external` also rewrites artifacts that were already `external`.** A host records a workspace file over the copy cap as `external` with no `host`; the merge sets `host` on it like any other artifact. Plan B therefore cannot tell a blob in the host's store from a file in the host's workspace by the record alone.
 - **A standalone remote agent run launched from the CP outside a workflow is mirrored but never merged.** Only the workflow runner ingests a unit's stream.
+
+## Deviations as built (Plan B)
+
+- **A local over-cap file keeps its shipped errors.** §B2.4's "404 `unavailable`" is not what #677/#683 serve, and that path is pinned by tests: a gone workspace file is `404` and a changed one is `409`, both with the standard `{"error": …}` body. `{"unavailable": …}` is the answer for remote (`host`) artifacts.
+- **One header policy.** Every artifact byte response, from both the coordinator endpoint and the host blob endpoint, carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`. The host blob endpoint's download filename is the sha.
+- **`pull_finding_artifact` takes `max_bytes`** (the recorded size) so a transport stops an oversize transfer as it streams.
+- **The web artifact browser is part of Plan B.** It previews and downloads remote artifacts; "web UI rendering" stayed out of scope only for the report renderer itself.
+- **The bucket worker's blob upload is part of the terminal hold, within a budget.** Plan A made the bucket terminal pass hold a run — no terminal `run.json`, no `finished` marker — until every stream chunk has landed. The §B1 upload runs inside that pass, after the final coverage drain, so blobs are uploaded before `finished`. A bucket error on a blob (its existence check, its upload, or reading it from the worker's store) holds the run and retries it next tick (a blob that landed is skipped by its existence check), but a blob that still fails after 3 passes is logged and released: `run.json` and `finished` land without it and the coordinator reports it unavailable, as §B1's "best-effort" requires. Without the budget, a blob that can never upload would hold the run non-terminal on the coordinator forever. Coverage lines are held until they land. A blob missing from the worker's own store is logged and skipped at once, since it can never land.

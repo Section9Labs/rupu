@@ -41,6 +41,26 @@ pub enum ArtifactError {
     TooLarge { total: u64, files: usize, max: u64 },
 }
 
+/// Why [`ArtifactStore::install_verified`] refused a pulled blob. The temp
+/// file is gone either way.
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactInstallError {
+    #[error("{0:?} is not a sha256 (64 lowercase hex characters)")]
+    BadSha(String),
+    #[error(
+        "hash mismatch: got {got_size} bytes hashing to {got_sha256}, \
+         expected {expected_size} bytes hashing to {expected_sha256}"
+    )]
+    Mismatch {
+        got_size: u64,
+        got_sha256: String,
+        expected_size: u64,
+        expected_sha256: String,
+    },
+    #[error("installing the artifact blob: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 /// Bounds on one report's artifacts. See [`crate::report::FindingWriteOptions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestLimits {
@@ -54,6 +74,7 @@ pub struct IngestLimits {
     pub max_total_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
 pub struct ArtifactStore {
     root: PathBuf,
 }
@@ -84,6 +105,13 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Exactly 64 lowercase hex characters — the only shape a store key takes.
+/// Callers MUST check this before [`ArtifactStore::blob_path`], which does no
+/// validation of its own.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// SHA-256 of a file's contents, streamed.
@@ -145,11 +173,68 @@ impl ArtifactStore {
     /// Like `blob_path`, but only for a well-formed sha256 (64 lowercase hex).
     /// Use this for any caller-supplied digest (e.g. an HTTP path segment).
     pub fn blob_path_checked(&self, sha256: &str) -> Option<PathBuf> {
-        let ok = sha256.len() == 64
-            && sha256
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        ok.then(|| self.blob_path(sha256))
+        is_sha256_hex(sha256).then(|| self.blob_path(sha256))
+    }
+
+    /// A fresh temp path for pulling blob `sha256` from another host:
+    /// `<root>/<aa>/.pull-<sha256>-<ulid>`, next to the blob it becomes, so
+    /// [`Self::install_verified`] is one rename. Creates the store root (0700
+    /// on unix, like every store root) and the shard directory, but not the
+    /// file. Refuses anything but a well-formed sha256 before touching the
+    /// disk.
+    pub fn pull_temp_path(&self, sha256: &str) -> std::io::Result<PathBuf> {
+        let Some(blob) = self.blob_path_checked(sha256) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{sha256:?} is not a sha256 (64 lowercase hex characters)"),
+            ));
+        };
+        create_store_dir(&self.root)?;
+        let shard = blob.parent().expect("blob path has a parent");
+        fs::create_dir_all(shard)?;
+        Ok(shard.join(format!(".pull-{sha256}-{}", ulid::Ulid::new())))
+    }
+
+    /// Install a pulled temp file (from [`Self::pull_temp_path`]) as blob
+    /// `sha256`, only if it holds exactly `size` bytes hashing to `sha256`:
+    /// a blob at a content address must hold the bytes its name promises.
+    /// The bytes are made durable before they become visible (as
+    /// `copy_hashing` does). When the blob already exists the temp file is
+    /// dropped (content-addressed: identical). On ANY error the temp file is
+    /// removed. Returns the blob's path. Synchronous and reads the whole
+    /// file: async callers run it under `spawn_blocking`.
+    pub fn install_verified(
+        &self,
+        tmp: &Path,
+        sha256: &str,
+        size: u64,
+    ) -> Result<PathBuf, ArtifactInstallError> {
+        let guard = TempFile::new(tmp.to_path_buf());
+        let Some(dest) = self.blob_path_checked(sha256) else {
+            return Err(ArtifactInstallError::BadSha(sha256.to_string()));
+        };
+        // Write access for `sync_all` on every platform; never truncates.
+        let mut file = fs::OpenOptions::new().read(true).write(true).open(tmp)?;
+        let (got_sha256, got_size) = sha256_reader_counted(&mut file)?;
+        if got_size != size || got_sha256 != sha256 {
+            return Err(ArtifactInstallError::Mismatch {
+                got_size,
+                got_sha256,
+                expected_size: size,
+                expected_sha256: sha256.to_string(),
+            });
+        }
+        file.sync_all()?;
+        drop(file);
+        if dest.is_file() {
+            // Already installed (an earlier pull or a local copy): `guard`
+            // removes the identical temp file.
+            return Ok(dest);
+        }
+        fs::create_dir_all(dest.parent().expect("blob path has a parent"))?;
+        fs::rename(tmp, &dest)?;
+        guard.disarm();
+        Ok(dest)
     }
 
     /// Resolve every requested path (expanding directories), check the whole
@@ -833,6 +918,15 @@ mod tests {
     }
 
     #[test]
+    fn is_sha256_hex_is_exact() {
+        assert!(is_sha256_hex(&"ab".repeat(32)));
+        assert!(!is_sha256_hex(&"AB".repeat(32)), "uppercase is rejected");
+        assert!(!is_sha256_hex(&"ab".repeat(31)));
+        assert!(!is_sha256_hex("../../etc/passwd"));
+        assert!(!is_sha256_hex(""));
+    }
+
+    #[test]
     fn blob_path_checked_rejects_non_hex_and_wrong_length() {
         let s = ArtifactStore::new("/tmp/store");
         assert!(s.blob_path_checked("").is_none());
@@ -844,6 +938,170 @@ mod tests {
             s.blob_path_checked(&ok).unwrap(),
             std::path::PathBuf::from("/tmp/store").join("01").join(&ok)
         );
+    }
+
+    // ---- pull_temp_path / install_verified (a coordinator's remote pull) ----
+
+    fn sha_of(bytes: &[u8]) -> String {
+        sha256_reader(&mut &bytes[..]).unwrap()
+    }
+
+    #[test]
+    fn pull_temp_path_refuses_a_non_sha_before_touching_the_disk() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let root = parent.path().join("findings").join("artifacts");
+        let s = ArtifactStore::new(&root);
+        for bad in ["", "../../etc/passwd", &"AB".repeat(32), &"a".repeat(63)] {
+            let err = s.pull_temp_path(bad).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(!root.exists(), "a refused sha must not create the store");
+    }
+
+    #[test]
+    fn pull_temp_path_names_a_fresh_hidden_file_in_the_blobs_shard() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let root = parent.path().join("findings").join("artifacts");
+        let s = ArtifactStore::new(&root);
+        let sha = sha_of(b"pulled");
+        let a = s.pull_temp_path(&sha).unwrap();
+        let b = s.pull_temp_path(&sha).unwrap();
+        assert_ne!(a, b, "every pull gets its own temp file");
+        // Next to the blob it will become, so the install is one rename.
+        assert_eq!(a.parent(), s.blob_path(&sha).parent());
+        assert!(a.parent().unwrap().is_dir(), "the shard dir is created");
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!(".pull-{sha}-")),
+            "temp name: {name}"
+        );
+        // Only the path: the transport creates the file.
+        assert!(!a.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_temp_path_creates_a_missing_store_root_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::TempDir::new().unwrap();
+        let root = parent.path().join("findings").join("artifacts");
+        ArtifactStore::new(&root)
+            .pull_temp_path(&sha_of(b"x"))
+            .unwrap();
+        let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "store root mode {mode:o}");
+    }
+
+    #[test]
+    fn install_verified_moves_matching_bytes_to_their_content_address() {
+        let store = tempfile::TempDir::new().unwrap();
+        let s = ArtifactStore::new(store.path());
+        let body = b"print('poc')\n";
+        let sha = sha_of(body);
+        let tmp = s.pull_temp_path(&sha).unwrap();
+        fs::write(&tmp, body).unwrap();
+        let blob = s.install_verified(&tmp, &sha, body.len() as u64).unwrap();
+        assert_eq!(blob, s.blob_path(&sha));
+        assert_eq!(fs::read(&blob).unwrap(), body);
+        assert!(!tmp.exists(), "the temp file became the blob");
+    }
+
+    #[test]
+    fn install_verified_accepts_an_empty_artifact() {
+        let store = tempfile::TempDir::new().unwrap();
+        let s = ArtifactStore::new(store.path());
+        let sha = sha_of(b"");
+        let tmp = s.pull_temp_path(&sha).unwrap();
+        fs::write(&tmp, b"").unwrap();
+        let blob = s.install_verified(&tmp, &sha, 0).unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"");
+    }
+
+    #[test]
+    fn install_verified_refuses_a_mismatch_and_removes_the_temp() {
+        let store = tempfile::TempDir::new().unwrap();
+        let s = ArtifactStore::new(store.path());
+        let recorded = sha_of(b"expected!");
+        // (bytes on disk, recorded size): same length but other bytes; short;
+        // long. Only an exact size AND hash match may be installed.
+        for (got, size) in [
+            (&b"tampered!"[..], 9u64),
+            (&b"expect"[..], 9),
+            (&b"expected!!"[..], 9),
+            (&b"expected!"[..], 8),
+        ] {
+            let tmp = s.pull_temp_path(&recorded).unwrap();
+            fs::write(&tmp, got).unwrap();
+            let err = s.install_verified(&tmp, &recorded, size).unwrap_err();
+            match &err {
+                ArtifactInstallError::Mismatch {
+                    got_size,
+                    got_sha256,
+                    expected_size,
+                    expected_sha256,
+                } => {
+                    assert_eq!(*got_size, got.len() as u64);
+                    assert_eq!(got_sha256, &sha_of(got));
+                    assert_eq!(*expected_size, size);
+                    assert_eq!(expected_sha256, &recorded);
+                }
+                other => panic!("expected a mismatch, got {other:?}"),
+            }
+            let msg = err.to_string();
+            assert!(msg.contains("mismatch"), "{msg}");
+            assert!(!tmp.exists(), "a refused temp file is removed");
+            assert!(!s.blob_path(&recorded).exists(), "nothing installed");
+        }
+        assert!(
+            walk(store.path()).is_empty(),
+            "no leftovers: {:?}",
+            walk(store.path())
+        );
+    }
+
+    #[test]
+    fn install_verified_onto_an_existing_blob_keeps_it_and_drops_the_temp() {
+        let store = tempfile::TempDir::new().unwrap();
+        let s = ArtifactStore::new(store.path());
+        let body = b"same bytes";
+        let sha = sha_of(body);
+        let first = s.pull_temp_path(&sha).unwrap();
+        fs::write(&first, body).unwrap();
+        s.install_verified(&first, &sha, body.len() as u64).unwrap();
+        let second = s.pull_temp_path(&sha).unwrap();
+        fs::write(&second, body).unwrap();
+        let blob = s
+            .install_verified(&second, &sha, body.len() as u64)
+            .unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), body);
+        assert!(!second.exists());
+        assert_eq!(
+            walk(store.path()),
+            vec![blob.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn install_verified_refuses_a_non_sha_and_removes_the_temp() {
+        let store = tempfile::TempDir::new().unwrap();
+        let s = ArtifactStore::new(store.path());
+        let tmp = store.path().join(".pull-whatever");
+        fs::write(&tmp, b"x").unwrap();
+        let err = s.install_verified(&tmp, "../../x", 1).unwrap_err();
+        assert!(matches!(err, ArtifactInstallError::BadSha(_)), "{err:?}");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn install_verified_of_a_missing_temp_is_an_io_error() {
+        let store = tempfile::TempDir::new().unwrap();
+        let s = ArtifactStore::new(store.path());
+        let sha = sha_of(b"x");
+        let err = s
+            .install_verified(&store.path().join(".pull-gone"), &sha, 1)
+            .unwrap_err();
+        assert!(matches!(err, ArtifactInstallError::Io(_)), "{err:?}");
+        assert!(!s.blob_path(&sha).exists());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<String> {

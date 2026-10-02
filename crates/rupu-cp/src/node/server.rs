@@ -21,12 +21,16 @@
 //!   - `Frame::Artifact` → [`NodeMirror::append`]
 //!   - `Frame::RunFinished` → [`NodeMirror::finish`]
 //!   - `Frame::Pong` → [`NodeRegistry::mark_seen`]
+//!   - `Frame::ArtifactChunk` / `Frame::ArtifactPullDone` →
+//!     [`NodeConn::route_pull`](crate::node::NodeConn::route_pull), to the
+//!     connector awaiting that pull (a chunk nobody awaits is dropped)
 //!   - Malformed JSON → log and **continue** (do not tear down the tunnel).
 //!   - `Close` / WS error → break.
 //!
 //! Both pumps run under a single `tokio::select!`; when either exits the
 //! other is cancelled, after which [`NodeRegistry::remove`] is called with
-//! the `Arc<NodeConn>` guard so a newer reconnect is never clobbered.
+//! the `Arc<NodeConn>` guard so a newer reconnect is never clobbered, and
+//! the connection's in-flight artifact pulls are ended.
 
 #![deny(clippy::all)]
 
@@ -198,6 +202,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Clone handles needed by each pump.
     let node_id_r = node_id.clone();
     let registry_r = Arc::clone(&state.node_registry);
+    let conn_r = Arc::clone(&conn);
     let mirror = Arc::clone(&state.node_mirror);
 
     // Write pump: mpsc rx → WS sink, with periodic keepalive.
@@ -289,6 +294,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // WS-level Ping handled automatically by axum; a
                         // Frame::Ping from node is unexpected but harmless.
                         Frame::Ping {} => {}
+                        Frame::ArtifactChunk { req, seq, data_b64 } => {
+                            use base64::Engine as _;
+                            let msg = match base64::engine::general_purpose::STANDARD
+                                .decode(data_b64.as_bytes())
+                            {
+                                Ok(data) => crate::node::PullMsg::Chunk { seq, data },
+                                Err(e) => crate::node::PullMsg::Done(Some(format!(
+                                    "undecodable artifact chunk: {e}"
+                                ))),
+                            };
+                            conn_r.route_pull(&req, msg).await;
+                        }
+                        Frame::ArtifactPullDone { req, error } => {
+                            conn_r
+                                .route_pull(&req, crate::node::PullMsg::Done(error))
+                                .await;
+                        }
                         other => {
                             warn!(
                                 frame_type = ?std::mem::discriminant(&other),
@@ -317,5 +339,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // `remove` uses `Arc::ptr_eq` so a newer reconnect (different Arc) is never
     // clobbered by a stale disconnect handler.
     state.node_registry.remove(&node_id, &conn);
+    // A connector awaiting a pull over this tunnel holds its own `Arc` of
+    // `conn`, so the routing table outlives the pumps: close it so each
+    // waiter fails now rather than after its idle timeout.
+    conn.close_pulls();
     info!(node_id, "node_tunnel: node disconnected");
 }

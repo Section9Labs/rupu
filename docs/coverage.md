@@ -210,15 +210,18 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A path that escapes the workspace, names the workspace root itself (`.`),
   does not exist, or names something other than a regular file (a device,
   socket, or the like) rejects the finding, so a typo is not silently dropped.
-- A remote workflow unit (`host:` / `distribute:`) records findings on its
-  host. Every `rupu run` also streams its coverage (runs, file touches,
-  concern assertions, findings, engagement assets) to
+- A remote workflow unit (`host:` / `distribute:`) runs `report_finding` on the
+  host, so its artifacts are copied into **that host's** store. Every
+  `rupu run` also streams its coverage (runs, file touches, concern
+  assertions, findings, engagement assets) to
   `$RUPU_HOME/runs/<run_id>/coverage.jsonl`, which the host's connector
   delivers to the coordinator when the unit ends — success or failure — on
   every transport. The coordinator merges it under its own workspace's targets
-  and records the unit's artifacts `stored: external` with `host` set (their
-  blobs stay in the host's store; a unit placed on the coordinator's own
-  `local` host shares its store, so its artifacts stay `copied`). In each of
+  and records the unit's artifacts `stored: external` with `host` set to the
+  host's id (their blobs stay in the host's store and are pulled on first
+  download — see [Downloading artifacts](#downloading-artifacts); a unit
+  placed on the coordinator's own `local` host shares its store, so its
+  artifacts stay `copied`). In each of
   the cases below the step shows a `StepWarning` — in the control-plane run
   view (a marker on the run graph and a card in the event feed), in the
   Situation Room, in the CLI live view, and in the completion summary and
@@ -242,12 +245,55 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
   never finished (no `run.json`) leaves `runs/<run_id>/` holding only its
   stream; it follows the run's transcript — `rupu transcript archive` moves
   it to `runs-archive/`, and `transcript delete`, `transcript prune` and
-  `rupu cleanup` remove it. Pulling the blobs into the coordinator's store on
-  first view is specified but not built yet.
+  `rupu cleanup` remove it.
 
 Each evidence claim's `sha256` is taken only from a file that resolves inside
 the workspace and is no larger than `artifact_max_bytes`; other claims are
 stored without a hash.
+
+#### Downloading artifacts
+
+`GET /api/findings/:id/artifacts/:sha256` returns an artifact's bytes. The sha
+must be one of that finding's artifacts. A blob already in this control plane's
+store is served directly. An `external` artifact with a `host` is pulled from
+that host on first download and then kept in this store. How the host delivers
+it depends on the transport:
+
+- SSH runs the hidden `rupu __findings artifact <sha256>` on the host (one SSH
+  invocation per pull).
+- An HTTP host serves it from `GET /api/findings/artifacts/:sha256`
+  (advertised as the `findings.artifact_blob` feature).
+- A tunnel node streams it over the tunnel (`findings.artifact_pull`
+  capability; the node must be online).
+- A bucket worker uploaded every blob its run's findings reference to
+  `artifacts/<sha256>` in the bucket when the run finished, whatever the
+  outcome — before it published the run as finished, so a run the control
+  plane sees as finished already has its blobs there — and the control plane
+  reads it from there. A failed upload holds the run and is retried, but a
+  blob that still fails after 3 passes is logged and released, and the
+  control plane reports it unavailable. Coverage lines, by contrast, are held
+  until they land.
+
+A pull is capped at the recorded size, then checked against the recorded size
+and sha256 before the blob enters the store. A recorded size over this control
+plane's own `artifact_max_bytes` is refused without contacting the host. Concurrent first downloads of the
+same blob share one pull. A local over-cap file (`external` with no `host`) is
+served from the workspace while it still hashes to the recorded sha: `404` once
+the file is gone, `409` once it has changed. Text artifacts are served as plain
+text; everything else as an attachment.
+
+When a remote artifact's bytes cannot be had, the response is `404` with
+`{"unavailable": "<reason>"}`: the host is unreachable or not registered, the
+node is offline, the blob is not in the host's store (this includes a file the
+host recorded by reference because it was over the copy cap), the host is too
+old to serve it, the recorded size is over this control plane's
+`artifact_max_bytes`, or the bytes failed the size or hash check. Nothing is stored
+for a failed pull, and the next view tries again.
+
+The web finding page's artifact browser uses the same endpoint. It previews
+text up to 256 KiB when you open it and offers a download for every artifact. A
+remote artifact is fetched from its host the first time it is previewed or
+downloaded; a binary one only when you download it.
 
 ### Configuration
 
@@ -326,17 +372,16 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
   64 MiB reports `unknown` (a much lower limit than the artifact copy cap,
   because every detail request re-hashes every claim's file).
 - `GET /api/findings/:id/artifacts/:sha256` serves an artifact only if that
-  finding lists it; `:sha256` must be 64 lowercase hex characters. Text is
-  served inline as `text/plain`; anything else is an attachment. Every response
-  carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy:
-  sandbox`. A copied artifact is read from the content-addressed store. An
-  external artifact on this machine is opened once and hashed from that same
-  handle: `409` if it no longer matches the recorded hash, `404` if it is gone.
-  Artifacts recorded by remote or placed units are not viewable in the control
-  plane yet: such a unit's findings arrive through its run's coverage stream and
-  are recorded `stored: external` with `host` set, but their blobs stay in that
-  host's store. The endpoint answers `404` for an artifact that carries a `host`,
-  because fetching from another host is not built (see `TODO.md`).
+  finding lists it; `:sha256` must be 64 lowercase hex characters. Every
+  response carries `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`. Where the bytes come from, how text and
+  other kinds are served, and what a missing, changed or unpullable artifact
+  answers are under [Downloading artifacts](#downloading-artifacts).
+- `GET /api/findings/artifacts/:sha256` is the host-side half of that pull: it
+  serves any blob in this control plane's own artifact store by hash. It sits
+  behind the CP's bearer token when one is configured, and is open to anyone
+  who can reach the CP otherwise. It is not finding-scoped, so that access
+  control is its only boundary; browsers use the finding-scoped endpoint above.
 
 ### Exporting reports
 

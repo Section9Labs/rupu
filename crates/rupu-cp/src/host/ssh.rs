@@ -310,6 +310,11 @@ fn validate_staged_working_dir(dir: &str) -> Result<(), HostConnectorError> {
 /// dashboard fan-out — the SSH analogue of the HTTP connector's 5s/30s bound.
 pub(crate) const SHORT_CALL_CONNECT_TIMEOUT_SECS: u32 = 3;
 
+/// How long a streamed ssh artifact pull may go without receiving a byte
+/// before it is abandoned. A connected-but-silent host would otherwise hold
+/// the coordinator's shared pull (and everyone waiting on it) forever.
+pub(crate) const SSH_PULL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Connect timeout (seconds) for the launch-path pump's long-lived `tail -F`
 /// ssh (`RemoteExec::spawn_lines`, used only by `spawn_tail_pump`). That is a
 /// streaming connection meant to stay open for the run's duration, not a
@@ -611,6 +616,18 @@ pub(crate) enum RemoteExecError {
     Spawn(String),
     #[error("remote command exited with {code:?}: {stderr}")]
     NonZero { code: Option<i32>, stderr: String },
+    /// Only `run_to_file` raises this: the output outgrew its expected size.
+    #[error("remote output exceeded {0} bytes")]
+    TooLarge(u64),
+    /// Only `run_to_file` raises this: the host sent nothing for longer than
+    /// the idle bound, so the stream is abandoned. The message already names
+    /// the host and the bound.
+    #[error("{0}")]
+    Idle(String),
+    /// Only `run_to_file` raises this: writing the coordinator's own
+    /// destination file failed. Not the host's fault, so not `Spawn`.
+    #[error("local write failed: {0}")]
+    LocalIo(String),
 }
 
 /// A pinned, boxed stream of lines from a remote command.
@@ -650,6 +667,28 @@ pub(crate) trait RemoteExec: Send + Sync {
         remote_command: &str,
         stdin: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, RemoteExecError>;
+
+    /// Run `remote_command` and stream its stdout into `dest` (created or
+    /// truncated), failing with `TooLarge` once more than `max_bytes` arrive.
+    /// Returns the byte count. On any error `dest` may be left partially
+    /// written — the caller owns its cleanup. This default buffers through
+    /// `run_bytes` and exists for test doubles; `SshExec` overrides it with a
+    /// true stream.
+    async fn run_to_file(
+        &self,
+        remote_command: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, RemoteExecError> {
+        let bytes = self.run_bytes(remote_command, None).await?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(RemoteExecError::TooLarge(max_bytes));
+        }
+        tokio::fs::write(dest, &bytes)
+            .await
+            .map_err(|e| RemoteExecError::LocalIo(e.to_string()))?;
+        Ok(bytes.len() as u64)
+    }
 }
 
 // ── Internal stream wrapper ───────────────────────────────────────────────────
@@ -711,6 +750,115 @@ impl SshExec {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             success: out.status.success(),
         })
+    }
+
+    /// Run `cmd` and stream its stdout into `dest` (created or truncated) in
+    /// 64 KiB chunks — never buffering the whole output. Once MORE than
+    /// `max_bytes` have arrived the child is killed and `TooLarge` returned;
+    /// if no chunk arrives for `idle` — or, once the output ends, the child's
+    /// exit or its stderr takes longer than `idle` — the child is killed and
+    /// `Idle` returned (a connection that goes silent must not pin the
+    /// caller);
+    /// a nonzero exit is `NonZero` with the child's stderr. Failures writing
+    /// `dest` are `LocalIo`. On any error `dest` may be left partially
+    /// written — the caller owns its cleanup. `host` only labels the `Idle`
+    /// message.
+    async fn stream_to_file(
+        mut cmd: tokio::process::Command,
+        dest: &Path,
+        max_bytes: u64,
+        idle: std::time::Duration,
+        host: &str,
+    ) -> Result<u64, RemoteExecError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let io = |e: std::io::Error| RemoteExecError::Spawn(e.to_string());
+        let local = |e: std::io::Error| RemoteExecError::LocalIo(e.to_string());
+        // Create the destination before spawning: an unwritable `dest` must
+        // not cost the host an ssh connection.
+        let mut file = tokio::fs::File::create(dest).await.map_err(local)?;
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(io)?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RemoteExecError::Spawn("no stdout pipe".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RemoteExecError::Spawn("no stderr pipe".into()))?;
+        // Drain stderr concurrently so a chatty remote cannot fill the pipe
+        // and stall stdout.
+        let mut stderr_task = tokio::spawn(async move {
+            let mut s = Vec::new();
+            let _ = stderr.read_to_end(&mut s).await;
+            s
+        });
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            // An early `?` drops `child`, and `kill_on_drop` ends the process.
+            let n = match tokio::time::timeout(idle, stdout.read(&mut buf)).await {
+                Ok(read) => read.map_err(io)?,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    stderr_task.abort();
+                    return Err(RemoteExecError::Idle(format!(
+                        "no data from {host} for {idle:?}"
+                    )));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > max_bytes {
+                // Stop the transfer now. Killing the child closes its stderr,
+                // so the reader task ends on its own — abort it rather than
+                // await it.
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(RemoteExecError::TooLarge(max_bytes));
+            }
+            file.write_all(&buf[..n]).await.map_err(local)?;
+        }
+        file.flush().await.map_err(local)?;
+        // The output ended, but a remote that closed stdout and kept running —
+        // or a connection that died between EOF and the exit status — would
+        // hang `wait()` and the stderr join forever, pinning everyone sharing
+        // this pull. Bound both with the same idle timeout.
+        let unfinished = || {
+            RemoteExecError::Idle(format!(
+                "{host} did not finish within {idle:?} of ending its output"
+            ))
+        };
+        let status = match tokio::time::timeout(idle, child.wait()).await {
+            Ok(status) => status.map_err(io)?,
+            Err(_) => {
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(unfinished());
+            }
+        };
+        let stderr = match tokio::time::timeout(idle, &mut stderr_task).await {
+            Ok(joined) => joined.unwrap_or_default(),
+            Err(_) => {
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(unfinished());
+            }
+        };
+        if !status.success() {
+            return Err(RemoteExecError::NonZero {
+                code: status.code(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            });
+        }
+        Ok(total)
     }
 }
 
@@ -810,6 +958,24 @@ impl RemoteExec for SshExec {
             });
         }
         Ok(out.stdout)
+    }
+
+    async fn run_to_file(
+        &self,
+        remote_command: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, RemoteExecError> {
+        let argv = ssh_argv(
+            &self.host,
+            self.port,
+            self.identity_file.as_deref(),
+            remote_command,
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
+        );
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv);
+        Self::stream_to_file(cmd, dest, max_bytes, SSH_PULL_IDLE_TIMEOUT, &self.host).await
     }
 }
 
@@ -1226,12 +1392,22 @@ async fn pump_finalize_if_terminal(
 /// Map a [`RemoteExecError`] from `run_bytes` to the corresponding
 /// [`HostConnectorError`]: a spawn/connection failure (ssh binary missing,
 /// no route to host, etc.) is `Unreachable`; a nonzero exit from the remote
-/// `rupu __workspace` helper is `Remote(code, stderr)`.
+/// `rupu __workspace` helper is `Remote(code, stderr)`; for a streamed
+/// `run_to_file` pull, one that outgrew its expected size or failed writing
+/// the coordinator's own file is `Invalid`, and one that went silent is
+/// `Unreachable`.
 fn map_remote_err(e: RemoteExecError) -> HostConnectorError {
     match e {
         RemoteExecError::Spawn(m) => HostConnectorError::Unreachable(m),
         RemoteExecError::NonZero { code, stderr } => {
             HostConnectorError::Remote(code.unwrap_or(-1) as u16, stderr)
+        }
+        RemoteExecError::TooLarge(n) => {
+            HostConnectorError::Invalid(format!("remote output exceeded its expected {n} bytes"))
+        }
+        RemoteExecError::Idle(m) => HostConnectorError::Unreachable(m),
+        RemoteExecError::LocalIo(m) => {
+            HostConnectorError::Invalid(format!("local write failed: {m}"))
         }
     }
 }
@@ -2751,6 +2927,37 @@ impl HostConnector for SshHostConnector {
         Ok(CoverageRead { bytes, complete })
     }
 
+    async fn pull_finding_artifact(
+        &self,
+        sha256: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<(), HostConnectorError> {
+        crate::host::connector::validate_sha256(sha256)?;
+        // One invocation per pull (no connection bursts at the host). An
+        // older remote rupu has no `__findings` and fails with clap's
+        // unknown-subcommand error, which becomes an actionable Unsupported
+        // rather than clap's raw text as the unavailable reason.
+        let cmd = build_remote_command(&[
+            "rupu".into(),
+            "__findings".into(),
+            "artifact".into(),
+            sha256.to_string(),
+        ]);
+        match self.exec.run_to_file(&cmd, dest, max_bytes).await {
+            Ok(_) => Ok(()),
+            Err(RemoteExecError::NonZero { stderr, .. })
+                if stderr.contains("unrecognized subcommand '__findings'") =>
+            {
+                Err(HostConnectorError::Unsupported(format!(
+                    "host {} runs a rupu without artifact pulls; upgrade rupu there",
+                    self.host_id
+                )))
+            }
+            Err(e) => Err(map_remote_err(e)),
+        }
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
@@ -3600,6 +3807,8 @@ mod tests {
         run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
         /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
         last_bytes_call: std::sync::Mutex<Option<(String, Option<Vec<u8>>)>>,
+        /// How many times `run_bytes` was invoked.
+        bytes_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeExec {
@@ -3622,6 +3831,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3644,6 +3854,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3668,6 +3879,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3692,6 +3904,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3715,6 +3928,7 @@ mod tests {
                 evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
     }
@@ -3811,6 +4025,8 @@ mod tests {
             remote_command: &str,
             stdin: Option<Vec<u8>>,
         ) -> Result<Vec<u8>, RemoteExecError> {
+            self.bytes_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_bytes_call.lock().unwrap() = Some((remote_command.to_string(), stdin));
             self.run_bytes_out
                 .lock()
@@ -3818,6 +4034,355 @@ mod tests {
                 .take()
                 .expect("run_bytes_out not scripted")
         }
+    }
+
+    #[tokio::test]
+    async fn default_run_to_file_writes_and_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let fake = FakeExec::with_bytes_ok(b"0123456789".to_vec());
+        assert_eq!(fake.run_to_file("cmd", &dest, 10).await.unwrap(), 10);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+        let fake = FakeExec::with_bytes_ok(b"0123456789".to_vec());
+        assert!(matches!(
+            fake.run_to_file("cmd", &dest, 9).await,
+            Err(RemoteExecError::TooLarge(9))
+        ));
+    }
+
+    /// A `/bin/sh -c <script>` command, standing in for the `ssh` child.
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_streams_exactly_up_to_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        // 200_000 bytes spans several 64 KiB reads.
+        let n = SshExec::stream_to_file(
+            sh("head -c 200000 /dev/zero"),
+            &dest,
+            200_000,
+            SSH_PULL_IDLE_TIMEOUT,
+            "h",
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 200_000);
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 200_000);
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_kills_the_child_once_the_cap_is_exceeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // `yes` never ends on its own: only the kill can stop it. `exec` keeps
+        // the recorded pid the child's pid.
+        let script = format!("echo $$ > {}; exec yes", pid_file.display());
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(sh(&script), &dest, 1000, SSH_PULL_IDLE_TIMEOUT, "h"),
+        )
+        .await
+        .expect("an over-cap stream must stop promptly, not run to completion");
+        assert!(
+            matches!(res, Err(RemoteExecError::TooLarge(1000))),
+            "{res:?}"
+        );
+        // Only in-cap chunks reach the file; the over-cap chunk is dropped.
+        assert!(std::fs::metadata(&dest).unwrap().len() <= 1000);
+        // ...and the child really is gone, not merely abandoned.
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the over-cap child (pid {pid}) was not killed");
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_reports_a_nonzero_exit_with_its_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let res = SshExec::stream_to_file(
+            sh("echo boom >&2; exit 3"),
+            &dest,
+            1000,
+            SSH_PULL_IDLE_TIMEOUT,
+            "h",
+        )
+        .await;
+        match res {
+            Err(RemoteExecError::NonZero { code, stderr }) => {
+                assert_eq!(code, Some(3));
+                assert!(stderr.contains("boom"), "{stderr}");
+            }
+            other => panic!("expected NonZero, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_fails_before_spawning_when_dest_is_unwritable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("no-such-dir").join("blob");
+        // The command would leave a marker if it ever ran.
+        let marker = tmp.path().join("ran");
+        let script = format!("touch {}", marker.display());
+        let res =
+            SshExec::stream_to_file(sh(&script), &dest, 1000, SSH_PULL_IDLE_TIMEOUT, "h").await;
+        // The failure is on the coordinator's side, not the host's.
+        assert!(matches!(res, Err(RemoteExecError::LocalIo(_))), "{res:?}");
+        assert!(!marker.exists(), "no child may be spawned for a bad dest");
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_kills_a_silent_child_after_the_idle_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // Writes a little, then goes silent far longer than the injected
+        // bound. `exec` keeps the recorded pid the sleeper's pid.
+        let script = format!(
+            "echo $$ > {}; printf abc; exec sleep 60",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(
+                sh(&script),
+                &dest,
+                1000,
+                std::time::Duration::from_millis(1000),
+                "slow-host",
+            ),
+        )
+        .await
+        .expect("a silent stream must hit the idle bound, not wait for the child");
+        match res {
+            Err(RemoteExecError::Idle(m)) => {
+                assert!(m.contains("no data from slow-host for"), "{m}")
+            }
+            other => panic!("expected Idle, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        // The bytes that did arrive were written before the stall.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        // ...and the silent child is killed, not abandoned.
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the silent child (pid {pid}) was not killed");
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_bounds_the_exit_wait_after_stdout_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // Sends a little, closes its stdout (the reader sees a clean EOF),
+        // then lives on far longer than the injected bound.
+        let script = format!(
+            "echo $$ > {}; printf abc; exec 1>&-; exec sleep 60",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(
+                sh(&script),
+                &dest,
+                1000,
+                std::time::Duration::from_millis(1000),
+                "lingering-host",
+            ),
+        )
+        .await
+        .expect("a lingering child must hit the bound, not be waited on");
+        match res {
+            Err(RemoteExecError::Idle(m)) => {
+                assert!(m.contains("lingering-host did not finish within"), "{m}")
+            }
+            other => panic!("expected Idle, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the lingering child (pid {pid}) was not killed");
+    }
+
+    #[test]
+    fn map_remote_err_maps_every_run_to_file_failure() {
+        assert!(matches!(
+            map_remote_err(RemoteExecError::TooLarge(7)),
+            HostConnectorError::Invalid(m) if m.contains('7')
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::LocalIo("disk full".into())),
+            HostConnectorError::Invalid(m) if m == "local write failed: disk full"
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::Idle("no data from h for 60s".into())),
+            HostConnectorError::Unreachable(m) if m == "no data from h for 60s"
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::Spawn("no route".into())),
+            HostConnectorError::Unreachable(_)
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::NonZero {
+                code: Some(2),
+                stderr: "x".into()
+            }),
+            HostConnectorError::Remote(2, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_run_to_file_reports_a_local_write_failure_as_local_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("no-such-dir").join("blob");
+        let fake = FakeExec::with_bytes_ok(b"abc".to_vec());
+        let res = fake.run_to_file("cmd", &dest, 10).await;
+        assert!(matches!(res, Err(RemoteExecError::LocalIo(_))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_runs_the_hidden_helper_once() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"blob".to_vec()));
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let dest = tmp.path().join("pulled");
+        let sha = "ab".repeat(32);
+        conn.pull_finding_artifact(&sha, &dest, 4).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"blob");
+        let (cmd, _stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, format!("'rupu' '__findings' 'artifact' '{sha}'"));
+        // Exactly one exec call for the pull: no probe, no retry, no second
+        // channel (never burst connections at a host).
+        let exec_calls = |f: &FakeExec| {
+            f.bytes_calls.load(std::sync::atomic::Ordering::SeqCst)
+                + f.commands.lock().unwrap().len()
+        };
+        assert_eq!(exec_calls(&fake), 1);
+        // A refused digest adds none.
+        assert!(conn.pull_finding_artifact("nope", &dest, 4).await.is_err());
+        assert_eq!(exec_calls(&fake), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_refuses_a_bad_sha_before_any_ssh() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"blob".to_vec()));
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let dest = tmp.path().join("pulled");
+        for bad in ["", "../etc/passwd", "AB", &"AB".repeat(32)] {
+            let err = conn.pull_finding_artifact(bad, &dest, 4).await.unwrap_err();
+            assert!(
+                matches!(err, HostConnectorError::Invalid(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+        assert!(
+            fake.last_bytes_call.lock().unwrap().is_none(),
+            "a malformed digest must not cost the host an ssh invocation"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_maps_remote_failures() {
+        let sha = "ab".repeat(32);
+        // An older rupu without `__findings` fails with clap's error (this is
+        // clap 4's wording, tip included): an actionable Unsupported naming
+        // the host, not the raw clap text.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(2),
+            stderr: "error: unrecognized subcommand '__findings'\n\n  tip: a similar \
+                     subcommand exists: 'findings'\n\nUsage: rupu [OPTIONS] <COMMAND>\n\n\
+                     For more information, try '--help'.\n"
+                .into(),
+        }));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m == "host host_abc runs a rupu without artifact pulls; upgrade rupu there"),
+            "{err:?}"
+        );
+        // The helper's own refusal (the blob is not in that host's store)
+        // keeps its reason.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(1),
+            stderr: format!("error: artifact {sha} is not in this host's store"),
+        }));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Remote(1, m) if m.contains("not in this host's store")),
+            "{err:?}"
+        );
+        // More bytes than recorded: refused as Invalid.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"too many".to_vec()));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 3)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
     }
 
     fn make_conn<E: RemoteExec + 'static>(

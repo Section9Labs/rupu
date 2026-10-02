@@ -335,6 +335,26 @@ impl HostConnector for BucketHostConnector {
             complete: true,
         })
     }
+    async fn pull_finding_artifact(
+        &self,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<(), HostConnectorError> {
+        crate::host::connector::validate_sha256(sha256)?;
+        self.bucket
+            .get_artifact_to_file(sha256, dest, max_bytes)
+            .await
+            .map_err(|e| match e {
+                BucketError::NotFound(_) => HostConnectorError::NotFound(format!(
+                    "artifact {sha256} was not uploaded to bucket host {} (the run may not \
+                     have finished yet — a worker uploads its blobs when the run ends — its \
+                     worker may predate artifact upload, or the upload failed)",
+                    self.host_id
+                )),
+                other => bucket_err_to_unreachable(other),
+            })
+    }
 
     async fn stream_run_events(
         &self,
@@ -713,6 +733,82 @@ mod tests {
         );
     }
 
+    // ── pull_finding_artifact ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pull_finding_artifact_streams_a_workers_uploaded_blob() {
+        let (conn, _run_store, bucket, tmp) = make_conn();
+        let sha = "ab".repeat(32);
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, b"poc bytes").unwrap();
+        bucket.put_artifact_file(&sha, &src).await.unwrap();
+
+        let dest = tmp.path().join("pulled");
+        conn.pull_finding_artifact(&sha, &dest, 9).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"poc bytes");
+
+        // More than the recorded size arriving is refused (the caller removes
+        // `dest`).
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("capped"), 8)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds its recorded 8 bytes"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_not_uploaded_is_not_found_naming_the_host() {
+        let (conn, _run_store, _bucket, tmp) = make_conn();
+        let sha = "cd".repeat(32);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("out"), 9)
+            .await
+            .unwrap_err();
+        match err {
+            HostConnectorError::NotFound(msg) => {
+                assert!(msg.contains(&sha), "{msg}");
+                assert!(msg.contains("host_bucket_1"), "{msg}");
+                assert!(msg.contains("not uploaded"), "{msg}");
+                // Blobs upload when the run ends, so "not there yet" is a cause.
+                assert!(msg.contains("may not have finished"), "{msg}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert!(
+            !tmp.path().join("out").exists(),
+            "a missing blob must not create dest"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_refuses_a_malformed_sha_before_the_bucket() {
+        // FailingBucket panics (`unimplemented!`) on any call it isn't scripted
+        // for: a malformed sha must be refused without reaching the bucket.
+        let tmp = tempfile::tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let conn = BucketHostConnector::new(
+            "host_failing",
+            Arc::new(FailingBucket),
+            mirror,
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+        for bad in ["../../etc/passwd", "", "AB", &"AB".repeat(32)] {
+            let err = conn
+                .pull_finding_artifact(bad, &tmp.path().join("out"), 9)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, HostConnectorError::Invalid(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
     // ── FailingBucket: test double whose put_job always fails ─────────────────
 
     struct FailingBucket;
@@ -770,6 +866,24 @@ mod tests {
         }
         async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
             unimplemented!("FailingBucket::list_worker_info")
+        }
+        async fn artifact_exists(&self, _sha256: &str) -> Result<bool, BucketError> {
+            unimplemented!("FailingBucket::artifact_exists")
+        }
+        async fn put_artifact_file(
+            &self,
+            _sha256: &str,
+            _src: &std::path::Path,
+        ) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::put_artifact_file")
+        }
+        async fn get_artifact_to_file(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::get_artifact_to_file")
         }
     }
 

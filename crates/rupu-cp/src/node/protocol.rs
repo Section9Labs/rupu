@@ -55,6 +55,25 @@ pub enum Frame {
         run_id: String,
         status: String,
     },
+    /// CP→node: stream the finding-artifact blob `sha256` from the node's
+    /// store. Sent only to a node that advertised
+    /// [`CAP_FINDINGS_ARTIFACT_PULL`] — an older node's frame parse is fatal.
+    ArtifactPull {
+        req: String,
+        sha256: String,
+    },
+    /// node→CP: one chunk of an [`Frame::ArtifactPull`] answer
+    /// (base64, ≤ [`ARTIFACT_CHUNK_BYTES`] decoded), in `seq` order.
+    ArtifactChunk {
+        req: String,
+        seq: u64,
+        data_b64: String,
+    },
+    /// node→CP: the pull ended; `error` set ⇒ it failed.
+    ArtifactPullDone {
+        req: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -96,6 +115,10 @@ pub const CAP_MIRROR_COVERAGE: &str = "mirror.coverage";
 /// `GET /api/runs/:id/coverage`.
 pub const CAP_RUN_COVERAGE_STREAM: &str = "run.coverage_stream";
 
+/// HTTP `/api/host/info` `features` entry: this CP serves
+/// `GET /api/findings/artifacts/:sha256` from its artifact store.
+pub const CAP_FINDINGS_ARTIFACT_BLOB: &str = "findings.artifact_blob";
+
 /// What this CP advertises to a node in `Welcome`.
 pub fn cp_capabilities() -> Vec<String> {
     vec![
@@ -104,10 +127,20 @@ pub fn cp_capabilities() -> Vec<String> {
     ]
 }
 
-/// Every capability this build's node executor supports — what `rupu node`
+/// `Hello.capabilities` entry: this node answers [`Frame::ArtifactPull`].
+/// Tunnel-only — a bucket worker has no frames to answer it with, so it is
+/// never in [`bucket_worker_capabilities`].
+pub const CAP_FINDINGS_ARTIFACT_PULL: &str = "findings.artifact_pull";
+/// Decoded bytes per [`Frame::ArtifactChunk`].
+pub const ARTIFACT_CHUNK_BYTES: usize = 1 << 20;
+
+/// Every capability this build's tunnel node supports — what `rupu node`
 /// advertises in `Hello`.
 pub fn node_capabilities() -> Vec<String> {
-    vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
+    vec![
+        CAP_AGENT_FINDINGS_PROFILE.to_string(),
+        CAP_FINDINGS_ARTIFACT_PULL.to_string(),
+    ]
 }
 
 /// Host feature: this build's `rupu workflow resume` takes `--if-unfinished`
@@ -126,6 +159,7 @@ pub fn host_features() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
+        CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
     ]
 }
 
@@ -152,6 +186,15 @@ impl FeaturesReport {
     pub fn supports(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
     }
+}
+
+/// What this build's bucket worker (`rupu node pull`) advertises in its
+/// `nodes/<worker>.json` marker: only the capabilities that hold over a
+/// bucket. Listed explicitly rather than filtered from
+/// [`node_capabilities`], so a new tunnel-only capability can never leak in
+/// — a capability missing here fails closed (the CP refuses the feature).
+pub fn bucket_worker_capabilities() -> Vec<String> {
+    vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -356,6 +399,64 @@ mod tests {
             serde_json::from_str(r#"{"features":["agent.findings_profile"],"later":1}"#).unwrap();
         assert!(back.supports(CAP_AGENT_FINDINGS_PROFILE));
         assert!(!back.supports(CAP_WORKFLOW_RESUME_IF_UNFINISHED));
+    }
+
+    #[test]
+    fn artifact_pull_frames_round_trip() {
+        let frames = [
+            Frame::ArtifactPull {
+                req: "pull_1".into(),
+                sha256: "ab".repeat(32),
+            },
+            Frame::ArtifactChunk {
+                req: "pull_1".into(),
+                seq: 3,
+                data_b64: "aGVsbG8=".into(),
+            },
+            Frame::ArtifactPullDone {
+                req: "pull_1".into(),
+                error: None,
+            },
+            Frame::ArtifactPullDone {
+                req: "pull_1".into(),
+                error: Some("artifact is not in this node's store".into()),
+            },
+        ];
+        for f in frames {
+            let json = serde_json::to_string(&f).unwrap();
+            assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), f, "{json}");
+        }
+        let pull = serde_json::to_string(&Frame::ArtifactPull {
+            req: "r".into(),
+            sha256: "s".into(),
+        })
+        .unwrap();
+        assert!(pull.contains(r#""type":"artifact_pull""#), "{pull}");
+    }
+
+    #[test]
+    fn the_node_advertises_artifact_pull_alongside_findings_profile() {
+        let caps = node_capabilities();
+        assert!(
+            caps.iter().any(|c| c == CAP_FINDINGS_ARTIFACT_PULL),
+            "{caps:?}"
+        );
+        assert!(
+            caps.iter().any(|c| c == CAP_AGENT_FINDINGS_PROFILE),
+            "{caps:?}"
+        );
+        assert_eq!(ARTIFACT_CHUNK_BYTES, 1 << 20);
+    }
+
+    #[test]
+    fn a_bucket_worker_advertises_no_tunnel_only_capability() {
+        assert_eq!(
+            bucket_worker_capabilities(),
+            vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
+        );
+        assert!(!bucket_worker_capabilities()
+            .iter()
+            .any(|c| c == CAP_FINDINGS_ARTIFACT_PULL));
     }
 
     #[test]

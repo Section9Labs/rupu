@@ -36,17 +36,22 @@ export class ApiError extends Error {
 }
 
 /** A human-readable message for anything a fetch chain can throw. The CP
- *  answers errors as `{"error": "…"}`, so an `ApiError` yields that message
- *  rather than the raw JSON body; a non-JSON body is shown as text, and an
- *  empty one falls back to the HTTP status. A plain `Error` yields its
- *  message and anything else its string form. */
+ *  answers errors as `{"error": "…"}` — or, for an artifact it could not pull
+ *  from its host, `{"unavailable": "<reason>"}` — so an `ApiError` yields that
+ *  message (`error` preferred when both are present) rather than the raw JSON
+ *  body; a non-JSON body is shown as text, and an empty one falls back to the
+ *  HTTP status. A plain `Error` yields its message and anything else its
+ *  string form. */
 export function apiErrorMessage(e: unknown): string {
   if (e instanceof ApiError) {
     const raw = e.body.trim();
     try {
       const parsed: unknown = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
-        return parsed.error;
+      if (parsed && typeof parsed === 'object') {
+        for (const key of ['error', 'unavailable'] as const) {
+          const v = (parsed as Record<string, unknown>)[key];
+          if (typeof v === 'string' && v.trim()) return v;
+        }
       }
     } catch {
       // not JSON; fall through to the raw text

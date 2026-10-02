@@ -234,6 +234,12 @@ pub enum Cmd {
     /// Internal: print this build's host features (SSH capability probe).
     #[command(name = "__features", hide = true)]
     Features,
+    /// Internal: stream a finding artifact from this host's store (SSH artifact pull).
+    #[command(name = "__findings", hide = true)]
+    FindingsHelper {
+        #[command(subcommand)]
+        action: cmd::findings_helper::FindingsHelperAction,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -408,6 +414,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::ApplyUpdate(args) => cmd::apply_update::handle(args),
         Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
         Cmd::Features => cmd::features_helper::handle(),
+        Cmd::FindingsHelper { action } => cmd::findings_helper::handle(action).await,
     }
 }
 
@@ -515,6 +522,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Features => output::formats::ensure_supported(
             "__features",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::FindingsHelper { .. } => output::formats::ensure_supported(
+            "__findings",
             format,
             &[output::formats::OutputFormat::Table],
         ),

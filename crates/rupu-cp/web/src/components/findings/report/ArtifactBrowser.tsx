@@ -4,7 +4,8 @@ import { formatBytes, type ArtifactRef } from '../../../lib/findingReport';
 
 const PREVIEW_LIMIT = 256 * 1024;
 
-/** Server errors are `{"error": "..."}`; show the message, not the JSON. */
+/** Server errors are `{"error": "..."}` (or `{"unavailable": "..."}` for a
+ *  remote artifact that could not be pulled); show the message, not the JSON. */
 async function errorMessage(res: Response): Promise<string> {
   const raw = await res.text().catch(() => '');
   return apiErrorMessage(new ApiError(res.status, raw || res.statusText, raw));
@@ -26,7 +27,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
     setText(null);
     setError(null);
     setLoading(false);
-    if (a.kind !== 'text' || a.host) return;
+    if (a.kind !== 'text') return;
     if (a.size > PREVIEW_LIMIT) { setError(`Too large to preview (${formatBytes(a.size)}); download it instead.`); return; }
     setLoading(true);
     try {
@@ -73,16 +74,17 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
           <>
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-1.5 font-mono text-note text-ink-mute">
               <span className="truncate">{selected.path}</span>
-              {selected.host ? (
-                <span>stored on host {selected.host}</span>
-              ) : (
+              <span className="flex items-center gap-3">
+                {selected.host && (
+                  <span title={`Fetched from host ${selected.host} the first time it is viewed.`}>from host {selected.host}</span>
+                )}
                 <a href={findingArtifactUrl(findingId, selected.sha256)} download className="text-brand-700 hover:underline">Download</a>
-              )}
+              </span>
             </div>
             {loading && <p role="status" className="px-3 py-2 text-ui text-ink-mute">Loading…</p>}
             {error && <p role="alert" className="px-3 py-2 text-ui text-err">{error}</p>}
             {text !== null && <pre className="max-h-96 overflow-auto px-3 py-2 text-note font-mono text-ink whitespace-pre">{text}</pre>}
-            {selected.kind !== 'text' && !selected.host && <p className="px-3 py-2 text-ui text-ink-mute">Binary file. Use Download.</p>}
+            {selected.kind !== 'text' && <p className="px-3 py-2 text-ui text-ink-mute">Binary file. Use Download.</p>}
           </>
         )}
       </div>
