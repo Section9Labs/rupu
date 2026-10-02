@@ -1190,6 +1190,192 @@ async fn ws_valid_hello_receives_welcome_and_is_online() {
     );
 }
 
+// ── Artifact pull over a real tunnel ────────────────────────────────────────
+//
+// The CP's read pump decodes `ArtifactChunk` / `ArtifactPullDone` and routes
+// them to the waiting `TunnelHostConnector`; a test WS client plays the node.
+
+type NodeWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Enroll a tunnel node, connect it with the current node capabilities, and
+/// return the node's socket plus a connector for it on the CP's registry.
+async fn connect_pull_capable_node(
+    dir: &std::path::Path,
+    name: &str,
+) -> (NodeWs, rupu_cp::host::tunnel::TunnelHostConnector) {
+    use rupu_workspace::{enroll_node, HostStore};
+    let host_store = HostStore {
+        root: dir.join("hosts"),
+    };
+    let (host, token) = enroll_node(&host_store, name).unwrap();
+    let nid = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+    let (addr, registry) = spawn_cp_with_state(dir).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/node/connect"))
+        .await
+        .expect("WS connect failed");
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: nid.clone(),
+            auth: rupu_cp::node::Auth::Token { token },
+            rupu_version: "9.9.9".to_string(),
+            capabilities: rupu_cp::node::protocol::node_capabilities(),
+        },
+    )
+    .await;
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut ws))
+        .await
+        .expect("timed out waiting for Welcome")
+        .expect("connection closed before Welcome");
+    assert!(matches!(welcome, Frame::Welcome { .. }), "{welcome:?}");
+    let run_store = Arc::new(rupu_orchestrator::RunStore::new(dir.join("runs")));
+    let connector = rupu_cp::host::tunnel::TunnelHostConnector::new(
+        nid,
+        registry,
+        Arc::new(rupu_cp::node::NodeMirror::new(Arc::clone(&run_store))),
+        run_store,
+        rupu_config::PricingConfig::default(),
+    );
+    (ws, connector)
+}
+
+/// The next `ArtifactPull` the node receives (keepalive pings skipped).
+async fn recv_artifact_pull(ws: &mut NodeWs) -> (String, String) {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(ws))
+            .await
+            .expect("timed out waiting for ArtifactPull")
+            .expect("connection closed before ArtifactPull");
+        match frame {
+            Frame::ArtifactPull { req, sha256 } => return (req, sha256),
+            Frame::Ping {} => continue,
+            other => panic!("expected ArtifactPull, got {other:?}"),
+        }
+    }
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Real-size chunks (a whole `ARTIFACT_CHUNK_BYTES` each, ~1.4 MB as base64
+/// JSON) fit the tunnel's WS message limits and reassemble in order.
+#[tokio::test]
+async fn ws_artifact_pull_streams_node_chunks_through_the_read_pump() {
+    use rupu_cp::host::connector::HostConnector as _;
+    use rupu_cp::node::protocol::ARTIFACT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ws, connector) = connect_pull_capable_node(dir.path(), "node-ws-pull").await;
+    let sha = "c4".repeat(32);
+    let dest = dir.path().join("pulled");
+    let full: Vec<u8> = (0..ARTIFACT_CHUNK_BYTES).map(|i| (i % 241) as u8).collect();
+    let max = (ARTIFACT_CHUNK_BYTES + 6) as u64;
+    let pull = {
+        let (sha, dest) = (sha.clone(), dest.clone());
+        tokio::spawn(async move { connector.pull_finding_artifact(&sha, &dest, max).await })
+    };
+    let (req, asked) = recv_artifact_pull(&mut ws).await;
+    assert_eq!(asked, sha);
+    for (seq, part) in [&full[..], b"two", b"333"].iter().enumerate() {
+        send_frame(
+            &mut ws,
+            &Frame::ArtifactChunk {
+                req: req.clone(),
+                seq: seq as u64,
+                data_b64: b64(part),
+            },
+        )
+        .await;
+    }
+    send_frame(&mut ws, &Frame::ArtifactPullDone { req, error: None }).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), pull)
+        .await
+        .expect("pull did not finish")
+        .unwrap()
+        .expect("pull failed");
+    let mut want = full;
+    want.extend_from_slice(b"two333");
+    assert!(std::fs::read(&dest).unwrap() == want, "pulled bytes differ");
+}
+
+#[tokio::test]
+async fn ws_an_undecodable_chunk_fails_the_pull() {
+    use rupu_cp::host::connector::{HostConnector as _, HostConnectorError};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ws, connector) = connect_pull_capable_node(dir.path(), "node-ws-bad-b64").await;
+    let dest = dir.path().join("pulled");
+    let pull = {
+        let dest = dest.clone();
+        tokio::spawn(async move {
+            connector
+                .pull_finding_artifact(&"c4".repeat(32), &dest, 9)
+                .await
+        })
+    };
+    let (req, _) = recv_artifact_pull(&mut ws).await;
+    send_frame(
+        &mut ws,
+        &Frame::ArtifactChunk {
+            req,
+            seq: 0,
+            data_b64: "%%% not base64 %%%".into(),
+        },
+    )
+    .await;
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), pull)
+        .await
+        .expect("pull did not finish")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::NotFound(m) if m.contains("undecodable")),
+        "{err:?}"
+    );
+}
+
+/// A node that drops the tunnel mid-pull fails the pull as soon as the CP
+/// sees the disconnect — not only after the idle timeout.
+#[tokio::test]
+async fn ws_a_node_disconnecting_mid_pull_fails_it_promptly() {
+    use rupu_cp::host::connector::{HostConnector as _, HostConnectorError};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ws, connector) = connect_pull_capable_node(dir.path(), "node-ws-drop").await;
+    let dest = dir.path().join("pulled");
+    let pull = {
+        let dest = dest.clone();
+        tokio::spawn(async move {
+            connector
+                .pull_finding_artifact(&"c4".repeat(32), &dest, 9)
+                .await
+        })
+    };
+    let (req, _) = recv_artifact_pull(&mut ws).await;
+    send_frame(
+        &mut ws,
+        &Frame::ArtifactChunk {
+            req,
+            seq: 0,
+            data_b64: b64(b"one"),
+        },
+    )
+    .await;
+    drop(ws);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), pull)
+        .await
+        .expect("the pull outlived the tunnel")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unreachable(m) if m.contains("disconnected")),
+        "{err:?}"
+    );
+}
+
 // ── TunnelHostConnector ───────────────────────────────────────────────────────
 
 mod tunnel_connector {
@@ -1583,11 +1769,17 @@ mod tunnel_connector {
         node_id: &str,
         dir: &std::path::Path,
         capabilities: Vec<String>,
-    ) -> (TunnelHostConnector, mpsc::Receiver<Frame>, Arc<RunStore>) {
+    ) -> (
+        TunnelHostConnector,
+        mpsc::Receiver<Frame>,
+        Arc<RunStore>,
+        Arc<rupu_cp::node::NodeConn>,
+    ) {
         let (tx, rx) = mpsc::channel(16);
         let run_store = Arc::new(RunStore::new(dir.join("runs")));
         let registry = Arc::new(NodeRegistry::new());
-        registry.register_with_hello(node_id, tx, capabilities, Some("0.0.1-test".into()));
+        let node_conn =
+            registry.register_with_hello(node_id, tx, capabilities, Some("0.0.1-test".into()));
         let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
         let conn = TunnelHostConnector::new(
             node_id,
@@ -1596,14 +1788,14 @@ mod tunnel_connector {
             Arc::clone(&run_store),
             rupu_config::PricingConfig::default(),
         );
-        (conn, rx, run_store)
+        (conn, rx, run_store, node_conn)
     }
 
     /// A placed unit's findings profile reaches the node in the Run frame.
     #[tokio::test]
     async fn launch_agent_carries_the_findings_profile_to_a_capable_node() {
         let dir = tempdir().unwrap();
-        let (conn, mut rx, _run_store) = setup_with_capabilities(
+        let (conn, mut rx, _run_store, _node_conn) = setup_with_capabilities(
             "node-fp-1",
             dir.path(),
             rupu_cp::node::protocol::node_capabilities(),
@@ -1655,6 +1847,290 @@ mod tunnel_connector {
             .await
             .expect("launch_agent");
         assert!(matches!(rx.recv().await, Some(Frame::Run { .. })));
+    }
+
+    // ── pull_finding_artifact ────────────────────────────────────────────────
+    //
+    // These play the node side by answering the `ArtifactPull` on the
+    // connection's routing table, where the read pump would deliver it.
+
+    #[tokio::test]
+    async fn pull_finding_artifact_reassembles_node_chunks() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = setup_with_capabilities(
+            "node-pull-1",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let sha = "ab".repeat(32);
+        let dest = dir.path().join("pulled");
+        let pull = {
+            let sha = sha.clone();
+            let dest = dest.clone();
+            tokio::spawn(async move { conn.pull_finding_artifact(&sha, &dest, 6).await })
+        };
+        let req = match rx.recv().await.unwrap() {
+            Frame::ArtifactPull { req, sha256 } => {
+                assert_eq!(sha256, sha);
+                req
+            }
+            other => panic!("expected ArtifactPull, got {other:?}"),
+        };
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Chunk {
+                    seq: 0,
+                    data: b"abc".to_vec(),
+                },
+            )
+            .await;
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Chunk {
+                    seq: 1,
+                    data: b"def".to_vec(),
+                },
+            )
+            .await;
+        node_conn
+            .route_pull(&req, rupu_cp::node::PullMsg::Done(None))
+            .await;
+        pull.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn an_out_of_order_chunk_fails_the_pull() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = setup_with_capabilities(
+            "node-pull-2",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let dest = dir.path().join("pulled");
+        let pull = {
+            let dest = dest.clone();
+            tokio::spawn(
+                async move { conn.pull_finding_artifact(&"ab".repeat(32), &dest, 6).await },
+            )
+        };
+        let Frame::ArtifactPull { req, .. } = rx.recv().await.unwrap() else {
+            panic!("expected ArtifactPull")
+        };
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Chunk {
+                    seq: 1,
+                    data: b"x".to_vec(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            pull.await.unwrap(),
+            Err(HostConnectorError::Invalid(m)) if m.contains("out of order")
+        ));
+    }
+
+    /// Once a pull has ended, the read pump's deliveries for it return at
+    /// once — even past the channel's capacity — so a node still streaming
+    /// an abandoned pull can never wedge the tunnel's read pump.
+    #[tokio::test]
+    async fn route_pull_never_blocks_once_the_pull_has_ended() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = setup_with_capabilities(
+            "node-pull-3",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let dest = dir.path().join("pulled");
+        let pull = {
+            let dest = dest.clone();
+            tokio::spawn(async move {
+                conn.pull_finding_artifact(&"ab".repeat(32), &dest, 1 << 30)
+                    .await
+            })
+        };
+        let Frame::ArtifactPull { req, .. } = rx.recv().await.unwrap() else {
+            panic!("expected ArtifactPull")
+        };
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Chunk {
+                    seq: 7,
+                    data: b"x".to_vec(),
+                },
+            )
+            .await;
+        assert!(pull.await.unwrap().is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for seq in 0..64 {
+                node_conn
+                    .route_pull(&req, rupu_cp::node::PullMsg::Chunk { seq, data: vec![1] })
+                    .await;
+            }
+        })
+        .await
+        .expect("route_pull blocked on a pull that already ended");
+    }
+
+    #[tokio::test]
+    async fn a_node_error_ends_the_pull_as_not_found_naming_the_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = setup_with_capabilities(
+            "node-pull-4",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let dest = dir.path().join("pulled");
+        let pull = {
+            let dest = dest.clone();
+            tokio::spawn(
+                async move { conn.pull_finding_artifact(&"ab".repeat(32), &dest, 6).await },
+            )
+        };
+        let Frame::ArtifactPull { req, .. } = rx.recv().await.unwrap() else {
+            panic!("expected ArtifactPull")
+        };
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Done(Some("artifact is not in this node's store".into())),
+            )
+            .await;
+        let err = pull.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::NotFound(m)
+                if m.contains("node-pull-4") && m.contains("not in this node's store")),
+            "{err:?}"
+        );
+    }
+
+    /// The transfer cap: more bytes than the recorded size abort the pull.
+    #[tokio::test]
+    async fn more_bytes_than_recorded_fail_the_pull() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = setup_with_capabilities(
+            "node-pull-5",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let dest = dir.path().join("pulled");
+        let pull = {
+            let dest = dest.clone();
+            tokio::spawn(
+                async move { conn.pull_finding_artifact(&"ab".repeat(32), &dest, 4).await },
+            )
+        };
+        let Frame::ArtifactPull { req, .. } = rx.recv().await.unwrap() else {
+            panic!("expected ArtifactPull")
+        };
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Chunk {
+                    seq: 0,
+                    data: b"abc".to_vec(),
+                },
+            )
+            .await;
+        node_conn
+            .route_pull(
+                &req,
+                rupu_cp::node::PullMsg::Chunk {
+                    seq: 1,
+                    data: b"de".to_vec(),
+                },
+            )
+            .await;
+        let err = pull.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m) if m.contains("exceeds")),
+            "{err:?}"
+        );
+        assert!(
+            std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) <= 4,
+            "nothing past the cap is written"
+        );
+    }
+
+    /// A node that goes quiet mid-pull fails it after the idle timeout
+    /// rather than pinning the caller forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_node_times_out_the_pull() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, _node_conn) = setup_with_capabilities(
+            "node-pull-6",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let dest = dir.path().join("pulled");
+        let pull = {
+            let dest = dest.clone();
+            tokio::spawn(
+                async move { conn.pull_finding_artifact(&"ab".repeat(32), &dest, 6).await },
+            )
+        };
+        assert!(matches!(rx.recv().await, Some(Frame::ArtifactPull { .. })));
+        let err = pull.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m.contains("node-pull-6")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_sha_is_refused_before_any_frame() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, _node_conn) = setup_with_capabilities(
+            "node-pull-7",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let err = conn
+            .pull_finding_artifact("../../etc/passwd", &dir.path().join("x"), 6)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+        assert!(rx.try_recv().is_err(), "no frame sent");
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_refuses_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store) = setup("node-pull-old", dir.path());
+        let err = conn
+            .pull_finding_artifact(&"ab".repeat(32), &dir.path().join("x"), 6)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("node-pull-old")),
+            "{err:?}"
+        );
+        // An older node can't parse the frame (a fatal parse on its side),
+        // so nothing may be sent.
+        assert!(rx.try_recv().is_err(), "no frame sent");
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_on_an_offline_node_is_unreachable() {
+        let dir = tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+        let conn = TunnelHostConnector::new(
+            "node-pull-offline",
+            Arc::new(NodeRegistry::new()),
+            Arc::new(NodeMirror::new(Arc::clone(&run_store))),
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+        let err = conn
+            .pull_finding_artifact(&"ab".repeat(32), &dir.path().join("x"), 6)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err:?}");
     }
 }
 

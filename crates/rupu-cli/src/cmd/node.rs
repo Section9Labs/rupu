@@ -8,8 +8,9 @@
 //! support to use it).  Sends `Hello`, awaits `Welcome`, then processes
 //! inbound frames: `Run` → spawn `rupu workflow run` / `rupu run`, tail
 //! artifact files, stream `Artifact` frames back; `Cancel` → kill
-//! child; `Ping` → `Pong`.  Reconnects with exponential backoff
-//! (1 s … 60 s cap) on disconnect.
+//! child; `Ping` → `Pong`; `ArtifactPull` → stream a finding-artifact blob
+//! from this node's store, one chunk per loop turn.  Reconnects with
+//! exponential backoff (1 s … 60 s cap) on disconnect.
 //!
 //! **Enroll mode** (`rupu node enroll <name>`):
 //! Mints a tunnel host + one-time token in the local host store and
@@ -24,16 +25,18 @@
 
 #![deny(clippy::all)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
 use rupu_cp::host::bucket::{Bucket, BucketError, ControlEnvelope, ObjectStoreBucket};
-use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, CAP_USAGE_LEDGER};
+use rupu_cp::node::protocol::{
+    ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, ARTIFACT_CHUNK_BYTES, CAP_USAGE_LEDGER,
+};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -366,6 +369,7 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
     }
 
     let exe = std::env::current_exe().context("resolve current executable path")?;
+    let global = crate::paths::global_dir()?;
     let mut backoff_secs: u64 = 1;
 
     loop {
@@ -374,7 +378,7 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
         // tracing — without these a successful connect is silent.
         eprintln!("connecting to {cp_url} as {node_id} …");
         info!(url = %cp_url, node_id = %node_id, "node: connecting");
-        match connect_and_run(cp_url, token, node_id, &exe).await {
+        match connect_and_run(cp_url, token, node_id, &exe, &global).await {
             Ok(()) => {
                 // Clean close: reset backoff so the next attempt is prompt.
                 backoff_secs = 1;
@@ -474,11 +478,16 @@ fn enroll_commands(
 // Single connection lifetime
 // ---------------------------------------------------------------------------
 
+/// How often the connection loop polls active runs' artifact files when no
+/// inbound frame wakes it.
+const RUN_FILE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 async fn connect_and_run(
     cp_url: &str,
     token: &str,
     node_id: &str,
     exe: &Path,
+    global: &Path,
 ) -> anyhow::Result<()> {
     // Dial the CP.
     let (ws_stream, _) = tokio_tungstenite::connect_async(cp_url)
@@ -525,26 +534,49 @@ async fn connect_and_run(
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 
     // Runs root: <global>/runs/<run_id>/
-    let global = crate::paths::global_dir()?;
     let runs_root = global.join("runs");
 
     let mut active: HashMap<String, RunState> = HashMap::new();
+    // Artifact pulls being answered, oldest first; the front one sends one
+    // frame per loop turn.
+    let mut pulls: VecDeque<ArtifactPullStream> = VecDeque::new();
+    let mut last_drain = tokio::time::Instant::now();
 
     loop {
-        // Interleave: poll artifact files every 250 ms, or process a WS frame immediately.
-        let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(250));
-        tokio::pin!(sleep_fut);
+        // Interleave: poll artifact files every RUN_FILE_POLL, or process a
+        // WS frame immediately. While pulls are queued the wait is zero-length
+        // so their chunks flow back-to-back — yet every turn still takes an
+        // inbound frame first (`biased`), so a large blob never holds up a
+        // Cancel, Run or Ping.
+        let pulling = !pulls.is_empty();
+        let wait = async move {
+            if pulling {
+                tokio::task::yield_now().await
+            } else {
+                tokio::time::sleep(RUN_FILE_POLL).await
+            }
+        };
+        tokio::pin!(wait);
 
         let maybe_msg = tokio::select! {
+            biased;
             msg = stream.next() => match msg {
                 None => break,                            // server closed cleanly
                 Some(m) => Some(m.context("recv frame")?),
             },
-            _ = &mut sleep_fut => None,
+            _ = &mut wait => None,
         };
 
-        // Drain artifact files for all active runs.
-        let run_ids: Vec<String> = active.keys().cloned().collect();
+        // Drain artifact files for all active runs — on an inbound frame or
+        // once per poll interval, not on every back-to-back pull turn (which
+        // would re-read every active run's files once per chunk).
+        let drain_due = maybe_msg.is_some() || last_drain.elapsed() >= RUN_FILE_POLL;
+        let run_ids: Vec<String> = if drain_due {
+            last_drain = tokio::time::Instant::now();
+            active.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
         let mut finished: Vec<String> = Vec::new();
 
         for rid in &run_ids {
@@ -617,6 +649,18 @@ async fn connect_and_run(
         }
         for rid in finished {
             active.remove(&rid);
+        }
+
+        // Answer the oldest queued artifact pull by ONE frame (R11): a blob
+        // of up to hundreds of MiB streamed inline would stall inbound
+        // frames and run-file drains for the whole transfer.
+        if let Some(pull) = pulls.front_mut() {
+            if let Some(frame) = pull.next_frame().await {
+                send_frame(&mut sink, &frame).await;
+            }
+            if pull.is_done() {
+                pulls.pop_front();
+            }
         }
 
         // Process incoming WS frame (if one arrived).
@@ -723,11 +767,17 @@ async fn connect_and_run(
                     warn!(run_id = %run_id, "node: Reject for unknown run_id (ignored)");
                 }
             }
+            Frame::ArtifactPull { req, sha256 } => {
+                info!(req = %req, sha256 = %sha256, "node: ArtifactPull received");
+                pulls.push_back(ArtifactPullStream::new(global, req, sha256));
+            }
             Frame::Hello { .. }
             | Frame::Welcome { .. }
             | Frame::Pong {}
             | Frame::Artifact { .. }
-            | Frame::RunFinished { .. } => {
+            | Frame::RunFinished { .. }
+            | Frame::ArtifactChunk { .. }
+            | Frame::ArtifactPullDone { .. } => {
                 warn!(
                     frame = %serde_json::to_string(&frame).unwrap_or_else(|_| "?".into()),
                     "node: unexpected server-sent frame type (ignored)"
@@ -1017,6 +1067,128 @@ where
         line,
     };
     send_frame(sink, &frame).await;
+}
+
+// ---------------------------------------------------------------------------
+// Artifact pulls (unit-testable)
+// ---------------------------------------------------------------------------
+
+/// The answer to one `ArtifactPull`: the blob
+/// `<global>/findings/artifacts/<aa>/<sha256>` as ordered `ArtifactChunk`
+/// frames (`seq` from 0, each a whole [`ARTIFACT_CHUNK_BYTES`] decoded except
+/// the last), then exactly one `ArtifactPullDone` — carrying the error when
+/// the blob can't be found, opened or read — then `None`.
+///
+/// `connect_and_run` takes one frame per loop turn from the front of its
+/// pull queue, so a large blob streams between inbound frames and run-file
+/// drains instead of holding them up. The blob is opened on the first
+/// frame, so a queued pull holds no file handle.
+struct ArtifactPullStream {
+    req: String,
+    sha256: String,
+    /// The blob's store path, or why there is none (a malformed sha).
+    path: Result<PathBuf, String>,
+    file: Option<tokio::fs::File>,
+    seq: u64,
+    done: bool,
+}
+
+impl ArtifactPullStream {
+    fn new(global: &Path, req: String, sha256: String) -> Self {
+        let path =
+            crate::cmd::findings_helper::blob_path(global, &sha256).map_err(|e| e.to_string());
+        Self {
+            req,
+            sha256,
+            path,
+            file: None,
+            seq: 0,
+            done: false,
+        }
+    }
+
+    /// Whether the closing `ArtifactPullDone` has been yielded.
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// The pull's next frame, or `None` once `ArtifactPullDone` has gone.
+    async fn next_frame(&mut self) -> Option<Frame> {
+        use base64::Engine as _;
+        if self.done {
+            return None;
+        }
+        let frame = match self.next_chunk().await {
+            Ok(Some(data)) => {
+                let seq = self.seq;
+                self.seq += 1;
+                return Some(Frame::ArtifactChunk {
+                    req: self.req.clone(),
+                    seq,
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
+                });
+            }
+            Ok(None) => Frame::ArtifactPullDone {
+                req: self.req.clone(),
+                error: None,
+            },
+            Err(error) => {
+                warn!(req = %self.req, sha256 = %self.sha256, %error, "node: artifact pull failed");
+                Frame::ArtifactPullDone {
+                    req: self.req.clone(),
+                    error: Some(error),
+                }
+            }
+        };
+        self.done = true;
+        self.file = None;
+        Some(frame)
+    }
+
+    /// The next chunk's bytes — a whole [`ARTIFACT_CHUNK_BYTES`] unless the
+    /// blob ends first — or `None` at the end of the blob.
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use tokio::io::AsyncReadExt as _;
+        if self.file.is_none() {
+            self.file = Some(self.open().await?);
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(format!("artifact {} was not opened", self.sha256));
+        };
+        let mut buf = vec![0u8; ARTIFACT_CHUNK_BYTES];
+        let mut n = 0;
+        // Fill a whole chunk: a read may return less.
+        while n < buf.len() {
+            let got = file
+                .read(&mut buf[n..])
+                .await
+                .map_err(|e| format!("reading artifact {}: {e}", self.sha256))?;
+            if got == 0 {
+                break;
+            }
+            n += got;
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.truncate(n);
+        Ok(Some(buf))
+    }
+
+    /// Open the blob without ever parking the caller: refuses anything but a
+    /// regular file (a FIFO swapped into the store would otherwise block
+    /// the open — and with it the node's frame loop — until a writer came).
+    async fn open(&self) -> Result<tokio::fs::File, String> {
+        let path = self.path.clone()?;
+        let sha256 = self.sha256.clone();
+        let opened =
+            tokio::task::spawn_blocking(move || rupu_cp::api::fs_open::open_regular_file(&path))
+                .await
+                .map_err(|e| format!("opening artifact {sha256}: {e}"))?;
+        let file = opened
+            .map_err(|e| format!("artifact {} is not in this node's store: {e}", self.sha256))?;
+        Ok(tokio::fs::File::from_std(file))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3507,5 +3679,369 @@ mod tests {
     fn next_control_seq_multiple_items_returns_max_plus_one() {
         let items = vec![(1u64, vec![]), (3u64, vec![]), (2u64, vec![])];
         assert_eq!(next_control_seq(&items), 4, "should be max(1,3,2)+1=4");
+    }
+
+    // ------------------------------------------------------------------
+    // ArtifactPullStream: one ArtifactPull answered frame by frame
+    // ------------------------------------------------------------------
+
+    /// Every frame `stream` yields, in order, until it ends.
+    async fn collect_pull(stream: &mut ArtifactPullStream) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(f) = stream.next_frame().await {
+            frames.push(f);
+            assert!(frames.len() < 1000, "the pull stream never ended");
+        }
+        frames
+    }
+
+    /// Put `body` in `global`'s artifact store under `sha`.
+    fn store_blob(global: &Path, sha: &str, body: &[u8]) {
+        let p = crate::cmd::findings_helper::blob_path(global, sha).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    }
+
+    fn decode_b64(data_b64: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn artifact_blob_is_streamed_as_ordered_chunks_then_done() {
+        let global = tempdir().unwrap();
+        let sha = "cd".repeat(32);
+        let body: Vec<u8> = (0..ARTIFACT_CHUNK_BYTES + 5)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        store_blob(global.path(), &sha, &body);
+
+        let mut stream = ArtifactPullStream::new(global.path(), "req1".into(), sha);
+        let frames = collect_pull(&mut stream).await;
+        assert_eq!(frames.len(), 3, "{} frames", frames.len());
+        let mut got = Vec::new();
+        for (i, f) in frames[..2].iter().enumerate() {
+            match f {
+                Frame::ArtifactChunk { req, seq, data_b64 } => {
+                    assert_eq!(req, "req1");
+                    assert_eq!(*seq, i as u64);
+                    got.extend(decode_b64(data_b64));
+                }
+                other => panic!("expected a chunk, got {other:?}"),
+            }
+        }
+        // A chunk is a whole ARTIFACT_CHUNK_BYTES, never a short read.
+        assert_eq!(got.len(), body.len());
+        assert_eq!(got, body);
+        assert_eq!(
+            frames[2],
+            Frame::ArtifactPullDone {
+                req: "req1".into(),
+                error: None
+            }
+        );
+        assert!(stream.is_done());
+        assert!(stream.next_frame().await.is_none(), "nothing after Done");
+    }
+
+    #[tokio::test]
+    async fn a_missing_blob_is_one_done_frame_with_an_error() {
+        let global = tempdir().unwrap();
+        let mut stream = ArtifactPullStream::new(global.path(), "req2".into(), "ef".repeat(32));
+        let frames = collect_pull(&mut stream).await;
+        assert!(
+            matches!(
+                &frames[..],
+                [Frame::ArtifactPullDone { req, error: Some(e) }]
+                    if req == "req2" && e.contains("not in this node's store")
+            ),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_sha_is_one_done_frame_with_an_error() {
+        let global = tempdir().unwrap();
+        let mut stream =
+            ArtifactPullStream::new(global.path(), "req3".into(), "../../etc/passwd".into());
+        let frames = collect_pull(&mut stream).await;
+        assert!(
+            matches!(
+                &frames[..],
+                [Frame::ArtifactPullDone { error: Some(e), .. }] if e.contains("not a sha256")
+            ),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_blob_is_just_done() {
+        let global = tempdir().unwrap();
+        let sha = "0e".repeat(32);
+        store_blob(global.path(), &sha, b"");
+        let mut stream = ArtifactPullStream::new(global.path(), "req4".into(), sha);
+        assert_eq!(
+            collect_pull(&mut stream).await,
+            vec![Frame::ArtifactPullDone {
+                req: "req4".into(),
+                error: None
+            }]
+        );
+    }
+
+    /// The pull runs inside the node's frame loop, so opening the blob must
+    /// never park it: a FIFO swapped into the store is refused at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_in_the_store_is_refused_without_blocking() {
+        let global = tempdir().unwrap();
+        let sha = "f1".repeat(32);
+        let p = crate::cmd::findings_helper::blob_path(global.path(), &sha).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&p).status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+        let mut stream = ArtifactPullStream::new(global.path(), "req5".into(), sha);
+        let frames =
+            tokio::time::timeout(std::time::Duration::from_secs(5), collect_pull(&mut stream))
+                .await
+                .expect("opening a FIFO blocked the pull");
+        assert!(
+            matches!(
+                &frames[..],
+                [Frame::ArtifactPullDone { error: Some(_), .. }]
+            ),
+            "{frames:?}"
+        );
+    }
+
+    type CpWs = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    /// The next text frame from a test CP's socket.
+    async fn next_cp_frame(ws: &mut CpWs) -> Frame {
+        loop {
+            let msg = ws
+                .next()
+                .await
+                .expect("node closed the tunnel")
+                .expect("ws read");
+            if let Message::Text(_) = msg {
+                return parse_frame(&msg).unwrap();
+            }
+        }
+    }
+
+    fn cp_text(f: &Frame) -> Message {
+        Message::Text(serde_json::to_string(f).unwrap())
+    }
+
+    /// Play a CP: accept the node's tunnel, check its Hello advertises
+    /// artifact pulls, and welcome it.
+    async fn accept_node(listener: tokio::net::TcpListener) -> CpWs {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let hello = next_cp_frame(&mut ws).await;
+        assert!(
+            matches!(&hello, Frame::Hello { capabilities, .. }
+                if capabilities.iter().any(|c| c == rupu_cp::node::protocol::CAP_FINDINGS_ARTIFACT_PULL)),
+            "{hello:?}"
+        );
+        ws.send(cp_text(&Frame::Welcome {
+            capabilities: vec![],
+        }))
+        .await
+        .unwrap();
+        ws
+    }
+
+    /// Run a node's connection loop against `url`, rooted at `global`.
+    fn spawn_node(
+        url: String,
+        global: &Path,
+        exe: &Path,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let (global, exe) = (global.to_path_buf(), exe.to_path_buf());
+        tokio::spawn(
+            async move { connect_and_run(&url, "tok", "node-pull-test", &exe, &global).await },
+        )
+    }
+
+    /// A blob of `chunks` whole chunks in `global`'s store; returns its sha
+    /// and bytes.
+    fn store_chunks(global: &Path, sha: &str, chunks: usize) -> Vec<u8> {
+        let body: Vec<u8> = (0..chunks * ARTIFACT_CHUNK_BYTES)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        store_blob(global, sha, &body);
+        body
+    }
+
+    /// R11: while a node streams a multi-chunk pull it still answers inbound
+    /// frames between chunks — not only after the whole blob has gone.
+    #[tokio::test]
+    async fn a_streaming_pull_does_not_hold_up_inbound_frames() {
+        const CHUNKS: usize = 8;
+        let global = tempdir().unwrap();
+        let sha = "a1".repeat(32);
+        let body = store_chunks(global.path(), &sha, CHUNKS);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let cp = tokio::spawn(async move {
+            let mut ws = accept_node(listener).await;
+            ws.send(cp_text(&Frame::ArtifactPull {
+                req: "r1".into(),
+                sha256: sha,
+            }))
+            .await
+            .unwrap();
+            let mut frames = Vec::new();
+            loop {
+                let f = next_cp_frame(&mut ws).await;
+                let done = matches!(f, Frame::ArtifactPullDone { .. });
+                frames.push(f);
+                // The node is mid-pull once its first chunk arrives: ask it
+                // something then.
+                if frames.len() == 1 {
+                    ws.send(cp_text(&Frame::Ping {})).await.unwrap();
+                }
+                if done {
+                    return frames;
+                }
+            }
+        });
+        let node = spawn_node(url, global.path(), Path::new("/nonexistent/rupu"));
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(60), cp)
+            .await
+            .expect("the pull never finished")
+            .unwrap();
+        node.abort();
+
+        let pong_at = frames
+            .iter()
+            .position(|f| matches!(f, Frame::Pong {}))
+            .expect("the Ping went unanswered until after the whole blob");
+        assert!(
+            pong_at + 2 < frames.len(),
+            "Pong at {pong_at} of {} frames: the Ping waited for the blob",
+            frames.len()
+        );
+        // The pull itself is intact: ordered chunks reassembling the blob.
+        let (mut got, mut next_seq) = (Vec::new(), 0u64);
+        for f in &frames {
+            match f {
+                Frame::ArtifactChunk { req, seq, data_b64 } => {
+                    assert_eq!(req, "r1");
+                    assert_eq!(*seq, next_seq);
+                    next_seq += 1;
+                    got.extend(decode_b64(data_b64));
+                }
+                Frame::Pong {} | Frame::ArtifactPullDone { error: None, .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(next_seq, CHUNKS as u64);
+        assert!(got == body, "reassembled blob differs");
+    }
+
+    /// R11's other half: an active run's files keep draining while a pull
+    /// streams (at the poll cadence, not once per chunk).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_streaming_pull_still_drains_active_runs() {
+        // More chunks than loopback socket buffers hold, so the node is still
+        // mid-pull when the CP resumes reading after its pause.
+        const CHUNKS: usize = 16;
+        // The node tracks a run by its files, not its child, so any
+        // spawnable no-op executable stands in for `rupu`.
+        let Some(exe) = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            eprintln!("no `true` executable; skipping");
+            return;
+        };
+        let global = tempdir().unwrap();
+        let sha = "b2".repeat(32);
+        store_chunks(global.path(), &sha, CHUNKS);
+        let events = global
+            .path()
+            .join("runs")
+            .join("run_drain")
+            .join("events.jsonl");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let cp = tokio::spawn(async move {
+            let mut ws = accept_node(listener).await;
+            ws.send(cp_text(&Frame::Run {
+                run_id: "run_drain".into(),
+                spec: RunSpec {
+                    kind: RunSpecKind::Workflow,
+                    name: "wf".into(),
+                    inputs: BTreeMap::new(),
+                    prompt: None,
+                    mode: None,
+                    target: None,
+                    findings_profile: None,
+                },
+            }))
+            .await
+            .unwrap();
+            ws.send(cp_text(&Frame::ArtifactPull {
+                req: "r2".into(),
+                sha256: sha,
+            }))
+            .await
+            .unwrap();
+            let mut frames = vec![next_cp_frame(&mut ws).await];
+            assert!(
+                matches!(frames[0], Frame::ArtifactChunk { seq: 0, .. }),
+                "{:?}",
+                frames[0]
+            );
+            // Mid-pull, the run writes an event; stop reading for longer than
+            // the poll interval, then take everything up to the pull's end.
+            std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+            std::fs::write(&events, "{\"e\":1}\n").unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            loop {
+                let f = next_cp_frame(&mut ws).await;
+                let done = matches!(f, Frame::ArtifactPullDone { .. });
+                frames.push(f);
+                if done {
+                    return frames;
+                }
+            }
+        });
+        let node = spawn_node(url, global.path(), exe);
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(60), cp)
+            .await
+            .expect("the pull never finished")
+            .unwrap();
+        node.abort();
+
+        let event_at = frames
+            .iter()
+            .position(|f| {
+                matches!(f, Frame::Artifact { run_id, file: ArtifactFile::Events, line }
+                    if run_id == "run_drain" && line == "{\"e\":1}")
+            })
+            .expect("the run's event was not drained during the pull");
+        let last_chunk_at = frames
+            .iter()
+            .rposition(|f| matches!(f, Frame::ArtifactChunk { .. }))
+            .unwrap();
+        assert!(
+            event_at < last_chunk_at,
+            "event at {event_at}, last chunk at {last_chunk_at}: drained only after the blob"
+        );
     }
 }

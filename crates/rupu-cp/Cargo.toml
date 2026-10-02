@@ -44,6 +44,7 @@ toml.workspace = true
 toml_edit = { workspace = true }
 fs2 = { workspace = true }
 rustix.workspace = true
+base64.workspace = true
 
 # In-workspace
 rupu-orchestrator = { path = "../rupu-orchestrator" }

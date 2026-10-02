@@ -25,7 +25,9 @@ use std::path::Path as FsPath;
 ///   daemon's controlling terminal before the type check refuses it.
 ///
 /// Blocking syscalls: async callers run this under `spawn_blocking`.
-pub(crate) fn open_regular_file(path: &FsPath) -> std::io::Result<File> {
+/// Also used by `rupu node` to open a finding-artifact blob for a tunnel
+/// pull, which runs inside the node's frame loop.
+pub fn open_regular_file(path: &FsPath) -> std::io::Result<File> {
     let flags =
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC;
     let file = File::from(rustix::fs::open(path, flags, Mode::empty())?);
