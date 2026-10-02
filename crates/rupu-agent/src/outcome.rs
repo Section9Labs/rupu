@@ -214,7 +214,13 @@ pub fn classify_response(resp: &LlmResponse) -> Option<Outcome> {
 
 /// Classify a provider error. Every error is an outcome.
 pub fn classify_error(e: &ProviderError) -> Outcome {
-    let class = e.class();
+    classify_error_as(e, e.class())
+}
+
+/// Classify a provider error under a class the caller already knows: the
+/// runner's overflow pipeline recognises a context overflow by its text
+/// even when the error's own class does not say so.
+pub fn classify_error_as(e: &ProviderError, class: ErrorClass) -> Outcome {
     let wire = match e.reply() {
         Some(body) => serde_json::to_value::<&ApiErrorBody>(body).unwrap_or(Value::Null),
         None => serde_json::json!({ "message": e.to_string() }),
@@ -500,6 +506,19 @@ mod tests {
         assert!(o.id.is_empty());
         assert_eq!(o.wire, serde_json::to_value(e.reply().unwrap()).unwrap());
         assert_eq!(o.record().error_class.as_deref(), Some("overloaded"));
+    }
+
+    #[test]
+    fn classify_error_as_keeps_the_error_and_takes_the_class() {
+        let e = ProviderError::Other(anyhow::anyhow!("prompt is too long"));
+        let o = classify_error_as(&e, ErrorClass::ContextOverflow);
+        assert_eq!(
+            o.class,
+            OutcomeClass::ProviderError(ErrorClass::ContextOverflow)
+        );
+        assert_eq!(o.title, "provider error · context_overflow");
+        assert_eq!(o.record().error_class.as_deref(), Some("context_overflow"));
+        assert_eq!(o.detail, classify_error(&e).detail);
     }
 
     #[test]
