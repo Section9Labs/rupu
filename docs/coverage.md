@@ -218,13 +218,28 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
   every transport. The coordinator merges it under its own workspace's targets
   and records the unit's artifacts `stored: external` with `host` set (their
   blobs stay in the host's store; a unit placed on the coordinator's own
-  `local` host shares its store, so its artifacts stay `copied`). A host too
-  old to stream, or a stream that cannot be collected or merged, shows a
-  `StepWarning` on the step — in the control-plane run view (a marker on the
-  run graph and a card in the event feed), in the Situation Room, in the CLI
-  live view, and in the completion summary and `rupu workflow show-run`; the
-  unit is not failed. Pulling the blobs into the coordinator's store on first
-  view is specified but not built yet.
+  `local` host shares its store, so its artifacts stay `copied`). In each of
+  the cases below the step shows a `StepWarning` — in the control-plane run
+  view (a marker on the run graph and a card in the event feed), in the
+  Situation Room, in the CLI live view, and in the completion summary and
+  `rupu workflow show-run` — and the unit is not failed:
+  - no stream arrived (no begin line): the host predates coverage streaming,
+    or its stream failed to start or was lost in transport;
+  - the stream could not be collected or merged, or had malformed lines;
+  - the stream may be incomplete — it was read while the unit may still have
+    been running (the coordinator's poll failed after it saw the run, or its
+    wall-clock budget ran out), or an SSH host's final copy of it did not
+    arrive. It is merged, and the warning says findings recorded after it was
+    collected may be missing.
+
+  With `workspace: sync` the unit's returned delta still carries its
+  `.rupu/coverage/`: the coordinator drops it when the unit's stream arrived
+  and merged, and applies it when no stream arrived. A standalone run that
+  never finished (no `run.json`) leaves `runs/<run_id>/` holding only its
+  stream; it follows the run's transcript — `rupu transcript archive` moves
+  it to `runs-archive/`, and `transcript delete`, `transcript prune` and
+  `rupu cleanup` remove it. Pulling the blobs into the coordinator's store on
+  first view is specified but not built yet.
 
 Each evidence claim's `sha256` is taken only from a file that resolves inside
 the workspace and is no larger than `artifact_max_bytes`; other claims are
