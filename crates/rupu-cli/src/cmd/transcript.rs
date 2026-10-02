@@ -2821,11 +2821,6 @@ mod tests {
         }
     }
 
-    // I4 (final-review finding): a standalone run's `.meta.json` is written
-    // before the agent loop starts and carries no status field, so an
-    // in-flight run is otherwise indistinguishable from a finished one.
-    // `ensure_standalone_not_running` refuses archive/delete while the
-    // captured pid is still alive.
     /// Only a plain run id with a `run.json`-less dir qualifies: the result
     /// is removed recursively, so `.`/`..`/separators must never resolve.
     #[test]
@@ -2846,6 +2841,11 @@ mod tests {
         }
     }
 
+    // I4 (final-review finding): a standalone run's `.meta.json` is written
+    // before the agent loop starts and carries no status field, so an
+    // in-flight run is otherwise indistinguishable from a finished one.
+    // `ensure_standalone_not_running` refuses archive/delete while the
+    // captured pid is still alive.
     #[test]
     fn ensure_standalone_not_running_refuses_a_live_pid() {
         // Our own pid is guaranteed alive for the duration of the test.
