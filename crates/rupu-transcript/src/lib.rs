@@ -11,5 +11,5 @@ pub use aggregate::{aggregate, TimeWindow, UsageRow};
 pub use cursor::{transcript_key, DrainStats, JsonlCursor};
 pub use event::{Event, FileEditKind, RunMode, RunStatus};
 pub use netflow_sink::TranscriptSink;
-pub use reader::{JsonlReader, ReadError, RunHead, RunSummary};
+pub use reader::{final_turn_text, JsonlReader, ReadError, RunHead, RunSummary};
 pub use writer::{JsonlWriter, WriteError};

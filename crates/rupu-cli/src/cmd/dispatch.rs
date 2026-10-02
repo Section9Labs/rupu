@@ -622,21 +622,13 @@ fn write_delegation_narrowing_notice(
     }
 }
 
-/// Walk the persisted transcript and return the last non-empty
-/// `AssistantMessage.content`. Used as the child's `output` in the
-/// dispatch tool's return payload — same shape as a top-level run's
-/// final assistant text.
+/// Walk the persisted transcript and return the final turn's text
+/// ([`rupu_transcript::final_turn_text`]). Used as the child's `output` in
+/// the dispatch tool's return payload — the same rule a workflow step's
+/// output uses.
 fn read_final_assistant_text(path: &Path) -> Option<String> {
     let iter = JsonlReader::iter(path).ok()?;
-    let mut last: Option<String> = None;
-    for ev in iter {
-        if let Ok(TxEvent::AssistantMessage { content, .. }) = ev {
-            if !content.trim().is_empty() {
-                last = Some(content);
-            }
-        }
-    }
-    last
+    rupu_transcript::final_turn_text(iter.flatten())
 }
 
 #[cfg(test)]
@@ -692,6 +684,44 @@ mod tests {
         assert_eq!(
             read_final_assistant_text(&path),
             Some("final answer".to_string())
+        );
+    }
+
+    /// A final turn text → thinking → text yields both fragments, the same
+    /// rule as a workflow step's output.
+    #[test]
+    fn read_final_assistant_text_joins_the_final_turn_s_fragments() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let mut w = JsonlWriter::create(&path).unwrap();
+        for e in [
+            Event::TurnStart { turn_idx: 0 },
+            Event::AssistantMessage {
+                content: "checking".into(),
+                thinking: None,
+            },
+            Event::TurnStart { turn_idx: 1 },
+            Event::AssistantMessage {
+                content: "part one".into(),
+                thinking: None,
+            },
+            Event::Thinking {
+                text: Some("hmm".into()),
+                provider: "anthropic".into(),
+                model: "m".into(),
+                raw: serde_json::json!({}),
+            },
+            Event::AssistantMessage {
+                content: "part two".into(),
+                thinking: None,
+            },
+        ] {
+            w.write(&e).unwrap();
+        }
+        w.flush().unwrap();
+        assert_eq!(
+            read_final_assistant_text(&path),
+            Some("part one\n\npart two".to_string())
         );
     }
 
