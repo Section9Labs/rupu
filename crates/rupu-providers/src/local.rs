@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ProviderError;
 use crate::provider::LlmProvider;
+use crate::stop::map;
 use crate::types::{
-    ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, Message, RefusalDetail, RefusalSource, Role, Stop,
+    StopReason, StreamEvent, Usage,
 };
 
 /// Provider backed by a local HTTP inference server (llama.cpp, Ollama, vLLM).
@@ -116,6 +118,66 @@ fn extract_text_content(msg: &Message) -> String {
         .join("")
 }
 
+/// Parse a local server's chat-completions reply. Text only: local models are
+/// not given tools, so `tool_calls` are not read.
+fn parse_local_response(
+    json: &serde_json::Value,
+    model_name: &str,
+) -> Result<LlmResponse, ProviderError> {
+    if json.get("choices").is_none() && json.get("error").is_some_and(|e| !e.is_null()) {
+        return Err(ProviderError::Reply(Box::new(
+            crate::reply_error::parse_error_value(
+                "local",
+                crate::reply_error::ErrorOrigin::Http { status: 200 },
+                json,
+            ),
+        )));
+    }
+
+    let choice = &json["choices"][0];
+    let content = choice["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let finish = choice["finish_reason"].as_str();
+    let mut stop = match finish {
+        Some(v) => Stop::from_wire(map::chat_finish(v), "local", Some(v)),
+        None => Stop::from_wire(StopReason::Unreported, "local", None),
+    };
+    // A refusal is the model declining: it is not reply text.
+    let refusal = choice["message"]["refusal"]
+        .as_str()
+        .filter(|r| !r.is_empty());
+    if let Some(text) = refusal {
+        stop.reason = StopReason::Refusal;
+        stop.refusal = Some(RefusalDetail {
+            category: None,
+            explanation: Some(text.to_string()),
+            recommended_model: None,
+            source: RefusalSource::Model,
+        });
+    }
+
+    let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+
+    Ok(LlmResponse {
+        id: json["id"].as_str().unwrap_or("local").to_string(),
+        model: model_name.to_string(),
+        content: if refusal.is_some() && content.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text { text: content }]
+        },
+        stop,
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        },
+    })
+}
+
 #[async_trait]
 impl LlmProvider for LocalModelProvider {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
@@ -147,26 +209,7 @@ impl LlmProvider for LocalModelProvider {
             .await
             .map_err(|e| ProviderError::Json(format!("cannot parse local model response: {e}")))?;
 
-        // Parse OpenAI-compatible response
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-        let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
-
-        Ok(LlmResponse {
-            id: json["id"].as_str().unwrap_or("local").to_string(),
-            model: self.model_name.clone(),
-            content: vec![ContentBlock::Text { text: content }],
-            stop: Stop::synthetic(StopReason::EndTurn, "local"),
-            usage: Usage {
-                input_tokens,
-                output_tokens,
-                ..Default::default()
-            },
-        })
+        parse_local_response(&json, &self.model_name)
     }
 
     async fn stream(
@@ -503,5 +546,42 @@ mod tests {
             policy.route("anything_else", true),
             RoutingDecision::Frontier
         );
+    }
+
+    #[test]
+    fn local_reads_finish_reason() {
+        let body = |finish: serde_json::Value| {
+            serde_json::json!({
+                "id": "l1",
+                "choices": [{"message": {"content": "hello"}, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+            })
+        };
+        let r = parse_local_response(&body(serde_json::json!("length")), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
+        assert_eq!(r.stop.wire.provider, "local");
+        assert_eq!(r.stop.wire.value.as_deref(), Some("length"));
+        assert_eq!(r.usage.input_tokens, 3);
+
+        let r = parse_local_response(&body(serde_json::json!("stop")), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::EndTurn);
+
+        let r = parse_local_response(&body(serde_json::Value::Null), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unreported);
+        assert_eq!(r.stop.wire.value, None);
+
+        let r = parse_local_response(&body(serde_json::json!("content_filter")), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::Safety);
+    }
+
+    #[test]
+    fn local_message_refusal_is_a_refusal() {
+        let json = serde_json::json!({
+            "choices": [{"message": {"content": null, "refusal": "No."}, "finish_reason": "stop"}]
+        });
+        let r = parse_local_response(&json, "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(r.stop.refusal.unwrap().explanation.as_deref(), Some("No."));
+        assert!(r.content.is_empty());
     }
 }

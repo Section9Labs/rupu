@@ -204,7 +204,7 @@ impl OpenAiCompatibleClient {
             .json()
             .await
             .map_err(|e| ProviderError::Json(e.to_string()))?;
-        crate::openai_wire::parse_chat_completion(&json)
+        crate::openai_wire::parse_chat_completion(&json, "openai-compatible")
     }
 
     async fn stream_inner(
@@ -233,7 +233,7 @@ impl OpenAiCompatibleClient {
             ));
         }
         let mut parser = SseParser::new();
-        let mut acc = crate::openai_wire::CompletionAccumulator::new();
+        let mut acc = crate::openai_wire::CompletionAccumulator::new("openai-compatible");
         let mut bytes_stream = response.bytes_stream();
         while let Some(chunk) = bytes_stream.next().await {
             let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
@@ -241,7 +241,7 @@ impl OpenAiCompatibleClient {
                 crate::openai_wire::process_completion_sse(&event, &mut acc, on_event)?;
             }
         }
-        acc.into_response()
+        acc.into_response()?
             .ok_or(ProviderError::UnexpectedEndOfStream)
     }
 

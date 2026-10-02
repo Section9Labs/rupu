@@ -6,8 +6,11 @@
 //! base URL, auth headers, token exchange — stay in the individual clients.
 
 use crate::error::ProviderError;
+use crate::reply_error::{parse_error_value, ErrorOrigin};
+use crate::stop::map;
 use crate::types::{
-    ContentBlock, LlmRequest, LlmResponse, Role, Stop, StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, RefusalDetail, RefusalSource, Role, Stop, StopReason,
+    StreamEvent, Usage,
 };
 
 /// Canonical tag for the OpenAI chat-completions dialect. GitHub Copilot and
@@ -186,26 +189,91 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
     body
 }
 
-/// Provider label stamped on stops built here; copilot overrides it.
-const WIRE_PROVIDER: &str = "openai-compatible";
-
-/// Wrap an accumulated stop reason into a [`Stop`] (a `None` is `Unreported`).
-fn legacy_stop(reason: Option<StopReason>) -> Stop {
-    match reason {
-        Some(r) => Stop::synthetic(r, WIRE_PROVIDER),
-        None => Stop::from_wire(StopReason::Unreported, WIRE_PROVIDER, None),
+/// Build the [`Stop`] for a chat-completions reply. Shared by the send and
+/// stream paths so they cannot drift.
+///
+/// `finish` is the wire `finish_reason`, `None` when the server sent none or
+/// sent `null`. A reply that carries tool calls but reports `stop` (or
+/// nothing) is `ToolUse`: several servers answer a tool turn that way. The
+/// provider's own wire value is kept either way.
+fn finalize_stop(
+    provider: &str,
+    finish: Option<&str>,
+    has_tool_use: bool,
+    refusal: &str,
+    bad_tool: Option<serde_json::Value>,
+) -> Stop {
+    let mut stop = match finish {
+        Some(v) => Stop::from_wire(map::chat_finish(v), provider, Some(v)),
+        None => Stop::from_wire(StopReason::Unreported, provider, None),
+    };
+    if has_tool_use && matches!(stop.reason, StopReason::EndTurn | StopReason::Unreported) {
+        stop.reason = StopReason::ToolUse;
     }
+    if !refusal.is_empty() {
+        stop.reason = StopReason::Refusal;
+        stop.refusal = Some(RefusalDetail {
+            category: None,
+            explanation: Some(refusal.to_string()),
+            recommended_model: None,
+            source: RefusalSource::Model,
+        });
+    }
+    if let Some(bad) = bad_tool {
+        if stop.reason == StopReason::MaxTokens {
+            stop.set_detail("truncated_tool", bad);
+        } else {
+            stop.reason = StopReason::MalformedToolCall;
+            stop.set_detail("malformed_tool", bad);
+        }
+    }
+    stop
+}
+
+/// Parse a tool call's argument string. An empty or whitespace-only string is
+/// a zero-parameter call (`{}`); anything else must parse. On failure the
+/// record the stop's `bad_tool` detail carries is returned.
+fn parse_tool_arguments(
+    id: &str,
+    name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, serde_json::Value> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(arguments).map_err(|e| {
+        tracing::warn!(tool = %name, error = %e, "dropping tool call with unparseable arguments");
+        serde_json::json!({
+            "name": name,
+            "id": id,
+            "error": e.to_string(),
+        })
+    })
 }
 
 /// Parse a non-streaming chat-completions response into an `LlmResponse`.
 pub(crate) fn parse_chat_completion(
     json: &serde_json::Value,
+    provider: &str,
 ) -> Result<LlmResponse, ProviderError> {
+    // A 200 body that is an error envelope (some gateways do this).
+    if json.get("choices").is_none() && json.get("error").is_some_and(|e| !e.is_null()) {
+        return Err(ProviderError::Reply(Box::new(parse_error_value(
+            provider,
+            ErrorOrigin::Http { status: 200 },
+            json,
+        ))));
+    }
     let id = json["id"].as_str().unwrap_or("").to_string();
     let model = json["model"].as_str().unwrap_or("").to_string();
 
     let mut content = Vec::new();
-    let mut stop_reason = Some(StopReason::EndTurn);
+    let mut finish: Option<String> = None;
+    let mut refusal = String::new();
+    // Only the last bad tool is kept, deliberately: one record is enough to
+    // name the failure, as in the Anthropic and Codex parsers.
+    let mut bad_tool: Option<serde_json::Value> = None;
+    let mut has_tool_use = false;
 
     if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
         if let Some(choice) = choices.first() {
@@ -229,17 +297,27 @@ pub(crate) fn parse_chat_completion(
                 for tc in tool_calls {
                     let tc_id = tc["id"].as_str().unwrap_or("").to_string();
                     let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                    let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                    let input: serde_json::Value = serde_json::from_str(args_str).map_err(|e| {
-                        ProviderError::Json(format!("malformed tool arguments for '{name}': {e}"))
-                    })?;
-                    content.push(ContentBlock::ToolUse {
-                        id: tc_id,
-                        name,
-                        input,
-                    });
-                    stop_reason = Some(StopReason::ToolUse);
+                    let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
+                    match parse_tool_arguments(&tc_id, &name, args_str) {
+                        Ok(input) => {
+                            content.push(ContentBlock::ToolUse {
+                                id: tc_id,
+                                name,
+                                input,
+                            });
+                            has_tool_use = true;
+                        }
+                        Err(bad) => bad_tool = Some(bad),
+                    }
                 }
+            }
+
+            if let Some(text) = choice
+                .get("message")
+                .and_then(|m| m.get("refusal"))
+                .and_then(|r| r.as_str())
+            {
+                refusal = text.to_string();
             }
 
             // Capture reasoning under the key it arrived on. `raw` is what
@@ -285,14 +363,10 @@ pub(crate) fn parse_chat_completion(
                 }
             }
 
-            if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                stop_reason = Some(match reason {
-                    "stop" => StopReason::EndTurn,
-                    "length" => StopReason::MaxTokens,
-                    "tool_calls" => StopReason::ToolUse,
-                    _ => StopReason::EndTurn,
-                });
-            }
+            finish = choice
+                .get("finish_reason")
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
         }
     }
 
@@ -316,7 +390,13 @@ pub(crate) fn parse_chat_completion(
         id,
         model,
         content,
-        stop: legacy_stop(stop_reason),
+        stop: finalize_stop(
+            provider,
+            finish.as_deref(),
+            has_tool_use,
+            &refusal,
+            bad_tool,
+        ),
         usage,
     })
 }
@@ -329,11 +409,16 @@ pub(crate) struct ToolCallAcc {
 }
 
 pub(crate) struct CompletionAccumulator {
+    /// Provider label stamped on the stop and on any error body.
+    provider: String,
     pub id: String,
     pub model: String,
     pub text: String,
     pub tool_calls: Vec<ToolCallAcc>,
-    pub stop_reason: Option<StopReason>,
+    /// The wire `finish_reason`; stays `None` while the server sends `null`.
+    pub finish_reason: Option<String>,
+    /// Concatenated `delta.refusal` chunks.
+    pub refusal: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
     cached_tokens: u32,
@@ -345,13 +430,15 @@ pub(crate) struct CompletionAccumulator {
 }
 
 impl CompletionAccumulator {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(provider: &str) -> Self {
         Self {
+            provider: provider.to_string(),
             id: String::new(),
             model: String::new(),
             text: String::new(),
             tool_calls: Vec::new(),
-            stop_reason: None,
+            finish_reason: None,
+            refusal: String::new(),
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
@@ -360,9 +447,16 @@ impl CompletionAccumulator {
         }
     }
 
-    pub(crate) fn into_response(self) -> Option<LlmResponse> {
-        if self.id.is_empty() && self.text.is_empty() && self.tool_calls.is_empty() {
-            return None;
+    /// `Ok(None)` means nothing arrived (the caller reports the stream as
+    /// ended early). A reply with unparseable tool arguments is still `Ok`:
+    /// the bad call is dropped and named in the stop.
+    pub(crate) fn into_response(self) -> Result<Option<LlmResponse>, ProviderError> {
+        if self.id.is_empty()
+            && self.text.is_empty()
+            && self.refusal.is_empty()
+            && self.tool_calls.is_empty()
+        {
+            return Ok(None);
         }
         let mut content = Vec::new();
         if !self.reasoning_text.is_empty() {
@@ -383,30 +477,45 @@ impl CompletionAccumulator {
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
         }
+        // Only the last bad tool is kept, deliberately: one record is enough
+        // to name the failure, as in the Anthropic and Codex accumulators.
+        let mut bad_tool: Option<serde_json::Value> = None;
+        let mut has_tool_use = false;
         for tc in self.tool_calls {
             if tc.name.is_empty() {
                 continue;
             }
-            let input: serde_json::Value =
-                serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
-            content.push(ContentBlock::ToolUse {
-                id: tc.id,
-                name: tc.name,
-                input,
-            });
+            match parse_tool_arguments(&tc.id, &tc.name, &tc.arguments) {
+                Ok(input) => {
+                    content.push(ContentBlock::ToolUse {
+                        id: tc.id,
+                        name: tc.name,
+                        input,
+                    });
+                    has_tool_use = true;
+                }
+                Err(bad) => bad_tool = Some(bad),
+            }
         }
-        Some(LlmResponse {
+        let stop = finalize_stop(
+            &self.provider,
+            self.finish_reason.as_deref(),
+            has_tool_use,
+            &self.refusal,
+            bad_tool,
+        );
+        Ok(Some(LlmResponse {
             id: self.id,
             model: self.model,
             content,
-            stop: legacy_stop(self.stop_reason),
+            stop,
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
                 cached_tokens: self.cached_tokens,
                 ..Default::default()
             },
-        })
+        }))
     }
 }
 
@@ -420,6 +529,16 @@ pub(crate) fn process_completion_sse(
         return Ok(());
     }
     let data: serde_json::Value = serde_json::from_str(&event.data)?;
+
+    // An error chunk inside a 200 stream (an upstream overload, a quota
+    // failure after the headers went out).
+    if data.get("error").is_some_and(|e| !e.is_null()) {
+        return Err(ProviderError::Reply(Box::new(parse_error_value(
+            &acc.provider,
+            ErrorOrigin::Stream,
+            &data,
+        ))));
+    }
 
     if let Some(id) = data["id"].as_str() {
         if acc.id.is_empty() {
@@ -444,6 +563,11 @@ pub(crate) fn process_completion_sse(
                     acc.reasoning_text.push_str(chunk);
                     on_event(StreamEvent::ReasoningDelta(chunk.to_string()));
                 }
+            }
+
+            // A refusal streams on its own field and is never shown as text.
+            if let Some(text) = delta.get("refusal").and_then(|r| r.as_str()) {
+                acc.refusal.push_str(text);
             }
 
             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
@@ -479,12 +603,7 @@ pub(crate) fn process_completion_sse(
             }
 
             if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                acc.stop_reason = Some(match reason {
-                    "stop" => StopReason::EndTurn,
-                    "length" => StopReason::MaxTokens,
-                    "tool_calls" => StopReason::ToolUse,
-                    _ => StopReason::EndTurn,
-                });
+                acc.finish_reason = Some(reason.to_string());
             }
         }
     }
@@ -534,7 +653,7 @@ mod tests {
         // A content chunk followed by an OpenAI-style usage-only final chunk
         // (`choices: []`, `usage: {...}`) — the shape a server emits once
         // `stream_options.include_usage` is requested.
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("openai-compatible");
         let mut sink = |_e: StreamEvent| {};
         process_completion_sse(
             &ev(r#"{"id":"cmpl_1","model":"glm","choices":[{"index":0,"delta":{"content":"hello"}}]}"#),
@@ -549,7 +668,7 @@ mod tests {
         )
         .unwrap();
 
-        let resp = acc.into_response().expect("response");
+        let resp = acc.into_response().unwrap().expect("response");
         assert_eq!(resp.usage.input_tokens, 11);
         assert_eq!(resp.usage.output_tokens, 7);
     }
@@ -560,7 +679,7 @@ mod tests {
         // `usage.prompt_tokens_details.cached_tokens`; they are a SUBSET of
         // `prompt_tokens`. Dropping them bills every cached token at the
         // full input rate (10x the cached rate on gpt-5.x).
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("openai-compatible");
         let mut seen: Vec<Usage> = Vec::new();
         let mut sink = |e: StreamEvent| {
             if let StreamEvent::UsageSnapshot(u) = e {
@@ -577,7 +696,7 @@ mod tests {
         assert_eq!(seen[0].input_tokens, 1000);
         assert_eq!(seen[0].cached_tokens, 800);
 
-        let resp = acc.into_response().expect("response");
+        let resp = acc.into_response().unwrap().expect("response");
         assert_eq!(resp.usage.input_tokens, 1000);
         assert_eq!(resp.usage.cached_tokens, 800);
     }
@@ -586,7 +705,7 @@ mod tests {
     fn streamed_usage_without_details_leaves_cached_at_zero() {
         // Servers that don't report the breakdown (local vLLM, older
         // proxies) must still parse.
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("openai-compatible");
         let mut sink = |_e: StreamEvent| {};
         process_completion_sse(
             &ev(r#"{"id":"cmpl_1","model":"glm","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#),
@@ -594,7 +713,7 @@ mod tests {
             &mut sink,
         )
         .unwrap();
-        let resp = acc.into_response().expect("response");
+        let resp = acc.into_response().unwrap().expect("response");
         assert_eq!(resp.usage.cached_tokens, 0);
     }
 
@@ -604,7 +723,7 @@ mod tests {
             r#"{"id":"cmpl_2","model":"gpt-5.6-cyber","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":500,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":320}}}"#,
         )
         .unwrap();
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
         assert_eq!(resp.usage.input_tokens, 500);
         assert_eq!(resp.usage.cached_tokens, 320);
     }
@@ -646,7 +765,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         let (text, provider, model, raw) = only_reasoning(&resp);
         assert_eq!(text.as_deref(), Some("step by step"));
@@ -676,7 +795,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         let (text, provider, _model, raw) = only_reasoning(&resp);
         assert_eq!(text.as_deref(), Some("vllm thoughts"));
@@ -712,7 +831,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         let (text, provider, _model, raw) = only_reasoning(&resp);
         assert_eq!(text.as_deref(), Some("step by step"));
@@ -734,7 +853,7 @@ mod tests {
                 }
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         let (text, _provider, _model, raw) = only_reasoning(&resp);
         assert_eq!(text.as_deref(), Some("canonical"));
@@ -751,7 +870,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "plain"));
@@ -767,7 +886,7 @@ mod tests {
                 "message": {"role": "assistant", "content": "plain", "reasoning_content": ""}
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(resp.content[0], ContentBlock::Text { .. }));
@@ -793,7 +912,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
 
         assert_eq!(resp.stop.reason, StopReason::ToolUse);
         assert!(matches!(resp.content[0], ContentBlock::Reasoning { .. }));
@@ -810,7 +929,7 @@ mod tests {
 
     #[test]
     fn sse_accumulates_reasoning_deltas_and_emits_events() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("openai-compatible");
         let mut events = Vec::new();
         {
             let mut sink = |e: StreamEvent| events.push(e);
@@ -848,7 +967,7 @@ mod tests {
             .collect();
         assert_eq!(text_deltas, vec!["42"]);
 
-        let resp = acc.into_response().expect("response");
+        let resp = acc.into_response().unwrap().expect("response");
         let (text, provider, model, raw) = only_reasoning(&resp);
         assert_eq!(text.as_deref(), Some("step by step"));
         assert_eq!(provider, "openai_chat");
@@ -863,7 +982,7 @@ mod tests {
 
     #[test]
     fn sse_accumulates_renamed_reasoning_deltas() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("openai-compatible");
         let mut sink = |_e: StreamEvent| {};
         for chunk in ["vllm ", "thoughts"] {
             let data = serde_json::json!({
@@ -874,7 +993,7 @@ mod tests {
             process_completion_sse(&ev(&data.to_string()), &mut acc, &mut sink).unwrap();
         }
 
-        let resp = acc.into_response().expect("response");
+        let resp = acc.into_response().unwrap().expect("response");
         let (text, _provider, _model, raw) = only_reasoning(&resp);
         assert_eq!(text.as_deref(), Some("vllm thoughts"));
         assert_eq!(raw, &serde_json::json!({"reasoning": "vllm thoughts"}));
@@ -1049,7 +1168,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let resp = parse_chat_completion(&json).unwrap();
+        let resp = parse_chat_completion(&json, "openai-compatible").unwrap();
         let (_text, _provider, _model, raw) = only_reasoning(&resp);
         assert_eq!(raw, &serde_json::json!({"reasoning": "vllm thoughts"}));
 
@@ -1293,7 +1412,7 @@ mod tests {
 
     #[test]
     fn sse_without_reasoning_is_unchanged() {
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = CompletionAccumulator::new("openai-compatible");
         let mut events = Vec::new();
         {
             let mut sink = |e: StreamEvent| events.push(e);
@@ -1305,11 +1424,275 @@ mod tests {
             .unwrap();
         }
 
-        let resp = acc.into_response().expect("response");
+        let resp = acc.into_response().unwrap().expect("response");
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "hi"));
         assert!(!events
             .iter()
             .any(|e| matches!(e, StreamEvent::ReasoningDelta(_))));
+    }
+
+    // ----- response outcomes (finish reasons, refusals, error chunks) -----
+
+    use crate::reply_error::ErrorClass;
+
+    fn stream_chunks(chunks: &[&str]) -> Result<Option<LlmResponse>, ProviderError> {
+        let mut acc = CompletionAccumulator::new("openai-compatible");
+        let mut sink = |_: StreamEvent| {};
+        for c in chunks {
+            process_completion_sse(&ev(c), &mut acc, &mut sink)?;
+        }
+        acc.into_response()
+    }
+
+    fn send_body(choice: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"id": "c1", "model": "m", "choices": [choice]})
+    }
+
+    #[test]
+    fn content_filter_is_safety() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": "x"}, "finish_reason": "content_filter"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Safety);
+        assert_eq!(resp.stop.wire.value.as_deref(), Some("content_filter"));
+
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"content":"x"},"finish_reason":"content_filter"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Safety);
+        assert_eq!(resp.stop.wire.value.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn message_refusal_is_refusal_not_text() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": null, "refusal": "I can't help with that."},
+                "finish_reason": "stop"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Refusal);
+        let detail = resp.stop.refusal.as_ref().unwrap();
+        assert_eq!(detail.source, RefusalSource::Model);
+        assert_eq!(
+            detail.explanation.as_deref(),
+            Some("I can't help with that.")
+        );
+        assert!(resp.content.is_empty(), "refusal text is not a Text block");
+        assert_eq!(resp.stop.wire.value.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn delta_refusal_accumulates_into_refusal() {
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"refusal":"I can"}}]}"#,
+            r#"{"id":"c","choices":[{"delta":{"refusal":"'t."},"finish_reason":"stop"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Refusal);
+        assert_eq!(
+            resp.stop.refusal.unwrap().explanation.as_deref(),
+            Some("I can't.")
+        );
+        assert!(resp.content.is_empty());
+    }
+
+    #[test]
+    fn vllm_abort_is_incomplete() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": "part"}, "finish_reason": "abort"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Incomplete);
+        assert_eq!(resp.stop.wire.value.as_deref(), Some("abort"));
+    }
+
+    #[test]
+    fn unknown_finish_reason_is_unrecognized_with_wire_value() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": "x"}, "finish_reason": "eos_token_reached"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Unrecognized);
+        assert_eq!(resp.stop.wire.value.as_deref(), Some("eos_token_reached"));
+    }
+
+    #[test]
+    fn null_finish_reason_is_unreported() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": "x"}, "finish_reason": null
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Unreported);
+        assert_eq!(resp.stop.wire.value, None);
+
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"content":"x"},"finish_reason":null}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Unreported);
+        assert_eq!(resp.stop.wire.value, None);
+    }
+
+    #[test]
+    fn tool_calls_with_stop_or_null_finish_are_tool_use() {
+        for finish in [serde_json::json!("stop"), serde_json::Value::Null] {
+            let resp = parse_chat_completion(
+                &send_body(serde_json::json!({
+                    "message": {"content": null, "tool_calls": [
+                        {"id": "t1", "function": {"name": "f", "arguments": "{\"a\":1}"}}
+                    ]},
+                    "finish_reason": finish
+                })),
+                "openai-compatible",
+            )
+            .unwrap();
+            assert_eq!(resp.stop.reason, StopReason::ToolUse);
+        }
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": null, "tool_calls": [
+                    {"id": "t1", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                "finish_reason": "stop"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        // The provider's own wire value is kept.
+        assert_eq!(resp.stop.wire.value.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn error_chunk_is_a_stream_error() {
+        let err = stream_chunks(&[
+            r#"{"error":{"message":"upstream overloaded","type":"server_error","code":null}}"#,
+        ])
+        .unwrap_err();
+        let body = err.reply().expect("a typed reply error");
+        assert_eq!(body.class, ErrorClass::Server);
+        assert!(body.is_retryable());
+        assert_eq!(body.provider, "openai-compatible");
+        assert_eq!(body.origin, ErrorOrigin::Stream);
+    }
+
+    #[test]
+    fn non_streaming_error_body_is_a_reply_error() {
+        let err = parse_chat_completion(
+            &serde_json::json!({"error": {"message": "bad gateway", "type": "server_error"}}),
+            "local",
+        )
+        .unwrap_err();
+        let body = err.reply().expect("a typed reply error");
+        assert_eq!(body.provider, "local");
+        assert_eq!(body.origin, ErrorOrigin::Http { status: 200 });
+    }
+
+    fn tool_chunks(finish: &str, args: &str) -> Vec<String> {
+        vec![
+            r#"{"id":"c","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}"#
+                .to_string(),
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":args}}
+            ]},"finish_reason":finish}]})
+            .to_string(),
+        ]
+    }
+
+    fn run_tool_chunks(finish: &str, args: &str) -> LlmResponse {
+        let chunks = tool_chunks(finish, args);
+        let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        stream_chunks(&refs).unwrap().unwrap()
+    }
+
+    #[test]
+    fn streamed_bad_arguments_never_dispatch_empty_object() {
+        let truncated = run_tool_chunks("length", "{\"path\": \"src/ma");
+        assert_eq!(truncated.stop.reason, StopReason::MaxTokens);
+        let d = truncated.stop.wire.details.as_ref().unwrap();
+        assert_eq!(d["truncated_tool"]["name"], "read_file");
+        assert_eq!(d["truncated_tool"]["id"], "call_1");
+        assert!(d["truncated_tool"]["error"].is_string());
+        assert!(!truncated
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+
+        let malformed = run_tool_chunks("tool_calls", "{\"path\": nope}");
+        assert_eq!(malformed.stop.reason, StopReason::MalformedToolCall);
+        let d = malformed.stop.wire.details.as_ref().unwrap();
+        assert_eq!(d["malformed_tool"]["name"], "read_file");
+        assert!(!malformed
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+    }
+
+    #[test]
+    fn non_streaming_bad_arguments_are_reported_not_an_error() {
+        let body = |finish: &str| {
+            send_body(serde_json::json!({
+                "message": {"content": null, "tool_calls": [
+                    {"id": "call_9", "function": {"name": "read_file", "arguments": "{\"a\":"}}
+                ]},
+                "finish_reason": finish
+            }))
+        };
+        let resp = parse_chat_completion(&body("tool_calls"), "openai-compatible").unwrap();
+        assert_eq!(resp.stop.reason, StopReason::MalformedToolCall);
+        assert_eq!(
+            resp.stop.wire.details.as_ref().unwrap()["malformed_tool"]["id"],
+            "call_9"
+        );
+        assert!(resp.content.is_empty());
+
+        let resp = parse_chat_completion(&body("length"), "openai-compatible").unwrap();
+        assert_eq!(resp.stop.reason, StopReason::MaxTokens);
+        assert!(resp.stop.wire.details.as_ref().unwrap()["truncated_tool"].is_object());
+    }
+
+    #[test]
+    fn empty_arguments_are_a_zero_parameter_call() {
+        for args in ["", "  "] {
+            let resp = run_tool_chunks("tool_calls", args);
+            assert_eq!(resp.stop.reason, StopReason::ToolUse, "streamed {args:?}");
+            assert!(resp.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolUse { input, .. } if *input == serde_json::json!({})
+            )));
+
+            let resp = parse_chat_completion(
+                &send_body(serde_json::json!({
+                    "message": {"content": null, "tool_calls": [
+                        {"id": "t", "function": {"name": "f", "arguments": args}}
+                    ]},
+                    "finish_reason": "tool_calls"
+                })),
+                "openai-compatible",
+            )
+            .unwrap();
+            assert_eq!(resp.stop.reason, StopReason::ToolUse, "sent {args:?}");
+            assert!(resp.stop.wire.details.is_none());
+        }
     }
 }
