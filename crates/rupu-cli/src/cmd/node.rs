@@ -1401,7 +1401,7 @@ fn referenced_artifacts(stream: &Path) -> std::collections::BTreeSet<String> {
             rupu_coverage::StreamLine::Findings { record, .. } => record.report,
             _ => None,
         })
-        .flat_map(|r| r.artifacts)
+        .flat_map(|r| r.artifact_refs().cloned().collect::<Vec<_>>())
         .filter(|a| {
             a.stored == Some(rupu_coverage::report::ArtifactStorage::Copied)
                 && rupu_coverage::report::is_sha256_hex(&a.sha256)
@@ -3234,6 +3234,45 @@ mod tests {
             std::collections::BTreeSet::from([copied])
         );
         assert!(referenced_artifacts(&tmp.path().join("absent")).is_empty());
+    }
+
+    /// A block's file (here a `pcap_ref`) is a referenced artifact like any
+    /// listed one, so the bucket worker uploads it too.
+    #[test]
+    fn referenced_artifacts_includes_block_artifacts() {
+        use rupu_coverage::report::{ArtifactKind, ArtifactRef, ArtifactStorage, EvidenceBlock};
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let sha = "ef".repeat(32);
+        let line = findings_stream_line("f1", vec![]);
+        let mut parsed: rupu_coverage::StreamLine = serde_json::from_str(line.trim()).unwrap();
+        if let rupu_coverage::StreamLine::Findings { record, .. } = &mut parsed {
+            record
+                .report
+                .as_mut()
+                .unwrap()
+                .blocks
+                .push(EvidenceBlock::PcapRef {
+                    artifact: ArtifactRef {
+                        path: "caps/session.pcap".into(),
+                        sha256: sha.clone(),
+                        size: 1,
+                        kind: Some(ArtifactKind::Binary),
+                        stored: Some(ArtifactStorage::Copied),
+                        host: None,
+                    },
+                    summary: "one session".into(),
+                });
+        }
+        std::fs::write(
+            &stream,
+            begin_stream_line() + &(serde_json::to_string(&parsed).unwrap() + "\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([sha])
+        );
     }
 
     /// The same blob referenced by two findings is listed once; a blob with

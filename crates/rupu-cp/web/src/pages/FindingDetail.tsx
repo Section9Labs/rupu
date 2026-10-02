@@ -17,6 +17,7 @@ import EvidenceClaims from '../components/findings/report/EvidenceClaims';
 import FixSections from '../components/findings/report/FixSections';
 import ReplicationSteps from '../components/findings/report/ReplicationSteps';
 import ArtifactBrowser from '../components/findings/report/ArtifactBrowser';
+import EvidenceBlocks from '../components/findings/report/EvidenceBlocks';
 import CrossReferences from '../components/findings/report/CrossReferences';
 import { Button } from '../components/ui/Button';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
@@ -24,7 +25,7 @@ import { Spinner } from '../components/ui/Spinner';
 
 const RAIL: [string, string][] = [
   ['s-desc', 'Description'], ['s-impact', 'Impact'], ['s-loc', 'Location'], ['s-root', 'Root cause'],
-  ['s-chain', 'Call chain'], ['s-evidence', 'Evidence'], ['s-artifacts', 'PoC artifacts'], ['s-repro', 'Replication'],
+  ['s-chain', 'Call chain'], ['s-evidence', 'Evidence'], ['s-blocks', 'Evidence blocks'], ['s-artifacts', 'PoC artifacts'], ['s-repro', 'Replication'],
   ['s-remediation', 'Remediation'], ['s-patch', 'Patch'], ['s-ci', 'CI/CD detection'], ['s-reg', 'Regression test'],
   ['s-refs', 'References'], ['s-prov', 'Provenance'],
 ];
@@ -166,7 +167,8 @@ export default function FindingDetail() {
   const hasArtifacts = (report.artifacts?.length ?? 0) > 0;
   // The PoC artifacts section only renders when there are artifacts; keep the
   // rail in step so it never points at a missing anchor.
-  const rail = RAIL.filter(([anchor]) => anchor !== 's-artifacts' || hasArtifacts);
+  const hasBlocks = (report.blocks?.length ?? 0) > 0;
+  const rail = RAIL.filter(([anchor]) => (anchor !== 's-artifacts' || hasArtifacts) && (anchor !== 's-blocks' || hasBlocks));
   return (
     <div className="grid gap-8 p-8 lg:grid-cols-[13rem_minmax(0,1fr)]">
       <nav aria-label="Report sections" className="hidden self-start lg:sticky lg:top-4 lg:block">
@@ -200,6 +202,7 @@ export default function FindingDetail() {
         <Section id="s-root" title="Root cause"><div className="rounded-md border border-brand-500 bg-brand-50 px-4 py-3 text-ink"><Markdown text={report.root_cause} /></div></Section>
         <Section id="s-chain" title="Call chain"><CallChain chain={report.call_chain} wsId={detail.ws_id} /></Section>
         <Section id="s-evidence" title="Evidence"><EvidenceClaims claims={report.evidence} states={detail.evidence_status} wsId={detail.ws_id} /></Section>
+        {hasBlocks && <Section id="s-blocks" title="Evidence blocks"><EvidenceBlocks findingId={detail.id} blocks={report.blocks!} /></Section>}
         {hasArtifacts && <Section id="s-artifacts" title="PoC artifacts"><ArtifactBrowser findingId={detail.id} artifacts={report.artifacts!} /></Section>}
         <Section id="s-repro" title="Replication steps"><ReplicationSteps steps={report.replication_steps} /></Section>
         <Section id="s-remediation" title="Remediation"><div className="text-ink-dim"><Markdown text={report.remediation} /></div></Section>

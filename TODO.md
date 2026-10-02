@@ -308,6 +308,9 @@ and are not repeated here.
   - [ ] Move the hardened blob opens into one `ArtifactStore::open_blob` (rupu-coverage) instead of `rupu-cli` calling `rupu_cp::api::fs_open`.
   - [ ] SSH pulls: a per-host concurrency limit and a short negative cache — each failing click costs the host one ssh connection (see (e)).
   - [ ] Before release: a manual smoke against a real S3/GCS bucket (InMemory enforces neither the 5 MiB part minimum nor multipart abort), a tunnel pull of more than one chunk, and an SSH pull against an older remote.
+- [ ] **Evidence-block files: follow-ups** (shipped: `docs/superpowers/specs/2026-10-02-rupu-evidence-block-artifacts-design.md`)
+  - [ ] Exports (`rupu findings export`, the CP export endpoints) print block files by path only; embed `image` blocks in the HTML and PDF.
+  - [ ] The Code tab's inline finding card does not render evidence blocks (only the `/findings/:id` page does).
 - [ ] **Remote coverage: a coordinator-side abort drops the unit's stream without a warning** (remote-findings spec, "Known limits (Plan A)") — a whole-run cancel, a `wait: any` loser, or the coordinator process exiting drops the unit's dispatch before it collects the stream, and no `StepWarning` says so. Collect on that path, or at least warn.
 - [ ] **Remote coverage: one workflow, two scopes** — a remote unit's `rupu run` records under the agent's name as `scope_name`, while an in-process step records under the workflow's name, so one workflow's findings land in two targets. Carry the workflow's scope to the host, or re-key at ingest.
 - [ ] **Remote coverage: the merge re-reads each target's whole ledger per unit** — `ingest_unit_stream` loads every existing key of a target (`load_seen`) once per unit to de-duplicate: O(units × ledger) on a large fan-out. Share the seen sets across a step's units, or index them.

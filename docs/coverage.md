@@ -204,14 +204,18 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A larger file is recorded `stored: external` with its path, size, and sha256.
 - A directory expands to the files inside it, each handled by the same rule.
   Symlinks inside a directory are skipped.
-- One report's artifacts are bounded before anything is copied: at most
+- One report's `artifacts` are bounded before any of them is copied: at most
   `[findings].artifact_max_files` files (default 500), and the files that
   will be copied into the store may add up to at most
   `[findings].artifact_total_max_bytes` bytes (default 2 GiB). A file over
   `artifact_max_bytes` is recorded by reference and does not count toward
   that total, so it never rejects the finding. A larger set rejects the
   finding with the count or total named; list specific files instead of
-  large directories.
+  large directories. The check is per call: files named by evidence blocks
+  are ingested afterwards, against what is left of the same limits, so a
+  later block file can still be refused after earlier files were copied.
+  Those copies are unreferenced, content-addressed blobs; a retry reuses
+  them rather than storing them again.
 - A path that escapes the workspace, names the workspace root itself (`.`),
   does not exist, or names something other than a regular file (a device,
   socket, or the like) rejects the finding, so a typo is not silently dropped.
@@ -259,7 +263,7 @@ stored without a hash.
 #### Downloading artifacts
 
 `GET /api/findings/:id/artifacts/:sha256` returns an artifact's bytes. The sha
-must be one of that finding's artifacts. A blob already in this control plane's
+must be one of that finding's artifacts or evidence-block files. A blob already in this control plane's
 store is served directly. An `external` artifact with a `host` is pulled from
 that host on first download and then kept in this store. How the host delivers
 it depends on the transport:
@@ -285,7 +289,10 @@ plane's own `artifact_max_bytes` is refused without contacting the host. Concurr
 same blob share one pull. A local over-cap file (`external` with no `host`) is
 served from the workspace while it still hashes to the recorded sha: `404` once
 the file is gone, `409` once it has changed. Text artifacts are served as plain
-text; everything else as an attachment.
+text; PNG, JPEG, GIF and WebP images (recognised by their leading bytes,
+never by file name) inline with their `image/*` type; everything else as an
+attachment. Every response carries `X-Content-Type-Options: nosniff` and a
+`Content-Security-Policy: sandbox`.
 
 When a remote artifact's bytes cannot be had, the response is `404` with
 `{"unavailable": "<reason>"}`: the host is unreachable or not registered, the
@@ -299,6 +306,25 @@ The web finding page's artifact browser uses the same endpoint. It previews
 text up to 256 KiB when you open it and offers a download for every artifact. A
 remote artifact is fetched from its host the first time it is previewed or
 downloaded; a binary one only when you download it.
+
+#### Evidence-block files
+
+An `image`, `hexdump` or `pcap_ref` evidence block names exactly one file, in
+its `artifact.path`. rupu verifies and stores that file the same way as a
+`report.artifacts` entry: the same hashing, the same copy-or-reference rule,
+and the same per-finding limits (`artifact_max_files` and
+`artifact_total_max_bytes` are shared, so block files and PoC artifacts count
+together). A block file is not a proof-of-concept artifact: it does not appear
+in the PoC list. A bad path is rejected like an artifact path, with the field
+named `report.blocks[<i>].artifact.path`.
+
+`GET /api/findings/:id/artifacts/:sha256` serves block files exactly like
+artifacts, including the first-view pull of a remote one from its host (see
+[Downloading artifacts](#downloading-artifacts)); the bucket worker also
+uploads them. The finding page renders every block kind in an "Evidence
+blocks" section. An `image` block shows its picture inline; a block whose file
+lives on a remote host loads only when you click it, so opening a finding
+never pulls from a host.
 
 ### Configuration
 
@@ -618,8 +644,8 @@ evidence claims are stored without a hash of their files (an agent's claims
 get one when it records them): the claims were made against the code as it
 was when the report was written, and hashing today's file would present them
 as current. The control plane shows their evidence status as `unknown`.
-Artifacts are copied from the workspace as it is at import, not as it was when
-the report was written.
+Artifacts (and any file an evidence block names) are verified and copied from
+the workspace as it is at import, not as it was when the report was written.
 
 **Backups and the lock file.** Every real import that attaches anything first
 copies the ledger byte for byte (and syncs the copy to disk) to
@@ -645,8 +671,8 @@ next run overwrites the temp file and takes a backup of its own).
 **Dry run.** `--dry-run` parses and validates every report and prints `would
 attach` for those that would go in. It writes nothing: no ledger change, no
 backup, and it takes no lock, so it also works on a read-only ledger directory.
-It checks that each artifact the report lists exists inside the workspace and
-is within the artifact count and size limits, and that the report as it would
+It checks that each artifact the report lists, and each evidence-block file,
+exists inside the workspace and is within the artifact count and size limits, and that the report as it would
 be stored (directories expanded, every artifact recorded with its hash, size,
 kind and storage) is within `report_max_bytes`. It copies nothing: it reads
 only the first 8 KiB of each artifact, to tell text from binary as a real

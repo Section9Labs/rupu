@@ -504,7 +504,7 @@ fn find_finding(global: &std::path::Path, id: &str) -> Option<FindingOut> {
 async fn get_finding(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<FindingDetail>> {
+) -> ApiResult<Json<serde_json::Value>> {
     let global = s.global_dir.clone();
     let id_for_lookup = id.clone();
     let found = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
@@ -529,10 +529,53 @@ async fn get_finding(
         (Some(report), Err(_)) => vec![ClaimState::Unknown; report.evidence.len()],
         (None, _) => Vec::new(),
     };
-    Ok(Json(FindingDetail {
+    let mut body = serde_json::to_value(FindingDetail {
         finding,
         evidence_status,
-    }))
+    })
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    add_hex_siblings(&mut body);
+    Ok(Json(body))
+}
+
+/// `0x` + lowercase hex of `n`, unpadded: the exact text for a 64-bit address.
+fn hex_string(n: u64) -> String {
+    format!("0x{n:x}")
+}
+
+/// Adds exact string siblings for the 64-bit numbers in a serialized finding
+/// body: `address_hex` on every disasm listing line and `base_hex` on every
+/// hexdump block (`report.blocks`). The numeric `address` / `base` stay as
+/// they are, but a JSON number above 2^53 is rounded by `JSON.parse` in the
+/// browser, so clients display the string. A wire-only transform: the stored
+/// report and its schema are untouched.
+fn add_hex_siblings(body: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(blocks) = body
+        .get_mut("report")
+        .and_then(|r| r.get_mut("blocks"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for block in blocks {
+        match block.get("kind").and_then(Value::as_str) {
+            Some("hexdump") => {
+                if let Some(base) = block.get("base").and_then(Value::as_u64) {
+                    block["base_hex"] = Value::String(hex_string(base));
+                }
+            }
+            Some("disasm") => {
+                let lines = block.get_mut("listing").and_then(Value::as_array_mut);
+                for line in lines.into_iter().flatten() {
+                    if let Some(addr) = line.get("address").and_then(Value::as_u64) {
+                        line["address_hex"] = Value::String(hex_string(addr));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The `filename` an artifact is offered under: the last `/`-separated segment
@@ -606,10 +649,12 @@ fn open_verified(
     Ok(file)
 }
 
-/// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact the
-/// finding's report references.
+/// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact or
+/// evidence-block file the finding's report references.
 ///
-/// Only artifacts listed in the finding's own `report.artifacts` are served, so
+/// Only artifacts or evidence-block files the finding itself references
+/// (`FindingReport::artifact_refs`: `report.artifacts` plus the files its
+/// `image`/`hexdump`/`pcap_ref` blocks name) are served, so
 /// a request to THIS endpoint can reach only a blob some finding in the ledger
 /// references (the host blob endpoint, `get_artifact_blob`, serves any stored
 /// blob by hash behind the CP token, for coordinator pulls). That limits
@@ -617,8 +662,10 @@ fn open_verified(
 /// agent-writable workspace, so a forged ledger line can list any blob whose
 /// sha256 is already known — in this store, or in the store of the registered
 /// host it names. Artifacts are never rendered as HTML: text is `text/plain`
-/// inline, anything else an `application/octet-stream` attachment, always
-/// `nosniff` and `Content-Security-Policy: sandbox`.
+/// inline, a raster image (PNG/JPEG/GIF/WebP, recognised by its magic bytes,
+/// never by name) is inline as its `image/*` type, anything else an
+/// `application/octet-stream` attachment; always `nosniff` and
+/// `Content-Security-Policy: sandbox`.
 ///
 /// Where the bytes come from (spec
 /// 2026-09-30-rupu-remote-findings-transport-design.md §B2):
@@ -648,7 +695,7 @@ async fn get_artifact(
         .record
         .report
         .as_ref()
-        .and_then(|r| r.artifacts.iter().find(|a| a.sha256 == sha))
+        .and_then(|r| r.artifact_refs().find(|a| a.sha256 == sha))
         .cloned()
         .ok_or_else(|| ApiError::not_found("this finding does not reference that artifact"))?;
 
@@ -973,9 +1020,23 @@ async fn pull_into_store(
     }
 }
 
+/// The `image/*` type of a raster image, by its magic bytes — never by name
+/// or by anything an agent wrote. SVG (text) is never an image here.
+fn raster_image_type(head: &[u8]) -> Option<&'static str> {
+    match head {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
+}
+
 /// The one way artifact bytes leave this CP: streamed from `file`, never
-/// renderable as HTML. Text is `text/plain; charset=utf-8` inline; anything
-/// else (`kind` binary or unknown) an `application/octet-stream` attachment.
+/// renderable as HTML. Text is `text/plain; charset=utf-8` inline; a binary
+/// (or unknown-kind) file whose leading bytes are a PNG / JPEG / GIF / WebP
+/// is served inline as that `image/*` type (so the web can show an `image`
+/// evidence block); anything else an `application/octet-stream` attachment.
 /// ALWAYS `X-Content-Type-Options: nosniff` and
 /// `Content-Security-Policy: sandbox`. `name` (a recorded path or any label)
 /// becomes the download's `filename`, reduced to a safe basename.
@@ -989,8 +1050,32 @@ pub(crate) async fn artifact_response(
     kind: Option<ArtifactKind>,
     name: &str,
 ) -> Response {
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    let mut file = file;
     let len = file.metadata().await.ok().map(|m| m.len());
+
+    // Peek the head of anything that is not declared text, to type raster
+    // images by their magic bytes. A failed read just means "not an image";
+    // but the handle must be rewound before it streams, and a handle that
+    // cannot be rewound is never served half-consumed (a 500, not wrong bytes).
+    let mut image_type = None;
+    if kind != Some(ArtifactKind::Text) {
+        let mut head = [0u8; 12];
+        let mut got = 0;
+        while got < head.len() {
+            match file.read(&mut head[got..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        if file.seek(std::io::SeekFrom::Start(0)).await.is_err() {
+            return axum::response::IntoResponse::into_response(ApiError::internal(
+                "could not read the artifact",
+            ));
+        }
+        image_type = raster_image_type(&head[..got]);
+    }
+
     let body = match len {
         Some(len) => Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
             file.take(len),
@@ -1007,10 +1092,13 @@ pub(crate) async fn artifact_response(
             "text/plain; charset=utf-8",
             format!("inline; filename=\"{name}\""),
         ),
-        _ => (
-            "application/octet-stream",
-            format!("attachment; filename=\"{name}\""),
-        ),
+        _ => match image_type {
+            Some(t) => (t, format!("inline; filename=\"{name}\"")),
+            None => (
+                "application/octet-stream",
+                format!("attachment; filename=\"{name}\""),
+            ),
+        },
     };
     let mut resp = Response::new(body);
     let h = resp.headers_mut();
@@ -2270,6 +2358,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn get_finding_adds_exact_hex_for_64_bit_addresses() {
+        use rupu_coverage::report::{ArtifactRef, DisasmLine, EvidenceBlock};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rec = full_record("fnd_hex");
+        rec.report.as_mut().unwrap().blocks = vec![
+            EvidenceBlock::Hexdump {
+                base: 0xffff_ffff_8123_4567,
+                artifact: ArtifactRef {
+                    path: "dump.bin".into(),
+                    sha256: String::new(),
+                    size: 0,
+                    kind: None,
+                    stored: None,
+                    host: None,
+                },
+                rendered: None,
+            },
+            EvidenceBlock::Disasm {
+                arch: "x86_64".into(),
+                listing: vec![
+                    DisasmLine {
+                        address: 0xffff_ffff_8123_4567,
+                        bytes: "90".into(),
+                        mnemonic: "nop".into(),
+                        ops: String::new(),
+                    },
+                    DisasmLine {
+                        address: 0x40,
+                        bytes: "c3".into(),
+                        mnemonic: "ret".into(),
+                        ops: String::new(),
+                    },
+                ],
+            },
+        ];
+        seed_workspace_findings(tmp.path(), &[rec]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let app = routes().with_state(state);
+        let (status, json) = get_json(app, "/api/findings/fnd_hex").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let blocks = &json["report"]["blocks"];
+        assert_eq!(blocks[0]["base_hex"], "0xffffffff81234567");
+        assert_eq!(blocks[1]["listing"][0]["address_hex"], "0xffffffff81234567");
+        assert_eq!(blocks[1]["listing"][1]["address_hex"], "0x40");
+    }
+
     #[test]
     fn claim_states_reject_paths_that_escape_the_workspace() {
         let root = tempfile::TempDir::new().unwrap();
@@ -2790,6 +2928,168 @@ mod tests {
         .await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(header_str(&headers, "content-length"), "3");
+    }
+
+    // ---- raster images served inline; evidence-block files servable ----
+
+    const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    #[test]
+    fn raster_image_type_is_decided_by_magic_bytes() {
+        assert_eq!(raster_image_type(PNG_MAGIC), Some("image/png"));
+        assert_eq!(
+            raster_image_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]),
+            Some("image/jpeg")
+        );
+        assert_eq!(raster_image_type(b"GIF87a\x01\x00"), Some("image/gif"));
+        assert_eq!(raster_image_type(b"GIF89a\x01\x00"), Some("image/gif"));
+        assert_eq!(
+            raster_image_type(b"RIFF\x10\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(raster_image_type(b"<svg xmlns"), None);
+        assert_eq!(raster_image_type(b"%PDF-1.7"), None);
+        assert_eq!(raster_image_type(b"GIF8"), None);
+        assert_eq!(raster_image_type(b"RIFF\0\0\0\0WAVE"), None);
+        assert_eq!(raster_image_type(b""), None);
+    }
+
+    #[tokio::test]
+    async fn a_png_artifact_is_served_inline_as_an_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut body = PNG_MAGIC.to_vec();
+        body.extend_from_slice(b"fake image body");
+        let sha = store_blob(tmp.path(), &body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "shots/crash.png",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&headers, "content-type"), "image/png");
+        assert!(header_str(&headers, "content-disposition").starts_with("inline"));
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
+        assert_eq!(bytes, body, "the peek must not consume bytes");
+        assert_eq!(
+            header_str(&headers, "content-length"),
+            body.len().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_images_and_text_are_never_typed_as_images() {
+        // A binary that is not a raster image stays an attachment.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = b"%PDF-1.7 not an image";
+        let sha = store_blob(tmp.path(), body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "doc.pdf",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert_eq!(
+            header_str(&headers, "content-type"),
+            "application/octet-stream"
+        );
+        assert!(header_str(&headers, "content-disposition").starts_with("attachment"));
+
+        // `Text` is never sniffed, even with a PNG head.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut body = PNG_MAGIC.to_vec();
+        body.extend_from_slice(b" but declared text");
+        let sha = store_blob(tmp.path(), &body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "notes.txt",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn an_evidence_block_artifact_is_servable_by_its_sha() {
+        use rupu_coverage::report::EvidenceBlock;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut body = PNG_MAGIC.to_vec();
+        body.extend_from_slice(b"block image");
+        let sha = store_blob(tmp.path(), &body);
+        let mut rec = full_record("fnd_art");
+        {
+            let report = rec.report.as_mut().unwrap();
+            report.artifacts = vec![];
+            report.blocks.push(EvidenceBlock::Image {
+                artifact: artifact_ref(
+                    "shots/block.png",
+                    &sha,
+                    body.len() as u64,
+                    Some(ArtifactKind::Binary),
+                    Some(ArtifactStorage::Copied),
+                    None,
+                ),
+                caption: None,
+            });
+        }
+        seed_workspace_findings(tmp.path(), &[rec]);
+
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&headers, "content-type"), "image/png");
+        assert_eq!(bytes, body);
+
+        // A sha in neither `artifacts` nor any block is still refused.
+        let other = "c".repeat(64);
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{other}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_of(&bytes),
+            "this finding does not reference that artifact"
+        );
     }
 
     // ---- the shared, cancel-safe in-flight pull ----
