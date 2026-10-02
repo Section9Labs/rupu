@@ -7,7 +7,9 @@
 
 use crate::coverage_tools;
 use crate::mcp_tool::McpToolAdapter;
+use crate::outcome::OutcomeClass;
 use crate::permission::PermissionDecision;
+use crate::recovery::Rung0;
 use crate::tool_registry::{default_tool_registry, ToolRegistry};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -24,7 +26,9 @@ use rupu_providers::types::{
 };
 use rupu_scm::Registry;
 use rupu_tools::{DerivedEvent, PermissionMode, Tool, ToolContext};
-use rupu_transcript::{Event, FileEditKind, JsonlWriter, RunMode, RunStatus};
+use rupu_transcript::{
+    Event, FileEditKind, JsonlWriter, RecoveryAction, RunMode, RunStatus, Severity,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -632,12 +636,40 @@ pub enum RunError {
     #[error("coverage setup: {0}")]
     Coverage(String),
     /// The agent loop returned `Ok` — no transport/provider failure — but the
-    /// run's own terminal [`RunStatus`] was not `Ok`. Today the only such
-    /// outcome is a `max_turns` bust (`RunStatus::Error`); a non-pause
+    /// run's own terminal [`RunStatus`] was not `Ok`: a `max_turns` bust, or
+    /// a response outcome the recovery ladder could not fix (both
+    /// `RunStatus::Error`; the latter carries `outcome`). A non-pause
     /// `RunStatus::Aborted` would land here too. Produced by
     /// [`RunResult::terminal_error`], never returned by [`run_agent`] itself.
     #[error("agent run ended in status {status:?} ({detail})")]
-    TerminalStatus { status: RunStatus, detail: String },
+    TerminalStatus {
+        status: RunStatus,
+        detail: String,
+        /// The typed cause when the run failed on a response outcome the
+        /// recovery ladder could not fix (spec 2026-10-01 §5).
+        outcome: Option<Box<rupu_transcript::OutcomeRecord>>,
+    },
+    /// The run failed on an outcome — a provider error the recovery ladder
+    /// could not route around. `message` is the error text the run recorded.
+    #[error("{message}")]
+    Outcome {
+        message: String,
+        outcome: Box<rupu_transcript::OutcomeRecord>,
+    },
+}
+
+impl RunError {
+    /// The typed outcome behind this failure, when it has one.
+    pub fn outcome(&self) -> Option<&rupu_transcript::OutcomeRecord> {
+        match self {
+            RunError::Outcome { outcome, .. } => Some(outcome),
+            RunError::TerminalStatus {
+                outcome: Some(outcome),
+                ..
+            } => Some(outcome),
+            _ => None,
+        }
+    }
 }
 
 /// The run's exit once SIGTERM has arrived: close the transcript as
@@ -708,6 +740,141 @@ fn emit_turn_content(
         }
     }
     Ok(tool_uses)
+}
+
+/// A turn's `TurnEnd`: token counts, the provider's stop (as a transcript
+/// `StopRecord`) and whether the turn's content was dropped from the
+/// conversation (spec 2026-10-01 §5.4).
+fn turn_end_event(turn_idx: u32, resp: &LlmResponse, tokens_out: u64, discarded: bool) -> Event {
+    Event::TurnEnd {
+        turn_idx,
+        tokens_in: Some(resp.usage.input_tokens as u64),
+        tokens_out: Some(tokens_out),
+        stop_reason: Some(resp.stop.wire_value_or_reason()),
+        response_id: {
+            let id = resp.id.trim();
+            if id.is_empty() {
+                None
+            } else {
+                Some(id.to_string())
+            }
+        },
+        discarded,
+        stop: serde_json::to_value(&resp.stop)
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok()),
+    }
+}
+
+/// One `Event::Recovery`, built field by field (spec 2026-10-01 §7.1).
+#[derive(Default)]
+struct RecoveryEvent<'a> {
+    outcome_id: &'a str,
+    rung: u8,
+    attempt: Option<u32>,
+    budget: Option<u32>,
+    reason: Option<String>,
+    merge_into_previous: bool,
+    continues_output: bool,
+}
+
+impl RecoveryEvent<'_> {
+    fn write(
+        self,
+        writer: &mut JsonlWriter,
+        action: rupu_transcript::RecoveryAction,
+    ) -> Result<(), RunError> {
+        writer.write(&Event::Recovery {
+            outcome_id: self.outcome_id.to_string(),
+            rung: self.rung,
+            action,
+            attempt: self.attempt,
+            budget: self.budget,
+            provider: None,
+            model: None,
+            reason: self.reason,
+            merge_into_previous: self.merge_into_previous,
+            continues_output: self.continues_output,
+        })?;
+        Ok(())
+    }
+}
+
+/// What rung 0 may do about one outcome.
+enum Rung0Step {
+    /// Act: this is attempt `n` of the policy's per-turn budget.
+    Act(u32),
+    /// The per-turn budget is spent: climb the ladder.
+    OverBudget,
+    /// `MAX_RECOVERY_ACTIONS` is reached: straight to rung 3.
+    Capped,
+}
+
+/// Charge one rung-0 action against the logical turn's budget (`chain` is
+/// the turn the continuation chain started on) and the run's action cap.
+fn rung0_step(
+    recovery: &mut crate::recovery::RecoveryState,
+    chain: u32,
+    p: &crate::recovery::Policy,
+) -> Rung0Step {
+    match recovery.try_budget(chain, p.rung0, p.budget) {
+        None => Rung0Step::OverBudget,
+        Some(attempt) if recovery.take_action() => Rung0Step::Act(attempt),
+        Some(_) => Rung0Step::Capped,
+    }
+}
+
+/// The rung-3 hint: what the operator can do once nothing is left to try.
+fn no_recovery_hint(opts: &AgentRunOpts) -> String {
+    if opts.step_id.is_empty() {
+        format!(
+            "no recovery left — continue with another model: rupu run {} --continue {} --model <model> [--provider <provider>]",
+            opts.agent_name, opts.run_id
+        )
+    } else {
+        "no recovery left — add fallbacks: to the agent or [recovery].fallbacks to try other models"
+            .to_string()
+    }
+}
+
+/// The ladder ran out for a response outcome. This plan's rung 3 fails the
+/// run with the hint (plan deviation 1); rungs 1–2 go in front of it.
+fn exhausted(
+    writer: &mut JsonlWriter,
+    opts: &AgentRunOpts,
+    outcome: &crate::outcome::Outcome,
+) -> Result<LoopOutcome, RunError> {
+    let hint = no_recovery_hint(opts);
+    RecoveryEvent {
+        outcome_id: &outcome.id,
+        rung: 3,
+        reason: Some(hint.clone()),
+        ..Default::default()
+    }
+    .write(writer, rupu_transcript::RecoveryAction::Failed)?;
+    writer.flush()?;
+    Ok(LoopOutcome::Status(
+        RunStatus::Error,
+        Some(format!("{}; {hint}", outcome.title)),
+        Some(outcome.record()),
+    ))
+}
+
+/// The malformed-tool correction note for a `malformed_tool_call` stop.
+fn malformed_correction(stop: &Stop) -> String {
+    let detail = |key: &str| {
+        stop.wire
+            .details
+            .as_ref()
+            .and_then(|d| d.get("malformed_tool"))
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    crate::recovery::malformed_note(
+        &detail("name").unwrap_or_else(|| "unknown".to_string()),
+        &detail("error").unwrap_or_else(|| "invalid arguments".to_string()),
+    )
 }
 
 /// Pluggable permission decider. Three production impls + a `Bypass`
@@ -962,6 +1129,11 @@ pub struct RunResult {
     /// `opts.limits` as the run ended, including any limit learned from an
     /// overflow error (spec §7). Sessions persist this.
     pub final_limits: rupu_providers::model_limits::ModelLimits,
+    /// The typed outcome the run failed on, when it failed on one (spec
+    /// 2026-10-01 §5). Mirrors the transcript's `RunComplete.outcome`;
+    /// `None` for a success and for failures that are not outcomes
+    /// (max turns, a pause).
+    pub outcome: Option<rupu_transcript::OutcomeRecord>,
 }
 
 impl RunResult {
@@ -986,6 +1158,7 @@ impl RunResult {
                     .error
                     .clone()
                     .unwrap_or_else(|| "no reason recorded".to_string()),
+                outcome: self.outcome.clone().map(Box::new),
             }),
         }
     }
@@ -1032,8 +1205,15 @@ enum CallOutcome {
 /// "why" survives out of the loop. It reaches both the transcript's
 /// `RunComplete.error` and [`RunResult::terminal_error`], which the
 /// orchestrator turns into the step's recorded failure message.
+///
+/// `Status`'s third field is the typed outcome a failed run ended on; it
+/// feeds `RunComplete.outcome` and [`RunResult::outcome`].
 enum LoopOutcome {
-    Status(RunStatus, Option<String>),
+    Status(
+        RunStatus,
+        Option<String>,
+        Option<rupu_transcript::OutcomeRecord>,
+    ),
     Paused,
 }
 
@@ -1049,16 +1229,40 @@ pub async fn run_agent(opts: AgentRunOpts) -> Result<RunResult, RunError> {
 /// retries exhausted, …), because [`RunResult::final_limits`] only exists on
 /// `Ok`. Sessions persist the returned value after every turn (§6.5).
 pub async fn run_agent_with_limits(
-    mut opts: AgentRunOpts,
+    opts: AgentRunOpts,
 ) -> (
     Result<RunResult, RunError>,
     rupu_providers::model_limits::ModelLimits,
 ) {
-    let result = run_agent_inner(&mut opts).await;
-    (result, opts.limits)
+    let e = run_agent_full(opts).await;
+    (e.result, e.final_limits)
 }
 
-async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError> {
+/// Everything a run hands back on EVERY exit path: the result, the limits
+/// as the run ended (see [`run_agent_with_limits`]), and the conversation
+/// as the runner last held it — on a failure too, so a caller can keep a
+/// session's history when the run fails (spec 2026-10-01 §5).
+pub struct RunExit {
+    pub result: Result<RunResult, RunError>,
+    pub final_limits: rupu_providers::model_limits::ModelLimits,
+    pub messages: Vec<Message>,
+}
+
+/// [`run_agent_with_limits`], plus the run's final conversation.
+pub async fn run_agent_full(mut opts: AgentRunOpts) -> RunExit {
+    let mut messages: Vec<Message> = Vec::new();
+    let result = run_agent_inner(&mut opts, &mut messages).await;
+    RunExit {
+        result,
+        final_limits: opts.limits.clone(),
+        messages,
+    }
+}
+
+async fn run_agent_inner(
+    opts: &mut AgentRunOpts,
+    messages: &mut Vec<Message>,
+) -> Result<RunResult, RunError> {
     // Truncate/create a fresh, empty transcript, then hold an
     // APPEND-mode writer for the rest of the run. This is deliberate,
     // not equivalent-by-accident to `JsonlWriter::create`: the
@@ -1320,7 +1524,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
 
     let tool_defs = registry.to_tool_definitions();
 
-    let mut messages: Vec<Message> = opts.initial_messages.clone();
+    *messages = opts.initial_messages.clone();
     if !opts.initial_messages.is_empty() {
         let (source_transcript, inline) = match &opts.seed_source {
             // Stored once at the source; this transcript keeps a verifiable
@@ -1351,7 +1555,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
     // a user turn, as after a tool turn — joins that turn rather than creating
     // two consecutive user messages, which providers reject.
     if !opts.user_message.is_empty() {
-        push_user_turn(&mut messages, &opts.user_message);
+        push_user_turn(messages, &opts.user_message);
         writer.write(&Event::UserMessage {
             content: opts.user_message.clone(),
         })?;
@@ -1380,11 +1584,24 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
         // calibrates an overflow-triggered compaction whose error message
         // carried no token count (spec §7).
         let mut last_turn_input_tokens: u32 = 0;
+        // Rung-0 recovery state (spec 2026-10-01 §5.2): outcome ids, per-turn
+        // budgets and the run's action cap.
+        let mut recovery = crate::recovery::RecoveryState::new();
+        // The turn a rung-0 continuation chain started on. Budgets are per
+        // logical turn: a truncated answer and its continuations share one
+        // budget, though each continuation is its own provider turn. Reset
+        // once a turn moves on through tool calls.
+        let mut chain_turn: Option<u32> = None;
+        // The previous turn stopped on `pause_turn`: this turn's assistant
+        // content joins that assistant message (spec §5.4; replay applies
+        // the same merge from `Recovery { merge_into_previous }`).
+        let mut merge_next_assistant = false;
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
                 break 'turns LoopOutcome::Status(
                     RunStatus::Error,
                     Some(format!("max turns ({}) reached", opts.max_turns)),
+                    None,
                 );
             }
             writer.write(&Event::TurnStart { turn_idx })?;
@@ -1443,6 +1660,9 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // `LongContextUnavailable` falls back to the standard window and
             // retries at most once per turn.
             let mut long_context_fallback = false;
+            // The API refused the server-side fallback opt-in; the provider
+            // has disabled it for the run, so the turn is retried once.
+            let mut fallback_refusal_noted = false;
             let mut http_retries = 0u32;
             let call_outcome: CallOutcome = loop {
                 // No new LLM call once SIGTERM has arrived (nor a retry).
@@ -1550,6 +1770,20 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     CallStep::Paused => break CallOutcome::Paused,
                     CallStep::Err(e) => {
                         let e_str = e.to_string();
+                        // The API refused `fallbacks: "default"` and the
+                        // provider has stopped sending it: note it and retry
+                        // once without it.
+                        if matches!(e, rupu_providers::ProviderError::FallbackUnavailable { .. })
+                            && !fallback_refusal_noted
+                        {
+                            fallback_refusal_noted = true;
+                            writer.write(&Event::Notice {
+                                kind: "server_side_fallback_disabled".into(),
+                                message: "server-side fallback refused by the API — disabled for this run".into(),
+                            })?;
+                            writer.flush()?;
+                            continue;
+                        }
                         // The account has no extra-usage entitlement for 1M
                         // context, and the client has stopped sending the 1M
                         // beta. Fall back to the standard window and retry
@@ -1661,7 +1895,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                     ));
                                 }
                                 if compact_context(
-                                    &mut messages,
+                                    messages,
                                     opts,
                                     &run_id_clone,
                                     compaction_seq + 1,
@@ -1813,6 +2047,32 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             total_cached += resp.usage.cached_tokens as u64;
             last_turn_input_tokens = resp.usage.input_tokens;
 
+            // Classify the reply (spec 2026-10-01 §5.1). A normal reply has
+            // no outcome; anything else is recorded ahead of the turn's
+            // content.
+            let outcome = match crate::outcome::classify_response(&resp) {
+                Some(mut o) => {
+                    o.id = recovery.next_outcome_id();
+                    writer.write(&Event::Outcome {
+                        turn_idx,
+                        outcome: o.record(),
+                    })?;
+                    Some(o)
+                }
+                None => None,
+            };
+            let policy = outcome
+                .as_ref()
+                .map(|o| crate::recovery::policy(&o.class, o.truncated_tool));
+            // A refused, blocked or retried turn's content never joins the
+            // conversation (spec §5.4).
+            let discard = policy.is_some_and(|p| p.discard_partial);
+            // An empty reply is never sent back either: providers reject an
+            // empty assistant message.
+            let empty_reply = outcome
+                .as_ref()
+                .is_some_and(|o| o.class == OutcomeClass::EmptyReply);
+
             // Proactive context compaction: if the previous turn's input exceeded
             // the configured threshold, summarise older turns before building the
             // next request. Must run after usage accounting.
@@ -1823,7 +2083,9 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     // not dropped: its content lands before the abort, as
                     // it does when the abort happens at the tool dispatch.
                     if rupu_providers::credential_writes::terminating() {
-                        emit_turn_content(&mut writer, &resp.content)?;
+                        if !discard {
+                            emit_turn_content(&mut writer, &resp.content)?;
+                        }
                         return Err(terminated(
                             &mut writer,
                             &opts.run_id,
@@ -1834,7 +2096,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     let run_id_clone = opts.run_id.clone();
                     let last_input_tokens = resp.usage.input_tokens;
                     if compact_context(
-                        &mut messages,
+                        messages,
                         opts,
                         &run_id_clone,
                         compaction_seq + 1,
@@ -1847,6 +2109,54 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                         compaction_seq += 1;
                     }
                 }
+            }
+
+            // A discarded turn: its content is not emitted, not dispatched
+            // and not kept. Rung 0 can retry it (with the output cap raised,
+            // or once for an incomplete reply); otherwise it climbs the ladder.
+            if let (true, Some(o), Some(p)) = (discard, outcome.as_ref(), policy) {
+                writer.write(&turn_end_event(
+                    turn_idx,
+                    &resp,
+                    billable_output_tokens,
+                    true,
+                ))?;
+                writer.flush()?;
+                // The cap this turn was sent with was lowered (model-limits
+                // §7) below what the model can produce.
+                let cap_was_lowered = output_cap_lowered
+                    && matches!(
+                        (opts.limits.output.tokens, req.max_tokens),
+                        (Some(full), Some(sent)) if full > sent
+                    );
+                let retry = match p.rung0 {
+                    Rung0::RetryRaisedCap => cap_was_lowered,
+                    Rung0::RetryTurn => true,
+                    _ => false,
+                };
+                if retry {
+                    let chain = *chain_turn.get_or_insert(turn_idx);
+                    if let Rung0Step::Act(attempt) = rung0_step(&mut recovery, chain, &p) {
+                        RecoveryEvent {
+                            outcome_id: &o.id,
+                            attempt: Some(attempt),
+                            budget: Some(p.budget),
+                            reason: (p.rung0 == Rung0::RetryRaisedCap)
+                                .then(|| "output cap raised to the model maximum".to_string()),
+                            ..Default::default()
+                        }
+                        .write(&mut writer, RecoveryAction::Retried)?;
+                        writer.flush()?;
+                        // The next turn is built from `opts.limits` again:
+                        // the full output cap, and the same `messages`.
+                        turn_idx += 1;
+                        if is_paused(&pause) {
+                            break 'turns LoopOutcome::Paused;
+                        }
+                        continue 'turns;
+                    }
+                }
+                break 'turns exhausted(&mut writer, opts, o)?;
             }
 
             // Emit the turn's content blocks in the provider's own order —
@@ -2006,31 +2316,33 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 }
             }
 
-            writer.write(&Event::TurnEnd {
+            writer.write(&turn_end_event(
                 turn_idx,
-                tokens_in: Some(resp.usage.input_tokens as u64),
-                tokens_out: Some(billable_output_tokens),
-                stop_reason: Some(resp.stop.wire_value_or_reason()),
-                response_id: {
-                    let id = resp.id.trim();
-                    if id.is_empty() {
-                        None
-                    } else {
-                        Some(id.to_string())
-                    }
-                },
-                discarded: false,
-                stop: None,
-            })?;
+                &resp,
+                billable_output_tokens,
+                empty_reply,
+            ))?;
             writer.flush()?;
 
             // Append assistant + tool_result(s) to messages so the next
             // turn sees them. `Message::assistant` only takes &str, so we
-            // construct a multi-block assistant message manually.
-            messages.push(Message {
-                role: Role::Assistant,
-                content: resp.content.clone(),
-            });
+            // construct a multi-block assistant message manually. A reply
+            // with no content is not appended (replay folds none either);
+            // after a `pause_turn` the content joins the paused message.
+            if !empty_reply {
+                if !resp.content.is_empty() {
+                    match messages.last_mut() {
+                        Some(last) if merge_next_assistant && last.role == Role::Assistant => {
+                            last.content.extend(resp.content.iter().cloned());
+                        }
+                        _ => messages.push(Message {
+                            role: Role::Assistant,
+                            content: resp.content.clone(),
+                        }),
+                    }
+                }
+                merge_next_assistant = false;
+            }
             // Whether the model requested any tool calls this turn. This — not
             // `stop_reason` — is the real "should I continue?" signal: tool
             // calls produce tool_results that we append below as a user
@@ -2057,6 +2369,149 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 });
             }
 
+            // Rung 0 for a kept turn (spec 2026-10-01 §5.2). A warning outcome
+            // (an unrecognized or unreported stop) gets no recovery: the
+            // content rule below decides. Every other outcome either
+            // continues the run here or ends it at the ladder; none reaches
+            // the success rule without tool calls.
+            if let (Some(o), Some(p)) = (outcome.as_ref(), policy) {
+                if o.severity() != Severity::Warning {
+                    let chain = *chain_turn.get_or_insert(turn_idx);
+                    let step = match p.rung0 {
+                        Rung0::ContinuePause
+                        | Rung0::ContinueTruncated
+                        | Rung0::CompactThenContinue
+                        | Rung0::CorrectMalformed
+                        | Rung0::NudgeEmpty => rung0_step(&mut recovery, chain, &p),
+                        _ => Rung0Step::OverBudget,
+                    };
+                    let attempt = match step {
+                        Rung0Step::Act(attempt) => attempt,
+                        Rung0Step::OverBudget if p.rung0 == Rung0::ContinuePause => {
+                            // Still paused after every continuation: the
+                            // reply is incomplete. Its partial is already in
+                            // the conversation, so it is not discarded; it
+                            // climbs the ladder as `Incomplete`.
+                            let incomplete = crate::outcome::Outcome {
+                                id: recovery.next_outcome_id(),
+                                class: OutcomeClass::Incomplete,
+                                title: format!(
+                                    "incomplete reply · still paused after {} continuations",
+                                    p.budget
+                                ),
+                                detail: o.detail.clone(),
+                                wire: o.wire.clone(),
+                                truncated_tool: false,
+                            };
+                            writer.write(&Event::Outcome {
+                                turn_idx,
+                                outcome: incomplete.record(),
+                            })?;
+                            break 'turns exhausted(&mut writer, opts, &incomplete)?;
+                        }
+                        Rung0Step::OverBudget | Rung0Step::Capped => {
+                            break 'turns exhausted(&mut writer, opts, o)?;
+                        }
+                    };
+                    let continued = |reason: Option<&str>| RecoveryEvent {
+                        outcome_id: &o.id,
+                        attempt: Some(attempt),
+                        budget: Some(p.budget),
+                        reason: reason.map(str::to_string),
+                        ..Default::default()
+                    };
+                    // The tool calls this turn made already continue the run
+                    // (their results end the conversation on a user turn).
+                    let tool_calls_ran = Some("tool calls ran");
+                    let note: Option<String> = match p.rung0 {
+                        Rung0::ContinuePause if made_tool_calls => {
+                            continued(tool_calls_ran)
+                                .write(&mut writer, RecoveryAction::Continued)?;
+                            None
+                        }
+                        Rung0::ContinuePause => {
+                            // Re-send with the paused content last and no new
+                            // user message; the continuation joins it.
+                            RecoveryEvent {
+                                merge_into_previous: true,
+                                continues_output: true,
+                                ..continued(None)
+                            }
+                            .write(&mut writer, RecoveryAction::Continued)?;
+                            writer.flush()?;
+                            merge_next_assistant = true;
+                            turn_idx += 1;
+                            continue 'turns;
+                        }
+                        Rung0::ContinueTruncated | Rung0::CompactThenContinue => {
+                            if p.rung0 == Rung0::CompactThenContinue {
+                                // The summariser is an LLM call too: none
+                                // once SIGTERM has arrived.
+                                if rupu_providers::credential_writes::terminating() {
+                                    return Err(terminated(
+                                        &mut writer,
+                                        &opts.run_id,
+                                        total_in + total_out,
+                                        started,
+                                    ));
+                                }
+                                let run_id_clone = opts.run_id.clone();
+                                if compact_context(
+                                    messages,
+                                    opts,
+                                    &run_id_clone,
+                                    compaction_seq + 1,
+                                    &mut writer,
+                                    last_turn_input_tokens.max(1),
+                                )
+                                .await
+                                {
+                                    compaction_seq += 1;
+                                    continued(None)
+                                        .write(&mut writer, RecoveryAction::Compacted)?;
+                                }
+                            }
+                            if made_tool_calls {
+                                continued(tool_calls_ran)
+                                    .write(&mut writer, RecoveryAction::Continued)?;
+                                None
+                            } else {
+                                RecoveryEvent {
+                                    continues_output: true,
+                                    ..continued(None)
+                                }
+                                .write(&mut writer, RecoveryAction::Continued)?;
+                                Some(crate::recovery::TRUNCATION_NOTE.to_string())
+                            }
+                        }
+                        Rung0::CorrectMalformed => {
+                            continued(None).write(&mut writer, RecoveryAction::Continued)?;
+                            Some(malformed_correction(&resp.stop))
+                        }
+                        Rung0::NudgeEmpty => {
+                            continued(None).write(&mut writer, RecoveryAction::Continued)?;
+                            Some(crate::recovery::EMPTY_REPLY_NOTE.to_string())
+                        }
+                        // `rung0_step` above only acts on the rows handled
+                        // here; anything else already went to the ladder.
+                        _ => break 'turns exhausted(&mut writer, opts, o)?,
+                    };
+                    if let Some(note) = note {
+                        // The note is a user turn: it joins tool results (or a
+                        // trailing user turn) the way replay folds it.
+                        push_user_turn(messages, &note);
+                        writer.write(&Event::UserMessage { content: note })?;
+                        writer.flush()?;
+                        turn_idx += 1;
+                        if is_paused(&pause) {
+                            break 'turns LoopOutcome::Paused;
+                        }
+                        continue 'turns;
+                    }
+                    writer.flush()?;
+                }
+            }
+
             turn_idx += 1;
             // Continue only when the model requested tools (we appended their
             // results as a user message, so the next request ends with a user
@@ -2067,9 +2522,16 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // and which is the wrong behaviour in general. `stop_reason` is
             // only a hint: an unrecognized/absent value deserializes to `None`,
             // so it must not be the sole terminator.
+            //
+            // The success rule (spec §5.3): only a turn with no outcome or a
+            // warning one reaches here without tool calls — every error
+            // outcome either continued above or ended at the ladder.
             if !made_tool_calls {
-                break 'turns LoopOutcome::Status(RunStatus::Ok, None);
+                break 'turns LoopOutcome::Status(RunStatus::Ok, None, None);
             }
+            // The run moved on through tool calls: the next turn starts a
+            // new logical turn with fresh rung-0 budgets.
+            chain_turn = None;
             // Cooperative pause after a full tool-calling turn: the tool(s) ran
             // to completion and their results are recorded in both the
             // transcript and `messages` (no dangling tool_call). Stop here,
@@ -2079,9 +2541,9 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             }
         };
 
-        let (result_status, paused, terminal_error) = match loop_outcome {
-            LoopOutcome::Status(s, why) => (s, false, why),
-            LoopOutcome::Paused => (RunStatus::Aborted, true, Some("paused".into())),
+        let (result_status, paused, terminal_error, run_outcome) = match loop_outcome {
+            LoopOutcome::Status(s, why, outcome) => (s, false, why, outcome),
+            LoopOutcome::Paused => (RunStatus::Aborted, true, Some("paused".into()), None),
         };
 
         writer.write(&Event::RunComplete {
@@ -2092,7 +2554,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // Previously hard-coded to `Some("paused")` / `None`, which left a
             // max-turns bust writing `status: error` with no reason at all.
             error: terminal_error.clone(),
-            outcome: None,
+            outcome: run_outcome.clone(),
         })?;
         writer.flush()?;
 
@@ -2109,10 +2571,11 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             total_tokens_in: total_in,
             total_tokens_out: total_out,
             total_tokens_cached: total_cached,
-            final_messages: messages,
+            final_messages: messages.clone(),
             paused,
             error: terminal_error,
             final_limits: opts.limits.clone(),
+            outcome: run_outcome,
         })
     }
     .await;
@@ -2622,26 +3085,29 @@ mod on_tool_call_tests {
     }
 
     #[tokio::test]
-    async fn final_answer_without_tool_calls_terminates_regardless_of_stop_reason() {
-        // Regression: a final assistant turn with NO tool calls must end the
-        // run. The loop previously broke only on `Some(EndTurn)`; a non-EndTurn
-        // stop reason (e.g. `MaxTokens`, or an unrecognized value that
-        // deserializes to `None`) made it loop again and re-send a conversation
-        // ending in an assistant message — which some models reject with a 400:
-        // "the conversation must end with a user message" (no prefill support).
-        //
-        // The mock has a SINGLE scripted turn, so if the loop wrongly continues
-        // it exhausts the script on the next turn and `run_agent` errors. A
-        // clean `Ok` in exactly one turn proves it terminated correctly.
+    async fn final_answer_cut_off_by_max_tokens_is_continued_not_accepted() {
+        // A final assistant turn cut off at the output limit is not an
+        // answer (spec 2026-10-01 §5.3): rung 0 continues it with the
+        // truncation note — a conversation that ends in a user message, so
+        // no provider sees an assistant-final request — and the run succeeds
+        // only on the continuation's normal stop.
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test.jsonl");
 
-        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
-            text: "All done — final answer, no tools to call.".into(),
-            stop: StopReason::MaxTokens,
-            input_tokens: 1,
-            output_tokens: 1,
-        }]);
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantText {
+                text: "All done — final answer, cut off".into(),
+                stop: StopReason::MaxTokens,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            ScriptedTurn::AssistantText {
+                text: " at the limit.".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
 
         let opts = AgentRunOpts {
             seed_source: None,
@@ -2698,11 +3164,11 @@ mod on_tool_call_tests {
         assert_eq!(
             result.status,
             RunStatus::Ok,
-            "a no-tool-call final turn must complete Ok"
+            "the continued answer completes Ok"
         );
         assert_eq!(
-            result.turns, 1,
-            "must terminate after the single turn, not continue looping"
+            result.turns, 2,
+            "the truncated turn plus its continuation, then stop"
         );
     }
 

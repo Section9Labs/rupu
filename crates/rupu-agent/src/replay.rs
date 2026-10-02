@@ -6,7 +6,11 @@
 //! user message using the SAME error-formatting + clamp the runner feeds
 //! the model; `Seed` initializes state; `Compaction` replaces it. A turn
 //! with no `TurnEnd` (paused / aborted mid-turn) is dropped, matching the
-//! runner, which never committed it to `messages` either.
+//! runner, which never committed it to `messages` either. A turn whose
+//! `TurnEnd` is `discarded` (a refused, retried or empty reply) is dropped
+//! too, and a `Recovery { merge_into_previous }` makes the next kept turn's
+//! assistant content join the previous assistant message (a `pause_turn`
+//! continuation) — both as the runner does (response-outcomes spec §5.4).
 //!
 //! Legacy (v1) transcripts reconstruct without reasoning blocks — the v1
 //! `assistant_message.thinking` string has no `raw` payload to rebuild.
@@ -45,12 +49,27 @@ struct TurnAccum {
 }
 
 impl TurnAccum {
-    fn flush_into(&mut self, messages: &mut Vec<Message>) {
+    /// Drop a discarded turn's content (a refused, blocked, retried or empty
+    /// reply): the runner never added it to the conversation.
+    fn discard(&mut self) {
+        self.assistant_blocks.clear();
+        self.call_order.clear();
+        self.results.clear();
+    }
+
+    /// Fold the turn into `messages`. With `merge`, the assistant blocks join
+    /// the last message when it is an assistant message — the continuation
+    /// of a `pause_turn`, which the runner appends the same way.
+    fn flush_into(&mut self, messages: &mut Vec<Message>, merge: bool) {
         if !self.assistant_blocks.is_empty() {
-            messages.push(Message {
-                role: Role::Assistant,
-                content: std::mem::take(&mut self.assistant_blocks),
-            });
+            let blocks = std::mem::take(&mut self.assistant_blocks);
+            match messages.last_mut() {
+                Some(last) if merge && last.role == Role::Assistant => last.content.extend(blocks),
+                _ => messages.push(Message {
+                    role: Role::Assistant,
+                    content: blocks,
+                }),
+            }
         }
         let blocks: Vec<ContentBlock> = self
             .call_order
@@ -213,6 +232,9 @@ fn reconstruct_with(
 ) -> Result<Vec<Message>, ReplayError> {
     let mut messages: Vec<Message> = Vec::new();
     let mut accum = TurnAccum::default();
+    // A `Recovery { merge_into_previous }` was seen: the next kept turn's
+    // assistant content joins the previous assistant message.
+    let mut merge_next = false;
 
     for ev in events {
         match ev {
@@ -285,7 +307,17 @@ fn reconstruct_with(
                     .results
                     .insert(call_id.clone(), (output.clone(), error.clone()));
             }
-            Event::TurnEnd { .. } => accum.flush_into(&mut messages),
+            Event::TurnEnd {
+                discarded: true, ..
+            } => accum.discard(),
+            Event::TurnEnd { .. } => {
+                accum.flush_into(&mut messages, merge_next);
+                merge_next = false;
+            }
+            Event::Recovery {
+                merge_into_previous: true,
+                ..
+            } => merge_next = true,
             // Non-conversation events.
             Event::RunStart { .. }
             | Event::TurnStart { .. }
@@ -300,7 +332,6 @@ fn reconstruct_with(
             | Event::ToolAudit { .. }
             | Event::NetFlow { .. }
             | Event::Notice { .. }
-            // Task 7 gives these their replay semantics (discard / merge).
             | Event::Outcome { .. }
             | Event::Recovery { .. }
             | Event::Unknown { .. } => {}
@@ -647,5 +678,125 @@ mod tests {
             serde_json::to_value(&expected).unwrap(),
             "replay must rebuild exactly what the runner sent"
         );
+    }
+
+    fn turn_end(discarded: bool) -> Event {
+        Event::TurnEnd {
+            turn_idx: 0,
+            tokens_in: None,
+            tokens_out: None,
+            stop_reason: None,
+            response_id: None,
+            discarded,
+            stop: None,
+        }
+    }
+
+    fn assistant(text: &str) -> Event {
+        Event::AssistantMessage {
+            content: text.into(),
+            thinking: None,
+        }
+    }
+
+    fn recovery(merge_into_previous: bool) -> Event {
+        Event::Recovery {
+            outcome_id: "oc_1".into(),
+            rung: 0,
+            action: rupu_transcript::RecoveryAction::Continued,
+            attempt: Some(1),
+            budget: Some(5),
+            provider: None,
+            model: None,
+            reason: None,
+            merge_into_previous,
+            continues_output: true,
+        }
+    }
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text { text: t.into() }
+    }
+
+    #[test]
+    fn a_discarded_turn_is_dropped() {
+        let events = vec![
+            Event::UserMessage {
+                content: "go".into(),
+            },
+            assistant("refused partial"),
+            turn_end(true),
+            assistant("answer"),
+            turn_end(false),
+        ];
+        let rebuilt = reconstruct_messages(&events).unwrap();
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("go"),
+                Message {
+                    role: rupu_providers::types::Role::Assistant,
+                    content: vec![text("answer")],
+                },
+            ])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_into_previous_joins_the_next_kept_turn_and_only_that_one() {
+        let events = vec![
+            Event::UserMessage {
+                content: "go".into(),
+            },
+            assistant("a"),
+            turn_end(false),
+            recovery(true),
+            // A discarded turn in between keeps the merge pending.
+            assistant("dropped"),
+            turn_end(true),
+            assistant("b"),
+            turn_end(false),
+            Event::UserMessage {
+                content: "more".into(),
+            },
+            assistant("c"),
+            turn_end(false),
+        ];
+        let rebuilt = reconstruct_messages(&events).unwrap();
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("go"),
+                Message {
+                    role: rupu_providers::types::Role::Assistant,
+                    content: vec![text("a"), text("b")],
+                },
+                Message::user("more"),
+                Message {
+                    role: rupu_providers::types::Role::Assistant,
+                    content: vec![text("c")],
+                },
+            ])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_recovery_without_merge_changes_nothing() {
+        let events = vec![
+            Event::UserMessage {
+                content: "go".into(),
+            },
+            assistant("a"),
+            turn_end(false),
+            recovery(false),
+            Event::UserMessage {
+                content: "continue".into(),
+            },
+            assistant("b"),
+            turn_end(false),
+        ];
+        assert_eq!(reconstruct_messages(&events).unwrap().len(), 4);
     }
 }
