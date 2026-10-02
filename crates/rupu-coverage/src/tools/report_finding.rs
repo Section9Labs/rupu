@@ -352,6 +352,60 @@ fn ingest_block_files(
     report: &mut crate::report::FindingReport,
     limits: crate::report::IngestLimits,
 ) -> Result<(), ReportFindingError> {
+    resolve_block_files(workspace, report, limits, |requested, left| {
+        store.ingest(workspace, std::slice::from_ref(requested), left)
+    })
+}
+
+/// [`ingest_block_files`] without the store: every block file is checked the
+/// way a real ingest checks it (it exists inside the workspace, is one file,
+/// and fits what is left of the finding's budget), and each block's ref is
+/// replaced with what the store would record, its sha256 a stand-in of the
+/// same length. Nothing is hashed, copied or created. The dry-run half, for
+/// `attach_reports`' dry run.
+pub(crate) fn check_block_files(
+    store: &crate::report::ArtifactStore,
+    workspace: &std::path::Path,
+    report: &mut crate::report::FindingReport,
+    limits: crate::report::IngestLimits,
+) -> Result<(), ReportFindingError> {
+    resolve_block_files(workspace, report, limits, |requested, left| {
+        Ok(store
+            .check(workspace, std::slice::from_ref(requested), left)?
+            .into_iter()
+            .map(planned_ref)
+            .collect())
+    })
+}
+
+/// What [`crate::report::ArtifactStore::ingest`] would record for a file
+/// [`crate::report::ArtifactStore::check`] planned, with a stand-in sha256
+/// as long as a real digest, so a report's stored size can be checked
+/// without hashing anything.
+pub(crate) fn planned_ref(a: crate::report::PlannedArtifact) -> crate::report::ArtifactRef {
+    crate::report::ArtifactRef {
+        path: a.path,
+        sha256: "0".repeat(64),
+        size: a.size,
+        kind: Some(a.kind),
+        stored: Some(a.stored),
+        host: None,
+    }
+}
+
+/// The walk shared by [`ingest_block_files`] and [`check_block_files`]:
+/// `resolve` turns one block's requested ref into what the store records (or
+/// would), against the budget left.
+fn resolve_block_files(
+    workspace: &std::path::Path,
+    report: &mut crate::report::FindingReport,
+    limits: crate::report::IngestLimits,
+    mut resolve: impl FnMut(
+        &crate::report::ArtifactRef,
+        crate::report::IngestLimits,
+    )
+        -> Result<Vec<crate::report::ArtifactRef>, crate::report::ArtifactError>,
+) -> Result<(), ReportFindingError> {
     use crate::report::{ArtifactError, ArtifactStorage};
     let field_error = |i: usize, message: &str| {
         ReportFindingError::Report(crate::report::ReportValidationError(vec![
@@ -389,19 +443,17 @@ fn ingest_block_files(
         };
         // The store judges this one block against what is left; report the
         // whole finding's numbers and the configured limits instead.
-        let got = store
-            .ingest(workspace, std::slice::from_ref(&requested), left)
-            .map_err(|e| match e {
-                ArtifactError::TooManyFiles { .. } => ArtifactError::TooManyFiles {
-                    max: limits.max_files,
-                },
-                ArtifactError::TooLarge { total, files, .. } => ArtifactError::TooLarge {
-                    total: used_bytes.saturating_add(total),
-                    files: used_copied + files,
-                    max: limits.max_total_bytes,
-                },
-                other => other,
-            });
+        let got = resolve(&requested, left).map_err(|e| match e {
+            ArtifactError::TooManyFiles { .. } => ArtifactError::TooManyFiles {
+                max: limits.max_files,
+            },
+            ArtifactError::TooLarge { total, files, .. } => ArtifactError::TooLarge {
+                total: used_bytes.saturating_add(total),
+                files: used_copied + files,
+                max: limits.max_total_bytes,
+            },
+            other => other,
+        });
         let got = match got {
             Ok(got) => got,
             // These name the block's own file: point at it.

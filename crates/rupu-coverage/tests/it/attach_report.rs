@@ -1077,3 +1077,148 @@ fn writers_wait_for_the_ledger_lock() {
     assert!(attached.report.is_some());
     assert!(records.iter().any(|r| r.id != id && r.report.is_none()));
 }
+
+/// An image block naming `path`, with everything the agent can claim about
+/// the file set to something false.
+fn image_block(path: &str) -> rupu_coverage::report::EvidenceBlock {
+    rupu_coverage::report::EvidenceBlock::Image {
+        artifact: rupu_coverage::report::ArtifactRef {
+            path: path.into(),
+            sha256: "0".repeat(64),
+            size: 1,
+            kind: Some(rupu_coverage::report::ArtifactKind::Text),
+            stored: Some(rupu_coverage::report::ArtifactStorage::External),
+            host: Some("agent-claimed-host".into()),
+        },
+        caption: Some("the login page".into()),
+    }
+}
+
+#[test]
+fn an_attached_reports_block_file_is_verified_and_stored() {
+    use rupu_coverage::report::{ArtifactKind, ArtifactStorage, ArtifactStore};
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    std::fs::create_dir_all(paths.workspace.join("shots")).unwrap();
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(b"fake");
+    std::fs::write(paths.workspace.join("shots/login.png"), &bytes).unwrap();
+    let real_sha =
+        rupu_coverage::report::sha256_file(&paths.workspace.join("shots/login.png")).unwrap();
+    let store = d.path().join("store");
+    let opts = FindingWriteOptions {
+        artifact_root: Some(store.clone()),
+        ..full_opts()
+    };
+    let mut r = report();
+    r.artifacts = vec![];
+    r.blocks = vec![image_block("shots/login.png")];
+    let item = || {
+        vec![AttachItem {
+            finding_id: id.clone(),
+            report: r.clone(),
+        }]
+    };
+
+    // A dry run accepts it and copies nothing.
+    let dry = attach_reports(&paths, item(), &opts, true).unwrap();
+    assert!(
+        matches!(dry.outcomes.as_slice(), [AttachOutcome::Attached]),
+        "{:?}",
+        dry.outcomes
+    );
+    assert!(!store.exists(), "a dry run copies nothing");
+
+    let batch = attach_reports(&paths, item(), &opts, false).unwrap();
+    assert!(
+        matches!(batch.outcomes.as_slice(), [AttachOutcome::Attached]),
+        "{:?} {:?}",
+        batch.outcomes,
+        batch.write_error
+    );
+    let rec = read_findings(&paths)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == id)
+        .unwrap();
+    let rep = rec.report.expect("the report is attached");
+    let a = rep.blocks[0].artifact().expect("still an image block");
+    assert_eq!(a.path, "shots/login.png");
+    assert_eq!(a.sha256, real_sha, "the agent's sha is replaced");
+    assert_eq!(a.size, bytes.len() as u64, "the agent's size is replaced");
+    assert_eq!(a.kind, Some(ArtifactKind::Binary));
+    assert_eq!(a.stored, Some(ArtifactStorage::Copied));
+    assert_eq!(a.host, None, "the report cannot claim a host");
+    assert_eq!(
+        std::fs::read(ArtifactStore::new(&store).blob_path(&real_sha)).unwrap(),
+        bytes
+    );
+    assert!(
+        rep.artifacts.is_empty(),
+        "a block's file is not a PoC artifact"
+    );
+}
+
+#[test]
+fn a_missing_block_file_is_rejected_by_a_dry_run_as_by_a_real_one() {
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    let store = d.path().join("store");
+    let opts = FindingWriteOptions {
+        artifact_root: Some(store.clone()),
+        ..full_opts()
+    };
+    let mut r = report();
+    r.artifacts = vec![];
+    r.blocks = vec![image_block("shots/absent.png")];
+    let before = std::fs::read(&paths.findings).unwrap();
+    for dry_run in [true, false] {
+        let batch = attach_reports(
+            &paths,
+            vec![AttachItem {
+                finding_id: id.clone(),
+                report: r.clone(),
+            }],
+            &opts,
+            dry_run,
+        )
+        .unwrap();
+        match batch.outcomes.as_slice() {
+            [AttachOutcome::Rejected(rupu_coverage::ReportFindingError::Report(v))] => {
+                assert_eq!(v.0.len(), 1, "dry_run={dry_run}: {v:?}");
+                assert_eq!(v.0[0].path, "report.blocks[0].artifact.path", "{v:?}");
+            }
+            o => panic!("dry_run={dry_run}: expected the block's field error, got {o:?}"),
+        }
+    }
+    assert_eq!(std::fs::read(&paths.findings).unwrap(), before);
+    assert!(!store.exists(), "no artifact store was created");
+}
+
+#[test]
+fn block_files_need_a_store_on_a_dry_run_as_on_a_real_one() {
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    std::fs::write(paths.workspace.join("login.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let mut r = report();
+    r.artifacts = vec![];
+    r.blocks = vec![image_block("login.png")];
+    for dry_run in [true, false] {
+        let batch = attach_reports(
+            &paths,
+            vec![AttachItem {
+                finding_id: id.clone(),
+                report: r.clone(),
+            }],
+            &full_opts(), // no artifact_root
+            dry_run,
+        )
+        .unwrap();
+        match batch.outcomes.as_slice() {
+            [AttachOutcome::Rejected(rupu_coverage::ReportFindingError::Artifact(
+                rupu_coverage::report::ArtifactError::NoStore,
+            ))] => {}
+            o => panic!("dry_run={dry_run}: expected Rejected(NoStore), got {o:?}"),
+        }
+    }
+}

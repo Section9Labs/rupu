@@ -4,7 +4,8 @@
 //! findings before the full profile existed (spec: "Backfill").
 //!
 //! A report attaches whole or not at all: it goes through the same
-//! validation and artifact store as `report_finding`, and a finding that
+//! validation and artifact store as `report_finding` (evidence-block files
+//! included: verified, stored, and their refs replaced), and a finding that
 //! already has a report is never touched. Unlike `report_finding`, claim
 //! files are not hashed: an imported report's claims were made against the
 //! code as it was when the report was written, so a hash of today's file
@@ -29,11 +30,11 @@ use crate::ledger::events::FindingRecord;
 use crate::ledger::paths::CoveragePaths;
 use crate::ledger::stream::lock_findings;
 use crate::report::{
-    ArtifactError, ArtifactRef, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
+    ArtifactError, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
 };
 use crate::tools::report_finding::{
-    check_full_report, check_stored_size, derived_fields, prepare_full_report, ClaimHashes,
-    ReportFindingError,
+    check_block_files, check_full_report, check_stored_size, derived_fields, planned_ref,
+    prepare_full_report, ClaimHashes, ReportFindingError,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -86,8 +87,8 @@ pub struct AttachBatch {
 /// Attach each item's report to its finding. With `dry_run`, only report what
 /// would happen: the ledger is read, but no lock is taken and nothing is
 /// created or written. A dry run's `Attached` means the report passed
-/// validation and every artifact it lists exists inside the workspace, within
-/// the count and size limits.
+/// validation and every artifact it lists, and every evidence-block file,
+/// exists inside the workspace, within the count and size limits.
 ///
 /// `Err` only when the ledger cannot be read: nothing was assessed or
 /// written. A failure to write it is [`AttachBatch::write_error`], alongside
@@ -250,8 +251,9 @@ fn refuse_symlinked_ledger(findings: &Path) -> std::io::Result<()> {
 /// The rejections a real run gives, minus the ones that need the artifact
 /// store to be written to or a file to be read in full: the report
 /// validates, an artifact store is configured when the report lists
-/// artifacts, every listed artifact path exists inside the workspace and is
-/// within the count and size limits (`ArtifactError::Missing` / `Escapes` /
+/// artifacts or evidence-block files, every listed artifact path and block
+/// file exists inside the workspace (a block's as one file) and is within
+/// the finding's shared count and size limits (`ArtifactError::Missing` / `Escapes` /
 /// `TooManyFiles` / `TooLarge`, as a real ingest gives), and the report as it
 /// would be stored, its artifacts expanded and recorded, is within
 /// `report_max_bytes`. Nothing is created, hashed or copied; each artifact's
@@ -268,22 +270,23 @@ fn dry_run_check(
     for claim in &mut stored.evidence {
         claim.sha256 = None;
     }
-    if !report.artifacts.is_empty() {
+    let has_block_files = report.blocks.iter().any(|b| b.artifact().is_some());
+    if !report.artifacts.is_empty() || has_block_files {
         let root = opts.artifact_root.as_ref().ok_or(ArtifactError::NoStore)?;
-        stored.artifacts = ArtifactStore::new(root)
-            .check(&paths.workspace, &report.artifacts, opts.ingest_limits())?
-            .into_iter()
-            .map(|a| ArtifactRef {
-                path: a.path,
-                // A stand-in as long as the digest a real ingest records, so
-                // the size checked is the stored report's.
-                sha256: "0".repeat(64),
-                size: a.size,
-                kind: Some(a.kind),
-                stored: Some(a.stored),
-                host: None,
-            })
-            .collect();
+        let store = ArtifactStore::new(root);
+        let limits = opts.ingest_limits();
+        if !report.artifacts.is_empty() {
+            // Stand-in digests as long as the ones a real ingest records, so
+            // the size checked is the stored report's.
+            stored.artifacts = store
+                .check(&paths.workspace, &report.artifacts, limits)?
+                .into_iter()
+                .map(planned_ref)
+                .collect();
+        }
+        // Block files share the finding's budget with `artifacts`, as in
+        // `prepare_full_report`.
+        check_block_files(&store, &paths.workspace, &mut stored, limits)?;
     }
     check_stored_size(&stored, opts)
 }

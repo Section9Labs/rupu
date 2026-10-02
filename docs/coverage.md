@@ -644,8 +644,8 @@ evidence claims are stored without a hash of their files (an agent's claims
 get one when it records them): the claims were made against the code as it
 was when the report was written, and hashing today's file would present them
 as current. The control plane shows their evidence status as `unknown`.
-Artifacts are copied from the workspace as it is at import, not as it was when
-the report was written.
+Artifacts (and any file an evidence block names) are verified and copied from
+the workspace as it is at import, not as it was when the report was written.
 
 **Backups and the lock file.** Every real import that attaches anything first
 copies the ledger byte for byte (and syncs the copy to disk) to
@@ -671,8 +671,8 @@ next run overwrites the temp file and takes a backup of its own).
 **Dry run.** `--dry-run` parses and validates every report and prints `would
 attach` for those that would go in. It writes nothing: no ledger change, no
 backup, and it takes no lock, so it also works on a read-only ledger directory.
-It checks that each artifact the report lists exists inside the workspace and
-is within the artifact count and size limits, and that the report as it would
+It checks that each artifact the report lists, and each evidence-block file,
+exists inside the workspace and is within the artifact count and size limits, and that the report as it would
 be stored (directories expanded, every artifact recorded with its hash, size,
 kind and storage) is within `report_max_bytes`. It copies nothing: it reads
 only the first 8 KiB of each artifact, to tell text from binary as a real
