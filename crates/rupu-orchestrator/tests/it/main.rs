@@ -9,6 +9,7 @@
 //! never cleared and would make every other run here stop as terminating.
 
 mod action_step;
+mod attempts_ledger;
 mod branch_runner;
 mod cancel_vs_completion;
 mod dispatch_agent;

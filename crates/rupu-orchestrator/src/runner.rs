@@ -7253,6 +7253,43 @@ async fn persist_active_step(
     }
 }
 
+/// Append one `attempts.jsonl` row for an agent attempt that is *starting
+/// now* — written before the agent runs, so an attempt that is interrupted
+/// mid-run is still in the ledger for `rupu workflow resume` to continue.
+///
+/// A no-op without a run store, and for the in-memory mode's empty
+/// `workflow_run_id` (the same guard the unit-checkpoint appends use).
+/// Best-effort: a failed ledger write is logged, never a failed run.
+/// `continued_from` is always `None` here — a continuation attempt is
+/// stamped by the resume path, not by a fresh start.
+fn record_attempt(
+    store: Option<&crate::runs::RunStore>,
+    workflow_run_id: &str,
+    step_id: &str,
+    unit_index: Option<usize>,
+    agent_run_id: &str,
+    transcript_path: &Path,
+    host: Option<&str>,
+) {
+    let Some(store) = store.filter(|_| !workflow_run_id.is_empty()) else {
+        return;
+    };
+    let attempt = crate::runs::AttemptRecord {
+        v: 1,
+        step_id: step_id.to_string(),
+        unit_index,
+        sub_id: None,
+        agent_run_id: agent_run_id.to_string(),
+        transcript_path: transcript_path.to_path_buf(),
+        host: host.map(str::to_string),
+        continued_from: None,
+        started_at: chrono::Utc::now(),
+    };
+    if let Err(e) = store.append_attempt(workflow_run_id, &attempt) {
+        warn!(step = %step_id, error = %e, "failed to append attempt record");
+    }
+}
+
 /// Clear `step_id` as the run's active step if it still is — under the run
 /// lock, never over an on-disk `Cancelled`.
 async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
@@ -7657,6 +7694,17 @@ async fn run_linear_step(
         .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
     let codename = step_codename(opts, step);
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone())).await;
+    // Ledger row for this attempt, at its start (a placed step's host is
+    // the step's `host:`).
+    record_attempt(
+        opts.run_store.as_deref(),
+        workflow_run_id,
+        &step.id,
+        None,
+        &run_id,
+        &transcript_path,
+        step.host.as_deref(),
+    );
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
     // `StepStarted`), so the UI has no way to learn it until the step
@@ -8340,6 +8388,18 @@ async fn run_fanout_step(
                 };
             }
 
+            // Ledger row at the attempt's start (past the pause check, so a
+            // unit that never started has none), written whether or not a
+            // live event sink is attached.
+            record_attempt(
+                store_for_task.as_deref(),
+                &workflow_run_id,
+                &step_id,
+                Some(idx),
+                &run_id,
+                &transcript_path,
+                placement_host.as_deref(),
+            );
             if let Some(sink) = event_sink.as_ref() {
                 sink.emit(
                     &workflow_run_id,
@@ -8514,6 +8574,18 @@ async fn run_fanout_step(
                                             retry = %retry_host,
                                             error = %first_err,
                                             "unit dispatch failed; retrying on next host"
+                                        );
+                                        // The retry is its own attempt (fresh
+                                        // run id, fallback host's mirror path),
+                                        // so it gets its own ledger row.
+                                        record_attempt(
+                                            store_for_task.as_deref(),
+                                            &workflow_run_id,
+                                            &step_id,
+                                            Some(idx),
+                                            &retry_run_id,
+                                            &transcript_path,
+                                            placement_host.as_deref(),
                                         );
                                         // Announce the fallback host's mirror path
                                         // on the live stream. Both frontends
