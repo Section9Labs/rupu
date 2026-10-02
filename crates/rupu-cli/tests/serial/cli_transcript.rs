@@ -481,6 +481,69 @@ async fn archive_moves_standalone_transcript_and_show_finds_it() {
         .stdout(predicate::str::contains("\"run_id\": \"run_archive123\""));
 }
 
+/// `rupu run` writes its coverage stream to `runs/<run_id>/` from the start,
+/// but only a run that finished writes `run.json` there (and so belongs to
+/// `RunStore`). A run dir WITHOUT `run.json` holds nothing but that run's
+/// stream: it follows the transcript — moved to `runs-archive/` on archive,
+/// removed on delete. A run dir WITH `run.json` is left alone.
+#[tokio::test]
+async fn archive_and_delete_carry_a_stream_only_run_dir() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+    let transcripts_dir = global.path().join("transcripts");
+    let runs = global.path().join("runs");
+    let stream_only = |run_id: &str| {
+        let dir = runs.join(run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("coverage.jsonl"),
+            format!("{{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"{run_id}\"}}\n"),
+        )
+        .unwrap();
+    };
+
+    // Archive: the stream-only dir moves with the transcript.
+    write_transcript(&transcripts_dir, "run_streamonly01", "archive-agent", 61);
+    stream_only("run_streamonly01");
+    // A finished run's dir (it has run.json) stays where RunStore keeps it.
+    write_transcript(&transcripts_dir, "run_recorded01", "archive-agent", 61);
+    stream_only("run_recorded01");
+    std::fs::write(runs.join("run_recorded01/run.json"), "{}").unwrap();
+
+    for run_id in ["run_streamonly01", "run_recorded01"] {
+        Command::cargo_bin("rupu")
+            .unwrap()
+            .env("RUPU_HOME", global.path())
+            .current_dir(tmp.path())
+            .args(["transcript", "archive", run_id])
+            .assert()
+            .success();
+    }
+    assert!(!runs.join("run_streamonly01").exists());
+    assert!(global
+        .path()
+        .join("runs-archive/run_streamonly01/coverage.jsonl")
+        .is_file());
+    assert!(runs.join("run_recorded01/run.json").is_file());
+    assert!(runs.join("run_recorded01/coverage.jsonl").is_file());
+    assert!(!global.path().join("runs-archive/run_recorded01").exists());
+
+    // Delete: the stream-only dir goes with the transcript.
+    write_transcript(&transcripts_dir, "run_streamonly02", "archive-agent", 61);
+    stream_only("run_streamonly02");
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "delete", "run_streamonly02", "--force"])
+        .assert()
+        .success();
+    assert!(!runs.join("run_streamonly02").exists());
+}
+
 #[tokio::test]
 async fn delete_requires_force_and_refuses_session_managed_transcripts() {
     let _guard = ENV_LOCK.lock().await;
