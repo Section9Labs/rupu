@@ -3720,8 +3720,11 @@ impl RunStore {
     /// for a runner whose process is still alive. Under the run lock, on
     /// the record as it is on disk: any other status — a cancel that
     /// landed, a gate the run parked at, a pause, a run already over — is
-    /// kept, nothing is written, and this is `Ok(false)`. The wait blocks
-    /// its thread: async callers go through [`RunStore::blocking`].
+    /// kept, as is a run another runner has taken since
+    /// ([`live_runner`](Self::live_runner): a resume that claimed it while
+    /// this one was failing); nothing is written, and this is `Ok(false)`.
+    /// The wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
     pub fn fail_in_flight(
         &self,
         run_id: &str,
@@ -3730,7 +3733,9 @@ impl RunStore {
     ) -> Result<bool, RunStoreError> {
         let _lock = self.lock_run_json(run_id);
         let mut current = self.load(run_id)?;
-        if !matches!(current.status, RunStatus::Pending | RunStatus::Running) {
+        if !matches!(current.status, RunStatus::Pending | RunStatus::Running)
+            || self.live_runner(&current).is_some()
+        {
             return Ok(false);
         }
         self.finalize_failed(&mut current, error.to_string(), now)?;
@@ -7770,6 +7775,25 @@ mod tests {
             }
             other => panic!("expected RunFailed, got {other:?}"),
         }
+
+        // A run another runner has taken since — its process alive — is
+        // that runner's to end: neither failed nor stripped of its pid.
+        let mut other_runner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut taken = sample_record("run_fail_in_flight_taken");
+        taken.status = RunStatus::Running;
+        taken.runner_pid = Some(other_runner.id());
+        store.create(taken.clone(), SAMPLE_YAML).unwrap();
+        let kept = store.fail_in_flight(&taken.id, "boom", now);
+        let reloaded = store.load(&taken.id).unwrap();
+        let _ = other_runner.kill();
+        let _ = other_runner.wait();
+        assert!(!kept.unwrap(), "a live runner's run is not failed");
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert_eq!(reloaded.runner_pid, Some(other_runner.id()));
+        assert_eq!(reloaded.error_message, None);
 
         for status in [
             RunStatus::Cancelled,

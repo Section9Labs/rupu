@@ -972,10 +972,11 @@ fn reap_detached(child: std::process::Child, run_id: &str, what: &'static str) {
 /// marker fields (`resume_mode`/`resume_gate_id`), then hands off to
 /// [`build_resume_argv`]. A marker gone by the reload — consumed between
 /// the listing and the claim, by another spawner or the `workflow resume`
-/// it asked for — spawns nothing: the claim is given back and that is all. The clear afterwards is for the marker read
-/// here only ([`give_back_resume`]): a decision recorded between this look
-/// and the clear wrote a newer marker the child was not spawned for, which
-/// is kept for the next tick. `exe_override` lets tests point at a fake
+/// it asked for — spawns nothing: the claim is given back and that is all.
+/// The clear afterwards is for the marker read here only
+/// ([`give_back_resume`]): a decision recorded between this look and the
+/// clear wrote a newer marker the child was not spawned for, which is kept
+/// for the next tick. `exe_override` lets tests point at a fake
 /// executable instead of `std::env::current_exe()` (the production
 /// default, used when `None`) — e.g. a capture script that records its
 /// argv, so a test can assert on the EXACT argv the real `rupu` binary
@@ -2141,8 +2142,18 @@ mod tests {
         assert!(store.claim_resume(&rec.id, "resume-worker", now).unwrap());
         let (exe, capture_path) = capture_exe(tmp.path());
 
-        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
+        let log = logs_of(resume_one_run(
+            Arc::clone(&store),
+            rec.id.clone(),
+            Some(exe),
+        ))
+        .await;
 
+        assert!(
+            log.contains("the marker it listed is gone, consumed since; nothing to spawn")
+                && !log.contains("spawned workflow subprocess"),
+            "it decided to spawn nothing: {log}"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !capture_path.exists(),

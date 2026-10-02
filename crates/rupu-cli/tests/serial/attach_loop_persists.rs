@@ -6,6 +6,12 @@
 //! Driven through the real binary (`CARGO_BIN_EXE_rupu`): the line
 //! printer's gate prompt reads its `a` from stdin, which a test can only
 //! feed to a child process, and a child keeps the panic out of this one.
+//! The no-UI invocation (cron ticks inside `cp serve`, webhooks, autoflow)
+//! is driven in-process, as those callers drive it.
+//!
+//! Here rather than in `tests/it/`: the no-UI test sets `RUPU_HOME` and
+//! `RUPU_MOCK_PROVIDER_SCRIPT` in this process, as its callers' process has
+//! them.
 
 use crate::ENV_LOCK;
 use assert_fs::prelude::*;
@@ -146,8 +152,9 @@ fn wait_for_status(
     );
 }
 
-/// The portable metadata is on the record and its manifest is on disk.
-fn assert_metadata_persisted(store: &rupu_orchestrator::RunStore, run_id: &str) {
+/// The portable metadata is on the record and its manifest is on disk:
+/// the manifest, returned.
+fn assert_metadata_persisted(store: &rupu_orchestrator::RunStore, run_id: &str) -> String {
     let record = store.load(run_id).unwrap();
     assert_eq!(
         record.backend_id.as_deref(),
@@ -164,6 +171,7 @@ fn assert_metadata_persisted(store: &rupu_orchestrator::RunStore, run_id: &str) 
         .expect("the manifest path was recorded");
     let body = std::fs::read_to_string(manifest).expect("the manifest was written");
     assert!(body.contains(run_id), "the manifest is this run's: {body}");
+    body
 }
 
 /// A runner that panics ends `workflow run` through the same last step as
@@ -171,9 +179,9 @@ fn assert_metadata_persisted(store: &rupu_orchestrator::RunStore, run_id: &str) 
 /// is persisted, the manifest written, and the command fails with the
 /// panic. The run's one agent step gets a provider that panics mid-send.
 /// Before, the printer waited on the dead runner's `Running` for good.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_panicked_runner_still_persists_the_metadata() {
-    let _guard = ENV_LOCK.lock().await;
+#[test]
+fn a_panicked_runner_still_persists_the_metadata() {
+    let _guard = ENV_LOCK.blocking_lock();
     let (_tmp, global, project) = home_and_project("one-agent", WORKFLOW_ONE_AGENT_STEP);
     let run_id = "run_attach_loop_panicked_runner";
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
@@ -211,10 +219,15 @@ async fn a_panicked_runner_still_persists_the_metadata() {
 /// the gate, fails that read after the operator's `a` (as root too, unlike
 /// a permission bit). The run still ends with its portable metadata
 /// persisted — the manifest written without the step transcripts it could
-/// not enumerate — and the command fails with that read's error.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unreadable_step_results_file_after_the_approve_still_persists_the_metadata() {
-    let _guard = ENV_LOCK.lock().await;
+/// not enumerate, and saying so — and the command fails with that read's
+/// error.
+///
+/// The seam is `RunStore::read_step_results` failing on a line that is not
+/// UTF-8, where it skips a line that is merely not JSON: a read that skipped
+/// both would make this test fail, and want another way to fail the read.
+#[test]
+fn an_unreadable_step_results_file_after_the_approve_still_persists_the_metadata() {
+    let _guard = ENV_LOCK.blocking_lock();
     let (_tmp, global, project) = home_and_project("gated", WORKFLOW_GATED);
     let run_id = "run_attach_loop_unreadable_results";
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
@@ -235,7 +248,12 @@ async fn an_unreadable_step_results_file_after_the_approve_still_persists_the_me
 
     // The operator approves; the inline resume then fails to read the
     // results back.
-    stdin.write_all(b"a\n").unwrap();
+    if let Err(e) = stdin.write_all(b"a\n") {
+        panic!(
+            "rupu stopped reading before the approve ({e}); stderr: {}",
+            std::fs::read_to_string(&rupu.stderr).unwrap_or_default()
+        );
+    }
     drop(stdin);
     let (status, stderr) = rupu.wait(Duration::from_secs(60));
 
@@ -244,5 +262,63 @@ async fn an_unreadable_step_results_file_after_the_approve_still_persists_the_me
         stderr.contains("read step results for resume"),
         "the read's error is what the command returned: {stderr}"
     );
+    let manifest = assert_metadata_persisted(&store, run_id);
+    assert!(
+        manifest.contains("step_results_error"),
+        "the manifest says its step transcripts are missing: {manifest}"
+    );
+}
+
+/// The no-UI invocation — a cron tick inside `cp serve`, a webhook, an
+/// autoflow cycle — whose runner panics gets the panic back as the run's
+/// error, with the run marked failed and its portable metadata persisted
+/// (the trigger's wake id included). Before, the panic unwound into the
+/// caller — in `cp serve`, its cron loop, for good — and left the run
+/// `Running` under that live process's pid, which no reaper ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_ui_run_whose_runner_panics_returns_the_panic_and_persists_the_metadata() {
+    let _guard = ENV_LOCK.lock().await;
+    let (_tmp, global, project) = home_and_project("one-agent", WORKFLOW_ONE_AGENT_STEP);
+    let run_id = "run_no_ui_panicked_runner";
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    std::env::set_var("RUPU_HOME", &global);
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", PANICKING_PROVIDER);
+    let ctx = rupu_cli::cmd::workflow::ExplicitWorkflowRunContext {
+        project_root: Some(project.clone()),
+        workspace_path: project.clone(),
+        workspace_id: "ws_no_ui".into(),
+        inputs: Vec::new(),
+        mode: "bypass".into(),
+        invocation_source: rupu_runtime::RunTriggerSource::CronEvent,
+        event: None,
+        issue: None,
+        issue_ref: None,
+        system_prompt_suffix: None,
+        attach_ui: false,
+        run_id_override: Some(run_id.into()),
+        plain: false,
+        strict_templates: false,
+        run_envelope_template: Some(rupu_cli::cmd::workflow::RunEnvelopeTemplate {
+            wake_id: Some("wake_42".into()),
+            ..Default::default()
+        }),
+        worker: None,
+        live_event_hook: None,
+        shared_printer: None,
+        live_view: rupu_cli::cmd::ui::LiveViewMode::Focused,
+    };
+
+    let err = rupu_cli::cmd::workflow::run_with_explicit_context("one-agent", ctx)
+        .await
+        .expect_err("the panic is the run's error");
+
+    assert!(
+        format!("{err:#}").contains("provider blew up mid-send"),
+        "the panic's message is the error: {err:#}"
+    );
+    let record = store.load(run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Failed);
+    assert_eq!(record.runner_pid, None);
+    assert_eq!(record.source_wake_id.as_deref(), Some("wake_42"));
     assert_metadata_persisted(&store, run_id);
 }

@@ -157,47 +157,65 @@ fn settle_awaiting(result: &mut OrchestratorRunResult, runs_dir: &Path) {
     }
 }
 
-/// `tokio::spawn(run_workflow(opts))` for a caller that watches the run's
-/// status on disk to know when it is over: the attach printers return only
-/// on a parked or terminal status, and the live view tails the run's
-/// events. A runner whose task panics writes neither, so a printer would
-/// wait on its `Running` forever, and `workflow run --plain` with it. The
-/// panic finalizes `run_id` `Failed` first ([`RunStore::fail_in_flight`]:
-/// a cancel that landed, or a gate the run parked at, is kept), then
-/// unwinds on, so the join still reports the panic.
+/// A panic out of a workflow runner: what it carried.
+type RunnerPanic = Box<dyn std::any::Any + Send>;
+
+/// `run_workflow(opts)` for a caller that watches the run's status on disk
+/// to know when it is over — the attach printers return only on a parked or
+/// terminal status, the live view tails the run's events, the CP lists it —
+/// with a panic in it caught: a runner that panics writes neither, so a
+/// printer would wait on its `Running` forever (and `workflow run --plain`
+/// with it), and the run would stay `Running` under a process that is still
+/// alive, which no reaper ends. The panic finalizes `run_id` `Failed` first
+/// ([`RunStore::fail_in_flight`]: a cancel that landed, a gate the run
+/// parked at, or a runner that took the run since is kept), then comes back
+/// as the `Err`.
 ///
 /// [`RunStore::fail_in_flight`]: rupu_orchestrator::RunStore::fail_in_flight
+async fn run_workflow_catching_panic(
+    opts: OrchestratorRunOpts,
+    run_id: &str,
+) -> Result<Result<OrchestratorRunResult, RunWfErr>, RunnerPanic> {
+    use futures_util::FutureExt as _;
+    let store = opts.run_store.clone();
+    let panic = match std::panic::AssertUnwindSafe(run_workflow(opts))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => return Ok(result),
+        Err(panic) => panic,
+    };
+    if let Some(store) = store {
+        let error = format!("workflow runner panicked: {}", panic_message(&*panic));
+        let id = run_id.to_string();
+        match store
+            .blocking(move |s| s.fail_in_flight(&id, &error, chrono::Utc::now()))
+            .await
+        {
+            Ok(true) => {
+                tracing::warn!(run_id = %run_id, "workflow runner panicked; the run is marked failed");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(run_id = %run_id, error = %e, "workflow runner panicked; could not mark the run failed");
+            }
+        }
+    }
+    Err(panic)
+}
+
+/// `tokio::spawn(run_workflow(opts))` through
+/// [`run_workflow_catching_panic`]: a panic finalizes the run `Failed`, then
+/// unwinds on, so the join still reports it.
 fn spawn_runner(
     opts: OrchestratorRunOpts,
     run_id: String,
 ) -> tokio::task::JoinHandle<Result<OrchestratorRunResult, RunWfErr>> {
-    use futures_util::FutureExt as _;
-    let store = opts.run_store.clone();
     tokio::spawn(async move {
-        let panic = match std::panic::AssertUnwindSafe(run_workflow(opts))
-            .catch_unwind()
-            .await
-        {
-            Ok(result) => return result,
-            Err(panic) => panic,
-        };
-        if let Some(store) = store {
-            let error = format!("workflow runner panicked: {}", panic_message(&*panic));
-            let id = run_id.clone();
-            match store
-                .blocking(move |s| s.fail_in_flight(&id, &error, chrono::Utc::now()))
-                .await
-            {
-                Ok(true) => {
-                    tracing::warn!(run_id = %run_id, "workflow runner panicked; the run is marked failed");
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(run_id = %run_id, error = %e, "workflow runner panicked; could not mark the run failed");
-                }
-            }
+        match run_workflow_catching_panic(opts, &run_id).await {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
-        std::panic::resume_unwind(panic)
     })
 }
 
@@ -5010,12 +5028,14 @@ fn build_artifact_manifest(
     // approve-resume's read). The run-level artifacts and the metadata the
     // manifest path rides along with (`source_wake_id` labels the run's
     // trigger) still land; the step transcripts that could not be
-    // enumerated are what is missing, logged.
-    let steps = match run_store.read_step_results(&run.id) {
-        Ok(steps) => steps,
+    // enumerated are what is missing — logged, and named in the run
+    // summary's `step_results_error`, so a reader of the manifest can tell
+    // them from a run that had no steps.
+    let (steps, step_results_error) = match run_store.read_step_results(&run.id) {
+        Ok(steps) => (steps, None),
         Err(e) => {
             tracing::warn!(run_id = %run.id, error = %e, "artifact manifest: step results unreadable; the manifest lists no step transcripts");
-            Vec::new()
+            (Vec::new(), Some(e.to_string()))
         }
     };
     for step in steps {
@@ -5039,13 +5059,19 @@ fn build_artifact_manifest(
         producer: "run".into(),
         local_path: None,
         uri: None,
-        inline_json: Some(serde_json::json!({
-            "status": run.status.as_str(),
-            "awaiting_step_id": run.awaiting_step_id,
-            "error_message": run.error_message,
-            "issue_ref": run.issue_ref,
-            "workspace_id": run.workspace_id,
-        })),
+        inline_json: Some({
+            let mut summary = serde_json::json!({
+                "status": run.status.as_str(),
+                "awaiting_step_id": run.awaiting_step_id,
+                "error_message": run.error_message,
+                "issue_ref": run.issue_ref,
+                "workspace_id": run.workspace_id,
+            });
+            if let Some(error) = step_results_error {
+                summary["step_results_error"] = serde_json::Value::String(error);
+            }
+            summary
+        }),
     });
     Ok(manifest)
 }
@@ -5615,9 +5641,15 @@ async fn execute_workflow_invocation(
             }
         }
     } else {
-        run_workflow(opts)
-            .await
-            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))
+        // In the caller's task, which a panic must not take down: in `cp
+        // serve` that is the cron loop, for good.
+        match run_workflow_catching_panic(opts, &run_id).await {
+            Ok(result) => result.map_err(|e| to_anyhow_with_input_snippet(e, &path, &body)),
+            Err(panic) => Err(anyhow::anyhow!(
+                "workflow runner panicked: {}",
+                panic_message(&*panic)
+            )),
+        }
     };
 
     // The run has finished (terminal or paused); the marker poller has no
