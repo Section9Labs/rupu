@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
+    UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::StopReason;
@@ -149,7 +150,18 @@ impl RecordingDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for RecordingDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.calls
             .lock()
             .unwrap()
@@ -159,6 +171,7 @@ impl UnitDispatcher for RecordingDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }
@@ -395,7 +408,18 @@ struct FlakyCodenameDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for FlakyCodenameDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         let first_try = {
             let mut seen = self.seen.lock().unwrap();
             let first = !seen.iter().any(|(i, _)| *i == unit.index);
@@ -403,13 +427,14 @@ impl UnitDispatcher for FlakyCodenameDispatcher {
             first
         };
         if unit.index == self.fail_index && first_try {
-            return Err(RunError::Provider("host down".into()));
+            return Err(RunError::Provider("host down".into()).into());
         }
         Ok(UnitOutcome {
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }

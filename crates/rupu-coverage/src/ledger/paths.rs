@@ -15,6 +15,9 @@ pub struct CoveragePaths {
     /// Append-only engagement asset graph (one `Asset` per line), folded on
     /// read. Absent for a code/no-engagement run.
     pub assets: PathBuf,
+    /// Where this run's coverage is also streamed (`rupu run` only). `None`
+    /// for every other writer — the coordinator's own ledgers never stream.
+    pub run_stream: Option<crate::ledger::stream::RunStream>,
 }
 
 impl CoveragePaths {
@@ -28,12 +31,20 @@ impl CoveragePaths {
             catalog: root.join("catalog.yaml"),
             runs: root.join("runs.jsonl"),
             assets: root.join("assets.jsonl"),
+            run_stream: None,
             root,
         }
     }
 
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)
+    }
+
+    /// Attach (or clear) the run stream every append through
+    /// [`crate::ledger::stream::append_record`] mirrors into.
+    pub fn with_run_stream(mut self, stream: Option<crate::ledger::stream::RunStream>) -> Self {
+        self.run_stream = stream;
+        self
     }
 }
 

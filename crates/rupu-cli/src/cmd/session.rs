@@ -7720,6 +7720,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             codename: Some(codename.clone()),
             agent: None,
             provider: None,
+            coverage_stream: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {

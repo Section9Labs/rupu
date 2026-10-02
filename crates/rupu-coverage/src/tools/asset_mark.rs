@@ -68,18 +68,22 @@ pub fn asset_mark(
     let id = Asset::derive_id(&input.kind, &locator);
 
     // Monotonic clamp: if this asset already sits at a deeper rung, keep it.
-    let existing_idx = crate::asset::read_assets(&paths.assets)?
+    let current = crate::asset::read_assets(&paths.assets)?
         .into_iter()
-        .find(|a| a.id == id)
-        .and_then(|a| a.depth)
-        .and_then(|d| ladder.iter().position(|r| r == &d));
+        .find(|a| a.id == id);
+    let existing_idx = current
+        .as_ref()
+        .and_then(|a| a.depth.as_ref())
+        .and_then(|d| ladder.iter().position(|r| r == d));
     let effective_idx = existing_idx.map_or(new_idx, |e| e.max(new_idx));
     let effective_depth = ladder[effective_idx].clone();
 
-    let label = input.label.clone().unwrap_or_else(|| input.kind.clone());
-    let mut asset = Asset::new(input.kind.clone(), locator, label, None);
+    // Only the depth moves; the asset's label (unless one is given here),
+    // parent and attributes ride along.
+    let mut asset = Asset::next_line(input.kind.clone(), locator, input.label.clone(), current);
     asset.depth = Some(effective_depth.clone());
-    crate::asset::upsert_asset(&paths.assets, &asset)?;
+    crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
+        .map_err(crate::asset::AssetStoreError::Io)?;
 
     Ok(AssetMarkOutput {
         id,
@@ -134,6 +138,127 @@ mod tests {
             ),
             Err(AssetMarkError::UnknownDepth { .. })
         ));
+    }
+
+    #[test]
+    fn a_mark_is_streamed_as_an_assets_line() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join("runs/run_1/coverage.jsonl");
+        let p = CoveragePaths::new(tmp.path(), "t").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "sec".into(),
+        }));
+        let out = asset_mark(
+            &p,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![Coordinate::Path("a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &active(),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&stream).unwrap();
+        let lines: Vec<StreamLine> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        match lines.as_slice() {
+            [StreamLine::Assets { scope_name, record }] => {
+                assert_eq!(scope_name, "sec");
+                assert_eq!(record.id, out.id);
+                assert_eq!(record.depth.as_deref(), Some("reviewed"));
+            }
+            other => panic!("expected one assets line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marking_keeps_the_assets_parent_and_attributes() {
+        let (_t, p) = paths();
+        let mut existing = Asset::new(
+            "code:file",
+            Locator(vec![Coordinate::Path("a.rs".into())]),
+            "a.rs",
+            Some("code:dir:0123456789abcdef".into()),
+        );
+        existing
+            .attributes
+            .insert("lang".into(), serde_json::json!("rust"));
+        crate::asset::store::upsert_asset(&p.assets, &existing).unwrap();
+
+        asset_mark(
+            &p,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![Coordinate::Path("a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &active(),
+        )
+        .unwrap();
+
+        let stored = crate::asset::read_assets(&p.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].parent, existing.parent);
+        assert_eq!(stored[0].attributes, existing.attributes);
+        assert_eq!(stored[0].depth.as_deref(), Some("reviewed"));
+    }
+
+    #[test]
+    fn marking_without_a_label_keeps_the_assets_descriptive_label() {
+        let (_t, p) = paths();
+        let existing = Asset::new(
+            "code:file",
+            Locator(vec![Coordinate::Path("a.rs".into())]),
+            "the auth handler",
+            None,
+        );
+        crate::asset::store::upsert_asset(&p.assets, &existing).unwrap();
+        let mk = |label: Option<&str>| AssetMarkInput {
+            kind: "code:file".into(),
+            coordinates: vec![Coordinate::Path("a.rs".into())],
+            depth: "reviewed".into(),
+            label: label.map(str::to_string),
+        };
+
+        // No label: the last-line-wins fold must not demote the descriptive
+        // label to the bare kind.
+        asset_mark(&p, mk(None), &active()).unwrap();
+        let stored = crate::asset::read_assets(&p.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].label, "the auth handler");
+
+        // An explicit label still replaces it.
+        asset_mark(&p, mk(Some("renamed")), &active()).unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&p.assets).unwrap()[0].label,
+            "renamed"
+        );
+    }
+
+    #[test]
+    fn a_new_asset_marked_without_a_label_is_labelled_with_its_kind() {
+        let (_t, p) = paths();
+        asset_mark(
+            &p,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![Coordinate::Path("a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &active(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&p.assets).unwrap()[0].label,
+            "code:file"
+        );
     }
 
     #[test]

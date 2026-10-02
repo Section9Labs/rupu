@@ -264,6 +264,64 @@ async fn cleanup_transcripts_only_removes_archived_transcripts() {
     assert!(!transcript.exists());
 }
 
+/// Pruning an archived standalone transcript removes its stream-only run
+/// dir — from `runs-archive/` (archived with it) and from `runs/` (archived
+/// before run dirs followed their transcript) — never a dir with `run.json`,
+/// and nothing on a dry run.
+#[tokio::test]
+async fn cleanup_prunes_an_archived_transcripts_stream_only_run_dir() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let old = (Utc::now() - Duration::days(40)).to_rfc3339();
+    let stream_dir = |root: &str, run_id: &str| {
+        let dir = home.join(root).join(run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("coverage.jsonl"), "{}\n").unwrap();
+        dir
+    };
+    write_archived_standalone_transcript(&home, "run_prunestream01", &old);
+    let archived_dir = stream_dir("runs-archive", "run_prunestream01");
+    write_archived_standalone_transcript(&home, "run_prunestream02", &old);
+    let active_dir = stream_dir("runs", "run_prunestream02");
+    write_archived_standalone_transcript(&home, "run_prunerecorded", &old);
+    let recorded_dir = stream_dir("runs", "run_prunerecorded");
+    std::fs::write(recorded_dir.join("run.json"), "{}").unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args([
+            "cleanup",
+            "--transcripts",
+            "--older-than",
+            "0s",
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    assert!(
+        archived_dir.exists() && active_dir.exists(),
+        "a dry run removes nothing"
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["cleanup", "--transcripts", "--older-than", "0s"])
+        .assert()
+        .success();
+    assert!(!archived_dir.exists());
+    assert!(!active_dir.exists());
+    assert!(
+        recorded_dir.join("run.json").is_file(),
+        "a run RunStore records is not the transcript's to prune"
+    );
+}
+
 #[tokio::test]
 async fn cleanup_stats_reports_resource_inventory() {
     let _guard = ENV_LOCK.lock().await;

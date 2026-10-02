@@ -15,9 +15,12 @@ pub enum Frame {
         capabilities: Vec<String>,
     },
     /// CP→node handshake reply. `capabilities` lists optional protocol
-    /// features the CP understands (e.g. [`CAP_USAGE_LEDGER`]); a node must
-    /// not send frames gated on a capability the CP did not advertise. Absent
-    /// on the wire when empty so an older node/CP round-trips the frame.
+    /// features the CP understands (e.g. [`CAP_USAGE_LEDGER`],
+    /// [`CAP_MIRROR_COVERAGE`]; see [`cp_capabilities`]); a node must not
+    /// send frames gated on a capability the CP did not advertise. An older
+    /// CP sends none, so the field defaults empty and the node sends only
+    /// what every CP understands. Absent on the wire when empty so an older
+    /// node/CP round-trips the frame.
     Welcome {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         capabilities: Vec<String>,
@@ -86,6 +89,21 @@ pub struct RunSpec {
 /// rather than let an older node run the agent under a different one.
 pub const CAP_AGENT_FINDINGS_PROFILE: &str = "agent.findings_profile";
 
+/// `Welcome.capabilities` entry: this CP mirrors [`ArtifactFile::Coverage`].
+pub const CAP_MIRROR_COVERAGE: &str = "mirror.coverage";
+
+/// HTTP `/api/host/info` `features` entry: this CP serves
+/// `GET /api/runs/:id/coverage`.
+pub const CAP_RUN_COVERAGE_STREAM: &str = "run.coverage_stream";
+
+/// What this CP advertises to a node in `Welcome`.
+pub fn cp_capabilities() -> Vec<String> {
+    vec![
+        CAP_USAGE_LEDGER.to_string(),
+        CAP_MIRROR_COVERAGE.to_string(),
+    ]
+}
+
 /// Every capability this build's node executor supports — what `rupu node`
 /// advertises in `Hello`.
 pub fn node_capabilities() -> Vec<String> {
@@ -107,6 +125,7 @@ pub fn host_features() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
+        CAP_RUN_COVERAGE_STREAM.to_string(),
     ]
 }
 
@@ -157,6 +176,10 @@ pub enum ArtifactFile {
     /// The run's usage ledger (`runs/<id>/usage.jsonl`, spec 2026-09-29 §3).
     /// Only sent to a tunnel CP that advertised [`CAP_USAGE_LEDGER`].
     Usage,
+    /// The run's coverage stream (`runs/<run_id>/coverage.jsonl`). Sent only
+    /// to a CP that advertised [`CAP_MIRROR_COVERAGE`] — an older CP fails to
+    /// parse an unknown variant.
+    Coverage,
 }
 
 #[cfg(test)]
@@ -301,6 +324,24 @@ mod tests {
     }
 
     #[test]
+    fn welcome_carries_cp_capabilities_and_old_welcomes_still_parse() {
+        let w = Frame::Welcome {
+            capabilities: cp_capabilities(),
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(json.contains(CAP_MIRROR_COVERAGE), "{json}");
+        assert!(json.contains(CAP_USAGE_LEDGER), "{json}");
+        // An older CP sends `{"type":"welcome"}`.
+        let old: Frame = serde_json::from_str(r#"{"type":"welcome"}"#).unwrap();
+        assert_eq!(
+            old,
+            Frame::Welcome {
+                capabilities: vec![]
+            }
+        );
+    }
+
+    #[test]
     fn features_report_round_trips_this_builds_features() {
         let json = serde_json::to_string(&FeaturesReport::current()).unwrap();
         let back: FeaturesReport = serde_json::from_str(&json).unwrap();
@@ -315,5 +356,16 @@ mod tests {
             serde_json::from_str(r#"{"features":["agent.findings_profile"],"later":1}"#).unwrap();
         assert!(back.supports(CAP_AGENT_FINDINGS_PROFILE));
         assert!(!back.supports(CAP_WORKFLOW_RESUME_IF_UNFINISHED));
+    }
+
+    #[test]
+    fn coverage_artifact_frame_round_trips() {
+        let f = Frame::Artifact {
+            run_id: "run_1".into(),
+            file: ArtifactFile::Coverage,
+            line: r#"{"ledger":"begin","v":1,"run_id":"run_1"}"#.into(),
+        };
+        let back: Frame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back, f);
     }
 }

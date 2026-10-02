@@ -33,11 +33,16 @@ import type { SeqEvent } from '../components/RunEventFeed';
 vi.mock('../components/RunGraph', () => ({
   __esModule: true,
   default: (props: {
+    model?: { nodes: { id: string; warnings?: unknown[] }[] };
     onSelectNode?: (sel: NodeSelection) => void;
     onExpandFanout?: (stepId: string) => void;
     onOpenUnit?: (stepId: string, index: number) => void;
   }) => (
     <div data-testid="run-graph-mock">
+      {/* the steps the model marks with a warning (what each node's ⚠ reads) */}
+      <span data-testid="graph-warned">
+        {(props.model?.nodes ?? []).filter((n) => n.warnings?.length).map((n) => n.id).join(',')}
+      </span>
       <button onClick={() => props.onSelectNode?.({ path: '/t/step-a.jsonl', live: false, label: 'step_a' })}>
         select-step-a
       </button>
@@ -354,6 +359,76 @@ describe('RunDetail shell', () => {
     // The step-scoped event survives; the run-level event is filtered out.
     expect(feed).toHaveTextContent('evt:step_a');
     expect(feed).not.toHaveTextContent('evt:run');
+  });
+
+  it('says a run has warnings in its own banner, without changing any step or the run status', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, onEvent) => {
+      onEvent({
+        type: 'step_warning', run_id: 'run-1', step_id: 'fan_out', index: 0,
+        message: 'host gpu-9 did not stream coverage',
+      });
+      return () => {};
+    });
+    renderPage();
+
+    const banner = await screen.findByTestId('run-warnings');
+    expect(banner).toHaveTextContent('1 warning');
+    expect(banner).toHaveTextContent('fan_out · unit 0');
+    expect(banner).toHaveTextContent('host gpu-9 did not stream coverage');
+    // a completed run stays completed — the warning is a notice, not a status
+    expect(screen.getByText('Completed')).toBeInTheDocument();
+  });
+
+  it('keeps a warning that has scrolled out of the 2000-event live window', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, onEvent) => {
+      // The log replays from byte 0: the warning is the FIRST event, then far
+      // more than RunDetail's 2000-event window of ordinary ones push it out.
+      onEvent({
+        type: 'step_warning', run_id: 'run-1', step_id: 'step_a',
+        message: 'host gpu-9 did not stream coverage',
+      });
+      for (let i = 0; i < 2100; i++) {
+        onEvent({ type: 'step_working', run_id: 'run-1', step_id: 'step_a', note: `tick ${i}` });
+      }
+      return () => {};
+    });
+    renderPage();
+
+    const banner = await screen.findByTestId('run-warnings');
+    expect(banner).toHaveTextContent('1 warning');
+    expect(banner).toHaveTextContent('host gpu-9 did not stream coverage');
+    // the graph node still carries its marker
+    expect(screen.getByTestId('graph-warned')).toHaveTextContent('step_a');
+  });
+
+  it('a log replay after a reconnect does not list the same warning twice', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, onEvent) => {
+      const w = { type: 'step_warning', run_id: 'run-1', step_id: 'step_a', message: 'dup me' } as const;
+      onEvent(w);
+      onEvent({ ...w });
+      return () => {};
+    });
+    renderPage();
+    expect(await screen.findByTestId('run-warnings')).toHaveTextContent('1 warning');
+  });
+
+  it('shows no warnings banner on a clean run', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByTestId('run-warnings')).toBeNull();
   });
 
   it('approves and rejects an awaiting run via the approval-gate controls', async () => {

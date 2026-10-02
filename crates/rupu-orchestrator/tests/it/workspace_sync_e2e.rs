@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitDispatch,
-    UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitCoverage, UnitDispatch,
+    UnitDispatcher, UnitFailure, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
 };
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::StopReason;
@@ -74,6 +74,11 @@ impl PlacedSyncDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for PlacedSyncDispatcher {
+    // Its deltas never carry `.rupu/coverage/`: nothing to drop.
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn prepare_workspace(
         &self,
         _workspace_path: &Path,
@@ -85,7 +90,7 @@ impl UnitDispatcher for PlacedSyncDispatcher {
         &self,
         unit: UnitDispatch,
         _host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    ) -> Result<UnitOutcome, UnitFailure> {
         *self.saw_workspace_path.lock().unwrap() = unit.workspace.is_some();
         Ok(UnitOutcome {
             output: "REMOTE-EDITED".to_string(),
@@ -96,6 +101,7 @@ impl UnitDispatcher for PlacedSyncDispatcher {
                 deleted: vec![],
                 payload: b"EDITED".to_vec(),
             }),
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 
@@ -246,6 +252,11 @@ impl FanoutSyncDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for FanoutSyncDispatcher {
+    // Its deltas never carry `.rupu/coverage/`: nothing to drop.
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
     async fn prepare_workspace(
         &self,
         _workspace_path: &Path,
@@ -258,7 +269,7 @@ impl UnitDispatcher for FanoutSyncDispatcher {
         &self,
         unit: UnitDispatch,
         _host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.unit_payloads
             .lock()
             .unwrap()
@@ -275,6 +286,7 @@ impl UnitDispatcher for FanoutSyncDispatcher {
                 deleted: vec![],
                 payload: content,
             }),
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 

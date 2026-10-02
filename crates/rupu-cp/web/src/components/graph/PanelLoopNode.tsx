@@ -15,6 +15,7 @@ import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
 import { memberLabel } from '../../lib/codename';
 import { AgentIdentity } from '../codename/AgentIdentity';
+import WarnMark, { unitWarningSuffix } from './WarnMark';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -66,6 +67,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
           panel · {node.id}
           {round && <span className="ml-1 tabular-nums">· round {round.current}/{round.max}</span>}
         </span>
+        <WarnMark warnings={node.warnings} className="ml-auto" />
         {running && (
           <span
             className="rg-loop-spin text-ui leading-none"
@@ -112,7 +114,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
             <button
               key={u.index}
               type="button"
-              title={`${u.codename ? memberLabel(u.codename, u.agent, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}`}
+              title={`${u.codename ? memberLabel(u.codename, u.agent, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}${unitWarningSuffix(u.warnings)}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
               className="flex w-full min-w-0 items-start gap-1 rounded bg-panel/80 px-1.5 py-0.5 text-left text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
             >
@@ -133,6 +135,10 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
               ) : (
                 <span className="min-w-0 truncate">{u.key}</span>
               )}
+              <WarnMark
+                warnings={u.warnings?.map((message) => ({ index: u.index, message }))}
+                className="ml-auto"
+              />
             </button>
           ))}
         </div>

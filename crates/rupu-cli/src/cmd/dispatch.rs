@@ -95,6 +95,8 @@ pub struct CliAgentDispatcher {
     /// overrides). Every dispatched child resolves its OWN provider/model's
     /// limits through it (spec 2026-09-30 §6.1), not the parent's.
     limits_ctx: rupu_runtime::model_limits::LimitsContext,
+    /// The parent `rupu run`'s coverage stream; children append to it.
+    coverage_stream: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -132,6 +134,7 @@ impl CliAgentDispatcher {
         findings_base: rupu_coverage::FindingWriteOptions,
         usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
         limits_ctx: rupu_runtime::model_limits::LimitsContext,
+        coverage_stream: Option<PathBuf>,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -153,6 +156,7 @@ impl CliAgentDispatcher {
             namer: std::sync::Mutex::new(None),
             usage_ledger,
             limits_ctx,
+            coverage_stream,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -404,6 +408,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             codename: codename.clone(),
             agent: None,
             provider: None,
+            coverage_stream: self.coverage_stream.clone(),
         };
 
         let opts = AgentRunOpts {
@@ -770,6 +775,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -889,6 +895,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -910,6 +917,98 @@ mod tests {
             transcript.contains("input 7,000 · output 900"),
             "the notice must state the child's own pinned limits: {transcript}"
         );
+    }
+
+    /// Spec 2026-09-30-rupu-remote-findings-transport-design.md deviation 4:
+    /// a `dispatch_agent` child shares the dispatching run's coverage stream,
+    /// so its findings travel to the coordinator with the unit's. Observable
+    /// on the stream file the dispatcher was built with: the child's catalog
+    /// and its `report_finding` call both land there, tagged with the child's
+    /// scope, after the begin line the parent wrote.
+    #[tokio::test]
+    async fn dispatched_child_streams_its_coverage_into_the_parents_stream() {
+        use rupu_coverage::StreamLine;
+
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 4\n\
+             findingsProfile: summary\nconcerns:\n  - include: stride\n---\nyou are a child agent.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        // The parent's stream, as `rupu run` opens it before any child runs.
+        let stream = rupu_coverage::stream_path(&runs_dir, "parent_run_1");
+        rupu_coverage::write_stream_begin(&stream, "parent_run_1").unwrap();
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+            None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
+            Some(stream.clone()),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[
+              { "AssistantToolUse": { "text": null, "tool_id": "call_1", "tool_name": "report_finding", "tool_input": {"scope": "repo", "summary": "child found it", "severity": "low", "evidence": {"rationale": "because"}}, "stop": "tool_use" } },
+              { "AssistantText": { "text": "child done", "stop": "end_turn" } }
+            ]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "go".into(), "parent_run_1", 0, None)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        result.expect("dispatch should succeed against the mock provider");
+
+        let lines: Vec<StreamLine> = std::fs::read_to_string(&stream)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("stream line parses"))
+            .collect();
+        assert!(
+            matches!(&lines[0], StreamLine::Begin { run_id, .. } if run_id == "parent_run_1"),
+            "the parent's begin line stays first: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| matches!(
+                l,
+                StreamLine::Catalog { scope_name, .. } if scope_name == "child"
+            )),
+            "the child's catalog must stream into the parent's file: {lines:?}"
+        );
+        let finding = lines
+            .iter()
+            .find_map(|l| match l {
+                StreamLine::Findings { scope_name, record } => Some((scope_name, record)),
+                _ => None,
+            })
+            .expect("the child's finding must stream into the parent's file");
+        assert_eq!(finding.0, "child");
+        assert_eq!(finding.1.summary, "child found it");
     }
 
     #[test]
@@ -970,6 +1069,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -1077,6 +1177,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -1143,6 +1244,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1215,6 +1317,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1297,6 +1400,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1386,6 +1490,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1480,6 +1585,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1559,6 +1665,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(

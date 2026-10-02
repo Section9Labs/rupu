@@ -184,7 +184,7 @@ export interface StepResultRecord {
  *
  * Full variant set from rupu-orchestrator/src/executor/event.rs:
  *   run_started | step_started | step_working | step_awaiting_approval
- *   step_completed | step_failed | step_skipped
+ *   step_completed | step_failed | step_skipped | step_warning
  *   unit_started | unit_completed
  *   run_completed | run_failed
  *
@@ -203,6 +203,7 @@ export type KnownRunEvent =
   | StepCompletedEvent
   | StepFailedEvent
   | StepSkippedEvent
+  | StepWarningEvent
   | UnitStartedEvent
   | UnitCompletedEvent
   | PanelRoundEvent
@@ -273,6 +274,17 @@ export interface StepSkippedEvent extends RunEventBase {
   type: 'step_skipped';
   step_id: string;
   reason: string;
+}
+
+/** A non-failing, operator-visible warning on a step (or one of its fan-out
+ *  units) — e.g. a remote unit whose coverage could not be collected. It NEVER
+ *  changes the step's status; `index` is absent when the warning is about the
+ *  step as a whole. */
+export interface StepWarningEvent extends RunEventBase {
+  type: 'step_warning';
+  step_id: string;
+  index?: number;
+  message: string;
 }
 
 export interface UnitStartedEvent extends RunEventBase {
@@ -393,6 +405,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'step_completed',
   'step_failed',
   'step_skipped',
+  'step_warning',
   'unit_started',
   'unit_completed',
   'panel_round',

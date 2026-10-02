@@ -113,6 +113,13 @@ pub enum HostConnectorError {
     /// A bad request or a local precondition failure (no launcher, wrong mode).
     #[error("invalid: {0}")]
     Invalid(String),
+    /// A failure on THIS side that the caller did not cause and cannot fix by
+    /// changing its request — an I/O error reading the coordinator's own run
+    /// store, say. Distinct from [`Self::Invalid`] (the caller's mistake →
+    /// HTTP 400) so a server-side fault is never reported as a bad request;
+    /// the API layer maps this to 500.
+    #[error("internal error: {0}")]
+    Internal(String),
     /// The operation is not supported on this transport (e.g. workspace sync
     /// over a Bucket/Tunnel host).
     #[error("unsupported on this transport: {0}")]
@@ -345,6 +352,14 @@ pub trait HostConnector: Send + Sync {
             "transcript pull is not supported for this host type".into(),
         ))
     }
+
+    /// The coverage stream (`runs/<run_id>/coverage.jsonl`) the executing
+    /// host wrote for `run_id`, for the coordinator to merge (spec
+    /// 2026-09-30-rupu-remote-findings-transport-design.md §A2), and whether
+    /// the transport guarantees it is all of it (see [`CoverageRead`]).
+    /// Empty bytes ⇒ no stream arrived. Deliberately no default: every
+    /// transport must say how it delivers this, or refuse.
+    async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError>;
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -867,6 +882,60 @@ pub(crate) async fn mirror_stream_run_events(
     open_run_events_tail(run_store, run_id).await
 }
 
+/// Whether `id` has the shape of a run id this system mints: `run_` followed
+/// by ASCII alphanumerics and `_` only. The ONE definition of "safe to use as
+/// a run-store path component" — no separators, no `.`, so it can neither
+/// traverse out of the runs root nor smuggle shell metacharacters. Every
+/// connector, the mirror and the coverage route validate an id they did not
+/// mint with this.
+pub(crate) fn valid_run_id(id: &str) -> bool {
+    id.starts_with("run_") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A unit's coverage stream as its host connector read it
+/// ([`HostConnector::unit_coverage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageRead {
+    /// The stream; empty ⇒ no stream arrived.
+    pub bytes: Vec<u8>,
+    /// Whether the transport guarantees these are every byte the run wrote,
+    /// PROVIDED the run was terminal when they were read: true for a local
+    /// run (its own file), a tunnel node (its coverage frames precede
+    /// `RunFinished` on one socket), a bucket worker (its finished marker
+    /// follows its uploads) and an HTTP remote (its own local file); for SSH
+    /// only once the tail pump's terminal pull replaced the mirrored copy
+    /// with the host's file. A read taken while the run may still be running
+    /// is a snapshot whatever this says — the caller knows which it took.
+    pub complete: bool,
+}
+
+/// A run's coverage stream read from the coordinator's own run store: the
+/// local host's file, or a mirror-backed transport's mirrored copy.
+///
+/// Async because the stream can be large and the callers are request
+/// handlers and connector methods on the async runtime: the read goes through
+/// `tokio::fs` (the blocking pool), never a bare `std::fs::read`. A run that
+/// wrote no stream reads as empty; a malformed id is [`HostConnectorError::Invalid`]
+/// (the caller's fault); any other I/O failure is
+/// [`HostConnectorError::Internal`] (ours).
+pub async fn mirror_unit_coverage(
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<Vec<u8>, HostConnectorError> {
+    if !valid_run_id(run_id) {
+        return Err(HostConnectorError::Invalid(format!(
+            "{run_id:?} is not a valid run id"
+        )));
+    }
+    match tokio::fs::read(rupu_coverage::stream_path(&run_store.root, run_id)).await {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(HostConnectorError::Internal(format!(
+            "read coverage stream for {run_id}: {e}"
+        ))),
+    }
+}
+
 /// Read and parse a transcript `.jsonl` file into the standard
 /// `{ "events": [...], "summary": … }` shape.
 ///
@@ -975,19 +1044,9 @@ pub(crate) mod testing {
         ) -> Result<serde_json::Value, HostConnectorError> {
             match &self.run_netflow {
                 Some(Ok(v)) => Ok(v.clone()),
-                Some(Err(e)) => Err(match e {
-                    HostConnectorError::Unreachable(m) => {
-                        HostConnectorError::Unreachable(m.clone())
-                    }
-                    HostConnectorError::Unsupported(m) => {
-                        HostConnectorError::Unsupported(m.clone())
-                    }
-                    HostConnectorError::Invalid(m) => HostConnectorError::Invalid(m.clone()),
-                    HostConnectorError::NotFound(m) => HostConnectorError::NotFound(m.clone()),
-                    HostConnectorError::Unauthorized => HostConnectorError::Unauthorized,
-                    HostConnectorError::Remote(c, m) => HostConnectorError::Remote(*c, m.clone()),
-                    HostConnectorError::NotJson(m) => HostConnectorError::NotJson(m.clone()),
-                }),
+                // `HostConnectorError` is `Clone`; copying it keeps this stub
+                // exhaustive-by-construction as variants are added.
+                Some(Err(e)) => Err(e.clone()),
                 None => Err(HostConnectorError::Unsupported("run netflow".into())),
             }
         }
@@ -1052,6 +1111,12 @@ pub(crate) mod testing {
             _path: &str,
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("StubConnector: get_transcript not configured")
+        }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<CoverageRead, HostConnectorError> {
+            Ok(CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,
@@ -1124,6 +1189,15 @@ pub(crate) mod testing {
             ) -> Result<serde_json::Value, HostConnectorError> {
                 unimplemented!()
             }
+            async fn unit_coverage(
+                &self,
+                _run_id: &str,
+            ) -> Result<CoverageRead, HostConnectorError> {
+                Ok(CoverageRead {
+                    bytes: Vec::new(),
+                    complete: true,
+                })
+            }
             async fn proxy_get_json(
                 &self,
                 _p: &str,
@@ -1143,5 +1217,62 @@ pub(crate) mod testing {
             Err(HostConnectorError::Unsupported(_))
         ));
         let _ = FeedGuard::noop();
+    }
+
+    #[tokio::test]
+    async fn mirror_unit_coverage_reads_the_run_stream_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        assert_eq!(
+            mirror_unit_coverage(&store, "run_X1").await.unwrap(),
+            Vec::<u8>::new()
+        );
+        let p = rupu_coverage::stream_path(&store.root, "run_X1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"line\n").unwrap();
+        assert_eq!(
+            mirror_unit_coverage(&store, "run_X1").await.unwrap(),
+            b"line\n"
+        );
+        assert!(matches!(
+            mirror_unit_coverage(&store, "../etc").await,
+            Err(HostConnectorError::Invalid(_))
+        ));
+    }
+
+    /// An I/O failure reading a stream that exists is OUR fault, not a bad
+    /// request: it must not be classified `Invalid` (which the API turns into
+    /// a 400).
+    #[tokio::test]
+    async fn mirror_unit_coverage_classifies_an_unreadable_stream_as_internal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        // A directory where the stream file belongs: present, but unreadable.
+        std::fs::create_dir_all(rupu_coverage::stream_path(&store.root, "run_X2")).unwrap();
+        assert!(matches!(
+            mirror_unit_coverage(&store, "run_X2").await,
+            Err(HostConnectorError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn valid_run_id_accepts_minted_ids_and_rejects_everything_else() {
+        assert!(valid_run_id("run_01HXYZ"));
+        assert!(valid_run_id(&format!("run_{}", ulid::Ulid::new())));
+        for bad in [
+            "",
+            "run",
+            "01HXYZ",
+            "Run_01X",
+            "run_a.b",
+            "run_../x",
+            "run_a/b",
+            "run_a-b",
+            "run_a b",
+            "run_a\n",
+            "run_$HOME",
+        ] {
+            assert!(!valid_run_id(bad), "{bad:?} must be rejected");
+        }
     }
 }

@@ -3,7 +3,6 @@ use crate::ledger::events::Surface;
 use crate::ledger::paths::CoveragePaths;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 
 /// The defining inputs of a coverage run, captured at run start so the run
 /// can be described and (for agent runs) replayed. Appended one-per-run to
@@ -36,15 +35,7 @@ pub struct RunManifest {
 
 /// Append a manifest row to `runs.jsonl` (creates the file if absent).
 pub fn append_manifest(paths: &CoveragePaths, manifest: &RunManifest) -> std::io::Result<()> {
-    if let Some(parent) = paths.runs.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.runs)?;
-    let line = serde_json::to_string(manifest)?;
-    writeln!(file, "{line}")
+    crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Runs, manifest)
 }
 
 /// Read all manifests from `runs.jsonl` (empty vec if the file is absent).
@@ -145,6 +136,30 @@ mod tests {
         m.continued_from = Some("/t/run_a.jsonl".to_string());
         append_manifest(&paths, &m).unwrap();
         assert_eq!(read_manifests(&paths).unwrap(), vec![m]);
+    }
+
+    #[test]
+    fn append_manifest_streams_the_run_when_paths_carry_a_stream() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stream = tmp.path().join("runs/run_a/coverage.jsonl");
+        let paths = CoveragePaths::new(tmp.path(), "tgt").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "reviewer".to_string(),
+        }));
+        append_manifest(&paths, &sample("run_a")).unwrap();
+
+        assert_eq!(read_manifests(&paths).unwrap(), vec![sample("run_a")]);
+        let raw = std::fs::read_to_string(&stream).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<StreamLine>(lines[0]).unwrap(),
+            StreamLine::Runs {
+                scope_name: "reviewer".to_string(),
+                record: sample("run_a"),
+            }
+        );
     }
 
     #[test]

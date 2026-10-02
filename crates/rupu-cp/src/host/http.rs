@@ -45,6 +45,18 @@ struct HostInfoBody {
     features: Vec<String>,
 }
 
+/// Parse a `/api/host/info` body. The ONE place that decides what "the remote
+/// did not answer with host info" means, shared by [`HostConnector::info`]
+/// (reachable, version unknown) and `require_feature` (`Unsupported`).
+///
+/// An `Err` is a 2xx whose complete body is not usable host info — in practice
+/// the web UI's HTML from a rupu older than `/api/host/info` (whose SPA
+/// fallback answers any `/api/*` path with 200). It is NOT a transport
+/// failure: a body that failed to arrive never reaches this function.
+fn parse_host_info(bytes: &[u8]) -> Result<HostInfoBody, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
+
 impl HttpHostConnector {
     /// Create a new connector for the remote server at `base_url`.
     ///
@@ -167,10 +179,26 @@ impl HttpHostConnector {
             }
             Err(e) => return Err(e),
         };
-        let body: HostInfoBody = resp
-            .json()
+        // Read, then parse (as `proxy_get_json` does): a body that failed to
+        // ARRIVE is a transport failure, but a 200 whose body is not the info
+        // JSON is a remote that has no such route and answered with its SPA —
+        // the signature of a rupu older than `/api/host/info`. That cannot
+        // advertise a feature, so it is the same refusal as a 404.
+        let bytes = resp
+            .bytes()
             .await
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+        let body = match parse_host_info(&bytes) {
+            Ok(body) => body,
+            Err(e) => {
+                return Err(HostConnectorError::Unsupported(format!(
+                    "{what}: remote host {} did not answer /api/host/info with host \
+                     info ({e}; an older rupu serves its web UI there), so it cannot \
+                     advertise support; upgrade rupu there",
+                    self.base_url
+                )))
+            }
+        };
         if body.features.iter().any(|f| f == feature) {
             return Ok(());
         }
@@ -194,14 +222,25 @@ impl HostConnector for HttpHostConnector {
         let req = self.client.get(self.url("/api/host/info"));
         match self.send(req).await {
             Ok(resp) => {
-                let body: HostInfoBody = resp
-                    .json()
+                // Read, then parse: a body that failed to ARRIVE is a
+                // transport failure (`Remote(0, _)`), but a 200 that is not
+                // host info is a reachable remote that predates the endpoint
+                // — the same outcome as its 404 below, not "offline".
+                let bytes = resp
+                    .bytes()
                     .await
                     .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
-                Ok(HostInfo {
-                    reachable: true,
-                    version: body.version,
-                    capabilities: body.capabilities,
+                Ok(match parse_host_info(&bytes) {
+                    Ok(body) => HostInfo {
+                        reachable: true,
+                        version: body.version,
+                        capabilities: body.capabilities,
+                    },
+                    Err(_) => HostInfo {
+                        reachable: true,
+                        version: None,
+                        capabilities: HostCapabilities::default(),
+                    },
                 })
             }
             Err(HostConnectorError::Unreachable(_)) => Ok(HostInfo {
@@ -473,6 +512,40 @@ impl HostConnector for HttpHostConnector {
     ) -> Result<serde_json::Value, HostConnectorError> {
         self.proxy_get_json(&format!("/api/sessions/{id}/usage-timeline"))
             .await
+    }
+
+    /// GET the remote CP's own local file. Complete once the run is terminal:
+    /// the remote serves the file its `rupu run` wrote, not a copy in transit.
+    async fn unit_coverage(
+        &self,
+        run_id: &str,
+    ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+        if !crate::host::connector::valid_run_id(run_id) {
+            return Err(HostConnectorError::Invalid(format!(
+                "{run_id:?} is not a valid run id"
+            )));
+        }
+        // An older remote answers an unknown /api path with the SPA and 200,
+        // so the feature — not the status — says whether this is a stream.
+        self.require_feature(
+            crate::node::protocol::CAP_RUN_COVERAGE_STREAM,
+            "this unit's coverage cannot be collected",
+        )
+        .await?;
+        let resp = self
+            .send(
+                self.client
+                    .get(self.url(&format!("/api/runs/{run_id}/coverage"))),
+            )
+            .await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        Ok(crate::host::connector::CoverageRead {
+            bytes: bytes.to_vec(),
+            complete: true,
+        })
     }
 
     async fn proxy_get_json(

@@ -1,5 +1,7 @@
 //! Embeds the built web UI (`web/dist/`) into the binary at compile time and
 //! serves it with an SPA fallback so client-side routes resolve to `index.html`.
+//! The fallback never covers the API: an unmatched `/api` or `/api/*` path is a
+//! JSON 404 ([`static_handler`]).
 
 use crate::state::AppState;
 use axum::extract::State;
@@ -64,6 +66,12 @@ fn serve_index(state: &AppState) -> Response {
 
 pub async fn static_handler(State(state): State<AppState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
+    // An unmatched API path is a client error, not a page: serving the SPA
+    // with 200 made every newer endpoint look present on an older CP.
+    if path == "api" || path.starts_with("api/") {
+        return crate::error::ApiError::not_found(format!("no API route for /{path}"))
+            .into_response();
+    }
     if path.is_empty() || path == "index.html" {
         return serve_index(&state);
     }

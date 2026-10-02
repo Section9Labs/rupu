@@ -3,7 +3,6 @@
 //! that re-marks an asset simply writes a newer line.
 
 use super::Asset;
-use std::io::Write;
 use std::path::Path;
 
 /// Errors reading or writing the asset store.
@@ -37,6 +36,12 @@ pub fn from_assets<I: IntoIterator<Item = Asset>>(assets: I) -> Vec<Asset> {
 
 /// Read and fold the asset store at `path`. A missing file is an empty set.
 pub fn read_assets(path: &Path) -> Result<Vec<Asset>, AssetStoreError> {
+    Ok(from_assets(read_asset_lines(path)?))
+}
+
+/// Every line recorded at `path`, in order and unfolded — the superseded
+/// states [`read_assets`] folds away. A missing file is empty.
+pub(crate) fn read_asset_lines(path: &Path) -> Result<Vec<Asset>, AssetStoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -53,12 +58,20 @@ pub fn read_assets(path: &Path) -> Result<Vec<Asset>, AssetStoreError> {
         })?;
         parsed.push(asset);
     }
-    Ok(from_assets(parsed))
+    Ok(parsed)
 }
 
 /// Append one asset as a JSON line, creating the parent directory and file as
 /// needed. Upsert semantics come from fold-on-read, not from rewriting.
-pub fn upsert_asset(path: &Path, asset: &Asset) -> Result<(), AssetStoreError> {
+///
+/// Test-only: this writes `assets.jsonl` WITHOUT mirroring the line into the
+/// run's coverage stream. Production writers go through
+/// `ledger::stream::append_record(.., Ledger::Assets, ..)`, so a remote unit's
+/// asset reaches the coordinator; keeping this out of the public API stops a
+/// future caller from silently bypassing the stream.
+#[cfg(test)]
+pub(crate) fn upsert_asset(path: &Path, asset: &Asset) -> Result<(), AssetStoreError> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -118,5 +131,9 @@ mod tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].depth.as_deref(), Some("tested"));
         assert!(read.iter().any(|x| x.id == b.id && x.depth.is_none()));
+
+        // The unfolded reader keeps the superseded line the fold drops.
+        let lines = read_asset_lines(&path).unwrap();
+        assert_eq!(lines, vec![a1, b, a2]);
     }
 }

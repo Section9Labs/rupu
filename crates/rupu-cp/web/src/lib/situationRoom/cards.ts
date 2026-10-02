@@ -22,8 +22,10 @@ import { memberLabel, parseCodename } from '../codename';
 import { findingCodename } from '../findingIdentity';
 
 /** Which filter chip a card answers to. `activity` is the catch-all for agent
- *  work / step + run lifecycle / panel rounds. */
-export type CardGroup = 'finding' | 'await' | 'error' | 'activity';
+ *  work / step + run lifecycle / panel rounds. `warning` is a non-failing
+ *  operator notice (`step_warning`) — deliberately NOT `error`: the step did
+ *  not fail. */
+export type CardGroup = 'finding' | 'await' | 'error' | 'warning' | 'activity';
 
 /** The editorial form the card renders as. `finding` gets the rich
  *  severity + evidence + code treatment; `await` gets inline approve/reject. */
@@ -34,11 +36,12 @@ export type CardForm =
   | 'complete'
   | 'finding'
   | 'await'
-  | 'error';
+  | 'error'
+  | 'warning';
 
 /** Left-stripe / badge color key — a severity for findings, otherwise a
  *  semantic role. Maps 1:1 to a `sr-s-*` CSS class. */
-export type CardAccent = FindingSeverity | 'brand' | 'await' | 'error';
+export type CardAccent = FindingSeverity | 'brand' | 'await' | 'error' | 'warn';
 
 export interface StreamCard {
   /** Stable identity — dedup + React key. Findings use their id; events use
@@ -191,6 +194,10 @@ export function cardFromEvent(
     const unitKey = ctx.unitKeys.get(unitKeyId(ev.run_id, ev.step_id, ev.unit_index));
     if (unitKey) card = { ...card, unitKey };
   }
+  if (ctx.unitKeys && isKnownRunEvent(ev) && ev.type === 'step_warning' && typeof ev.index === 'number') {
+    const unitKey = ctx.unitKeys.get(unitKeyId(ev.run_id, ev.step_id, ev.index));
+    if (unitKey) card = { ...card, unitKey };
+  }
   if (!card.crew && card.runId && ctx.crewByRun) {
     const runName = ctx.crewByRun.get(card.runId);
     if (runName) card = { ...card, crew: parseCodename(runName).crew };
@@ -270,6 +277,16 @@ function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard |
     case 'step_failed':
       return { ...base, form: 'error', group: 'error', accent: 'error',
         badge: 'Error', stepId: k.step_id, title: `${stepLabel(k.step_id)} failed`, detail: k.error };
+    case 'step_warning':
+      // A warning never fails the step — its own group/accent (amber), never
+      // the error group. A unit-scoped one names the unit in the headline
+      // (the page's unit_key index adds the target as a meta chip).
+      return { ...base, form: 'warning', group: 'warning', accent: 'warn',
+        badge: 'Warning', stepId: k.step_id,
+        title: typeof k.index === 'number'
+          ? `${stepLabel(k.step_id)} · unit ${k.index} warning`
+          : `${stepLabel(k.step_id)} warning`,
+        detail: k.message };
     case 'step_skipped':
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Skipped', stepId: k.step_id, title: `${stepLabel(k.step_id)} skipped`, detail: k.reason };

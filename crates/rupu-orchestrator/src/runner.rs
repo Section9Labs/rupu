@@ -170,6 +170,53 @@ pub struct UnitOutcome {
     /// The unit's file changes when it ran with a synced workspace; `None`
     /// for a self-contained unit.
     pub workspace_delta: Option<WorkspaceDelta>,
+    /// What the unit recorded; see [`UnitCoverage`].
+    pub coverage: UnitCoverage,
+}
+
+/// What a remote unit recorded (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A4), carried on every
+/// post-launch outcome — success or failure — so the runner can merge it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitCoverage {
+    /// The unit's whole coverage stream, read after the unit was terminal
+    /// through a transport that guarantees it is complete.
+    Stream(Vec<u8>),
+    /// A stream the coordinator could not confirm is whole: read while the
+    /// unit may still have been running (a poll error after the run was
+    /// observed, the wall timeout), or a terminal read the transport could not
+    /// confirm complete. Merged exactly like [`Self::Stream`], plus a
+    /// `StepWarning` naming `reason`: what the unit recorded after this read
+    /// may be missing.
+    Partial { bytes: Vec<u8>, reason: String },
+    /// The connector could not deliver a stream; the reason is surfaced as a
+    /// `StepWarning`.
+    Unavailable(String),
+    /// The unit never launched: nothing to collect.
+    NotLaunched,
+}
+
+/// A remote unit that failed, with whatever coverage it recorded. `Err` keeps
+/// its meaning for the fan-out's fallback-host retry.
+#[derive(Debug)]
+pub struct UnitFailure {
+    pub error: RunError,
+    pub coverage: UnitCoverage,
+}
+
+impl From<RunError> for UnitFailure {
+    fn from(error: RunError) -> Self {
+        Self {
+            error,
+            coverage: UnitCoverage::NotLaunched,
+        }
+    }
+}
+
+impl std::fmt::Display for UnitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 /// Port that remote-fleet implementations plug into.
@@ -182,7 +229,11 @@ pub struct UnitOutcome {
 #[async_trait]
 pub trait UnitDispatcher: Send + Sync {
     /// Run one unit (an agent invocation) on `host` and return its output.
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError>;
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure>;
 
     /// Pack the coordinator workspace at `workspace_path` for staging.
     ///
@@ -226,6 +277,21 @@ pub trait UnitDispatcher: Send + Sync {
     ) -> Result<(), WorkspaceConflict> {
         Ok(())
     }
+
+    /// `delta` without its `.rupu/coverage/` entries. The runner asks for
+    /// this only for a unit whose complete coverage stream arrived with its
+    /// begin line and merged every line (spec
+    /// 2026-09-30-rupu-remote-findings-transport-design.md §A4): the stream
+    /// is then that unit's coverage, and the delta's copy — collected under
+    /// the host's scratch path, so keyed to a target the coordinator never
+    /// uses — would only duplicate it. A unit whose stream did not arrive,
+    /// arrived `Partial`, or had malformed lines keeps its delta whole. An `Err` keeps the whole
+    /// delta too: its coverage then lands twice, never lost.
+    ///
+    /// Deliberately no default (like `HostConnector::unit_coverage`): a
+    /// dispatcher whose deltas carry `.rupu/coverage/` must say how it drops
+    /// it, and one whose deltas never do says so by returning `delta`.
+    async fn strip_delta_coverage(&self, delta: &WorkspaceDelta) -> Result<WorkspaceDelta, String>;
 }
 
 #[derive(Debug, Error)]
@@ -1724,9 +1790,9 @@ async fn dispatch_unit_unless_terminating(
     dispatcher: &dyn UnitDispatcher,
     unit: UnitDispatch,
     host: &str,
-) -> Result<UnitOutcome, RunError> {
+) -> Result<UnitOutcome, UnitFailure> {
     if rupu_providers::credential_writes::terminating() {
-        return Err(RunError::Terminating);
+        return Err(RunError::Terminating.into());
     }
     dispatcher.dispatch_unit(unit, host).await
 }
@@ -7215,6 +7281,187 @@ async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, st
     }
 }
 
+/// Take the coverage out of a dispatch result, leaving `NotLaunched`.
+fn take_coverage(r: &mut Result<UnitOutcome, UnitFailure>) -> UnitCoverage {
+    let slot = match r {
+        Ok(o) => &mut o.coverage,
+        Err(f) => &mut f.coverage,
+    };
+    std::mem::replace(slot, UnitCoverage::NotLaunched)
+}
+
+/// What a warning adds when the unit returned a workspace-sync delta, which
+/// then keeps its own copy of the unit's coverage.
+const SYNCED_COPY_KEPT: &str = "the unit's workspace-sync delta keeps its own copy";
+/// What a no-stream warning adds when that delta is the only copy.
+const SYNCED_COPY_ONLY: &str =
+    "its findings and coverage arrive only through the unit's workspace-sync delta";
+
+/// Whether a remote unit's result carries a workspace-sync delta — the only
+/// case in which a warning may speak of a synced copy. A failure carries none
+/// (the dispatcher drops a failed unit's delta).
+fn carries_delta(result: &Result<UnitOutcome, UnitFailure>) -> bool {
+    matches!(result, Ok(o) if o.workspace_delta.is_some())
+}
+
+/// Merge a remote unit's coverage into the coordinator workspace (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A4) and surface
+/// anything that went wrong as a `StepWarning`. Never fails the unit.
+/// `synced_delta` ([`carries_delta`]) says whether the unit returned a
+/// workspace-sync delta; only then does a warning mention its copy.
+///
+/// Returns whether the stream is now the source of truth for the unit's
+/// coverage: a complete [`UnitCoverage::Stream`] that arrived with its begin
+/// line and merged every line — no error, nothing malformed. Only then does
+/// the unit's workspace-sync delta drop its `.rupu/coverage/`
+/// ([`delta_to_apply`]). Otherwise the delta's copy applies as it did before
+/// coverage streaming: it is the only copy when no stream merged, and for a
+/// [`UnitCoverage::Partial`] stream, or one with lines this coordinator could
+/// not read (a newer host's line kind counts), it may hold what the stream
+/// lacks — a duplicate under the host's workspace target is preferred to a
+/// loss.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_remote_unit_coverage(
+    workspace: &Path,
+    host: &str,
+    coverage: UnitCoverage,
+    synced_delta: bool,
+    sink: Option<&Arc<dyn crate::executor::EventSink>>,
+    workflow_run_id: &str,
+    step_id: &str,
+    index: Option<usize>,
+) -> bool {
+    let warn = |mut message: String, synced_clause: &str| {
+        if synced_delta {
+            message.push_str("; ");
+            message.push_str(synced_clause);
+        }
+        warn!(step = %step_id, host, %message, "remote unit coverage");
+        if let Some(sink) = sink {
+            sink.emit(
+                workflow_run_id,
+                &crate::executor::Event::StepWarning {
+                    run_id: workflow_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    index,
+                    message,
+                },
+            );
+        }
+    };
+    let (bytes, partial) = match coverage {
+        UnitCoverage::NotLaunched => return false,
+        UnitCoverage::Unavailable(reason) => {
+            warn(
+                format!("coverage from host {host} was not collected: {reason}"),
+                SYNCED_COPY_ONLY,
+            );
+            return false;
+        }
+        UnitCoverage::Stream(bytes) => (bytes, None),
+        UnitCoverage::Partial { bytes, reason } => (bytes, Some(reason)),
+    };
+    let source = rupu_coverage::IngestSource {
+        host: (host != "local").then(|| host.to_string()),
+    };
+    let ws = workspace.to_path_buf();
+    let merged = tokio::task::spawn_blocking(move || {
+        rupu_coverage::ingest_unit_stream(&ws, &source, &bytes)
+    })
+    .await;
+    match merged {
+        Ok(Ok(r)) if !r.begin_seen => {
+            // A current host writes the begin line when `rupu run` starts, so
+            // its absence means an older host OR a stream that failed to start
+            // or was lost on the way here — not provably either.
+            let mut message = format!(
+                "no coverage stream arrived from host {host} (no begin line: the host may \
+                 predate coverage streaming, or its stream failed to start or was lost in \
+                 transport)"
+            );
+            if let Some(reason) = partial {
+                message.push_str(&format!("; {reason}"));
+            }
+            warn(message, SYNCED_COPY_ONLY);
+            false
+        }
+        Ok(Ok(r)) => {
+            if let Some(reason) = partial {
+                let mut message = format!(
+                    "coverage from host {host} may be incomplete: {reason}. Findings and \
+                     coverage the unit recorded after it was collected may be missing \
+                     ({} line(s) merged",
+                    r.appended
+                );
+                if r.malformed > 0 {
+                    message.push_str(&format!(", {} malformed line(s) skipped", r.malformed));
+                }
+                message.push(')');
+                warn(message, SYNCED_COPY_KEPT);
+                // Not the source of truth: the delta keeps its coverage.
+                return false;
+            }
+            if r.malformed > 0 {
+                warn(
+                    format!(
+                        "{} malformed coverage line(s) from host {host} were skipped ({} merged)",
+                        r.malformed, r.appended
+                    ),
+                    SYNCED_COPY_KEPT,
+                );
+                // What was skipped may be in the delta's copy: keep it.
+                return false;
+            }
+            true
+        }
+        Ok(Err(e)) => {
+            warn(
+                format!("merging coverage from host {host} failed: {e}"),
+                SYNCED_COPY_KEPT,
+            );
+            false
+        }
+        Err(e) => {
+            warn(
+                format!("merging coverage from host {host} panicked: {e}"),
+                SYNCED_COPY_KEPT,
+            );
+            false
+        }
+    }
+}
+
+/// The delta a synced unit contributes to the coordinator workspace: whole,
+/// or without `.rupu/coverage/` when `stream_whole` (the unit's complete
+/// coverage stream merged with its begin line and every line — see
+/// [`ingest_remote_unit_coverage`]). A strip that fails keeps the whole
+/// delta: its coverage then lands a second time under the host's scratch-path
+/// target, which loses nothing.
+async fn delta_to_apply(
+    dispatcher: &dyn UnitDispatcher,
+    delta: Option<WorkspaceDelta>,
+    stream_whole: bool,
+    step_id: &str,
+    index: Option<usize>,
+) -> Option<WorkspaceDelta> {
+    let delta = delta?;
+    if !stream_whole {
+        return Some(delta);
+    }
+    match dispatcher.strip_delta_coverage(&delta).await {
+        Ok(stripped) => Some(stripped),
+        Err(e) => {
+            warn!(
+                step = %step_id,
+                ?index,
+                error = %e,
+                "could not drop .rupu/coverage/ from the unit's workspace delta; applying it whole"
+            );
+            Some(delta)
+        }
+    }
+}
+
 /// Run a host-placed linear step as a single remote unit through the
 /// [`UnitDispatcher`] port (index 0). Mirrors the fan-out remote path:
 /// `Ok(success:true)` → that output; `Ok(success:false)` or `Err` → a
@@ -7282,10 +7529,33 @@ async fn dispatch_placed_step(
         run_id,
         transcript_path.to_path_buf(),
     );
-    match dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await {
+    let mut result = dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await;
+    // Merge BEFORE the delta applies: whether a complete stream merged decides
+    // whether the delta keeps its `.rupu/coverage/`. Only a success's delta
+    // applies here.
+    let synced_delta = matches!(&result, Ok(o) if o.success) && carries_delta(&result);
+    let stream_whole = ingest_remote_unit_coverage(
+        &opts.workspace_path,
+        host,
+        take_coverage(&mut result),
+        synced_delta,
+        opts.event_sink.as_ref(),
+        workflow_run_id,
+        &step.id,
+        None,
+    )
+    .await;
+    match result {
         Ok(outcome) if outcome.success => {
             let output = outcome.output;
-            let ws_delta = outcome.workspace_delta;
+            let ws_delta = delta_to_apply(
+                dispatcher.as_ref(),
+                outcome.workspace_delta,
+                stream_whole,
+                &step.id,
+                None,
+            )
+            .await;
             // Apply the unit's workspace delta back to the coordinator before
             // the step is considered complete. Guard on both sync mode and a
             // dispatcher being present (always true here, but keeps the guard
@@ -7319,7 +7589,8 @@ async fn dispatch_placed_step(
             );
             placed_failure(step, host, outcome.output, source, continue_on_error)
         }
-        Err(source) => {
+        Err(failure) => {
+            let source = failure.error;
             let output = source.to_string();
             placed_failure(step, host, output, source, continue_on_error)
         }
@@ -8139,13 +8410,27 @@ async fn run_fanout_step(
                                     &run_id_clone,
                                     transcript_clone.clone(),
                                 );
-                                match dispatch_unit_unless_terminating(
+                                let mut result = dispatch_unit_unless_terminating(
                                     dispatcher.as_ref(),
                                     unit,
                                     &host,
                                 )
-                                .await
-                                {
+                                .await;
+                                // Merged here, before the step applies its
+                                // units' deltas after the join.
+                                let synced_delta = carries_delta(&result);
+                                let stream_whole = ingest_remote_unit_coverage(
+                                    &workspace_path,
+                                    &host,
+                                    take_coverage(&mut result),
+                                    synced_delta,
+                                    event_sink.as_ref(),
+                                    &workflow_run_id,
+                                    &step_id,
+                                    Some(idx),
+                                )
+                                .await;
+                                match result {
                                     Ok(outcome) => {
                                         // Important fix: when the agent ran but failed
                                         // (success=false), synthesize a raw_error so
@@ -8162,7 +8447,14 @@ async fn run_fanout_step(
                                         } else {
                                             None
                                         };
-                                        let ws_delta = outcome.workspace_delta;
+                                        let ws_delta = delta_to_apply(
+                                            dispatcher.as_ref(),
+                                            outcome.workspace_delta,
+                                            stream_whole,
+                                            &step_id,
+                                            Some(idx),
+                                        )
+                                        .await;
                                         (
                                             outcome.output,
                                             outcome.success,
@@ -8254,13 +8546,25 @@ async fn run_fanout_step(
                                             &retry_run_id,
                                             transcript_path.clone(),
                                         );
-                                        match dispatch_unit_unless_terminating(
+                                        let mut retry_result = dispatch_unit_unless_terminating(
                                             dispatcher.as_ref(),
                                             retry_unit,
                                             retry_host,
                                         )
-                                        .await
-                                        {
+                                        .await;
+                                        let retry_synced_delta = carries_delta(&retry_result);
+                                        let retry_stream_whole = ingest_remote_unit_coverage(
+                                            &workspace_path,
+                                            retry_host,
+                                            take_coverage(&mut retry_result),
+                                            retry_synced_delta,
+                                            event_sink.as_ref(),
+                                            &workflow_run_id,
+                                            &step_id,
+                                            Some(idx),
+                                        )
+                                        .await;
+                                        match retry_result {
                                             Ok(outcome) => {
                                                 // Same fix as primary path: synthesize
                                                 // raw_error for a failed-but-Ok outcome.
@@ -8274,7 +8578,14 @@ async fn run_fanout_step(
                                                 } else {
                                                     None
                                                 };
-                                                let ws_delta = outcome.workspace_delta;
+                                                let ws_delta = delta_to_apply(
+                                                    dispatcher.as_ref(),
+                                                    outcome.workspace_delta,
+                                                    retry_stream_whole,
+                                                    &step_id,
+                                                    Some(idx),
+                                                )
+                                                .await;
                                                 (
                                                     outcome.output,
                                                     outcome.success,
@@ -8290,7 +8601,7 @@ async fn run_fanout_step(
                                                     msg.clone(),
                                                     false,
                                                     Some(msg),
-                                                    Some(second_err),
+                                                    Some(second_err.error),
                                                     None,
                                                     false,
                                                 )
@@ -10013,6 +10324,13 @@ mod tests {
             "src/a.rs"
         );
     }
+
+    #[test]
+    fn a_plain_run_error_is_a_failure_that_never_launched() {
+        let f: UnitFailure = RunError::Provider("boom".into()).into();
+        assert_eq!(f.coverage, UnitCoverage::NotLaunched);
+        assert_eq!(f.to_string(), RunError::Provider("boom".into()).to_string());
+    }
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -10066,23 +10384,31 @@ mod tests {
 
     #[async_trait]
     impl UnitDispatcher for FakeUnitDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
             host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((unit.index, host.to_string()));
             if self.fail_first_host.as_deref() == Some(host) {
-                return Err(RunError::Provider("host down".into()));
+                return Err(RunError::Provider("host down".into()).into());
             }
             Ok(UnitOutcome {
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -10256,20 +10582,28 @@ steps:
 
     #[async_trait]
     impl UnitDispatcher for PathDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
             host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.seen_run_ids.lock().unwrap().push(unit.run_id.clone());
             if self.fail_first_host.as_deref() == Some(host) {
-                return Err(RunError::Provider("host down".into()));
+                return Err(RunError::Provider("host down".into()).into());
             }
             Ok(UnitOutcome {
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
         fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
@@ -10725,16 +11059,24 @@ steps:
 
     #[async_trait]
     impl UnitDispatcher for AlwaysFailedOutcomeDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             _unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             Ok(UnitOutcome {
                 output: String::new(),
                 success: false,
                 error: Some("boom".into()),
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -10869,6 +11211,14 @@ steps:
 
     #[async_trait]
     impl UnitDispatcher for WorkspaceFakeDispatcher {
+        // Its deltas never carry `.rupu/coverage/`: nothing to drop.
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn prepare_workspace(
             &self,
             _workspace_path: &std::path::Path,
@@ -10885,7 +11235,7 @@ steps:
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.saw_ws_path
                 .lock()
                 .unwrap()
@@ -10899,6 +11249,7 @@ steps:
                     deleted: vec![],
                     payload: vec![],
                 }),
+                coverage: UnitCoverage::NotLaunched,
             })
         }
 
@@ -11520,11 +11871,18 @@ steps:
     }
     #[async_trait]
     impl UnitDispatcher for CancelAfterFirstDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
             host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             let first = self.calls.lock().unwrap().is_empty();
             self.calls
                 .lock()
@@ -11538,6 +11896,7 @@ steps:
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -17972,11 +18331,18 @@ steps:
     }
     #[async_trait]
     impl UnitDispatcher for CancelFirstUnitDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             let is_first = self.calls.lock().unwrap().is_empty();
             self.calls.lock().unwrap().push(unit.index);
             let outcome = UnitOutcome {
@@ -17984,6 +18350,7 @@ steps:
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             };
             if is_first {
                 self.token.cancel();
@@ -18000,17 +18367,25 @@ steps:
     }
     #[async_trait]
     impl UnitDispatcher for RecordingUnitDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.calls.lock().unwrap().push(unit.index);
             Ok(UnitOutcome {
                 output: format!("out-{}", unit.index),
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -18711,11 +19086,18 @@ mod manual_pause_drain {
     }
     #[async_trait]
     impl UnitDispatcher for PlacedDispatcher {
+        async fn strip_delta_coverage(
+            &self,
+            delta: &crate::runner::WorkspaceDelta,
+        ) -> Result<crate::runner::WorkspaceDelta, String> {
+            Ok(delta.clone())
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.calls.lock().unwrap().push(unit.step_id.clone());
             if let Some((id, token, after)) = &self.trip_on {
                 if *id == unit.step_id {
@@ -18734,6 +19116,7 @@ mod manual_pause_drain {
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }

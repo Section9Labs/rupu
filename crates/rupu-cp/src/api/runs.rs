@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
         .route("/api/runs/:id/usage", get(get_run_usage))
         .route("/api/runs/:id/autoflow", get(get_run_autoflow))
+        .route("/api/runs/:id/coverage", get(get_run_coverage))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
@@ -35,6 +36,27 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/resume", post(resume_run))
         .route("/api/runs/:id/archive", post(archive_run))
         .route("/api/runs/:id/restore", post(restore_run))
+}
+
+/// `GET /api/runs/:id/coverage` — the run's coverage stream as this host
+/// wrote it, for a coordinator merging a placed unit (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A2). 200 with an
+/// empty body when the run wrote none.
+async fn get_run_coverage(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let bytes = crate::host::connector::mirror_unit_coverage(&s.run_store, &id)
+        .await
+        .map_err(|e| match e {
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Map an [`ApprovalError`] from the store's approve/reject flow to an
@@ -465,6 +487,9 @@ pub(crate) fn resolve_host(
 /// - `Unsupported` / `Invalid` → 501: the host cannot serve this listing (an
 ///   old remote rupu, a transport with no such surface). The web shows the
 ///   host as *unavailable*, with this reason.
+/// - `Internal` → 500: a failure on THIS side (a local I/O error reading the
+///   coordinator's own run store), not a bad gateway — the remote did nothing
+///   wrong.
 /// - everything else, `NotFound` included → 502: the host gave no usable
 ///   answer. The web shows it as *offline*, with this reason.
 ///
@@ -480,6 +505,7 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
         HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
             ApiError::not_available(e.to_string())
         }
+        HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
         other => ApiError::bad_gateway(other.to_string()),
     }
 }
@@ -2521,6 +2547,12 @@ pub(crate) mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -3396,6 +3428,15 @@ pub(crate) mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+            Ok(crate::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -3432,6 +3473,10 @@ pub(crate) mod tests {
             (
                 HostConnectorError::NotJson("x".into()),
                 StatusCode::BAD_GATEWAY,
+            ),
+            (
+                HostConnectorError::Internal("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
         ];
         for (err, want) in cases {
@@ -3691,6 +3736,15 @@ pub(crate) mod tests {
             _path: &str,
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("not exercised by this test")
+        }
+        async fn unit_coverage(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+            Ok(crate::host::connector::CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
         }
         async fn proxy_get_json(
             &self,

@@ -24,6 +24,7 @@ import {
   type RunEvent,
   type RunGraphResponse,
   type RunRecord,
+  type StepWarningEvent,
   type UsageTimelinePoint,
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
@@ -34,13 +35,14 @@ import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { FindingRow } from '../components/findings/FindingRow';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
+import RunWarningsBanner from '../components/RunWarningsBanner';
 import TranscriptPanel from '../components/TranscriptPanel';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
-import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
+import { buildRunGraphModel, collectWarnings, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -174,6 +176,13 @@ export default function RunDetail() {
   const [liveRunStatus, setLiveRunStatus] = useState<RunRecord['status'] | null>(null);
   // Monotonically-increasing sequence counter — stable key source for SeqEvent.
   const seqRef = useRef<number>(0);
+  // Every `step_warning` the run has emitted, UNCAPPED. `events` is a bounded
+  // window (MAX_EVENTS), and the log replays from byte 0 on connect, so on a
+  // long distributed run the early warnings scroll out of it; this list keeps
+  // them so the graph markers and the banner never lose one. `warningKeys`
+  // drops an exact repeat (a reconnect replays the whole log).
+  const [stepWarnings, setStepWarnings] = useState<StepWarningEvent[]>([]);
+  const warningKeysRef = useRef<Set<string>>(new Set());
 
   // Aggregated per-turn token series for the "Token usage by turn" timeline —
   // a global index across all of the run's steps (see effect below).
@@ -378,6 +387,8 @@ export default function RunDetail() {
     if (!id) return;
     setEvents([]);
     seqRef.current = 0;
+    setStepWarnings([]);
+    warningKeysRef.current = new Set();
     setLiveRunStatus(null);
     setConnection('connecting');
 
@@ -391,7 +402,13 @@ export default function RunDetail() {
           return [...next, { seq, event: ev }];
         });
         if (isKnownRunEvent(ev)) {
-          if (ev.type === 'run_completed') setLiveRunStatus(ev.status);
+          if (ev.type === 'step_warning') {
+            const key = `${ev.step_id}\0${ev.index ?? ''}\0${ev.message}`;
+            if (!warningKeysRef.current.has(key)) {
+              warningKeysRef.current.add(key);
+              setStepWarnings((prev) => [...prev, ev]);
+            }
+          } else if (ev.type === 'run_completed') setLiveRunStatus(ev.status);
           else if (ev.type === 'run_failed') setLiveRunStatus('failed');
           else if (ev.type === 'run_paused') setLiveRunStatus('paused');
           else if (ev.type === 'run_resumed') setLiveRunStatus('running');
@@ -422,9 +439,12 @@ export default function RunDetail() {
   // recompute on every event so the graph reflects live state.
   // Built for both local and remote runs via the host-aware graph endpoint.
   const model = useMemo(
-    () => (graph ? buildRunGraphModel(graph, rawEvents) : null),
-    [graph, rawEvents],
+    () => (graph ? buildRunGraphModel(graph, rawEvents, stepWarnings) : null),
+    [graph, rawEvents, stepWarnings],
   );
+  // `step_warning`s folded onto the model — listed in a run-level banner so a
+  // run with warnings says so without opening the Events tab.
+  const warnings = useMemo(() => (model ? collectWarnings(model) : []), [model]);
 
   // Seed the default selection ONCE, the first time the model resolves a
   // selectable node. After that the user (or a click) owns the selection — we
@@ -908,6 +928,8 @@ export default function RunDetail() {
             {run.error_message}
           </div>
         )}
+
+        <RunWarningsBanner warnings={warnings} />
 
         {awaitingGates.length > 1 ? (
           <div className="mt-3 space-y-3">

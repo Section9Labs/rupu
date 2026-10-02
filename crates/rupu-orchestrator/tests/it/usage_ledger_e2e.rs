@@ -9,10 +9,11 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::JsonlSink;
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
+    UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::usage_ledger::LedgerRow;
 use rupu_orchestrator::{RunStore, Workflow};
@@ -180,7 +181,18 @@ struct MirrorDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for MirrorDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         let path = self.unit_transcript_path(host, &unit.run_id).unwrap();
         write_mirrored_transcript(&path, &unit.run_id);
         Ok(UnitOutcome {
@@ -188,6 +200,7 @@ impl UnitDispatcher for MirrorDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 

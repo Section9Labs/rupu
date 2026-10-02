@@ -396,6 +396,7 @@ async fn rebuild_opts_from_disk(
             &store_arc, run_id,
         )),
         limits_ctx.clone(),
+        None,
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over

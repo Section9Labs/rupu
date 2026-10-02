@@ -114,6 +114,13 @@ pub struct ToolContext {
     /// `AgentRunOpts.provider_name`, for coverage/finding attribution.
     #[serde(skip)]
     pub provider: Option<String>,
+    /// Where this run's coverage is streamed for a coordinator to collect
+    /// (`$RUPU_HOME/runs/<run_id>/coverage.jsonl`). Set by `rupu run` — the
+    /// command every host connector launches — and shared with its
+    /// `dispatch_agent` children; `None` for in-process workflow steps and
+    /// sessions, which already write the coordinator's ledgers directly.
+    #[serde(skip)]
+    pub coverage_stream: Option<std::path::PathBuf>,
 }
 
 impl Default for ToolContext {
@@ -135,6 +142,7 @@ impl Default for ToolContext {
             codename: None,
             agent: None,
             provider: None,
+            coverage_stream: None,
         }
     }
 }

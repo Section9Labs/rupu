@@ -106,8 +106,11 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         // bearer token is configured.
         .merge(crate::node::server::routes())
         .merge(api)
-        // Registered routes above match first; anything else (incl. client-side
-        // routes like `/runs/abc`) falls through to the embedded SPA.
+        // Registered routes above match first. Anything else is handled by the
+        // embedded-UI fallback: an unmatched `/api` or `/api/*` path is a JSON
+        // 404 (never the SPA — that made every missing endpoint look present
+        // on an older CP), and every other path (incl. client-side routes like
+        // `/runs/abc`) falls through to the embedded SPA.
         .fallback(crate::embed::static_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

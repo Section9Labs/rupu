@@ -89,6 +89,16 @@ pub enum Event {
         step_id: String,
         reason: String,
     },
+    /// Something about a step the operator should see that did not fail it —
+    /// e.g. a remote unit whose coverage could not be collected.
+    StepWarning {
+        run_id: String,
+        step_id: String,
+        /// The fan-out unit, when the warning is about one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        message: String,
+    },
     /// One fan-out (`for_each` / `parallel`) unit began its agent run.
     /// Emitted immediately before the unit is dispatched so the live
     /// view can mark that unit working and re-point the focus feed at
@@ -204,6 +214,7 @@ impl Event {
             | Event::StepCompleted { run_id, .. }
             | Event::StepFailed { run_id, .. }
             | Event::StepSkipped { run_id, .. }
+            | Event::StepWarning { run_id, .. }
             | Event::UnitStarted { run_id, .. }
             | Event::UnitCompleted { run_id, .. }
             | Event::PanelRound { run_id, .. }

@@ -48,7 +48,7 @@ use tracing::{info, warn};
 
 use rupu_workspace::{verify_node_token, HostTransport};
 
-use crate::node::protocol::{Auth, Frame, CAP_USAGE_LEDGER};
+use crate::node::protocol::{Auth, Frame};
 use crate::state::AppState;
 
 /// How often the CP sends a `Frame::Ping` to keep the tunnel alive.
@@ -176,7 +176,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // (an older CP logs-and-continues on a frame it can't parse; the gate
     // keeps that from becoming per-line log spam).
     let welcome = match serde_json::to_string(&Frame::Welcome {
-        capabilities: vec![CAP_USAGE_LEDGER.to_string()],
+        capabilities: crate::node::protocol::cp_capabilities(),
     }) {
         Ok(s) => s,
         Err(e) => {

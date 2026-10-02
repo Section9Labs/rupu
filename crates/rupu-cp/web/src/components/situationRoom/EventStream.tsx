@@ -1,9 +1,9 @@
 // Situation Room — the center live stream. A newest-first column of editorial
 // EventCards merged from the SSE/history event firehose and the REST findings
 // list. A search box + filter chips (Findings / Agent activity / Awaiting /
-// Errors) narrow the stream via the pure `filterStreamCards`. Follows the top
-// as new events land unless the operator scrolls down to read history; a
-// "Load older events" sentinel pages the event backlog.
+// Warnings / Errors) narrow the stream via the pure `filterStreamCards`.
+// Follows the top as new events land unless the operator scrolls down to read
+// history; a "Load older events" sentinel pages the event backlog.
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '../../lib/cn';
@@ -17,6 +17,7 @@ const FILTERS: { key: StreamFilter; label: string }[] = [
   { key: 'finding', label: 'Findings' },
   { key: 'activity', label: 'Activity' },
   { key: 'await', label: 'Awaiting' },
+  { key: 'warning', label: 'Warnings' },
   { key: 'error', label: 'Errors' },
 ];
 
@@ -45,7 +46,7 @@ export default function EventStream({
   const [follow, setFollow] = useState(true);
 
   const counts = useMemo(() => {
-    const c: Record<string, number> = { finding: 0, await: 0, error: 0, activity: 0 };
+    const c: Record<string, number> = { finding: 0, await: 0, error: 0, warning: 0, activity: 0 };
     for (const card of cards) if (card.group in c) c[card.group] += 1;
     return c;
   }, [cards]);
