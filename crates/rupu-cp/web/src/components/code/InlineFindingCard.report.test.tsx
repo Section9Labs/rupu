@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import fixture from '../../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
-import { api, ApiError, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
-import type { FindingReport } from '../../lib/findingReport';
+import { api, ApiError, findingArtifactUrl, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
+import type { ArtifactRef, EvidenceBlock, FindingReport } from '../../lib/findingReport';
 import InlineFindingCard from './InlineFindingCard';
 
 afterEach(() => {
@@ -253,6 +253,70 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     expect(screen.getByText(/code may have changed/i)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /view on repository/i })).toBeInTheDocument();
     await screen.findByRole('tablist');
+  });
+});
+
+describe('InlineFindingCard — evidence blocks in the Evidence tab', () => {
+  const sha = 'a1'.repeat(32);
+  const shot = (over: Partial<ArtifactRef> = {}): ArtifactRef => ({
+    path: 'shots/gizmo-panel.png', sha256: sha, size: 4096, kind: 'binary', stored: 'copied', ...over,
+  });
+
+  async function openEvidence(blocks: EvidenceBlock[] | undefined, evidence = report.evidence) {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf({ report: { ...report, evidence, blocks } }));
+    const utils = view(FULL);
+    fireEvent.click(header());
+    await screen.findByRole('tablist');
+    fireEvent.click(screen.getByRole('tab', { name: 'Evidence' }));
+    return utils;
+  }
+
+  it('renders blocks under the claims, with the image capped for the card', async () => {
+    const { container } = await openEvidence([
+      { kind: 'text', text: 'The gizmo panel kept a stale handle.' },
+      { kind: 'image', artifact: shot(), caption: 'Gizmo panel after the reload' },
+    ]);
+    const panel = screen.getByRole('tabpanel', { name: 'Evidence' });
+    const claim = screen.getByText('The handler looks the note up by id alone.');
+    const text = screen.getByText('The gizmo panel kept a stale handle.');
+    expect(panel).toContainElement(claim);
+    expect(panel).toContainElement(text);
+    // Claims first, then blocks.
+    expect(claim.compareDocumentPosition(text) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const img = container.querySelector('img')!;
+    expect(img).toHaveAttribute('src', findingArtifactUrl('f-full', sha));
+    expect(img).toHaveClass('max-h-48');
+    expect(img).not.toHaveClass('max-h-[32rem]');
+    expect(screen.getByRole('link', { name: 'Download' })).toHaveAttribute('href', findingArtifactUrl('f-full', sha));
+  });
+
+  it('never fetches a remote-host image block until it is clicked', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const { container } = await openEvidence([
+      { kind: 'image', artifact: shot({ stored: 'external', host: 'gizmo-box' }), caption: 'Remote panel' },
+    ]);
+    expect(container.querySelector('img')).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /Load image \(from host gizmo-box\)/ }));
+    expect(container.querySelector('img')).toHaveAttribute('src', findingArtifactUrl('f-full', sha));
+  });
+
+  it('shows blocks without an empty-claims note when the report has blocks but no claims', async () => {
+    await openEvidence([{ kind: 'hexdump', base: 0x1000, artifact: shot({ path: 'dumps/gizmo.bin' }), rendered: '00001000  ca fe  |..|' }], []);
+    const panel = screen.getByRole('tabpanel', { name: 'Evidence' });
+    expect(panel).toHaveTextContent('ca fe');
+    expect(panel).toHaveTextContent('dumps/gizmo.bin');
+    expect(panel).not.toHaveTextContent(/No evidence/);
+  });
+
+  it('says no evidence was recorded when there are neither claims nor blocks', async () => {
+    await openEvidence(undefined, []);
+    expect(screen.getByRole('tabpanel', { name: 'Evidence' })).toHaveTextContent('No evidence recorded.');
+  });
+
+  it('treats an empty blocks array like no blocks', async () => {
+    await openEvidence([], []);
+    expect(screen.getByRole('tabpanel', { name: 'Evidence' })).toHaveTextContent('No evidence recorded.');
   });
 });
 
