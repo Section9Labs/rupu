@@ -128,11 +128,13 @@ pub fn cp_capabilities() -> Vec<String> {
 }
 
 /// `Hello.capabilities` entry: this node answers [`Frame::ArtifactPull`].
+/// Tunnel-only — a bucket worker has no frames to answer it with, so it is
+/// never in [`bucket_worker_capabilities`].
 pub const CAP_FINDINGS_ARTIFACT_PULL: &str = "findings.artifact_pull";
 /// Decoded bytes per [`Frame::ArtifactChunk`].
 pub const ARTIFACT_CHUNK_BYTES: usize = 1 << 20;
 
-/// Every capability this build's node executor supports — what `rupu node`
+/// Every capability this build's tunnel node supports — what `rupu node`
 /// advertises in `Hello`.
 pub fn node_capabilities() -> Vec<String> {
     vec![
@@ -184,6 +186,15 @@ impl FeaturesReport {
     pub fn supports(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
     }
+}
+
+/// What this build's bucket worker (`rupu node pull`) advertises in its
+/// `nodes/<worker>.json` marker: only the capabilities that hold over a
+/// bucket. Listed explicitly rather than filtered from
+/// [`node_capabilities`], so a new tunnel-only capability can never leak in
+/// — a capability missing here fails closed (the CP refuses the feature).
+pub fn bucket_worker_capabilities() -> Vec<String> {
+    vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -435,6 +446,17 @@ mod tests {
             "{caps:?}"
         );
         assert_eq!(ARTIFACT_CHUNK_BYTES, 1 << 20);
+    }
+
+    #[test]
+    fn a_bucket_worker_advertises_no_tunnel_only_capability() {
+        assert_eq!(
+            bucket_worker_capabilities(),
+            vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
+        );
+        assert!(!bucket_worker_capabilities()
+            .iter()
+            .any(|c| c == CAP_FINDINGS_ARTIFACT_PULL));
     }
 
     #[test]

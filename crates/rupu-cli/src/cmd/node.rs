@@ -9,8 +9,9 @@
 //! inbound frames: `Run` → spawn `rupu workflow run` / `rupu run`, tail
 //! artifact files, stream `Artifact` frames back; `Cancel` → kill
 //! child; `Ping` → `Pong`; `ArtifactPull` → stream a finding-artifact blob
-//! from this node's store, one chunk per loop turn.  Reconnects with
-//! exponential backoff (1 s … 60 s cap) on disconnect.
+//! from this node's store, one chunk per loop turn, round-robin across
+//! concurrent pulls.  Reconnects with exponential backoff (1 s … 60 s cap)
+//! on disconnect.
 //!
 //! **Enroll mode** (`rupu node enroll <name>`):
 //! Mints a tunnel host + one-time token in the local host store and
@@ -537,8 +538,8 @@ async fn connect_and_run(
     let runs_root = global.join("runs");
 
     let mut active: HashMap<String, RunState> = HashMap::new();
-    // Artifact pulls being answered, oldest first; the front one sends one
-    // frame per loop turn.
+    // Artifact pulls being answered; each loop turn the front one sends one
+    // frame and goes to the back (round-robin).
     let mut pulls: VecDeque<ArtifactPullStream> = VecDeque::new();
     let mut last_drain = tokio::time::Instant::now();
 
@@ -651,15 +652,17 @@ async fn connect_and_run(
             active.remove(&rid);
         }
 
-        // Answer the oldest queued artifact pull by ONE frame (R11): a blob
-        // of up to hundreds of MiB streamed inline would stall inbound
-        // frames and run-file drains for the whole transfer.
-        if let Some(pull) = pulls.front_mut() {
+        // Answer ONE frame of one artifact pull per turn (R11): a blob of up
+        // to hundreds of MiB streamed inline would stall inbound frames and
+        // run-file drains for the whole transfer. Pulls take turns
+        // round-robin, so a small pull queued behind a large blob still
+        // starts — and finishes — within the CP's idle timeout.
+        if let Some(mut pull) = pulls.pop_front() {
             if let Some(frame) = pull.next_frame().await {
                 send_frame(&mut sink, &frame).await;
             }
-            if pull.is_done() {
-                pulls.pop_front();
+            if !pull.is_done() {
+                pulls.push_back(pull);
             }
         }
 
@@ -1079,10 +1082,11 @@ where
 /// the last), then exactly one `ArtifactPullDone` — carrying the error when
 /// the blob can't be found, opened or read — then `None`.
 ///
-/// `connect_and_run` takes one frame per loop turn from the front of its
-/// pull queue, so a large blob streams between inbound frames and run-file
-/// drains instead of holding them up. The blob is opened on the first
-/// frame, so a queued pull holds no file handle.
+/// `connect_and_run` takes one frame per loop turn from its pull queue,
+/// round-robin across pulls, so a large blob streams between inbound frames,
+/// run-file drains and other pulls instead of holding them up. The blob is
+/// opened on the first frame, so a pull that hasn't started holds no file
+/// handle.
 struct ArtifactPullStream {
     req: String,
     sha256: String,
@@ -1188,6 +1192,19 @@ impl ArtifactPullStream {
         let file = opened
             .map_err(|e| format!("artifact {} is not in this node's store: {e}", self.sha256))?;
         Ok(tokio::fs::File::from_std(file))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket worker marker
+// ---------------------------------------------------------------------------
+
+/// The `nodes/<worker>.json` marker a bucket worker writes at startup.
+fn bucket_worker_info(worker_id: &str) -> rupu_cp::host::bucket::WorkerInfo {
+    rupu_cp::host::bucket::WorkerInfo {
+        worker_id: worker_id.to_string(),
+        rupu_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: rupu_cp::node::protocol::bucket_worker_capabilities(),
     }
 }
 
@@ -1791,11 +1808,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
     // CP reads these markers before putting a job that needs a newer worker
     // (e.g. one carrying `findings_profile`). A worker that can't write here
     // can't upload results either, so fail startup rather than run unseen.
-    let info = rupu_cp::host::bucket::WorkerInfo {
-        worker_id: host_id.clone(),
-        rupu_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: rupu_cp::node::protocol::node_capabilities(),
-    };
+    let info = bucket_worker_info(&host_id);
     bucket
         .put_worker_info(&host_id, &serde_json::to_vec(&info)?)
         .await
@@ -3947,6 +3960,97 @@ mod tests {
         }
         assert_eq!(next_seq, CHUNKS as u64);
         assert!(got == body, "reassembled blob differs");
+    }
+
+    /// Concurrent pulls share the loop round-robin: a small pull requested
+    /// behind a large blob finishes first instead of waiting out the whole
+    /// blob (and the CP's idle timeout for its first frame).
+    #[tokio::test]
+    async fn concurrent_pulls_are_served_round_robin() {
+        const CHUNKS: usize = 8;
+        let global = tempdir().unwrap();
+        let (big, small) = ("c3".repeat(32), "d4".repeat(32));
+        store_chunks(global.path(), &big, CHUNKS);
+        store_blob(global.path(), &small, b"small blob");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let cp = tokio::spawn(async move {
+            let mut ws = accept_node(listener).await;
+            for (req, sha256) in [("big", big), ("small", small)] {
+                ws.send(cp_text(&Frame::ArtifactPull {
+                    req: req.into(),
+                    sha256,
+                }))
+                .await
+                .unwrap();
+            }
+            let (mut frames, mut done) = (Vec::new(), 0);
+            while done < 2 {
+                let f = next_cp_frame(&mut ws).await;
+                if matches!(f, Frame::ArtifactPullDone { .. }) {
+                    done += 1;
+                }
+                frames.push(f);
+            }
+            frames
+        });
+        let node = spawn_node(url, global.path(), Path::new("/nonexistent/rupu"));
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(60), cp)
+            .await
+            .expect("the pulls never finished")
+            .unwrap();
+        node.abort();
+
+        let done_at = |want: &str| {
+            frames
+                .iter()
+                .position(
+                    |f| matches!(f, Frame::ArtifactPullDone { req, error: None } if req == want),
+                )
+                .unwrap_or_else(|| panic!("no clean Done for {want}: {frames:?}"))
+        };
+        assert!(
+            done_at("small") < done_at("big"),
+            "the small pull waited behind the big blob"
+        );
+        let small_bytes: Vec<u8> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ArtifactChunk { req, data_b64, .. } if req == "small" => {
+                    Some(decode_b64(data_b64))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(small_bytes, b"small blob");
+        let big_seqs: Vec<u64> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ArtifactChunk { req, seq, .. } if req == "big" => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(big_seqs, (0..CHUNKS as u64).collect::<Vec<_>>());
+    }
+
+    // ------------------------------------------------------------------
+    // Bucket worker marker
+    // ------------------------------------------------------------------
+
+    /// A bucket worker advertises what holds over a bucket — never the
+    /// tunnel-only artifact pull, which it has no frames to answer.
+    #[test]
+    fn the_bucket_worker_does_not_advertise_the_tunnel_artifact_pull() {
+        let info = bucket_worker_info("worker-1");
+        assert_eq!(info.worker_id, "worker-1");
+        assert_eq!(info.rupu_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            info.capabilities,
+            vec![rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string()]
+        );
     }
 
     /// R11's other half: an active run's files keep draining while a pull

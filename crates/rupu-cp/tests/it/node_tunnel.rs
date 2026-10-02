@@ -2051,10 +2051,19 @@ mod tunnel_connector {
             matches!(&err, HostConnectorError::Invalid(m) if m.contains("exceeds")),
             "{err:?}"
         );
-        assert!(
-            std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) <= 4,
-            "nothing past the cap is written"
-        );
+        // Exactly the in-cap chunk, never the one that crossed the cap. Its
+        // write may still be landing (tokio finishes a dropped file's queued
+        // write on the blocking pool), so wait for it — the over-cap chunk
+        // was never handed to the file, so nothing can follow it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let written = loop {
+            let got = std::fs::read(&dest).unwrap_or_default();
+            if got.len() >= 3 || std::time::Instant::now() > deadline {
+                break got;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(written, b"abc", "only the in-cap chunk is written");
     }
 
     /// A node that goes quiet mid-pull fails it after the idle timeout

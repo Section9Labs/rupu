@@ -52,8 +52,9 @@ pub struct ControlEnvelope {
 pub struct WorkerInfo {
     pub worker_id: String,
     pub rupu_version: String,
-    /// Same vocabulary as the tunnel's `Hello.capabilities`
-    /// ([`crate::node::protocol::node_capabilities`]).
+    /// Same vocabulary as the tunnel's `Hello.capabilities`, minus the
+    /// tunnel-only entries
+    /// ([`crate::node::protocol::bucket_worker_capabilities`]).
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
