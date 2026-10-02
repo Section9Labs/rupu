@@ -86,6 +86,13 @@ impl Drop for TempFile {
     }
 }
 
+/// Exactly 64 lowercase hex characters — the only shape a store key takes.
+/// Callers MUST check this before [`ArtifactStore::blob_path`], which does no
+/// validation of its own.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// SHA-256 of a file's contents, streamed.
 pub fn sha256_file(p: &Path) -> std::io::Result<String> {
     sha256_file_counted(p).map(|(sha, _)| sha)
@@ -145,11 +152,7 @@ impl ArtifactStore {
     /// Like `blob_path`, but only for a well-formed sha256 (64 lowercase hex).
     /// Use this for any caller-supplied digest (e.g. an HTTP path segment).
     pub fn blob_path_checked(&self, sha256: &str) -> Option<PathBuf> {
-        let ok = sha256.len() == 64
-            && sha256
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        ok.then(|| self.blob_path(sha256))
+        is_sha256_hex(sha256).then(|| self.blob_path(sha256))
     }
 
     /// Resolve every requested path (expanding directories), check the whole
@@ -830,6 +833,15 @@ mod tests {
             matches!(&err, ArtifactError::Path { reason, .. } if reason.contains("workspace root")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn is_sha256_hex_is_exact() {
+        assert!(is_sha256_hex(&"ab".repeat(32)));
+        assert!(!is_sha256_hex(&"AB".repeat(32)), "uppercase is rejected");
+        assert!(!is_sha256_hex(&"ab".repeat(31)));
+        assert!(!is_sha256_hex("../../etc/passwd"));
+        assert!(!is_sha256_hex(""));
     }
 
     #[test]

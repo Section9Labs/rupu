@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod editor;
 pub mod features_helper;
 pub mod findings;
+pub mod findings_helper;
 pub mod host;
 pub mod init;
 pub mod issues;
