@@ -26,6 +26,12 @@ use crate::{
 /// total timeout (sized for JSON calls) on that request alone.
 const ARTIFACT_PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// How long an artifact pull may receive nothing — the response head, then
+/// each body chunk — before it is abandoned: a half-open connection must not
+/// pin the coordinator's shared pull (and every viewer waiting on it) for the
+/// whole [`ARTIFACT_PULL_TIMEOUT`]. The SSH and tunnel pulls use the same 60 s.
+const ARTIFACT_PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ── Struct ────────────────────────────────────────────────────────────────────
 
 /// Remote-host connector: forwards every [`HostConnector`] call as an HTTP
@@ -34,6 +40,8 @@ pub struct HttpHostConnector {
     client: reqwest_middleware::ClientWithMiddleware,
     base_url: String,
     token: Option<String>,
+    /// [`ARTIFACT_PULL_IDLE_TIMEOUT`]; a field so tests can shorten it.
+    artifact_idle: Duration,
 }
 
 /// Private response struct for deserializing the `/api/host/info` endpoint.
@@ -88,6 +96,7 @@ impl HttpHostConnector {
             client,
             base_url,
             token,
+            artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
         }
     }
 
@@ -122,6 +131,7 @@ impl HttpHostConnector {
             client,
             base_url,
             token,
+            artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
         }
     }
 
@@ -568,14 +578,27 @@ impl HostConnector for HttpHostConnector {
         .await?;
         // The client's 30 s total timeout would cut a large blob short, and a
         // per-request timeout overrides it: an artifact pull gets its own
-        // bound (the whole transfer, not an idle gap).
-        let resp = self
-            .send(
+        // whole-transfer ceiling. Within it, the response head and each body
+        // chunk must arrive within `artifact_idle` of the last, so a
+        // half-open connection fails the pull instead of pinning it.
+        let idle = self.artifact_idle;
+        let stalled = || {
+            HostConnectorError::Unreachable(format!(
+                "no data from {} for {} s",
+                self.base_url,
+                idle.as_secs()
+            ))
+        };
+        let resp = tokio::time::timeout(
+            idle,
+            self.send(
                 self.client
                     .get(self.url(&format!("/api/findings/artifacts/{sha256}")))
                     .timeout(ARTIFACT_PULL_TIMEOUT),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| stalled())??;
         let too_big = || {
             HostConnectorError::Invalid(format!(
                 "artifact {sha256} exceeds its recorded {max_bytes} bytes"
@@ -593,7 +616,10 @@ impl HostConnector for HttpHostConnector {
         let mut file = tokio::fs::File::create(dest).await.map_err(write_err)?;
         let mut stream = resp.bytes_stream();
         let mut total: u64 = 0;
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = tokio::time::timeout(idle, stream.next())
+            .await
+            .map_err(|_| stalled())?
+        {
             let chunk = chunk.map_err(|e| {
                 HostConnectorError::Unreachable(format!(
                     "reading artifact {sha256} from the remote failed: {e}"
@@ -1005,5 +1031,172 @@ mod tests {
         let conn = HttpHostConnector::new(format!("http://{addr}"), None);
         let err = conn.proxy_get_json("/api/runs/r/usage").await.unwrap_err();
         assert!(matches!(err, HostConnectorError::Remote(0, _)), "{err:?}");
+    }
+
+    /// What [`artifact_remote`]'s blob route sends.
+    enum BlobPlan {
+        /// Nothing at all — not even the response head.
+        Silent,
+        /// A chunked body: each `(delay_ms, bytes)` chunk after its delay.
+        /// With `stall`, the remote then goes silent with the connection
+        /// open instead of ending the body.
+        Chunks {
+            chunks: Vec<(u64, &'static [u8])>,
+            stall: bool,
+        },
+    }
+
+    /// A remote that advertises `findings.artifact_blob` on `/api/host/info`
+    /// and answers any other request (the blob GET) per `plan`. One request
+    /// per connection (`connection: close`), so the client never reuses a
+    /// socket this server is closing.
+    async fn artifact_remote(plan: BlobPlan) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let plan = Arc::new(plan);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let plan = plan.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if head.starts_with(b"GET /api/host/info ") {
+                        let body = serde_json::json!({
+                            "version": "0.81.0",
+                            "features": [crate::node::protocol::CAP_FINDINGS_ARTIFACT_BLOB],
+                        })
+                        .to_string();
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let BlobPlan::Chunks { chunks, stall } = &*plan else {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        return;
+                    };
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                              transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    for (delay_ms, data) in chunks {
+                        tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                        let mut frame = format!("{:x}\r\n", data.len()).into_bytes();
+                        frame.extend_from_slice(data);
+                        frame.extend_from_slice(b"\r\n");
+                        if stream.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    if *stall {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A connector on `addr` whose artifact idle bound is 1 s.
+    fn quick_idle_connector(addr: std::net::SocketAddr) -> HttpHostConnector {
+        HttpHostConnector {
+            artifact_idle: Duration::from_secs(1),
+            ..HttpHostConnector::new(format!("http://{addr}"), None)
+        }
+    }
+
+    /// Pull `"ab" * 32` into a fresh temp file; fails the test if the pull
+    /// takes longer than 10 s (so a missing idle bound fails fast instead of
+    /// hanging on the 30-minute ceiling).
+    async fn bounded_pull(
+        conn: &HttpHostConnector,
+    ) -> (Result<(), HostConnectorError>, Vec<u8>, Duration) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("pulled");
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            conn.pull_finding_artifact(&"ab".repeat(32), &dest, 100),
+        )
+        .await
+        .expect("the pull must end on its idle bound, not run on to its 30-minute ceiling");
+        let elapsed = start.elapsed();
+        (res, std::fs::read(&dest).unwrap_or_default(), elapsed)
+    }
+
+    /// A half-open remote that sends one chunk and then nothing must not pin
+    /// the pull: it fails once the idle bound passes with no data.
+    #[tokio::test]
+    async fn an_artifact_pull_that_stalls_mid_body_fails_on_the_idle_bound() {
+        let addr = artifact_remote(BlobPlan::Chunks {
+            chunks: vec![(0, b"abc")],
+            stall: true,
+        })
+        .await;
+        let (res, _, elapsed) = bounded_pull(&quick_idle_connector(addr)).await;
+        let err = res.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m.contains("no data from")),
+            "{err:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// A remote that accepts the blob request and never answers it is bounded
+    /// the same way (the response head counts as data).
+    #[tokio::test]
+    async fn an_artifact_pull_whose_remote_never_answers_fails_on_the_idle_bound() {
+        let addr = artifact_remote(BlobPlan::Silent).await;
+        let (res, _, elapsed) = bounded_pull(&quick_idle_connector(addr)).await;
+        let err = res.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m.contains("no data from")),
+            "{err:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// The idle bound is per gap, not per transfer, and the pull's own
+    /// per-request timeout overrides the client's total one: a client built
+    /// with a 1 s total timeout still pulls a body trickled over ~2 s.
+    #[tokio::test]
+    async fn an_artifact_pull_outlives_the_clients_total_timeout_while_data_flows() {
+        let addr = artifact_remote(BlobPlan::Chunks {
+            chunks: vec![(0, b"ab"), (700, b"cd"), (700, b"ef"), (700, b"gh")],
+            stall: false,
+        })
+        .await;
+        let conn = HttpHostConnector::new_with_timeout(
+            format!("http://{addr}"),
+            None,
+            Duration::from_secs(1),
+        );
+        let (res, body, elapsed) = bounded_pull(&conn).await;
+        res.unwrap();
+        assert_eq!(body, b"abcdefgh");
+        assert!(
+            elapsed > Duration::from_millis(1500),
+            "the trickle must outlast the client's 1 s total timeout: {elapsed:?}"
+        );
     }
 }

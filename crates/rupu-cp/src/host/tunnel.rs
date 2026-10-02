@@ -358,17 +358,27 @@ impl HostConnector for TunnelHostConnector {
             conn: &conn,
             req: &req,
         };
-        conn.send(Frame::ArtifactPull {
+        // The tunnel's write channel is bounded: a node that stopped reading
+        // leaves it full, so even the request is held to the idle bound.
+        let sent = conn.send(Frame::ArtifactPull {
             req: req.clone(),
             sha256: sha256.to_string(),
-        })
-        .await
-        .map_err(|_| {
-            HostConnectorError::Unreachable(format!(
-                "node {} disconnected before ArtifactPull frame could be sent",
-                self.node_id
-            ))
-        })?;
+        });
+        tokio::time::timeout(ARTIFACT_PULL_IDLE_TIMEOUT, sent)
+            .await
+            .map_err(|_| {
+                HostConnectorError::Unreachable(format!(
+                    "node {} took no ArtifactPull frame for {}s (its tunnel is not draining)",
+                    self.node_id,
+                    ARTIFACT_PULL_IDLE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|_| {
+                HostConnectorError::Unreachable(format!(
+                    "node {} disconnected before ArtifactPull frame could be sent",
+                    self.node_id
+                ))
+            })?;
 
         let (mut total, mut next_seq) = (0u64, 0u64);
         loop {
@@ -517,6 +527,36 @@ mod tests {
         assert_eq!(node_conn.pulls_in_flight(), 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(node_conn.pulls_in_flight(), 0);
+    }
+
+    /// A node that stopped reading leaves its tunnel's bounded write channel
+    /// full. The pull's initial `ArtifactPull` send must not wait on it
+    /// forever: it fails on the same idle bound as a silent node, and
+    /// forgets its routing entry. (Paused time: the 60 s pass instantly.)
+    #[tokio::test(start_paused = true)]
+    async fn a_full_tunnel_fails_the_initial_send_on_the_idle_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (connector, _rx, node_conn) = pull_capable(dir.path());
+        for i in 0..4 {
+            node_conn
+                .send(Frame::Cancel {
+                    run_id: format!("run_{i}"),
+                })
+                .await
+                .unwrap();
+        }
+        let err = tokio::time::timeout(
+            ARTIFACT_PULL_IDLE_TIMEOUT * 2,
+            connector.pull_finding_artifact(&"ab".repeat(32), &dir.path().join("pulled"), 6),
+        )
+        .await
+        .expect("the initial send must give up on the idle bound")
+        .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m.contains("ArtifactPull")),
+            "{err:?}"
+        );
         assert_eq!(node_conn.pulls_in_flight(), 0);
     }
 }
