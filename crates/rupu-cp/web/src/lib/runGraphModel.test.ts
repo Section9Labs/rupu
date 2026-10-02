@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildRunGraphModel } from './runGraphModel';
+import { buildRunGraphModel, collectWarnings } from './runGraphModel';
 import type { RunGraphResponse, StepNodeDto, UnitCheckpoint, StepResultRecord, RunEvent } from './api';
 
 // ---------------------------------------------------------------------------
@@ -1077,5 +1077,140 @@ describe('superseded attempts', () => {
     const b = buildRunGraphModel(makeGraph({}), events).nodeById('b')!;
     expect(b.fanout!.units[0].state).toBe('running');
     expect(b.state).toBe('running');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Step warnings — recorded per step / unit, NEVER a status change.
+// ---------------------------------------------------------------------------
+
+describe('step_warning', () => {
+  const warn = (step_id: string, message: string, index?: number): RunEvent =>
+    ({
+      type: 'step_warning',
+      run_id: runId(),
+      step_id,
+      message,
+      ...(index === undefined ? {} : { index }),
+    }) as RunEvent;
+  const unitStarted = (index: number): RunEvent => ({
+    type: 'unit_started',
+    run_id: runId(),
+    step_id: 'b',
+    index,
+    unit_key: `u${index}`,
+    transcript_path: `/t/${index}.jsonl`,
+  });
+  const unitDone = (index: number): RunEvent => ({
+    type: 'unit_completed',
+    run_id: runId(),
+    step_id: 'b',
+    index,
+    unit_key: `u${index}`,
+    success: true,
+    tokens_in: 1,
+    tokens_out: 1,
+  });
+
+  it('records a step-level warning on that step only', () => {
+    const model = buildRunGraphModel(makeGraph(), [warn('a', 'host gpu-9 sent no coverage')]);
+    expect(model.nodeById('a')!.warnings).toEqual([{ message: 'host gpu-9 sent no coverage' }]);
+    expect(model.nodeById('b')!.warnings).toBeUndefined();
+    expect(model.nodeById('c')!.warnings).toBeUndefined();
+  });
+
+  it('never changes a step status — pending stays pending, done stays done, failed stays failed', () => {
+    const events: RunEvent[] = [
+      { type: 'step_completed', run_id: runId(), step_id: 'a', success: true, duration_ms: 5 },
+      { type: 'step_failed', run_id: runId(), step_id: 'c', error: 'boom' },
+      warn('a', 'late coverage note'),
+      warn('b', 'never started'),
+      warn('c', 'partial coverage'),
+    ];
+    const model = buildRunGraphModel(makeGraph(), events);
+    expect(model.nodeById('a')!.state).toBe('done');
+    expect(model.nodeById('b')!.state).toBe('pending');
+    expect(model.nodeById('c')!.state).toBe('failed');
+    for (const id of ['a', 'b', 'c']) expect(model.nodeById(id)!.warnings).toHaveLength(1);
+  });
+
+  it('a warning on a running step leaves it running', () => {
+    const model = buildRunGraphModel(makeGraph(), [
+      { type: 'step_started', run_id: runId(), step_id: 'a', kind: 'step' },
+      warn('a', 'still going'),
+    ]);
+    expect(model.nodeById('a')!.state).toBe('running');
+  });
+
+  it('attaches a unit warning to that unit and to its step, leaving unit states alone', () => {
+    const model = buildRunGraphModel(makeGraph(), [
+      unitStarted(0),
+      unitStarted(1),
+      unitDone(0),
+      warn('b', 'host gpu-9 did not stream coverage', 1),
+    ]);
+    const b = model.nodeById('b')!;
+    const u0 = b.fanout!.units.find((u) => u.index === 0)!;
+    const u1 = b.fanout!.units.find((u) => u.index === 1)!;
+    expect(u1.warnings).toEqual(['host gpu-9 did not stream coverage']);
+    expect(u0.warnings).toBeUndefined();
+    // the step aggregates every warning, tagged with its unit index
+    expect(b.warnings).toEqual([{ index: 1, message: 'host gpu-9 did not stream coverage' }]);
+    // statuses are exactly what the lifecycle events say
+    expect(u0.state).toBe('done');
+    expect(u1.state).toBe('running');
+    expect(b.fanout!.byState.failed).toBe(0);
+  });
+
+  it('lands a unit warning even when it precedes that unit_started', () => {
+    const model = buildRunGraphModel(makeGraph(), [warn('b', 'early', 3), unitStarted(3)]);
+    const unit = model.nodeById('b')!.fanout!.units.find((u) => u.index === 3)!;
+    expect(unit.warnings).toEqual(['early']);
+  });
+
+  it('keeps a unit warning on the step when the unit has no view yet', () => {
+    const model = buildRunGraphModel(makeGraph(), [warn('b', 'orphan unit note', 7)]);
+    expect(model.nodeById('b')!.warnings).toEqual([{ index: 7, message: 'orphan unit note' }]);
+  });
+
+  it('keeps several warnings in arrival order and drops exact duplicates', () => {
+    const model = buildRunGraphModel(makeGraph(), [
+      warn('a', 'first'),
+      warn('a', 'second'),
+      warn('a', 'first'),
+    ]);
+    expect(model.nodeById('a')!.warnings!.map((w) => w.message)).toEqual(['first', 'second']);
+  });
+
+  it('ignores a warning for a step that is not in the workflow', () => {
+    const model = buildRunGraphModel(makeGraph(), [warn('ghost', 'who?')]);
+    expect(model.nodes.every((n) => n.warnings === undefined)).toBe(true);
+  });
+
+  it('a successfully completed run keeps its warnings while promoting in-flight state', () => {
+    const g = makeGraph();
+    g.run.status = 'completed';
+    const model = buildRunGraphModel(g, [warn('a', 'kept')]);
+    expect(model.nodeById('a')!.state).toBe('done');
+    expect(model.nodeById('a')!.warnings).toEqual([{ message: 'kept' }]);
+  });
+});
+
+describe('collectWarnings', () => {
+  it('lists every warning across steps in graph order, labelled by step and unit', () => {
+    const model = buildRunGraphModel(makeGraph(), [
+      { type: 'step_warning', run_id: runId(), step_id: 'c', message: 'c note' } as RunEvent,
+      { type: 'step_warning', run_id: runId(), step_id: 'b', index: 2, message: 'b unit note' } as RunEvent,
+      { type: 'step_warning', run_id: runId(), step_id: 'a', message: 'a note' } as RunEvent,
+    ]);
+    expect(collectWarnings(model)).toEqual([
+      { stepId: 'a', message: 'a note' },
+      { stepId: 'b', index: 2, message: 'b unit note' },
+      { stepId: 'c', message: 'c note' },
+    ]);
+  });
+
+  it('is empty when nothing warned', () => {
+    expect(collectWarnings(buildRunGraphModel(makeGraph(), []))).toEqual([]);
   });
 });

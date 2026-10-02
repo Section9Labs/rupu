@@ -12,6 +12,7 @@ import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent, runKindIcon, runKindLabel } from './kindBridge';
 import { AgentIdentity } from '../codename/AgentIdentity';
+import WarnMark from './WarnMark';
 
 export interface StepNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -61,6 +62,7 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
           {s.glyph}
         </span>
         <span className="flex-1 truncate text-ui font-semibold text-ink">{node.id}</span>
+        <WarnMark warnings={node.warnings} />
         <span className="text-meta text-ink-mute tabular-nums">
           {node.state === 'pending' ? '—' : s.label}
         </span>

@@ -49,7 +49,8 @@ function KindIcon({ form, badge, className }: { form: CardForm; badge: string; c
   if (badge === 'Skipped') return <SkipForward className={cls} />;
   switch (form) {
     case 'await': return <Pause className={cls} />;
-    case 'error': return <AlertTriangle className={cls} />;
+    case 'error':
+    case 'warning': return <AlertTriangle className={cls} />;
     case 'complete': return <CheckCircle2 className={cls} />;
     case 'panel': return <Users className={cls} />;
     case 'lifecycle': return <PlayCircle className={cls} />;
@@ -58,10 +59,11 @@ function KindIcon({ form, badge, className }: { form: CardForm; badge: string; c
 }
 
 /** Status pill tone + rail-marker colour, from the card's outcome. Green =
- *  succeeded, red = failed, amber = awaiting, blue = in-progress, violet =
- *  routine; findings tint by severity. */
+ *  succeeded, red = failed, amber = awaiting / warned, blue = in-progress,
+ *  violet = routine; findings tint by severity. */
 function statusVisual(card: StreamCard): { tone: BadgeTone; dot: DotColor } {
   if (card.accent === 'error') return { tone: 'red', dot: 'failed' };
+  if (card.accent === 'warn') return { tone: 'amber', dot: 'awaiting' };
   if (card.accent === 'await') return { tone: 'amber', dot: 'awaiting' };
   if (card.form === 'finding') {
     const s = card.severity;
@@ -134,7 +136,8 @@ export default function EventCard({
 
   const durationS = card.durationMs != null ? `${Math.round(card.durationMs / 100) / 10}s` : undefined;
   const hasMeta = !!(card.unitKey || durationS || card.tokensIn != null || card.round);
-  const showNote = !!card.detail && card.form !== 'complete' && card.form !== 'finding' && card.form !== 'error';
+  const showNote =
+    !!card.detail && card.form !== 'complete' && card.form !== 'finding' && card.form !== 'error' && card.form !== 'warning';
 
   async function act(kind: 'approve' | 'reject') {
     const runId = card.approvable?.runId;
@@ -205,7 +208,7 @@ export default function EventCard({
 
         {/* Line 2: what happened — icon · agent · step/what */}
         <div className="mt-1 flex items-start gap-1.5 text-sm font-medium text-ink">
-          <span className="mt-px shrink-0 text-ink-mute"><KindIcon form={card.form} badge={card.badge} className="h-[14px] w-[14px]" /></span>
+          <span className={cn('mt-px shrink-0', card.form === 'warning' ? 'text-warn' : 'text-ink-mute')}><KindIcon form={card.form} badge={card.badge} className="h-[14px] w-[14px]" /></span>
           {card.codename ? (
             <>
               <span className="shrink-0 text-brand-700">
@@ -245,6 +248,12 @@ export default function EventCard({
 
         {/* Secondary note (real notes / reasons) */}
         {showNote && <p className="mt-1 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+
+        {/* Warning body — the step did NOT fail; the message is the point, so
+            it carries the warning tone rather than the muted note style. */}
+        {card.form === 'warning' && card.detail && (
+          <p className="mt-1 break-words text-note leading-relaxed text-warn">{card.detail}</p>
+        )}
 
         {/* Finding: the rich, detailed body */}
         {card.form === 'finding' && (

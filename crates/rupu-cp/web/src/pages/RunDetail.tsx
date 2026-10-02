@@ -34,13 +34,14 @@ import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { FindingRow } from '../components/findings/FindingRow';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
+import RunWarningsBanner from '../components/RunWarningsBanner';
 import TranscriptPanel from '../components/TranscriptPanel';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
-import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
+import { buildRunGraphModel, collectWarnings, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -425,6 +426,9 @@ export default function RunDetail() {
     () => (graph ? buildRunGraphModel(graph, rawEvents) : null),
     [graph, rawEvents],
   );
+  // `step_warning`s folded onto the model — listed in a run-level banner so a
+  // run with warnings says so without opening the Events tab.
+  const warnings = useMemo(() => (model ? collectWarnings(model) : []), [model]);
 
   // Seed the default selection ONCE, the first time the model resolves a
   // selectable node. After that the user (or a click) owns the selection — we
@@ -908,6 +912,8 @@ export default function RunDetail() {
             {run.error_message}
           </div>
         )}
+
+        <RunWarningsBanner warnings={warnings} />
 
         {awaitingGates.length > 1 ? (
           <div className="mt-3 space-y-3">

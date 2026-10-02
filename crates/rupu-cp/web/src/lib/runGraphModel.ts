@@ -43,6 +43,21 @@ export interface UnitView {
   /** Provider + model from the unit's `agent_started` (absent for placed units). */
   provider?: string;
   model?: string;
+  /** `step_warning` messages about this unit, in arrival order. Never affects
+   *  `state` — a warning is not a status. */
+  warnings?: string[];
+}
+
+/** One `step_warning`, as kept on its step. `index` is set when the warning is
+ *  about one fan-out unit (the unit's own `warnings` carries the message too). */
+export interface StepWarningView {
+  index?: number;
+  message: string;
+}
+
+/** A warning flattened for run-level display (see {@link collectWarnings}). */
+export interface RunWarning extends StepWarningView {
+  stepId: string;
 }
 
 /** One `parallel:` sub-step. `agent` comes from the DAG; codename from the
@@ -76,6 +91,9 @@ export interface GraphNode {
   /** Provider + model from the step's `agent_started` event. */
   provider?: string;
   model?: string;
+  /** Every `step_warning` for this step (step-level and per-unit), in arrival
+   *  order. Informational only — never changes `state`. */
+  warnings?: StepWarningView[];
   state: StepState;
   /** Path to this step's agent transcript JSONL, when one was recorded. */
   transcriptPath?: string;
@@ -158,6 +176,16 @@ function applyIdentity(
   setCodename(target, id.codename, id.codename_derived);
   if (id.provider) target.provider = id.provider;
   if (id.model) target.model = id.model;
+}
+
+/** Every warning in the model, flattened in graph (step) order — what a
+ *  run-level "this run has warnings" banner lists. */
+export function collectWarnings(model: RunGraphModel): RunWarning[] {
+  const out: RunWarning[] = [];
+  for (const node of model.nodes) {
+    for (const w of node.warnings ?? []) out.push({ stepId: node.id, ...w });
+  }
+  return out;
 }
 
 /** Zero-fill a byState counter object. */
@@ -281,6 +309,9 @@ export function buildRunGraphModel(
   // Seeded from the graph response's server-side fold (the WHOLE
   // events.jsonl), so identities survive the capped live-event window; the
   // live events below layer on top, field by field (live wins).
+  // `step_warning`s are likewise applied after the loop (a unit warning can
+  // beat its unit_started) and never touch a status: they only annotate.
+  const warningEvents: Array<{ stepId: string; index?: number; message: string }> = [];
   const stepIdentities = new Map<string, AgentIdentity>(Object.entries(g.step_identities ?? {}));
   const unitIdentities = new Map<string, Map<number, AgentIdentity>>();
   for (const [stepId, byIndex] of Object.entries(g.unit_identities ?? {})) {
@@ -353,6 +384,15 @@ export function buildRunGraphModel(
       case 'step_skipped': {
         const node = nodeMap.get(ev.step_id);
         if (node) node.state = 'skipped';
+        break;
+      }
+      case 'step_warning': {
+        // Deliberately no `state` change — see the deferred application below.
+        warningEvents.push({
+          stepId: ev.step_id,
+          index: typeof ev.index === 'number' ? ev.index : undefined,
+          message: ev.message,
+        });
         break;
       }
       case 'unit_started': {
@@ -487,6 +527,22 @@ export function buildRunGraphModel(
     const hasInFlight = byState.running > 0 || byState.awaiting_approval > 0;
     if (hasInFlight && node.state === 'pending') {
       node.state = 'running';
+    }
+  }
+
+  // Apply step warnings (annotation only — never a status). Each lands on its
+  // step, and on its unit when `index` names one that exists. A warning for a
+  // step the skeleton lacks is dropped (never fabricates a node); an exact
+  // repeat (same unit + message) is shown once.
+  for (const w of warningEvents) {
+    const node = nodeMap.get(w.stepId);
+    if (!node) continue;
+    const list = (node.warnings ??= []);
+    if (list.some((x) => x.index === w.index && x.message === w.message)) continue;
+    list.push(w.index === undefined ? { message: w.message } : { index: w.index, message: w.message });
+    if (w.index !== undefined) {
+      const unit = unitsByStep.get(w.stepId)?.get(w.index);
+      if (unit) (unit.warnings ??= []).push(w.message);
     }
   }
 

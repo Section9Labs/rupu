@@ -10,7 +10,7 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import EventCard from './EventCard';
 import { cardFromEvent, cardFromFinding } from '../../lib/situationRoom/cards';
-import type { FindingOut, StepAwaitingApprovalEvent, StepFailedEvent } from '../../lib/api';
+import type { FindingOut, StepAwaitingApprovalEvent, StepFailedEvent, StepWarningEvent } from '../../lib/api';
 
 afterEach(cleanup);
 
@@ -49,6 +49,29 @@ describe('EventCard — error', () => {
     const raw = screen.getByRole('button', { name: /raw/i });
     fireEvent.click(raw);
     expect(screen.getByText(/provider error: \{"code":429/)).toBeInTheDocument();
+  });
+});
+
+describe('EventCard — warning', () => {
+  const ev: StepWarningEvent = {
+    type: 'step_warning', run_id: 'r1', step_id: 'sweep', index: 4,
+    message: 'host gpu-9 did not stream coverage (older rupu?)',
+  };
+
+  it('renders a warning-toned row: amber badge, step + unit headline, the message', () => {
+    const { container } = renderCard(<EventCard card={cardFromEvent(ev, 1000, 'k1')!} />);
+    const badge = screen.getByText('Warning');
+    expect(badge).toHaveClass('text-warn');
+    expect(screen.getByText('sweep · unit 4 warning')).toBeInTheDocument();
+    const msg = screen.getByText('host gpu-9 did not stream coverage (older rupu?)');
+    expect(msg).toHaveClass('text-warn');
+    expect(container.querySelector('[data-testid="sr-ev"]')).toHaveAttribute('data-accent', 'warn');
+  });
+
+  it('is not an error row: no error badge, no Parsed/Raw error toggle', () => {
+    renderCard(<EventCard card={cardFromEvent(ev, 1000, 'k1')!} />);
+    expect(screen.queryByText('Error')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /parsed/i })).not.toBeInTheDocument();
   });
 });
 

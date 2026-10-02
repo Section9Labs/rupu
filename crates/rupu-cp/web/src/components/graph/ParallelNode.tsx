@@ -11,6 +11,7 @@ import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
 import { AgentIdentity } from '../codename/AgentIdentity';
+import WarnMark from './WarnMark';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -54,8 +55,11 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
         style={{ color: colors.get(accentKey) }}
       >
         <span className="truncate">parallel · {node.id}</span>
-        <span className="tabular-nums">
-          {done}/{total} ✓
+        <span className="flex shrink-0 items-center gap-1.5">
+          <WarnMark warnings={node.warnings} />
+          <span className="tabular-nums">
+            {done}/{total} ✓
+          </span>
         </span>
       </div>
 

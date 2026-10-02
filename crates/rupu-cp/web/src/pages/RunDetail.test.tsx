@@ -356,6 +356,37 @@ describe('RunDetail shell', () => {
     expect(feed).not.toHaveTextContent('evt:run');
   });
 
+  it('says a run has warnings in its own banner, without changing any step or the run status', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, onEvent) => {
+      onEvent({
+        type: 'step_warning', run_id: 'run-1', step_id: 'fan_out', index: 0,
+        message: 'host gpu-9 did not stream coverage',
+      });
+      return () => {};
+    });
+    renderPage();
+
+    const banner = await screen.findByTestId('run-warnings');
+    expect(banner).toHaveTextContent('1 warning');
+    expect(banner).toHaveTextContent('fan_out · unit 0');
+    expect(banner).toHaveTextContent('host gpu-9 did not stream coverage');
+    // a completed run stays completed — the warning is a notice, not a status
+    expect(screen.getByText('Completed')).toBeInTheDocument();
+  });
+
+  it('shows no warnings banner on a clean run', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByTestId('run-warnings')).toBeNull();
+  });
+
   it('approves and rejects an awaiting run via the approval-gate controls', async () => {
     vi.spyOn(api, 'getRunGraph').mockResolvedValue(AWAITING_GRAPH);
     vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);

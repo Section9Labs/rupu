@@ -33,3 +33,26 @@ describe('RunEventFeed — crewByRun', () => {
     expect(screen.queryByTestId('sr-crew-stripe')).toBeNull();
   });
 });
+
+describe('RunEventFeed — step_warning', () => {
+  const warning: SeqEvent[] = [
+    { seq: 1, event: { type: 'step_started', run_id: 'run-1', step_id: 'sweep', kind: 'for_each' } as SeqEvent['event'] },
+    {
+      seq: 2,
+      event: { type: 'step_warning', run_id: 'run-1', step_id: 'sweep', index: 1, message: 'host gpu-9 sent no coverage stream' } as SeqEvent['event'],
+    },
+  ];
+
+  it('renders a warning row with the message in the warning tone, beside the normal rows', () => {
+    render(
+      <MemoryRouter>
+        <RunEventFeed events={warning} connection="live" />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('Warning')).toHaveClass('text-warn');
+    expect(screen.getByText('host gpu-9 sent no coverage stream')).toHaveClass('text-warn');
+    expect(screen.getByText('sweep · unit 1 warning')).toBeInTheDocument();
+    // the step's ordinary row is untouched
+    expect(screen.getByText('Step')).toBeInTheDocument();
+  });
+});

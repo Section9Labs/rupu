@@ -6,12 +6,14 @@
 
 import { describe, it, expect } from 'vitest';
 import { cardFromEvent, cardFromFinding, unitKeyIndex } from './cards';
+import { filterStreamCards } from './filter';
 import type {
   FindingOut,
   StepAwaitingApprovalEvent,
   StepCompletedEvent,
   StepFailedEvent,
   StepStartedEvent,
+  StepWarningEvent,
   StepWorkingEvent,
   PanelRoundEvent,
   UnitStartedEvent,
@@ -38,6 +40,47 @@ describe('cardFromEvent', () => {
     expect(c.group).toBe('error');
     expect(c.accent).toBe('error');
     expect(c.detail).toBe('clone timed out');
+  });
+
+  it('a step warning is its own warning card — not the generic unknown-event card, not an error', () => {
+    const ev: StepWarningEvent = {
+      type: 'step_warning', run_id: 'r1', step_id: 'sweep',
+      message: 'host gpu-9 did not stream coverage (older rupu?) — the unit\'s findings were not collected',
+    };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.form).toBe('warning');
+    expect(c.group).toBe('warning');
+    expect(c.accent).toBe('warn');
+    expect(c.badge).toBe('Warning');
+    expect(c.stepId).toBe('sweep');
+    expect(c.title).toBe('sweep warning');
+    expect(c.detail).toBe(ev.message);
+    expect(c.runId).toBe('r1');
+    expect(c.unitKey).toBeUndefined();
+  });
+
+  it('a unit-scoped warning names the unit, and takes its unit_key from the run context', () => {
+    const ev: StepWarningEvent = {
+      type: 'step_warning', run_id: 'r1', step_id: 'sweep', index: 2, message: 'no coverage from gpu-9',
+    };
+    const started: UnitStartedEvent = {
+      type: 'unit_started', run_id: 'r1', step_id: 'sweep', index: 2, unit_key: 'repo-delta', transcript_path: '/t/2.jsonl',
+    };
+    const bare = cardFromEvent(ev, 1000, 'k1')!;
+    expect(bare.title).toBe('sweep · unit 2 warning');
+    const withCtx = cardFromEvent(ev, 1000, 'k1', { unitKeys: unitKeyIndex([started]) })!;
+    expect(withCtx.unitKey).toBe('repo-delta');
+    expect(withCtx.group).toBe('warning');
+  });
+
+  it('warnings narrow with their own group chip and stay out of the error group', () => {
+    const warn = cardFromEvent(
+      { type: 'step_warning', run_id: 'r1', step_id: 'sweep', message: 'coverage gap' } as StepWarningEvent, 1, 'w')!;
+    const err = cardFromEvent({ type: 'step_failed', run_id: 'r1', step_id: 'x', error: 'boom' } as StepFailedEvent, 2, 'e')!;
+    expect(filterStreamCards([warn, err], 'warning', '').map((c) => c.key)).toEqual(['w']);
+    expect(filterStreamCards([warn, err], 'error', '').map((c) => c.key)).toEqual(['e']);
+    // the message is searchable
+    expect(filterStreamCards([warn, err], 'all', 'coverage gap').map((c) => c.key)).toEqual(['w']);
   });
 
   it('an agent step_started is a Scanning activity card attributed to the agent', () => {

@@ -76,4 +76,42 @@ describe('StepNode', () => {
     renderNode({ agent: 'security-reviewer', codename: 'jade-reef/heron' });
     expect(screen.getByTestId('agent-identity')).not.toHaveClass('opacity-60');
   });
+
+  it('shows a warning marker with the message on hover, without touching the status', () => {
+    renderNode({
+      state: 'done',
+      warnings: [
+        { message: 'host gpu-9 did not stream coverage' },
+        { index: 2, message: 'unit findings were not collected' },
+      ],
+    });
+    const mark = screen.getByTestId('rg-warn');
+    expect(mark).toHaveTextContent('⚠');
+    expect(mark).toHaveClass('text-warn');
+    expect(mark).toHaveAttribute('aria-label', '2 warnings');
+    expect(mark.getAttribute('title')).toBe(
+      'host gpu-9 did not stream coverage\nunit 2: unit findings were not collected',
+    );
+    // the status overlay is exactly what the lifecycle said
+    expect(screen.getByText('✓')).toBeInTheDocument();
+    expect(screen.getByText('done')).toBeInTheDocument();
+  });
+
+  it('a FAILED step that also warned still reads failed', () => {
+    renderNode({ state: 'failed', warnings: [{ message: 'partial coverage' }] });
+    expect(screen.getByText('✕')).toBeInTheDocument();
+    expect(screen.getByText('failed')).toBeInTheDocument();
+    expect(screen.getByTestId('rg-warn')).toHaveAttribute('aria-label', '1 warning');
+  });
+
+  it('renders no marker when the step has no warnings', () => {
+    renderNode({ state: 'done' });
+    expect(screen.queryByTestId('rg-warn')).toBeNull();
+  });
+
+  it('adding a marker does not change the node box', () => {
+    const { container } = renderNode({ agent: 'security-reviewer', warnings: [{ message: 'x' }] });
+    const root = container.querySelector('.shadow-card') as HTMLElement;
+    expect(root.style.minHeight).toBe(`${STEP_AGENT_H}px`);
+  });
 });

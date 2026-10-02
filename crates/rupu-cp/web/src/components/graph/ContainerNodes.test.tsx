@@ -299,3 +299,69 @@ describe('codenames on container nodes', () => {
     expect(screen.getByText('lynx1')).toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Step warnings — a header marker with the message, plus the warned unit's own
+// square / row. Never a state change.
+// ---------------------------------------------------------------------------
+
+describe('step warnings on container nodes', () => {
+  const W = { index: 1, message: 'host gpu-9 sent no coverage stream' };
+
+  it('FanoutNode (inline) marks the header and the warned unit square, leaving unit states alone', () => {
+    const node = {
+      ...FANOUT,
+      warnings: [W],
+      fanout: {
+        ...FANOUT.fanout!,
+        units: FANOUT.fanout!.units.map((u) => (u.index === 1 ? { ...u, warnings: [W.message] } : u)),
+      },
+    } as GraphNode;
+    const { container } = renderFanout(node);
+    const mark = screen.getByTestId('rg-warn');
+    expect(mark.getAttribute('title')).toBe('unit 1: host gpu-9 sent no coverage stream');
+    // only unit 1's square carries the warning ring + message
+    const squares = Array.from(container.querySelectorAll('button'));
+    expect(squares).toHaveLength(3);
+    expect(squares[1].className).toContain('ring-warn');
+    expect(squares[1].getAttribute('title')).toMatch(/done · ⚠ host gpu-9 sent no coverage stream$/);
+    expect(squares[0].className).not.toContain('ring-warn');
+    expect(squares[0].getAttribute('title')).not.toMatch(/⚠/);
+    // the header counts are still the lifecycle's: 2 done, none failed
+    expect(screen.getByText(/2 ✓/)).toBeInTheDocument();
+    expect(screen.queryByText(/✕/)).toBeNull();
+  });
+
+  it('FanoutNode (large) marks the header', () => {
+    renderFanout({ ...FANOUT_LARGE, warnings: [W] } as GraphNode);
+    expect(screen.getByTestId('rg-warn')).toHaveAttribute('aria-label', '1 warning');
+  });
+
+  it('FanoutNode with no warnings renders no marker', () => {
+    renderFanout(FANOUT);
+    expect(screen.queryByTestId('rg-warn')).toBeNull();
+  });
+
+  it('PanelLoopNode marks the header and the warned unit row', () => {
+    const node = {
+      ...PANEL,
+      warnings: [W],
+      fanout: {
+        ...PANEL.fanout!,
+        units: PANEL.fanout!.units.map((u) => (u.index === 1 ? { ...u, warnings: [W.message] } : u)),
+      },
+    } as GraphNode;
+    const { container } = renderPanel(node);
+    const marks = screen.getAllByTestId('rg-warn');
+    // one on the container header + one on bob's row; alice's row has none
+    expect(marks).toHaveLength(2);
+    const rows = Array.from(container.querySelectorAll('button'));
+    expect(rows[1].getAttribute('title')).toMatch(/⚠ host gpu-9 sent no coverage stream$/);
+    expect(rows[0].getAttribute('title')).not.toMatch(/⚠/);
+  });
+
+  it('ParallelNode marks the header', () => {
+    renderParallel({ ...PARALLEL, warnings: [{ message: 'one sub-step lost its coverage' }] } as GraphNode);
+    expect(screen.getByTestId('rg-warn').getAttribute('title')).toBe('one sub-step lost its coverage');
+  });
+});
