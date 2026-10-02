@@ -34,6 +34,25 @@ pub trait OAuthRefresher: Send + Sync {
         &self,
         stale: crate::auth::AuthCredentials,
     ) -> Result<crate::auth::AuthCredentials, crate::error::ProviderError>;
+
+    /// Record `fields` in the stored credential's `extra`, under the same
+    /// lock and against what is stored, so a fact a client learned about its
+    /// credential (Gemini's Code Assist project) survives the next refresh
+    /// and reaches the next process. `holder` is the credential the client
+    /// holds: nothing is written — `Ok(false)` — when the stored credential
+    /// is no longer that grant (a re-login or logout since), so a fact about
+    /// one grant never lands on another. A store that cannot record says so
+    /// with an error; it never drops the fields silently.
+    async fn record_extra(
+        &self,
+        holder: crate::auth::AuthCredentials,
+        fields: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bool, crate::error::ProviderError> {
+        let _ = (holder, fields);
+        Err(crate::error::ProviderError::AuthConfig(
+            "this credential store cannot record credential fields".into(),
+        ))
+    }
 }
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);

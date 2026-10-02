@@ -270,6 +270,9 @@ pub async fn run_with_client(
         .context("token exchange json")?;
 
     let mut stored = stored_credential_for(provider, token);
+    if provider == ProviderId::Gemini {
+        crate::oauth::gemini::set_up_code_assist(&mut stored).await;
+    }
     if chosen {
         if let AuthCredentials::OAuth { extra, .. } = &mut stored.credentials {
             extra.insert(EXTRA_CLIENT_ID.into(), app.client_id.into());

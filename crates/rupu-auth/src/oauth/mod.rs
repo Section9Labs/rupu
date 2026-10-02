@@ -5,6 +5,7 @@
 
 pub mod callback;
 pub mod device;
+mod gemini;
 pub mod gitlab;
 pub mod pkce;
 pub mod providers;

@@ -222,8 +222,16 @@ impl KeychainResolver {
         T: Send + 'static,
         F: FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
     {
-        let path = self.auth_file();
-        let lock_timeout = self.lock_timeout;
+        Self::with_lock_at(self.auth_file(), self.lock_timeout, f).await
+    }
+
+    /// [`Self::with_file_lock`] on the auth file at `path` (already resolved
+    /// through any symlink), waiting at most `lock_timeout` for its lock.
+    async fn with_lock_at<T, F>(path: PathBuf, lock_timeout: std::time::Duration, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
+    {
         let mutex = file_mutex(&path);
         let _in_process = mutex.lock().await;
         tokio::task::spawn_blocking(move || {
@@ -377,6 +385,41 @@ impl KeychainResolver {
         let account = format!("{name}/{}", mode.as_str());
         let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
         Self::write_account_at(path, &account, &payload)
+    }
+
+    /// Merge `fields` into `account`'s stored SSO credential's `extra`, if it
+    /// is still the grant whose refresh token is `holder_refresh`; `false`
+    /// (nothing written) when it is not — a re-login or logout since. The
+    /// caller holds the [`AuthFileLock`]. A rotation the file could not take
+    /// ([`unpersisted`]) is the credential merged into, and lands with it.
+    fn record_extra_at(
+        path: &std::path::Path,
+        account: &str,
+        holder_refresh: &str,
+        fields: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bool> {
+        let key = format!("{account}/{}", AuthMode::Sso.as_str());
+        let file_entry = Self::file_entry_at(path, &key)?;
+        let current = match unpersisted::get_based_on(path, &key, file_entry.as_deref()) {
+            Some(pending) => pending,
+            None => match file_entry {
+                Some(entry) => entry,
+                None => return Ok(false),
+            },
+        };
+        let mut sc = parse_stored_credential(&current, AuthMode::Sso)?;
+        if stored_refresh_token(&sc) != Some(holder_refresh) {
+            return Ok(false);
+        }
+        let AuthCredentials::OAuth { extra, .. } = &mut sc.credentials else {
+            return Ok(false);
+        };
+        for (k, v) in fields {
+            extra.insert(k.clone(), v.clone());
+        }
+        let payload = serde_json::to_string(&sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+        Self::write_account_at(path, &key, &payload)?;
+        Ok(true)
     }
 
     /// Refresh `account`'s stored `mode` credential and persist it — as a
@@ -1073,6 +1116,26 @@ impl rupu_providers::credential_writes::OAuthRefresher for KeychainRefresher {
         .await
         .map(|sc| sc.credentials)
         .map_err(|e| rupu_providers::ProviderError::TokenRefreshFailed(e.to_string()))
+    }
+
+    async fn record_extra(
+        &self,
+        holder: AuthCredentials,
+        fields: std::collections::HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<bool, rupu_providers::ProviderError> {
+        let AuthCredentials::OAuth {
+            refresh: holder_refresh,
+            ..
+        } = holder
+        else {
+            return Ok(false);
+        };
+        let account = self.account.clone();
+        KeychainResolver::with_lock_at(self.path.clone(), self.lock_timeout, move |path| {
+            KeychainResolver::record_extra_at(path, &account, &holder_refresh, &fields)
+        })
+        .await
+        .map_err(|e| rupu_providers::ProviderError::AuthConfig(e.to_string()))
     }
 }
 
