@@ -179,8 +179,16 @@ pub struct UnitOutcome {
 /// post-launch outcome — success or failure — so the runner can merge it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitCoverage {
-    /// The unit's coverage stream as its host connector delivered it.
+    /// The unit's whole coverage stream, read after the unit was terminal
+    /// through a transport that guarantees it is complete.
     Stream(Vec<u8>),
+    /// A stream the coordinator could not confirm is whole: read while the
+    /// unit may still have been running (a poll error after the run was
+    /// observed, the wall timeout), or a terminal read the transport could not
+    /// confirm complete. Merged exactly like [`Self::Stream`], plus a
+    /// `StepWarning` naming `reason`: what the unit recorded after this read
+    /// may be missing.
+    Partial { bytes: Vec<u8>, reason: String },
     /// The connector could not deliver a stream; the reason is surfaced as a
     /// `StepWarning`.
     Unavailable(String),
@@ -7270,6 +7278,10 @@ fn take_coverage(r: &mut Result<UnitOutcome, UnitFailure>) -> UnitCoverage {
 /// Merge a remote unit's coverage into the coordinator workspace (spec
 /// 2026-09-30-rupu-remote-findings-transport-design.md §A4) and surface
 /// anything that went wrong as a `StepWarning`. Never fails the unit.
+///
+/// Returns whether the stream is now the source of truth for the unit's
+/// coverage: it arrived with its begin line (whole or [`UnitCoverage::Partial`])
+/// and merged without an error.
 async fn ingest_remote_unit_coverage(
     workspace: &Path,
     host: &str,
@@ -7278,7 +7290,7 @@ async fn ingest_remote_unit_coverage(
     workflow_run_id: &str,
     step_id: &str,
     index: Option<usize>,
-) {
+) -> bool {
     let warn = |message: String| {
         warn!(step = %step_id, host, %message, "remote unit coverage");
         if let Some(sink) = sink {
@@ -7293,15 +7305,16 @@ async fn ingest_remote_unit_coverage(
             );
         }
     };
-    let bytes = match coverage {
-        UnitCoverage::NotLaunched => return,
+    let (bytes, partial) = match coverage {
+        UnitCoverage::NotLaunched => return false,
         UnitCoverage::Unavailable(reason) => {
             warn(format!(
                 "coverage from host {host} was not collected: {reason}"
             ));
-            return;
+            return false;
         }
-        UnitCoverage::Stream(bytes) => bytes,
+        UnitCoverage::Stream(bytes) => (bytes, None),
+        UnitCoverage::Partial { bytes, reason } => (bytes, Some(reason)),
     };
     let source = rupu_coverage::IngestSource {
         host: (host != "local").then(|| host.to_string()),
@@ -7312,18 +7325,51 @@ async fn ingest_remote_unit_coverage(
     })
     .await;
     match merged {
-        Ok(Ok(r)) if !r.begin_seen => warn(format!(
-            "host {host} sent no coverage stream (it may predate coverage streaming — upgrade \
-             rupu there); its findings and coverage reach the coordinator only through a \
-             workspace-sync delta, if any"
-        )),
-        Ok(Ok(r)) if r.malformed > 0 => warn(format!(
-            "{} malformed coverage line(s) from host {host} were skipped ({} merged)",
-            r.malformed, r.appended
-        )),
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => warn(format!("merging coverage from host {host} failed: {e}")),
-        Err(e) => warn(format!("merging coverage from host {host} panicked: {e}")),
+        Ok(Ok(r)) if !r.begin_seen => {
+            // A current host writes the begin line when `rupu run` starts, so
+            // its absence means an older host OR a stream that failed to start
+            // or was lost on the way here — not provably either.
+            let mut message = format!(
+                "no coverage stream arrived from host {host} (no begin line: the host may \
+                 predate coverage streaming, or its stream failed to start or was lost in \
+                 transport); its findings and coverage arrive only through the \
+                 workspace-sync delta, when the step syncs"
+            );
+            if let Some(reason) = partial {
+                message.push_str(&format!(" ({reason})"));
+            }
+            warn(message);
+            false
+        }
+        Ok(Ok(r)) => {
+            if let Some(reason) = partial {
+                let mut message = format!(
+                    "coverage from host {host} may be incomplete ({reason}): findings and \
+                     coverage the unit recorded after it was collected may be missing \
+                     ({} line(s) merged",
+                    r.appended
+                );
+                if r.malformed > 0 {
+                    message.push_str(&format!(", {} malformed line(s) skipped", r.malformed));
+                }
+                message.push(')');
+                warn(message);
+            } else if r.malformed > 0 {
+                warn(format!(
+                    "{} malformed coverage line(s) from host {host} were skipped ({} merged)",
+                    r.malformed, r.appended
+                ));
+            }
+            true
+        }
+        Ok(Err(e)) => {
+            warn(format!("merging coverage from host {host} failed: {e}"));
+            false
+        }
+        Err(e) => {
+            warn(format!("merging coverage from host {host} panicked: {e}"));
+            false
+        }
     }
 }
 

@@ -248,3 +248,84 @@ async fn a_fan_out_primary_failure_and_its_retry_both_merge() {
     ids.sort();
     assert_eq!(ids, vec!["f_primary", "f_retry"]);
 }
+
+fn warnings(sink: &Collect) -> Vec<String> {
+    sink.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::StepWarning { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A stream the coordinator could not confirm is whole (read while the unit
+/// may still have been running) merges exactly like a complete one, AND says
+/// that findings recorded after it was collected may be missing.
+#[tokio::test]
+async fn a_partial_stream_merges_and_warns_that_later_findings_may_be_missing() {
+    let (tmp, sink) = run(
+        PLACED,
+        vec![Err(UnitFailure {
+            error: RunError::Provider("poll failed".into()),
+            coverage: UnitCoverage::Partial {
+                bytes: stream_with_finding("f_partial"),
+                reason: "read while the unit may still be running".into(),
+            },
+        })],
+    )
+    .await;
+    assert_eq!(findings_in(tmp.path())[0].id, "f_partial");
+    let w = warnings(&sink);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("host_01R"), "{w:?}");
+    assert!(
+        w[0].contains("read while the unit may still be running"),
+        "{w:?}"
+    );
+    assert!(w[0].contains("may be missing"), "{w:?}");
+}
+
+/// A complete stream merges silently: no warning is the signal that nothing
+/// was lost.
+#[tokio::test]
+async fn a_complete_stream_merges_without_a_warning() {
+    let (tmp, sink) = run(
+        PLACED,
+        vec![Ok(UnitOutcome {
+            output: "ok".into(),
+            success: true,
+            error: None,
+            workspace_delta: None,
+            coverage: UnitCoverage::Stream(stream_with_finding("f_whole")),
+        })],
+    )
+    .await;
+    assert_eq!(findings_in(tmp.path())[0].id, "f_whole");
+    assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
+}
+
+/// The no-begin-line warning must not claim the host is old: a current host
+/// writes the begin line at start, so its absence there means the stream
+/// failed to start or was lost in transport.
+#[tokio::test]
+async fn the_no_begin_line_warning_covers_an_old_host_and_a_lost_stream() {
+    let (_tmp, sink) = run(
+        PLACED,
+        vec![Ok(UnitOutcome {
+            output: "ok".into(),
+            success: true,
+            error: None,
+            workspace_delta: None,
+            coverage: UnitCoverage::Stream(Vec::new()),
+        })],
+    )
+    .await;
+    let w = warnings(&sink);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("predate coverage streaming"), "{w:?}");
+    assert!(w[0].contains("lost in transport"), "{w:?}");
+    assert!(!w[0].contains("upgrade rupu"), "{w:?}");
+}
