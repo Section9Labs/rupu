@@ -946,11 +946,11 @@ async fn a_plain_extra_usage_429_is_not_retried() {
     let inner = CapturingMockProvider::new(vec![final_text_turn(usage(1, 1, 0))]);
     let captured = inner.captured.clone();
     let provider = FailFirst {
-        err: Some(ProviderError::Api {
-            status: 429,
-            message: r#"{"error":{"message":"Extra usage is required for long context requests"}}"#
-                .into(),
-        }),
+        err: Some(ProviderError::api(
+            "anthropic",
+            429,
+            r#"{"error":{"message":"Extra usage is required for long context requests"}}"#,
+        )),
         inner,
     };
     let tmp = tempfile::tempdir().unwrap();

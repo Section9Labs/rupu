@@ -16,7 +16,7 @@
 use chrono::Utc;
 use rupu_auth::CredentialResolver;
 use rupu_cp::fleet_inventory::{FleetInventory, InventorySnapshot, ProbeState, ProviderProbeRow};
-use rupu_providers::{error::ProviderError, provider::LlmProvider};
+use rupu_providers::{error::ProviderError, provider::LlmProvider, reply_error::ErrorClass};
 use std::sync::{Arc, RwLock};
 
 /// How long a probe result stays authoritative. Long enough that a fleet of
@@ -89,13 +89,12 @@ pub struct CpFleetInventory {
 pub fn classify(err: &ProviderError) -> ProbeState {
     match err {
         ProviderError::NotImplemented { .. } => ProbeState::NeverProbed,
-        ProviderError::Unauthorized { .. }
-        | ProviderError::MissingAuth { .. }
+        ProviderError::MissingAuth { .. }
         | ProviderError::TokenRefreshFailed(_)
         | ProviderError::AuthConfig(_) => ProbeState::AuthFailed {
             detail: err.to_string(),
         },
-        ProviderError::Api { status, .. } if *status == 401 || *status == 403 => {
+        e if matches!(e.class(), ErrorClass::Auth | ErrorClass::Permission) => {
             ProbeState::AuthFailed {
                 detail: err.to_string(),
             }
@@ -419,7 +418,7 @@ async fn probe_one(name: &str, creds: rupu_providers::auth::AuthCredentials) -> 
         // Rate limiting is NOT a health failure: a 429 proves the credential
         // works. Reporting it red would light the strip up during normal
         // heavy use.
-        Err(ProviderError::RateLimited { .. }) => ProbeState::Ok,
+        Err(e) if e.class() == ErrorClass::RateLimited => ProbeState::Ok,
         Err(e) => classify(&e),
     }
 }
@@ -609,25 +608,14 @@ mod tests {
     #[test]
     fn auth_shaped_errors_classify_as_auth_failed() {
         let cases = [
-            ProviderError::Unauthorized {
-                provider: "anthropic".into(),
-                auth_mode: rupu_providers::auth_mode::AuthMode::ApiKey,
-                hint: "check your key".into(),
-            },
             ProviderError::MissingAuth {
                 provider: "anthropic".into(),
                 env_hint: "ANTHROPIC_API_KEY".into(),
             },
             ProviderError::TokenRefreshFailed("expired".into()),
             ProviderError::AuthConfig("bad auth.json".into()),
-            ProviderError::Api {
-                status: 401,
-                message: "nope".into(),
-            },
-            ProviderError::Api {
-                status: 403,
-                message: "nope".into(),
-            },
+            ProviderError::api("anthropic", 401, "nope"),
+            ProviderError::api("anthropic", 403, "nope"),
         ];
         for err in cases {
             assert!(
@@ -641,10 +629,7 @@ mod tests {
     fn transport_and_server_errors_classify_as_unreachable() {
         let cases = [
             ProviderError::Http("connection refused".into()),
-            ProviderError::Api {
-                status: 503,
-                message: "down".into(),
-            },
+            ProviderError::api("anthropic", 503, "down"),
         ];
         for err in cases {
             assert!(

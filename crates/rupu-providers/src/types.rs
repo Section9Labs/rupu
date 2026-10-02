@@ -532,10 +532,7 @@ mod tests {
         assert!(e.to_string().contains("ANTHROPIC_API_KEY"));
         assert!(e.to_string().contains("anthropic"));
 
-        let e = ProviderError::Api {
-            status: 401,
-            message: "Unauthorized".into(),
-        };
+        let e = ProviderError::api("anthropic", 401, "Unauthorized");
         let s = e.to_string();
         assert!(s.contains("401"));
         assert!(s.contains("Unauthorized"));

@@ -332,9 +332,10 @@ impl GoogleGeminiClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                &self.variant.provider_id().to_string(),
                 status,
                 &headers,
-                extract_google_error(&text),
+                &text,
             ));
         }
 
@@ -366,9 +367,10 @@ impl GoogleGeminiClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                &self.variant.provider_id().to_string(),
                 status,
                 &headers,
-                extract_google_error(&text),
+                &text,
             ));
         }
 
@@ -920,17 +922,14 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
                 .map_err(|e| ProviderError::Http(e.to_string()))?;
             let status = resp.status();
             if !status.is_success() {
-                let message: String = resp
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(500)
-                    .collect();
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message,
-                });
+                let headers = resp.headers().clone();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(crate::error::api_error_from_response(
+                    &provider,
+                    status.as_u16(),
+                    &headers,
+                    &text,
+                ));
             }
             let body = resp
                 .text()
@@ -1467,20 +1466,6 @@ fn truncate(text: &str, max_len: usize) -> String {
             .unwrap_or(0);
         format!("{}...", &text[..end])
     }
-}
-
-/// Extract a clean error message from a Google API JSON error response.
-fn extract_google_error(text: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(msg) = json
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-        {
-            return msg.to_string();
-        }
-    }
-    truncate(text, 500)
 }
 
 #[cfg(test)]
@@ -2810,18 +2795,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_google_error_json() {
-        let text = r#"{"error":{"code":429,"message":"Rate limit exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
-        assert_eq!(extract_google_error(text), "Rate limit exceeded");
-    }
-
-    #[test]
-    fn test_extract_google_error_plain() {
-        let text = "Internal server error";
-        assert_eq!(extract_google_error(text), "Internal server error");
-    }
-
-    #[test]
     fn test_stream_url() {
         let client = GoogleGeminiClient::new(
             test_creds("proj"),
@@ -3145,7 +3118,7 @@ mod llm_provider_impl_tests {
         let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
-        assert!(matches!(err, ProviderError::Api { status: 403, .. }));
+        assert_eq!(err.status(), Some(403));
     }
 
     #[tokio::test]

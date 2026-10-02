@@ -328,9 +328,10 @@ impl OpenAiCodexClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "openai-codex",
                 status,
                 &headers,
-                truncate_error(&text, 500),
+                &text,
             ));
         }
 
@@ -731,16 +732,20 @@ impl OpenAiCodexClient {
                 }
             }
             "response.failed" => {
-                let error_msg = data
+                let error = data
                     .get("response")
                     .and_then(|r| r.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("response failed (no details)");
-                return Err(ProviderError::Api {
-                    status: 500,
-                    message: error_msg.to_string(),
-                });
+                    .cloned()
+                    .unwrap_or_else(
+                        || serde_json::json!({"message": "response failed (no details)"}),
+                    );
+                return Err(ProviderError::Reply(Box::new(
+                    crate::reply_error::parse_error_value(
+                        "openai-codex",
+                        crate::reply_error::ErrorOrigin::Stream,
+                        &error,
+                    ),
+                )));
             }
             _ => {
                 debug!(event_type, "ignoring OpenAI SSE event");
@@ -835,17 +840,14 @@ impl OpenAiCodexClient {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::api_error_from_response(
+                "openai-codex",
+                status.as_u16(),
+                &headers,
+                &text,
+            ));
         }
         let body = resp
             .text()
@@ -4028,10 +4030,7 @@ mod fetch_models_tests {
         catalog.assert_hits(1);
         public.assert_hits(1);
         // The public `/v1/models` failure is the one reported.
-        assert!(
-            matches!(err, ProviderError::Api { status: 500, .. }),
-            "{err:?}"
-        );
+        assert!(err.status() == Some(500), "{err:?}");
     }
 
     // ── review fixes: shapes, decode errors, fallback, production URL ─────

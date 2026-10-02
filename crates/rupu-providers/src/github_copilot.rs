@@ -143,9 +143,10 @@ impl GithubCopilotClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "github-copilot",
                 status,
                 &headers,
-                truncate(&text, 500),
+                &text,
             ));
         }
 
@@ -178,9 +179,10 @@ impl GithubCopilotClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "github-copilot",
                 status,
                 &headers,
-                truncate(&text, 500),
+                &text,
             ));
         }
 
@@ -426,17 +428,14 @@ impl crate::provider::LlmProvider for GithubCopilotClient {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::api_error_from_response(
+                "github-copilot",
+                status.as_u16(),
+                &headers,
+                &text,
+            ));
         }
         let body = resp
             .text()
@@ -1089,13 +1088,12 @@ mod tests {
         let err = <GithubCopilotClient as LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
-        match err {
-            ProviderError::Api { status, message } => {
-                assert_eq!(status, 401);
-                assert_eq!(message, "Unauthorized");
-            }
-            _ => panic!("expected ProviderError::Api with status 401, got {err:?}"),
-        }
+        let reply = err
+            .reply()
+            .unwrap_or_else(|| panic!("expected a reply error, got {err:?}"));
+        assert_eq!(reply.status(), Some(401));
+        assert_eq!(reply.message, "Unauthorized");
+        assert_eq!(reply.provider, "github-copilot");
     }
 }
 

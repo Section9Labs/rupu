@@ -247,20 +247,14 @@ mod tests {
         #[async_trait]
         impl LlmProvider for FailingProvider {
             async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-                Err(ProviderError::Api {
-                    status: 500,
-                    message: "upstream failure".into(),
-                })
+                Err(ProviderError::api("mock", 500, "upstream failure"))
             }
             async fn stream(
                 &mut self,
                 _: &LlmRequest,
                 _: &mut (dyn FnMut(StreamEvent) + Send),
             ) -> Result<LlmResponse, ProviderError> {
-                Err(ProviderError::Api {
-                    status: 503,
-                    message: "unavailable".into(),
-                })
+                Err(ProviderError::api("mock", 503, "unavailable"))
             }
             fn default_model(&self) -> &str {
                 "failing-model"
@@ -292,7 +286,7 @@ mod tests {
         let result = provider.send(&request).await;
         assert!(matches!(
             result,
-            Err(ProviderError::Api { status: 500, .. })
+            Err(e) if e.status() == Some(500)
         ));
     }
 }

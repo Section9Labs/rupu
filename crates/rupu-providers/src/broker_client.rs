@@ -39,8 +39,9 @@ impl BrokerClient {
         // `FlowCtx::system(Origin::Provider("broker"))`. Plan 2 threads
         // the real run id through once the provider factory is touched.
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("broker".into()));
-        let client = rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink)
-            .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
+        let client =
+            rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink)
+                .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             client,
             broker_url,
@@ -91,9 +92,10 @@ impl LlmProvider for BrokerClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "broker",
                 status.as_u16(),
                 &headers,
-                text,
+                &text,
             ));
         }
 
@@ -140,9 +142,10 @@ impl LlmProvider for BrokerClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "broker",
                 status.as_u16(),
                 &headers,
-                text,
+                &text,
             ));
         }
 

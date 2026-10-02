@@ -1335,7 +1335,12 @@ impl AnthropicClient {
     /// [`ProviderError::LongContextUnavailable`] for the runner to fall back
     /// on. Without the beta it is surfaced as the plain 429 it is. Either way
     /// it is not retried — the same request is refused every time.
-    fn long_context_refusal(&mut self, request: &LlmRequest, body: String) -> ProviderError {
+    fn long_context_refusal(
+        &mut self,
+        request: &LlmRequest,
+        headers: &reqwest::header::HeaderMap,
+        body: String,
+    ) -> ProviderError {
         if self.sends_1m_beta(&request.model, request.context_window) {
             warn!(
                 model = request.model.as_str(),
@@ -1344,10 +1349,7 @@ impl AnthropicClient {
             self.long_context_disabled = true;
             ProviderError::LongContextUnavailable { message: body }
         } else {
-            ProviderError::Api {
-                status: 429,
-                message: body,
-            }
+            crate::error::api_error_from_response("anthropic", 429, headers, &body)
         }
     }
 
@@ -1737,6 +1739,7 @@ impl AnthropicClient {
             };
 
             let status = response.status();
+            let headers = response.headers().clone();
             if status.as_u16() == 429 {
                 let text = response.text().await.unwrap_or_default();
                 warn!(
@@ -1746,34 +1749,32 @@ impl AnthropicClient {
                 );
                 // Not a rate limit: the same request is refused every time.
                 if crate::error::is_long_context_refusal(&text) {
-                    return Err(self.long_context_refusal(request, text));
+                    return Err(self.long_context_refusal(request, &headers, text));
                 }
-                last_err = Some(ProviderError::Api {
-                    status: 429,
-                    message: text,
-                });
+                last_err = Some(crate::error::api_error_from_response(
+                    "anthropic",
+                    429,
+                    &headers,
+                    &text,
+                ));
                 continue;
             }
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
-                let truncated = if text.len() > 4096 {
-                    format!("{}... (truncated)", &text[..4096])
-                } else {
-                    text
-                };
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message: truncated,
-                });
+                return Err(crate::error::api_error_from_response(
+                    "anthropic",
+                    status.as_u16(),
+                    &headers,
+                    &text,
+                ));
             }
 
             let api_response: AnthropicResponse = response.json().await?;
             return Ok(api_response.into_llm_response());
         }
 
-        Err(last_err.unwrap_or_else(|| ProviderError::Api {
-            status: 429,
-            message: "rate-limited after max retries".into(),
+        Err(last_err.unwrap_or_else(|| {
+            ProviderError::api("anthropic", 429, "rate-limited after max retries")
         }))
     }
 
@@ -1907,6 +1908,7 @@ impl AnthropicClient {
                     );
 
                     let status = resp.status();
+                    let headers = resp.headers().clone();
                     if status.as_u16() == 429 {
                         let text = resp.text().await.unwrap_or_default();
                         flow_guard.add_bytes(text.len() as u64);
@@ -1914,29 +1916,28 @@ impl AnthropicClient {
                         // Not a rate limit: the same request is refused
                         // every time.
                         if crate::error::is_long_context_refusal(&text) {
-                            return Err(self.long_context_refusal(request, text));
+                            return Err(self.long_context_refusal(request, &headers, text));
                         }
-                        last_err = Some(ProviderError::Api {
-                            status: 429,
-                            message: text,
-                        });
+                        last_err = Some(crate::error::api_error_from_response(
+                            "anthropic",
+                            429,
+                            &headers,
+                            &text,
+                        ));
                         retries_used += 1;
                         continue; // `permit` drops here, before the next iteration's backoff sleep
                     }
                     if !status.is_success() {
                         let text = resp.text().await.unwrap_or_default();
                         let bytes_in = text.len() as u64;
-                        let truncated = if text.len() > 4096 {
-                            format!("{}... (truncated)", &text[..4096])
-                        } else {
-                            text
-                        };
                         flow_guard.add_bytes(bytes_in);
                         flow_guard.complete().await;
-                        return Err(ProviderError::Api {
-                            status: status.as_u16(),
-                            message: truncated,
-                        });
+                        return Err(crate::error::api_error_from_response(
+                            "anthropic",
+                            status.as_u16(),
+                            &headers,
+                            &text,
+                        ));
                     }
                     winner = Some((resp, permit, flow_guard));
                     break;
@@ -1944,9 +1945,8 @@ impl AnthropicClient {
                 match winner {
                     Some(w) => w,
                     None => {
-                        return Err(last_err.unwrap_or_else(|| ProviderError::Api {
-                            status: 429,
-                            message: "rate-limited after max retries".into(),
+                        return Err(last_err.unwrap_or_else(|| {
+                            ProviderError::api("anthropic", 429, "rate-limited after max retries")
                         }))
                     }
                 }
@@ -2545,17 +2545,14 @@ impl AnthropicClient {
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                let message: String = resp
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(500)
-                    .collect();
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message,
-                });
+                let headers = resp.headers().clone();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(crate::error::api_error_from_response(
+                    "anthropic",
+                    status.as_u16(),
+                    &headers,
+                    &text,
+                ));
             }
             let body = resp
                 .text()
@@ -2864,19 +2861,14 @@ impl crate::provider::LlmProvider for AnthropicClient {
         if status.is_success() {
             return Ok(());
         }
-        // Bound the body: this string ends up in a cache the dashboard reads,
-        // not in a log the operator greps.
-        let message = resp
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect::<String>();
-        Err(ProviderError::Api {
-            status: status.as_u16(),
-            message,
-        })
+        let headers = resp.headers().clone();
+        let text = resp.text().await.unwrap_or_default();
+        Err(crate::error::api_error_from_response(
+            "anthropic",
+            status.as_u16(),
+            &headers,
+            &text,
+        ))
     }
 
     async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
@@ -5634,8 +5626,11 @@ mod tests {
             }
             .unwrap_err();
             assert!(
-                matches!(&err, ProviderError::Api { status: 429, message }
-                    if message.contains("Extra usage is required for long context")),
+                err.status() == Some(429)
+                    && err.reply().is_some_and(|b| {
+                        b.message
+                            .contains("Extra usage is required for long context")
+                    }),
                 "streamed={streamed}: {err:?}"
             );
         }
@@ -5950,7 +5945,7 @@ mod tests {
             );
             let second = call(&mut client, &request, streamed).await.unwrap_err();
             assert!(
-                matches!(&second, ProviderError::Api { status: 400, .. }),
+                second.status() == Some(400),
                 "streamed={streamed}: the retry goes out without the beta: {second:?}"
             );
             refused.assert_hits(1);
@@ -5989,10 +5984,7 @@ mod tests {
             "{first:?}"
         );
         let second = client.send(&request).await.unwrap_err();
-        assert!(
-            matches!(second, ProviderError::Api { status: 400, .. }),
-            "{second:?}"
-        );
+        assert!(second.status() == Some(400), "{second:?}");
         refused.assert_hits(1);
         without.assert_hits(1);
     }
@@ -6210,16 +6202,10 @@ mod tests {
             .await
             .expect_err("a 401 must never be reported as healthy");
 
-        match err {
-            ProviderError::Api {
-                status: 401,
-                message,
-            } => assert!(
-                message.contains("authentication_error"),
-                "the response body must land in the message, got {message:?}"
-            ),
-            other => panic!("expected Api{{status:401}}, got {other:?}"),
-        }
+        let reply = err.reply().expect("a 401 is a reply error");
+        assert_eq!(reply.status(), Some(401));
+        assert_eq!(reply.kind.as_deref(), Some("authentication_error"));
+        assert_eq!(reply.class, crate::reply_error::ErrorClass::Auth);
     }
 
     /// `probe` only needs the status, so it must not download the whole
@@ -6389,10 +6375,7 @@ mod tests {
         let err = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, ProviderError::Api { status: 401, .. }),
-            "{err:?}"
-        );
+        assert!(err.status() == Some(401), "{err:?}");
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use crate::model_pool::ModelPool;
 use crate::model_scorer::{self, BudgetMode, BudgetState};
 use crate::provider::LlmProvider;
 use crate::provider_id::ProviderId;
+use crate::reply_error::ErrorClass;
 use crate::routing_history::RoutingHistory;
 use crate::task_classifier::{TaskClassifier, TaskType};
 use crate::types::{LlmRequest, LlmResponse, StreamEvent};
@@ -120,15 +121,14 @@ impl SmartRouter {
 
 /// Check if an error is retriable (should try next model).
 fn is_retriable(e: &ProviderError) -> bool {
-    matches!(
-        e,
-        ProviderError::Api {
-            status: 429 | 401 | 403,
-            ..
-        } | ProviderError::RateLimited { .. }
-            | ProviderError::TokenRefreshFailed(_)
-            | ProviderError::Http(_)
-    )
+    match e {
+        ProviderError::Reply(b) => matches!(
+            b.class,
+            ErrorClass::RateLimited | ErrorClass::Auth | ErrorClass::Permission
+        ),
+        ProviderError::TokenRefreshFailed(_) | ProviderError::Http(_) => true,
+        _ => false,
+    }
 }
 
 /// Record a success outcome against pool + history.
@@ -155,12 +155,9 @@ async fn record_err(
     latency_ms: u64,
     error: &ProviderError,
 ) {
-    match error {
-        ProviderError::Api { status: 429, .. } => {
-            pool.record_rate_limit(provider, model_id, None);
-        }
-        ProviderError::RateLimited { retry_after } => {
-            pool.record_rate_limit(provider, model_id, *retry_after);
+    match error.reply() {
+        Some(b) if b.class == ErrorClass::RateLimited => {
+            pool.record_rate_limit(provider, model_id, b.retry_after());
         }
         _ => {
             pool.record_error(provider, model_id, &error.to_string());
@@ -200,10 +197,11 @@ impl LlmProvider for SmartRouter {
                     Err(e) => return Err(e),
                 }
             }
-            return Err(ProviderError::Api {
-                status: 503,
-                message: "all models exhausted (empty scoring)".into(),
-            });
+            return Err(ProviderError::api(
+                "router",
+                503,
+                "all models exhausted (empty scoring)",
+            ));
         }
 
         debug!(
@@ -295,10 +293,11 @@ impl LlmProvider for SmartRouter {
             }
         }
 
-        Err(ProviderError::Api {
-            status: 503,
-            message: "all models exhausted after smart routing".into(),
-        })
+        Err(ProviderError::api(
+            "router",
+            503,
+            "all models exhausted after smart routing",
+        ))
     }
 
     async fn stream(
@@ -329,10 +328,11 @@ impl LlmProvider for SmartRouter {
                     Err(e) => return Err(e),
                 }
             }
-            return Err(ProviderError::Api {
-                status: 503,
-                message: "all models exhausted (empty scoring)".into(),
-            });
+            return Err(ProviderError::api(
+                "router",
+                503,
+                "all models exhausted (empty scoring)",
+            ));
         }
 
         debug!(task_type = %task_type, top = ranked[0].model.id.as_str(), score = ranked[0].score, n = ranked.len(), "routing (stream)");
@@ -415,10 +415,11 @@ impl LlmProvider for SmartRouter {
             }
         }
 
-        Err(ProviderError::Api {
-            status: 503,
-            message: "all models exhausted after smart routing".into(),
-        })
+        Err(ProviderError::api(
+            "router",
+            503,
+            "all models exhausted after smart routing",
+        ))
     }
 
     fn default_model(&self) -> &str {
@@ -483,10 +484,7 @@ mod tests {
     #[async_trait]
     impl LlmProvider for FailProvider {
         async fn send(&mut self, _: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-            Err(ProviderError::Api {
-                status: self.status,
-                message: "error".into(),
-            })
+            Err(ProviderError::api("mock", self.status, "error"))
         }
         async fn stream(
             &mut self,
@@ -655,7 +653,7 @@ mod tests {
         )
         .unwrap();
         let err = router.send(&test_request()).await.unwrap_err();
-        assert!(matches!(err, ProviderError::Api { status: 503, .. }));
+        assert_eq!(err.status(), Some(503));
     }
 
     #[tokio::test]
@@ -674,26 +672,14 @@ mod tests {
 
     #[test]
     fn test_is_retriable() {
-        assert!(is_retriable(&ProviderError::Api {
-            status: 429,
-            message: "".into()
-        }));
-        assert!(is_retriable(&ProviderError::Api {
-            status: 401,
-            message: "".into()
-        }));
-        assert!(is_retriable(&ProviderError::Api {
-            status: 403,
-            message: "".into()
-        }));
+        assert!(is_retriable(&ProviderError::api("mock", 429, "")));
+        assert!(is_retriable(&ProviderError::api("mock", 401, "")));
+        assert!(is_retriable(&ProviderError::api("mock", 403, "")));
         assert!(is_retriable(&ProviderError::TokenRefreshFailed(
             "expired".into()
         )));
         assert!(is_retriable(&ProviderError::Http("".into())));
-        assert!(!is_retriable(&ProviderError::Api {
-            status: 500,
-            message: "".into()
-        }));
+        assert!(!is_retriable(&ProviderError::api("mock", 500, "")));
         assert!(!is_retriable(&ProviderError::Json("".into())));
     }
 
@@ -759,6 +745,6 @@ mod tests {
             .stream(&test_request(), &mut |_| {})
             .await
             .unwrap_err();
-        assert!(matches!(err, ProviderError::Api { status: 503, .. }));
+        assert_eq!(err.status(), Some(503));
     }
 }

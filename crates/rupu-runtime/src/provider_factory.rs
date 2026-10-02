@@ -1301,7 +1301,7 @@ mod decorate_kind_tests {
     impl LlmProvider for RetryableProbe {
         async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(ProviderError::RateLimited { retry_after: None })
+            Err(ProviderError::api("mock", 429, "slow down"))
         }
         async fn stream(
             &mut self,
