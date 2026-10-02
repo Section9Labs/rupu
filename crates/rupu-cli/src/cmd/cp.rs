@@ -2219,7 +2219,7 @@ mod tests {
         let captured = poll_captured_argv(&capture_path).await;
         assert_eq!(
             captured.trim(),
-            format!("workflow resume {}", rec.id),
+            format!("workflow resume {} --if-unfinished", rec.id),
             "the child applies the recorded decision instead of re-deciding the gate"
         );
     }
@@ -3053,7 +3053,7 @@ mod tests {
         let consumed = poll_captured_argv(&worker_argv).await;
         assert_eq!(
             consumed.trim(),
-            format!("workflow resume {} --mode bypass", rec.id),
+            format!("workflow resume {} --if-unfinished --mode bypass", rec.id),
             "the resume worker's child: {consumed:?}"
         );
     }
