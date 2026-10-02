@@ -2957,10 +2957,12 @@ fn parse_content_blocks(raw: Vec<serde_json::Value>, model: &str) -> Vec<Content
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    // An absent (or null) input is a zero-parameter call.
                     input: block
                         .get("input")
+                        .filter(|v| !v.is_null())
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null),
+                        .unwrap_or_else(|| serde_json::json!({})),
                 },
                 "thinking" | "redacted_thinking" => {
                     let text = block
@@ -8044,5 +8046,22 @@ mod tests {
         restore_reasoning_blocks(&mut expected, PROVIDER_TAG);
         let got = body_messages(messages);
         assert_eq!(serde_json::Value::Array(got), expected);
+    }
+
+    /// A `tool_use` block that arrives without `input` is a zero-parameter
+    /// call, `{}`, as on the stream; never `null`.
+    #[test]
+    fn send_tool_use_without_input_is_an_empty_object() {
+        let blocks = parse_content_blocks(
+            vec![serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "list"})],
+            "claude-test",
+        );
+        match blocks.as_slice() {
+            [ContentBlock::ToolUse { id, name, input }] => {
+                assert_eq!((id.as_str(), name.as_str()), ("toolu_1", "list"));
+                assert_eq!(*input, serde_json::json!({}));
+            }
+            other => panic!("expected one tool call, got {other:?}"),
+        }
     }
 }
