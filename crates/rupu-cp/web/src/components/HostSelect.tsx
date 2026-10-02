@@ -28,8 +28,9 @@ interface Props {
   onChange: (hostId: string) => void;
   disabled?: boolean;
   className?: string;
-  /** Render the "This host" / registered hosts / "All hosts" fan-out list
-   *  instead of the plain registered-hosts list. Default false. */
+  /** Render the fan-out list instead of the plain host list: "This host",
+   *  "All hosts" (value = ALL_HOSTS), then the registered non-local hosts.
+   *  Reads the probe-free `api.getRegisteredHosts()`. Default false. */
   allowAll?: boolean;
   /** Override the default `aria-label` ("Host"). WorkflowRuns passes
    *  "Host filter" to keep its pre-migration label unchanged. */
