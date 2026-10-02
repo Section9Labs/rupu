@@ -773,6 +773,8 @@ struct RecoveryEvent<'a> {
     rung: u8,
     attempt: Option<u32>,
     budget: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
     reason: Option<String>,
     merge_into_previous: bool,
     continues_output: bool,
@@ -790,8 +792,8 @@ impl RecoveryEvent<'_> {
             action,
             attempt: self.attempt,
             budget: self.budget,
-            provider: None,
-            model: None,
+            provider: self.provider,
+            model: self.model,
             reason: self.reason,
             merge_into_previous: self.merge_into_previous,
             continues_output: self.continues_output,
@@ -864,6 +866,203 @@ fn exhausted(
         Some(format!("{}; {hint}", outcome.title)),
         Some(outcome.record()),
     ))
+}
+
+/// A reply still paused after every pause continuation is incomplete
+/// (spec 2026-10-01 §5.2): a fresh `Incomplete` outcome carrying the pause
+/// outcome's detail and wire.
+fn still_paused(
+    recovery: &mut crate::recovery::RecoveryState,
+    pause: &crate::outcome::Outcome,
+    budget: u32,
+) -> crate::outcome::Outcome {
+    crate::outcome::Outcome {
+        id: recovery.next_outcome_id(),
+        class: OutcomeClass::Incomplete,
+        title: format!("incomplete reply · still paused after {budget} continuations"),
+        detail: pause.detail.clone(),
+        wire: pause.wire.clone(),
+        truncated_tool: false,
+    }
+}
+
+/// The ladder ran out for a provider error: write rung 3, then close the
+/// run with the same `RunComplete` error text as before the ladder existed,
+/// now carrying the outcome. `error` is that closing text; `message` is the
+/// returned error's text.
+fn provider_exhausted(
+    writer: &mut JsonlWriter,
+    opts: &AgentRunOpts,
+    outcome: &crate::outcome::Outcome,
+    error: String,
+    message: String,
+    total_tokens: u64,
+    started: Instant,
+) -> RunError {
+    let closed = RecoveryEvent {
+        outcome_id: &outcome.id,
+        rung: 3,
+        reason: Some(no_recovery_hint(opts)),
+        ..Default::default()
+    }
+    .write(writer, RecoveryAction::Failed)
+    .and_then(|_| {
+        writer.write(&Event::RunComplete {
+            run_id: opts.run_id.clone(),
+            status: RunStatus::Error,
+            total_tokens,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error: Some(error),
+            outcome: Some(outcome.record()),
+        })?;
+        writer.flush()?;
+        Ok(())
+    });
+    match closed {
+        Ok(()) => RunError::Outcome {
+            message,
+            outcome: Box::new(outcome.record()),
+        },
+        Err(e) => e,
+    }
+}
+
+/// What rungs 1 and 2 did.
+enum FallBack {
+    /// Nothing left to try, or the action cap is reached: rung 3.
+    Exhausted,
+    /// A hop now serves the attempt. `messages_changed`: it compacted the
+    /// history or added the retry note, so a request built before the hop
+    /// is stale.
+    Hopped { messages_changed: bool },
+}
+
+/// Rungs 1 and 2 (spec 2026-10-01 §5.2, §6.2): move the attempt onto the
+/// next fallback in the chain that builds — same-provider entries when
+/// `p.rung1`, then other providers when `p.rung2`.
+///
+/// - Every candidate costs one recovery action, a skipped one included;
+///   at `MAX_RECOVERY_ACTIONS` the ladder stops.
+/// - A candidate with no hop builder, or one that fails to build, writes
+///   `Recovery { Skipped, reason }` and the next is tried.
+/// - A built hop replaces `opts.provider`, `provider_name`, `model` and
+///   `limits`. The swap is sticky: every later turn uses `opts`. It writes
+///   the hop's `model_limits` notice, then `Recovery { FellBack }`.
+/// - When the last measured input is over the hop's compaction threshold,
+///   the history is compacted first (not twice in one turn).
+/// - When the conversation ends on an assistant message (content kept by a
+///   rung-0 continuation that ran out of budget), the hop gets
+///   `RECOVERY_RETRY_NOTE` as a user turn: a request must end on one.
+///
+/// The messages change only through `Compaction` and `UserMessage` events,
+/// so replay stays in lockstep.
+#[allow(clippy::too_many_arguments)]
+async fn fall_back(
+    writer: &mut JsonlWriter,
+    opts: &mut AgentRunOpts,
+    messages: &mut Vec<Message>,
+    recovery: &mut crate::recovery::RecoveryState,
+    outcome: &crate::outcome::Outcome,
+    p: &crate::recovery::Policy,
+    compaction_seq: &mut u32,
+    compacted_this_turn: &mut bool,
+    last_input_tokens: u32,
+) -> Result<FallBack, RunError> {
+    while let Some((rung, entry)) = recovery.next_hop(
+        &opts.recovery.chain,
+        &opts.provider_name,
+        &opts.model,
+        p.rung1,
+        p.rung2,
+    ) {
+        if !recovery.take_action() {
+            break;
+        }
+        let provider_name = entry
+            .provider
+            .clone()
+            .unwrap_or_else(|| opts.provider_name.clone());
+        let built = match opts.recovery.hop_builder.clone() {
+            None => Err("no hop builder in this context".to_string()),
+            Some(builder) => builder.build(&provider_name, &entry.model).await,
+        };
+        let hop = match built {
+            Ok(hop) => hop,
+            Err(reason) => {
+                RecoveryEvent {
+                    outcome_id: &outcome.id,
+                    rung,
+                    provider: Some(provider_name),
+                    model: Some(entry.model.clone()),
+                    reason: Some(reason),
+                    ..Default::default()
+                }
+                .write(writer, RecoveryAction::Skipped)?;
+                writer.flush()?;
+                continue;
+            }
+        };
+        opts.provider = hop.provider;
+        opts.provider_name = hop.provider_name;
+        opts.model = hop.model;
+        opts.limits = hop.limits;
+        writer.write(&Event::Notice {
+            kind: "model_limits".into(),
+            message: opts.limits.describe(&opts.provider_name, Utc::now()),
+        })?;
+        let (hop_provider, hop_model) = (opts.provider_name.clone(), opts.model.clone());
+        let event = || RecoveryEvent {
+            outcome_id: &outcome.id,
+            rung,
+            provider: Some(hop_provider.clone()),
+            model: Some(hop_model.clone()),
+            ..Default::default()
+        };
+        event().write(writer, RecoveryAction::FellBack)?;
+        writer.flush()?;
+
+        let mut messages_changed = false;
+        let over_threshold = opts
+            .limits
+            .compact_threshold()
+            .is_some_and(|t| u64::from(last_input_tokens) > t);
+        // No summariser call once SIGTERM has arrived: the next call
+        // attempt closes the run.
+        if over_threshold
+            && !*compacted_this_turn
+            && !rupu_providers::credential_writes::terminating()
+        {
+            let run_id = opts.run_id.clone();
+            if compact_context(
+                messages,
+                opts,
+                &run_id,
+                *compaction_seq + 1,
+                writer,
+                last_input_tokens.max(1),
+            )
+            .await
+            {
+                *compaction_seq += 1;
+                *compacted_this_turn = true;
+                messages_changed = true;
+                event().write(writer, RecoveryAction::Compacted)?;
+            }
+        }
+        if messages.last().is_some_and(|m| m.role == Role::Assistant) {
+            let note = crate::recovery::recovery_retry_note(
+                &outcome.title,
+                &opts.provider_name,
+                &opts.model,
+            );
+            push_user_turn(messages, &note);
+            writer.write(&Event::UserMessage { content: note })?;
+            messages_changed = true;
+        }
+        writer.flush()?;
+        return Ok(FallBack::Hopped { messages_changed });
+    }
+    Ok(FallBack::Exhausted)
 }
 
 /// The malformed-tool correction note for a `malformed_tool_call` stop.
@@ -1866,6 +2065,9 @@ async fn run_agent_inner(
                                 continue;
                             }
                         }
+                        // The ladder's closing texts when this error ends at
+                        // rung 3: `(RunComplete error, returned error)`.
+                        let mut closing: Option<(String, String)> = None;
                         if let Some(overflow) = context_overflow_of(&e) {
                             // Learn the real limit, then compact once per turn
                             // (spec §7).
@@ -1937,23 +2139,21 @@ async fn run_agent_inner(
                                 );
                                 continue;
                             }
-                            // Cannot trim further — surface as ContextOverflow.
-                            writer.write(&Event::RunComplete {
-                                run_id: opts.run_id.clone(),
-                                status: RunStatus::Error,
-                                total_tokens: total_in + total_out,
-                                duration_ms: started.elapsed().as_millis() as u64,
-                                error: Some(format!("context overflow: {e_str}")),
-                                outcome: None,
-                            })?;
-                            writer.flush()?;
-                            return Err(RunError::ContextOverflow { turn: turn_idx });
+                            // Cannot trim further: the ladder, then the
+                            // context-overflow failure.
+                            closing = Some((
+                                format!("context overflow: {e_str}"),
+                                RunError::ContextOverflow { turn: turn_idx }.to_string(),
+                            ));
                         }
                         // Transient provider errors (network/decode/SSE/5xx/
                         // rate-limit) are retried with backoff before the step
                         // is failed — a single dropped or malformed response
                         // shouldn't kill the run.
-                        if is_retryable_provider_error(&e) && http_retries < MAX_HTTP_RETRIES {
+                        if closing.is_none()
+                            && is_retryable_provider_error(&e)
+                            && http_retries < MAX_HTTP_RETRIES
+                        {
                             http_retries += 1;
                             let backoff = retry_backoff(http_retries);
                             writer.write(&Event::Notice {
@@ -1972,17 +2172,27 @@ async fn run_agent_inner(
                         // A Preflight failure never involved a provider
                         // request (e.g. the step's agent file failed to
                         // load) — surface the message verbatim instead of
-                        // attributing it to a provider.
-                        let is_preflight =
-                            matches!(e, rupu_providers::ProviderError::Preflight(_));
-                        writer.write(&Event::RunComplete {
-                            run_id: opts.run_id.clone(),
-                            status: RunStatus::Error,
-                            total_tokens: total_in + total_out,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            error: Some(if is_preflight {
-                                e_str.clone()
-                            } else {
+                        // attributing it to a provider. No outcome, no ladder.
+                        if closing.is_none()
+                            && matches!(e, rupu_providers::ProviderError::Preflight(_))
+                        {
+                            writer.write(&Event::RunComplete {
+                                run_id: opts.run_id.clone(),
+                                status: RunStatus::Error,
+                                total_tokens: total_in + total_out,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                error: Some(e_str.clone()),
+                                outcome: None,
+                            })?;
+                            writer.flush()?;
+                            return Err(RunError::Preflight(e_str));
+                        }
+                        // The overflow pipeline above recognised this error
+                        // (by class or by its text): it is a context overflow
+                        // whatever the provider's own error class says.
+                        let overflowed = closing.is_some();
+                        let (closing_error, message) = closing.unwrap_or_else(|| {
+                            (
                                 format!(
                                     "provider: {e_str}{}",
                                     if http_retries > 0 {
@@ -1990,16 +2200,67 @@ async fn run_agent_inner(
                                     } else {
                                         String::new()
                                     }
-                                )
-                            }),
-                            outcome: None,
+                                ),
+                                RunError::Provider(e_str.clone()).to_string(),
+                            )
+                        });
+                        // The error is an outcome; it climbs the ladder
+                        // (spec 2026-10-01 §5.2) once the pipeline above
+                        // has given up on it.
+                        let mut o = if overflowed {
+                            crate::outcome::classify_error_as(
+                                &e,
+                                rupu_providers::reply_error::ErrorClass::ContextOverflow,
+                            )
+                        } else {
+                            crate::outcome::classify_error(&e)
+                        };
+                        o.id = recovery.next_outcome_id();
+                        writer.write(&Event::Outcome {
+                            turn_idx,
+                            outcome: o.record(),
                         })?;
                         writer.flush()?;
-                        return Err(if is_preflight {
-                            RunError::Preflight(e_str)
-                        } else {
-                            RunError::Provider(e_str)
-                        });
+                        let p = crate::recovery::policy(&o.class, false);
+                        let hopped = fall_back(
+                            &mut writer,
+                            opts,
+                            messages,
+                            &mut recovery,
+                            &o,
+                            &p,
+                            &mut compaction_seq,
+                            &mut compacted_this_turn,
+                            last_turn_input_tokens,
+                        )
+                        .await?;
+                        if let FallBack::Hopped { messages_changed } = hopped {
+                            // Retry the same request on the hop: its model and
+                            // output cap, and every once-per-turn guard reset
+                            // for the new client.
+                            req.model = opts.model.clone();
+                            req.max_tokens = opts.limits.output.tokens;
+                            if messages_changed {
+                                req.messages = messages.clone();
+                            }
+                            http_retries = 0;
+                            overflow_compacted = false;
+                            output_cap_lowered = false;
+                            trim_attempts = 0;
+                            long_context_fallback = false;
+                            fallback_refusal_noted = false;
+                            chain_turn = None;
+                            continue;
+                        }
+                        return Err(provider_exhausted(
+                            &mut writer,
+                            opts,
+                            &o,
+                            closing_error,
+                            message,
+                            total_in + total_out,
+                            started,
+                        ));
                     }
                 }
             };
@@ -2057,6 +2318,33 @@ async fn run_agent_inner(
             })?;
             total_cached += resp.usage.cached_tokens as u64;
             last_turn_input_tokens = resp.usage.input_tokens;
+
+            // A server-side fallback served this turn (spec 2026-10-01
+            // §4.6): the requested model refused, and the reply is the
+            // fallback model's answer. The refusal is recorded as an error
+            // outcome with its rung-1 recovery; the turn proceeds normally.
+            if let Some(served) = resp.stop.served_by.as_ref() {
+                let refused = crate::outcome::Outcome {
+                    id: recovery.next_outcome_id(),
+                    class: OutcomeClass::Refusal,
+                    title: format!("refused · served by {}", served.model),
+                    detail: None,
+                    wire: serde_json::to_value(&resp.stop.wire).unwrap_or(serde_json::Value::Null),
+                    truncated_tool: false,
+                };
+                writer.write(&Event::Outcome {
+                    turn_idx,
+                    outcome: refused.record(),
+                })?;
+                RecoveryEvent {
+                    outcome_id: &refused.id,
+                    rung: 1,
+                    provider: Some(opts.provider_name.clone()),
+                    model: Some(served.model.clone()),
+                    ..Default::default()
+                }
+                .write(&mut writer, RecoveryAction::ServedByFallback)?;
+            }
 
             // Classify the reply (spec 2026-10-01 §5.1). A normal reply has
             // no outcome; anything else is recorded ahead of the turn's
@@ -2211,6 +2499,27 @@ async fn run_agent_inner(
                             continue 'turns;
                         }
                     }
+                }
+                // Rungs 1–2: retry the turn on a fallback.
+                if let FallBack::Hopped { .. } = fall_back(
+                    &mut writer,
+                    opts,
+                    messages,
+                    &mut recovery,
+                    o,
+                    &p,
+                    &mut compaction_seq,
+                    &mut compacted_this_turn,
+                    last_turn_input_tokens,
+                )
+                .await?
+                {
+                    turn_idx += 1;
+                    chain_turn = None;
+                    if is_paused(&pause) {
+                        break 'turns LoopOutcome::Paused;
+                    }
+                    continue 'turns;
                 }
                 break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?;
             }
@@ -2441,31 +2750,49 @@ async fn run_agent_inner(
                         | Rung0::NudgeEmpty => rung0_step(&mut recovery, chain, &p),
                         _ => Rung0Step::OverBudget,
                     };
+                    let over_budget = matches!(step, Rung0Step::OverBudget);
                     let attempt = match step {
                         Rung0Step::Act(attempt) => attempt,
-                        Rung0Step::OverBudget if p.rung0 == Rung0::ContinuePause => {
+                        Rung0Step::OverBudget | Rung0Step::Capped => {
                             // Still paused after every continuation: the
                             // reply is incomplete. Its partial is already in
                             // the conversation, so it is not discarded; it
-                            // climbs the ladder as `Incomplete`.
-                            let incomplete = crate::outcome::Outcome {
-                                id: recovery.next_outcome_id(),
-                                class: OutcomeClass::Incomplete,
-                                title: format!(
-                                    "incomplete reply · still paused after {} continuations",
-                                    p.budget
-                                ),
-                                detail: o.detail.clone(),
-                                wire: o.wire.clone(),
-                                truncated_tool: false,
+                            // climbs the ladder as `Incomplete`, under
+                            // `Incomplete`'s policy.
+                            let incomplete = (over_budget && p.rung0 == Rung0::ContinuePause)
+                                .then(|| still_paused(&mut recovery, o, p.budget));
+                            if let Some(incomplete) = incomplete.as_ref() {
+                                writer.write(&Event::Outcome {
+                                    turn_idx,
+                                    outcome: incomplete.record(),
+                                })?;
+                            }
+                            let (o, p) = match incomplete.as_ref() {
+                                Some(i) => (i, crate::recovery::policy(&i.class, false)),
+                                None => (o, p),
                             };
-                            writer.write(&Event::Outcome {
-                                turn_idx,
-                                outcome: incomplete.record(),
-                            })?;
-                            break 'turns exhausted(&mut writer, opts, &incomplete, &mut turn_idx)?;
-                        }
-                        Rung0Step::OverBudget | Rung0Step::Capped => {
+                            // Rungs 1–2: retry on a fallback. The `Capped`
+                            // case takes no hop: every hop costs an action.
+                            if let FallBack::Hopped { .. } = fall_back(
+                                &mut writer,
+                                opts,
+                                messages,
+                                &mut recovery,
+                                o,
+                                &p,
+                                &mut compaction_seq,
+                                &mut compacted_this_turn,
+                                last_turn_input_tokens,
+                            )
+                            .await?
+                            {
+                                turn_idx += 1;
+                                chain_turn = None;
+                                if is_paused(&pause) {
+                                    break 'turns LoopOutcome::Paused;
+                                }
+                                continue 'turns;
+                            }
                             break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?;
                         }
                     };

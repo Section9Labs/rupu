@@ -3,7 +3,7 @@
 //! warning stop, and replay rebuilds exactly what the runner sent.
 
 use rupu_agent::recovery::{malformed_note, EMPTY_REPLY_NOTE, TRUNCATION_NOTE};
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, RunResult};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::{
@@ -950,4 +950,598 @@ async fn a_nudged_empty_turn_inside_a_truncation_chain_keeps_the_first_piece() {
         Some("part one\n\npart two")
     );
     assert_replay_lockstep(&ran);
+}
+
+// ---------------------------------------------------------------------------
+// Rungs 1–2: fallback hops (spec 2026-10-01 §5.2, §6.2).
+// ---------------------------------------------------------------------------
+
+/// A test [`HopBuilder`]: `(provider, model)` → a prebuilt provider (handed
+/// out once), anything else → `Err("no credentials")`. Records every call.
+struct TestHops {
+    hops: Mutex<std::collections::HashMap<(String, String), Box<dyn LlmProvider>>>,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl TestHops {
+    fn new(hops: Vec<(&str, &str, Box<dyn LlmProvider>)>) -> Self {
+        Self {
+            hops: Mutex::new(
+                hops.into_iter()
+                    .map(|(p, m, prov)| ((p.to_string(), m.to_string()), prov))
+                    .collect(),
+            ),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rupu_agent::HopBuilder for TestHops {
+    async fn build(&self, provider: &str, model: &str) -> Result<rupu_agent::Hop, String> {
+        let key = (provider.to_string(), model.to_string());
+        self.calls.lock().unwrap().push(key.clone());
+        match self.hops.lock().unwrap().remove(&key) {
+            Some(p) => Ok(rupu_agent::Hop {
+                provider: p,
+                provider_name: provider.to_string(),
+                model: model.to_string(),
+                limits: ModelLimits::unknown(),
+            }),
+            None => Err("no credentials".to_string()),
+        }
+    }
+}
+
+fn fallback(provider: Option<&str>, model: &str) -> rupu_config::FallbackEntry {
+    rupu_config::FallbackEntry {
+        provider: provider.map(str::to_string),
+        model: model.to_string(),
+    }
+}
+
+/// A run with a fallback chain and (optionally) a hop builder.
+struct HopRun {
+    result: Result<RunResult, rupu_agent::runner::RunError>,
+    events: Vec<Event>,
+    builds: Vec<(String, String)>,
+}
+
+async fn run_with_hops(
+    primary: Box<dyn LlmProvider>,
+    (provider_name, model): (&str, &str),
+    chain: Vec<rupu_config::FallbackEntry>,
+    hops: Option<TestHops>,
+    tmp: &tempfile::TempDir,
+) -> HopRun {
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(primary, tmp, transcript.clone());
+    opts.provider_name = provider_name.into();
+    opts.model = model.into();
+    let builds = hops.as_ref().map(|h| h.calls.clone()).unwrap_or_default();
+    opts.recovery = rupu_agent::RecoveryOpts {
+        chain,
+        hop_builder: hops.map(|h| Arc::new(h) as Arc<dyn rupu_agent::HopBuilder>),
+    };
+    let result = run_agent(opts).await;
+    let events = read_events(&transcript);
+    let builds = builds.lock().unwrap().clone();
+    HopRun {
+        result,
+        events,
+        builds,
+    }
+}
+
+/// `(rung, action, provider, model, reason)` per Recovery.
+type RecoveryRow = (
+    u8,
+    RecoveryAction,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn recovery_rows(events: &[Event]) -> Vec<RecoveryRow> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Recovery {
+                rung,
+                action,
+                provider,
+                model,
+                reason,
+                ..
+            } => Some((
+                *rung,
+                *action,
+                provider.clone(),
+                model.clone(),
+                reason.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn refusal_reply() -> ScriptedTurn {
+    ScriptedTurn::Reply {
+        content: vec![text("I can't help with that")],
+        stop: Stop::synthetic(StopReason::Refusal, "anthropic"),
+        usage: Usage::default(),
+    }
+}
+
+fn overloaded() -> ScriptedTurn {
+    ScriptedTurn::ReplyError {
+        body: rupu_providers::reply_error::parse_error_body(
+            "anthropic",
+            rupu_providers::reply_error::ErrorOrigin::Http { status: 529 },
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            None,
+            None,
+        ),
+    }
+}
+
+/// The served-by-a-hop runs' replay check: hops never change the messages.
+fn assert_hop_lockstep(run: &HopRun) {
+    let result = run.result.as_ref().expect("an Ok run");
+    let rebuilt = rupu_agent::replay::reconstruct_messages(&run.events).expect("replay");
+    assert_eq!(
+        serde_json::to_value(&rebuilt).unwrap(),
+        serde_json::to_value(&result.final_messages).unwrap(),
+        "replay must rebuild exactly what the runner sent"
+    );
+}
+
+#[tokio::test]
+async fn refusal_falls_back_on_the_same_provider_and_sticks() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "the notes").unwrap();
+    // One turn only: a second call to the primary would fail with "mock
+    // script exhausted", so completing proves the hop is sticky.
+    let primary = MockProvider::new(vec![refusal_reply()]);
+    let hop = CapturingMockProvider::new(vec![
+        ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "c1".into(),
+            tool_name: "read_file".into(),
+            tool_input: serde_json::json!({ "path": "notes.txt" }),
+            stop: StopReason::ToolUse,
+        },
+        reply(StopReason::EndTurn, vec![text("answer")]),
+    ]);
+    let hop_requests = hop.captured.clone();
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(None, "claude-opus-4-8")],
+        Some(TestHops::new(vec![(
+            "anthropic",
+            "claude-opus-4-8",
+            Box::new(hop),
+        )])),
+        &tmp,
+    )
+    .await;
+    let result = run.result.as_ref().expect("the hop answered");
+    assert_eq!(result.status, RunStatus::Ok);
+    assert!(recovery_rows(&run.events).contains(&(
+        1,
+        RecoveryAction::FellBack,
+        Some("anthropic".into()),
+        Some("claude-opus-4-8".into()),
+        None
+    )));
+    let hop_requests = hop_requests.lock().unwrap();
+    assert_eq!(hop_requests.len(), 2, "both later turns went to the hop");
+    assert!(hop_requests.iter().all(|r| r.model == "claude-opus-4-8"));
+    // The hop resolves its own limits and says so.
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|e| matches!(e, Event::Notice { kind, .. } if kind == "model_limits"))
+            .count(),
+        2,
+        "the run's notice, then the hop's"
+    );
+    // Usage after the hop is attributed to it.
+    let usage: Vec<String> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Usage { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        vec!["claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-8"]
+    );
+    assert!(!result
+        .final_messages
+        .iter()
+        .any(|m| last_text(m) == Some("I can't help with that")));
+    assert_hop_lockstep(&run);
+}
+
+#[tokio::test]
+async fn skipped_hop_then_cross_provider_hop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = run_with_hops(
+        Box::new(MockProvider::new(vec![refusal_reply()])),
+        ("anthropic", "claude-opus-5-5"),
+        vec![
+            fallback(None, "missing-model"),
+            fallback(Some("openai-codex"), "gpt-test"),
+        ],
+        Some(TestHops::new(vec![(
+            "openai-codex",
+            "gpt-test",
+            Box::new(
+                MockProvider::new(vec![reply(StopReason::EndTurn, vec![text("done")])])
+                    .with_provider_id(ProviderId::OpenaiCodex),
+            ),
+        )])),
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    assert_eq!(
+        run.builds,
+        vec![
+            ("anthropic".to_string(), "missing-model".to_string()),
+            ("openai-codex".to_string(), "gpt-test".to_string()),
+        ]
+    );
+    assert_eq!(
+        recovery_rows(&run.events),
+        vec![
+            (
+                1,
+                RecoveryAction::Skipped,
+                Some("anthropic".into()),
+                Some("missing-model".into()),
+                Some("no credentials".into())
+            ),
+            (
+                2,
+                RecoveryAction::FellBack,
+                Some("openai-codex".into()),
+                Some("gpt-test".into()),
+                None
+            ),
+        ]
+    );
+    assert_hop_lockstep(&run);
+}
+
+#[tokio::test(start_paused = true)]
+async fn overloaded_after_retries_goes_cross_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The first attempt plus MAX_HTTP_RETRIES (10) retries.
+    let primary = MockProvider::new((0..11).map(|_| overloaded()).collect());
+    let hop = CapturingMockProvider::new(vec![reply(StopReason::EndTurn, vec![text("done")])]);
+    let hop_requests = hop.captured.clone();
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![
+            fallback(None, "claude-opus-4-8"),
+            fallback(Some("openai-codex"), "gpt-test"),
+        ],
+        Some(TestHops::new(vec![(
+            "openai-codex",
+            "gpt-test",
+            Box::new(hop),
+        )])),
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    let hop_requests = hop_requests.lock().unwrap();
+    assert_eq!(hop_requests.len(), 1);
+    assert_eq!(
+        hop_requests[0].model, "gpt-test",
+        "the request is rebuilt for the hop"
+    );
+    let outs = outcomes(&run.events);
+    assert_eq!(outs.len(), 1, "{outs:?}");
+    assert_eq!(outs[0].class, "provider_error");
+    assert_eq!(outs[0].error_class.as_deref(), Some("overloaded"));
+    // Overloaded skips rung 1: the same provider is the one overloaded.
+    assert_eq!(
+        run.builds,
+        vec![("openai-codex".to_string(), "gpt-test".to_string())]
+    );
+    assert_eq!(
+        recovery_rows(&run.events),
+        vec![(
+            2,
+            RecoveryAction::FellBack,
+            Some("openai-codex".into()),
+            Some("gpt-test".into()),
+            None
+        )]
+    );
+    assert_hop_lockstep(&run);
+}
+
+#[tokio::test]
+async fn auth_error_does_not_hop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new(vec![ScriptedTurn::ReplyError {
+        body: rupu_providers::reply_error::parse_error_body(
+            "anthropic",
+            rupu_providers::reply_error::ErrorOrigin::Http { status: 401 },
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+            None,
+            None,
+        ),
+    }]);
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![
+            fallback(None, "claude-opus-4-8"),
+            fallback(Some("openai-codex"), "gpt-test"),
+        ],
+        Some(TestHops::new(vec![(
+            "anthropic",
+            "claude-opus-4-8",
+            Box::new(MockProvider::new(vec![reply(
+                StopReason::EndTurn,
+                vec![text("never")],
+            )])),
+        )])),
+        &tmp,
+    )
+    .await;
+    let Err(err) = run.result.as_ref() else {
+        panic!("an auth error fails the run");
+    };
+    assert!(
+        matches!(err, rupu_agent::runner::RunError::Outcome { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "provider: API error 401: invalid x-api-key",
+        "the error text is unchanged"
+    );
+    assert_eq!(
+        err.outcome().and_then(|o| o.error_class.as_deref()),
+        Some("auth")
+    );
+    assert!(run.builds.is_empty(), "no hop was built");
+    let rows = recovery_rows(&run.events);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].0, rows[0].1), (3, RecoveryAction::Failed));
+    let closing = run.events.iter().find_map(|e| match e {
+        Event::RunComplete { error, outcome, .. } => Some((error.clone(), outcome.clone())),
+        _ => None,
+    });
+    let (error, outcome) = closing.expect("RunComplete");
+    assert_eq!(
+        error.as_deref(),
+        Some("provider: API error 401: invalid x-api-key")
+    );
+    assert_eq!(outcome.map(|o| o.class), Some("provider_error".to_string()));
+}
+
+#[tokio::test]
+async fn served_by_fallback_is_recorded_and_the_answer_kept() {
+    let mut stop = Stop::synthetic(StopReason::EndTurn, "anthropic");
+    stop.served_by = Some(rupu_providers::ServedBy {
+        model: "claude-opus-4-8".into(),
+        hops: vec![rupu_providers::FallbackHop {
+            from_model: "claude-opus-5-5".into(),
+            to_model: "claude-opus-4-8".into(),
+        }],
+    });
+    let ran = run_script(
+        vec![ScriptedTurn::Reply {
+            content: vec![text("the fallback's answer")],
+            stop,
+            usage: Usage::default(),
+        }],
+        "s1",
+    )
+    .await;
+    assert_eq!(ran.result.status, RunStatus::Ok);
+    assert_eq!(
+        rupu_transcript::final_turn_text(ran.events.clone()).as_deref(),
+        Some("the fallback's answer")
+    );
+    let outs = outcomes(&ran.events);
+    assert_eq!(outs.len(), 1, "{outs:?}");
+    assert_eq!(outs[0].class, "refusal");
+    assert_eq!(outs[0].title, "refused · served by claude-opus-4-8");
+    assert_eq!(outs[0].severity, Severity::Error);
+    let rows = recovery_rows(&ran.events);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].0, rows[0].1, rows[0].3.as_deref()),
+        (1, RecoveryAction::ServedByFallback, Some("claude-opus-4-8"))
+    );
+    let linked = ran
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::Recovery { outcome_id, .. } if *outcome_id == outs[0].id));
+    assert!(linked, "the recovery points at the outcome");
+    assert_replay_lockstep(&ran);
+}
+
+#[tokio::test]
+async fn max_recovery_actions_caps_the_ladder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = (0..25)
+        .map(|i| fallback(None, &format!("unbuildable-{i}")))
+        .collect();
+    let run = run_with_hops(
+        Box::new(MockProvider::new(vec![refusal_reply()])),
+        ("anthropic", "claude-opus-5-5"),
+        chain,
+        Some(TestHops::new(Vec::new())),
+        &tmp,
+    )
+    .await;
+    let result = run.result.as_ref().unwrap();
+    assert_eq!(result.status, RunStatus::Error);
+    let rows = recovery_rows(&run.events);
+    let skips = rows
+        .iter()
+        .filter(|r| r.1 == RecoveryAction::Skipped)
+        .count();
+    assert_eq!(
+        skips,
+        rupu_agent::recovery::MAX_RECOVERY_ACTIONS as usize,
+        "skips count as actions"
+    );
+    assert_eq!(
+        rows.last().map(|r| (r.0, r.1)),
+        Some((3, RecoveryAction::Failed))
+    );
+}
+
+#[tokio::test]
+async fn a_chain_without_a_hop_builder_is_skipped_with_a_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = run_with_hops(
+        Box::new(MockProvider::new(vec![refusal_reply()])),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(None, "claude-opus-4-8")],
+        None,
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Error);
+    assert_eq!(
+        recovery_rows(&run.events)[0],
+        (
+            1,
+            RecoveryAction::Skipped,
+            Some("anthropic".into()),
+            Some("claude-opus-4-8".into()),
+            Some("no hop builder in this context".into())
+        )
+    );
+}
+
+/// Truncation past its budget leaves the truncated text as the last
+/// message: the hop gets the retry note as a user turn, so the request it
+/// sees ends on a user message.
+#[tokio::test]
+async fn a_hop_after_kept_content_gets_the_retry_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new(
+        (0..4)
+            .map(|_| reply(StopReason::MaxTokens, vec![text("piece")]))
+            .collect(),
+    );
+    let hop = CapturingMockProvider::new(vec![reply(StopReason::EndTurn, vec![text("done")])]);
+    let hop_requests = hop.captured.clone();
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(None, "claude-opus-4-8")],
+        Some(TestHops::new(vec![(
+            "anthropic",
+            "claude-opus-4-8",
+            Box::new(hop),
+        )])),
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    let req = hop_requests.lock().unwrap()[0].clone();
+    let last = req.messages.last().expect("messages");
+    assert_eq!(last.role, Role::User);
+    assert_eq!(
+        last_text(last),
+        Some(
+            rupu_agent::recovery::recovery_retry_note(
+                "truncated · output limit",
+                "anthropic",
+                "claude-opus-4-8"
+            )
+            .as_str()
+        )
+    );
+    assert_hop_lockstep(&run);
+}
+
+/// A context overflow nothing can compact or trim climbs to rung 2.
+#[tokio::test]
+async fn context_overflow_exhaustion_hops_to_another_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new(vec![ScriptedTurn::ProviderError(
+        "prompt is too long: 250000 tokens > 200000 maximum".into(),
+    )]);
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(Some("openai-codex"), "gpt-test")],
+        Some(TestHops::new(vec![(
+            "openai-codex",
+            "gpt-test",
+            Box::new(MockProvider::new(vec![reply(
+                StopReason::EndTurn,
+                vec![text("done")],
+            )])),
+        )])),
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    let outs = outcomes(&run.events);
+    assert_eq!(outs[0].error_class.as_deref(), Some("context_overflow"));
+    assert_eq!(outs[0].title, "provider error · context_overflow");
+    assert!(recovery_rows(&run.events)
+        .iter()
+        .any(|r| (r.0, r.1) == (2, RecoveryAction::FellBack)));
+}
+
+/// Still paused past the pause budget: the reply is `Incomplete`, and it
+/// climbs under `Incomplete`'s policy (rungs 1 and 2), the incomplete
+/// outcome being the one the hop answers.
+#[tokio::test]
+async fn pause_turn_past_its_budget_hops_as_incomplete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new(
+        (0..6)
+            .map(|i| reply(StopReason::PauseTurn, vec![text(&format!("p{i}"))]))
+            .collect(),
+    );
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(None, "claude-opus-4-8")],
+        Some(TestHops::new(vec![(
+            "anthropic",
+            "claude-opus-4-8",
+            Box::new(MockProvider::new(vec![reply(
+                StopReason::EndTurn,
+                vec![text("done")],
+            )])),
+        )])),
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    let incomplete = outcomes(&run.events)
+        .into_iter()
+        .find(|o| o.class == "incomplete")
+        .expect("the incomplete outcome");
+    let fell_back = run.events.iter().any(|e| {
+        matches!(
+            e,
+            Event::Recovery { outcome_id, rung: 1, action: RecoveryAction::FellBack, .. }
+                if *outcome_id == incomplete.id
+        )
+    });
+    assert!(fell_back, "rung 1 answers the incomplete outcome");
+    assert_hop_lockstep(&run);
 }

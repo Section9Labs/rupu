@@ -464,7 +464,7 @@ async fn streaming_run_writes_assistant_deltas() {
 /// Spec §6.5: a limit learned from an overflow must survive a run that ends
 /// in an error, or a session whose turn clamps and then fails never persists
 /// it. One message is too short to compact or trim, so the clamp is followed
-/// by `Err(ContextOverflow)`; the run's final limits still come back.
+/// by a `context_overflow` outcome error; the run's final limits still come back.
 #[tokio::test]
 async fn run_agent_with_limits_returns_the_learned_limit_on_an_error_exit() {
     let provider = CapturingMockProvider::new(vec![ScriptedTurn::ProviderError(
@@ -475,7 +475,11 @@ async fn run_agent_with_limits_returns_the_learned_limit_on_an_error_exit() {
     opts.limits = ModelLimits::unknown().with_input(1_000_000);
     let (result, limits) = run_agent_with_limits(opts).await;
     assert!(
-        matches!(result, Err(RunError::ContextOverflow { .. })),
+        matches!(
+            &result,
+            Err(e @ RunError::Outcome { .. })
+                if e.outcome().and_then(|o| o.error_class.as_deref()) == Some("context_overflow")
+        ),
         "the run must end in an error for this test to mean anything"
     );
     assert_eq!(limits.input, Limit::new(200_000, LimitSource::Observed));
@@ -959,7 +963,7 @@ async fn a_plain_extra_usage_429_is_not_retried() {
     let opts = build_opts(Box::new(provider), &tmp, transcript.clone());
     let result = run_agent(opts).await;
     assert!(
-        matches!(&result, Err(RunError::Provider(m)) if m.contains("Extra usage")),
+        matches!(&result, Err(e @ RunError::Outcome { .. }) if e.to_string().contains("Extra usage")),
         "surfaces as an error: {:?}",
         result.as_ref().err()
     );
