@@ -1471,14 +1471,14 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
         })?;
     }
     // Conditional user-turn append. An EMPTY `user_message` means "seed-only":
-    // the caller has supplied a complete, ready-to-send transcript via
-    // `initial_messages` (e.g. the orchestrator resuming a tool-boundary pause,
-    // where the seed already ends in a `tool_result` that pairs with the
-    // preceding assistant `tool_use`). Appending a fresh user turn there would
-    // either double the user turn or — worse — strand the assistant's
-    // `tool_use` with no matching `tool_result`, which real Anthropic rejects
-    // with a 400. So we only append when there is an actual message to add.
-    // Every existing caller passes a non-empty `user_message` and is unaffected.
+    // `initial_messages` is a complete, ready-to-send conversation (e.g. the
+    // orchestrator resuming a tool-boundary pause, where the seed already ends
+    // in a `tool_result` that pairs with the preceding assistant `tool_use`, or
+    // a continuation whose seed already ends in the continuation note), and
+    // nothing is appended. A non-empty `user_message` goes through
+    // `push_user_turn`: it becomes a new user turn, or — when the seed ends in
+    // a user turn, as after a tool turn — joins that turn rather than creating
+    // two consecutive user messages, which providers reject.
     if !opts.user_message.is_empty() {
         push_user_turn(&mut messages, &opts.user_message);
         writer.write(&Event::UserMessage {
