@@ -519,6 +519,12 @@ pub struct AssetMarkTool {
     engagement: Arc<rupu_coverage::ActiveSet>,
 }
 
+impl AssetMarkTool {
+    pub fn new(paths: CoveragePaths, engagement: Arc<rupu_coverage::ActiveSet>) -> Self {
+        Self { paths, engagement }
+    }
+}
+
 #[async_trait]
 impl Tool for AssetMarkTool {
     fn name(&self) -> &'static str {
