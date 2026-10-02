@@ -1470,69 +1470,72 @@ fn process_gemini_sse(
         }
     }
 
-    // Process candidates
-    if let Some(candidates) = data.get("candidates").and_then(|c| c.as_array()) {
-        if let Some(candidate) = candidates.first() {
-            if let Some(parts) = candidate
-                .get("content")
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.as_array())
-            {
-                for part in parts {
-                    // Every part is stored verbatim — it may carry a
-                    // thoughtSignature that has to return on this exact part.
-                    acc.raw_parts.push(part.clone());
+    // Process the first candidate. With none (absent or an empty array) the
+    // prompt itself may have been refused, as in the non-streaming parse.
+    let first_candidate = data
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
+    if let Some(candidate) = first_candidate {
+        if let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+        {
+            for part in parts {
+                // Every part is stored verbatim — it may carry a
+                // thoughtSignature that has to return on this exact part.
+                acc.raw_parts.push(part.clone());
 
-                    let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        if is_thought {
-                            // Deliberately no "\n\n" separator here, unlike the
-                            // non-streaming join in parse_generate_content_response:
-                            // SSE commonly delivers a single thought summary
-                            // fragmented across chunks, and inserting a separator
-                            // per chunk would corrupt it into disjoint paragraphs.
-                            // Display-only (reasoning_text()) — raw["parts"] and
-                            // the replay path are unaffected either way. Do not
-                            // "fix" this to match the non-streaming path.
-                            acc.thought_text.push_str(text);
-                            on_event(StreamEvent::ReasoningDelta(text.to_string()));
-                        } else {
-                            acc.text.push_str(text);
-                            on_event(StreamEvent::TextDelta(text.to_string()));
-                        }
-                    }
-
-                    // Checked even on a thought part: a part can carry both, and
-                    // the old `continue` here silently dropped the tool call.
-                    if let Some(fc) = part.get("functionCall") {
-                        let name = fc["name"].as_str().unwrap_or("").to_string();
-                        let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
-                        acc.tool_call_counter += 1;
-                        let id = format!("gemini_tc_{}", acc.tool_call_counter);
-                        on_event(StreamEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: name.clone(),
-                        });
-                        let args_str = args.to_string();
-                        on_event(StreamEvent::InputJsonDelta(args_str));
-                        acc.content_blocks.push(ContentBlock::ToolUse {
-                            id,
-                            name,
-                            input: args,
-                        });
+                let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if is_thought {
+                        // Deliberately no "\n\n" separator here, unlike the
+                        // non-streaming join in parse_generate_content_response:
+                        // SSE commonly delivers a single thought summary
+                        // fragmented across chunks, and inserting a separator
+                        // per chunk would corrupt it into disjoint paragraphs.
+                        // Display-only (reasoning_text()) — raw["parts"] and
+                        // the replay path are unaffected either way. Do not
+                        // "fix" this to match the non-streaming path.
+                        acc.thought_text.push_str(text);
+                        on_event(StreamEvent::ReasoningDelta(text.to_string()));
+                    } else {
+                        acc.text.push_str(text);
+                        on_event(StreamEvent::TextDelta(text.to_string()));
                     }
                 }
-            }
 
-            if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
-                acc.finish = Some(reason.to_string());
+                // Checked even on a thought part: a part can carry both, and
+                // the old `continue` here silently dropped the tool call.
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc["name"].as_str().unwrap_or("").to_string();
+                    let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                    acc.tool_call_counter += 1;
+                    let id = format!("gemini_tc_{}", acc.tool_call_counter);
+                    on_event(StreamEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                    let args_str = args.to_string();
+                    on_event(StreamEvent::InputJsonDelta(args_str));
+                    acc.content_blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input: args,
+                    });
+                }
             }
-            if let Some(m) = candidate.get("finishMessage").filter(|m| !m.is_null()) {
-                acc.finish_message = Some(m.clone());
-            }
-            if let Some(r) = candidate.get("safetyRatings").filter(|r| !r.is_null()) {
-                acc.safety_ratings = Some(r.clone());
-            }
+        }
+
+        if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
+            acc.finish = Some(reason.to_string());
+        }
+        if let Some(m) = candidate.get("finishMessage").filter(|m| !m.is_null()) {
+            acc.finish_message = Some(m.clone());
+        }
+        if let Some(r) = candidate.get("safetyRatings").filter(|r| !r.is_null()) {
+            acc.safety_ratings = Some(r.clone());
         }
     } else if let Some(block) = data
         .get("promptFeedback")
@@ -3140,6 +3143,42 @@ mod tests {
             r.stop.wire.details.as_ref().unwrap()["prompt_blocked"],
             true
         );
+    }
+
+    #[test]
+    fn prompt_blocked_stream_with_an_empty_candidates_array() {
+        let s = stream_parse(&[r#"{"candidates":[],"promptFeedback":{"blockReason":"SAFETY"}}"#])
+            .expect("an empty candidates array with a block is a reply");
+        assert_eq!(s.stop.reason, StopReason::Safety);
+        assert_eq!(s.stop.wire.value.as_deref(), Some("SAFETY"));
+        assert_eq!(
+            s.stop.wire.details.as_ref().unwrap()["prompt_blocked"],
+            true
+        );
+
+        let r = send_parse(serde_json::json!({
+            "candidates": [], "promptFeedback": {"blockReason": "SAFETY"}
+        }));
+        assert_eq!(r.stop.reason, StopReason::Safety);
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["prompt_blocked"],
+            true
+        );
+    }
+
+    #[test]
+    fn stream_error_body_carries_the_antigravity_provider() {
+        let mut acc = GeminiAccumulator::new("m", "google-antigravity");
+        let err = process_gemini_sse(
+            &sse(r#"{"error":{"code":429,"message":"Quota.","status":"RESOURCE_EXHAUSTED"}}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        match err {
+            ProviderError::Reply(body) => assert_eq!(body.provider, "google-antigravity"),
+            other => panic!("expected Reply, got {other:?}"),
+        }
     }
 
     #[test]
