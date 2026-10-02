@@ -197,12 +197,37 @@ fn continue_refuses_an_unknown_run() {
         .stderr(predicate::str::contains("can't be read"));
 }
 
+/// `--continue` re-enters an existing run, so it takes no target, prompt or
+/// clone destination. The run being continued really exists here, so each
+/// case can only fail on clap's conflict — not on a missing transcript.
 #[test]
-fn continue_does_not_take_a_prompt() {
+fn continue_conflicts_with_a_target_prompt_or_clone_destination() {
     let dir = tempfile::tempdir().unwrap();
     make_agent(dir.path(), "hello");
-    rupu(dir.path(), "[]")
-        .args(["run", "hello", "--continue", "run_first", "another prompt"])
-        .assert()
-        .failure();
+    first_run(dir.path());
+    interrupt_first_run(dir.path());
+    let into = dir.path().join("clone-here");
+
+    let cases: [(&[&str], &str); 4] = [
+        (&["another prompt"], "'[TARGET]'"),
+        (&["--prompt", "x"], "'--prompt <PROMPT_FLAG>'"),
+        (&["--tmp"], "'--tmp'"),
+        (&["--into", into.to_str().unwrap()], "'--into <PATH>'"),
+    ];
+    for (extra, conflicting) in cases {
+        rupu(dir.path(), "[]")
+            .args([
+                "run",
+                "hello",
+                "--mode",
+                "bypass",
+                "--continue",
+                "run_first",
+            ])
+            .args(extra)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"))
+            .stderr(predicate::str::contains(conflicting));
+    }
 }
