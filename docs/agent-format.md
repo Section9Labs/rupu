@@ -480,3 +480,14 @@ calling the model; a run that failed can't be continued — start it fresh.
 Run the command from the same project as the original run. The new run needs
 its own run id: a `--run-id` that already has a transcript (the run being
 continued, or any other run) is refused rather than overwritten.
+
+A run that failed on a provider-side outcome — a refusal, a reply that kept
+getting cut off — with no fallback left ends with a hint naming this command.
+Its conversation is intact, so it can be continued on another model:
+
+    rupu run <agent> --continue <agent_run_id> --model <model> [--provider <provider>]
+
+The agent is told the earlier attempt stopped and why, and which model it is
+continuing on. `--model` and `--provider` override the agent's own `model:` /
+`provider:` for any `rupu run`, not only a continuation. A run that failed for
+another reason (max turns, say) still can't be continued this way.

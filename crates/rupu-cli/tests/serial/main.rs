@@ -83,6 +83,7 @@ mod cli_paths;
 mod cli_provider_factory;
 mod cli_repos;
 mod cli_run;
+mod cli_run_continue_model;
 mod cli_run_fallback;
 mod cli_samples;
 mod cli_transcript;

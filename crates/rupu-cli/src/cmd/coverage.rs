@@ -1234,6 +1234,8 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         // engagement selection (follow-on); it never silently guesses one.
         engagement_profiles: Vec::new(),
         continue_from: None,
+        model: None,
+        provider: None,
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),
