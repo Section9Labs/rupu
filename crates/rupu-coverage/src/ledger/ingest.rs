@@ -146,7 +146,8 @@ fn append_unseen(
 
 fn mark_external(record: &mut FindingRecord, host: &str) {
     if let Some(report) = record.report.as_mut() {
-        for a in &mut report.artifacts {
+        // Every file the report references, evidence-block files included.
+        for a in report.artifact_refs_mut() {
             a.stored = Some(ArtifactStorage::External);
             a.host = Some(host.to_string());
         }
@@ -355,6 +356,40 @@ mod tests {
         );
         assert_eq!(a.size, 12);
         assert_eq!(a.path, "poc/exploit.py");
+    }
+
+    #[test]
+    fn remote_ingest_marks_block_artifacts_external_with_the_host() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut f = finding("f1", true);
+        f.report.as_mut().unwrap().blocks = vec![crate::report::EvidenceBlock::Image {
+            artifact: ArtifactRef {
+                path: "shots/login.png".into(),
+                sha256: "cd".repeat(32),
+                size: 7,
+                kind: Some(ArtifactKind::Binary),
+                stored: Some(ArtifactStorage::Copied),
+                host: None,
+            },
+            caption: None,
+        }];
+        let s = stream(&[begin(), findings_line("sec", f)]);
+        ingest_unit_stream(ws.path(), &remote(), &s).unwrap();
+        let tid = target_id(ws.path(), "sec");
+        let got = read_findings(&CoveragePaths::new(ws.path(), &tid)).unwrap();
+        let rep = got[0].report.as_ref().unwrap();
+        let a = rep.blocks[0].artifact().expect("an image block has a file");
+        assert_eq!(a.stored, Some(ArtifactStorage::External));
+        assert_eq!(a.host.as_deref(), Some("host_01REMOTE"));
+        assert_eq!(
+            a.sha256,
+            "cd".repeat(32),
+            "sha256 is kept for the pull's verification"
+        );
+        assert_eq!(a.size, 7);
+        // The PoC artifact is still marked too, and block files did not join it.
+        assert_eq!(rep.artifacts.len(), 1);
+        assert_eq!(rep.artifacts[0].host.as_deref(), Some("host_01REMOTE"));
     }
 
     #[test]

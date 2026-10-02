@@ -278,7 +278,8 @@ pub(crate) fn check_full_report(
 
 /// Validate a full-profile report and turn it into what the ledger stores:
 /// claim hashes recomputed (or, with [`ClaimHashes::Skip`], left unset),
-/// artifacts ingested into the store, the size budget re-checked. Shared by
+/// artifacts and evidence-block files verified and ingested into the store,
+/// the size budget re-checked. Shared by
 /// `report_finding` (a new finding, [`ClaimHashes::Record`]) and
 /// `attach_reports` (a report imported onto an existing finding,
 /// [`ClaimHashes::Skip`]).
@@ -296,14 +297,18 @@ pub(crate) fn prepare_full_report(
     for claim in &mut report.evidence {
         claim.sha256 = None;
     }
-    if !report.artifacts.is_empty() {
+    let has_block_files = report.blocks.iter().any(|b| b.artifact().is_some());
+    if !report.artifacts.is_empty() || has_block_files {
         let store = opts
             .artifact_root
             .as_ref()
             .map(crate::report::ArtifactStore::new)
             .ok_or(crate::report::ArtifactError::NoStore)?;
-        report.artifacts =
-            store.ingest(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
+        let limits = opts.ingest_limits();
+        if !report.artifacts.is_empty() {
+            report.artifacts = store.ingest(&paths.workspace, &report.artifacts, limits)?;
+        }
+        ingest_block_files(&store, &paths.workspace, &mut report, limits)?;
     }
     if hashes == ClaimHashes::Record {
         hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
@@ -332,6 +337,82 @@ pub(crate) fn check_stored_size(
                 ),
             }]),
         ));
+    }
+    Ok(())
+}
+
+/// Verify and store every file an evidence block points at, against what is
+/// left of the finding's ingest budget after `report.artifacts`, and replace
+/// each block's ref (whatever the agent wrote) with the verified one. A block
+/// names exactly one file. Block files stay in their blocks: they are not
+/// PoC artifacts.
+fn ingest_block_files(
+    store: &crate::report::ArtifactStore,
+    workspace: &std::path::Path,
+    report: &mut crate::report::FindingReport,
+    limits: crate::report::IngestLimits,
+) -> Result<(), ReportFindingError> {
+    use crate::report::{ArtifactError, ArtifactStorage};
+    let field_error = |i: usize, message: &str| {
+        ReportFindingError::Report(crate::report::ReportValidationError(vec![
+            crate::report::FieldError {
+                path: format!("report.blocks[{i}].artifact.path"),
+                message: message.into(),
+            },
+        ]))
+    };
+    // What the finding has already spent: the files `report.artifacts`
+    // expanded to, and the bytes of those that were copied.
+    let mut used_files = report.artifacts.len();
+    let mut used_copied = 0usize;
+    let mut used_bytes = 0u64;
+    for a in &report.artifacts {
+        if a.stored == Some(ArtifactStorage::Copied) {
+            used_copied += 1;
+            used_bytes = used_bytes.saturating_add(a.size);
+        }
+    }
+    for i in 0..report.blocks.len() {
+        let Some(requested) = report.blocks[i].artifact().cloned() else {
+            continue;
+        };
+        if workspace.join(&requested.path).is_dir() {
+            return Err(field_error(
+                i,
+                "names a directory; an evidence block shows exactly one file",
+            ));
+        }
+        let left = crate::report::IngestLimits {
+            max_files: limits.max_files.saturating_sub(used_files),
+            max_total_bytes: limits.max_total_bytes.saturating_sub(used_bytes),
+            ..limits
+        };
+        // The store judges this one block against what is left; report the
+        // whole finding's numbers and the configured limits instead.
+        let got = store
+            .ingest(workspace, std::slice::from_ref(&requested), left)
+            .map_err(|e| match e {
+                ArtifactError::TooManyFiles { .. } => ArtifactError::TooManyFiles {
+                    max: limits.max_files,
+                },
+                ArtifactError::TooLarge { total, files, .. } => ArtifactError::TooLarge {
+                    total: used_bytes.saturating_add(total),
+                    files: used_copied + files,
+                    max: limits.max_total_bytes,
+                },
+                other => other,
+            })?;
+        let [one] = got.as_slice() else {
+            return Err(field_error(i, "must name exactly one file"));
+        };
+        used_files += 1;
+        if one.stored == Some(ArtifactStorage::Copied) {
+            used_copied += 1;
+            used_bytes = used_bytes.saturating_add(one.size);
+        }
+        *report.blocks[i]
+            .artifact_mut()
+            .expect("the block had an artifact above") = one.clone();
     }
     Ok(())
 }
@@ -1257,6 +1338,201 @@ mod tests {
             stored: None,
             host: None,
         }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = crate::report::FindingWriteOptions::default(); // no artifact_root
+        let err = report_finding(&paths, attribution(), full_input(r), &opts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReportFindingError::Artifact(crate::report::ArtifactError::NoStore)
+            ),
+            "{err}"
+        );
+        assert!(!paths.findings.exists());
+    }
+
+    fn file_ref(path: &str) -> crate::report::ArtifactRef {
+        crate::report::ArtifactRef {
+            path: path.into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }
+    }
+
+    fn image_block(path: &str) -> crate::report::EvidenceBlock {
+        crate::report::EvidenceBlock::Image {
+            artifact: file_ref(path),
+            caption: Some("the login page".into()),
+        }
+    }
+
+    #[test]
+    fn an_image_block_file_is_verified_and_stored_but_not_listed_as_a_poc() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("shots")).unwrap();
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(b"fake");
+        std::fs::write(ws.path().join("shots/login.png"), &bytes).unwrap();
+        let real_sha = crate::report::sha256_file(&ws.path().join("shots/login.png")).unwrap();
+        let mut r = fixture_report();
+        r.artifacts = vec![];
+        r.blocks = vec![crate::report::EvidenceBlock::Image {
+            artifact: crate::report::ArtifactRef {
+                path: "shots/login.png".into(),
+                sha256: "0".repeat(64),
+                size: 1,
+                kind: Some(crate::report::ArtifactKind::Text),
+                stored: Some(crate::report::ArtifactStorage::External),
+                host: Some("agent-claimed-host".into()),
+            },
+            caption: Some("the login page".into()),
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap();
+        let rep = only_record(&paths).report.unwrap();
+        let a = rep.blocks[0].artifact().expect("still an image block");
+        assert_eq!(a.path, "shots/login.png");
+        assert_eq!(a.sha256, real_sha, "the agent's sha is replaced");
+        assert_ne!(a.sha256, "0".repeat(64));
+        assert_eq!(a.size, bytes.len() as u64, "the agent's size is replaced");
+        assert_eq!(a.kind, Some(crate::report::ArtifactKind::Binary));
+        assert_eq!(a.stored, Some(crate::report::ArtifactStorage::Copied));
+        assert_eq!(a.host, None, "the agent cannot claim a host");
+        assert!(matches!(
+            &rep.blocks[0],
+            crate::report::EvidenceBlock::Image { caption: Some(c), .. } if c == "the login page"
+        ));
+        let blob = crate::report::ArtifactStore::new(store.path()).blob_path(&real_sha);
+        assert_eq!(std::fs::read(blob).unwrap(), bytes);
+        assert!(
+            rep.artifacts.is_empty(),
+            "a block's file is not a PoC artifact"
+        );
+    }
+
+    #[test]
+    fn a_block_naming_a_directory_is_a_field_error() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("dumps")).unwrap();
+        std::fs::write(ws.path().join("dumps/a.bin"), b"aa").unwrap();
+        std::fs::write(ws.path().join("dumps/b.bin"), b"bb").unwrap();
+        let mut r = fixture_report();
+        r.blocks = vec![crate::report::EvidenceBlock::Hexdump {
+            base: 0x1000,
+            artifact: file_ref("dumps/"),
+            rendered: None,
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let err = report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap_err();
+        match &err {
+            ReportFindingError::Report(e) => {
+                assert_eq!(e.0.len(), 1, "{err}");
+                assert_eq!(e.0[0].path, "report.blocks[0].artifact.path");
+            }
+            other => panic!("expected a report field error, got {other}"),
+        }
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+    }
+
+    #[test]
+    fn a_block_naming_a_missing_file_is_refused() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let mut r = fixture_report();
+        r.blocks = vec![crate::report::EvidenceBlock::PcapRef {
+            artifact: file_ref("caps/none.pcap"),
+            summary: "three SYNs".into(),
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let err = report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReportFindingError::Artifact(crate::report::ArtifactError::Missing { .. })
+            ),
+            "{err}"
+        );
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn block_files_share_the_findings_ingest_budget() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "aaaaaa").unwrap();
+        std::fs::write(ws.path().join("b.png"), "bbbbbb").unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = crate::report::FindingWriteOptions {
+            artifact_total_max_bytes: 10,
+            ..full_opts(store.path())
+        };
+        let mut only_artifact = fixture_report();
+        only_artifact.artifacts = vec![file_ref("a.txt")];
+        report_finding(&paths, attribution(), full_input(only_artifact), &opts)
+            .expect("6 of 10 bytes fits");
+        std::fs::remove_file(&paths.findings).unwrap();
+
+        let mut both = fixture_report();
+        both.artifacts = vec![file_ref("a.txt")];
+        both.blocks = vec![image_block("b.png")];
+        let err =
+            report_finding(&paths, attribution(), full_input(both.clone()), &opts).unwrap_err();
+        match &err {
+            // The numbers are the whole finding's, not what was left over.
+            ReportFindingError::Artifact(crate::report::ArtifactError::TooLarge {
+                total,
+                files,
+                max,
+            }) => assert_eq!((*total, *files, *max), (12, 2, 10), "{err}"),
+            other => panic!("expected TooLarge, got {other}"),
+        }
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+
+        // The file count is shared too, and reported as the configured limit.
+        let files = crate::report::FindingWriteOptions {
+            artifact_max_files: 1,
+            ..full_opts(store.path())
+        };
+        let err = report_finding(&paths, attribution(), full_input(both), &files).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReportFindingError::Artifact(crate::report::ArtifactError::TooManyFiles { max: 1 })
+            ),
+            "{err}"
+        );
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn block_files_without_a_store_fail_loudly() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("x.png"), "x").unwrap();
+        let mut r = fixture_report();
+        r.blocks = vec![image_block("x.png")];
         let paths = CoveragePaths::new(ws.path(), "t");
         let opts = crate::report::FindingWriteOptions::default(); // no artifact_root
         let err = report_finding(&paths, attribution(), full_input(r), &opts).unwrap_err();

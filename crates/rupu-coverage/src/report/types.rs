@@ -303,6 +303,25 @@ impl EvidenceBlock {
             EvidenceBlock::PcapRef { .. } => "pcap_ref",
         }
     }
+
+    /// The file this block points at (`image`, `hexdump`, `pcap_ref`).
+    pub fn artifact(&self) -> Option<&ArtifactRef> {
+        match self {
+            EvidenceBlock::Image { artifact, .. }
+            | EvidenceBlock::Hexdump { artifact, .. }
+            | EvidenceBlock::PcapRef { artifact, .. } => Some(artifact),
+            _ => None,
+        }
+    }
+
+    pub fn artifact_mut(&mut self) -> Option<&mut ArtifactRef> {
+        match self {
+            EvidenceBlock::Image { artifact, .. }
+            | EvidenceBlock::Hexdump { artifact, .. }
+            | EvidenceBlock::PcapRef { artifact, .. } => Some(artifact),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +494,23 @@ impl FindingReport {
         }
         kinds
     }
+
+    /// Every file this report references: `artifacts`, then the files its
+    /// evidence blocks point at. Consumers that mean "any referenced file"
+    /// (serving, remote marking, bucket upload) use this, never `artifacts`.
+    pub fn artifact_refs(&self) -> impl Iterator<Item = &ArtifactRef> {
+        self.artifacts
+            .iter()
+            .chain(self.blocks.iter().filter_map(EvidenceBlock::artifact))
+    }
+
+    pub fn artifact_refs_mut(&mut self) -> impl Iterator<Item = &mut ArtifactRef> {
+        self.artifacts.iter_mut().chain(
+            self.blocks
+                .iter_mut()
+                .filter_map(EvidenceBlock::artifact_mut),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +559,50 @@ mod tests {
         let kinds = r.block_kinds();
         assert!(kinds.contains("scan_output"));
         assert!(kinds.contains("code_slice"));
+    }
+
+    fn art(path: &str) -> ArtifactRef {
+        ArtifactRef {
+            path: path.into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }
+    }
+
+    #[test]
+    fn artifact_refs_lists_artifacts_then_block_artifacts() {
+        let mut r = report_fixture();
+        r.artifacts = vec![art("a.bin")];
+        r.blocks = vec![
+            EvidenceBlock::Text { text: "t".into() },
+            EvidenceBlock::Image {
+                artifact: art("x.png"),
+                caption: None,
+            },
+            EvidenceBlock::PcapRef {
+                artifact: art("c.pcap"),
+                summary: "s".into(),
+            },
+        ];
+        let paths: Vec<&str> = r.artifact_refs().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, ["a.bin", "x.png", "c.pcap"]);
+        for a in r.artifact_refs_mut() {
+            a.sha256 = "marked".into();
+        }
+        assert!(r.artifact_refs().all(|a| a.sha256 == "marked"));
+        assert_eq!(r.artifact_refs().count(), 3);
+        // The block accessors name exactly the three file-bearing kinds.
+        assert!(r.blocks[0].artifact().is_none());
+        assert_eq!(r.blocks[1].artifact().unwrap().path, "x.png");
+        let hex = EvidenceBlock::Hexdump {
+            base: 0,
+            artifact: art("h.bin"),
+            rendered: None,
+        };
+        assert_eq!(hex.artifact().unwrap().path, "h.bin");
     }
 
     #[test]

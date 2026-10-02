@@ -279,6 +279,21 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
         }
     }
 
+    // A block's file follows the same path rules as `artifacts`; it names
+    // exactly one file, which `report_finding` checks against the disk.
+    for (i, b) in r.blocks.iter().enumerate() {
+        let Some(a) = b.artifact() else { continue };
+        let field = format!("report.blocks[{i}].artifact.path");
+        if let Some(why) = rel_path_problem(&a.path) {
+            c.err(field, why);
+        } else if crate::report::artifacts::names_workspace_root(&a.path) {
+            c.err(
+                field,
+                "names the workspace root; name the one file this block shows",
+            );
+        }
+    }
+
     // Size last, and only when nothing else is wrong: a flood of field
     // errors plus "too big" buries the actionable ones.
     if c.errors.is_empty() {
@@ -467,6 +482,36 @@ mod tests {
                 "{p}"
             );
         }
+    }
+
+    #[test]
+    fn a_block_artifact_path_follows_the_artifact_path_rules() {
+        let img = |path: &str| EvidenceBlock::Image {
+            artifact: ArtifactRef {
+                path: path.into(),
+                sha256: String::new(),
+                size: 0,
+                kind: None,
+                stored: None,
+                host: None,
+            },
+            caption: None,
+        };
+        let mut r = valid();
+        // Block index 1, behind a text block: the field path names the index.
+        for bad in ["../x.png", ".", "./"] {
+            r.blocks = vec![EvidenceBlock::Text { text: "t".into() }, img(bad)];
+            assert_eq!(
+                problems(&r),
+                vec!["report.blocks[1].artifact.path".to_string()],
+                "{bad}"
+            );
+        }
+        r.blocks = vec![
+            EvidenceBlock::Text { text: "t".into() },
+            img("shots/login.png"),
+        ];
+        assert_eq!(problems(&r), Vec::<String>::new());
     }
 
     #[test]
