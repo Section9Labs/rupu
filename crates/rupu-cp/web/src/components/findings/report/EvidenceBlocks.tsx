@@ -3,7 +3,14 @@ import { findingArtifactUrl } from '../../../lib/api';
 import { formatBytes, type ArtifactRef, type DisasmLine, type EvidenceBlock } from '../../../lib/findingReport';
 import Markdown from '../../transcript/Markdown';
 
-const hex = (n: number) => `0x${n.toString(16)}`;
+/** An address for display. The CP's exact `0x…` string wins; a bare number
+ *  above 2^53 was already rounded by JSON.parse, so it is marked imprecise
+ *  rather than shown as if it were right. */
+function hex(n: number, exact?: string): string {
+  if (exact) return exact;
+  const s = `0x${n.toString(16)}`;
+  return Number.isSafeInteger(n) ? s : `${s} ≈ (imprecise)`;
+}
 
 const PRE = 'max-h-96 overflow-auto px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre';
 
@@ -84,7 +91,7 @@ function Disasm({ arch, listing }: { arch: string; listing: DisasmLine[] }) {
           <tbody>
             {listing.map((l, i) => (
               <tr key={i} className="align-top">
-                <td className="whitespace-nowrap px-3 py-0.5 text-ink-mute">{hex(l.address)}</td>
+                <td className="whitespace-nowrap px-3 py-0.5 text-ink-mute">{hex(l.address, l.address_hex)}</td>
                 <td className="whitespace-nowrap px-2 py-0.5 text-ink-mute">{l.bytes}</td>
                 <td className="whitespace-nowrap px-2 py-0.5">{l.mnemonic}</td>
                 <td className="px-2 py-0.5 text-ink-dim">{l.ops}</td>
@@ -132,7 +139,7 @@ function Block({ findingId, block }: { findingId: string; block: EvidenceBlock }
       return <ImageBlock findingId={findingId} artifact={block.artifact} caption={block.caption} />;
     case 'hexdump':
       return (
-        <Frame label={<span className="flex flex-wrap items-center justify-between gap-2"><span>hexdump · base {hex(block.base)}</span><ArtifactMeta findingId={findingId} artifact={block.artifact} /></span>}>
+        <Frame label={<span className="flex flex-wrap items-center justify-between gap-2"><span>hexdump · base {hex(block.base, block.base_hex)}</span><ArtifactMeta findingId={findingId} artifact={block.artifact} /></span>}>
           {block.rendered ? <Code text={block.rendered} /> : <p className="px-3 py-2 text-ui text-ink-mute">No rendered preview. Use Download.</p>}
         </Frame>
       );

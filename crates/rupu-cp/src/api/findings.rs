@@ -504,7 +504,7 @@ fn find_finding(global: &std::path::Path, id: &str) -> Option<FindingOut> {
 async fn get_finding(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<FindingDetail>> {
+) -> ApiResult<Json<serde_json::Value>> {
     let global = s.global_dir.clone();
     let id_for_lookup = id.clone();
     let found = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
@@ -529,10 +529,53 @@ async fn get_finding(
         (Some(report), Err(_)) => vec![ClaimState::Unknown; report.evidence.len()],
         (None, _) => Vec::new(),
     };
-    Ok(Json(FindingDetail {
+    let mut body = serde_json::to_value(FindingDetail {
         finding,
         evidence_status,
-    }))
+    })
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    add_hex_siblings(&mut body);
+    Ok(Json(body))
+}
+
+/// `0x` + lowercase hex of `n`, unpadded: the exact text for a 64-bit address.
+fn hex_string(n: u64) -> String {
+    format!("0x{n:x}")
+}
+
+/// Adds exact string siblings for the 64-bit numbers in a serialized finding
+/// body: `address_hex` on every disasm listing line and `base_hex` on every
+/// hexdump block (`report.blocks`). The numeric `address` / `base` stay as
+/// they are, but a JSON number above 2^53 is rounded by `JSON.parse` in the
+/// browser, so clients display the string. A wire-only transform: the stored
+/// report and its schema are untouched.
+fn add_hex_siblings(body: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(blocks) = body
+        .get_mut("report")
+        .and_then(|r| r.get_mut("blocks"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for block in blocks {
+        match block.get("kind").and_then(Value::as_str) {
+            Some("hexdump") => {
+                if let Some(base) = block.get("base").and_then(Value::as_u64) {
+                    block["base_hex"] = Value::String(hex_string(base));
+                }
+            }
+            Some("disasm") => {
+                let lines = block.get_mut("listing").and_then(Value::as_array_mut);
+                for line in lines.into_iter().flatten() {
+                    if let Some(addr) = line.get("address").and_then(Value::as_u64) {
+                        line["address_hex"] = Value::String(hex_string(addr));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The `filename` an artifact is offered under: the last `/`-separated segment
@@ -2309,6 +2352,56 @@ mod tests {
             assert!(row.get("report").is_none());
             assert!(row["report_summary"]["root_cause"].is_string());
         }
+    }
+
+    #[tokio::test]
+    async fn get_finding_adds_exact_hex_for_64_bit_addresses() {
+        use rupu_coverage::report::{ArtifactRef, DisasmLine, EvidenceBlock};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rec = full_record("fnd_hex");
+        rec.report.as_mut().unwrap().blocks = vec![
+            EvidenceBlock::Hexdump {
+                base: 0xffff_ffff_8123_4567,
+                artifact: ArtifactRef {
+                    path: "dump.bin".into(),
+                    sha256: String::new(),
+                    size: 0,
+                    kind: None,
+                    stored: None,
+                    host: None,
+                },
+                rendered: None,
+            },
+            EvidenceBlock::Disasm {
+                arch: "x86_64".into(),
+                listing: vec![
+                    DisasmLine {
+                        address: 0xffff_ffff_8123_4567,
+                        bytes: "90".into(),
+                        mnemonic: "nop".into(),
+                        ops: String::new(),
+                    },
+                    DisasmLine {
+                        address: 0x40,
+                        bytes: "c3".into(),
+                        mnemonic: "ret".into(),
+                        ops: String::new(),
+                    },
+                ],
+            },
+        ];
+        seed_workspace_findings(tmp.path(), &[rec]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let app = routes().with_state(state);
+        let (status, json) = get_json(app, "/api/findings/fnd_hex").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let blocks = &json["report"]["blocks"];
+        assert_eq!(blocks[0]["base_hex"], "0xffffffff81234567");
+        assert_eq!(blocks[1]["listing"][0]["address_hex"], "0xffffffff81234567");
+        assert_eq!(blocks[1]["listing"][1]["address_hex"], "0x40");
     }
 
     #[test]

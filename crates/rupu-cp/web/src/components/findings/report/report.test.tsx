@@ -445,6 +445,28 @@ describe('EvidenceBlocks', () => {
     expect(container).toHaveTextContent('3 hits in module');
   });
 
+  it('shows the exact hex string for 64-bit addresses verbatim', () => {
+    // 0xffffffff81234567 rounds to ...800 as a JS number; the string is exact.
+    const { container } = show([
+      { kind: 'hexdump', base: 0xffffffff81234567, base_hex: '0xffffffff81234567', artifact: art() },
+      { kind: 'disasm', arch: 'x86_64', listing: [{ address: 0xffffffff81234567, address_hex: '0xffffffff81234567', bytes: '90', mnemonic: 'nop' }] },
+    ]);
+    expect(container).toHaveTextContent('base 0xffffffff81234567');
+    expect(screen.getByText('0xffffffff81234567', { selector: 'td' })).toBeInTheDocument();
+    expect(container).not.toHaveTextContent('imprecise');
+  });
+
+  it('marks an unsafe-integer address without an exact string as imprecise', () => {
+    const { container } = show([
+      { kind: 'disasm', arch: 'x86_64', listing: [{ address: 0xffffffff81234567, bytes: '90', mnemonic: 'nop' }] },
+      { kind: 'hexdump', base: 0x401000, artifact: art() },
+    ]);
+    expect(container.querySelector('td')).toHaveTextContent('≈ (imprecise)');
+    // A safe integer needs no marker.
+    expect(container).toHaveTextContent('base 0x401000');
+    expect(container.textContent!.match(/imprecise/g)).toHaveLength(1);
+  });
+
   it('renders a local image inline with a download link', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
     const { container } = show([{ kind: 'image', artifact: art(), caption: 'Panel after the crash' }]);

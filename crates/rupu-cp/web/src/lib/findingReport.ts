@@ -29,14 +29,16 @@ export interface ArtifactRef {
 export type VerificationStatus = 'unverified' | 'confirmed' | 'disputed' | 'inconclusive';
 export interface Verification { status: VerificationStatus; by_run?: string; notes?: string }
 
-export interface DisasmLine { address: number; bytes: string; mnemonic: string; ops?: string }
+/** `address_hex` / `base_hex` are the exact 64-bit values as `0x…` strings the CP
+ *  adds on `GET /api/findings/:id`; the numbers lose precision above 2^53. */
+export interface DisasmLine { address: number; address_hex?: string; bytes: string; mnemonic: string; ops?: string }
 export type EvidenceBlock =
   | { kind: 'text'; text: string }
   | { kind: 'code_slice'; file?: string; excerpt: string; lang?: string }
   | { kind: 'diff'; diff: string }
   | { kind: 'table'; headers: string[]; rows: string[][] }
   | { kind: 'image'; artifact: ArtifactRef; caption?: string }
-  | { kind: 'hexdump'; base: number; artifact: ArtifactRef; rendered?: string }
+  | { kind: 'hexdump'; base: number; base_hex?: string; artifact: ArtifactRef; rendered?: string }
   | { kind: 'disasm'; arch: string; listing: DisasmLine[] }
   | { kind: 'decompile'; lang: string; listing: string }
   | { kind: 'http_exchange'; request: string; response: string }
