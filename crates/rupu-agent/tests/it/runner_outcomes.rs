@@ -251,6 +251,7 @@ async fn truncation_budget_exhausted_fails_with_an_outcome() {
         4,
         "three continuations, then the ladder"
     );
+    assert_eq!(ran.result.turns, 4, "the failing turn counts");
     let outcome = ran.result.outcome.as_ref().expect("a typed outcome");
     assert_eq!(outcome.class, "max_tokens");
 
@@ -311,6 +312,7 @@ async fn refusal_with_no_chain_fails_and_discards_the_partial() {
     )
     .await;
     assert_eq!(ran.result.status, RunStatus::Error);
+    assert_eq!(ran.result.turns, 1, "the refused turn counts");
     assert_eq!(
         ran.result.outcome.as_ref().map(|o| o.class.as_str()),
         Some("refusal")
@@ -665,12 +667,117 @@ fn truncated_tool_reply() -> ScriptedTurn {
     }
 }
 
+fn truncated_tool_reply_with_input(input_tokens: u32) -> ScriptedTurn {
+    match truncated_tool_reply() {
+        ScriptedTurn::Reply { content, stop, .. } => ScriptedTurn::Reply {
+            content,
+            stop,
+            usage: Usage {
+                input_tokens,
+                ..Default::default()
+            },
+        },
+        other => other,
+    }
+}
+
+fn compaction_count(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::Compaction { .. }))
+        .count()
+}
+
+fn read_events(path: &std::path::Path) -> Vec<Event> {
+    JsonlReader::iter(path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+/// The cap was lowered because input + max_tokens overflowed the window, so
+/// the retry compacts first and then sends the compacted history at the
+/// model's full output cap.
 #[tokio::test]
-async fn a_truncated_tool_call_under_a_lowered_cap_retries_with_the_full_cap() {
+async fn a_truncated_tool_call_under_a_lowered_cap_compacts_then_retries_at_the_full_cap() {
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::ProviderError(INPUT_PLUS_MAX_TOKENS.into()),
+        truncated_tool_reply_with_input(900),
+        // The compaction summariser's reply.
+        reply(StopReason::EndTurn, vec![text("SUMMARY of earlier work")]),
+        reply(StopReason::EndTurn, vec![text("written")]),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = vec![
+        dense_msg(Role::User, "task"),
+        dense_msg(Role::Assistant, "assistant 0"),
+        dense_msg(Role::User, "user 0"),
+        dense_msg(Role::Assistant, "assistant 1"),
+    ];
+    opts.limits = ModelLimits::unknown()
+        .with_input(2000)
+        .with_percent(90)
+        .with_output(20_000);
+    let result = run_agent(opts).await.unwrap();
+    assert_eq!(result.status, RunStatus::Ok);
+
+    let reqs = captured.lock().unwrap().clone();
+    assert_eq!(
+        reqs.len(),
+        4,
+        "overflow, truncated reply, summariser, retry"
+    );
+    assert_eq!(reqs[0].max_tokens, Some(20_000));
+    assert_eq!(reqs[1].max_tokens, Some(16_500), "the lowered cap");
+    let retry = &reqs[3];
+    assert_eq!(retry.max_tokens, Some(20_000), "the model's full cap");
+    assert!(
+        retry.messages.len() < reqs[1].messages.len(),
+        "the retry carries the compacted history"
+    );
+    assert!(retry
+        .messages
+        .iter()
+        .any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text { text } if text.contains("SUMMARY of earlier work")
+        ))));
+
+    let events = read_events(&transcript);
+    assert_eq!(compaction_count(&events), 1);
+    assert_eq!(
+        recovery_reasons(&events),
+        vec![
+            (0, RecoveryAction::Compacted, None),
+            (
+                0,
+                RecoveryAction::Retried,
+                Some("output cap raised to the model maximum after compaction".to_string())
+            ),
+        ]
+    );
+    assert!(!result
+        .final_messages
+        .iter()
+        .any(|m| m.role == Role::Assistant && last_text(m) == Some("writing")));
+    let rebuilt = rupu_agent::replay::reconstruct_messages(&events).unwrap();
+    assert_eq!(
+        serde_json::to_value(&rebuilt).unwrap(),
+        serde_json::to_value(&result.final_messages).unwrap()
+    );
+}
+
+/// Nothing to compact (the history is far below the threshold): retrying at
+/// the full cap would overflow again, so rung 0 does nothing and the outcome
+/// goes to the ladder.
+#[tokio::test]
+async fn a_truncated_tool_call_under_a_lowered_cap_with_nothing_to_compact_goes_to_the_ladder() {
     let provider = CapturingMockProvider::new(vec![
         ScriptedTurn::ProviderError(INPUT_PLUS_MAX_TOKENS.into()),
         truncated_tool_reply(),
-        reply(StopReason::EndTurn, vec![text("written")]),
     ]);
     let captured = provider.captured.clone();
     let tmp = tempfile::tempdir().unwrap();
@@ -678,30 +785,22 @@ async fn a_truncated_tool_call_under_a_lowered_cap_retries_with_the_full_cap() {
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
     opts.limits = ModelLimits::fixed(1_000_000, 20_000);
     let result = run_agent(opts).await.unwrap();
-    assert_eq!(result.status, RunStatus::Ok);
-    let caps: Vec<Option<u32>> = captured
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|r| r.max_tokens)
-        .collect();
-    assert_eq!(caps, vec![Some(20_000), Some(16_500), Some(20_000)]);
-    let events: Vec<Event> = JsonlReader::iter(&transcript)
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
+    assert_eq!(result.status, RunStatus::Error);
+    assert_eq!(result.turns, 1);
+    assert_eq!(captured.lock().unwrap().len(), 2, "no retry was sent");
     assert_eq!(
-        recovery_reasons(&events),
-        vec![(
-            0,
-            RecoveryAction::Retried,
-            Some("output cap raised to the model maximum".to_string())
-        )]
+        result.outcome.as_ref().map(|o| o.class.as_str()),
+        Some("max_tokens")
     );
-    assert!(!result
-        .final_messages
-        .iter()
-        .any(|m| m.role == Role::Assistant && last_text(m) == Some("writing")));
+    let events = read_events(&transcript);
+    assert_eq!(compaction_count(&events), 0);
+    assert_eq!(
+        recovery_reasons(&events)
+            .into_iter()
+            .map(|(rung, action, _)| (rung, action))
+            .collect::<Vec<_>>(),
+        vec![(3, RecoveryAction::Failed)]
+    );
 }
 
 #[tokio::test]
@@ -778,4 +877,77 @@ async fn context_window_exceeded_compacts_then_continues() {
         serde_json::to_value(&rebuilt).unwrap(),
         serde_json::to_value(&result.final_messages).unwrap()
     );
+}
+
+/// Over the proactive threshold AND stopped on a full context window: the
+/// proactive compaction already ran this turn, so rung 0 does not summarise
+/// the history it just produced a second time.
+#[tokio::test]
+async fn context_window_exceeded_after_a_proactive_compaction_compacts_once() {
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::Reply {
+            content: vec![text("partial")],
+            stop: Stop::synthetic(StopReason::ContextWindowExceeded, "mock"),
+            usage: Usage {
+                input_tokens: 1900,
+                ..Default::default()
+            },
+        },
+        // The one summariser call.
+        reply(StopReason::EndTurn, vec![text("SUMMARY of earlier work")]),
+        reply(StopReason::EndTurn, vec![text("finished")]),
+    ]);
+    let captured = provider.captured.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    opts.initial_messages = vec![
+        dense_msg(Role::User, "task"),
+        dense_msg(Role::Assistant, "assistant 0"),
+        dense_msg(Role::User, "user 0"),
+        dense_msg(Role::Assistant, "assistant 1"),
+    ];
+    // Threshold 1,800: the reply's 1,900 input tokens trigger the proactive
+    // compaction.
+    opts.limits = ModelLimits::unknown().with_input(2000).with_percent(90);
+    let result = run_agent(opts).await.unwrap();
+    assert_eq!(result.status, RunStatus::Ok);
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        3,
+        "the turn, ONE summariser call, the continuation"
+    );
+    let events = read_events(&transcript);
+    assert_eq!(compaction_count(&events), 1);
+    let actions: Vec<RecoveryAction> = recovery_reasons(&events)
+        .into_iter()
+        .map(|(_, action, _)| action)
+        .collect();
+    assert_eq!(
+        actions,
+        vec![RecoveryAction::Compacted, RecoveryAction::Continued]
+    );
+}
+
+/// truncation → empty reply (nudged) → the rest: the final answer still
+/// joins the earlier piece, because the discarded turn is transparent to
+/// the continuation chain.
+#[tokio::test]
+async fn a_nudged_empty_turn_inside_a_truncation_chain_keeps_the_first_piece() {
+    let ran = run_script(
+        vec![
+            reply(StopReason::MaxTokens, vec![text("part one")]),
+            reply(StopReason::EndTurn, vec![]),
+            reply(StopReason::EndTurn, vec![text("part two")]),
+        ],
+        "s1",
+    )
+    .await;
+    assert_eq!(ran.result.status, RunStatus::Ok);
+    assert_eq!(ran.result.turns, 3);
+    assert_eq!(
+        rupu_transcript::final_turn_text(ran.events.clone()).as_deref(),
+        Some("part one\n\npart two")
+    );
+    assert_replay_lockstep(&ran);
 }

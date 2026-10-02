@@ -129,3 +129,80 @@ fn a_discarded_turn_does_not_contribute() {
     ];
     assert_eq!(final_turn_text(ev).as_deref(), Some("kept"));
 }
+
+fn turn_end(idx: u32, discarded: bool) -> Event {
+    Event::TurnEnd {
+        turn_idx: idx,
+        tokens_in: None,
+        tokens_out: None,
+        stop_reason: None,
+        response_id: None,
+        stop: None,
+        discarded,
+    }
+}
+
+fn recovery(action: rupu_transcript::RecoveryAction, continues_output: bool) -> Event {
+    Event::Recovery {
+        outcome_id: "oc".into(),
+        rung: 0,
+        action,
+        attempt: Some(1),
+        budget: Some(1),
+        provider: None,
+        model: None,
+        reason: None,
+        merge_into_previous: false,
+        continues_output,
+    }
+}
+
+/// truncation → empty reply (discarded, nudged) → the rest: the discarded
+/// turn is transparent to the continuation chain.
+#[test]
+fn an_empty_nudged_turn_inside_a_chain_keeps_the_earlier_pieces() {
+    use rupu_transcript::RecoveryAction::Continued;
+    let ev = vec![
+        turn(0),
+        say("part one"),
+        turn_end(0, false),
+        recovery(Continued, true),
+        Event::UserMessage {
+            content: "continue".into(),
+        },
+        turn(1),
+        say("  "),
+        turn_end(1, true),
+        recovery(Continued, false),
+        Event::UserMessage {
+            content: "nudge".into(),
+        },
+        turn(2),
+        say("part two"),
+        turn_end(2, false),
+    ];
+    assert_eq!(final_turn_text(ev).as_deref(), Some("part one\n\npart two"));
+}
+
+/// truncation → incomplete reply (discarded, retried) → the rest.
+#[test]
+fn a_retried_turn_inside_a_chain_keeps_the_earlier_pieces() {
+    use rupu_transcript::RecoveryAction::{Continued, Retried};
+    let ev = vec![
+        turn(0),
+        say("part one"),
+        turn_end(0, false),
+        recovery(Continued, true),
+        Event::UserMessage {
+            content: "continue".into(),
+        },
+        turn(1),
+        say("half of part two"),
+        turn_end(1, true),
+        recovery(Retried, false),
+        turn(2),
+        say("part two"),
+        turn_end(2, false),
+    ];
+    assert_eq!(final_turn_text(ev).as_deref(), Some("part one\n\npart two"));
+}

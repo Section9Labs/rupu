@@ -45,10 +45,16 @@ pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String
     // `last_non_empty` as it stood when the current turn began, so a
     // discarded turn can be rolled back out of the fallback too.
     let mut last_before_turn: Option<String> = None;
+    // The chain state as it stood when the current turn began. A discarded
+    // turn (a refused, retried or empty reply) is transparent to the chain:
+    // its `TurnEnd` restores this, so the earlier pieces survive it and the
+    // next turn continues them.
+    let mut chain_before_turn: (Vec<String>, Vec<String>, bool) = (Vec::new(), Vec::new(), false);
     for event in events {
         match event {
             Event::TurnStart { .. } => {
                 saw_turn_start = true;
+                chain_before_turn = (carried.clone(), turn_fragments.clone(), carry_next);
                 if carry_next {
                     carried.append(&mut turn_fragments);
                 } else {
@@ -67,7 +73,7 @@ pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String
             Event::TurnEnd {
                 discarded: true, ..
             } => {
-                turn_fragments.clear();
+                (carried, turn_fragments, carry_next) = chain_before_turn.clone();
                 last_non_empty = last_before_turn.clone();
             }
             Event::Recovery {

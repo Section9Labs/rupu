@@ -47,6 +47,12 @@ pub fn recovery_retry_note(title: &str, provider: &str, model: &str) -> String {
 pub enum Rung0 {
     ContinuePause,
     ContinueTruncated,
+    /// A tool call cut off at an output cap that was lowered below the
+    /// model's maximum. The cap is lowered only when input + max_tokens
+    /// overflowed the window, so the same input at the full cap would fail
+    /// the same way: the history is compacted first, then the turn is
+    /// retried at the model's output cap. When nothing can be compacted,
+    /// rung 0 does nothing and the outcome climbs the ladder.
     RetryRaisedCap,
     CompactThenContinue,
     CorrectMalformed,

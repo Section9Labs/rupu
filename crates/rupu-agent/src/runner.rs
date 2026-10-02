@@ -839,11 +839,17 @@ fn no_recovery_hint(opts: &AgentRunOpts) -> String {
 
 /// The ladder ran out for a response outcome. This plan's rung 3 fails the
 /// run with the hint (plan deviation 1); rungs 1–2 go in front of it.
+///
+/// The failing turn counts: `turn_idx` moves past it, so `RunResult.turns`
+/// includes it and a session's next `turn_index_offset` never reuses its
+/// index.
 fn exhausted(
     writer: &mut JsonlWriter,
     opts: &AgentRunOpts,
     outcome: &crate::outcome::Outcome,
+    turn_idx: &mut u32,
 ) -> Result<LoopOutcome, RunError> {
+    *turn_idx += 1;
     let hint = no_recovery_hint(opts);
     RecoveryEvent {
         outcome_id: &outcome.id,
@@ -1660,6 +1666,10 @@ async fn run_agent_inner(
             // `LongContextUnavailable` falls back to the standard window and
             // retries at most once per turn.
             let mut long_context_fallback = false;
+            // A compaction already ran this turn (on overflow, or the
+            // proactive one after the reply): rung 0 never summarises the
+            // same history twice in one turn.
+            let mut compacted_this_turn = false;
             // The API refused the server-side fallback opt-in; the provider
             // has disabled it for the run, so the turn is retried once.
             let mut fallback_refusal_noted = false;
@@ -1906,6 +1916,7 @@ async fn run_agent_inner(
                                 {
                                     // Numbered only once it ran: no gaps.
                                     compaction_seq += 1;
+                                    compacted_this_turn = true;
                                     req.messages = messages.clone();
                                     continue;
                                 }
@@ -2107,6 +2118,7 @@ async fn run_agent_inner(
                     {
                         // Numbered only once it ran: no gaps.
                         compaction_seq += 1;
+                        compacted_this_turn = true;
                     }
                 }
             }
@@ -2137,26 +2149,70 @@ async fn run_agent_inner(
                 if retry {
                     let chain = *chain_turn.get_or_insert(turn_idx);
                     if let Rung0Step::Act(attempt) = rung0_step(&mut recovery, chain, &p) {
-                        RecoveryEvent {
-                            outcome_id: &o.id,
-                            attempt: Some(attempt),
-                            budget: Some(p.budget),
-                            reason: (p.rung0 == Rung0::RetryRaisedCap)
-                                .then(|| "output cap raised to the model maximum".to_string()),
-                            ..Default::default()
+                        let raise_cap = p.rung0 == Rung0::RetryRaisedCap;
+                        // The cap was lowered because input + max_tokens
+                        // overflowed the window: the same input at the full
+                        // cap fails the same way, so the history is compacted
+                        // first. When nothing can be compacted, the ladder.
+                        let compacted = if !raise_cap || compacted_this_turn {
+                            compacted_this_turn
+                        } else {
+                            // The summariser is an LLM call too: none once
+                            // SIGTERM has arrived.
+                            if rupu_providers::credential_writes::terminating() {
+                                return Err(terminated(
+                                    &mut writer,
+                                    &opts.run_id,
+                                    total_in + total_out,
+                                    started,
+                                ));
+                            }
+                            let run_id_clone = opts.run_id.clone();
+                            let ran = compact_context(
+                                messages,
+                                opts,
+                                &run_id_clone,
+                                compaction_seq + 1,
+                                &mut writer,
+                                last_turn_input_tokens.max(1),
+                            )
+                            .await;
+                            if ran {
+                                compaction_seq += 1;
+                            }
+                            ran
+                        };
+                        if !raise_cap || compacted {
+                            let step = || RecoveryEvent {
+                                outcome_id: &o.id,
+                                attempt: Some(attempt),
+                                budget: Some(p.budget),
+                                ..Default::default()
+                            };
+                            if raise_cap {
+                                step().write(&mut writer, RecoveryAction::Compacted)?;
+                            }
+                            RecoveryEvent {
+                                reason: raise_cap.then(|| {
+                                    "output cap raised to the model maximum after compaction"
+                                        .to_string()
+                                }),
+                                ..step()
+                            }
+                            .write(&mut writer, RecoveryAction::Retried)?;
+                            writer.flush()?;
+                            // The next turn is built from `opts.limits`
+                            // again: the full output cap, on `messages` as
+                            // they now stand.
+                            turn_idx += 1;
+                            if is_paused(&pause) {
+                                break 'turns LoopOutcome::Paused;
+                            }
+                            continue 'turns;
                         }
-                        .write(&mut writer, RecoveryAction::Retried)?;
-                        writer.flush()?;
-                        // The next turn is built from `opts.limits` again:
-                        // the full output cap, and the same `messages`.
-                        turn_idx += 1;
-                        if is_paused(&pause) {
-                            break 'turns LoopOutcome::Paused;
-                        }
-                        continue 'turns;
                     }
                 }
-                break 'turns exhausted(&mut writer, opts, o)?;
+                break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?;
             }
 
             // Emit the turn's content blocks in the provider's own order —
@@ -2407,10 +2463,10 @@ async fn run_agent_inner(
                                 turn_idx,
                                 outcome: incomplete.record(),
                             })?;
-                            break 'turns exhausted(&mut writer, opts, &incomplete)?;
+                            break 'turns exhausted(&mut writer, opts, &incomplete, &mut turn_idx)?;
                         }
                         Rung0Step::OverBudget | Rung0Step::Capped => {
-                            break 'turns exhausted(&mut writer, opts, o)?;
+                            break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?;
                         }
                     };
                     let continued = |reason: Option<&str>| RecoveryEvent {
@@ -2445,28 +2501,38 @@ async fn run_agent_inner(
                         }
                         Rung0::ContinueTruncated | Rung0::CompactThenContinue => {
                             if p.rung0 == Rung0::CompactThenContinue {
-                                // The summariser is an LLM call too: none
-                                // once SIGTERM has arrived.
-                                if rupu_providers::credential_writes::terminating() {
-                                    return Err(terminated(
+                                // A compaction that already ran this turn
+                                // (the proactive one) is not repeated on the
+                                // history it just produced.
+                                let compacted = if compacted_this_turn {
+                                    true
+                                } else {
+                                    // The summariser is an LLM call too: none
+                                    // once SIGTERM has arrived.
+                                    if rupu_providers::credential_writes::terminating() {
+                                        return Err(terminated(
+                                            &mut writer,
+                                            &opts.run_id,
+                                            total_in + total_out,
+                                            started,
+                                        ));
+                                    }
+                                    let run_id_clone = opts.run_id.clone();
+                                    let ran = compact_context(
+                                        messages,
+                                        opts,
+                                        &run_id_clone,
+                                        compaction_seq + 1,
                                         &mut writer,
-                                        &opts.run_id,
-                                        total_in + total_out,
-                                        started,
-                                    ));
-                                }
-                                let run_id_clone = opts.run_id.clone();
-                                if compact_context(
-                                    messages,
-                                    opts,
-                                    &run_id_clone,
-                                    compaction_seq + 1,
-                                    &mut writer,
-                                    last_turn_input_tokens.max(1),
-                                )
-                                .await
-                                {
-                                    compaction_seq += 1;
+                                        last_turn_input_tokens.max(1),
+                                    )
+                                    .await;
+                                    if ran {
+                                        compaction_seq += 1;
+                                    }
+                                    ran
+                                };
+                                if compacted {
                                     continued(None)
                                         .write(&mut writer, RecoveryAction::Compacted)?;
                                 }
@@ -2494,7 +2560,7 @@ async fn run_agent_inner(
                         }
                         // `rung0_step` above only acts on the rows handled
                         // here; anything else already went to the ladder.
-                        _ => break 'turns exhausted(&mut writer, opts, o)?,
+                        _ => break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?,
                     };
                     if let Some(note) = note {
                         // The note is a user turn: it joins tool results (or a
