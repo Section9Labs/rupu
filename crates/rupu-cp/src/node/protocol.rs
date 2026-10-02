@@ -92,6 +92,46 @@ pub fn node_capabilities() -> Vec<String> {
     vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
 }
 
+/// Host feature: this build's `rupu workflow resume` takes `--if-unfinished`
+/// (refuse a run that finished since the resume was requested, instead of
+/// retrying it). The SSH connector passes the flag only to a remote whose
+/// `rupu __features` lists this: an older remote's clap rejects the flag,
+/// and the resume runs detached, so it would fail without a trace.
+pub const CAP_WORKFLOW_RESUME_IF_UNFINISHED: &str = "workflow.resume_if_unfinished";
+
+/// Every feature this build honours as a host — what `/api/host/info`
+/// serves as `features` and what `rupu __features` prints for an SSH
+/// coordinator. Same vocabulary as the tunnel `Hello.capabilities` and the
+/// bucket worker markers.
+pub fn host_features() -> Vec<String> {
+    vec![
+        CAP_AGENT_FINDINGS_PROFILE.to_string(),
+        CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
+    ]
+}
+
+/// What `rupu __features` prints (one JSON object on stdout), and what the
+/// SSH connector parses from it. A remote predating the command prints
+/// nothing, which reads as no features.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct FeaturesReport {
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl FeaturesReport {
+    /// This build's report.
+    pub fn current() -> Self {
+        Self {
+            features: host_features(),
+        }
+    }
+
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunSpecKind {
@@ -240,5 +280,37 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains(r#""capabilities":["usage_ledger"]"#));
         assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), f);
+    }
+
+    #[test]
+    fn host_features_advertise_resume_if_unfinished() {
+        let features = host_features();
+        assert!(
+            features
+                .iter()
+                .any(|f| f == CAP_WORKFLOW_RESUME_IF_UNFINISHED),
+            "{features:?}"
+        );
+        assert!(
+            features.iter().any(|f| f == CAP_AGENT_FINDINGS_PROFILE),
+            "{features:?}"
+        );
+    }
+
+    #[test]
+    fn features_report_round_trips_this_builds_features() {
+        let json = serde_json::to_string(&FeaturesReport::current()).unwrap();
+        let back: FeaturesReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.features, host_features());
+        assert!(back.supports(CAP_WORKFLOW_RESUME_IF_UNFINISHED));
+    }
+
+    #[test]
+    fn features_report_ignores_fields_it_does_not_know() {
+        // A newer peer may add fields; an older reader still sees the list.
+        let back: FeaturesReport =
+            serde_json::from_str(r#"{"features":["agent.findings_profile"],"later":1}"#).unwrap();
+        assert!(back.supports(CAP_AGENT_FINDINGS_PROFILE));
+        assert!(!back.supports(CAP_WORKFLOW_RESUME_IF_UNFINISHED));
     }
 }

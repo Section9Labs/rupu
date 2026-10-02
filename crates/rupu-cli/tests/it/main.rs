@@ -26,6 +26,7 @@ mod cli_usage;
 mod cli_workflow_summary;
 mod findings_export;
 mod findings_schema;
+mod host_features;
 mod init_create_skeleton;
 mod init_force;
 mod init_git_flag;

@@ -231,6 +231,9 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::workspace_helper::WorkspaceHelperAction,
     },
+    /// Internal: print this build's host features (SSH capability probe).
+    #[command(name = "__features", hide = true)]
+    Features,
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -404,6 +407,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Man => cmd::man::handle(),
         Cmd::ApplyUpdate(args) => cmd::apply_update::handle(args),
         Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
+        Cmd::Features => cmd::features_helper::handle(),
     }
 }
 
@@ -506,6 +510,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Workspace { .. } => output::formats::ensure_supported(
             "__workspace",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Features => output::formats::ensure_supported(
+            "__features",
             format,
             &[output::formats::OutputFormat::Table],
         ),
@@ -688,6 +697,37 @@ mod arg_parse_tests {
             } => assert!(if_unfinished),
             other => panic!("expected Workflow(Resume), got {other:?}"),
         }
+    }
+
+    /// What this build advertises, its clap accepts: an SSH coordinator
+    /// sends exactly this argv, detached, to a remote whose `rupu
+    /// __features` lists `workflow.resume_if_unfinished` — where a flag
+    /// clap rejected would fail the resume without a trace.
+    #[test]
+    fn the_ssh_resume_argv_for_a_remote_advertising_the_flag_parses() {
+        assert!(rupu_cp::node::protocol::FeaturesReport::current()
+            .supports(rupu_cp::node::protocol::CAP_WORKFLOW_RESUME_IF_UNFINISHED));
+        let cli = Cli::try_parse_from(rupu_cp::host::ssh::resume_argv("run_01ABC", true)).unwrap();
+        match cli.command {
+            Cmd::Workflow {
+                action:
+                    cmd::workflow::Action::Resume {
+                        run_id,
+                        if_unfinished,
+                        ..
+                    },
+            } => {
+                assert_eq!(run_id, "run_01ABC");
+                assert!(if_unfinished);
+            }
+            other => panic!("expected Workflow(Resume), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn features_helper_parses() {
+        let cli = Cli::try_parse_from(["rupu", "__features"]).unwrap();
+        assert!(matches!(cli.command, Cmd::Features), "{:?}", cli.command);
     }
 
     #[test]
