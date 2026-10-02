@@ -72,7 +72,10 @@ impl ApiErrorBody {
         }
     }
 
-    /// Re-issuing the same request could plausibly succeed.
+    /// Re-issuing the same request could plausibly succeed. A mid-stream
+    /// error is retried when its class says so, or when the provider sent no
+    /// kind/code at all; an unknown kind/code is not retried, since it may
+    /// name a permanent condition (a new policy code, ...).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.class,
@@ -80,7 +83,9 @@ impl ApiErrorBody {
                 | ErrorClass::Overloaded
                 | ErrorClass::Server
                 | ErrorClass::Timeout
-        ) || (self.origin == ErrorOrigin::Stream && self.class == ErrorClass::Unrecognized)
+        ) || (self.origin == ErrorOrigin::Stream
+            && self.class == ErrorClass::Unrecognized
+            && self.kind.is_none())
     }
 
     pub fn retry_after(&self) -> Option<Duration> {
@@ -187,6 +192,14 @@ pub fn parse_error_value(
     // then keep only a preview for display.
     let class = classify_kinds(origin, &kind_refs, &full_message);
     let message = preview(&full_message);
+    // `raw` is capped like an HTTP body: a value whose JSON is over the cap
+    // is kept as its capped JSON text.
+    let raw = match serde_json::to_string(value) {
+        Ok(text) if text.len() > RAW_CAP_BYTES => {
+            serde_json::Value::String(cap_chars(&text, RAW_CAP_BYTES).to_string())
+        }
+        _ => value.clone(),
+    };
     ApiErrorBody {
         provider: provider.to_string(),
         origin,
@@ -194,7 +207,7 @@ pub fn parse_error_value(
         message,
         request_id: str_at(v, "request_id"),
         details,
-        raw: value.clone(),
+        raw,
         retry_after_secs: None,
         class,
     }
@@ -236,6 +249,9 @@ pub fn classify_kinds(origin: ErrorOrigin, kinds: &[&str], message: &str) -> Err
             "invalid_request_error" | "invalid_argument" | "invalid_prompt" => {
                 Some(ErrorClass::InvalidRequest)
             }
+            // Policy codes keep growing (`cyber_policy`, ...); any kind that
+            // names a policy is one.
+            other if other.contains("policy") => Some(ErrorClass::Policy),
             _ => None,
         });
     let class = by_kind.unwrap_or(match origin {
@@ -255,7 +271,7 @@ pub fn classify_kinds(origin: ErrorOrigin, kinds: &[&str], message: &str) -> Err
         ErrorOrigin::Stream => ErrorClass::Unrecognized,
     });
     if class == ErrorClass::InvalidRequest
-        && crate::overflow::parse_context_overflow(message).is_some()
+        && crate::overflow::parse_context_overflow_specific(message).is_some()
     {
         return ErrorClass::ContextOverflow;
     }
@@ -396,12 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_errors_with_unknown_kind_are_unrecognized_but_retryable() {
+    fn stream_errors_with_unknown_kind_are_unrecognized_and_not_retried() {
         let v =
             serde_json::json!({"type":"error","error":{"type":"brand_new_kind","message":"hmm"}});
         let b = parse_error_value("anthropic", ErrorOrigin::Stream, &v);
         assert_eq!(b.class, ErrorClass::Unrecognized);
-        assert!(b.is_retryable());
+        assert!(!b.is_retryable());
     }
 
     #[test]
@@ -453,5 +469,57 @@ mod tests {
         let b = parse_error_value("openai-compatible", ErrorOrigin::Stream, &v);
         assert_eq!(b.kind.as_deref(), Some("new_code"));
         assert_eq!(b.class, ErrorClass::InvalidRequest);
+    }
+
+    #[test]
+    fn any_kind_naming_a_policy_is_policy() {
+        let k = |kind: &str| classify(ErrorOrigin::Stream, Some(kind), "x");
+        assert_eq!(k("cyber_policy"), ErrorClass::Policy);
+        assert_eq!(k("Brand_New_POLICY_violation"), ErrorClass::Policy);
+        let v = serde_json::json!({"error": {"code": "weapons_policy", "message": "declined"}});
+        let b = parse_error_value("openai-codex", ErrorOrigin::Stream, &v);
+        assert_eq!(b.class, ErrorClass::Policy);
+        assert!(!b.is_retryable());
+    }
+
+    #[test]
+    fn a_stream_error_with_an_unknown_code_is_not_retried() {
+        let v = serde_json::json!({"error": {"code": "permanent_new_thing", "message": "no"}});
+        let b = parse_error_value("openai-codex", ErrorOrigin::Stream, &v);
+        assert_eq!(b.class, ErrorClass::Unrecognized);
+        assert!(!b.is_retryable());
+    }
+
+    #[test]
+    fn a_stream_error_without_any_kind_is_retried() {
+        let v = serde_json::json!({"error": {"message": "connection reset upstream"}});
+        let b = parse_error_value("openai-codex", ErrorOrigin::Stream, &v);
+        assert_eq!(b.kind, None);
+        assert_eq!(b.class, ErrorClass::Unrecognized);
+        assert!(b.is_retryable());
+        let s = parse_error_value(
+            "broker",
+            ErrorOrigin::Stream,
+            &serde_json::json!("something broke"),
+        );
+        assert!(s.is_retryable());
+    }
+
+    #[test]
+    fn huge_stream_error_values_are_capped_char_safely() {
+        let long = "é".repeat(RAW_CAP_BYTES);
+        let v = serde_json::json!({"error": {"type": "api_error", "message": long}});
+        let b = parse_error_value("anthropic", ErrorOrigin::Stream, &v);
+        let raw = b
+            .raw
+            .as_str()
+            .expect("an over-cap value is kept as a capped string");
+        assert!(raw.len() <= RAW_CAP_BYTES);
+        assert!(raw.starts_with(r#"{"error""#));
+        assert_eq!(b.class, ErrorClass::Server);
+        // A small value stays structured.
+        let small = serde_json::json!({"error": {"type": "api_error", "message": "x"}});
+        let b = parse_error_value("anthropic", ErrorOrigin::Stream, &small);
+        assert_eq!(b.raw, small);
     }
 }

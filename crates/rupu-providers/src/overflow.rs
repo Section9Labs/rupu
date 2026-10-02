@@ -11,7 +11,33 @@ pub struct Overflow {
     pub max: Option<u32>,
 }
 
+/// Every overflow format: the provider-specific ones
+/// ([`parse_context_overflow_specific`]), then the three generic phrases
+/// ("prompt is too long", "too many tokens", "context window"). The generic
+/// phrases are a fallback for errors without a body only (spec 2026-10-01
+/// §4.4); a reply body is read with [`parse_context_overflow_specific`].
 pub fn parse_context_overflow(err: &str) -> Option<Overflow> {
+    if let Some(o) = parse_context_overflow_specific(err) {
+        return Some(o);
+    }
+    let e = err.to_ascii_lowercase();
+    if e.contains("prompt is too long")
+        || e.contains("too many tokens")
+        || e.contains("context window")
+    {
+        return Some(Overflow {
+            tokens: None,
+            max: None,
+        });
+    }
+    None
+}
+
+/// The provider-specific overflow formats only (the model-limits §7 table),
+/// without the generic-phrase fallback. A 429 "too many tokens processed per
+/// minute" is a rate limit, not an overflow, so a reply body never matches a
+/// generic phrase.
+pub fn parse_context_overflow_specific(err: &str) -> Option<Overflow> {
     let e = err.to_ascii_lowercase();
     let after = |needle: &str| e.find(needle).map(|i| &e[i + needle.len()..]);
     // Anthropic: "prompt is too long: N tokens > M maximum"
@@ -72,15 +98,6 @@ pub fn parse_context_overflow(err: &str) -> Option<Overflow> {
                 max: n.get(1).copied(),
             });
         }
-    }
-    if e.contains("prompt is too long")
-        || e.contains("too many tokens")
-        || e.contains("context window")
-    {
-        return Some(Overflow {
-            tokens: None,
-            max: None,
-        });
     }
     None
 }
@@ -179,17 +196,19 @@ fn full_reply_text(b: &ApiErrorBody) -> String {
 }
 
 /// Overflow read off an error (spec 2026-10-01 §4.4): a reply body's
-/// full message is parsed for numbers; a `ContextOverflow`-class reply is an
-/// overflow even when no numbers parse. Errors without a body fall back to
-/// their display text (the three generic phrases still match there).
+/// full message is matched against the provider-specific formats only; a
+/// `ContextOverflow`-class reply is an overflow even when no numbers parse.
+/// Errors without a body fall back to their display text, where the three
+/// generic phrases still match.
 pub fn context_overflow_of(e: &ProviderError) -> Option<Overflow> {
     match e {
-        ProviderError::Reply(b) => parse_context_overflow(&full_reply_text(b)).or((b.class
-            == ErrorClass::ContextOverflow)
-            .then_some(Overflow {
+        ProviderError::Reply(b) => {
+            let by_class = (b.class == ErrorClass::ContextOverflow).then_some(Overflow {
                 tokens: None,
                 max: None,
-            })),
+            });
+            parse_context_overflow_specific(&full_reply_text(b)).or(by_class)
+        }
         other => parse_context_overflow(&other.to_string()),
     }
 }
@@ -479,6 +498,79 @@ mod tests {
             Some(Overflow {
                 tokens: Some(130_500),
                 max: Some(128_000)
+            })
+        );
+    }
+
+    /// Spec §4.4: the generic phrases are a fallback for errors without a
+    /// body only. A 429 "too many tokens processed per minute" reply is a
+    /// rate limit; it is not compacted.
+    #[test]
+    fn a_rate_limit_reply_with_a_generic_phrase_is_not_an_overflow() {
+        let e = ProviderError::api(
+            "openai",
+            429,
+            r#"{"error":{"message":"Rate limit reached: too many tokens processed per minute","type":"tokens"}}"#,
+        );
+        assert_eq!(context_overflow_of(&e), None);
+        assert!(e.reply().unwrap().is_retryable());
+        // A 400 reply whose body only has a generic phrase is not one either.
+        let e = ProviderError::api(
+            "openai",
+            400,
+            r#"{"error":{"message":"this exceeds the context window","type":"invalid_request_error"}}"#,
+        );
+        assert_eq!(context_overflow_of(&e), None);
+        assert_eq!(e.reply().unwrap().class, ErrorClass::InvalidRequest);
+    }
+
+    #[test]
+    fn a_reply_with_a_numbered_format_is_an_overflow() {
+        let e = ProviderError::api(
+            "anthropic",
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 maximum"}}"#,
+        );
+        assert_eq!(e.reply().unwrap().class, ErrorClass::ContextOverflow);
+        assert_eq!(
+            context_overflow_of(&e),
+            Some(Overflow {
+                tokens: Some(215_000),
+                max: Some(200_000)
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_body_error_with_a_generic_phrase_is_still_an_overflow() {
+        for msg in [
+            "too many tokens in request",
+            "prompt is too long",
+            "context window exceeded",
+        ] {
+            let e = ProviderError::Other(anyhow::anyhow!(msg));
+            assert_eq!(
+                context_overflow_of(&e),
+                Some(Overflow {
+                    tokens: None,
+                    max: None
+                }),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn specific_parser_skips_generic_phrases() {
+        assert_eq!(
+            parse_context_overflow_specific("too many tokens in request"),
+            None
+        );
+        assert_eq!(
+            parse_context_overflow_specific("prompt is too long: 10 tokens > 5 maximum"),
+            Some(Overflow {
+                tokens: Some(10),
+                max: Some(5)
             })
         );
     }
