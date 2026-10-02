@@ -1,5 +1,5 @@
 use crate::error::FleetError;
-use crate::types::{BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord};
+use crate::types::{BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord, Directive};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -183,6 +183,20 @@ impl Board {
     /// All posts, oldest first. An absent log is an empty board, not an error.
     pub fn read_posts(&self) -> Result<Vec<BoardPost>, FleetError> {
         read_jsonl(&self.posts_path())
+    }
+
+    fn directives_path(&self) -> PathBuf {
+        self.root.join("board").join("directives.jsonl")
+    }
+
+    /// Append one lead->fleet directive to `directives.jsonl`.
+    pub fn put_directive(&self, directive: &Directive) -> Result<(), FleetError> {
+        append_jsonl(&self.directives_path(), directive)
+    }
+
+    /// All directives, oldest first. An absent log yields an empty list.
+    pub fn read_directives(&self) -> Result<Vec<Directive>, FleetError> {
+        read_jsonl(&self.directives_path())
     }
 }
 
@@ -549,5 +563,24 @@ mod tests {
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[0].body, "port 443 open on 1.1.2.2");
         assert_eq!(posts[1].addressed_to.as_deref(), Some("recon"));
+    }
+
+    #[test]
+    fn directives_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        assert!(board.read_directives().unwrap().is_empty());
+
+        board
+            .put_directive(&Directive {
+                author: "lead".into(),
+                ts: "2026-10-01T00:00:00Z".into(),
+                body: "budget almost spent; converge and bank".into(),
+                addressed_to: None,
+            })
+            .unwrap();
+        let ds = board.read_directives().unwrap();
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].body, "budget almost spent; converge and bank");
     }
 }
