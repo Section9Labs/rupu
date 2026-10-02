@@ -1,0 +1,37 @@
+id = "container"
+name = "Container image assessment"
+evidence_blocks = ["table", "text"]
+classification_systems = ["CVE"]
+
+[[asset_kinds]]
+id = "image"
+coordinates = ["sha256"]
+label = "{sha256}"
+
+[[asset_kinds]]
+id = "layer"
+parent = "image"
+coordinates = ["sha256", "path"]
+label = "{path}"
+
+[[asset_kinds]]
+id = "package"
+parent = "image"
+coordinates = ["resource_id"]
+label = "{resource_id}"
+
+[[completeness]]
+id = "component_identified"
+label = "Finding pinned to a package or path"
+required = true
+satisfied_when = { any = [ { locator_has_coordinate = "resource_id" }, { locator_has_coordinate = "path" } ] }
+
+[[completeness]]
+id = "classified"
+label = "Classified (CVE)"
+required = true
+satisfied_when = { has_classification_system = "CVE" }
+
+[coverage]
+enumerates = ["package"]
+depth_ladder = ["inventoried", "scanned", "triaged"]

@@ -1,0 +1,41 @@
+id = "network"
+name = "Network security assessment"
+evidence_blocks = ["text", "table", "scan_output", "http_exchange", "pcap_ref"]
+classification_systems = ["CVE", "CWE", "CAPEC", "ATT&CK"]
+
+[[asset_kinds]]
+id = "host"
+coordinates = ["host"]
+label = "{host}"
+
+[[asset_kinds]]
+id = "service"
+parent = "host"
+coordinates = ["host", "port"]
+label = "{host}:{port}"
+
+[[completeness]]
+id = "service_identified"
+label = "Affected service pinned to host + port"
+required = true
+satisfied_when = { all = [ { locator_has_coordinate = "host" }, { locator_has_coordinate = "port" } ] }
+
+[[completeness]]
+id = "has_root_cause"
+label = "Vulnerability / root cause stated"
+required = true
+satisfied_when = { has_field = "root_cause" }
+
+[[completeness]]
+id = "classified"
+label = "Classified (CVE or CWE)"
+required = true
+satisfied_when = { any = [ { has_classification_system = "CVE" }, { has_classification_system = "CWE" } ] }
+
+[coverage]
+enumerates = ["host", "service"]
+depth_ladder = ["discovered", "enumerated", "tested", "exploited"]
+
+[bundle]
+agents = ["recon", "service-analyst", "exploit-verifier"]
+workflows = ["network-assessment"]

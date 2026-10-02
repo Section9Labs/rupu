@@ -1,0 +1,43 @@
+id = "firmware"
+name = "Firmware assessment"
+evidence_blocks = ["text", "hexdump", "disasm", "decompile", "table"]
+classification_systems = ["CWE", "CVE"]
+
+[[asset_kinds]]
+id = "image"
+coordinates = ["sha256"]
+label = "{sha256}"
+
+[[asset_kinds]]
+id = "partition"
+parent = "image"
+coordinates = ["sha256", "path"]
+label = "{path}"
+
+[[asset_kinds]]
+id = "file"
+parent = "partition"
+coordinates = ["path", "sha256"]
+label = "{path}"
+
+[[asset_kinds]]
+id = "function"
+parent = "file"
+coordinates = ["path", "address", "symbol"]
+label = "{symbol} @ {address}"
+
+[[completeness]]
+id = "evidence_has_listing"
+label = "Evidence includes a disassembly, decompile or hexdump"
+required = true
+satisfied_when = { any = [ { has_block_kind = "disasm" }, { has_block_kind = "decompile" }, { has_block_kind = "hexdump" } ] }
+
+[[completeness]]
+id = "classified"
+label = "Weakness classified (CWE)"
+required = true
+satisfied_when = { has_classification_system = "CWE" }
+
+[coverage]
+enumerates = ["image", "partition", "file", "function"]
+depth_ladder = ["acquired", "extracted", "unpacked", "analyzed"]

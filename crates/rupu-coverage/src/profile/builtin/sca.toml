@@ -1,0 +1,31 @@
+id = "sca"
+name = "Software composition analysis"
+evidence_blocks = ["table", "text"]
+classification_systems = ["CVE", "GHSA"]
+
+[[asset_kinds]]
+id = "repo"
+coordinates = ["path"]
+label = "{path}"
+
+[[asset_kinds]]
+id = "dependency"
+parent = "repo"
+coordinates = ["path", "resource_id"]
+label = "{resource_id}"
+
+[[completeness]]
+id = "dependency_identified"
+label = "Finding pinned to a dependency (purl)"
+required = true
+satisfied_when = { locator_has_coordinate = "resource_id" }
+
+[[completeness]]
+id = "classified"
+label = "Classified (CVE or GHSA)"
+required = true
+satisfied_when = { any = [ { has_classification_system = "CVE" }, { has_classification_system = "GHSA" } ] }
+
+[coverage]
+enumerates = ["dependency"]
+depth_ladder = ["inventoried", "resolved", "triaged"]

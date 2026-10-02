@@ -1,0 +1,20 @@
+id = "mobile"
+name = "Mobile application assessment"
+includes = ["binary", "web"]
+evidence_blocks = ["disasm", "http_exchange", "image"]
+classification_systems = ["MASVS", "OWASP", "CWE"]
+
+[[asset_kinds]]
+id = "package"
+coordinates = ["sha256"]
+label = "{sha256}"
+
+[[completeness]]
+id = "package_identified"
+label = "Finding pinned to a package, function or route"
+required = true
+satisfied_when = { any = [ { locator_has_coordinate = "sha256" }, { locator_has_coordinate = "address" }, { locator_has_coordinate = "http_route" } ] }
+
+[coverage]
+enumerates = ["package"]
+depth_ladder = ["unpacked", "static", "dynamic"]

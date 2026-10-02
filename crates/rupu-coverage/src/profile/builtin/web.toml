@@ -1,0 +1,41 @@
+id = "web"
+name = "Web application assessment"
+evidence_blocks = ["text", "http_exchange", "image", "table"]
+classification_systems = ["OWASP", "CWE", "CVE"]
+
+[[asset_kinds]]
+id = "site"
+coordinates = ["url"]
+label = "{url}"
+
+[[asset_kinds]]
+id = "route"
+parent = "site"
+coordinates = ["url", "http_route", "param"]
+label = "{http_route}"
+
+[[completeness]]
+id = "route_identified"
+label = "Finding pinned to a route"
+required = true
+satisfied_when = { any = [ { locator_has_coordinate = "http_route" }, { locator_has_coordinate = "url" } ] }
+
+[[completeness]]
+id = "evidence_has_exchange"
+label = "Evidence includes an HTTP exchange"
+required = true
+satisfied_when = { has_block_kind = "http_exchange" }
+
+[[completeness]]
+id = "classified"
+label = "Classified (OWASP or CWE)"
+required = true
+satisfied_when = { any = [ { has_classification_system = "OWASP" }, { has_classification_system = "CWE" } ] }
+
+[coverage]
+enumerates = ["site", "route"]
+depth_ladder = ["mapped", "crawled", "tested", "exploited"]
+
+[bundle]
+agents = ["crawler", "appsec-tester"]
+workflows = ["web-assessment"]

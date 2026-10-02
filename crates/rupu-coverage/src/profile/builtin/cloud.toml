@@ -1,0 +1,31 @@
+id = "cloud"
+name = "Cloud configuration review"
+evidence_blocks = ["text", "table", "code_slice"]
+classification_systems = ["CIS", "CWE", "ATT&CK"]
+
+[[asset_kinds]]
+id = "account"
+coordinates = ["resource_id"]
+label = "{resource_id}"
+
+[[asset_kinds]]
+id = "resource"
+parent = "account"
+coordinates = ["resource_id"]
+label = "{resource_id}"
+
+[[completeness]]
+id = "resource_identified"
+label = "Finding pinned to a resource"
+required = true
+satisfied_when = { locator_has_coordinate = "resource_id" }
+
+[[completeness]]
+id = "classified"
+label = "Classified (CIS or CWE)"
+required = true
+satisfied_when = { any = [ { has_classification_system = "CIS" }, { has_classification_system = "CWE" } ] }
+
+[coverage]
+enumerates = ["account", "resource"]
+depth_ladder = ["inventoried", "policy-evaluated", "validated"]

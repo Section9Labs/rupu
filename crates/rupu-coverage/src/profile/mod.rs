@@ -33,8 +33,25 @@ pub fn builtin_profiles() -> BTreeMap<String, EngagementProfile> {
 }
 
 /// The embedded built-in profile packages. Add a new built-in by dropping its
-/// `.toml` beside the others and listing it here.
-const BUILTIN_TOMLS: &[&str] = &[include_str!("builtin/code.toml")];
+/// `.toml` beside the others and listing it here. Composites (`mobile`,
+/// `pentest`) must appear with the profiles they include.
+const BUILTIN_TOMLS: &[&str] = &[
+    include_str!("builtin/code.toml"),
+    include_str!("builtin/binary.toml"),
+    include_str!("builtin/firmware.toml"),
+    include_str!("builtin/network.toml"),
+    include_str!("builtin/web.toml"),
+    include_str!("builtin/api.toml"),
+    include_str!("builtin/cloud.toml"),
+    include_str!("builtin/sca.toml"),
+    include_str!("builtin/iac.toml"),
+    include_str!("builtin/secrets.toml"),
+    include_str!("builtin/container.toml"),
+    include_str!("builtin/redteam.toml"),
+    include_str!("builtin/threat-model.toml"),
+    include_str!("builtin/mobile.toml"),
+    include_str!("builtin/pentest.toml"),
+];
 
 /// The registry of just the built-in profiles.
 pub fn builtin_registry() -> Result<ProfileRegistry, RegistryError> {
@@ -74,6 +91,73 @@ mod tests {
         let reg = builtin_registry().unwrap();
         let set = reg.active_set(&[DEFAULT_PROFILE.into()]).unwrap();
         assert_eq!(set.profile_for_kind("code:file").unwrap().id, "code");
+    }
+
+    #[test]
+    fn the_full_catalog_loads_and_each_profile_routes_its_root_kind() {
+        let all = builtin_profiles();
+        let expected = [
+            "code",
+            "binary",
+            "firmware",
+            "network",
+            "web",
+            "api",
+            "cloud",
+            "sca",
+            "iac",
+            "secrets",
+            "container",
+            "redteam",
+            "threat-model",
+            "mobile",
+            "pentest",
+        ];
+        for id in expected {
+            assert!(all.contains_key(id), "missing built-in profile `{id}`");
+        }
+        assert_eq!(all.len(), expected.len(), "unexpected extra built-ins");
+
+        // The registry builds (composite includes resolve), and a representative
+        // namespaced kind from each single-root profile routes to it.
+        let reg = builtin_registry().unwrap();
+        for (id, kind) in [
+            ("network", "network:service"),
+            ("web", "web:route"),
+            ("api", "api:endpoint"),
+            ("binary", "binary:function"),
+            ("firmware", "firmware:function"),
+            ("cloud", "cloud:resource"),
+            ("sca", "sca:dependency"),
+            ("iac", "iac:resource"),
+            ("secrets", "secrets:secret"),
+            ("container", "container:package"),
+            ("redteam", "redteam:objective"),
+            ("threat-model", "threat-model:component"),
+        ] {
+            let set = reg.active_set(&[id.to_string()]).unwrap();
+            assert_eq!(set.profile_for_kind(kind).unwrap().id, id, "{kind}");
+        }
+    }
+
+    #[test]
+    fn composites_activate_members_and_route_per_origin() {
+        let reg = builtin_registry().unwrap();
+        // pentest = network + web
+        let set = reg.active_set(&["pentest".into()]).unwrap();
+        assert_eq!(
+            set.profile_for_kind("network:service").unwrap().id,
+            "network"
+        );
+        assert_eq!(set.profile_for_kind("web:route").unwrap().id, "web");
+        // mobile = binary + web + its own `package` root
+        let set = reg.active_set(&["mobile".into()]).unwrap();
+        assert_eq!(
+            set.profile_for_kind("binary:function").unwrap().id,
+            "binary"
+        );
+        assert_eq!(set.profile_for_kind("web:route").unwrap().id, "web");
+        assert_eq!(set.profile_for_kind("mobile:package").unwrap().id, "mobile");
     }
 
     #[test]
