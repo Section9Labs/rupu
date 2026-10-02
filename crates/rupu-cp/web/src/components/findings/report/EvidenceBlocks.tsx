@@ -27,6 +27,15 @@ function Code({ text }: { text: string }) {
   return <pre className={PRE}>{text}</pre>;
 }
 
+/** True when rupu verified and stored this file. Before evidence-block files
+ *  were ingested, agents wrote block refs verbatim: such a ref may carry an
+ *  empty or malformed `sha256` and no `stored`, and the CP cannot serve it. */
+function isRecorded(artifact: ArtifactRef): boolean {
+  return /^[0-9a-f]{64}$/.test(artifact.sha256 ?? '') && artifact.stored !== undefined;
+}
+
+const UNRECORDED_NOTE = 'file not recorded by rupu (finding predates file verification)';
+
 function DownloadLink({ findingId, artifact }: { findingId: string; artifact: ArtifactRef }) {
   return (
     <a href={findingArtifactUrl(findingId, artifact.sha256)} download className="text-brand-700 hover:underline">
@@ -36,6 +45,14 @@ function DownloadLink({ findingId, artifact }: { findingId: string; artifact: Ar
 }
 
 function ArtifactMeta({ findingId, artifact }: { findingId: string; artifact: ArtifactRef }) {
+  if (!isRecorded(artifact)) {
+    return (
+      <span className="flex flex-wrap items-center gap-3 font-mono text-note text-ink-mute">
+        <span className="truncate">{artifact.path}</span>
+        <span className="font-sans italic">{UNRECORDED_NOTE}</span>
+      </span>
+    );
+  }
   return (
     <span className="flex flex-wrap items-center gap-3 font-mono text-note text-ink-mute">
       <span className="truncate">{artifact.path}</span>
@@ -47,8 +64,23 @@ function ArtifactMeta({ findingId, artifact }: { findingId: string; artifact: Ar
 }
 
 /** An image artifact. A remote one (`host` set) is pulled by the CP on first
- *  request, so it is never requested on render, only after a click. */
+ *  request, so it is never requested on render, only after a click. An
+ *  unrecorded one is never requested at all. */
 function ImageBlock({ findingId, artifact, caption }: { findingId: string; artifact: ArtifactRef; caption?: string }) {
+  if (!isRecorded(artifact)) {
+    return (
+      <figure className="overflow-hidden rounded-md border border-border bg-panel">
+        {caption && <figcaption className="px-3 py-1.5 text-ui text-ink-dim">{caption}</figcaption>}
+        <div className={caption ? 'border-t border-border px-3 py-1.5' : 'px-3 py-1.5'}>
+          <ArtifactMeta findingId={findingId} artifact={artifact} />
+        </div>
+      </figure>
+    );
+  }
+  return <RecordedImage findingId={findingId} artifact={artifact} caption={caption} />;
+}
+
+function RecordedImage({ findingId, artifact, caption }: { findingId: string; artifact: ArtifactRef; caption?: string }) {
   const [show, setShow] = useState(!artifact.host);
   const [broken, setBroken] = useState(false);
   const url = findingArtifactUrl(findingId, artifact.sha256);
@@ -140,7 +172,13 @@ function Block({ findingId, block }: { findingId: string; block: EvidenceBlock }
     case 'hexdump':
       return (
         <Frame label={<span className="flex flex-wrap items-center justify-between gap-2"><span>hexdump · base {hex(block.base, block.base_hex)}</span><ArtifactMeta findingId={findingId} artifact={block.artifact} /></span>}>
-          {block.rendered ? <Code text={block.rendered} /> : <p className="px-3 py-2 text-ui text-ink-mute">No rendered preview. Use Download.</p>}
+          {block.rendered ? (
+            <Code text={block.rendered} />
+          ) : (
+            <p className="px-3 py-2 text-ui text-ink-mute">
+              {isRecorded(block.artifact) ? 'No rendered preview. Use Download.' : 'No rendered preview.'}
+            </p>
+          )}
         </Frame>
       );
     case 'disasm':

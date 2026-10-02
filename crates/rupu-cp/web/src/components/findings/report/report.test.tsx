@@ -506,6 +506,63 @@ describe('EvidenceBlocks', () => {
     expect(container).toHaveTextContent('hologram');
   });
 
+  describe('a block file rupu never recorded', () => {
+    // Refs written before evidence-block files were verified: the CP cannot
+    // serve them, so no <img> and no Download — just the path and a note.
+    const unrecorded: [string, ArtifactRef][] = [
+      ['an empty sha256', art({ path: 'shots/old-panel.png', sha256: '' })],
+      ['a non-hex sha256', art({ path: 'shots/old-panel.png', sha256: 'sha256-of-panel-shot' })],
+      ['an uppercase sha256', art({ path: 'shots/old-panel.png', sha256: 'C'.repeat(64) })],
+      ['no stored value', art({ path: 'shots/old-panel.png', stored: undefined })],
+    ];
+
+    it.each(unrecorded)('with %s: an image shows its path and caption, never an <img> or Download', (_, a) => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      const { container } = show([{ kind: 'image', artifact: a, caption: 'Panel before the fix' }]);
+      expect(container.querySelector('img')).toBeNull();
+      expect(screen.queryByRole('button')).toBeNull();
+      expect(screen.queryByRole('link')).toBeNull();
+      expect(screen.getByText('Panel before the fix')).toBeInTheDocument();
+      expect(screen.getByText('shots/old-panel.png')).toBeInTheDocument();
+      expect(screen.getByText(/file not recorded by rupu \(finding predates file verification\)/)).toBeInTheDocument();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('a remote image with no stored value offers no Load button', () => {
+      const { container } = show([{ kind: 'image', artifact: art({ host: 'kuki', stored: undefined }) }]);
+      expect(container.querySelector('img')).toBeNull();
+      expect(screen.queryByRole('button')).toBeNull();
+      expect(container).toHaveTextContent('file not recorded by rupu');
+    });
+
+    it('a hexdump keeps its rendered text and base, without Download', () => {
+      const { container } = show([
+        { kind: 'hexdump', base: 0x7ffe0000, artifact: art({ path: 'dumps/old-heap.bin', sha256: '' }), rendered: '00000000  ca fe ba be  |....|' },
+      ]);
+      expect(container.querySelector('pre')).toHaveTextContent('ca fe ba be');
+      expect(container).toHaveTextContent('0x7ffe0000');
+      expect(container).toHaveTextContent('dumps/old-heap.bin');
+      expect(container).toHaveTextContent('file not recorded by rupu');
+      expect(screen.queryByRole('link')).toBeNull();
+    });
+
+    it('a hexdump with no rendered text does not point at Download', () => {
+      const { container } = show([{ kind: 'hexdump', base: 0, artifact: art({ sha256: 'not-a-hash' }) }]);
+      expect(container).toHaveTextContent('No rendered preview.');
+      expect(container).not.toHaveTextContent('Use Download');
+    });
+
+    it('a pcap_ref keeps its summary, without Download', () => {
+      const { container } = show([
+        { kind: 'pcap_ref', artifact: art({ path: 'net/old-session.pcap', stored: undefined }), summary: 'Two retransmits then a reset' },
+      ]);
+      expect(screen.getByText('Two retransmits then a reset')).toBeInTheDocument();
+      expect(container).toHaveTextContent('net/old-session.pcap');
+      expect(container).toHaveTextContent('file not recorded by rupu');
+      expect(screen.queryByRole('link')).toBeNull();
+    });
+  });
+
   it('swaps a broken image for a message and the download link', () => {
     const { container } = show([{ kind: 'image', artifact: art(), caption: 'Gone' }]);
     fireEvent.error(container.querySelector('img')!);
