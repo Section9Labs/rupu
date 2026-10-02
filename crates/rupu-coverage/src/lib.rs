@@ -30,6 +30,11 @@ pub use asset::{
     Coordinate, Locator, Proto,
 };
 
+pub use profile::{
+    builtin_profiles, builtin_registry, registry_with_overlay, ActiveSet, AssetKindDef, Bundle,
+    CompletenessCheck, Coverage, EngagementProfile, Predicate, ProfileRegistry, DEFAULT_PROFILE,
+};
+
 pub use audit::generate::audit as run_audit;
 pub use audit::{
     AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster,
