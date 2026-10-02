@@ -277,13 +277,7 @@ where
 fn duplicate_error(e: &ProviderError) -> ProviderError {
     match e {
         ProviderError::Http(m) => ProviderError::Http(m.clone()),
-        ProviderError::Api { status, message } => ProviderError::Api {
-            status: *status,
-            message: message.clone(),
-        },
-        ProviderError::RateLimited { retry_after } => ProviderError::RateLimited {
-            retry_after: *retry_after,
-        },
+        ProviderError::Reply(b) => ProviderError::Reply(b.clone()),
         ProviderError::Json(m) => ProviderError::Json(m.clone()),
         ProviderError::AuthConfig(m) => ProviderError::AuthConfig(m.clone()),
         other => ProviderError::Other(anyhow::anyhow!("{other}")),
@@ -462,17 +456,24 @@ impl Api<'_> {
                 headers,
                 body,
             } => {
-                let mut message = format!(
-                    "Gemini Code Assist setup ({method}) failed: {}",
-                    super::extract_google_error(&body)
+                let mut e = crate::error::api_error_from_response(
+                    &self.variant.provider_id().to_string(),
+                    status,
+                    &headers,
+                    &body,
                 );
-                if let (Some(p), 403) = (self.project, status) {
-                    message.push_str(&format!(
-                        ". Check that the Google Cloud project \"{p}\" (GOOGLE_CLOUD_PROJECT) \
-                         exists and this account can use Gemini Code Assist in it"
-                    ));
+                if let ProviderError::Reply(b) = &mut e {
+                    let mut message =
+                        format!("Gemini Code Assist setup ({method}) failed: {}", b.message);
+                    if let (Some(p), 403) = (self.project, status) {
+                        message.push_str(&format!(
+                            ". Check that the Google Cloud project \"{p}\" (GOOGLE_CLOUD_PROJECT) \
+                             exists and this account can use Gemini Code Assist in it"
+                        ));
+                    }
+                    b.message = message;
                 }
-                crate::error::api_error_from_response(status, &headers, message)
+                e
             }
             Failure::Other(ProviderError::Json(e)) => ProviderError::Json(format!(
                 "Gemini Code Assist setup ({method}) returned an unexpected body: {e}"
@@ -823,12 +824,40 @@ mod tests {
         });
 
         match setup(&server, None).await.unwrap_err() {
-            ProviderError::Api { status, message } => {
-                assert_eq!(status, 503);
-                assert!(message.contains("loadCodeAssist"), "{message}");
-                assert!(message.contains("backend unavailable"), "{message}");
+            ProviderError::Reply(b) => {
+                assert_eq!(b.status(), Some(503));
+                assert!(b.message.contains("loadCodeAssist"), "{}", b.message);
+                assert!(b.message.contains("backend unavailable"), "{}", b.message);
             }
-            other => panic!("expected Api, got {other:?}"),
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    /// A setup failure is labelled with the variant's own provider id, so an
+    /// Antigravity failure is not reported as gemini-cli's.
+    #[tokio::test]
+    async fn a_setup_failure_names_the_variant_s_provider() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(503)
+                .json_body(json!({ "error": { "message": "backend unavailable" } }));
+        });
+        for (variant, provider) in [
+            (GeminiVariant::GeminiCli, "google-gemini-cli"),
+            (GeminiVariant::Antigravity, "google-antigravity"),
+        ] {
+            let err = setup_user(
+                &client(),
+                &server.url(""),
+                variant,
+                "access-1",
+                None,
+                &fast(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.reply().expect("a reply error").provider, provider);
         }
     }
 

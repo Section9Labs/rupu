@@ -152,8 +152,10 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
 /// fine, and *stripping* them is what triggers ordering/signature 400s. The gate
 /// is the provider tag only; do not add a model check here.
 ///
-/// `Unknown` blocks are dropped too: they serialize as `{"type":"Unknown"}`
-/// (pinned by a test in `types.rs`), which no provider accepts.
+/// `Unknown` blocks are dropped too: they serialize as `{"type":"unknown"}`,
+/// which no provider accepts. A `Fallback` block is rewritten into Anthropic's
+/// own `{"type":"fallback","from":{"model":…},"to":{"model":…}}` shape and
+/// echoed in place.
 fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
@@ -187,12 +189,73 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
                     }
                     // else: foreign provider — drop.
                 }
-                Some("Unknown") => {} // never goes on the wire
+                Some("unknown") => {} // never goes on the wire
+                Some("fallback") => {
+                    let model = |k: &str| {
+                        block
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .map(|m| serde_json::json!({ "model": m }))
+                    };
+                    match (model("from_model"), model("to_model")) {
+                        (Some(from), Some(to)) => restored.push(serde_json::json!({
+                            "type": "fallback",
+                            "from": from,
+                            "to": to,
+                        })),
+                        _ => debug!("dropping fallback block with missing model names"),
+                    }
+                }
                 _ => restored.push(block.clone()),
             }
         }
         *blocks = restored;
     }
+}
+
+/// After `restore_reasoning_blocks`, a stored message can be left with no
+/// content at all (an assistant turn that held only `Unknown` blocks), which
+/// Anthropic rejects with a 400. Drop such messages, and where a drop leaves
+/// two neighbours of the same role, merge them (content arrays concatenated in
+/// order) so roles still alternate. Messages next to no drop are untouched.
+fn drop_emptied_messages(messages: &mut serde_json::Value) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    let is_empty = |m: &serde_json::Value| {
+        m.get("content")
+            .and_then(|c| c.as_array())
+            .is_some_and(|c| c.is_empty())
+    };
+    if !msgs.iter().any(is_empty) {
+        return;
+    }
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(msgs.len());
+    let mut dropped_since_last = false;
+    for msg in msgs.drain(..) {
+        if is_empty(&msg) {
+            dropped_since_last = true;
+            continue;
+        }
+        let same_role = out
+            .last()
+            .is_some_and(|prev| prev.get("role") == msg.get("role"));
+        if dropped_since_last && same_role {
+            if let (Some(prev_content), Some(more)) = (
+                out.last_mut()
+                    .and_then(|p| p.get_mut("content"))
+                    .and_then(|c| c.as_array_mut()),
+                msg.get("content").and_then(|c| c.as_array()),
+            ) {
+                prev_content.extend(more.iter().cloned());
+                dropped_since_last = false;
+                continue;
+            }
+        }
+        dropped_since_last = false;
+        out.push(msg);
+    }
+    *msgs = out;
 }
 
 /// Content-block types that may carry `cache_control`. An allowlist, not a
@@ -1335,7 +1398,12 @@ impl AnthropicClient {
     /// [`ProviderError::LongContextUnavailable`] for the runner to fall back
     /// on. Without the beta it is surfaced as the plain 429 it is. Either way
     /// it is not retried — the same request is refused every time.
-    fn long_context_refusal(&mut self, request: &LlmRequest, body: String) -> ProviderError {
+    fn long_context_refusal(
+        &mut self,
+        request: &LlmRequest,
+        headers: &reqwest::header::HeaderMap,
+        body: String,
+    ) -> ProviderError {
         if self.sends_1m_beta(&request.model, request.context_window) {
             warn!(
                 model = request.model.as_str(),
@@ -1344,10 +1412,7 @@ impl AnthropicClient {
             self.long_context_disabled = true;
             ProviderError::LongContextUnavailable { message: body }
         } else {
-            ProviderError::Api {
-                status: 429,
-                message: body,
-            }
+            crate::error::api_error_from_response("anthropic", 429, headers, &body)
         }
     }
 
@@ -1737,6 +1802,7 @@ impl AnthropicClient {
             };
 
             let status = response.status();
+            let headers = response.headers().clone();
             if status.as_u16() == 429 {
                 let text = response.text().await.unwrap_or_default();
                 warn!(
@@ -1746,34 +1812,32 @@ impl AnthropicClient {
                 );
                 // Not a rate limit: the same request is refused every time.
                 if crate::error::is_long_context_refusal(&text) {
-                    return Err(self.long_context_refusal(request, text));
+                    return Err(self.long_context_refusal(request, &headers, text));
                 }
-                last_err = Some(ProviderError::Api {
-                    status: 429,
-                    message: text,
-                });
+                last_err = Some(crate::error::api_error_from_response(
+                    "anthropic",
+                    429,
+                    &headers,
+                    &text,
+                ));
                 continue;
             }
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
-                let truncated = if text.len() > 4096 {
-                    format!("{}... (truncated)", &text[..4096])
-                } else {
-                    text
-                };
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message: truncated,
-                });
+                return Err(crate::error::api_error_from_response(
+                    "anthropic",
+                    status.as_u16(),
+                    &headers,
+                    &text,
+                ));
             }
 
             let api_response: AnthropicResponse = response.json().await?;
             return Ok(api_response.into_llm_response());
         }
 
-        Err(last_err.unwrap_or_else(|| ProviderError::Api {
-            status: 429,
-            message: "rate-limited after max retries".into(),
+        Err(last_err.unwrap_or_else(|| {
+            ProviderError::api("anthropic", 429, "rate-limited after max retries")
         }))
     }
 
@@ -1907,6 +1971,7 @@ impl AnthropicClient {
                     );
 
                     let status = resp.status();
+                    let headers = resp.headers().clone();
                     if status.as_u16() == 429 {
                         let text = resp.text().await.unwrap_or_default();
                         flow_guard.add_bytes(text.len() as u64);
@@ -1914,29 +1979,28 @@ impl AnthropicClient {
                         // Not a rate limit: the same request is refused
                         // every time.
                         if crate::error::is_long_context_refusal(&text) {
-                            return Err(self.long_context_refusal(request, text));
+                            return Err(self.long_context_refusal(request, &headers, text));
                         }
-                        last_err = Some(ProviderError::Api {
-                            status: 429,
-                            message: text,
-                        });
+                        last_err = Some(crate::error::api_error_from_response(
+                            "anthropic",
+                            429,
+                            &headers,
+                            &text,
+                        ));
                         retries_used += 1;
                         continue; // `permit` drops here, before the next iteration's backoff sleep
                     }
                     if !status.is_success() {
                         let text = resp.text().await.unwrap_or_default();
                         let bytes_in = text.len() as u64;
-                        let truncated = if text.len() > 4096 {
-                            format!("{}... (truncated)", &text[..4096])
-                        } else {
-                            text
-                        };
                         flow_guard.add_bytes(bytes_in);
                         flow_guard.complete().await;
-                        return Err(ProviderError::Api {
-                            status: status.as_u16(),
-                            message: truncated,
-                        });
+                        return Err(crate::error::api_error_from_response(
+                            "anthropic",
+                            status.as_u16(),
+                            &headers,
+                            &text,
+                        ));
                     }
                     winner = Some((resp, permit, flow_guard));
                     break;
@@ -1944,9 +2008,8 @@ impl AnthropicClient {
                 match winner {
                     Some(w) => w,
                     None => {
-                        return Err(last_err.unwrap_or_else(|| ProviderError::Api {
-                            status: 429,
-                            message: "rate-limited after max retries".into(),
+                        return Err(last_err.unwrap_or_else(|| {
+                            ProviderError::api("anthropic", 429, "rate-limited after max retries")
                         }))
                     }
                 }
@@ -2003,9 +2066,7 @@ impl AnthropicClient {
             let stalled = stalled_result?;
 
             if !stalled {
-                return accumulator
-                    .into_response()
-                    .ok_or(ProviderError::UnexpectedEndOfStream);
+                return accumulator.into_response();
             }
 
             // Stalled. Retry only on a *prefill* stall (nothing emitted yet)
@@ -2043,6 +2104,7 @@ impl AnthropicClient {
         // blocks last guarantees `raw` is echoed byte-exact and is never
         // touched by the tool-name sanitizer's block-rewriting pass.
         restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
+        drop_emptied_messages(&mut messages_value);
 
         let max_tokens = request
             .max_tokens
@@ -2310,6 +2372,9 @@ impl AnthropicClient {
                         .unwrap_or_default()
                         .to_string();
                     if let Some(usage) = msg.get("usage") {
+                        // Lenient on purpose: a stream updates usage
+                        // incrementally (message_delta overwrites fields), so
+                        // an unreadable start snapshot starts from zero.
                         acc.wire = serde_json::from_value(usage.clone()).unwrap_or_default();
                         // message_start's `output_tokens` is a placeholder
                         // (real streams send 1). Output is authoritative only
@@ -2326,6 +2391,7 @@ impl AnthropicClient {
             }
             "content_block_start" => {
                 let data: serde_json::Value = serde_json::from_str(&event.data)?;
+                acc.in_unknown_block = false;
                 if let Some(block) = data.get("content_block") {
                     let block_type = block
                         .get("type")
@@ -2376,7 +2442,53 @@ impl AnthropicClient {
                                 raw: block.clone(),
                             });
                         }
-                        _ => {}
+                        "text" => {
+                            // Text normally arrives as deltas, but a start event
+                            // may already carry some.
+                            if let Some(t) = block
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .filter(|t| !t.is_empty())
+                            {
+                                acc.text.push_str(t);
+                                on_event(StreamEvent::TextDelta(t.to_string()));
+                            }
+                        }
+                        "fallback" => {
+                            let model = |k: &str| {
+                                block
+                                    .get(k)
+                                    .and_then(|v| v.get("model"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                            };
+                            if let (Some(from_model), Some(to_model)) = (model("from"), model("to"))
+                            {
+                                acc.hops.push(FallbackHop {
+                                    from_model: from_model.clone(),
+                                    to_model: to_model.clone(),
+                                });
+                                acc.content_blocks.push(ContentBlock::Fallback {
+                                    from_model,
+                                    to_model,
+                                });
+                            } else {
+                                // Without both model names the block cannot be
+                                // echoed; keep it verbatim instead.
+                                acc.content_blocks.push(ContentBlock::Unknown {
+                                    provider: Some(PROVIDER_TAG.to_string()),
+                                    raw: block.clone(),
+                                });
+                            }
+                        }
+                        other => {
+                            debug!(block_type = other, "keeping unrecognized content block");
+                            acc.content_blocks.push(ContentBlock::Unknown {
+                                provider: Some(PROVIDER_TAG.to_string()),
+                                raw: block.clone(),
+                            });
+                            acc.in_unknown_block = true;
+                        }
                     }
                 }
             }
@@ -2387,6 +2499,13 @@ impl AnthropicClient {
                         .get("type")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
+                    if acc.in_unknown_block {
+                        debug!(
+                            delta_type,
+                            "ignoring delta of an unrecognized content block"
+                        );
+                        return Ok(());
+                    }
                     match delta_type {
                         "text_delta" => {
                             if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
@@ -2434,6 +2553,12 @@ impl AnthropicClient {
                 }
             }
             "content_block_stop" => {
+                acc.in_unknown_block = false;
+                // Whether this stop closes a thinking or tool block; if it
+                // does not, it closes a text block and the buffered text is
+                // flushed below.
+                let closes_non_text =
+                    acc.current_reasoning_text.is_some() || acc.current_tool_id.is_some();
                 // Finalize a pending thinking block. Reconstruct raw in Anthropic's
                 // own wire shape so it echoes back byte-identical to what arrived.
                 // Note the block is emitted even when the text is empty
@@ -2459,32 +2584,62 @@ impl AnthropicClient {
                 if let (Some(id), Some(name)) =
                     (acc.current_tool_id.take(), acc.current_tool_name.take())
                 {
-                    // Architect fix: propagate JSON error instead of silent default
-                    let input: serde_json::Value = if acc.current_tool_input.is_empty() {
-                        serde_json::Value::Object(serde_json::Map::new())
-                    } else {
-                        serde_json::from_str(&acc.current_tool_input).map_err(|e| {
-                            ProviderError::Json(format!(
-                                "malformed tool input JSON for tool '{}': {}",
-                                name, e
-                            ))
-                        })?
-                    };
-                    acc.content_blocks
-                        .push(ContentBlock::ToolUse { id, name, input });
+                    // A tool whose JSON does not parse is not a transport
+                    // failure: drop the block and record why, so
+                    // `into_response` can report it as truncated (max_tokens)
+                    // or malformed (anything else).
+                    let parsed: Result<serde_json::Value, serde_json::Error> =
+                        if acc.current_tool_input.is_empty() {
+                            Ok(serde_json::Value::Object(serde_json::Map::new()))
+                        } else {
+                            serde_json::from_str(&acc.current_tool_input)
+                        };
+                    match parsed {
+                        Ok(input) => {
+                            acc.content_blocks
+                                .push(ContentBlock::ToolUse { id, name, input })
+                        }
+                        Err(e) => {
+                            warn!(tool = %name, error = %e, "dropping tool call with unparseable input JSON");
+                            // Overwrites an earlier bad tool on purpose; see
+                            // `StreamAccumulator::bad_tool`.
+                            acc.bad_tool = Some(serde_json::json!({
+                                "name": name,
+                                "id": id,
+                                "error": e.to_string(),
+                            }));
+                        }
+                    }
                     acc.current_tool_input.clear();
+                }
+
+                // Flush a finished text block where it appeared on the wire,
+                // so text written before a mid-output fallback stays before
+                // the `Fallback` block (spec §4.5). Text still buffered at the
+                // end of the stream (deltas with no block stop) is placed by
+                // `into_response`.
+                if !closes_non_text && !acc.text.is_empty() {
+                    let text = std::mem::take(&mut acc.text);
+                    acc.content_blocks.push(ContentBlock::Text { text });
                 }
             }
             "message_delta" => {
                 let data: serde_json::Value = serde_json::from_str(&event.data)?;
                 if let Some(delta) = data.get("delta") {
                     if let Some(reason) = delta.get("stop_reason").and_then(|v| v.as_str()) {
-                        acc.stop_reason =
-                            serde_json::from_value(serde_json::Value::String(reason.to_string()))
-                                .ok();
+                        acc.stop_reason = Some(reason.to_string());
+                    }
+                    if let Some(seq) = delta.get("stop_sequence").and_then(|v| v.as_str()) {
+                        acc.stop_sequence = Some(seq.to_string());
+                    }
+                    if let Some(details) = delta.get("stop_details").filter(|d| !d.is_null()) {
+                        acc.stop_details = Some(details.clone());
                     }
                 }
                 if let Some(usage) = data.get("usage") {
+                    if let Some(it) = usage.get("iterations").filter(|i| !i.is_null()) {
+                        acc.iterations = Some(it.clone());
+                    }
                     let field = |k: &str| usage.get(k).and_then(|v| v.as_u64());
                     acc.wire.output_tokens = field("output_tokens").unwrap_or(0) as u32;
                     // Newer API versions repeat the input/cache fields in the
@@ -2504,7 +2659,21 @@ impl AnthropicClient {
                     on_event(StreamEvent::UsageSnapshot(acc.wire.normalize()));
                 }
             }
-            "message_stop" | "ping" => {}
+            "message_stop" => acc.saw_message_stop = true,
+            "ping" => {}
+            "error" => {
+                // An error event inside a 200 stream. A body that is not JSON
+                // is still an error: keep it as a string.
+                let data = serde_json::from_str::<serde_json::Value>(&event.data)
+                    .unwrap_or_else(|_| serde_json::Value::String(event.data.clone()));
+                return Err(ProviderError::Reply(Box::new(
+                    crate::reply_error::parse_error_value(
+                        "anthropic",
+                        crate::reply_error::ErrorOrigin::Stream,
+                        &data,
+                    ),
+                )));
+            }
             other => {
                 debug!(event_type = other, "unhandled SSE event type");
             }
@@ -2547,17 +2716,14 @@ impl AnthropicClient {
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                let message: String = resp
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(500)
-                    .collect();
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message,
-                });
+                let headers = resp.headers().clone();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(crate::error::api_error_from_response(
+                    "anthropic",
+                    status.as_u16(),
+                    &headers,
+                    &text,
+                ));
             }
             let body = resp
                 .text()
@@ -2675,13 +2841,30 @@ struct StreamAccumulator {
     model: String,
     text: String,
     content_blocks: Vec<ContentBlock>,
-    stop_reason: Option<StopReason>,
+    /// The raw `stop_reason` string off `message_delta`.
+    stop_reason: Option<String>,
     wire: AnthropicWireUsage,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
     current_reasoning_text: Option<String>,
     current_reasoning_signature: Option<String>,
+    /// `message_delta.delta.stop_sequence`.
+    stop_sequence: Option<String>,
+    /// `message_delta.delta.stop_details`, when not null.
+    stop_details: Option<serde_json::Value>,
+    /// Server-side fallback hops seen as `fallback` content blocks.
+    hops: Vec<FallbackHop>,
+    /// `message_delta.usage.iterations`.
+    iterations: Option<serde_json::Value>,
+    /// The last tool call whose input JSON did not parse. Keeping only the
+    /// last is deliberate: one malformed or truncated tool is enough to
+    /// classify the turn, and the details name the last one.
+    bad_tool: Option<serde_json::Value>,
+    saw_message_stop: bool,
+    /// True between the start and stop of a block rupu keeps verbatim; its
+    /// deltas are ignored.
+    in_unknown_block: bool,
 }
 
 impl StreamAccumulator {
@@ -2689,30 +2872,53 @@ impl StreamAccumulator {
         Self::default()
     }
 
-    fn into_response(mut self) -> Option<LlmResponse> {
+    fn into_response(mut self) -> Result<LlmResponse, ProviderError> {
         if self.id.is_empty() {
-            return None;
+            return Err(ProviderError::UnexpectedEndOfStream);
+        }
+        if !self.saw_message_stop {
+            return Err(ProviderError::IncompleteStream(
+                "anthropic: no message_stop".into(),
+            ));
         }
 
         if !self.text.is_empty() {
             // Anthropic requires reasoning blocks first in an assistant turn,
             // so text goes after any leading reasoning — not at index 0. (The
             // old `insert(0, ..)` predates reasoning capture, when nothing
-            // depended on block order.)
+            // depended on block order.) A fallback marker opens the reply it
+            // introduces, so text follows it too. Only text with no block
+            // stop to flush it reaches here; streamed text blocks are
+            // flushed in wire order by `content_block_stop`.
             let idx = self
                 .content_blocks
                 .iter()
-                .position(|b| !matches!(b, ContentBlock::Reasoning { .. }))
+                .position(|b| {
+                    !matches!(
+                        b,
+                        ContentBlock::Reasoning { .. } | ContentBlock::Fallback { .. }
+                    )
+                })
                 .unwrap_or(self.content_blocks.len());
             self.content_blocks
                 .insert(idx, ContentBlock::Text { text: self.text });
         }
 
-        Some(LlmResponse {
+        let mut stop = anthropic_stop(
+            self.stop_reason.as_deref(),
+            self.stop_sequence.as_deref(),
+            self.stop_details.as_ref(),
+            self.hops,
+            self.iterations.as_ref(),
+            &self.model,
+        );
+        stop.apply_bad_tool(self.bad_tool);
+
+        Ok(LlmResponse {
             id: self.id,
             model: self.model,
             content: self.content_blocks,
-            stop_reason: self.stop_reason,
+            stop,
             usage: self.wire.normalize(),
         })
     }
@@ -2724,20 +2930,20 @@ impl StreamAccumulator {
 /// format, not Anthropic's wire format, and the two must not be coupled.
 fn parse_content_blocks(raw: Vec<serde_json::Value>, model: &str) -> Vec<ContentBlock> {
     raw.into_iter()
-        .filter_map(|block| {
+        .map(|block| {
             let block_type = block
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             match block_type {
-                "text" => Some(ContentBlock::Text {
+                "text" => ContentBlock::Text {
                     text: block
                         .get("text")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                }),
-                "tool_use" => Some(ContentBlock::ToolUse {
+                },
+                "tool_use" => ContentBlock::ToolUse {
                     id: block
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -2751,27 +2957,51 @@ fn parse_content_blocks(raw: Vec<serde_json::Value>, model: &str) -> Vec<Content
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    // An absent (or null) input is a zero-parameter call.
                     input: block
                         .get("input")
+                        .filter(|v| !v.is_null())
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                }),
+                        .unwrap_or_else(|| serde_json::json!({})),
+                },
                 "thinking" | "redacted_thinking" => {
                     let text = block
                         .get("thinking")
                         .and_then(|v| v.as_str())
                         .filter(|t| !t.is_empty())
                         .map(|t| t.to_string());
-                    Some(ContentBlock::Reasoning {
+                    ContentBlock::Reasoning {
                         text,
                         provider: PROVIDER_TAG.to_string(),
                         model: model.to_string(),
                         raw: block,
-                    })
+                    }
+                }
+                "fallback" => {
+                    let model_of = |k: &str| {
+                        block
+                            .get(k)
+                            .and_then(|v| v.get("model"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    };
+                    match (model_of("from"), model_of("to")) {
+                        (Some(from_model), Some(to_model)) => ContentBlock::Fallback {
+                            from_model,
+                            to_model,
+                        },
+                        _ => ContentBlock::Unknown {
+                            provider: Some(PROVIDER_TAG.to_string()),
+                            raw: block,
+                        },
+                    }
                 }
                 other => {
-                    debug!(block_type = other, "dropping unrecognized content block");
-                    None
+                    debug!(block_type = other, "keeping unrecognized content block");
+                    ContentBlock::Unknown {
+                        provider: Some(PROVIDER_TAG.to_string()),
+                        raw: block,
+                    }
                 }
             }
         })
@@ -2788,19 +3018,108 @@ struct AnthropicResponse {
     id: String,
     model: String,
     content: Vec<serde_json::Value>,
-    stop_reason: Option<StopReason>,
-    usage: AnthropicWireUsage,
+    stop_reason: Option<String>,
+    #[serde(default)]
+    stop_sequence: Option<String>,
+    #[serde(default)]
+    stop_details: Option<serde_json::Value>,
+    /// A malformed `usage` fails the decode, as it always has on this path.
+    usage: AnthropicResponseUsage,
+}
+
+/// The `usage` object of a non-streaming reply: the token counters plus the
+/// `iterations` list that reports a server-side fallback.
+#[derive(Debug, Deserialize)]
+struct AnthropicResponseUsage {
+    #[serde(flatten)]
+    counters: AnthropicWireUsage,
+    #[serde(default)]
+    iterations: Option<serde_json::Value>,
+}
+
+/// One place for both paths (stream + send): stop_reason, stop_sequence,
+/// stop_details and fallback hops/iterations → a [`Stop`]. An unknown
+/// `stop_reason` becomes `Unrecognized` and keeps its wire text; a missing
+/// one is `Unreported`.
+fn anthropic_stop(
+    stop_reason: Option<&str>,
+    stop_sequence: Option<&str>,
+    stop_details: Option<&serde_json::Value>,
+    hops: Vec<FallbackHop>,
+    iterations: Option<&serde_json::Value>,
+    response_model: &str,
+) -> Stop {
+    let mut stop = match stop_reason {
+        Some(v) => Stop::from_wire(crate::stop::map::anthropic(v), "anthropic", Some(v)),
+        None => Stop::from_wire(StopReason::Unreported, "anthropic", None),
+    };
+    if let Some(seq) = stop_sequence {
+        stop.set_detail("stop_sequence", serde_json::json!(seq));
+    }
+    if let Some(d) = stop_details.filter(|d| !d.is_null()) {
+        let s = |k: &str| d.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let category = s("category");
+        stop.refusal = Some(RefusalDetail {
+            source: if category.is_some() {
+                RefusalSource::Classifier
+            } else {
+                RefusalSource::Model
+            },
+            category,
+            explanation: s("explanation"),
+            recommended_model: s("recommended_model"),
+        });
+        stop.set_detail("stop_details", d.clone());
+    }
+    let fallback_entry = iterations
+        .and_then(|it| it.as_array())
+        .and_then(|it| {
+            it.iter()
+                .rev()
+                .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("fallback_message"))
+        })
+        .and_then(|e| e.get("model").and_then(|m| m.as_str()).map(str::to_string));
+    if !hops.is_empty() || fallback_entry.is_some() {
+        let model = hops
+            .last()
+            .map(|h| h.to_model.clone())
+            .or(fallback_entry)
+            .unwrap_or_else(|| response_model.to_string());
+        stop.served_by = Some(ServedBy { model, hops });
+    }
+    stop
 }
 
 impl AnthropicResponse {
     fn into_llm_response(self) -> LlmResponse {
         let content = parse_content_blocks(self.content, &self.model);
+        let hops = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Fallback {
+                    from_model,
+                    to_model,
+                } => Some(FallbackHop {
+                    from_model: from_model.clone(),
+                    to_model: to_model.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let stop = anthropic_stop(
+            self.stop_reason.as_deref(),
+            self.stop_sequence.as_deref(),
+            self.stop_details.as_ref(),
+            hops,
+            self.usage.iterations.as_ref(),
+            &self.model,
+        );
         LlmResponse {
             id: self.id,
             model: self.model,
             content,
-            stop_reason: self.stop_reason,
-            usage: self.usage.normalize(),
+            stop,
+            usage: self.usage.counters.normalize(),
         }
     }
 }
@@ -2855,19 +3174,18 @@ impl crate::provider::LlmProvider for AnthropicClient {
         if status.is_success() {
             return Ok(());
         }
-        // Bound the body: this string ends up in a cache the dashboard reads,
-        // not in a log the operator greps.
-        let message = resp
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect::<String>();
-        Err(ProviderError::Api {
-            status: status.as_u16(),
-            message,
-        })
+        // The error's `Display` string ends up in a cache the dashboard reads,
+        // not in a log the operator greps: `ApiErrorBody::message` is a short
+        // preview (`MESSAGE_PREVIEW_CHARS`), so it stays bounded however large
+        // the body is. The full body is kept in the error's `raw` field.
+        let headers = resp.headers().clone();
+        let text = resp.text().await.unwrap_or_default();
+        Err(crate::error::api_error_from_response(
+            "anthropic",
+            status.as_u16(),
+            &headers,
+            &text,
+        ))
     }
 
     async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
@@ -3657,19 +3975,26 @@ mod tests {
 
     #[test]
     fn unknown_block_is_dropped_from_request() {
-        // `ContentBlock::Unknown` serializes as `{"type":"Unknown"}` (pinned by
-        // a test in types.rs), which no provider accepts.
+        // `ContentBlock::Unknown` serializes as `{"type":"unknown",…}`, which
+        // no provider accepts.
         // Caching off: this pins the restoration shape exactly;
         // `restored_reasoning_raw_block_is_byte_identical` pins the cache-on shape.
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
             .with_prompt_cache(false);
         assert_eq!(
-            serde_json::to_value(ContentBlock::Unknown).unwrap()["type"],
-            "Unknown",
+            serde_json::to_value(ContentBlock::Unknown {
+                provider: None,
+                raw: serde_json::json!({"type": "x"}),
+            })
+            .unwrap()["type"],
+            "unknown",
             "Unknown's wire tag changed — restore_reasoning_blocks must follow"
         );
         let request = request_with_assistant_blocks(vec![
-            ContentBlock::Unknown,
+            ContentBlock::Unknown {
+                provider: None,
+                raw: serde_json::json!({"type": "x"}),
+            },
             ContentBlock::Text {
                 text: "the answer".into(),
             },
@@ -3679,6 +4004,27 @@ mod tests {
             body["messages"][1]["content"],
             serde_json::json!([{ "type": "text", "text": "the answer" }])
         );
+    }
+
+    #[test]
+    fn fallback_block_is_echoed_in_wire_shape() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Fallback {
+                from_model: "a".into(),
+                to_model: "b".into(),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            serde_json::json!({"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}})
+        );
+        assert_eq!(body["messages"][1]["content"][1]["type"], "text");
     }
 
     #[test]
@@ -3962,14 +4308,15 @@ mod tests {
         acc.id = "msg_123".into();
         acc.model = "claude-sonnet-4-6".into();
         acc.text = "Hello world".into();
-        acc.stop_reason = Some(StopReason::EndTurn);
+        acc.stop_reason = Some("end_turn".to_string());
+        acc.saw_message_stop = true;
         acc.wire.input_tokens = 10;
         acc.wire.output_tokens = 5;
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.text(), Some("Hello world"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 10);
     }
 
@@ -3984,7 +4331,8 @@ mod tests {
             name: "read_file".into(),
             input: serde_json::json!({"path": "/tmp/test"}),
         });
-        acc.stop_reason = Some(StopReason::ToolUse);
+        acc.stop_reason = Some("tool_use".to_string());
+        acc.saw_message_stop = true;
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.content.len(), 2);
@@ -3992,9 +4340,12 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_accumulator_empty_returns_none() {
+    fn test_stream_accumulator_empty_is_unexpected_end_of_stream() {
         let acc = StreamAccumulator::new();
-        assert!(acc.into_response().is_none());
+        assert!(matches!(
+            acc.into_response(),
+            Err(ProviderError::UnexpectedEndOfStream)
+        ));
     }
 
     #[test]
@@ -4027,7 +4378,39 @@ mod tests {
         let response: AnthropicResponse = serde_json::from_str(json).unwrap();
         let llm = response.into_llm_response();
         assert_eq!(llm.text(), Some("Hello!"));
-        assert_eq!(llm.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(llm.stop.reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn an_unknown_stop_reason_decodes_as_unrecognized_and_keeps_its_wire_value() {
+        let json = r#"{
+            "id": "msg_test",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "stop_reason": "brand_new_reason",
+            "usage": {"input_tokens": 10, "output_tokens": 3}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.stop.reason, StopReason::Unrecognized);
+        assert_eq!(llm.stop.wire.value.as_deref(), Some("brand_new_reason"));
+        assert_eq!(llm.stop.wire.provider, "anthropic");
+    }
+
+    #[test]
+    fn a_missing_stop_reason_is_unreported() {
+        let json = r#"{
+            "id": "msg_test",
+            "model": "claude-sonnet-4-6",
+            "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.stop.reason, StopReason::Unreported);
+        assert_eq!(llm.stop.wire.value, None);
     }
 
     #[test]
@@ -4080,7 +4463,7 @@ mod tests {
         assert_eq!(response.id, "msg_1");
         assert_eq!(response.model, "claude-sonnet-4-6");
         assert_eq!(response.text(), Some("Hello world"));
-        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.stop.reason, StopReason::EndTurn);
         assert_eq!(response.usage.input_tokens, 25);
         assert_eq!(response.usage.output_tokens, 3);
         // Verify callback was called with text deltas
@@ -4159,8 +4542,15 @@ mod tests {
             event_type: "content_block_stop".into(),
             data: r#"{"type":"content_block_stop","index":0}"#.into(),
         };
-        let result = client.process_sse_event(&stop_event, &mut acc, &mut |_| {});
-        assert!(result.is_err());
+        // Not a transport error: the call is dropped and recorded, so the
+        // stop can be reported as truncated or malformed.
+        client
+            .process_sse_event(&stop_event, &mut acc, &mut |_| {})
+            .unwrap();
+        assert!(acc.content_blocks.is_empty());
+        let bad = acc.bad_tool.expect("bad tool recorded");
+        assert_eq!(bad["name"], "some_tool");
+        assert_eq!(bad["id"], "toolu_bad");
     }
 
     // ── Anthropic-specific auth tests (moved from auth/mod.rs) ───────
@@ -4364,6 +4754,7 @@ mod tests {
         assert_eq!(snapshots[0].cached_tokens, 200);
         assert_eq!(snapshots[0].cache_write_tokens, 30);
         // Final usage.
+        acc.saw_message_stop = true;
         let response = acc.into_response().unwrap();
         assert_eq!(response.usage.input_tokens, 240);
         assert_eq!(response.usage.cached_tokens, 200);
@@ -4392,6 +4783,7 @@ mod tests {
                 .process_sse_event(event, &mut acc, &mut |_| {})
                 .unwrap();
         }
+        acc.saw_message_stop = true;
         let response = acc.into_response().unwrap();
         // 12 + 100 + 50
         assert_eq!(response.usage.input_tokens, 162);
@@ -4419,6 +4811,7 @@ mod tests {
                 .process_sse_event(event, &mut acc, &mut |_| {})
                 .unwrap();
         }
+        acc.saw_message_stop = true;
         let response = acc.into_response().unwrap();
         assert_eq!(response.usage.input_tokens, 240);
         assert_eq!(response.usage.cached_tokens, 200);
@@ -4457,6 +4850,7 @@ mod tests {
         assert_eq!(snapshots[0].input_tokens, 25);
         assert_eq!(snapshots[0].output_tokens, 0);
         assert_eq!(snapshots[1].output_tokens, 42);
+        acc.saw_message_stop = true;
         let response = acc.into_response().unwrap();
         assert_eq!(response.usage.input_tokens, 25);
         assert_eq!(response.usage.output_tokens, 42);
@@ -4473,6 +4867,7 @@ mod tests {
         client
             .process_sse_event(&event, &mut acc, &mut |_| {})
             .unwrap();
+        acc.saw_message_stop = true;
         let response = acc.into_response().unwrap();
         // 10 + 200 + (null -> 0): input and read survive the null write field.
         assert_eq!(response.usage.input_tokens, 210);
@@ -5593,8 +5988,11 @@ mod tests {
             }
             .unwrap_err();
             assert!(
-                matches!(&err, ProviderError::Api { status: 429, message }
-                    if message.contains("Extra usage is required for long context")),
+                err.status() == Some(429)
+                    && err.reply().is_some_and(|b| {
+                        b.message
+                            .contains("Extra usage is required for long context")
+                    }),
                 "streamed={streamed}: {err:?}"
             );
         }
@@ -5909,7 +6307,7 @@ mod tests {
             );
             let second = call(&mut client, &request, streamed).await.unwrap_err();
             assert!(
-                matches!(&second, ProviderError::Api { status: 400, .. }),
+                second.status() == Some(400),
                 "streamed={streamed}: the retry goes out without the beta: {second:?}"
             );
             refused.assert_hits(1);
@@ -5948,10 +6346,7 @@ mod tests {
             "{first:?}"
         );
         let second = client.send(&request).await.unwrap_err();
-        assert!(
-            matches!(second, ProviderError::Api { status: 400, .. }),
-            "{second:?}"
-        );
+        assert!(second.status() == Some(400), "{second:?}");
         refused.assert_hits(1);
         without.assert_hits(1);
     }
@@ -6169,16 +6564,10 @@ mod tests {
             .await
             .expect_err("a 401 must never be reported as healthy");
 
-        match err {
-            ProviderError::Api {
-                status: 401,
-                message,
-            } => assert!(
-                message.contains("authentication_error"),
-                "the response body must land in the message, got {message:?}"
-            ),
-            other => panic!("expected Api{{status:401}}, got {other:?}"),
-        }
+        let reply = err.reply().expect("a 401 is a reply error");
+        assert_eq!(reply.status(), Some(401));
+        assert_eq!(reply.kind.as_deref(), Some("authentication_error"));
+        assert_eq!(reply.class, crate::reply_error::ErrorClass::Auth);
     }
 
     /// `probe` only needs the status, so it must not download the whole
@@ -6348,10 +6737,7 @@ mod tests {
         let err = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, ProviderError::Api { status: 401, .. }),
-            "{err:?}"
-        );
+        assert!(err.status() == Some(401), "{err:?}");
     }
 
     #[tokio::test]
@@ -6803,6 +7189,7 @@ mod tests {
                 .unwrap();
         }
 
+        acc.saw_message_stop = true;
         let resp = acc.into_response().unwrap();
         assert_eq!(resp.content.len(), 2);
         assert!(
@@ -6883,6 +7270,7 @@ mod tests {
                 .unwrap();
         }
 
+        acc.saw_message_stop = true;
         let resp = acc.into_response().unwrap();
         assert_eq!(
             resp.content.len(),
@@ -7002,7 +7390,7 @@ mod tests {
     }
 
     #[test]
-    fn non_streaming_unknown_block_type_is_dropped_not_fatal() {
+    fn send_keeps_unknown_blocks() {
         let json = r#"{
             "id": "msg_unk",
             "model": "claude-opus-4-8",
@@ -7016,7 +7404,664 @@ mod tests {
         let llm = serde_json::from_str::<AnthropicResponse>(json)
             .expect("unknown block must not fail the turn")
             .into_llm_response();
-        assert_eq!(llm.content.len(), 1);
+        assert_eq!(llm.content.len(), 2);
         assert_eq!(llm.text(), Some("still here"));
+        match &llm.content[0] {
+            ContentBlock::Unknown { provider, raw } => {
+                assert_eq!(provider.as_deref(), Some("anthropic"));
+                assert_eq!(raw["payload"], 1);
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_decodes_refusal_and_unknown_stop_reason() {
+        let refusal = r#"{
+            "id": "msg_r", "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "No."}],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber", "explanation": "Declined for this example."},
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(refusal)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.stop.reason, StopReason::Refusal);
+        let r = llm.stop.refusal.expect("refusal detail");
+        assert_eq!(r.category.as_deref(), Some("cyber"));
+        assert_eq!(r.source, RefusalSource::Classifier);
+
+        let unknown = r#"{
+            "id": "msg_u", "model": "claude-opus-4-8", "content": [],
+            "stop_reason": "brand_new_reason",
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(unknown)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.stop.reason, StopReason::Unrecognized);
+        assert_eq!(llm.stop.wire.value.as_deref(), Some("brand_new_reason"));
+    }
+
+    #[test]
+    fn send_decodes_fallback_blocks_and_iterations_into_served_by() {
+        let json = r#"{
+            "id": "msg_f", "model": "claude-opus-5-5",
+            "content": [
+                {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
+                {"type": "text", "text": "ok"}
+            ],
+            "stop_reason": "end_turn", "stop_sequence": "</done>",
+            "usage": {"input_tokens": 1, "output_tokens": 1,
+                      "iterations": [{"type": "message", "model": "claude-opus-5-5"},
+                                     {"type": "fallback_message", "model": "claude-opus-4-8"}]}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(
+            llm.content[0],
+            ContentBlock::Fallback {
+                from_model: "claude-opus-5-5".into(),
+                to_model: "claude-opus-4-8".into()
+            }
+        );
+        let served = llm.stop.served_by.expect("served_by");
+        assert_eq!(served.model, "claude-opus-4-8");
+        assert_eq!(served.hops.len(), 1);
+        assert_eq!(
+            llm.stop.wire.details.as_ref().unwrap()["stop_sequence"],
+            "</done>"
+        );
+        assert_eq!(llm.usage.input_tokens, 1);
+    }
+
+    // ── Reply shapes through the SSE accumulator ─────────────────────
+
+    fn msg_start(model: &str) -> crate::sse::SseEvent {
+        sse(
+            "message_start",
+            &format!(
+                r#"{{"type":"message_start","message":{{"id":"msg_1","model":"{model}","usage":{{"input_tokens":5}}}}}}"#
+            ),
+        )
+    }
+
+    fn text_block(text: &str) -> Vec<crate::sse::SseEvent> {
+        vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                &format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}"#
+                ),
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ]
+    }
+
+    fn msg_delta(delta: &str) -> crate::sse::SseEvent {
+        sse(
+            "message_delta",
+            &format!(r#"{{"type":"message_delta","delta":{delta},"usage":{{"output_tokens":3}}}}"#),
+        )
+    }
+
+    fn msg_stop() -> crate::sse::SseEvent {
+        sse("message_stop", r#"{"type":"message_stop"}"#)
+    }
+
+    fn run_events(
+        events: Vec<crate::sse::SseEvent>,
+    ) -> (StreamAccumulator, Result<(), ProviderError>) {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        for ev in &events {
+            if let Err(e) = client.process_sse_event(ev, &mut acc, &mut |_| {}) {
+                return (acc, Err(e));
+            }
+        }
+        (acc, Ok(()))
+    }
+
+    fn run_response(events: Vec<crate::sse::SseEvent>) -> LlmResponse {
+        let (acc, r) = run_events(events);
+        r.unwrap();
+        acc.into_response().unwrap()
+    }
+
+    fn tool_events(partial_json: &str, stop_reason: &str) -> Vec<crate::sse::SseEvent> {
+        vec![
+            msg_start("claude-sonnet-4-6"),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file"}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                &serde_json::json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":partial_json}})
+                .to_string(),
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            msg_delta(&format!(r#"{{"stop_reason":"{stop_reason}"}}"#)),
+            msg_stop(),
+        ]
+    }
+
+    #[test]
+    fn refusal_stream_carries_stop_details() {
+        let mut evs = vec![msg_start("claude-opus-4-8")];
+        evs.extend(text_block("Partial"));
+        evs.push(msg_delta(
+            r#"{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"Declined for this example."}}"#,
+        ));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("refusal"));
+        let d = r.stop.refusal.as_ref().expect("refusal detail");
+        assert_eq!(d.category.as_deref(), Some("cyber"));
+        assert_eq!(d.explanation.as_deref(), Some("Declined for this example."));
+        assert_eq!(d.source, RefusalSource::Classifier);
+        assert_eq!(r.text(), Some("Partial"));
+    }
+
+    #[test]
+    fn refusal_with_null_category_is_model_sourced() {
+        let mut evs = vec![msg_start("claude-opus-4-8")];
+        evs.extend(text_block("x"));
+        evs.push(msg_delta(
+            r#"{"stop_reason":"refusal","stop_details":{"type":"refusal","category":null,"explanation":null}}"#,
+        ));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        let d = r.stop.refusal.as_ref().expect("refusal detail");
+        assert_eq!(d.category, None);
+        assert_eq!(d.source, RefusalSource::Model);
+    }
+
+    #[test]
+    fn pause_turn_and_context_window_exceeded_are_typed() {
+        for (wire, want) in [
+            ("pause_turn", StopReason::PauseTurn),
+            (
+                "model_context_window_exceeded",
+                StopReason::ContextWindowExceeded,
+            ),
+        ] {
+            let mut evs = vec![msg_start("claude-opus-4-8")];
+            evs.extend(text_block("x"));
+            evs.push(msg_delta(&format!(r#"{{"stop_reason":"{wire}"}}"#)));
+            evs.push(msg_stop());
+            let r = run_response(evs);
+            assert_eq!(r.stop.reason, want);
+            assert_eq!(r.stop.wire.value.as_deref(), Some(wire));
+        }
+    }
+
+    #[test]
+    fn unknown_stop_reason_is_unrecognized_with_wire_value() {
+        let mut evs = vec![msg_start("claude-opus-4-8")];
+        evs.extend(text_block("x"));
+        evs.push(msg_delta(r#"{"stop_reason":"brand_new_reason"}"#));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        assert_eq!(r.stop.reason, StopReason::Unrecognized);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("brand_new_reason"));
+    }
+
+    #[test]
+    fn stop_sequence_is_recorded() {
+        let mut evs = vec![msg_start("claude-opus-4-8")];
+        evs.extend(text_block("x"));
+        evs.push(msg_delta(
+            r#"{"stop_reason":"stop_sequence","stop_sequence":"</done>"}"#,
+        ));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        assert_eq!(r.stop.reason, StopReason::StopSequence);
+        assert_eq!(
+            r.stop.wire.details.as_ref().unwrap()["stop_sequence"],
+            "</done>"
+        );
+    }
+
+    #[test]
+    fn sse_error_event_is_a_stream_reply_error() {
+        use crate::reply_error::{ErrorClass, ErrorOrigin};
+        let (_, r) = run_events(vec![
+            msg_start("claude-opus-4-8"),
+            sse(
+                "error",
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            ),
+        ]);
+        match r {
+            Err(ProviderError::Reply(b)) => {
+                assert_eq!(b.origin, ErrorOrigin::Stream);
+                assert_eq!(b.class, ErrorClass::Overloaded);
+                assert!(b.is_retryable());
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_message_stop_is_incomplete_stream() {
+        let mut evs = vec![msg_start("claude-opus-4-8")];
+        evs.extend(text_block("partial"));
+        let (acc, r) = run_events(evs);
+        r.unwrap();
+        assert!(matches!(
+            acc.into_response(),
+            Err(ProviderError::IncompleteStream(_))
+        ));
+    }
+
+    #[test]
+    fn truncated_tool_json_under_max_tokens_is_dropped_and_reported() {
+        let r = run_response(tool_events(r#"{"path": "a"#, "max_tokens"));
+        assert!(r.tool_calls().is_empty());
+        assert!(!r
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
+        let d = r.stop.wire.details.as_ref().unwrap();
+        assert_eq!(d["truncated_tool"]["name"], "read_file");
+        assert_eq!(d["truncated_tool"]["id"], "toolu_1");
+    }
+
+    #[test]
+    fn bad_tool_json_without_max_tokens_is_malformed_tool_call() {
+        let r = run_response(tool_events(r#"{"path": "a"#, "tool_use"));
+        assert!(r.tool_calls().is_empty());
+        assert_eq!(r.stop.reason, StopReason::MalformedToolCall);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("tool_use"));
+        assert!(r.stop.wire.details.as_ref().unwrap()["malformed_tool"].is_object());
+    }
+
+    #[test]
+    fn server_side_fallback_blocks_and_iterations_set_served_by() {
+        let mut evs = vec![
+            msg_start("claude-opus-5-5"),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        evs.extend(text_block("hello"));
+        evs.push(sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3,"iterations":[{"type":"message","model":"claude-opus-5-5"},{"type":"fallback_message","model":"claude-opus-4-8"}]}}"#,
+        ));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        assert_eq!(
+            r.content[0],
+            ContentBlock::Fallback {
+                from_model: "claude-opus-5-5".into(),
+                to_model: "claude-opus-4-8".into()
+            }
+        );
+        assert_eq!(r.text(), Some("hello"));
+        let served = r.stop.served_by.expect("served_by");
+        assert_eq!(served.model, "claude-opus-4-8");
+        assert_eq!(served.hops.len(), 1);
+        assert_eq!(served.hops[0].from_model, "claude-opus-5-5");
+    }
+
+    #[test]
+    fn unknown_content_block_is_kept() {
+        let mut evs = vec![
+            msg_start("claude-sonnet-4-6"),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        evs.extend(text_block("done"));
+        evs.push(msg_delta(r#"{"stop_reason":"end_turn"}"#));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        let unknown = r
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Unknown { provider, raw } => Some((provider, raw)),
+                _ => None,
+            })
+            .expect("unknown block kept");
+        assert_eq!(unknown.0.as_deref(), Some("anthropic"));
+        assert_eq!(unknown.1["id"], "srv_1");
+        assert_eq!(r.text(), Some("done"));
+        assert!(r.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn text_block_start_with_initial_text_is_kept() {
+        let r = run_response(vec![
+            msg_start("claude-sonnet-4-6"),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Seed"}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" more"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            msg_delta(r#"{"stop_reason":"end_turn"}"#),
+            msg_stop(),
+        ]);
+        assert_eq!(r.text(), Some("Seed more"));
+    }
+
+    #[test]
+    fn stream_without_message_start_is_unexpected_end() {
+        let acc = StreamAccumulator::new();
+        assert!(matches!(
+            acc.into_response(),
+            Err(ProviderError::UnexpectedEndOfStream)
+        ));
+    }
+
+    #[test]
+    fn request_drops_messages_emptied_by_the_post_pass_and_merges_neighbours() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
+        let mut request = request_with_assistant_blocks(vec![ContentBlock::Unknown {
+            provider: Some("anthropic".into()),
+            raw: serde_json::json!({"type": "server_tool_use", "id": "srv_1"}),
+        }]);
+        request.messages = vec![
+            Message::user("q"),
+            request.messages.remove(1),
+            Message::user("tool output"),
+        ];
+        let body = client.build_request_body(&request, false);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "got {msgs:?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(
+            msgs[0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "q"},
+                {"type": "text", "text": "tool output"}
+            ])
+        );
+    }
+
+    fn fallback_block_events() -> Vec<crate::sse::SseEvent> {
+        vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+        ]
+    }
+
+    #[test]
+    fn streamed_text_around_a_fallback_keeps_wire_order_and_matches_send() {
+        let mut evs = vec![msg_start("claude-opus-5-5")];
+        evs.extend(text_block("A"));
+        evs.extend(fallback_block_events());
+        evs.extend(text_block("B"));
+        evs.push(msg_delta(r#"{"stop_reason":"end_turn"}"#));
+        evs.push(msg_stop());
+        let streamed = run_response(evs);
+
+        let sent = serde_json::from_str::<AnthropicResponse>(
+            r#"{
+                "id": "msg_1", "model": "claude-opus-5-5",
+                "content": [
+                    {"type": "text", "text": "A"},
+                    {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
+                    {"type": "text", "text": "B"}
+                ],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3}
+            }"#,
+        )
+        .unwrap()
+        .into_llm_response();
+        assert_eq!(streamed.content, sent.content);
+        assert_eq!(
+            streamed.content,
+            vec![
+                ContentBlock::Text { text: "A".into() },
+                ContentBlock::Fallback {
+                    from_model: "claude-opus-5-5".into(),
+                    to_model: "claude-opus-4-8".into()
+                },
+                ContentBlock::Text { text: "B".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn streamed_thinking_and_text_either_side_of_a_fallback_keep_wire_order() {
+        let thinking = |t: &str| {
+            vec![
+                sse(
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                ),
+                sse(
+                    "content_block_delta",
+                    &serde_json::json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"thinking_delta","thinking":t}})
+                    .to_string(),
+                ),
+                sse(
+                    "content_block_stop",
+                    r#"{"type":"content_block_stop","index":0}"#,
+                ),
+            ]
+        };
+        let mut evs = vec![msg_start("claude-opus-5-5")];
+        evs.extend(thinking("think A"));
+        evs.extend(text_block("A"));
+        evs.extend(fallback_block_events());
+        evs.extend(thinking("think B"));
+        evs.extend(text_block("B"));
+        evs.push(msg_delta(r#"{"stop_reason":"end_turn"}"#));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        let shape: Vec<&str> = r
+            .content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Reasoning { .. } => "reasoning",
+                ContentBlock::Text { .. } => "text",
+                ContentBlock::Fallback { .. } => "fallback",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["reasoning", "text", "fallback", "reasoning", "text"]
+        );
+        assert!(matches!(&r.content[1], ContentBlock::Text { text } if text == "A"));
+        assert!(matches!(&r.content[4], ContentBlock::Text { text } if text == "B"));
+    }
+
+    #[test]
+    fn streamed_unknown_block_before_text_keeps_wire_order() {
+        let mut evs = vec![
+            msg_start("claude-sonnet-4-6"),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        evs.extend(text_block("after"));
+        evs.push(msg_delta(r#"{"stop_reason":"end_turn"}"#));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        assert_eq!(r.content.len(), 2);
+        assert!(matches!(&r.content[0], ContentBlock::Unknown { .. }));
+        assert!(matches!(&r.content[1], ContentBlock::Text { text } if text == "after"));
+    }
+
+    #[test]
+    fn refusal_recommended_model_is_kept() {
+        let mut evs = vec![msg_start("claude-opus-4-8")];
+        evs.extend(text_block("x"));
+        evs.push(msg_delta(
+            r#"{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"e","recommended_model":"claude-sonnet-4-6"}}"#,
+        ));
+        evs.push(msg_stop());
+        let r = run_response(evs);
+        let d = r.stop.refusal.as_ref().expect("refusal detail");
+        assert_eq!(d.recommended_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn non_json_sse_error_event_is_a_stream_reply_carrying_the_raw_string() {
+        use crate::reply_error::ErrorOrigin;
+        let (_, r) = run_events(vec![
+            msg_start("claude-opus-4-8"),
+            sse("error", "upstream connection reset"),
+        ]);
+        match r {
+            Err(ProviderError::Reply(b)) => {
+                assert_eq!(b.origin, ErrorOrigin::Stream);
+                assert_eq!(
+                    b.raw,
+                    serde_json::Value::String("upstream connection reset".into())
+                );
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_rejects_a_malformed_usage_object() {
+        let json = r#"{
+            "id": "m", "model": "x", "content": [], "stop_reason": "end_turn",
+            "usage": "not an object"
+        }"#;
+        assert!(serde_json::from_str::<AnthropicResponse>(json).is_err());
+    }
+
+    fn unknown_only_assistant() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Unknown {
+                provider: Some("anthropic".into()),
+                raw: serde_json::json!({"type": "server_tool_use", "id": "srv_1"}),
+            }],
+        }
+    }
+
+    fn body_messages(messages: Vec<Message>) -> Vec<serde_json::Value> {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
+        let mut request = request_with_assistant_blocks(vec![]);
+        request.messages = messages;
+        client.build_request_body(&request, false)["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_dropped_first_message_leaves_the_rest() {
+        let msgs = body_messages(vec![unknown_only_assistant(), Message::user("q")]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_dropped_last_message_leaves_the_rest() {
+        let msgs = body_messages(vec![Message::user("q"), unknown_only_assistant()]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+    }
+
+    #[test]
+    fn same_role_neighbours_away_from_a_drop_are_not_merged() {
+        let msgs = body_messages(vec![
+            Message::user("a"),
+            Message::user("b"),
+            unknown_only_assistant(),
+            Message::user("c"),
+        ]);
+        assert_eq!(msgs.len(), 2, "got {msgs:?}");
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 1);
+        let second = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0]["text"], "b");
+        assert_eq!(second[1]["text"], "c");
+    }
+
+    #[test]
+    fn a_request_with_no_empty_message_is_unchanged_by_the_post_pass() {
+        let messages = vec![
+            Message::user("a"),
+            Message::user("b"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: "r".into() }],
+            },
+            Message::user("c"),
+        ];
+        let mut expected = sanitize_messages_tool_names(serde_json::to_value(&messages).unwrap());
+        restore_reasoning_blocks(&mut expected, PROVIDER_TAG);
+        let got = body_messages(messages);
+        assert_eq!(serde_json::Value::Array(got), expected);
+    }
+
+    /// A `tool_use` block that arrives without `input` is a zero-parameter
+    /// call, `{}`, as on the stream; never `null`.
+    #[test]
+    fn send_tool_use_without_input_is_an_empty_object() {
+        let blocks = parse_content_blocks(
+            vec![serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "list"})],
+            "claude-test",
+        );
+        match blocks.as_slice() {
+            [ContentBlock::ToolUse { id, name, input }] => {
+                assert_eq!((id.as_str(), name.as_str()), ("toolu_1", "list"));
+                assert_eq!(*input, serde_json::json!({}));
+            }
+            other => panic!("expected one tool call, got {other:?}"),
+        }
     }
 }

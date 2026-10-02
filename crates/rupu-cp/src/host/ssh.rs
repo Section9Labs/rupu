@@ -18,7 +18,7 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_stream_run_events, read_transcript_file, EventByteStream, FeedGuard,
+        mirror_stream_run_events, read_transcript_file, CoverageRead, EventByteStream, FeedGuard,
         HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
         RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
@@ -209,7 +209,10 @@ pub(crate) const RUN_START_EVIDENCE_NO: &str = "rupu_run_no_trace";
 /// detached launch wrapper (`detach_launch`) creates both itself, BEFORE the
 /// remote `rupu` runs — they exist just as much for a launch that died
 /// instantly, so keying on them would make the probe answer "started" for
-/// exactly the failure it must still catch.
+/// exactly the failure it must still catch. The run's `coverage.jsonl` is in
+/// the same class: `rupu run` writes its begin line before the provider
+/// pre-flight, so it survives a launch that died on missing credentials (the
+/// pump likewise does not count its `tail` header as a sign of life).
 ///
 /// The `pgrep` pattern is written `[-]-run-id` on purpose: the shell running
 /// this command has the pattern in its OWN `/proc/<pid>/cmdline`, and a
@@ -306,6 +309,11 @@ fn validate_staged_working_dir(dir: &str) -> Result<(), HostConnectorError> {
 /// `dashboard_summary`. Bounds a dead host to ~3s instead of stalling the
 /// dashboard fan-out — the SSH analogue of the HTTP connector's 5s/30s bound.
 pub(crate) const SHORT_CALL_CONNECT_TIMEOUT_SECS: u32 = 3;
+
+/// How long a streamed ssh artifact pull may go without receiving a byte
+/// before it is abandoned. A connected-but-silent host would otherwise hold
+/// the coordinator's shared pull (and everyone waiting on it) forever.
+pub(crate) const SSH_PULL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Connect timeout (seconds) for the launch-path pump's long-lived `tail -F`
 /// ssh (`RemoteExec::spawn_lines`, used only by `spawn_tail_pump`). That is a
@@ -608,6 +616,18 @@ pub(crate) enum RemoteExecError {
     Spawn(String),
     #[error("remote command exited with {code:?}: {stderr}")]
     NonZero { code: Option<i32>, stderr: String },
+    /// Only `run_to_file` raises this: the output outgrew its expected size.
+    #[error("remote output exceeded {0} bytes")]
+    TooLarge(u64),
+    /// Only `run_to_file` raises this: the host sent nothing for longer than
+    /// the idle bound, so the stream is abandoned. The message already names
+    /// the host and the bound.
+    #[error("{0}")]
+    Idle(String),
+    /// Only `run_to_file` raises this: writing the coordinator's own
+    /// destination file failed. Not the host's fault, so not `Spawn`.
+    #[error("local write failed: {0}")]
+    LocalIo(String),
 }
 
 /// A pinned, boxed stream of lines from a remote command.
@@ -647,6 +667,28 @@ pub(crate) trait RemoteExec: Send + Sync {
         remote_command: &str,
         stdin: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, RemoteExecError>;
+
+    /// Run `remote_command` and stream its stdout into `dest` (created or
+    /// truncated), failing with `TooLarge` once more than `max_bytes` arrive.
+    /// Returns the byte count. On any error `dest` may be left partially
+    /// written — the caller owns its cleanup. This default buffers through
+    /// `run_bytes` and exists for test doubles; `SshExec` overrides it with a
+    /// true stream.
+    async fn run_to_file(
+        &self,
+        remote_command: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, RemoteExecError> {
+        let bytes = self.run_bytes(remote_command, None).await?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(RemoteExecError::TooLarge(max_bytes));
+        }
+        tokio::fs::write(dest, &bytes)
+            .await
+            .map_err(|e| RemoteExecError::LocalIo(e.to_string()))?;
+        Ok(bytes.len() as u64)
+    }
 }
 
 // ── Internal stream wrapper ───────────────────────────────────────────────────
@@ -708,6 +750,115 @@ impl SshExec {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             success: out.status.success(),
         })
+    }
+
+    /// Run `cmd` and stream its stdout into `dest` (created or truncated) in
+    /// 64 KiB chunks — never buffering the whole output. Once MORE than
+    /// `max_bytes` have arrived the child is killed and `TooLarge` returned;
+    /// if no chunk arrives for `idle` — or, once the output ends, the child's
+    /// exit or its stderr takes longer than `idle` — the child is killed and
+    /// `Idle` returned (a connection that goes silent must not pin the
+    /// caller);
+    /// a nonzero exit is `NonZero` with the child's stderr. Failures writing
+    /// `dest` are `LocalIo`. On any error `dest` may be left partially
+    /// written — the caller owns its cleanup. `host` only labels the `Idle`
+    /// message.
+    async fn stream_to_file(
+        mut cmd: tokio::process::Command,
+        dest: &Path,
+        max_bytes: u64,
+        idle: std::time::Duration,
+        host: &str,
+    ) -> Result<u64, RemoteExecError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let io = |e: std::io::Error| RemoteExecError::Spawn(e.to_string());
+        let local = |e: std::io::Error| RemoteExecError::LocalIo(e.to_string());
+        // Create the destination before spawning: an unwritable `dest` must
+        // not cost the host an ssh connection.
+        let mut file = tokio::fs::File::create(dest).await.map_err(local)?;
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(io)?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RemoteExecError::Spawn("no stdout pipe".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RemoteExecError::Spawn("no stderr pipe".into()))?;
+        // Drain stderr concurrently so a chatty remote cannot fill the pipe
+        // and stall stdout.
+        let mut stderr_task = tokio::spawn(async move {
+            let mut s = Vec::new();
+            let _ = stderr.read_to_end(&mut s).await;
+            s
+        });
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            // An early `?` drops `child`, and `kill_on_drop` ends the process.
+            let n = match tokio::time::timeout(idle, stdout.read(&mut buf)).await {
+                Ok(read) => read.map_err(io)?,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    stderr_task.abort();
+                    return Err(RemoteExecError::Idle(format!(
+                        "no data from {host} for {idle:?}"
+                    )));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > max_bytes {
+                // Stop the transfer now. Killing the child closes its stderr,
+                // so the reader task ends on its own — abort it rather than
+                // await it.
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(RemoteExecError::TooLarge(max_bytes));
+            }
+            file.write_all(&buf[..n]).await.map_err(local)?;
+        }
+        file.flush().await.map_err(local)?;
+        // The output ended, but a remote that closed stdout and kept running —
+        // or a connection that died between EOF and the exit status — would
+        // hang `wait()` and the stderr join forever, pinning everyone sharing
+        // this pull. Bound both with the same idle timeout.
+        let unfinished = || {
+            RemoteExecError::Idle(format!(
+                "{host} did not finish within {idle:?} of ending its output"
+            ))
+        };
+        let status = match tokio::time::timeout(idle, child.wait()).await {
+            Ok(status) => status.map_err(io)?,
+            Err(_) => {
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(unfinished());
+            }
+        };
+        let stderr = match tokio::time::timeout(idle, &mut stderr_task).await {
+            Ok(joined) => joined.unwrap_or_default(),
+            Err(_) => {
+                let _ = child.start_kill();
+                stderr_task.abort();
+                return Err(unfinished());
+            }
+        };
+        if !status.success() {
+            return Err(RemoteExecError::NonZero {
+                code: status.code(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            });
+        }
+        Ok(total)
     }
 }
 
@@ -808,6 +959,24 @@ impl RemoteExec for SshExec {
         }
         Ok(out.stdout)
     }
+
+    async fn run_to_file(
+        &self,
+        remote_command: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, RemoteExecError> {
+        let argv = ssh_argv(
+            &self.host,
+            self.port,
+            self.identity_file.as_deref(),
+            remote_command,
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
+        );
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv);
+        Self::stream_to_file(cmd, dest, max_bytes, SSH_PULL_IDLE_TIMEOUT, &self.host).await
+    }
 }
 
 // ── Tail pump helpers ─────────────────────────────────────────────────────────
@@ -892,10 +1061,71 @@ async fn pump_catch_up_transcript(
     }
 }
 
-/// One-shot terminal usage-ledger pull for the tail pump: `cat` the remote
-/// `usage.jsonl` and atomically REPLACE the mirrored ledger with it.
+/// Section label (and file name) of the usage ledger in [`ledger_pull_command`].
+const LEDGER_USAGE: &str = "usage.jsonl";
+/// Section label (and file name) of the coverage stream in [`ledger_pull_command`].
+const LEDGER_COVERAGE: &str = "coverage.jsonl";
+/// How every [`ledger_pull_command`] starts (tests route on it).
+const LEDGER_PULL_PREFIX: &str = "for f in usage.jsonl coverage.jsonl;";
+
+/// The pump's terminal ledger pull: the run's `usage.jsonl` AND
+/// `coverage.jsonl` in ONE ssh invocation, framed like [`batch_cat_command`]
+/// (`==> <label> <==`, body, synthetic newline) but with `cat`'s exit status
+/// in each trailer (`==> end <status> <==`), so [`split_ledger_pull`] can
+/// tell a whole file from one whose read failed part-way. The labels are the
+/// bare file names: the paths need `$HOME` expanded remotely, so they cannot
+/// go through `shell_escape`, and the label is all the split needs. Callers
+/// guarantee [`is_safe_run_id`].
+fn ledger_pull_command(run_id: &str) -> String {
+    format!(
+        "{LEDGER_PULL_PREFIX} do printf '==> %s <==\\n' \"$f\"; cat \"{}/$f\" 2>/dev/null; \
+         printf '\\n==> end %s <==\\n' \"$?\"; done",
+        remote_run_dir(run_id)
+    )
+}
+
+/// Inverse of [`ledger_pull_command`]: `label → body` for every file whose
+/// trailer arrived carrying exit status `0`. A file whose `cat` failed (an
+/// absent file, or a read error mid-file that leaves a truncated body), a
+/// trailer with no status, or a section cut off before its trailer is
+/// absent from the map: it did not arrive.
+fn split_ledger_pull(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.split('\n') {
+        match parse_tail_marker(line) {
+            Some(marker) if marker == "end" || marker.starts_with("end ") => {
+                let status = marker.strip_prefix("end").map(str::trim);
+                if let Some((label, mut lines)) = current.take() {
+                    if status == Some("0") {
+                        // Drop the ONE synthetic empty line the command appended.
+                        if lines.last() == Some(&"") {
+                            lines.pop();
+                        }
+                        let mut body = lines.join("\n");
+                        if !body.is_empty() {
+                            body.push('\n');
+                        }
+                        out.insert(label, body);
+                    }
+                }
+            }
+            Some(label) => current = Some((label.to_string(), Vec::new())),
+            None => {
+                if let Some((_, lines)) = current.as_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One-shot terminal pull of the run's two ledgers for the tail pump, in a
+/// single ssh round trip ([`ledger_pull_command`]), each atomically REPLACING
+/// its mirrored copy.
 ///
-/// The tailed copy is only as fresh as the last poll interval
+/// **Usage.** The tailed copy is only as fresh as the last poll interval
 /// ([`PUMP_POLL_INTERVAL`]) — rows the run wrote just before its terminal
 /// `run.json` can still be sitting in the tail stream, or never have reached
 /// it. Left alone that is a silent undercount (the usage fold's transcript
@@ -905,13 +1135,28 @@ async fn pump_catch_up_transcript(
 /// rows by their ULID `id`, so rows the tail already delivered are not
 /// counted twice.
 ///
-/// A failed `cat`, an empty answer (no ledger — an older host, or a run that
-/// never billed anything) or an unsafe `run_id` leaves the mirror as-is.
-async fn pump_catch_up_usage_ledger(
+/// **Coverage.** Same reason: the tail can still be behind, and the last
+/// lines are often the unit's final findings. When `run_terminal` (the host's
+/// own `run.json` said terminal before this pull, so `rupu run` had finished
+/// writing its stream) the replace is marked complete — the signal
+/// [`HostConnector::unit_coverage`] reports, and the only one: a copy without
+/// it makes the coordinator warn that findings may be missing rather than
+/// merge a short stream silently. Riding the usage pull costs no ssh
+/// connection of its own (a fan-out finishing together already adds one per
+/// unit, and ssh hosts may throttle connection bursts), and it runs BEFORE
+/// the transcript catch-up, whose `cat` of a large transcript can outlast
+/// [`PUMP_FINALIZE_TIMEOUT`].
+///
+/// A section that did not arrive whole (the pull failed or was cut off, or
+/// the host's `cat` failed — an absent file, or a read error part-way), or
+/// that is empty, leaves that mirrored copy as the tail built it, unmarked.
+/// An unsafe `run_id` pulls nothing.
+async fn pump_catch_up_ledgers(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
     run_id: &str,
     host_id: &str,
+    run_terminal: bool,
 ) {
     // `$HOME` must expand remotely, so the path is interpolated unquoted —
     // `run_id` therefore has to be shell-safe (the pump's other commands rely
@@ -919,10 +1164,38 @@ async fn pump_catch_up_usage_ledger(
     if !is_safe_run_id(run_id) {
         return;
     }
-    let cmd = format!("cat {}/usage.jsonl", remote_run_dir(run_id));
-    if let Ok(out) = exec.run(&cmd).await {
-        if out.success && !out.stdout.is_empty() {
-            let _ = mirror.replace_usage_ledger(run_id, host_id, &out.stdout);
+    let out = match exec.run(&ledger_pull_command(run_id)).await {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(host_id, run_id, error = %e, "terminal ledger pull failed");
+            return;
+        }
+    };
+    if !out.success {
+        // The loop's own commands cannot fail it, so this is the transport
+        // (a throttled or dropped connection): whatever arrived whole below
+        // still counts, the rest stays as the tail delivered it.
+        tracing::warn!(
+            host_id,
+            run_id,
+            stderr = %out.stderr.trim(),
+            "terminal ledger pull failed; mirrored ledgers it did not deliver stay as tailed"
+        );
+    }
+    // A section is whole only when its trailer arrived with `cat`'s exit
+    // status 0, whatever the ssh exit status says about the rest.
+    let sections = split_ledger_pull(&out.stdout);
+    if let Some(usage) = sections.get(LEDGER_USAGE).filter(|b| !b.is_empty()) {
+        let _ = mirror.replace_usage_ledger(run_id, host_id, usage);
+    }
+    // No coverage section (or an empty one) is ordinary for a workflow run,
+    // which writes no stream; for a unit, the read reports it not complete.
+    if let Some(coverage) = sections.get(LEDGER_COVERAGE).filter(|b| !b.is_empty()) {
+        if let Err(e) = mirror
+            .replace_coverage(run_id, host_id, coverage, run_terminal)
+            .await
+        {
+            tracing::warn!(host_id, run_id, error = %e, "terminal coverage replace failed");
         }
     }
 }
@@ -1104,8 +1377,9 @@ async fn pump_finalize_if_terminal(
     // mirrored: the usage fold seals a terminal run on what it reads, so a
     // reader must never see "terminal" next to the tailed (possibly short)
     // ledger. The replace only needs the run to exist with this worker id,
-    // which `create_run` already guaranteed.
-    pump_catch_up_usage_ledger(exec, mirror, run_id, host_id).await;
+    // which `create_run` already guaranteed. The same round trip brings the
+    // complete coverage stream, ahead of the (possibly slow) transcript work.
+    pump_catch_up_ledgers(exec, mirror, run_id, host_id, true).await;
     let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
     // Before `finish`, so the synthesized step-result row sees the complete
     // transcript on disk.
@@ -1118,12 +1392,22 @@ async fn pump_finalize_if_terminal(
 /// Map a [`RemoteExecError`] from `run_bytes` to the corresponding
 /// [`HostConnectorError`]: a spawn/connection failure (ssh binary missing,
 /// no route to host, etc.) is `Unreachable`; a nonzero exit from the remote
-/// `rupu __workspace` helper is `Remote(code, stderr)`.
+/// `rupu __workspace` helper is `Remote(code, stderr)`; for a streamed
+/// `run_to_file` pull, one that outgrew its expected size or failed writing
+/// the coordinator's own file is `Invalid`, and one that went silent is
+/// `Unreachable`.
 fn map_remote_err(e: RemoteExecError) -> HostConnectorError {
     match e {
         RemoteExecError::Spawn(m) => HostConnectorError::Unreachable(m),
         RemoteExecError::NonZero { code, stderr } => {
             HostConnectorError::Remote(code.unwrap_or(-1) as u16, stderr)
+        }
+        RemoteExecError::TooLarge(n) => {
+            HostConnectorError::Invalid(format!("remote output exceeded its expected {n} bytes"))
+        }
+        RemoteExecError::Idle(m) => HostConnectorError::Unreachable(m),
+        RemoteExecError::LocalIo(m) => {
+            HostConnectorError::Invalid(format!("local write failed: {m}"))
         }
     }
 }
@@ -1571,6 +1855,22 @@ impl SshHostConnector {
     /// (or unreadable), the run is finished as `"failed"` so it is never stuck
     /// in `Running` indefinitely.
     fn spawn_tail_pump(&self, run_id: String) {
+        // Every remote command below interpolates `run_id` UNQUOTED (so `$HOME`
+        // expands remotely): the id must be shell-safe, whatever the caller
+        // did. The launch paths mint or validate theirs; this is the single
+        // check that covers all of the pump's commands (tail, run.json cat,
+        // transcript cat, usage and coverage catch-ups) should one ever not.
+        // Nothing is spawned for an unsafe id; the mirror run (if one exists)
+        // is finished as failed so it is not left `Running` with no pump.
+        if !is_safe_run_id(&run_id) {
+            tracing::error!(
+                run_id = %run_id,
+                host_id = %self.host_id,
+                "refusing to spawn a tail pump for an unsafe run id"
+            );
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            return;
+        }
         let exec = Arc::clone(&self.exec);
         let mirror = Arc::clone(&self.mirror);
         // The pump's terminal pull needs to know which cache files a viewer is
@@ -1583,8 +1883,9 @@ impl SshHostConnector {
         // rather than through build_remote_command / shell_escape. Single-quoting
         // every token (as build_remote_command does) would prevent $HOME from
         // expanding, producing a literal path that never exists on the remote.
-        // run_id contains only [A-Za-z0-9_] (ULID prefix), so unquoted
-        // concatenation is safe. That invariant covers ALL FIVE tailed paths
+        // run_id contains only [A-Za-z0-9_] (checked at the top of this
+        // function), so unquoted concatenation is safe. That invariant covers
+        // ALL SIX tailed paths
         // and both cat commands below: run_id is their only variable component.
         //
         // The last path is the run's agent transcript, which lives OUTSIDE
@@ -1600,6 +1901,7 @@ impl SshHostConnector {
              $HOME/.rupu/runs/{run_id}/step_results.jsonl \
              $HOME/.rupu/runs/{run_id}/unit_checkpoints.jsonl \
              $HOME/.rupu/runs/{run_id}/usage.jsonl \
+             $HOME/.rupu/runs/{run_id}/coverage.jsonl \
              $HOME/.rupu/transcripts/{run_id}.jsonl"
         );
         let cat_cmd = format!("cat $HOME/.rupu/runs/{run_id}/run.json");
@@ -1609,7 +1911,7 @@ impl SshHostConnector {
         // impossible: none of the `runs/<run_id>/*.jsonl` artifacts can end
         // with `transcripts/<run_id>.jsonl`, and the transcript can't end
         // with `events.jsonl` / `step_results.jsonl` / `unit_checkpoints.jsonl` /
-        // `usage.jsonl`.
+        // `usage.jsonl` / `coverage.jsonl`.
         let transcript_suffix = format!("transcripts/{run_id}.jsonl");
 
         // Register the dispatcher-facing handle BEFORE spawning, so a caller
@@ -1639,10 +1941,12 @@ impl SshHostConnector {
                 // and calls mirror.finish.  Used below to skip the fallback cat.
                 let mut terminal_seen = false;
                 // Set to true the first time the host shows ANY sign that this
-                // run exists: a `==>` header from `tail` (the file is there) or
-                // a readable `run.json`. Until then the pump is bounded by
-                // PUMP_STARTUP_DEADLINE — see that constant for why a pump with
-                // no such bound spins forever on a launch that died.
+                // run exists: a `==>` header from `tail` (the file is there) —
+                // except the coverage stream's, which a launch that died before
+                // doing anything else already leaves behind — or a readable
+                // `run.json`, or an `Alive` probe. Until then the pump is
+                // bounded by PUMP_STARTUP_DEADLINE — see that constant for why
+                // a pump with no such bound spins forever on a launch that died.
                 let mut run_seen_on_host = false;
                 let pump_started = tokio::time::Instant::now();
                 // Set once the transcript's first `==>` header is seen. `tail -n +1`
@@ -1667,7 +1971,20 @@ impl SshHostConnector {
                                             // so the run exists on the host. (stderr
                                             // is /dev/null, so an unopenable path
                                             // produces no line at all.)
-                                            run_seen_on_host = true;
+                                            //
+                                            // EXCEPT the coverage stream: `rupu run`
+                                            // writes its begin line before the provider
+                                            // pre-flight and credential resolution, so a
+                                            // launch that died right there leaves a
+                                            // `coverage.jsonl` and nothing else. Its
+                                            // header is not a sign of life (same reason
+                                            // the run dir and `launch.log` are not
+                                            // start evidence), or the startup deadline
+                                            // would never fire for it. Its lines are
+                                            // still mirrored below.
+                                            if !path.ends_with("coverage.jsonl") {
+                                                run_seen_on_host = true;
+                                            }
                                             // Route subsequent lines based on filename
                                             // suffix — the expanded absolute path from
                                             // `tail` still ends with the same basename.
@@ -1689,8 +2006,10 @@ impl SshHostConnector {
                                                 // `id`. The one rewrite is the terminal
                                                 // pull, which REPLACES the whole file
                                                 // with the remote's (see
-                                                // `pump_catch_up_usage_ledger`).
+                                                // `pump_catch_up_ledgers`).
                                                 Some(ArtifactFile::Usage)
+                                            } else if path.ends_with("coverage.jsonl") {
+                                                Some(ArtifactFile::Coverage)
                                             } else if path.ends_with(&transcript_suffix) {
                                                 if !transcript_replayed {
                                                     transcript_replayed = true;
@@ -1844,28 +2163,38 @@ impl SshHostConnector {
                     // persist as final since the executor may still be alive.
                     // Finish as "failed" in that case — and when the cat fails
                     // outright — so the run is never stuck in Running.
-                    let run_json = exec.run(&cat_cmd).await;
+                    let record = match exec.run(&cat_cmd).await {
+                        Ok(out) if out.success && !out.stdout.trim().is_empty() => {
+                            Some(out.stdout.trim().to_string())
+                        }
+                        _ => None,
+                    };
+                    let terminal_status = record
+                        .as_deref()
+                        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+                        .and_then(|rec| {
+                            rec.get("status")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .filter(|s| is_terminal_status(s));
                     // Same authoritative ledger pull as the terminal arm: rows
                     // still buffered in the dead stream are gone, so replace the
-                    // mirrored ledger with the remote's while we can reach it.
-                    pump_catch_up_usage_ledger(exec.as_ref(), &mirror, &run_id, &host_id).await;
-                    let finish_status = match run_json {
-                        Ok(out) if out.success && !out.stdout.trim().is_empty() => {
-                            let trimmed = out.stdout.trim().to_string();
-                            let _ =
-                                mirror.append(&run_id, &host_id, ArtifactFile::RunJson, &trimmed);
-                            serde_json::from_str::<serde_json::Value>(&trimmed)
-                                .ok()
-                                .and_then(|rec| {
-                                    rec.get("status")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_string)
-                                })
-                                .filter(|s| is_terminal_status(s))
-                                .unwrap_or_else(|| "failed".to_string())
-                        }
-                        _ => "failed".to_string(),
-                    };
+                    // mirrored ledgers with the remote's while we can reach it.
+                    // The coverage copy is complete only when the host's record
+                    // is terminal; otherwise the run may still be writing it.
+                    pump_catch_up_ledgers(
+                        exec.as_ref(),
+                        &mirror,
+                        &run_id,
+                        &host_id,
+                        terminal_status.is_some(),
+                    )
+                    .await;
+                    if let Some(trimmed) = &record {
+                        let _ = mirror.append(&run_id, &host_id, ArtifactFile::RunJson, trimmed);
+                    }
+                    let finish_status = terminal_status.unwrap_or_else(|| "failed".to_string());
                     // Same terminal transcript catch-up as the interval arm above:
                     // the stream ended without a clean terminal detection, so any
                     // buffered-but-undelivered transcript lines are gone. Replace
@@ -2168,9 +2497,7 @@ impl HostConnector for SshHostConnector {
         // behind). `None` ⇒ this connector mints one, as before.
         let run_id = match req.run_id.as_deref() {
             Some(id) => {
-                let ok = id.starts_with("run_")
-                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                if !ok {
+                if !crate::host::connector::valid_run_id(id) {
                     return Err(HostConnectorError::Invalid(format!(
                         "supplied run id {id:?} is not a valid run id"
                     )));
@@ -2584,6 +2911,51 @@ impl HostConnector for SshHostConnector {
     async fn delete_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         self.remote_workflow(&["delete-run", run_id, "--force"])
             .await
+    }
+
+    /// The mirrored stream, complete only when the pump's terminal pull
+    /// replaced it with the host's file after the run was terminal (see
+    /// [`pump_catch_up_ledgers`]). Otherwise it is what the tail delivered,
+    /// which can miss the last lines.
+    async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError> {
+        // The mark BEFORE the bytes: it is written only after the
+        // authoritative replace landed, so bytes read after seeing it are that
+        // copy. Read the other way round, a replace landing in between would
+        // pair the tailed bytes with "complete".
+        let complete = self.mirror.coverage_complete(run_id);
+        let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
+        Ok(CoverageRead { bytes, complete })
+    }
+
+    async fn pull_finding_artifact(
+        &self,
+        sha256: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<(), HostConnectorError> {
+        crate::host::connector::validate_sha256(sha256)?;
+        // One invocation per pull (no connection bursts at the host). An
+        // older remote rupu has no `__findings` and fails with clap's
+        // unknown-subcommand error, which becomes an actionable Unsupported
+        // rather than clap's raw text as the unavailable reason.
+        let cmd = build_remote_command(&[
+            "rupu".into(),
+            "__findings".into(),
+            "artifact".into(),
+            sha256.to_string(),
+        ]);
+        match self.exec.run_to_file(&cmd, dest, max_bytes).await {
+            Ok(_) => Ok(()),
+            Err(RemoteExecError::NonZero { stderr, .. })
+                if stderr.contains("unrecognized subcommand '__findings'") =>
+            {
+                Err(HostConnectorError::Unsupported(format!(
+                    "host {} runs a rupu without artifact pulls; upgrade rupu there",
+                    self.host_id
+                )))
+            }
+            Err(e) => Err(map_remote_err(e)),
+        }
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
@@ -3403,10 +3775,20 @@ mod tests {
         /// If set, the transcript `cat` sleeps this long before answering —
         /// a slow remote, so a teardown test can catch the pump mid-`cat`.
         cat_transcript_delay: Option<std::time::Duration>,
-        /// If set, returned as stdout for the pump's terminal
-        /// `cat …/runs/<id>/usage.jsonl` (the authoritative ledger pull).
-        /// `None` → empty stdout, which the pump treats as "no ledger".
+        /// The `usage.jsonl` section of the pump's terminal ledger pull
+        /// ([`ledger_pull_command`]). `None` → an empty section, which the
+        /// pump treats as "no ledger".
         cat_usage_stdout: Option<String>,
+        /// The `coverage.jsonl` section of the same pull. `None` → an empty
+        /// section: the file is absent (an older host with no coverage
+        /// stream) or empty.
+        cat_coverage_stdout: Option<String>,
+        /// When set, the ledger pull fails in the ssh transport (no stdout,
+        /// exit 255) — a throttled or dropped connection.
+        ledger_pull_fails: bool,
+        /// The exit status each section's `cat` reports in its trailer
+        /// (`usage`, `coverage`); nonzero is a host-side read error mid-file.
+        ledger_cat_status: (i32, i32),
         /// If set, returned as stdout for the pump's batched terminal pull
         /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
         batch_cat_stdout: Option<String>,
@@ -3425,6 +3807,8 @@ mod tests {
         run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
         /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
         last_bytes_call: std::sync::Mutex<Option<(String, Option<Vec<u8>>)>>,
+        /// How many times `run_bytes` was invoked.
+        bytes_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeExec {
@@ -3438,12 +3822,16 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
+                ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3457,12 +3845,16 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
+                ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3478,12 +3870,16 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
+                ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3499,12 +3895,16 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
+                ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
 
@@ -3519,12 +3919,16 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
+                ledger_pull_fails: false,
+                ledger_cat_status: (0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
                 last_bytes_call: Default::default(),
+                bytes_calls: Default::default(),
             }
         }
     }
@@ -3539,6 +3943,39 @@ mod tests {
                     stderr: self.fail_stderr.clone(),
                     success: false,
                 })
+            } else if remote.starts_with(LEDGER_PULL_PREFIX) {
+                // The pump's terminal ledger pull: both sections, framed
+                // exactly as the real loop frames them.
+                if self.ledger_pull_fails {
+                    return Ok(RemoteOutput {
+                        stdout: String::new(),
+                        stderr: "kex_exchange_identification: read: Connection reset by peer"
+                            .into(),
+                        success: false,
+                    });
+                }
+                let mut stdout = String::new();
+                for (label, body, status) in [
+                    (
+                        LEDGER_USAGE,
+                        &self.cat_usage_stdout,
+                        self.ledger_cat_status.0,
+                    ),
+                    (
+                        LEDGER_COVERAGE,
+                        &self.cat_coverage_stdout,
+                        self.ledger_cat_status.1,
+                    ),
+                ] {
+                    stdout.push_str(&format!("==> {label} <==\n"));
+                    stdout.push_str(body.as_deref().unwrap_or(""));
+                    stdout.push_str(&format!("\n==> end {status} <==\n"));
+                }
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
             } else {
                 // Return the canned stdout for the two `cat` shapes the pump
                 // issues: `cat …/transcripts/<id>.jsonl` (terminal transcript
@@ -3552,8 +3989,6 @@ mod tests {
                 } else if remote.starts_with("cat ") {
                     if remote.contains("/launch.log") {
                         self.launch_log_stdout.clone().unwrap_or_default()
-                    } else if remote.contains("/usage.jsonl") {
-                        self.cat_usage_stdout.clone().unwrap_or_default()
                     } else if remote.contains("/transcripts/") {
                         if let Some(d) = self.cat_transcript_delay {
                             tokio::time::sleep(d).await;
@@ -3590,6 +4025,8 @@ mod tests {
             remote_command: &str,
             stdin: Option<Vec<u8>>,
         ) -> Result<Vec<u8>, RemoteExecError> {
+            self.bytes_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_bytes_call.lock().unwrap() = Some((remote_command.to_string(), stdin));
             self.run_bytes_out
                 .lock()
@@ -3597,6 +4034,355 @@ mod tests {
                 .take()
                 .expect("run_bytes_out not scripted")
         }
+    }
+
+    #[tokio::test]
+    async fn default_run_to_file_writes_and_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let fake = FakeExec::with_bytes_ok(b"0123456789".to_vec());
+        assert_eq!(fake.run_to_file("cmd", &dest, 10).await.unwrap(), 10);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+        let fake = FakeExec::with_bytes_ok(b"0123456789".to_vec());
+        assert!(matches!(
+            fake.run_to_file("cmd", &dest, 9).await,
+            Err(RemoteExecError::TooLarge(9))
+        ));
+    }
+
+    /// A `/bin/sh -c <script>` command, standing in for the `ssh` child.
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_streams_exactly_up_to_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        // 200_000 bytes spans several 64 KiB reads.
+        let n = SshExec::stream_to_file(
+            sh("head -c 200000 /dev/zero"),
+            &dest,
+            200_000,
+            SSH_PULL_IDLE_TIMEOUT,
+            "h",
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 200_000);
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 200_000);
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_kills_the_child_once_the_cap_is_exceeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // `yes` never ends on its own: only the kill can stop it. `exec` keeps
+        // the recorded pid the child's pid.
+        let script = format!("echo $$ > {}; exec yes", pid_file.display());
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(sh(&script), &dest, 1000, SSH_PULL_IDLE_TIMEOUT, "h"),
+        )
+        .await
+        .expect("an over-cap stream must stop promptly, not run to completion");
+        assert!(
+            matches!(res, Err(RemoteExecError::TooLarge(1000))),
+            "{res:?}"
+        );
+        // Only in-cap chunks reach the file; the over-cap chunk is dropped.
+        assert!(std::fs::metadata(&dest).unwrap().len() <= 1000);
+        // ...and the child really is gone, not merely abandoned.
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the over-cap child (pid {pid}) was not killed");
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_reports_a_nonzero_exit_with_its_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let res = SshExec::stream_to_file(
+            sh("echo boom >&2; exit 3"),
+            &dest,
+            1000,
+            SSH_PULL_IDLE_TIMEOUT,
+            "h",
+        )
+        .await;
+        match res {
+            Err(RemoteExecError::NonZero { code, stderr }) => {
+                assert_eq!(code, Some(3));
+                assert!(stderr.contains("boom"), "{stderr}");
+            }
+            other => panic!("expected NonZero, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_fails_before_spawning_when_dest_is_unwritable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("no-such-dir").join("blob");
+        // The command would leave a marker if it ever ran.
+        let marker = tmp.path().join("ran");
+        let script = format!("touch {}", marker.display());
+        let res =
+            SshExec::stream_to_file(sh(&script), &dest, 1000, SSH_PULL_IDLE_TIMEOUT, "h").await;
+        // The failure is on the coordinator's side, not the host's.
+        assert!(matches!(res, Err(RemoteExecError::LocalIo(_))), "{res:?}");
+        assert!(!marker.exists(), "no child may be spawned for a bad dest");
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_kills_a_silent_child_after_the_idle_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // Writes a little, then goes silent far longer than the injected
+        // bound. `exec` keeps the recorded pid the sleeper's pid.
+        let script = format!(
+            "echo $$ > {}; printf abc; exec sleep 60",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(
+                sh(&script),
+                &dest,
+                1000,
+                std::time::Duration::from_millis(1000),
+                "slow-host",
+            ),
+        )
+        .await
+        .expect("a silent stream must hit the idle bound, not wait for the child");
+        match res {
+            Err(RemoteExecError::Idle(m)) => {
+                assert!(m.contains("no data from slow-host for"), "{m}")
+            }
+            other => panic!("expected Idle, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        // The bytes that did arrive were written before the stall.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        // ...and the silent child is killed, not abandoned.
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the silent child (pid {pid}) was not killed");
+    }
+
+    #[tokio::test]
+    async fn stream_to_file_bounds_the_exit_wait_after_stdout_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("blob");
+        let pid_file = tmp.path().join("pid");
+        // Sends a little, closes its stdout (the reader sees a clean EOF),
+        // then lives on far longer than the injected bound.
+        let script = format!(
+            "echo $$ > {}; printf abc; exec 1>&-; exec sleep 60",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            SshExec::stream_to_file(
+                sh(&script),
+                &dest,
+                1000,
+                std::time::Duration::from_millis(1000),
+                "lingering-host",
+            ),
+        )
+        .await
+        .expect("a lingering child must hit the bound, not be waited on");
+        match res {
+            Err(RemoteExecError::Idle(m)) => {
+                assert!(m.contains("lingering-host did not finish within"), "{m}")
+            }
+            other => panic!("expected Idle, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut alive = true;
+        for _ in 0..100 {
+            let st = tokio::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !st.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the lingering child (pid {pid}) was not killed");
+    }
+
+    #[test]
+    fn map_remote_err_maps_every_run_to_file_failure() {
+        assert!(matches!(
+            map_remote_err(RemoteExecError::TooLarge(7)),
+            HostConnectorError::Invalid(m) if m.contains('7')
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::LocalIo("disk full".into())),
+            HostConnectorError::Invalid(m) if m == "local write failed: disk full"
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::Idle("no data from h for 60s".into())),
+            HostConnectorError::Unreachable(m) if m == "no data from h for 60s"
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::Spawn("no route".into())),
+            HostConnectorError::Unreachable(_)
+        ));
+        assert!(matches!(
+            map_remote_err(RemoteExecError::NonZero {
+                code: Some(2),
+                stderr: "x".into()
+            }),
+            HostConnectorError::Remote(2, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_run_to_file_reports_a_local_write_failure_as_local_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("no-such-dir").join("blob");
+        let fake = FakeExec::with_bytes_ok(b"abc".to_vec());
+        let res = fake.run_to_file("cmd", &dest, 10).await;
+        assert!(matches!(res, Err(RemoteExecError::LocalIo(_))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_runs_the_hidden_helper_once() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"blob".to_vec()));
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let dest = tmp.path().join("pulled");
+        let sha = "ab".repeat(32);
+        conn.pull_finding_artifact(&sha, &dest, 4).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"blob");
+        let (cmd, _stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, format!("'rupu' '__findings' 'artifact' '{sha}'"));
+        // Exactly one exec call for the pull: no probe, no retry, no second
+        // channel (never burst connections at a host).
+        let exec_calls = |f: &FakeExec| {
+            f.bytes_calls.load(std::sync::atomic::Ordering::SeqCst)
+                + f.commands.lock().unwrap().len()
+        };
+        assert_eq!(exec_calls(&fake), 1);
+        // A refused digest adds none.
+        assert!(conn.pull_finding_artifact("nope", &dest, 4).await.is_err());
+        assert_eq!(exec_calls(&fake), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_refuses_a_bad_sha_before_any_ssh() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"blob".to_vec()));
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let dest = tmp.path().join("pulled");
+        for bad in ["", "../etc/passwd", "AB", &"AB".repeat(32)] {
+            let err = conn.pull_finding_artifact(bad, &dest, 4).await.unwrap_err();
+            assert!(
+                matches!(err, HostConnectorError::Invalid(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+        assert!(
+            fake.last_bytes_call.lock().unwrap().is_none(),
+            "a malformed digest must not cost the host an ssh invocation"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_maps_remote_failures() {
+        let sha = "ab".repeat(32);
+        // An older rupu without `__findings` fails with clap's error (this is
+        // clap 4's wording, tip included): an actionable Unsupported naming
+        // the host, not the raw clap text.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(2),
+            stderr: "error: unrecognized subcommand '__findings'\n\n  tip: a similar \
+                     subcommand exists: 'findings'\n\nUsage: rupu [OPTIONS] <COMMAND>\n\n\
+                     For more information, try '--help'.\n"
+                .into(),
+        }));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m == "host host_abc runs a rupu without artifact pulls; upgrade rupu there"),
+            "{err:?}"
+        );
+        // The helper's own refusal (the blob is not in that host's store)
+        // keeps its reason.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(1),
+            stderr: format!("error: artifact {sha} is not in this host's store"),
+        }));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Remote(1, m) if m.contains("not in this host's store")),
+            "{err:?}"
+        );
+        // More bytes than recorded: refused as Invalid.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"too many".to_vec()));
+        let (conn, _store, tmp) = make_conn(fake);
+        let err = conn
+            .pull_finding_artifact(&sha, &tmp.path().join("p"), 3)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
     }
 
     fn make_conn<E: RemoteExec + 'static>(
@@ -6006,6 +6792,301 @@ mod tests {
         );
     }
 
+    /// The pump tails the run's coverage stream and, at terminal, replaces the
+    /// tailed copy with the host's file: the tail can still be behind when the
+    /// run turns terminal, the host's file is complete by then.
+    #[test]
+    fn tail_pump_mirrors_the_coverage_stream_and_replaces_it_at_terminal() {
+        let run_id = "run_01COVPUMP";
+        let mut fake = FakeExec::with_cat_stdout(
+            vec![
+                format!("==> $HOME/.rupu/runs/{run_id}/coverage.jsonl <=="),
+                r#"{"ledger":"begin","v":1,"run_id":"run_01COVPUMP"}"#.to_string(),
+            ],
+            r#"{"status":"completed","final_output":"done."}"#,
+        );
+        fake.cat_coverage_stdout = Some(
+            "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPUMP\"}\n{\"late\":true}\n"
+                .to_string(),
+        );
+        let fake = std::sync::Arc::new(fake);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "sec".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some(run_id.into()),
+                findings_profile: None,
+                codename: None,
+            })
+            .await
+            .unwrap();
+            conn.await_run_mirror(run_id).await;
+            let read = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(
+                String::from_utf8(read.bytes).unwrap(),
+                "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPUMP\"}\n{\"late\":true}\n",
+                "terminal catch-up must replace the tailed copy with the host's file"
+            );
+            assert!(
+                read.complete,
+                "the authoritative replace landed, so the read is complete"
+            );
+        });
+        let cmds = fake.commands.lock().unwrap();
+        assert!(cmds.iter().any(|c| c.starts_with("tail ")
+            && c.contains(&format!("$HOME/.rupu/runs/{run_id}/coverage.jsonl"))));
+        // The stream rides the usage ledger's terminal round trip: no ssh
+        // invocation of its own, and it lands BEFORE the transcript catch-up,
+        // whose `cat` of a large transcript can outlast `await_run_mirror`.
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.starts_with("cat ") && c.contains("/coverage.jsonl")),
+            "no separate coverage cat: {cmds:?}"
+        );
+        let pull = cmds
+            .iter()
+            .position(|c| c == &ledger_pull_command(run_id))
+            .expect("the terminal ledger pull ran");
+        let transcript = cmds
+            .iter()
+            .position(|c| c.starts_with("cat ") && c.contains("/transcripts/"))
+            .expect("the transcript catch-up ran");
+        assert!(pull < transcript, "{cmds:?}");
+    }
+
+    /// The pull arrives, but `cat` failed reading both files part-way (a
+    /// host-side read error): the framed sections are truncated, so neither
+    /// is used — the usage ledger is not replaced, and the coverage copy is
+    /// not replaced or marked complete even though the run is terminal.
+    #[test]
+    fn a_ledger_section_whose_cat_failed_is_not_used() {
+        let run_id = "run_01COVCATFAIL";
+        let tailed = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVCATFAIL\"}\n";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_coverage_stdout = Some(format!("{tailed}{{\"trunc"));
+        fake.cat_usage_stdout = Some(format!("{USAGE_ROW_1}\n"));
+        fake.ledger_cat_status = (1, 1);
+        let fake = std::sync::Arc::new(fake);
+        let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .unwrap();
+        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+        conn.mirror
+            .append(run_id, &conn.host_id, ArtifactFile::Usage, USAGE_ROW_LATE)
+            .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.spawn_tail_pump(run_id.to_string());
+            conn.await_run_mirror(run_id).await;
+            let read = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(String::from_utf8(read.bytes).unwrap(), tailed);
+            assert!(!read.complete, "a cat that failed mid-file is not complete");
+        });
+        assert_eq!(
+            std::fs::read_to_string(store.usage_ledger_path(run_id)).unwrap(),
+            format!("{USAGE_ROW_LATE}\n"),
+            "a usage section whose cat failed must not replace the ledger"
+        );
+    }
+
+    /// The terminal pull fails in the ssh transport (throttled or dropped
+    /// connection): the mirror keeps what the tail delivered, and the read
+    /// says it is NOT known complete, so the coordinator warns instead of
+    /// silently merging a short copy.
+    ///
+    /// The "tailed copy" is seeded before the pump is spawned (as in
+    /// `coverage_catch_up_never_truncates_the_tailed_copy_with_an_empty_cat`),
+    /// so the result does not depend on the pump's unbiased `select!`.
+    #[test]
+    fn a_failed_terminal_ledger_pull_leaves_the_coverage_read_partial() {
+        let run_id = "run_01COVPULLFAIL";
+        let tailed = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPULLFAIL\"}\n";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_coverage_stdout = Some(format!("{tailed}{{\"late\":true}}\n"));
+        fake.ledger_pull_fails = true;
+        let fake = std::sync::Arc::new(fake);
+        let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .unwrap();
+        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.spawn_tail_pump(run_id.to_string());
+            conn.await_run_mirror(run_id).await;
+            let read = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(String::from_utf8(read.bytes).unwrap(), tailed);
+            assert!(!read.complete, "a pull that never arrived is not complete");
+        });
+        assert!(fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == &ledger_pull_command(run_id)));
+    }
+
+    /// The tail stream ENDS (ssh dropped) while the host's record is not yet
+    /// terminal: the fallback still refreshes the mirrored stream from the
+    /// host, but the run may still be writing it, so the copy is a snapshot —
+    /// never marked complete.
+    #[tokio::test]
+    async fn the_stream_end_fallback_never_marks_a_non_terminal_runs_coverage_complete() {
+        /// A `FakeExec` whose tail stream is finite: it ends after its lines.
+        struct EndingTailExec(std::sync::Arc<FakeExec>);
+
+        #[async_trait::async_trait]
+        impl RemoteExec for EndingTailExec {
+            async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.0.run(c).await
+            }
+            fn spawn_lines(&self, c: &str) -> Result<LineStream, RemoteExecError> {
+                self.0.commands.lock().unwrap().push(c.to_string());
+                let lines: Vec<std::io::Result<String>> =
+                    self.0.tail_lines.iter().cloned().map(Ok).collect();
+                Ok(Box::pin(futures_util::stream::iter(lines)))
+            }
+            async fn run_bytes(
+                &self,
+                c: &str,
+                stdin: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                self.0.run_bytes(c, stdin).await
+            }
+        }
+
+        let run_id = "run_01COVSNAPSHOT";
+        let run_json = format!(r#"{{"run_id":"{run_id}","status":"running"}}"#);
+        let mut fake = FakeExec::with_cat_stdout(vec![], run_json);
+        let snapshot = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVSNAPSHOT\"}\n";
+        fake.cat_coverage_stdout = Some(snapshot.to_string());
+        let exec = std::sync::Arc::new(EndingTailExec(std::sync::Arc::new(fake)));
+        let (conn, run_store, _tmp) = make_conn(exec);
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .unwrap();
+        conn.spawn_tail_pump(run_id.to_string());
+        wait_until_finished(&run_store, run_id).await;
+
+        let read = conn.unit_coverage(run_id).await.unwrap();
+        assert_eq!(String::from_utf8(read.bytes).unwrap(), snapshot);
+        assert!(!read.complete, "a non-terminal run's copy is a snapshot");
+    }
+
+    /// A terminal catch-up whose `cat` SUCCEEDS with nothing (the file
+    /// vanished between the tail and the pull, or raced a rotation) must not
+    /// replace the tailed copy with an empty file — the transcript catch-up
+    /// next to it has the same non-empty rule.
+    ///
+    /// The "tailed copy" is seeded BEFORE the pump is spawned (the mirror run
+    /// is created by hand, as the dead-launch test does), so the ordering does
+    /// not depend on when a spawned task first runs.
+    #[test]
+    fn coverage_catch_up_never_truncates_the_tailed_copy_with_an_empty_cat() {
+        let run_id = "run_01COVEMPTY";
+        let tailed = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVEMPTY\"}\n";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_coverage_stdout = Some(String::new());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "sec".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+        let stream = rupu_coverage::stream_path(&store.root, run_id);
+        std::fs::write(&stream, tailed).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stream).unwrap(),
+            tailed,
+            "precondition: the tailed copy is on disk before the pump exists"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.spawn_tail_pump(run_id.to_string());
+            conn.await_run_mirror(run_id).await;
+            let read = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(
+                String::from_utf8(read.bytes).unwrap(),
+                tailed,
+                "an empty successful cat must leave the tailed copy intact"
+            );
+            assert!(
+                !read.complete,
+                "no authoritative replace landed, so the tailed copy is not known complete"
+            );
+        });
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c == &ledger_pull_command(run_id)),
+            "the catch-up must have run for this to prove anything: {cmds:?}"
+        );
+    }
+
+    /// `spawn_tail_pump` interpolates the run id unquoted into every remote
+    /// command it builds, so an unsafe id must spawn nothing at all: no remote
+    /// command, no registered pump, and the (validated-elsewhere) mirror run
+    /// is not left `Running`.
+    #[test]
+    fn spawn_tail_pump_refuses_an_unsafe_run_id() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for bad in ["", "run_x; rm -rf ~", "run_$(id)", "run_a/../b", "run_a\nb"] {
+                conn.spawn_tail_pump(bad.to_string());
+            }
+            // Let anything that WAS spawned run.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(
+            fake.commands.lock().unwrap().is_empty(),
+            "no remote command may be built from an unsafe id: {:?}",
+            fake.commands.lock().unwrap()
+        );
+        assert!(
+            conn.pumps.lock().unwrap().is_empty(),
+            "no pump may be registered for an unsafe id"
+        );
+    }
+
     /// Wait, on the PAUSED virtual clock, for the pump to move `run_id` out of
     /// `Running`. Returns the virtual time it took, or `None` if it never did
     /// within `bound`. The sleep is what lets tokio auto-advance virtual time
@@ -6100,6 +7181,76 @@ mod tests {
         assert!(
             conn.pumps.lock().unwrap().get(run_id).is_none(),
             "the pump must deregister when it gives up"
+        );
+    }
+
+    /// `rupu run` writes the coverage stream's begin line BEFORE the provider
+    /// pre-flight and credential resolution, so a launch that dies right there
+    /// leaves a `coverage.jsonl` and nothing else (no transcript, no `run.json`
+    /// for an agent run). `tail` still emits a `==>` header for it, but that
+    /// header is not evidence the run is alive: counting it would switch the
+    /// startup deadline off for exactly the launch the deadline exists to
+    /// catch, stranding the ssh session and the mirrored run in `Running` until
+    /// `PUMP_MAX_WALL`.
+    ///
+    /// The tail yields ONLY the coverage header + begin line; the pump must
+    /// still abandon at `PUMP_STARTUP_DEADLINE` exactly as it does with no
+    /// header at all, and the begin line it did receive stays mirrored.
+    #[tokio::test(start_paused = true)]
+    async fn tail_pump_abandons_a_launch_that_only_left_a_coverage_header() {
+        let run_id = "run_01TESTPUMPCOV";
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![
+            format!("==> /home/ci/.rupu/runs/{run_id}/coverage.jsonl <=="),
+            format!(r#"{{"ledger":"begin","v":1,"run_id":"{run_id}"}}"#),
+        ]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "died-before-preflight".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let took = wait_for_pump_to_finish(
+            &run_store,
+            run_id,
+            PUMP_STARTUP_DEADLINE + std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect(
+            "a coverage header alone must not count as a sign of life; the \
+             pump must give up at the startup deadline",
+        );
+
+        assert!(
+            took >= PUMP_STARTUP_DEADLINE && took < PUMP_STARTUP_DEADLINE + PUMP_POLL_INTERVAL * 5,
+            "the pump must give up at the {}s startup deadline; took {}s",
+            PUMP_STARTUP_DEADLINE.as_secs(),
+            took.as_secs()
+        );
+        assert_eq!(
+            run_store.load(run_id).unwrap().status,
+            rupu_orchestrator::RunStatus::Failed
+        );
+        assert!(
+            conn.pumps.lock().unwrap().get(run_id).is_none(),
+            "the pump must deregister when it gives up"
+        );
+        // The begin line the tail did deliver was still routed to the mirror.
+        assert!(
+            std::fs::read_to_string(conn.mirror.coverage_path(run_id))
+                .unwrap_or_default()
+                .contains(r#""ledger":"begin""#),
+            "coverage lines are still mirrored even though the header is not a sign of life"
         );
     }
 
@@ -6636,8 +7787,7 @@ mod tests {
         );
         let cmds = fake.commands.lock().unwrap();
         assert!(
-            cmds.iter()
-                .any(|c| c == &format!("cat $HOME/.rupu/runs/{run_id}/usage.jsonl")),
+            cmds.iter().any(|c| c == &ledger_pull_command(run_id)),
             "the terminal pull must cat the remote ledger: {cmds:?}"
         );
     }
@@ -6823,7 +7973,7 @@ mod tests {
     #[async_trait::async_trait]
     impl RemoteExec for LedgerOrderExec {
         async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
-            if c.starts_with("cat ") && c.contains("/usage.jsonl") {
+            if c.starts_with(LEDGER_PULL_PREFIX) {
                 if let Some(store) = self.store.get() {
                     let status = store.load(self.run_id).unwrap().status;
                     self.seen.lock().unwrap().push(status);
@@ -7713,6 +8863,39 @@ mod tests {
         let rec = run_store.load("run_01LIVE").unwrap();
         assert_eq!(rec.active_step_id, None);
         assert_eq!(rec.active_step_transcript_path, None);
+    }
+
+    /// The ledger pull expands `$HOME` remotely (unquoted run dir, quoted
+    /// `"…/$f"`) and frames each file the way `split_batched_cat` reads.
+    #[test]
+    fn ledger_pull_command_frames_both_ledgers_under_the_remote_run_dir() {
+        let cmd = ledger_pull_command("run_01LEDGER");
+        assert_eq!(
+            cmd,
+            "for f in usage.jsonl coverage.jsonl; do printf '==> %s <==\\n' \"$f\"; \
+             cat \"$HOME/.rupu/runs/run_01LEDGER/$f\" 2>/dev/null; \
+             printf '\\n==> end %s <==\\n' \"$?\"; done"
+        );
+        let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end 0 <==\n\
+                      ==> coverage.jsonl <==\n\n==> end 0 <==\n";
+        let sections = split_ledger_pull(framed);
+        assert_eq!(
+            sections.get(LEDGER_USAGE).map(String::as_str),
+            Some("{\"u\":1}\n")
+        );
+        assert_eq!(sections.get(LEDGER_COVERAGE).map(String::as_str), Some(""));
+    }
+
+    /// A section counts only when its trailer carries `cat`'s exit status 0:
+    /// a read that failed mid-file (nonzero), a trailer without a status, or
+    /// a section cut off before its trailer all read as "did not arrive".
+    #[test]
+    fn split_ledger_pull_drops_a_section_whose_cat_did_not_exit_zero() {
+        let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end 1 <==\n\
+                      ==> coverage.jsonl <==\n{\"c\":1}\n\n==> end <==\n";
+        assert!(split_ledger_pull(framed).is_empty());
+        let cut = "==> usage.jsonl <==\n{\"u\":1}\n";
+        assert!(split_ledger_pull(cut).is_empty());
     }
 
     #[test]

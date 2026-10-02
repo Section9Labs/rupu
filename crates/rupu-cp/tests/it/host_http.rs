@@ -8,6 +8,26 @@ use rupu_cp::host::{
 };
 use rupu_cp::launcher::LaunchRequest;
 
+/// A fresh in-process CP state rooted in `tmp` (default pricing, no launchers).
+fn cp_state(tmp: &tempfile::TempDir) -> rupu_cp::state::AppState {
+    rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    )
+}
+
+/// Serve `state`'s real router (no bearer) on an ephemeral loopback port and
+/// return the address; the server task lives for the rest of the test.
+async fn serve_cp(state: rupu_cp::state::AppState) -> std::net::SocketAddr {
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
 // ── From the brief (verbatim) ─────────────────────────────────────────────────
 
 #[tokio::test]
@@ -648,12 +668,7 @@ async fn launch_agent_delivers_the_findings_profile_to_a_real_remote_cp() {
         rupu_config::PricingConfig::default(),
     )
     .with_agent_launcher(Some(launcher.clone()));
-    let app = rupu_cp::server::router(state, None);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr = serve_cp(state).await;
 
     let c = HttpHostConnector::new(format!("http://{addr}"), None);
     let id = c
@@ -750,4 +765,508 @@ async fn launch_agent_without_a_profile_skips_the_feature_check() {
     );
     info.assert_hits(0);
     post.assert();
+}
+
+// ── Remote findings Plan A, Task 6: coverage stream over HTTP ────────────────
+
+/// A real remote CP serves a run's stream; the connector fetches it.
+#[tokio::test]
+async fn unit_coverage_fetches_the_remote_runs_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let p = rupu_coverage::stream_path(&state.run_store.root, "run_H1");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        b"{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_H1\"}\n",
+    )
+    .unwrap();
+    let addr = serve_cp(state).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let read = c.unit_coverage("run_H1").await.unwrap();
+    assert!(read.bytes.starts_with(b"{\"ledger\":\"begin\""));
+    assert!(read.complete, "the remote serves its own file: complete");
+    assert!(c.unit_coverage("run_NONE").await.unwrap().bytes.is_empty());
+}
+
+/// An older remote answers unknown /api paths with the SPA (200 HTML), so the
+/// connector must check the feature first rather than trust the status.
+#[tokio::test]
+async fn unit_coverage_refuses_a_remote_without_the_feature() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(serde_json::json!({"version": "0.70.0", "features": []}));
+    });
+    let spa = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/coverage");
+        then.status(200).body("<!doctype html>");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err:?}");
+    spa.assert_hits(0);
+}
+
+#[tokio::test]
+async fn unmatched_api_paths_are_a_json_404_not_the_spa() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let addr = serve_cp(state).await;
+    #[allow(clippy::disallowed_methods)]
+    let resp = reqwest::get(format!("http://{addr}/api/definitely/not/a/route"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("/api/definitely"));
+}
+
+/// The `/api` boundary: the bare prefix and its trailing-slash form are API
+/// paths (JSON 404); a look-alike sibling such as `/apiary` is not, and still
+/// gets the SPA fallback.
+#[tokio::test]
+async fn api_prefix_boundary_is_a_json_404_but_a_lookalike_path_gets_the_spa() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let addr = serve_cp(state).await;
+    for path in ["/api", "/api/"] {
+        #[allow(clippy::disallowed_methods)]
+        let resp = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        assert_eq!(resp.status(), 404, "{path} must be a JSON 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("no API route"),
+            "{path}: {body}"
+        );
+    }
+    #[allow(clippy::disallowed_methods)]
+    let resp = reqwest::get(format!("http://{addr}/apiary")).await.unwrap();
+    assert_eq!(resp.status(), 200, "/apiary is a client route, not the API");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(ct.starts_with("text/html"), "SPA fallback, got {ct}");
+}
+
+#[tokio::test]
+async fn coverage_endpoint_serves_ndjson_and_rejects_a_malformed_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let p = rupu_coverage::stream_path(&state.run_store.root, "run_H2");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        b"{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_H2\"}\n",
+    )
+    .unwrap();
+    let addr = serve_cp(state).await;
+
+    #[allow(clippy::disallowed_methods)]
+    let ok = reqwest::get(format!("http://{addr}/api/runs/run_H2/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(
+        ok.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
+    // A run that wrote none: 200, empty body.
+    #[allow(clippy::disallowed_methods)]
+    let none = reqwest::get(format!("http://{addr}/api/runs/run_NONE/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(none.status(), 200);
+    assert!(none.bytes().await.unwrap().is_empty());
+    #[allow(clippy::disallowed_methods)]
+    let bad = reqwest::get(format!("http://{addr}/api/runs/not-a-run/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+}
+
+/// A stream that exists but cannot be read is the server's problem, not the
+/// client's: 500, not the 400 a malformed id earns.
+#[tokio::test]
+async fn coverage_endpoint_reports_an_unreadable_stream_as_a_server_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    // `coverage.jsonl` is a directory: it exists, `read` fails, NotFound it is not.
+    let p = rupu_coverage::stream_path(&state.run_store.root, "run_H3");
+    std::fs::create_dir_all(&p).unwrap();
+    let addr = serve_cp(state).await;
+
+    #[allow(clippy::disallowed_methods)]
+    let unreadable = reqwest::get(format!("http://{addr}/api/runs/run_H3/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(unreadable.status(), 500);
+    #[allow(clippy::disallowed_methods)]
+    let missing = reqwest::get(format!("http://{addr}/api/runs/run_NONE/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        200,
+        "no stream written is empty, not an error"
+    );
+    #[allow(clippy::disallowed_methods)]
+    let malformed = reqwest::get(format!("http://{addr}/api/runs/run_a.b/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+}
+
+// ── Older-remote feature gate (Plan A review triage, G) ──────────────────────
+
+/// A remote older than `/api/host/info` answers it with its SPA — HTML with a
+/// 200. The feature gate must fail closed with `Unsupported`, never leak the
+/// decode failure as `Remote(0, ..)`, and never go on to fetch the stream.
+#[tokio::test]
+async fn unit_coverage_refuses_a_remote_whose_host_info_is_the_spa() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .header("content-type", "text/html")
+            .body("<!doctype html><html></html>");
+    });
+    let stream = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/coverage");
+        then.status(200).body("{}\n");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    // The distinguishing text: this is the "answered with something that is
+    // not host info" refusal (carrying the parse error), NOT the 404 branch's
+    // "predates /api/host/info" one.
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m)
+            if m.contains("did not answer /api/host/info with host info")
+                && m.contains("expected value")
+                && m.contains("this unit's coverage cannot be collected")
+                && !m.contains("predates")),
+        "{err:?}"
+    );
+    stream.assert_hits(0);
+}
+
+/// A 200 that IS JSON but not host info keeps its parse error in the refusal —
+/// it must not be misreported as "not JSON".
+#[tokio::test]
+async fn unit_coverage_refusal_for_wrong_shaped_host_info_names_the_parse_error() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!([1, 2, 3]));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m)
+            if m.contains("did not answer /api/host/info with host info")
+                && m.contains("invalid type")),
+        "{err:?}"
+    );
+}
+
+/// `info()` on a remote whose `/api/host/info` answers with its SPA (200 HTML)
+/// is the same outcome as its 404: reachable, version unknown — not an error
+/// (which `probe_remote` would render as "offline").
+#[tokio::test]
+async fn info_on_a_spa_host_info_reply_is_reachable_with_unknown_version() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .header("content-type", "text/html")
+            .body("<!doctype html><html></html>");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let info = c.info().await.unwrap();
+    assert!(info.reachable);
+    assert!(info.version.is_none());
+}
+
+/// A remote with no `/api/host/info` route at all (404) fails the same way.
+#[tokio::test]
+async fn unit_coverage_refuses_a_remote_with_no_host_info_route() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(404);
+    });
+    let stream = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/coverage");
+        then.status(200).body("{}\n");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m) if m.contains("predates /api/host/info")),
+        "{err:?}"
+    );
+    stream.assert_hits(0);
+}
+
+// ── Remote findings Plan B, Task 3: artifact blobs over HTTP ─────────────────
+
+fn store_blob(global: &std::path::Path, sha: &str, body: &[u8]) {
+    let p = rupu_coverage::report::ArtifactStore::new(global.join("findings").join("artifacts"))
+        .blob_path(sha);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, body).unwrap();
+}
+
+/// [`serve_cp`] over a CP whose global dir is `global`.
+async fn serve_cp_at(global: &std::path::Path) -> std::net::SocketAddr {
+    serve_cp(rupu_cp::state::AppState::new(
+        global.to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    ))
+    .await
+}
+
+/// End to end against a real remote CP: the connector sees the feature on
+/// `/api/host/info`, streams the blob into `dest`, and refuses a blob that
+/// outgrows its recorded size or is absent.
+#[tokio::test]
+async fn pull_finding_artifact_streams_a_real_remotes_blob() {
+    let remote = tempfile::tempdir().unwrap();
+    let sha = "ab".repeat(32);
+    store_blob(remote.path(), &sha, b"remote poc");
+    let addr = serve_cp_at(remote.path()).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let dest = tempfile::tempdir().unwrap();
+    let out = dest.path().join("pulled");
+    c.pull_finding_artifact(&sha, &out, 10).await.unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"remote poc");
+
+    // Over the recorded size: refused mid-stream.
+    assert!(matches!(
+        c.pull_finding_artifact(&sha, &out, 3).await,
+        Err(HostConnectorError::Invalid(_))
+    ));
+    // Absent on the remote: an actionable reason naming the blob and the
+    // host, not the bare request URL.
+    let absent = "cd".repeat(32);
+    let err = c
+        .pull_finding_artifact(&absent, &out, 10)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::NotFound(m)
+            if *m == format!("artifact {absent} is not in host http://{addr}'s store")),
+        "{err:?}"
+    );
+    // A malformed digest never reaches the wire.
+    assert!(matches!(
+        c.pull_finding_artifact("../x", &out, 10).await,
+        Err(HostConnectorError::Invalid(_))
+    ));
+}
+
+/// An older remote answers an unknown /api path with the SPA, so the
+/// connector must check the feature before it trusts a status.
+#[tokio::test]
+async fn pull_finding_artifact_refuses_a_remote_without_the_feature() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(serde_json::json!({"version": "0.70.0", "features": []}));
+    });
+    let blob = server.mock(|when, then| {
+        when.method("GET")
+            .path_matches(httpmock::Regex::new(r"^/api/findings/artifacts/").unwrap());
+        then.status(200).body("<!doctype html>");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let dest = tempfile::tempdir().unwrap();
+    let out = dest.path().join("x");
+    let err = c
+        .pull_finding_artifact(&"ab".repeat(32), &out, 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err:?}");
+    blob.assert_hits(0);
+    assert!(!out.exists(), "a refused pull must not create dest");
+}
+
+/// A remote that errors (not 404) surfaces as `Remote`, and leaves no claim
+/// of success.
+#[tokio::test]
+async fn pull_finding_artifact_maps_a_remote_error_status() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.70.0",
+            "features": ["findings.artifact_blob"]
+        }));
+    });
+    let sha = "ab".repeat(32);
+    server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/findings/artifacts/{sha}"));
+        then.status(500).body("boom");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let dest = tempfile::tempdir().unwrap();
+    let err = c
+        .pull_finding_artifact(&sha, &dest.path().join("x"), 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HostConnectorError::Remote(500, _)), "{err:?}");
+}
+
+/// The endpoint is a security surface: every success response is a
+/// `nosniff` + `sandbox` octet-stream attachment; a malformed digest is 400
+/// before any path is built; a directory where a blob should be is 404.
+#[tokio::test]
+async fn artifact_blob_endpoint_headers_and_validation() {
+    let remote = tempfile::tempdir().unwrap();
+    let sha = "ab".repeat(32);
+    store_blob(remote.path(), &sha, b"<script>alert(1)</script>");
+    // A directory squatting on a (never written) blob's path.
+    let dir_sha = "ee".repeat(32);
+    let squat =
+        rupu_coverage::report::ArtifactStore::new(remote.path().join("findings").join("artifacts"))
+            .blob_path(&dir_sha);
+    std::fs::create_dir_all(&squat).unwrap();
+    // A FIFO with no writer: a blocking open would park forever.
+    let fifo_sha = "ff".repeat(32);
+    let fifo =
+        rupu_coverage::report::ArtifactStore::new(remote.path().join("findings").join("artifacts"))
+            .blob_path(&fifo_sha);
+    std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    let have_fifo = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|s| s.success());
+    let addr = serve_cp_at(remote.path()).await;
+
+    #[allow(clippy::disallowed_methods)]
+    let ok = reqwest::get(format!("http://{addr}/api/findings/artifacts/{sha}"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let h = ok.headers().clone();
+    assert_eq!(h["content-type"], "application/octet-stream");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["content-security-policy"], "sandbox");
+    assert!(
+        h["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment"),
+        "{:?}",
+        h["content-disposition"]
+    );
+    assert_eq!(
+        ok.bytes().await.unwrap().as_ref(),
+        b"<script>alert(1)</script>"
+    );
+
+    // Well-formed but absent: a JSON 404.
+    #[allow(clippy::disallowed_methods)]
+    let absent = reqwest::get(format!(
+        "http://{addr}/api/findings/artifacts/{}",
+        "cd".repeat(32)
+    ))
+    .await
+    .unwrap();
+    assert_eq!(absent.status(), 404);
+    let body: serde_json::Value = absent.json().await.unwrap();
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("not in this host's store"));
+
+    // Not a regular file: 404, never an open attempt that could hang.
+    #[allow(clippy::disallowed_methods)]
+    let squatted = reqwest::get(format!("http://{addr}/api/findings/artifacts/{dir_sha}"))
+        .await
+        .unwrap();
+    assert_eq!(squatted.status(), 404);
+    if have_fifo {
+        #[allow(clippy::disallowed_methods)]
+        let piped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reqwest::get(format!("http://{addr}/api/findings/artifacts/{fifo_sha}")),
+        )
+        .await
+        .expect("a FIFO in the store must not hang the handler")
+        .unwrap();
+        assert_eq!(piped.status(), 404);
+    }
+
+    for bad in [
+        "AB".repeat(32),      // uppercase
+        "a".repeat(63),       // short
+        "a".repeat(65),       // long
+        "..%2Fx".to_string(), // decodes to a traversal
+    ] {
+        #[allow(clippy::disallowed_methods)]
+        let r = reqwest::get(format!("http://{addr}/api/findings/artifacts/{bad}"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+}
+
+/// A host that serves the blob endpoint says so on `/api/host/info`.
+#[tokio::test]
+async fn host_info_advertises_the_artifact_blob_feature() {
+    let remote = tempfile::tempdir().unwrap();
+    let addr = serve_cp_at(remote.path()).await;
+    #[allow(clippy::disallowed_methods)]
+    let info: serde_json::Value = reqwest::get(format!("http://{addr}/api/host/info"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let features: Vec<&str> = info["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f.as_str())
+        .collect();
+    assert!(features.contains(&"findings.artifact_blob"), "{features:?}");
+}
+
+/// A remote that declares a length over the recorded size is refused before
+/// anything is written.
+#[tokio::test]
+async fn pull_finding_artifact_refuses_a_declared_oversize_before_writing() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.70.0",
+            "features": ["findings.artifact_blob"]
+        }));
+    });
+    let sha = "ab".repeat(32);
+    server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/findings/artifacts/{sha}"));
+        then.status(200).body("0123456789");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let dest = tempfile::tempdir().unwrap();
+    let out = dest.path().join("x");
+    let err = c.pull_finding_artifact(&sha, &out, 4).await.unwrap_err();
+    assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    assert!(
+        !out.exists(),
+        "an oversize declaration must not create dest"
+    );
 }

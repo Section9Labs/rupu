@@ -2014,6 +2014,7 @@ async fn archive(run_id: &str, ignore_liveness: bool) -> anyhow::Result<()> {
     if !ignore_liveness {
         ensure_standalone_not_running(run_id, "archive", metadata.as_ref())?;
     }
+    archive_stream_only_run_dir(&paths::global_dir()?, run_id)?;
     let archived_dir = paths::archived_transcripts_dir(
         location
             .transcript_path
@@ -2047,6 +2048,7 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
     if !args.ignore_liveness {
         ensure_standalone_not_running(run_id, "delete", metadata.as_ref())?;
     }
+    remove_stream_only_run_dirs(&paths::global_dir()?, run_id)?;
     remove_file_if_exists(&location.transcript_path)?;
     remove_file_if_exists(&location.metadata_path)?;
     println!("deleted transcript {run_id}");
@@ -2160,11 +2162,63 @@ pub(crate) fn prune_archived_transcripts(
             },
         });
         if !dry_run {
+            remove_stream_only_run_dirs(&global, &run_id)?;
             remove_file_if_exists(&location.transcript_path)?;
             remove_file_if_exists(&location.metadata_path)?;
         }
     }
     Ok(rows)
+}
+
+/// `rupu run` writes its coverage stream to `<global>/runs/<run_id>/` from the
+/// moment it starts, but only a run that finishes writes `run.json` there —
+/// and with it joins `RunStore`, which archives and deletes it. A run dir
+/// WITHOUT `run.json` (a launch that failed its pre-flight, a killed run)
+/// belongs to nothing but the transcript, so it follows the transcript: moved
+/// on archive, removed on prune and delete. `None` for an id that is not a
+/// plain run id — it is joined onto a path that may be removed recursively.
+fn stream_only_run_dir(runs_root: &std::path::Path, run_id: &str) -> Option<PathBuf> {
+    let plain = !run_id.is_empty()
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let dir = runs_root.join(run_id);
+    (plain && dir.is_dir() && !dir.join("run.json").exists()).then_some(dir)
+}
+
+/// Archive `run_id`'s stream-only run dir with its transcript:
+/// `runs/<run_id>` → `runs-archive/<run_id>`, the layout `RunStore` archives
+/// runs into. An archive copy that already exists is never overwritten — the
+/// dir then stays in `runs/`, where prune still finds it.
+fn archive_stream_only_run_dir(global: &std::path::Path, run_id: &str) -> anyhow::Result<()> {
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let Some(src) = stream_only_run_dir(&store.root, run_id) else {
+        return Ok(());
+    };
+    let dst = store.archive_root().join(run_id);
+    if dst.exists() {
+        tracing::warn!(
+            run_id,
+            dst = %dst.display(),
+            "an archived run dir already exists; leaving this run's coverage stream in place"
+        );
+        return Ok(());
+    }
+    fs::create_dir_all(store.archive_root())?;
+    fs::rename(&src, &dst)?;
+    Ok(())
+}
+
+/// Remove `run_id`'s stream-only run dir from `runs/` and `runs-archive/`
+/// (a transcript archived before run dirs followed it left its dir active).
+fn remove_stream_only_run_dirs(global: &std::path::Path, run_id: &str) -> anyhow::Result<()> {
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    for root in [store.root.clone(), store.archive_root()] {
+        if let Some(dir) = stream_only_run_dir(&root, run_id) {
+            fs::remove_dir_all(dir)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve `fragment` to a transcript and locate it on disk.
@@ -2764,6 +2818,26 @@ mod tests {
             target: None,
             workspace_strategy: None,
             pid,
+        }
+    }
+
+    /// Only a plain run id with a `run.json`-less dir qualifies: the result
+    /// is removed recursively, so `.`/`..`/separators must never resolve.
+    #[test]
+    fn stream_only_run_dir_needs_a_plain_id_and_no_run_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path().join("runs");
+        std::fs::create_dir_all(runs.join("run_01STREAM")).unwrap();
+        std::fs::create_dir_all(runs.join("run_01DONE")).unwrap();
+        std::fs::write(runs.join("run_01DONE/run.json"), "{}").unwrap();
+        assert_eq!(
+            stream_only_run_dir(&runs, "run_01STREAM"),
+            Some(runs.join("run_01STREAM"))
+        );
+        assert_eq!(stream_only_run_dir(&runs, "run_01DONE"), None);
+        assert_eq!(stream_only_run_dir(&runs, "run_01ABSENT"), None);
+        for bad in ["", ".", "..", "run_01STREAM/..", "../runs"] {
+            assert_eq!(stream_only_run_dir(&runs, bad), None, "{bad:?}");
         }
     }
 

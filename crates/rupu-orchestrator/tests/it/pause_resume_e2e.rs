@@ -32,11 +32,11 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::{Event, EventSink};
 use rupu_orchestrator::runner::{
     run_workflow, ItemResult, OrchestratorRunOpts, PauseReason, PausedStep, ResumeState,
-    StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher, UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::{RunStatus, RunStore, StepResult, Workflow};
 use rupu_providers::types::{LlmRequest, LlmResponse, StopReason, StreamEvent};
@@ -152,6 +152,7 @@ fn linear_agent_opts(
 ) -> AgentRunOpts {
     AgentRunOpts {
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: agent_name.to_string(),
         agent_system_prompt: "test".into(),
         agent_tools: None,
@@ -799,7 +800,18 @@ struct CancelFirstUnitDispatcher {
 }
 #[async_trait]
 impl UnitDispatcher for CancelFirstUnitDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         let is_first = self.calls.lock().unwrap().is_empty();
         self.calls
             .lock()
@@ -810,6 +822,7 @@ impl UnitDispatcher for CancelFirstUnitDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         };
         if is_first {
             self.token.cancel();
@@ -826,7 +839,18 @@ struct RecordingUnitDispatcher {
 }
 #[async_trait]
 impl UnitDispatcher for RecordingUnitDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.calls
             .lock()
             .unwrap()
@@ -836,6 +860,7 @@ impl UnitDispatcher for RecordingUnitDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }

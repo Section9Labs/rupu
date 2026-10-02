@@ -16,9 +16,11 @@ use rupu_coverage::{
     FlatCatalog, DEFAULT_FULL_MODE_THRESHOLD,
 };
 use rupu_mcp::{McpPermission, ServeHandle};
+use rupu_providers::overflow::{context_overflow_of, output_cap_overflow_of};
 use rupu_providers::provider::LlmProvider;
+use rupu_providers::reply_error::ApiErrorBody;
 use rupu_providers::types::{
-    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
 use rupu_scm::Registry;
 use rupu_tools::{DerivedEvent, PermissionMode, Tool, ToolContext};
@@ -35,6 +37,17 @@ struct CoverageBundle {
     catalog: FlatCatalog,
     paths: CoveragePaths,
     prompt_section: String,
+}
+
+/// The run stream for records written under `scope`, when `rupu run` asked
+/// for one (see `ToolContext::coverage_stream`).
+fn run_stream_for(ctx: &ToolContext, scope: &str) -> Option<rupu_coverage::RunStream> {
+    ctx.coverage_stream
+        .clone()
+        .map(|path| rupu_coverage::RunStream {
+            path,
+            scope_name: scope.to_string(),
+        })
 }
 
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
@@ -65,21 +78,17 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
         return false;
     }
     match e {
+        E::Reply(b) => b.is_retryable(),
         E::Http(_)
         | E::SseParse(_)
         | E::Json(_)
         | E::UnexpectedEndOfStream
+        | E::IncompleteStream(_)
         | E::TokenRefreshFailed(_)
-        | E::RateLimited { .. }
         | E::Transient(_) => true,
-        E::Api { status, .. } => *status == 429 || *status >= 500,
         E::MissingAuth { .. }
         | E::AuthConfig(_)
-        | E::Unauthorized { .. }
-        | E::QuotaExceeded { .. }
         | E::NotImplemented { .. }
-        | E::BadRequest { .. }
-        | E::ModelUnavailable { .. }
         | E::Preflight(_)
         | E::LongContextUnavailable { .. }
         | E::Other(_) => false,
@@ -200,158 +209,9 @@ fn trim_oldest_exchange(messages: &mut Vec<Message>) -> usize {
     0
 }
 
-/// A provider context-overflow error, with the numbers when the message
-/// carries them (spec 2026-09-30 §7; formats are observed, not documented).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Overflow {
-    pub tokens: Option<u32>,
-    pub max: Option<u32>,
-}
-
 /// The input limit a run falls back to on `ProviderError::LongContextUnavailable`
 /// (no extra-usage entitlement for 1M context): the standard window.
 const STANDARD_CONTEXT_WINDOW: u32 = 200_000;
-
-pub(crate) fn parse_context_overflow(err: &str) -> Option<Overflow> {
-    let e = err.to_ascii_lowercase();
-    let after = |needle: &str| e.find(needle).map(|i| &e[i + needle.len()..]);
-    // Anthropic: "prompt is too long: N tokens > M maximum"
-    if let Some(rest) = after("prompt is too long:") {
-        let n = numbers(rest);
-        return Some(Overflow {
-            tokens: n.first().copied(),
-            max: n.get(1).copied(),
-        });
-    }
-    // Anthropic (pre-4.5 validation): "input length and `max_tokens` exceed
-    // context limit: A + B > C". The input alone (A) fits; it is the output
-    // reservation that does not, so C is no input limit — no max. The runner
-    // first lowers the request's cap (`parse_output_cap_overflow`); this arm
-    // is the fall-through when that is not possible.
-    if let Some(cap) = parse_output_cap_overflow(err) {
-        return Some(Overflow {
-            tokens: Some(cap.input),
-            max: None,
-        });
-    }
-    // GitHub Copilot (CAPI `model_max_prompt_tokens_exceeded`): "prompt token
-    // count of N exceeds the limit of M" (microsoft/vscode
-    // extensions/copilot/test/inline/inlineEditCode.stest.ts).
-    if let Some(rest) = after("prompt token count of") {
-        if rest.contains("exceeds the limit of") {
-            let n = numbers(rest);
-            return Some(Overflow {
-                tokens: n.first().copied(),
-                max: n.get(1).copied(),
-            });
-        }
-    }
-    // OpenAI / Copilot: "maximum context length is M tokens … resulted in N tokens"
-    if let Some(rest) = after("maximum context length is") {
-        let n = numbers(rest);
-        return Some(Overflow {
-            max: n.first().copied(),
-            tokens: n.get(1).copied(),
-        });
-    }
-    // vLLM: "Input length (N) exceeds model's maximum context length (M)"
-    if e.contains("exceeds model's maximum context length") {
-        if let Some(rest) = after("input length") {
-            let n = numbers(rest);
-            return Some(Overflow {
-                tokens: n.first().copied(),
-                max: n.get(1).copied(),
-            });
-        }
-    }
-    // Gemini: "input token count (N) exceeds the maximum number of tokens allowed (M)"
-    if let Some(rest) = after("input token count") {
-        if rest.contains("exceeds") {
-            let n = numbers(rest);
-            return Some(Overflow {
-                tokens: n.first().copied(),
-                max: n.get(1).copied(),
-            });
-        }
-    }
-    if e.contains("prompt is too long")
-        || e.contains("too many tokens")
-        || e.contains("context window")
-    {
-        return Some(Overflow {
-            tokens: None,
-            max: None,
-        });
-    }
-    None
-}
-
-/// Anthropic's pre-4.5 validation error, "input length and `max_tokens`
-/// exceed context limit: A + B > C": the input (A) fits the window (C), the
-/// output reservation (B) does not. Wording verified against real API
-/// responses quoted in anthropics/claude-code#42 and #228.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutputCapOverflow {
-    pub input: u32,
-    pub max_tokens: u32,
-    pub window: u32,
-}
-
-/// Room left between the input and the window when lowering the output cap
-/// after an [`OutputCapOverflow`] (token counts are estimates on both sides).
-const OUTPUT_CAP_MARGIN: u32 = 1000;
-/// The smallest output cap worth retrying with; below it, compact instead.
-const MIN_LOWERED_OUTPUT_CAP: u32 = 1024;
-
-impl OutputCapOverflow {
-    /// `window − input − 1000`, or `None` when that is under 1024 (the input
-    /// itself is what has to shrink).
-    pub(crate) fn lowered_max_tokens(&self) -> Option<u32> {
-        self.window
-            .checked_sub(self.input)?
-            .checked_sub(OUTPUT_CAP_MARGIN)
-            .filter(|n| *n >= MIN_LOWERED_OUTPUT_CAP)
-    }
-}
-
-pub(crate) fn parse_output_cap_overflow(err: &str) -> Option<OutputCapOverflow> {
-    let e = err.to_ascii_lowercase();
-    let needle = "input length and `max_tokens` exceed context limit";
-    let rest = &e[e.find(needle)? + needle.len()..];
-    let n = numbers(rest);
-    Some(OutputCapOverflow {
-        input: *n.first()?,
-        max_tokens: *n.get(1)?,
-        window: *n.get(2)?,
-    })
-}
-
-/// Every integer in `s`, in order. A `,` or `_` between digits is a thousands separator.
-fn numbers(s: &str) -> Vec<u32> {
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut cur: Option<u64> = None;
-    for (i, &c) in b.iter().enumerate() {
-        if c.is_ascii_digit() {
-            cur = Some(
-                cur.unwrap_or(0)
-                    .saturating_mul(10)
-                    .saturating_add(u64::from(c - b'0')),
-            );
-        } else if (c == b',' || c == b'_')
-            && cur.is_some()
-            && b.get(i + 1).is_some_and(u8::is_ascii_digit)
-        {
-            // thousands separator
-        } else if let Some(n) = cur.take() {
-            out.push(n.min(u64::from(u32::MAX)) as u32);
-        }
-    }
-    if let Some(n) = cur {
-        out.push(n.min(u64::from(u32::MAX)) as u32);
-    }
-    out
-}
 
 /// Estimate token count for a slice of messages using chars/4 approximation.
 /// Kept for reference and tests; production sizing now uses calibrated char budgets.
@@ -370,7 +230,7 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
             // raw is what goes on the wire (thinking text + signature); text is
             // only a display summary and is None when display is "omitted".
             ContentBlock::Reasoning { raw, .. } => raw.to_string().len() / 4,
-            ContentBlock::Unknown => 0,
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => 0,
         })
         .sum()
 }
@@ -390,7 +250,7 @@ fn message_chars(m: &Message) -> usize {
             // raw is what goes on the wire (thinking text + signature); text is
             // only a display summary and is None when display is "omitted".
             ContentBlock::Reasoning { raw, .. } => raw.to_string().len(),
-            ContentBlock::Unknown => 0,
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => 0,
         })
         .sum()
 }
@@ -842,7 +702,7 @@ fn emit_turn_content(
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
             ContentBlock::ToolResult { .. } => {}
-            ContentBlock::Unknown => {}
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
         }
     }
     Ok(tool_uses)
@@ -1061,6 +921,9 @@ pub struct AgentRunOpts {
     /// messages; the caller owns that invariant and replay verifies it via
     /// the recorded sha256. `None` → the seed is embedded inline in full.
     pub seed_source: Option<PathBuf>,
+    /// Pre-turn collectors (spec §8). Empty = no injection; the loop behaves
+    /// exactly as before. Run off the async runtime via spawn_blocking.
+    pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
 }
 
 /// Outcome of a finished run.
@@ -1142,7 +1005,7 @@ fn is_paused(pause: &Option<tokio_util::sync::CancellationToken>) -> bool {
 
 /// Result of a single provider call attempt inside the retry loop.
 enum CallStep {
-    Ok(LlmResponse),
+    Ok(Box<LlmResponse>),
     Err(rupu_providers::ProviderError),
     /// The pause token fired while the provider call was in flight; the
     /// in-flight stream was dropped and any partial text discarded.
@@ -1151,7 +1014,7 @@ enum CallStep {
 
 /// Outcome of the provider-call retry loop for one turn.
 enum CallOutcome {
-    Response(LlmResponse),
+    Response(Box<LlmResponse>),
     Paused,
 }
 
@@ -1224,12 +1087,15 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
             let resolved_scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
             let target = target_id(&opts.workspace_path, resolved_scope);
-            let paths = CoveragePaths::new(&opts.workspace_path, &target);
+            let paths = CoveragePaths::new(&opts.workspace_path, &target)
+                .with_run_stream(run_stream_for(&opts.tool_context, resolved_scope));
             paths
                 .ensure_dir()
                 .map_err(|e| RunError::Coverage(format!("ensure coverage dir: {e}")))?;
             write_snapshot(&catalog, &paths.catalog)
                 .map_err(|e| RunError::Coverage(format!("write catalog snapshot: {e}")))?;
+            // Infallible: a stream problem is logged, never fails the run.
+            rupu_coverage::stream_catalog(&paths, &catalog);
             // Capture a run manifest describing this run's defining inputs.
             // This is the single all-surfaces seam (workflow / agent /
             // autoflow / session all reach run_agent), so every run becomes
@@ -1376,7 +1242,8 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
     {
         let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
         let target = target_id(&opts.workspace_path, scope);
-        let paths = CoveragePaths::new(&opts.workspace_path, &target);
+        let paths = CoveragePaths::new(&opts.workspace_path, &target)
+            .with_run_stream(run_stream_for(&opts.tool_context, scope));
         paths
             .ensure_dir()
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
@@ -1517,10 +1384,37 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 );
             }
             writer.write(&Event::TurnStart { turn_idx })?;
+            // Pre-model-call collector phase (spec §8). Empty collectors => no-op,
+            // and `turn_messages` equals `messages.clone()` exactly as before.
+            let turn_messages = if opts.collectors.is_empty() {
+                messages.clone()
+            } else {
+                let pipeline = crate::collector::CollectorPipeline::new(
+                    opts.collectors.clone(),
+                    crate::collector::INJECTION_TOKEN_BUDGET,
+                );
+                let ctx = crate::collector::TurnContext {
+                    run_id: opts.run_id.clone(),
+                    codename: opts.codename.clone(),
+                    participant: opts.agent_name.clone(),
+                    turn_index: turn_idx,
+                };
+                // Run collectors off the async runtime; a panicking collector
+                // degrades to "inject nothing this turn", never kills the run.
+                let assembly = tokio::task::spawn_blocking(move || pipeline.run(&ctx))
+                    .await
+                    .unwrap_or_default();
+                for m in assembly.once {
+                    messages.push(m); // persist once-delivered injections
+                }
+                let mut tm = messages.clone();
+                tm.extend(assembly.every_turn); // transient for this turn only
+                tm
+            };
             let mut req = LlmRequest {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
-                messages: messages.clone(),
+                messages: turn_messages,
                 max_tokens: opts.limits.output.tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
@@ -1574,7 +1468,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                     // returns; a dropped partial is never committed.
                     tokio::select! {
                         r = opts.provider.stream(&req, &mut quiet) => match r {
-                            Ok(x) => CallStep::Ok(x),
+                            Ok(x) => CallStep::Ok(Box::new(x)),
                             Err(e) => CallStep::Err(e),
                         },
                         _ = wait_pause(&pause) => CallStep::Paused,
@@ -1641,7 +1535,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                 }
                             }
                             match result {
-                                Ok(x) => CallStep::Ok(x),
+                                Ok(x) => CallStep::Ok(Box::new(x)),
                                 Err(e) => CallStep::Err(e),
                             }
                         }
@@ -1703,7 +1597,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                         // When no useful cap is left, it falls through to the
                         // overflow handling below (compaction).
                         if !output_cap_lowered {
-                            if let Some((cap, lowered)) = parse_output_cap_overflow(&e_str)
+                            if let Some((cap, lowered)) = output_cap_overflow_of(&e)
                                 .and_then(|c| Some((c, c.lowered_max_tokens()?)))
                             {
                                 use rupu_providers::model_limits::group_thousands;
@@ -1724,7 +1618,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                                 continue;
                             }
                         }
-                        if let Some(overflow) = parse_context_overflow(&e_str) {
+                        if let Some(overflow) = context_overflow_of(&e) {
                             // Learn the real limit, then compact once per turn
                             // (spec §7).
                             if !overflow_compacted {
@@ -1863,7 +1757,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
             // was committed for this turn, so the transcript ends at the last
             // complete message and is ready to seed a resume.
             let resp: LlmResponse = match call_outcome {
-                CallOutcome::Response(r) => r,
+                CallOutcome::Response(r) => *r,
                 CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
             // I-48: reasoning tokens (Gemini's thoughtsTokenCount, reported
@@ -2109,15 +2003,7 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 turn_idx,
                 tokens_in: Some(resp.usage.input_tokens as u64),
                 tokens_out: Some(billable_output_tokens),
-                stop_reason: resp.stop_reason.as_ref().map(|s| {
-                    match s {
-                        StopReason::EndTurn => "end_turn",
-                        StopReason::MaxTokens => "max_tokens",
-                        StopReason::StopSequence => "stop_sequence",
-                        StopReason::ToolUse => "tool_use",
-                    }
-                    .to_string()
-                }),
+                stop_reason: Some(resp.stop.wire_value_or_reason()),
                 response_id: {
                     let id = resp.id.trim();
                     if id.is_empty() {
@@ -2342,6 +2228,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2444,6 +2331,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: Some(vec!["read_file".to_string()]),
@@ -2567,6 +2455,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2643,6 +2532,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             codename: Some("jade-reef/heron#3".into()),
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2741,6 +2631,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2817,6 +2708,7 @@ mod on_tool_call_tests {
 
         let opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2915,6 +2807,7 @@ mod on_tool_call_tests {
 
             let opts = AgentRunOpts {
                 seed_source: None,
+                collectors: Vec::new(),
                 agent_name: "test-agent".into(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -3073,14 +2966,19 @@ mod retry_tests {
             "bad chunk".into()
         )));
         assert!(is_retryable_provider_error(&E::Json("truncated".into())));
-        assert!(is_retryable_provider_error(&E::Api {
-            status: 503,
-            message: "unavailable".into()
-        }));
-        assert!(is_retryable_provider_error(&E::Api {
-            status: 429,
-            message: "slow down".into()
-        }));
+        assert!(is_retryable_provider_error(&E::api(
+            "mock",
+            503,
+            "unavailable"
+        )));
+        assert!(is_retryable_provider_error(&E::api(
+            "mock",
+            429,
+            "slow down"
+        )));
+        assert!(is_retryable_provider_error(&E::IncompleteStream(
+            "no message_stop".into()
+        )));
     }
 
     #[test]
@@ -3089,17 +2987,14 @@ mod retry_tests {
         assert!(!is_retryable_provider_error(&E::AuthConfig(
             "oracle: unknown provider: oracle".into()
         )));
-        assert!(!is_retryable_provider_error(&E::BadRequest {
-            message: "max_tokens too large".into()
-        }));
-        assert!(!is_retryable_provider_error(&E::Api {
-            status: 400,
-            message: "bad request".into()
-        }));
-        assert!(!is_retryable_provider_error(&E::Api {
-            status: 404,
-            message: "no model".into()
-        }));
+        assert!(!is_retryable_provider_error(&E::api(
+            "mock",
+            400,
+            "max_tokens too large"
+        )));
+        assert!(!is_retryable_provider_error(&E::api(
+            "mock", 404, "no model"
+        )));
     }
 
     #[test]
@@ -3114,10 +3009,7 @@ mod retry_tests {
 
 #[cfg(test)]
 mod context_trim_tests {
-    use super::{
-        parse_context_overflow, parse_output_cap_overflow, trim_oldest_exchange, OutputCapOverflow,
-        Overflow,
-    };
+    use super::trim_oldest_exchange;
     use rupu_providers::types::{ContentBlock, Message, Role};
 
     fn user_msg(text: &str) -> Message {
@@ -3199,180 +3091,6 @@ mod context_trim_tests {
         assert_eq!(trim_oldest_exchange(&mut msgs), 0);
         assert_eq!(msgs.len(), 3, "no further shrinkage when len < 4");
     }
-
-    #[test]
-    fn overflow_formats_parse_tokens_and_max() {
-        let cases = [
-            (
-                r#"bad request: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 maximum"}}"#,
-                Some(215_000),
-                Some(200_000),
-            ),
-            (
-                "API error 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130500 tokens.",
-                Some(130_500),
-                Some(128_000),
-            ),
-            (
-                "API error 400: Input length (140000) exceeds model's maximum context length (131072).",
-                Some(140_000),
-                Some(131_072),
-            ),
-            (
-                "bad request: The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).",
-                Some(1_100_000),
-                Some(1_048_576),
-            ),
-            ("prompt is too long for the model", None, None),
-            ("too many tokens in request", None, None),
-            ("exceeds context window limit", None, None),
-            ("PROMPT IS TOO LONG", None, None), // case-insensitive
-        ];
-        for (msg, tokens, max) in cases {
-            assert_eq!(
-                parse_context_overflow(msg),
-                Some(Overflow { tokens, max }),
-                "{msg}"
-            );
-        }
-    }
-
-    /// Anthropic's pre-4.5 validation error: `input + max_tokens > window`.
-    /// Verbatim wording from real API responses quoted in
-    /// anthropics/claude-code#42 and #228 (numbers invented).
-    const ANTHROPIC_INPUT_PLUS_MAX_TOKENS: &str = r#"API error 400: {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 183500 + 20000 > 201000, decrease input length or `max_tokens` and try again"}}"#;
-
-    #[test]
-    fn input_plus_max_tokens_format_parses_all_three_numbers() {
-        assert_eq!(
-            parse_output_cap_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
-            Some(OutputCapOverflow {
-                input: 183_500,
-                max_tokens: 20_000,
-                window: 201_000,
-            })
-        );
-        // Thousands separators, and case-insensitive.
-        assert_eq!(
-            parse_output_cap_overflow(
-                "INPUT LENGTH AND `MAX_TOKENS` EXCEED CONTEXT LIMIT: 1,000 + 2,000 > 2,500"
-            ),
-            Some(OutputCapOverflow {
-                input: 1_000,
-                max_tokens: 2_000,
-                window: 2_500,
-            })
-        );
-        // Not this format.
-        assert_eq!(
-            parse_output_cap_overflow("prompt is too long: 215000 tokens > 200000 maximum"),
-            None
-        );
-        // The format with its numbers missing is not usable for lowering.
-        assert_eq!(
-            parse_output_cap_overflow("input length and `max_tokens` exceed context limit"),
-            None
-        );
-    }
-
-    /// `input + max_tokens > window` lowers the output cap to
-    /// `window − input − 1000`, floor 1024; below the floor there is nothing
-    /// to lower to.
-    #[test]
-    fn input_plus_max_tokens_lowered_cap_keeps_a_margin_and_a_floor() {
-        let c = |input, window| OutputCapOverflow {
-            input,
-            max_tokens: 20_000,
-            window,
-        };
-        assert_eq!(c(183_500, 201_000).lowered_max_tokens(), Some(16_500));
-        assert_eq!(
-            c(100, 2_124).lowered_max_tokens(),
-            Some(1_024),
-            "exactly the floor"
-        );
-        assert_eq!(c(100, 2_123).lowered_max_tokens(), None, "below the floor");
-        assert_eq!(
-            c(205_000, 201_000).lowered_max_tokens(),
-            None,
-            "input alone overflows"
-        );
-    }
-
-    /// The same error, when the cap cannot be lowered, is still an overflow:
-    /// the input count is known, the input LIMIT is not (the window `C`
-    /// counts output too), so no max.
-    #[test]
-    fn input_plus_max_tokens_is_an_overflow_without_an_input_max() {
-        assert_eq!(
-            parse_context_overflow(ANTHROPIC_INPUT_PLUS_MAX_TOKENS),
-            Some(Overflow {
-                tokens: Some(183_500),
-                max: None
-            })
-        );
-    }
-
-    /// GitHub Copilot (CAPI) `model_max_prompt_tokens_exceeded`. Verbatim
-    /// wording from microsoft/vscode `extensions/copilot/test/inline/
-    /// inlineEditCode.stest.ts` (the vscode-copilot-chat sources).
-    #[test]
-    fn copilot_prompt_limit_format_parses_tokens_and_max() {
-        assert_eq!(
-            parse_context_overflow(
-                r#"API error 400: {"error":{"message":"prompt token count of 13613 exceeds the limit of 12288","code":"model_max_prompt_tokens_exceeded"}}"#
-            ),
-            Some(Overflow {
-                tokens: Some(13_613),
-                max: Some(12_288)
-            })
-        );
-    }
-
-    /// Anthropic's extra-usage 429 is triggered by the 1M beta header, not by
-    /// the request's size (see the `anthropic-beta` comment in
-    /// rupu-providers/src/anthropic.rs), so it is no overflow: compacting
-    /// cannot make the same request acceptable. The client turns it into
-    /// `ProviderError::LongContextUnavailable`, handled on its own.
-    #[test]
-    fn long_context_entitlement_429_is_not_an_overflow() {
-        assert_eq!(
-            parse_context_overflow(
-                "API error 429: Extra usage is required for long context requests"
-            ),
-            None
-        );
-    }
-
-    /// The Gemini arm needs the "exceeds" verb: a message that merely
-    /// mentions an input token count is not an overflow.
-    #[test]
-    fn gemini_arm_requires_exceeds() {
-        assert_eq!(
-            parse_context_overflow(
-                "API error 500: internal error (input token count 1200, output token count 30)"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn overflow_ignores_unrelated_errors() {
-        for msg in ["network error", "invalid api key", "rate limited"] {
-            assert_eq!(parse_context_overflow(msg), None);
-        }
-    }
-
-    #[test]
-    fn overflow_numbers_accept_thousands_separators() {
-        assert_eq!(
-            parse_context_overflow("prompt is too long: 215,000 tokens > 200,000 maximum"),
-            Some(Overflow {
-                tokens: Some(215_000),
-                max: Some(200_000)
-            })
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3422,6 +3140,20 @@ pub enum ScriptedTurn {
         content: Vec<ContentBlock>,
         stop: StopReason,
     },
+    /// A reply carrying a full [`Stop`] (reason, the provider's wire value,
+    /// refusal detail), for scripting outcomes the bare [`StopReason`]
+    /// variants cannot express.
+    Reply {
+        content: Vec<ContentBlock>,
+        stop: Stop,
+        #[serde(default)]
+        usage: Usage,
+    },
+    /// A structured provider error body, surfaced as
+    /// `ProviderError::Reply`.
+    ReplyError {
+        body: ApiErrorBody,
+    },
     ProviderError(String),
     /// The provider panics mid-send with this message: for a caller's
     /// handling of a task that panicked (a workflow runner's, say).
@@ -3436,13 +3168,27 @@ fn default_mock_tokens() -> u32 {
 /// in `rupu-agent` and (later) `rupu-cli`.
 pub struct MockProvider {
     script: std::sync::Mutex<std::collections::VecDeque<ScriptedTurn>>,
+    provider_id: rupu_providers::ProviderId,
 }
 
 impl MockProvider {
     pub fn new(turns: Vec<ScriptedTurn>) -> Self {
         Self {
             script: std::sync::Mutex::new(turns.into()),
+            provider_id: rupu_providers::ProviderId::Anthropic,
         }
+    }
+
+    /// Report a different provider id (default `Anthropic`), for tests of
+    /// provider-specific handling.
+    pub fn with_provider_id(mut self, id: rupu_providers::ProviderId) -> Self {
+        self.provider_id = id;
+        self
+    }
+
+    /// The label recorded on every synthetic stop this mock builds.
+    fn provider_label(&self) -> &'static str {
+        "mock"
     }
 }
 
@@ -3452,6 +3198,7 @@ impl LlmProvider for MockProvider {
         &mut self,
         _req: &LlmRequest,
     ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+        let label = self.provider_label();
         let next = {
             let mut q = self.script.lock().unwrap();
             q.pop_front()
@@ -3471,6 +3218,20 @@ impl LlmProvider for MockProvider {
                 Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
             }
             ScriptedTurn::Panic(message) => panic!("{message}"),
+            ScriptedTurn::Reply {
+                content,
+                stop,
+                usage,
+            } => Ok(LlmResponse {
+                id: "mock".to_string(),
+                model: "mock-1".to_string(),
+                content,
+                stop,
+                usage,
+            }),
+            ScriptedTurn::ReplyError { body } => {
+                Err(rupu_providers::ProviderError::Reply(Box::new(body)))
+            }
             ScriptedTurn::AssistantText {
                 text,
                 stop,
@@ -3480,7 +3241,7 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, label),
                 usage: Usage {
                     input_tokens,
                     output_tokens,
@@ -3491,7 +3252,7 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content,
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, label),
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -3506,14 +3267,14 @@ impl LlmProvider for MockProvider {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content,
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, label),
                 usage,
             }),
             ScriptedTurn::AssistantTextWithUsage { text, stop, usage } => Ok(LlmResponse {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
-                stop_reason: Some(stop),
+                stop: Stop::synthetic(stop, label),
                 usage,
             }),
             ScriptedTurn::AssistantToolUse {
@@ -3536,7 +3297,7 @@ impl LlmProvider for MockProvider {
                     id: "mock".to_string(),
                     model: "mock-1".to_string(),
                     content: blocks,
-                    stop_reason: Some(stop),
+                    stop: Stop::synthetic(stop, label),
                     usage: Usage {
                         input_tokens: 1,
                         output_tokens: 1,
@@ -3561,7 +3322,7 @@ impl LlmProvider for MockProvider {
     }
 
     fn provider_id(&self) -> rupu_providers::ProviderId {
-        rupu_providers::ProviderId::Anthropic
+        self.provider_id
     }
 }
 
@@ -3881,6 +3642,7 @@ mod compaction_tests {
 
         let mut opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4200,7 +3962,7 @@ mod pause_tests {
                 content: vec![ContentBlock::Text {
                     text: "unused".into(),
                 }],
-                stop_reason: Some(StopReason::EndTurn),
+                stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                 usage: Usage::default(),
             })
         }
@@ -4222,7 +3984,7 @@ mod pause_tests {
                 content: vec![ContentBlock::Text {
                     text: "the full answer".into(),
                 }],
-                stop_reason: Some(StopReason::EndTurn),
+                stop: Stop::synthetic(StopReason::EndTurn, "mock"),
                 usage: Usage::default(),
             })
         }
@@ -4246,6 +4008,7 @@ mod pause_tests {
     ) -> AgentRunOpts {
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4585,6 +4348,7 @@ mod reasoning_tests {
     ) -> AgentRunOpts {
         AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,

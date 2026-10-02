@@ -31,6 +31,7 @@ fn opts_for(
 ) -> AgentRunOpts {
     AgentRunOpts {
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: "net-assessor".into(),
         agent_system_prompt: "You assess hosts.".into(),
         agent_tools,
@@ -161,4 +162,35 @@ async fn tool_is_absent_when_not_granted() {
         !paths.findings.exists(),
         "ungranted agent must not be able to write findings"
     );
+}
+
+#[tokio::test]
+async fn a_run_stream_receives_the_finding_with_its_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let stream = tmp.path().join("runs/run_findings_test/coverage.jsonl");
+    rupu_coverage::write_stream_begin(&stream, "run_findings_test").unwrap();
+
+    let mut opts = opts_for(
+        &workspace,
+        Some(vec!["report_finding".to_string()]),
+        call_then_stop(),
+    );
+    opts.tool_context.coverage_stream = Some(stream.clone());
+    run_agent(opts).await.expect("agent run should succeed");
+
+    let lines: Vec<rupu_coverage::StreamLine> = std::fs::read_to_string(&stream)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(matches!(lines[0], rupu_coverage::StreamLine::Begin { .. }));
+    let found = lines.iter().any(|l| {
+        matches!(
+            l,
+            rupu_coverage::StreamLine::Findings { scope_name, record }
+                if scope_name == "net-assessor" && record.severity == rupu_coverage::Severity::Medium
+        )
+    });
+    assert!(found, "the finding must reach the stream: {lines:?}");
 }

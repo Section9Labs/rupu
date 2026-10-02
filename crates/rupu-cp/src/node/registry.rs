@@ -34,6 +34,24 @@ pub enum NodeError {
     Offline,
 }
 
+// ── Artifact pulls ────────────────────────────────────────────────────────────
+
+/// One message of an in-flight artifact pull, routed from the tunnel's read
+/// pump to the connector waiting on it.
+#[derive(Debug)]
+pub enum PullMsg {
+    Chunk {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    /// End of the pull; `Some` carries the node's error.
+    Done(Option<String>),
+}
+
+/// Per-pull channel depth: how many chunks the read pump may run ahead of a
+/// waiter that is still writing earlier ones to disk.
+const PULL_CHANNEL_CAPACITY: usize = 8;
+
 // ── NodeConn ──────────────────────────────────────────────────────────────────
 
 /// A live connection to a remote node.
@@ -50,6 +68,9 @@ pub struct NodeConn {
     capabilities: Vec<String>,
     /// The node's `Hello.rupu_version`, for refusal messages.
     rupu_version: Option<String>,
+    /// In-flight artifact pulls on this connection, by request id: where
+    /// the read pump delivers each `ArtifactChunk` / `ArtifactPullDone`.
+    pulls: Mutex<HashMap<String, tokio::sync::mpsc::Sender<PullMsg>>>,
 }
 
 impl NodeConn {
@@ -61,6 +82,7 @@ impl NodeConn {
             last_seen: Mutex::new(now),
             capabilities,
             rupu_version,
+            pulls: Mutex::new(HashMap::new()),
         }
     }
 
@@ -80,6 +102,50 @@ impl NodeConn {
     /// Returns `Err(NodeError::Offline)` if the node's receiver has been dropped.
     pub async fn send(&self, f: Frame) -> Result<(), NodeError> {
         self.tx.send(f).await.map_err(|_| NodeError::Offline)
+    }
+
+    /// Register `req` and return the receiver its chunks arrive on.
+    pub fn begin_pull(&self, req: &str) -> tokio::sync::mpsc::Receiver<PullMsg> {
+        let (tx, rx) = tokio::sync::mpsc::channel(PULL_CHANNEL_CAPACITY);
+        self.pulls
+            .lock()
+            .expect("pulls lock poisoned")
+            .insert(req.to_string(), tx);
+        rx
+    }
+
+    /// Forget `req` (the waiting side finished or gave up).
+    pub fn end_pull(&self, req: &str) {
+        self.pulls.lock().expect("pulls lock poisoned").remove(req);
+    }
+
+    /// Deliver `msg` to `req`'s waiter; dropped if nobody is waiting.
+    ///
+    /// Awaits room in the waiter's bounded channel (back-pressure on the read
+    /// pump), but never indefinitely: a waiter drops its receiver on every
+    /// exit, which fails the send at once.
+    pub async fn route_pull(&self, req: &str, msg: PullMsg) {
+        let tx = self
+            .pulls
+            .lock()
+            .expect("pulls lock poisoned")
+            .get(req)
+            .cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(msg).await;
+        }
+    }
+
+    /// The tunnel closed: end every in-flight pull. Each waiter's channel
+    /// closes, so it fails at once instead of waiting out its idle timeout.
+    pub fn close_pulls(&self) {
+        self.pulls.lock().expect("pulls lock poisoned").clear();
+    }
+
+    /// How many pulls are registered on this connection.
+    #[cfg(test)]
+    pub(crate) fn pulls_in_flight(&self) -> usize {
+        self.pulls.lock().expect("pulls lock poisoned").len()
     }
 }
 
@@ -287,5 +353,74 @@ mod tests {
         drop(rx);
         let result = conn.send(Frame::Ping {}).await;
         assert!(matches!(result, Err(NodeError::Offline)));
+    }
+
+    fn bare_conn() -> NodeConn {
+        let (tx, _rx) = mpsc::channel::<Frame>(8);
+        NodeConn::new(tx, Vec::new(), None)
+    }
+
+    /// A pull's messages reach only its own waiter; a `req` nobody began is
+    /// dropped.
+    #[tokio::test]
+    async fn route_pull_delivers_only_to_the_begun_request() {
+        let conn = bare_conn();
+        let mut a = conn.begin_pull("a");
+        let mut b = conn.begin_pull("b");
+        conn.route_pull(
+            "a",
+            PullMsg::Chunk {
+                seq: 0,
+                data: vec![1, 2],
+            },
+        )
+        .await;
+        conn.route_pull("nobody", PullMsg::Done(None)).await;
+        assert!(matches!(
+            a.try_recv(),
+            Ok(PullMsg::Chunk { seq: 0, ref data }) if data == &[1, 2]
+        ));
+        assert!(a.try_recv().is_err());
+        assert!(b.try_recv().is_err());
+    }
+
+    /// `end_pull` forgets the request: its waiter sees the channel close and
+    /// later deliveries for it are dropped.
+    #[tokio::test]
+    async fn end_pull_forgets_the_request() {
+        let conn = bare_conn();
+        let mut rx = conn.begin_pull("a");
+        conn.end_pull("a");
+        assert_eq!(conn.pulls_in_flight(), 0);
+        conn.route_pull("a", PullMsg::Done(None)).await;
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// The tunnel closing ends every in-flight pull at once.
+    #[tokio::test]
+    async fn close_pulls_ends_every_waiter() {
+        let conn = bare_conn();
+        let mut a = conn.begin_pull("a");
+        let mut b = conn.begin_pull("b");
+        conn.close_pulls();
+        assert!(a.recv().await.is_none());
+        assert!(b.recv().await.is_none());
+        assert_eq!(conn.pulls_in_flight(), 0);
+    }
+
+    /// A waiter that dropped its receiver never blocks the router, however
+    /// many messages still arrive for it.
+    #[tokio::test]
+    async fn route_pull_to_a_dropped_waiter_never_blocks() {
+        let conn = bare_conn();
+        drop(conn.begin_pull("a"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for seq in 0..64 {
+                conn.route_pull("a", PullMsg::Chunk { seq, data: vec![0] })
+                    .await;
+            }
+        })
+        .await
+        .expect("route_pull blocked on a dropped waiter");
     }
 }

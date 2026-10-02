@@ -534,6 +534,11 @@ tab-completion for session ids and transcript run ids.
 Transcript archive/delete is only available for standalone runs. If a transcript is owned
 by a session, manage it through `rupu session archive|delete` instead.
 
+A standalone run that never finished (a failed pre-flight, a killed run) leaves
+`$RUPU_HOME/runs/<run-id>/` holding only its coverage stream, with no `run.json`. That
+directory follows the transcript: `archive` moves it to `$RUPU_HOME/runs-archive/`, and
+`delete`, `prune` and `cleanup` remove it.
+
 Retention defaults:
 
 - if `--older-than` is omitted, archived session prune uses `[storage].archived_session_retention`

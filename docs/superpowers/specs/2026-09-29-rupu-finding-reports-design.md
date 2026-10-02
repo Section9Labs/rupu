@@ -246,12 +246,14 @@ sweep followed by a deep dive).
   Returns a file, or a zip of per-finding files when `split: true`.
 - `make macos-fixtures` regenerates the new DTOs. The drift test covers them.
 
-Deviations as built (Plan 2): artifact errors use the CP's standard
-`{"error": …}` body with the usual status (`404`/`409`), not
-`{"unavailable": …}`. An artifact with a recorded `host` answers `404` — no
-code sets `host` yet and there is no `pull_finding_artifact`, so artifacts from
-remote/placed units are not viewable in the CP (tracked in `TODO.md`). Claim
-staleness hashes files up to 64 MiB only (larger reports `unknown`).
+Deviations as built (Plan 2): artifact errors for a path on this machine use
+the CP's standard `{"error": …}` body with the usual status (`404`/`409`), not
+`{"unavailable": …}`. A remote artifact (`external` with a recorded `host`) is
+pulled from that host on first view per
+`docs/superpowers/specs/2026-09-30-rupu-remote-findings-transport-design.md`
+(§B1–B2, built by Plan B), and its failures answer `404` with
+`{"unavailable": "<reason>"}`. Claim staleness hashes files up to 64 MiB only
+(larger reports `unknown`).
 
 ## Rendering
 

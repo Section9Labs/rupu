@@ -4562,6 +4562,7 @@ dependencies = [
  "assert_fs",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "clap_complete",
@@ -4677,6 +4678,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "fs2",
@@ -4738,6 +4740,20 @@ dependencies = [
  "typst-layout",
  "typst-pdf",
  "zip",
+]
+
+[[package]]
+name = "rupu-fleet"
+version = "0.81.0"
+dependencies = [
+ "chrono",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

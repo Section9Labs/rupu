@@ -62,6 +62,13 @@ async fn poll_bucket_run_mirrors_and_finishes() {
         .await
         .unwrap();
 
+    // coverage.0001.jsonl — the run's coverage stream, as the worker uploads it.
+    let coverage_lines = "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_BUCKETPOLL0001\"}\n";
+    bucket
+        .put_result(run_id, "coverage.0001.jsonl", coverage_lines.as_bytes())
+        .await
+        .unwrap();
+
     // run.json — serialise the current mirror record (worker_id = host_id).
     let current_record = store.load(run_id).unwrap();
     let run_json_bytes = serde_json::to_vec(&current_record).unwrap();
@@ -102,6 +109,13 @@ async fn poll_bucket_run_mirrors_and_finishes() {
         "run must be Completed after first poll"
     );
 
+    // The coverage object was classified and mirrored, not skipped as unknown.
+    assert_eq!(
+        std::fs::read_to_string(mirror.coverage_path(run_id)).expect("coverage.jsonl mirrored"),
+        coverage_lines,
+        "the bucket's coverage result must land in the mirrored coverage.jsonl"
+    );
+
     // ── Second poll (idempotency) ────────────────────────────────────────────
     // Re-use the SAME consumed set.  All result keys are already in it, so
     // no new lines must be appended, even though the bucket still has the
@@ -114,6 +128,13 @@ async fn poll_bucket_run_mirrors_and_finishes() {
     assert!(
         done2,
         "second poll must still return true (finished marker persists)"
+    );
+
+    // Coverage is likewise not double-appended.
+    assert_eq!(
+        std::fs::read_to_string(mirror.coverage_path(run_id)).unwrap(),
+        coverage_lines,
+        "second poll must NOT double-append coverage"
     );
 
     // Line count must be unchanged — no double-append.

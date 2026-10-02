@@ -113,6 +113,13 @@ pub enum HostConnectorError {
     /// A bad request or a local precondition failure (no launcher, wrong mode).
     #[error("invalid: {0}")]
     Invalid(String),
+    /// A failure on THIS side that the caller did not cause and cannot fix by
+    /// changing its request — an I/O error reading the coordinator's own run
+    /// store, say. Distinct from [`Self::Invalid`] (the caller's mistake →
+    /// HTTP 400) so a server-side fault is never reported as a bad request;
+    /// the API layer maps this to 500.
+    #[error("internal error: {0}")]
+    Internal(String),
     /// The operation is not supported on this transport (e.g. workspace sync
     /// over a Bucket/Tunnel host).
     #[error("unsupported on this transport: {0}")]
@@ -345,6 +352,27 @@ pub trait HostConnector: Send + Sync {
             "transcript pull is not supported for this host type".into(),
         ))
     }
+
+    /// The coverage stream (`runs/<run_id>/coverage.jsonl`) the executing
+    /// host wrote for `run_id`, for the coordinator to merge (spec
+    /// 2026-09-30-rupu-remote-findings-transport-design.md §A2), and whether
+    /// the transport guarantees it is all of it (see [`CoverageRead`]).
+    /// Empty bytes ⇒ no stream arrived. Deliberately no default: every
+    /// transport must say how it delivers this, or refuse.
+    async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError>;
+
+    /// Stream the blob `sha256` from this host's finding-artifact store into
+    /// `dest` (a temp file the caller created inside the coordinator's
+    /// store), aborting once more than `max_bytes` (the recorded size) arrive.
+    /// The caller verifies size + sha256 before using it (spec
+    /// 2026-09-30-rupu-remote-findings-transport-design.md §B1). No default:
+    /// every transport must say how, or refuse.
+    async fn pull_finding_artifact(
+        &self,
+        sha256: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<(), HostConnectorError>;
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -867,6 +895,164 @@ pub(crate) async fn mirror_stream_run_events(
     open_run_events_tail(run_store, run_id).await
 }
 
+/// Whether `id` has the shape of a run id this system mints: `run_` followed
+/// by ASCII alphanumerics and `_` only. The ONE definition of "safe to use as
+/// a run-store path component" — no separators, no `.`, so it can neither
+/// traverse out of the runs root nor smuggle shell metacharacters. Every
+/// connector, the mirror and the coverage route validate an id they did not
+/// mint with this.
+pub(crate) fn valid_run_id(id: &str) -> bool {
+    id.starts_with("run_") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A unit's coverage stream as its host connector read it
+/// ([`HostConnector::unit_coverage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageRead {
+    /// The stream; empty ⇒ no stream arrived.
+    pub bytes: Vec<u8>,
+    /// Whether the transport guarantees these are every byte the run wrote,
+    /// PROVIDED the run was terminal when they were read: true for a local
+    /// run (its own file), a tunnel node (its coverage frames precede
+    /// `RunFinished` on one socket), a bucket worker (its finished marker
+    /// follows its uploads) and an HTTP remote (its own local file); for SSH
+    /// only once the tail pump's terminal pull replaced the mirrored copy
+    /// with the host's file. A read taken while the run may still be running
+    /// is a snapshot whatever this says — the caller knows which it took.
+    pub complete: bool,
+}
+
+/// A run's coverage stream read from the coordinator's own run store: the
+/// local host's file, or a mirror-backed transport's mirrored copy.
+///
+/// Async because the stream can be large and the callers are request
+/// handlers and connector methods on the async runtime: the read goes through
+/// `tokio::fs` (the blocking pool), never a bare `std::fs::read`. A run that
+/// wrote no stream reads as empty; a malformed id is [`HostConnectorError::Invalid`]
+/// (the caller's fault); any other I/O failure is
+/// [`HostConnectorError::Internal`] (ours).
+pub async fn mirror_unit_coverage(
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<Vec<u8>, HostConnectorError> {
+    if !valid_run_id(run_id) {
+        return Err(HostConnectorError::Invalid(format!(
+            "{run_id:?} is not a valid run id"
+        )));
+    }
+    match tokio::fs::read(rupu_coverage::stream_path(&run_store.root, run_id)).await {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(HostConnectorError::Internal(format!(
+            "read coverage stream for {run_id}: {e}"
+        ))),
+    }
+}
+
+/// `Invalid` unless `sha256` is a store key (64 lowercase hex).
+pub fn validate_sha256(sha256: &str) -> Result<(), HostConnectorError> {
+    if rupu_coverage::report::is_sha256_hex(sha256) {
+        Ok(())
+    } else {
+        Err(HostConnectorError::Invalid(format!(
+            "{sha256:?} is not a sha256 (64 lowercase hex characters)"
+        )))
+    }
+}
+
+/// Copy the blob at `src` to `dest`, refusing a source that is missing or not
+/// a regular file (`NotFound`) or larger than `max_bytes` (`Invalid`).
+///
+/// `src` is opened once — non-blocking, so a FIFO swapped into the store
+/// cannot park the thread — and the type and size are read off that handle,
+/// then the bytes come from the same handle. A file that grows after the size
+/// check still cannot overshoot: the copy stops one byte past `max_bytes` and
+/// fails. On failure `dest` may be left partially written (or absent); the
+/// caller owns its cleanup.
+pub async fn copy_blob_capped(
+    src: &Path,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<(), HostConnectorError> {
+    let not_in_store = || {
+        HostConnectorError::NotFound(format!(
+            "artifact is not in this host's store ({})",
+            src.display()
+        ))
+    };
+    let path = src.to_path_buf();
+    let opened = tokio::task::spawn_blocking(move || crate::api::fs_open::open_regular_file(&path))
+        .await
+        .map_err(|e| HostConnectorError::Invalid(format!("opening the stored blob failed: {e}")))?;
+    let file = match opened {
+        Ok(f) => f,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Err(not_in_store())
+        }
+        Err(e) => {
+            return Err(HostConnectorError::Invalid(format!(
+                "opening the stored blob failed: {e}"
+            )))
+        }
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| HostConnectorError::Invalid(format!("reading the stored blob failed: {e}")))?
+        .len();
+    if len > max_bytes {
+        return Err(HostConnectorError::Invalid(format!(
+            "stored blob is {len} bytes, more than its recorded {max_bytes}"
+        )));
+    }
+    copy_reader_capped(tokio::fs::File::from_std(file), dest, max_bytes).await
+}
+
+/// Write at most `max_bytes` from `reader` to `dest` (created or truncated);
+/// `Invalid` if the reader has more. Reads one byte past the cap to tell
+/// "exactly `max_bytes`" from "more", never further, and never writes the
+/// over-cap bytes. Each failure says which side failed: the coordinator's
+/// `dest` ("local write failed"), the source ("reading the stored blob
+/// failed"), or the size cap.
+async fn copy_reader_capped<R>(
+    reader: R,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<(), HostConnectorError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let write_err =
+        |e: std::io::Error| HostConnectorError::Invalid(format!("local write failed: {e}"));
+    let read_err = |e: std::io::Error| {
+        HostConnectorError::Invalid(format!("reading the stored blob failed: {e}"))
+    };
+    let mut out = tokio::fs::File::create(dest).await.map_err(write_err)?;
+    let mut limited = reader.take(max_bytes.saturating_add(1));
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied: u64 = 0;
+    loop {
+        let n = limited.read(&mut buf).await.map_err(read_err)?;
+        if n == 0 {
+            break;
+        }
+        copied += n as u64;
+        if copied > max_bytes {
+            return Err(HostConnectorError::Invalid(format!(
+                "stored blob is larger than its recorded {max_bytes} bytes"
+            )));
+        }
+        out.write_all(&buf[..n]).await.map_err(write_err)?;
+    }
+    out.flush().await.map_err(write_err)?;
+    Ok(())
+}
+
 /// Read and parse a transcript `.jsonl` file into the standard
 /// `{ "events": [...], "summary": … }` shape.
 ///
@@ -975,19 +1161,9 @@ pub(crate) mod testing {
         ) -> Result<serde_json::Value, HostConnectorError> {
             match &self.run_netflow {
                 Some(Ok(v)) => Ok(v.clone()),
-                Some(Err(e)) => Err(match e {
-                    HostConnectorError::Unreachable(m) => {
-                        HostConnectorError::Unreachable(m.clone())
-                    }
-                    HostConnectorError::Unsupported(m) => {
-                        HostConnectorError::Unsupported(m.clone())
-                    }
-                    HostConnectorError::Invalid(m) => HostConnectorError::Invalid(m.clone()),
-                    HostConnectorError::NotFound(m) => HostConnectorError::NotFound(m.clone()),
-                    HostConnectorError::Unauthorized => HostConnectorError::Unauthorized,
-                    HostConnectorError::Remote(c, m) => HostConnectorError::Remote(*c, m.clone()),
-                    HostConnectorError::NotJson(m) => HostConnectorError::NotJson(m.clone()),
-                }),
+                // `HostConnectorError` is `Clone`; copying it keeps this stub
+                // exhaustive-by-construction as variants are added.
+                Some(Err(e)) => Err(e.clone()),
                 None => Err(HostConnectorError::Unsupported("run netflow".into())),
             }
         }
@@ -1052,6 +1228,20 @@ pub(crate) mod testing {
             _path: &str,
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("StubConnector: get_transcript not configured")
+        }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<CoverageRead, HostConnectorError> {
+            Ok(CoverageRead {
+                bytes: Vec::new(),
+                complete: true,
+            })
+        }
+        async fn pull_finding_artifact(
+            &self,
+            _sha256: &str,
+            _dest: &std::path::Path,
+            _max_bytes: u64,
+        ) -> Result<(), HostConnectorError> {
+            Err(HostConnectorError::Unsupported("test double".into()))
         }
         async fn proxy_get_json(
             &self,
@@ -1124,6 +1314,23 @@ pub(crate) mod testing {
             ) -> Result<serde_json::Value, HostConnectorError> {
                 unimplemented!()
             }
+            async fn unit_coverage(
+                &self,
+                _run_id: &str,
+            ) -> Result<CoverageRead, HostConnectorError> {
+                Ok(CoverageRead {
+                    bytes: Vec::new(),
+                    complete: true,
+                })
+            }
+            async fn pull_finding_artifact(
+                &self,
+                _sha256: &str,
+                _dest: &std::path::Path,
+                _max_bytes: u64,
+            ) -> Result<(), HostConnectorError> {
+                Err(HostConnectorError::Unsupported("test double".into()))
+            }
             async fn proxy_get_json(
                 &self,
                 _p: &str,
@@ -1143,5 +1350,182 @@ pub(crate) mod testing {
             Err(HostConnectorError::Unsupported(_))
         ));
         let _ = FeedGuard::noop();
+    }
+
+    #[tokio::test]
+    async fn mirror_unit_coverage_reads_the_run_stream_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        assert_eq!(
+            mirror_unit_coverage(&store, "run_X1").await.unwrap(),
+            Vec::<u8>::new()
+        );
+        let p = rupu_coverage::stream_path(&store.root, "run_X1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"line\n").unwrap();
+        assert_eq!(
+            mirror_unit_coverage(&store, "run_X1").await.unwrap(),
+            b"line\n"
+        );
+        assert!(matches!(
+            mirror_unit_coverage(&store, "../etc").await,
+            Err(HostConnectorError::Invalid(_))
+        ));
+    }
+
+    /// An I/O failure reading a stream that exists is OUR fault, not a bad
+    /// request: it must not be classified `Invalid` (which the API turns into
+    /// a 400).
+    #[tokio::test]
+    async fn mirror_unit_coverage_classifies_an_unreadable_stream_as_internal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        // A directory where the stream file belongs: present, but unreadable.
+        std::fs::create_dir_all(rupu_coverage::stream_path(&store.root, "run_X2")).unwrap();
+        assert!(matches!(
+            mirror_unit_coverage(&store, "run_X2").await,
+            Err(HostConnectorError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn valid_run_id_accepts_minted_ids_and_rejects_everything_else() {
+        assert!(valid_run_id("run_01HXYZ"));
+        assert!(valid_run_id(&format!("run_{}", ulid::Ulid::new())));
+        for bad in [
+            "",
+            "run",
+            "01HXYZ",
+            "Run_01X",
+            "run_a.b",
+            "run_../x",
+            "run_a/b",
+            "run_a-b",
+            "run_a b",
+            "run_a\n",
+            "run_$HOME",
+        ] {
+            assert!(!valid_run_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_blob_capped_copies_refuses_missing_and_oversize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        std::fs::write(&src, b"12345").unwrap();
+        copy_blob_capped(&src, &dest, 5).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"12345");
+        assert!(matches!(
+            copy_blob_capped(&src, &dest, 4).await,
+            Err(HostConnectorError::Invalid(_))
+        ));
+        assert!(matches!(
+            copy_blob_capped(&tmp.path().join("absent"), &dest, 5).await,
+            Err(HostConnectorError::NotFound(_))
+        ));
+        assert!(validate_sha256("../x").is_err());
+        assert!(validate_sha256(&"ab".repeat(32)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn copy_blob_capped_refuses_an_oversize_source_without_creating_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        std::fs::write(&src, b"12345").unwrap();
+        assert!(copy_blob_capped(&src, &dest, 4).await.is_err());
+        assert!(!dest.exists(), "an oversize source must not create dest");
+    }
+
+    #[tokio::test]
+    async fn copy_blob_capped_refuses_a_non_regular_source_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        // A directory sitting where a blob should be.
+        assert!(matches!(
+            copy_blob_capped(tmp.path(), &dest, 100).await,
+            Err(HostConnectorError::NotFound(_))
+        ));
+        // A FIFO has no writer: a blocking open would park here forever, so
+        // the timeout is what this assertion really checks.
+        let fifo = tmp.path().join("pipe");
+        if crate::api::fs_open::test_support::mkfifo(&fifo) {
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                copy_blob_capped(&fifo, &dest, 100),
+            )
+            .await
+            .expect("a FIFO source must be refused promptly, not waited on");
+            assert!(
+                matches!(res, Err(HostConnectorError::NotFound(_))),
+                "{res:?}"
+            );
+        }
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn copy_reader_capped_stops_one_byte_past_the_cap() {
+        // A source that keeps producing (a file that grew after the size
+        // check): the copy must stop at cap + 1 and fail, never run on.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let res = copy_reader_capped(tokio::io::repeat(7), &dest, 10).await;
+        assert!(
+            matches!(res, Err(HostConnectorError::Invalid(_))),
+            "{res:?}"
+        );
+        // Only in-cap bytes ever reach the file.
+        assert!(std::fs::metadata(&dest).unwrap().len() <= 10);
+        // Exactly at the cap is fine.
+        let ok = copy_reader_capped(&b"0123456789"[..], &dest, 10).await;
+        assert!(ok.is_ok(), "{ok:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    }
+
+    /// A reader that fails on the first read.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("disk gone")))
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_reader_capped_labels_which_side_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Source read failure.
+        let err = copy_reader_capped(FailingReader, &tmp.path().join("dest"), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m == "reading the stored blob failed: disk gone"),
+            "{err:?}"
+        );
+        // Coordinator-side destination failure (parent directory missing).
+        let err = copy_reader_capped(&b"abc"[..], &tmp.path().join("no-dir").join("dest"), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m) if m.starts_with("local write failed: ")),
+            "{err:?}"
+        );
+        // Over the cap: its own message, neither of the above.
+        let err = copy_reader_capped(&b"0123456789ab"[..], &tmp.path().join("dest"), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m == "stored blob is larger than its recorded 10 bytes"),
+            "{err:?}"
+        );
     }
 }

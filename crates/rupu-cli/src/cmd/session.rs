@@ -6871,7 +6871,8 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
                         // is "omitted".
                         raw.to_string().len()
                     }
-                    rupu_providers::types::ContentBlock::Unknown => 0,
+                    rupu_providers::types::ContentBlock::Unknown { .. }
+                    | rupu_providers::types::ContentBlock::Fallback { .. } => 0,
                 })
                 .sum::<usize>()
         })
@@ -7424,7 +7425,8 @@ async fn run_compact_request(
                         // is "omitted".
                         raw.to_string().len()
                     }
-                    rupu_providers::types::ContentBlock::Unknown => 0,
+                    rupu_providers::types::ContentBlock::Unknown { .. }
+                    | rupu_providers::types::ContentBlock::Fallback { .. } => 0,
                 })
                 .sum::<usize>()
         })
@@ -7720,6 +7722,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             codename: Some(codename.clone()),
             agent: None,
             provider: None,
+            coverage_stream: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
@@ -7842,6 +7845,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             surface_tag: Some("session".to_string()),
             pause: None,
             seed_source,
+            collectors: Vec::new(),
             codename: Some(codename.clone()),
         };
 

@@ -385,7 +385,7 @@ fn summary_schema() -> Value {
                         "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
                         "items": { "type": "object" }
                     },
-                    "label": { "type": "string", "description": "Optional human label; defaults to the kind." }
+                    "label": { "type": "string", "description": "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind)." }
                 }
             }
         }

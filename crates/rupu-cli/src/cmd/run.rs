@@ -599,6 +599,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
+    // Every `rupu run` streams its coverage to a run-scoped file so a
+    // coordinator can collect a placed unit's findings (spec
+    // 2026-09-30-rupu-remote-findings-transport-design.md §A1).
+    let coverage_stream = rupu_coverage::stream_path(&global.join("runs"), &run_id);
+
     // `--continue <agent_run_id>`: rebuild the interrupted run's conversation
     // from its transcript (recover-on-interrupt spec §1). Same transcripts
     // dir as the new run, so run it from the same project.
@@ -626,6 +631,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 }
                 match prepare_continuation(&prev_path)? {
                     Continuation::Finished { output } => {
+                        // This run records nothing, but it is still a
+                        // `rupu run`: start its stream so a coordinator reads
+                        // "nothing recorded", not "host can't stream".
+                        start_coverage_stream(&coverage_stream, &run_id);
                         println!("{output}");
                         eprintln!(
                             "run {prev} had already finished — printed its recorded answer without calling the model"
@@ -655,6 +664,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 }
             }
         };
+
+    // The begin line goes first, even if the run records nothing: its
+    // absence is how the coordinator tells "this host can't stream" from
+    // "nothing recorded". Written after the `--continue` checks, which must
+    // not touch a run's files before they pass.
+    start_coverage_stream(&coverage_stream, &run_id);
 
     // Netflow capture. Two destinations: this run's own ledger FILE
     // (`<run_id>.jsonl`, rooted at the project when one already has a
@@ -924,6 +939,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             // sub-run transcripts.
             None,
             limits_ctx.clone(),
+            Some(coverage_stream.clone()),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -957,6 +973,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             codename: Some(codename.to_string()),
             agent: None,
             provider: None,
+            coverage_stream: Some(coverage_stream.clone()),
         };
 
         let backend_id = "local_checkout".to_string();
@@ -1014,6 +1031,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 
         let mut opts = AgentRunOpts {
             seed_source: None,
+            collectors: Vec::new(),
             agent_name: spec.name.clone(),
             agent_system_prompt,
             agent_tools: spec.tools.clone(),
@@ -1584,6 +1602,18 @@ pub(crate) fn standalone_codename(
             rupu_codename::Codename::crew_only(rupu_codename::crew_for(run_id))
                 .child(rupu_codename::role_word(agent), None)
         })
+}
+
+/// Write a run's coverage-stream begin line. A failure is logged, never
+/// returned: a coverage problem must not fail the run.
+fn start_coverage_stream(coverage_stream: &std::path::Path, run_id: &str) {
+    if let Err(e) = rupu_coverage::write_stream_begin(coverage_stream, run_id) {
+        warn!(
+            error = %e,
+            path = %coverage_stream.display(),
+            "could not start this run's coverage stream; a coordinator will report its coverage as not collected"
+        );
+    }
 }
 
 #[cfg(test)]

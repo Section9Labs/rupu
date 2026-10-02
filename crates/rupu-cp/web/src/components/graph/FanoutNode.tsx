@@ -22,6 +22,7 @@ import { memberLabel, parseCodename } from '../../lib/codename';
 import { cn } from '../../lib/cn';
 import { derivedTitle } from '../codename/CrewChip';
 import { RoleBadge } from '../codename/RoleBadge';
+import WarnMark, { unitWarningSuffix } from './WarnMark';
 
 export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -69,7 +70,7 @@ function FanoutRole({ node, total }: { node: GraphNode; total: number }) {
 /** Hover title for one unit square: `leaf · agent · provider/model · state`. */
 function unitTitle(node: GraphNode, u: UnitView, stateLabel: string): string {
   const who = u.codename ? memberLabel(u.codename, node.agent, u.provider, u.model) : u.key;
-  return `${who} · ${stateLabel}`;
+  return `${who} · ${stateLabel}${unitWarningSuffix(u.warnings)}`;
 }
 
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
@@ -130,8 +131,12 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ borderColor: border, background: bg, width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className="text-meta font-bold uppercase tracking-wide" style={{ color: labelColor }}>
-          for_each · {node.id}
+        <div
+          className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide"
+          style={{ color: labelColor }}
+        >
+          <span className="truncate">for_each · {node.id}</span>
+          <WarnMark warnings={node.warnings} />
         </div>
         <div className="mt-1 text-note text-ink-mute">{message}</div>
         <Handle type="source" position={Position.Right} style={handleStyle} />
@@ -168,6 +173,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
           <span className="flex min-w-0 items-center gap-2">
             <span className="truncate">for_each · {node.id} · {total}</span>
             <FanoutRole node={node} total={total} />
+            <WarnMark warnings={node.warnings} />
           </span>
           <span className="tabular-nums">
             {done} ✓
@@ -186,7 +192,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
               type="button"
               title={unitTitle(node, u, stateStyle(colors, u.state).label)}
               onClick={() => onOpenUnit?.(node.id, u.index)}
-              className="h-[15px] w-[15px] rounded-[3px] transition-transform hover:scale-110"
+              className={cn(
+                'h-[15px] w-[15px] rounded-[3px] transition-transform hover:scale-110',
+                u.warnings?.length && 'ring-2 ring-warn ring-offset-1 ring-offset-panel',
+              )}
               style={{ background: glyphBg(colors, u.state) }}
             />
           ))}
@@ -211,7 +220,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ color: colors.get(accentKey) }}
       >
         <span className="truncate">for_each · {node.id}</span>
-        <FanoutRole node={node} total={total} />
+        <span className="flex shrink-0 items-center gap-1.5">
+          <WarnMark warnings={node.warnings} />
+          <FanoutRole node={node} total={total} />
+        </span>
       </div>
 
       <div className="mt-1 flex items-baseline gap-2">

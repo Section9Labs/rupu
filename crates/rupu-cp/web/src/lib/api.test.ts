@@ -353,6 +353,15 @@ describe('apiErrorMessage', () => {
     expect(apiErrorMessage(new ApiError(404, body, body))).toBe('finding x not found');
   });
 
+  it('extracts the reason from a JSON {"unavailable"} body, preferring "error" when both are present', () => {
+    const unavailable = JSON.stringify({ unavailable: 'host kuki: node offline' });
+    expect(apiErrorMessage(new ApiError(404, unavailable, unavailable))).toBe('host kuki: node offline');
+    const both = JSON.stringify({ error: 'bad request', unavailable: 'host kuki: node offline' });
+    expect(apiErrorMessage(new ApiError(404, both, both))).toBe('bad request');
+    const blank = JSON.stringify({ unavailable: '  ' });
+    expect(apiErrorMessage(new ApiError(404, blank, blank))).toBe(blank);
+  });
+
   it('falls back to the raw body text when it is not the {"error"} shape', () => {
     expect(apiErrorMessage(new ApiError(502, 'upstream exploded', 'upstream exploded'))).toBe('upstream exploded');
     const other = JSON.stringify({ detail: 'nope' });

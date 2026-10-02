@@ -123,10 +123,10 @@ pub fn is_retryable(e: &ProviderError) -> bool {
         return false;
     }
     match e {
-        ProviderError::RateLimited { .. }
-        | ProviderError::Transient(_)
-        | ProviderError::Http(_) => true,
-        ProviderError::Api { status, .. } => *status == 429 || *status == 529 || *status >= 500,
+        ProviderError::Reply(b) => b.is_retryable(),
+        ProviderError::Transient(_)
+        | ProviderError::Http(_)
+        | ProviderError::IncompleteStream(_) => true,
         _ => false,
     }
 }
@@ -139,12 +139,9 @@ pub fn is_retryable(e: &ProviderError) -> bool {
 /// be able to hang a run for a day.
 pub const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 
-/// Extracts `retry_after` from a `RateLimited` error, if any.
+/// Extracts the server's `Retry-After` from a reply error, if it sent one.
 fn retry_after_of(e: &ProviderError) -> Option<Duration> {
-    match e {
-        ProviderError::RateLimited { retry_after } => *retry_after,
-        _ => None,
-    }
+    e.reply().and_then(|b| b.retry_after())
 }
 
 /// The delay to actually sleep before the next attempt: the server's
@@ -277,7 +274,7 @@ impl LlmProvider for RetryingProvider {
 mod tests {
     use super::*;
     use crate::tuning::ProviderTuning;
-    use crate::types::{ContentBlock, Message, StopReason, Usage};
+    use crate::types::{ContentBlock, Message, Stop, StopReason, Usage};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn req() -> LlmRequest {
@@ -306,7 +303,7 @@ mod tests {
             id: "msg".into(),
             model: "m".into(),
             content: vec![ContentBlock::Text { text: "ok".into() }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: Usage::default(),
         }
     }
@@ -342,7 +339,7 @@ mod tests {
             }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
-                return Err(ProviderError::RateLimited { retry_after: None });
+                return Err(ProviderError::api("mock", 429, "slow down"));
             }
             Ok(ok_response())
         }
@@ -357,7 +354,7 @@ mod tests {
                 if self.emit_before_error {
                     on_event(StreamEvent::TextDelta("partial".into()));
                 }
-                return Err(ProviderError::RateLimited { retry_after: None });
+                return Err(ProviderError::api("mock", 429, "slow down"));
             }
             on_event(StreamEvent::TextDelta("ok".into()));
             Ok(ok_response())
@@ -562,9 +559,7 @@ mod tests {
         impl LlmProvider for BadRequest {
             async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Err(ProviderError::BadRequest {
-                    message: "max_tokens too large".into(),
-                })
+                Err(ProviderError::api("mock", 400, "max_tokens too large"))
             }
             async fn stream(
                 &mut self,
@@ -619,40 +614,28 @@ mod tests {
     /// the agent runner to treat as an overflow. Other 429s still retry.
     #[test]
     fn long_context_entitlement_429_is_not_retryable() {
-        assert!(!is_retryable(&ProviderError::Api {
-            status: 429,
-            message: r#"{"error":{"message":"Extra usage is required for long context requests"}}"#
-                .into(),
-        }));
-        assert!(is_retryable(&ProviderError::Api {
-            status: 429,
-            message: r#"{"error":{"type":"rate_limit_error"}}"#.into(),
-        }));
+        assert!(!is_retryable(&ProviderError::api(
+            "anthropic",
+            429,
+            r#"{"error":{"message":"Extra usage is required for long context requests"}}"#,
+        )));
+        assert!(is_retryable(&ProviderError::api(
+            "anthropic",
+            429,
+            r#"{"error":{"type":"rate_limit_error"}}"#,
+        )));
     }
 
     #[test]
     fn retryability_matches_the_documented_error_classes() {
-        assert!(is_retryable(&ProviderError::RateLimited {
-            retry_after: None
-        }));
+        assert!(is_retryable(&ProviderError::api("mock", 429, "slow down")));
         assert!(is_retryable(&ProviderError::Transient(anyhow::anyhow!(
             "x"
         ))));
-        assert!(is_retryable(&ProviderError::Api {
-            status: 503,
-            message: String::new()
-        }));
-        assert!(is_retryable(&ProviderError::Api {
-            status: 429,
-            message: String::new()
-        }));
-        assert!(!is_retryable(&ProviderError::Api {
-            status: 400,
-            message: String::new()
-        }));
-        assert!(!is_retryable(&ProviderError::BadRequest {
-            message: String::new()
-        }));
+        assert!(is_retryable(&ProviderError::api("mock", 503, "")));
+        assert!(is_retryable(&ProviderError::api("mock", 429, "")));
+        assert!(!is_retryable(&ProviderError::api("mock", 400, "")));
+        assert!(is_retryable(&ProviderError::IncompleteStream("x".into())));
         // Preflight failures happen before any request is attempted (e.g. a
         // workflow step whose agent file failed to load) — retrying the
         // identical request can never succeed.
@@ -706,9 +689,19 @@ mod tests {
             async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    return Err(ProviderError::RateLimited {
-                        retry_after: self.retry_after,
-                    });
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    if let Some(d) = self.retry_after {
+                        headers.insert(
+                            reqwest::header::RETRY_AFTER,
+                            d.as_secs().to_string().parse().unwrap(),
+                        );
+                    }
+                    return Err(crate::error::api_error_from_response(
+                        "mock",
+                        429,
+                        &headers,
+                        "slow down",
+                    ));
                 }
                 Ok(ok_response())
             }

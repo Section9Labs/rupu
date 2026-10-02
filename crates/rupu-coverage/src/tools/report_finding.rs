@@ -45,7 +45,8 @@ pub struct AssetRef {
     pub kind: String,
     #[serde(default)]
     pub coordinates: Vec<crate::asset::Coordinate>,
-    /// Optional human label; defaults to the kind if omitted.
+    /// Optional human label; if omitted, the asset keeps its existing label
+    /// (or, for a new asset, takes its kind).
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -172,13 +173,34 @@ pub fn report_finding(
                 });
             }
         }
-        // Stamp the asset into the graph.
-        let label = asset_ref
-            .label
-            .clone()
-            .unwrap_or_else(|| asset_ref.kind.clone());
-        let asset = crate::asset::Asset::new(asset_ref.kind.clone(), locator, label, None);
-        crate::asset::upsert_asset(&paths.assets, &asset)?;
+        // Stamp the asset into the graph (and the run stream, so a
+        // coordinator collecting this run sees it). The store folds
+        // last-line-wins, so this line replaces whatever the asset holds:
+        // `next_line` carries its label (unless one is given here), depth (an
+        // `asset_mark`), parent and attributes forward instead of erasing them.
+        // A finding is never lost to the asset graph: if the store cannot be
+        // read the asset is stamped without that carried state, and the
+        // finding records as normal.
+        let id = crate::asset::Asset::derive_id(&asset_ref.kind, &locator);
+        let current = match crate::asset::read_assets(&paths.assets) {
+            Ok(assets) => assets.into_iter().find(|a| a.id == id),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %paths.assets.display(),
+                    "asset store unreadable; stamping the finding's asset without its prior state"
+                );
+                None
+            }
+        };
+        let asset = crate::asset::Asset::next_line(
+            asset_ref.kind.clone(),
+            locator,
+            asset_ref.label.clone(),
+            current,
+        );
+        crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Assets, &asset)
+            .map_err(crate::asset::AssetStoreError::Io)?;
     }
 
     let id = format!("fnd_{}", Ulid::new());
@@ -197,86 +219,11 @@ pub fn report_finding(
         profile: opts.profile,
         report,
     };
-    // One `write_all` of the line and its newline together: with two
-    // writes, a concurrent writer appending to the same ledger could land
-    // its line between ours and our newline, fusing two records into one
-    // unparseable line.
-    let mut line = serde_json::to_string(&record)?;
-    line.push('\n');
-    append_line(paths, line.as_bytes(), std::fs::File::lock)?;
+    paths.ensure_dir()?;
+    // One write per line, under the ledger lock, then the run stream — see
+    // `ledger::stream::append_record`.
+    crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Findings, &record)?;
     Ok(ReportFindingOutput { id })
-}
-
-/// Append `line` to the ledger, holding the ledger lock (taken with `lock`)
-/// across the append so it cannot interleave with an import's rewrite.
-///
-/// Where the filesystem cannot lock at all (some network and FUSE mounts:
-/// see [`lock_unsupported`]), where the lock file cannot be opened (a
-/// directory this user may not create files in), or where it could only be
-/// opened read-only and an exclusive lock needs it writable (`EBADF`, as
-/// NFS's locks do), the line is appended without the lock and a warning is
-/// logged, as before the lock existed: losing the finding would be worse.
-/// An import needs the same lock, so it either cannot run there or runs as a
-/// user who can take it; its length check then almost always catches the
-/// unlocked append (not one that lands between that check and its rename).
-/// Any other lock failure is an error.
-fn append_line(
-    paths: &CoveragePaths,
-    line: &[u8],
-    lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let lock_file = match open_lock_file(paths) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                ledger = ?paths.findings,
-                "cannot open the findings ledger's lock file; appending without the lock"
-            );
-            None
-        }
-    };
-    if let Some((Err(e), read_only)) = lock_file.as_ref().map(|(f, ro)| (lock(f), *ro)) {
-        let needs_write =
-            read_only && e.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error());
-        if !(lock_unsupported(&e) || needs_write) {
-            return Err(e);
-        }
-        tracing::warn!(
-            error = %e,
-            ledger = ?paths.findings,
-            "this filesystem cannot lock the findings ledger; appending without the lock"
-        );
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.findings)?;
-    f.write_all(line)?;
-    f.flush()?;
-    // `lock_file` drops here, releasing the lock after the append.
-    Ok(())
-}
-
-/// Whether a lock error means the filesystem cannot lock at all, rather than
-/// a failure to report: `ErrorKind::Unsupported` (`ENOSYS`, `EOPNOTSUPP`),
-/// or one of [`no_lock_errnos`].
-fn lock_unsupported(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::Unsupported
-        || e.raw_os_error()
-            .is_some_and(|n| no_lock_errnos().contains(&n))
-}
-
-/// `ENOLCK`, `ENOTSUP` and `EOPNOTSUPP` on this platform (the last two are
-/// the same number on Linux).
-fn no_lock_errnos() -> [i32; 3] {
-    use rustix::io::Errno;
-    [
-        Errno::NOLCK.raw_os_error(),
-        Errno::NOTSUP.raw_os_error(),
-        Errno::OPNOTSUPP.raw_os_error(),
-    ]
 }
 
 /// Whether [`prepare_full_report`] records the SHA-256 of each evidence
@@ -402,39 +349,6 @@ pub(crate) fn derived_fields(
             references: Vec::new(),
         },
     )
-}
-
-/// Serializes the writers of one target's findings ledger. The lock is a
-/// sidecar file, not the ledger itself: `attach_reports` replaces the ledger
-/// by rename, and a lock held on the replaced file would not exclude the
-/// next writer. Released when the returned handle drops.
-pub(crate) fn lock_findings(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
-    let (f, _) = open_lock_file(paths)?;
-    f.lock()?;
-    Ok(f)
-}
-
-/// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing,
-/// and whether it was opened read-only.
-///
-/// A lock needs only a handle on the file on most filesystems, so one this
-/// user may not write (created by another user, say an import run with
-/// `sudo`) is opened read-only instead.
-fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<(std::fs::File, bool)> {
-    paths.ensure_dir()?;
-    let path = paths.root.join("findings.jsonl.lock");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-    {
-        Ok(f) => Ok((f, false)),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            std::fs::File::open(&path).map(|f| (f, true)).map_err(|_| e)
-        }
-        Err(e) => Err(e),
-    }
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
@@ -815,6 +729,227 @@ mod tests {
     }
 
     #[test]
+    fn engagement_stamp_streams_the_asset_before_the_finding() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let stream = tmp.path().join("runs/run_1/coverage.jsonl");
+        let paths = CoveragePaths::new(tmp.path(), "t").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "sec".into(),
+        }));
+        let mut opts = full_opts(&store);
+        opts.engagement = Some(Arc::new(
+            crate::profile::builtin_registry()
+                .unwrap()
+                .active_set(&["code".into()])
+                .unwrap(),
+        ));
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "code:file".into(),
+            coordinates: vec![crate::asset::Coordinate::Path("src/a.rs".into())],
+            label: Some("src/a.rs".into()),
+        });
+
+        let out = report_finding(&paths, attribution(), inp, &opts).unwrap();
+
+        let streamed: Vec<StreamLine> = std::fs::read_to_string(&stream)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        match streamed.as_slice() {
+            [StreamLine::Assets {
+                scope_name: a_scope,
+                record: asset,
+            }, StreamLine::Findings {
+                scope_name: f_scope,
+                record: finding,
+            }] => {
+                assert_eq!((a_scope.as_str(), f_scope.as_str()), ("sec", "sec"));
+                assert_eq!(asset.kind, "code:file");
+                assert_eq!(asset.label, "src/a.rs");
+                assert_eq!(finding.id, out.id);
+                // The streamed asset is the one the ledger holds.
+                assert_eq!(
+                    crate::asset::read_assets(&paths.assets).unwrap(),
+                    vec![asset.clone()]
+                );
+            }
+            other => panic!("expected an assets line then a findings line, got {other:?}"),
+        }
+    }
+
+    fn code_engagement_opts(store: &std::path::Path) -> crate::report::FindingWriteOptions {
+        let mut opts = full_opts(store);
+        opts.engagement = Some(std::sync::Arc::new(
+            crate::profile::builtin_registry()
+                .unwrap()
+                .active_set(&["code".into()])
+                .unwrap(),
+        ));
+        opts
+    }
+
+    fn code_file_input(path: &str) -> ReportFindingInput {
+        let mut inp = full_input(fixture_report());
+        inp.asset = Some(AssetRef {
+            kind: "code:file".into(),
+            coordinates: vec![crate::asset::Coordinate::Path(path.into())],
+            label: Some(path.into()),
+        });
+        inp
+    }
+
+    #[test]
+    fn stamping_a_marked_asset_keeps_its_depth() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+        use crate::tools::asset_mark::{asset_mark, AssetMarkInput};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let stream = tmp.path().join("runs/run_1/coverage.jsonl");
+        let paths = CoveragePaths::new(tmp.path(), "t").with_run_stream(Some(RunStream {
+            path: stream.clone(),
+            scope_name: "sec".into(),
+        }));
+        let opts = code_engagement_opts(&store);
+        let engagement = opts.engagement.clone().unwrap();
+
+        let marked = asset_mark(
+            &paths,
+            AssetMarkInput {
+                kind: "code:file".into(),
+                coordinates: vec![crate::asset::Coordinate::Path("src/a.rs".into())],
+                depth: "reviewed".into(),
+                label: None,
+            },
+            &engagement,
+        )
+        .unwrap();
+        assert_eq!(marked.effective_depth, "reviewed");
+
+        report_finding(&paths, attribution(), code_file_input("src/a.rs"), &opts).unwrap();
+
+        let stored = crate::asset::read_assets(&paths.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].depth.as_deref(),
+            Some("reviewed"),
+            "a finding about a marked asset must not erase its depth"
+        );
+        // The unit's stream carries the full current state, so a coordinator
+        // folding it ends where the unit did.
+        let stamped: Vec<crate::asset::Asset> = std::fs::read_to_string(&stream)
+            .unwrap()
+            .lines()
+            .filter_map(|l| match serde_json::from_str(l).unwrap() {
+                StreamLine::Assets { record, .. } => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamped.len(), 2, "the mark and the stamp");
+        assert_eq!(stamped[1].depth.as_deref(), Some("reviewed"));
+    }
+
+    #[test]
+    fn stamping_an_existing_asset_keeps_its_parent_and_attributes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let opts = code_engagement_opts(&store);
+        let locator =
+            crate::asset::Locator(vec![crate::asset::Coordinate::Path("src/a.rs".into())]);
+        let mut existing = crate::asset::Asset::new(
+            "code:file",
+            locator,
+            "src/a.rs",
+            Some("code:dir:0123456789abcdef".into()),
+        );
+        existing.depth = Some("reviewed".into());
+        existing
+            .attributes
+            .insert("lang".into(), serde_json::json!("rust"));
+        crate::asset::store::upsert_asset(&paths.assets, &existing).unwrap();
+
+        report_finding(&paths, attribution(), code_file_input("src/a.rs"), &opts).unwrap();
+
+        assert_eq!(
+            crate::asset::read_assets(&paths.assets).unwrap(),
+            vec![existing]
+        );
+    }
+
+    #[test]
+    fn stamping_without_a_label_keeps_the_assets_descriptive_label() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let opts = code_engagement_opts(&store);
+        let locator =
+            crate::asset::Locator(vec![crate::asset::Coordinate::Path("src/a.rs".into())]);
+        let existing = crate::asset::Asset::new("code:file", locator, "the auth handler", None);
+        crate::asset::store::upsert_asset(&paths.assets, &existing).unwrap();
+
+        // No label on the stamp: the last-line-wins fold must not demote the
+        // descriptive label to the bare kind.
+        let mut inp = code_file_input("src/a.rs");
+        inp.asset.as_mut().unwrap().label = None;
+        report_finding(&paths, attribution(), inp, &opts).unwrap();
+        let stored = crate::asset::read_assets(&paths.assets).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].label, "the auth handler");
+
+        // An explicit label still replaces it.
+        let mut inp = code_file_input("src/a.rs");
+        inp.asset.as_mut().unwrap().label = Some("renamed".into());
+        report_finding(&paths, attribution(), inp, &opts).unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&paths.assets).unwrap()[0].label,
+            "renamed"
+        );
+    }
+
+    #[test]
+    fn a_new_asset_stamped_without_a_label_is_labelled_with_its_kind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let mut inp = code_file_input("src/a.rs");
+        inp.asset.as_mut().unwrap().label = None;
+        report_finding(
+            &paths,
+            attribution(),
+            inp,
+            &code_engagement_opts(&tmp.path().join("store")),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::asset::read_assets(&paths.assets).unwrap()[0].label,
+            "code:file"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_asset_store_does_not_lose_the_finding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        paths.ensure_dir().unwrap();
+        std::fs::write(&paths.assets, "this is not json\n{\"half\":\n").unwrap();
+
+        let out = report_finding(
+            &paths,
+            attribution(),
+            code_file_input("src/a.rs"),
+            &code_engagement_opts(&store),
+        )
+        .expect("a finding must not be lost to the asset graph");
+
+        assert_eq!(only_record(&paths).id, out.id);
+    }
+
+    #[test]
     fn no_engagement_never_touches_the_asset_store() {
         // The native code path: with no active engagement, an asset on the
         // input is ignored and no assets.jsonl is written.
@@ -1133,108 +1268,6 @@ mod tests {
             "{err}"
         );
         assert!(!paths.findings.exists());
-    }
-
-    #[test]
-    fn an_append_goes_ahead_unlocked_only_where_the_filesystem_cannot_lock() {
-        use std::io::{Error, ErrorKind};
-        let ws = tempfile::TempDir::new().unwrap();
-        let paths = CoveragePaths::new(ws.path(), "t");
-        // A filesystem that cannot lock: the finding is still recorded.
-        append_line(&paths, b"{\"n\":1}\n", |_| {
-            Err(Error::from(ErrorKind::Unsupported))
-        })
-        .expect("unsupported locking falls back to an unlocked append");
-        let mut expected = "{\"n\":1}\n".to_string();
-        for errno in no_lock_errnos() {
-            append_line(&paths, b"{\"n\":2}\n", |_| {
-                Err(Error::from_raw_os_error(errno))
-            })
-            .unwrap_or_else(|e| panic!("errno {errno}: {e}"));
-            expected.push_str("{\"n\":2}\n");
-        }
-        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), expected);
-        // Any other lock failure is an error, and nothing is appended.
-        let err = append_line(&paths, b"{\"n\":3}\n", |_| {
-            Err(Error::from(ErrorKind::PermissionDenied))
-        })
-        .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
-        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), expected);
-        // And the real lock is taken when it can be.
-        append_line(&paths, b"{\"n\":4}\n", std::fs::File::lock).unwrap();
-        assert!(std::fs::read_to_string(&paths.findings)
-            .unwrap()
-            .ends_with("{\"n\":4}\n"));
-    }
-
-    #[test]
-    fn an_append_goes_ahead_unlocked_when_the_lock_file_cannot_be_opened() {
-        let ws = tempfile::TempDir::new().unwrap();
-        let paths = CoveragePaths::new(ws.path(), "t");
-        // Something that cannot be opened as the lock file.
-        std::fs::create_dir_all(paths.root.join("findings.jsonl.lock")).unwrap();
-        append_line(&paths, b"{\"n\":1}\n", std::fs::File::lock)
-            .expect("the finding is still recorded");
-        assert_eq!(
-            std::fs::read_to_string(&paths.findings).unwrap(),
-            "{\"n\":1}\n"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_lock_file_this_user_cannot_write_is_locked_through_a_read_only_handle() {
-        use std::os::unix::fs::PermissionsExt;
-        if rustix::process::geteuid().is_root() {
-            return; // root can write any file: nothing to fall back from
-        }
-        let ws = tempfile::TempDir::new().unwrap();
-        let paths = CoveragePaths::new(ws.path(), "t");
-        paths.ensure_dir().unwrap();
-        let sidecar = paths.root.join("findings.jsonl.lock");
-        std::fs::write(&sidecar, "").unwrap();
-        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
-
-        let held = lock_findings(&paths).expect("locked through a read-only handle");
-        let other = std::fs::File::open(&sidecar).unwrap();
-        assert!(
-            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-            "the read-only handle's lock excludes other writers"
-        );
-        drop(held);
-        append_line(&paths, b"{\"n\":1}\n", std::fs::File::lock).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&paths.findings).unwrap(),
-            "{\"n\":1}\n"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_read_only_lock_handle_refused_as_unwritable_appends_unlocked() {
-        use std::io::{Error, ErrorKind};
-        use std::os::unix::fs::PermissionsExt;
-        if rustix::process::geteuid().is_root() {
-            return; // root opens the lock file writable: no read-only handle
-        }
-        let ebadf = || Error::from_raw_os_error(rustix::io::Errno::BADF.raw_os_error());
-        let ws = tempfile::TempDir::new().unwrap();
-        let paths = CoveragePaths::new(ws.path(), "t");
-        paths.ensure_dir().unwrap();
-        // A writable handle refused with EBADF is a real error.
-        let err = append_line(&paths, b"{\"n\":1}\n", |_| Err(ebadf())).unwrap_err();
-        assert_ne!(err.kind(), ErrorKind::Unsupported);
-        assert!(!paths.findings.exists());
-        // A read-only one (the lock file is another user's) is NFS refusing
-        // an exclusive lock it cannot take: the finding is still recorded.
-        let sidecar = paths.root.join("findings.jsonl.lock");
-        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
-        append_line(&paths, b"{\"n\":1}\n", |_| Err(ebadf())).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&paths.findings).unwrap(),
-            "{\"n\":1}\n"
-        );
     }
 
     #[test]

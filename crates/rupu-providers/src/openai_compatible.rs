@@ -125,8 +125,12 @@ impl OpenAiCompatibleClient {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(
             "openai_compatible".into(),
         ));
-        let client = rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink.clone())
-            .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
+        let client = rupu_netflow::http::shared_client(
+            ctx,
+            rupu_netflow::http::Transport::default(),
+            sink.clone(),
+        )
+        .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             base_url: root.to_string(),
             api_key: api_key.to_string(),
@@ -190,16 +194,17 @@ impl OpenAiCompatibleClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "openai-compatible",
                 status,
                 &headers,
-                text.chars().take(500).collect(),
+                &text,
             ));
         }
         let json: serde_json::Value = response
             .json()
             .await
             .map_err(|e| ProviderError::Json(e.to_string()))?;
-        crate::openai_wire::parse_chat_completion(&json)
+        crate::openai_wire::parse_chat_completion(&json, "openai-compatible")
     }
 
     async fn stream_inner(
@@ -221,13 +226,14 @@ impl OpenAiCompatibleClient {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "openai-compatible",
                 status,
                 &headers,
-                text.chars().take(500).collect(),
+                &text,
             ));
         }
         let mut parser = SseParser::new();
-        let mut acc = crate::openai_wire::CompletionAccumulator::new();
+        let mut acc = crate::openai_wire::CompletionAccumulator::new("openai-compatible");
         let mut bytes_stream = response.bytes_stream();
         while let Some(chunk) = bytes_stream.next().await {
             let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
@@ -235,7 +241,7 @@ impl OpenAiCompatibleClient {
                 crate::openai_wire::process_completion_sse(&event, &mut acc, on_event)?;
             }
         }
-        acc.into_response()
+        acc.into_response()?
             .ok_or(ProviderError::UnexpectedEndOfStream)
     }
 
@@ -283,7 +289,7 @@ fn emit_response_events(resp: &LlmResponse, on_event: &mut (dyn FnMut(StreamEven
             }
             ContentBlock::ToolResult { .. } => {}
             ContentBlock::Reasoning { .. } => {}
-            ContentBlock::Unknown => {}
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
         }
     }
 }
@@ -332,17 +338,14 @@ impl LlmProvider for OpenAiCompatibleClient {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::api_error_from_response(
+                "openai-compatible",
+                status.as_u16(),
+                &headers,
+                &text,
+            ));
         }
         let body = resp
             .text()
@@ -511,7 +514,7 @@ mod tests {
 
     #[test]
     fn emit_response_events_surfaces_text_and_tool_calls() {
-        use crate::types::{ContentBlock, LlmResponse, StopReason, Usage};
+        use crate::types::{ContentBlock, LlmResponse, Stop, StopReason, Usage};
         let resp = LlmResponse {
             id: "1".into(),
             model: "m".into(),
@@ -523,7 +526,7 @@ mod tests {
                     input: serde_json::json!({"path": "a.rs"}),
                 },
             ],
-            stop_reason: Some(StopReason::ToolUse),
+            stop: Stop::synthetic(StopReason::ToolUse, "mock"),
             usage: Usage::default(),
         };
         let mut events = Vec::new();
@@ -574,14 +577,30 @@ mod tests {
         use httpmock::prelude::*;
         let server = MockServer::start();
         let m = server.mock(|when, then| {
-            when.method(GET).path("/v1/models").header("authorization", "Bearer k");
-            then.status(200).json_body(serde_json::json!({ "data": [{ "id": "base-model", "max_model_len": 4096 }] }));
+            when.method(GET)
+                .path("/v1/models")
+                .header("authorization", "Bearer k");
+            then.status(200).json_body(
+                serde_json::json!({ "data": [{ "id": "base-model", "max_model_len": 4096 }] }),
+            );
         });
-        let mut c = OpenAiCompatibleClient::new(&format!("{}/v1", server.url("")), "k", "base-model", vec![], true, Arc::new(rupu_netflow::NullSink));
-        let ms = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c).await.unwrap();
+        let mut c = OpenAiCompatibleClient::new(
+            &format!("{}/v1", server.url("")),
+            "k",
+            "base-model",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let ms = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c)
+            .await
+            .unwrap();
         m.assert();
         assert_eq!(ms[0].context_window, 4096);
-        assert_eq!(ms[0].provider, crate::provider_id::ProviderId::OpenaiCompatible);
+        assert_eq!(
+            ms[0].provider,
+            crate::provider_id::ProviderId::OpenaiCompatible
+        );
     }
 
     #[test]
@@ -683,9 +702,18 @@ mod tests {
             when.method(GET).path("/v1/models");
             then.status(401);
         });
-        let mut c = OpenAiCompatibleClient::new(&format!("{}/v1", server.url("")), "k", "base-model", vec![], true, Arc::new(rupu_netflow::NullSink));
-        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c).await.unwrap_err();
+        let mut c = OpenAiCompatibleClient::new(
+            &format!("{}/v1", server.url("")),
+            "k",
+            "base-model",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c)
+            .await
+            .unwrap_err();
         m.assert();
-        assert!(matches!(err, ProviderError::Api { status: 401, .. }));
+        assert_eq!(err.status(), Some(401));
     }
 }

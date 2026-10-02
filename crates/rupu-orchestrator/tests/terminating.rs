@@ -9,10 +9,10 @@
 //! (the flag is already up before the run starts).
 
 use async_trait::async_trait;
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory, UnitDispatch, UnitDispatcher,
-    UnitOutcome,
+    run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory, UnitCoverage, UnitDispatch,
+    UnitDispatcher, UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::Workflow;
 use rupu_providers::credential_writes;
@@ -47,7 +47,18 @@ struct TerminatingDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for TerminatingDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn strip_delta_coverage(
+        &self,
+        delta: &rupu_orchestrator::runner::WorkspaceDelta,
+    ) -> Result<rupu_orchestrator::runner::WorkspaceDelta, String> {
+        Ok(delta.clone())
+    }
+
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.calls.lock().unwrap().push(unit.index);
         credential_writes::request_termination();
         Ok(UnitOutcome {
@@ -55,6 +66,7 @@ impl UnitDispatcher for TerminatingDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }

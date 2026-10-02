@@ -76,4 +76,50 @@ describe('StepNode', () => {
     renderNode({ agent: 'security-reviewer', codename: 'jade-reef/heron' });
     expect(screen.getByTestId('agent-identity')).not.toHaveClass('opacity-60');
   });
+
+  it('shows a warning marker with the message on hover, without touching the status', () => {
+    renderNode({
+      state: 'done',
+      warnings: [
+        { message: 'host gpu-9 did not stream coverage' },
+        { index: 2, message: 'unit findings were not collected' },
+      ],
+    });
+    const mark = screen.getByTestId('rg-warn');
+    expect(mark).toHaveTextContent('⚠');
+    expect(mark).toHaveClass('text-warn');
+    expect(mark).toHaveAttribute('aria-label', '2 warnings');
+    expect(mark.getAttribute('title')).toBe(
+      'host gpu-9 did not stream coverage\nunit 2: unit findings were not collected',
+    );
+    // the status overlay is exactly what the lifecycle said
+    expect(screen.getByText('✓')).toBeInTheDocument();
+    expect(screen.getByText('done')).toBeInTheDocument();
+  });
+
+  it('a FAILED step that also warned still reads failed', () => {
+    renderNode({ state: 'failed', warnings: [{ message: 'partial coverage' }] });
+    expect(screen.getByText('✕')).toBeInTheDocument();
+    expect(screen.getByText('failed')).toBeInTheDocument();
+    expect(screen.getByTestId('rg-warn')).toHaveAttribute('aria-label', '1 warning');
+  });
+
+  it('renders no marker when the step has no warnings', () => {
+    renderNode({ state: 'done' });
+    expect(screen.queryByTestId('rg-warn')).toBeNull();
+  });
+
+  it('keeps the marker inside the header row, so it adds no row to the node', () => {
+    const { container } = renderNode({ state: 'done', agent: 'security-reviewer', warnings: [{ message: 'x' }] });
+    const mark = screen.getByTestId('rg-warn');
+    // same flex row as the step name and its status label …
+    expect(mark.parentElement).toBe(screen.getByText('done').parentElement);
+    expect(mark.parentElement).toBe(screen.getByText('build').parentElement);
+    // … so the node has the same number of rows as an unwarned one.
+    const rows = (root: Element) => root.querySelector('.shadow-card')!.children.length;
+    const warned = rows(container);
+    cleanup();
+    const clean = renderNode({ state: 'done', agent: 'security-reviewer' });
+    expect(warned).toBe(rows(clean.container));
+  });
 });

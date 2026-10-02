@@ -27,12 +27,13 @@
 
 use crate::ledger::events::FindingRecord;
 use crate::ledger::paths::CoveragePaths;
+use crate::ledger::stream::lock_findings;
 use crate::report::{
     ArtifactError, ArtifactRef, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
 };
 use crate::tools::report_finding::{
-    check_full_report, check_stored_size, derived_fields, lock_findings, prepare_full_report,
-    ClaimHashes, ReportFindingError,
+    check_full_report, check_stored_size, derived_fields, prepare_full_report, ClaimHashes,
+    ReportFindingError,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;

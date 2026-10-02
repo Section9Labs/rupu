@@ -7,7 +7,7 @@ use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, run_agent_with_limits, AgentRunOpts, RunError};
 use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
 use rupu_providers::types::{
-    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
 use rupu_providers::{LlmProvider, ProviderError, ProviderId};
 use rupu_tools::ToolContext;
@@ -122,6 +122,7 @@ fn build_opts(
     AgentRunOpts {
         codename: None,
         seed_source: None,
+        collectors: Vec::new(),
         agent_name: "noop".into(),
         agent_system_prompt: "You are a noop agent.".into(),
         agent_tools: None,
@@ -350,7 +351,7 @@ impl LlmProvider for StreamOnlyProvider {
             content: vec![ContentBlock::Text {
                 text: "hello".into(),
             }],
-            stop_reason: Some(StopReason::EndTurn),
+            stop: Stop::synthetic(StopReason::EndTurn, "mock"),
             usage: usage(5, 2, 0),
         })
     }
@@ -945,11 +946,11 @@ async fn a_plain_extra_usage_429_is_not_retried() {
     let inner = CapturingMockProvider::new(vec![final_text_turn(usage(1, 1, 0))]);
     let captured = inner.captured.clone();
     let provider = FailFirst {
-        err: Some(ProviderError::Api {
-            status: 429,
-            message: r#"{"error":{"message":"Extra usage is required for long context requests"}}"#
-                .into(),
-        }),
+        err: Some(ProviderError::api(
+            "anthropic",
+            429,
+            r#"{"error":{"message":"Extra usage is required for long context requests"}}"#,
+        )),
         inner,
     };
     let tmp = tempfile::tempdir().unwrap();

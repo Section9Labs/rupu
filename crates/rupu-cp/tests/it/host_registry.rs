@@ -75,6 +75,23 @@ impl HostConnector for StubLocal {
     async fn get_transcript(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
         unimplemented!()
     }
+    async fn unit_coverage(
+        &self,
+        _run_id: &str,
+    ) -> Result<rupu_cp::host::connector::CoverageRead, HostConnectorError> {
+        Ok(rupu_cp::host::connector::CoverageRead {
+            bytes: Vec::new(),
+            complete: true,
+        })
+    }
+    async fn pull_finding_artifact(
+        &self,
+        _sha256: &str,
+        _dest: &std::path::Path,
+        _max_bytes: u64,
+    ) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("test double".into()))
+    }
     async fn proxy_get_json(
         &self,
         _: &str,

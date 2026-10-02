@@ -15,7 +15,8 @@ pub mod types;
 pub mod validate;
 
 pub use artifacts::{
-    sha256_file, sha256_reader, ArtifactError, ArtifactStore, IngestLimits, PlannedArtifact,
+    is_sha256_hex, sha256_file, sha256_reader, ArtifactError, ArtifactInstallError, ArtifactStore,
+    IngestLimits, PlannedArtifact,
 };
 pub use guidance::guidance;
 pub use options::{

@@ -36,17 +36,22 @@ export class ApiError extends Error {
 }
 
 /** A human-readable message for anything a fetch chain can throw. The CP
- *  answers errors as `{"error": "…"}`, so an `ApiError` yields that message
- *  rather than the raw JSON body; a non-JSON body is shown as text, and an
- *  empty one falls back to the HTTP status. A plain `Error` yields its
- *  message and anything else its string form. */
+ *  answers errors as `{"error": "…"}` — or, for an artifact it could not pull
+ *  from its host, `{"unavailable": "<reason>"}` — so an `ApiError` yields that
+ *  message (`error` preferred when both are present) rather than the raw JSON
+ *  body; a non-JSON body is shown as text, and an empty one falls back to the
+ *  HTTP status. A plain `Error` yields its message and anything else its
+ *  string form. */
 export function apiErrorMessage(e: unknown): string {
   if (e instanceof ApiError) {
     const raw = e.body.trim();
     try {
       const parsed: unknown = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
-        return parsed.error;
+      if (parsed && typeof parsed === 'object') {
+        for (const key of ['error', 'unavailable'] as const) {
+          const v = (parsed as Record<string, unknown>)[key];
+          if (typeof v === 'string' && v.trim()) return v;
+        }
       }
     } catch {
       // not JSON; fall through to the raw text
@@ -184,7 +189,7 @@ export interface StepResultRecord {
  *
  * Full variant set from rupu-orchestrator/src/executor/event.rs:
  *   run_started | step_started | step_working | step_awaiting_approval
- *   step_completed | step_failed | step_skipped
+ *   step_completed | step_failed | step_skipped | step_warning
  *   unit_started | unit_completed
  *   run_completed | run_failed
  *
@@ -203,6 +208,7 @@ export type KnownRunEvent =
   | StepCompletedEvent
   | StepFailedEvent
   | StepSkippedEvent
+  | StepWarningEvent
   | UnitStartedEvent
   | UnitCompletedEvent
   | PanelRoundEvent
@@ -273,6 +279,17 @@ export interface StepSkippedEvent extends RunEventBase {
   type: 'step_skipped';
   step_id: string;
   reason: string;
+}
+
+/** A non-failing, operator-visible warning on a step (or one of its fan-out
+ *  units) — e.g. a remote unit whose coverage could not be collected. It NEVER
+ *  changes the step's status; `index` is absent when the warning is about the
+ *  step as a whole. */
+export interface StepWarningEvent extends RunEventBase {
+  type: 'step_warning';
+  step_id: string;
+  index?: number;
+  message: string;
 }
 
 export interface UnitStartedEvent extends RunEventBase {
@@ -393,6 +410,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'step_completed',
   'step_failed',
   'step_skipped',
+  'step_warning',
   'unit_started',
   'unit_completed',
   'panel_round',

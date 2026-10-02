@@ -22,6 +22,7 @@ members = [
     "crates/rupu-cli",
     "crates/rupu-update",
     "crates/rupu-netflow",
+    "crates/rupu-fleet",
 ]
 
 [workspace.package]
@@ -191,6 +192,9 @@ rupu-codename = { path = "crates/rupu-codename" }
 
 # Network egress observability (netflow)
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
+
+# File-backed fleet comms store (agentiflows)
+rupu-fleet = { path = "crates/rupu-fleet" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -386,6 +386,31 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_store_err(run_id, e))
     }
 
+    /// The run's own file: once the run is terminal, every line it wrote.
+    async fn unit_coverage(
+        &self,
+        run_id: &str,
+    ) -> Result<crate::host::connector::CoverageRead, HostConnectorError> {
+        let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
+        Ok(crate::host::connector::CoverageRead {
+            bytes,
+            complete: true,
+        })
+    }
+    async fn pull_finding_artifact(
+        &self,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<(), HostConnectorError> {
+        crate::host::connector::validate_sha256(sha256)?;
+        let src = rupu_coverage::report::ArtifactStore::new(
+            self.global_dir.join("findings").join("artifacts"),
+        )
+        .blob_path(sha256);
+        crate::host::connector::copy_blob_capped(&src, dest, max_bytes).await
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         // Verify the run exists before opening the tail.
         self.run_store
@@ -957,5 +982,49 @@ mod launch_agent_tests {
             capture.0.lock().unwrap().as_ref().unwrap().findings_profile,
             Some(rupu_coverage::FindingProfile::Summary)
         );
+    }
+}
+
+#[cfg(test)]
+mod finding_artifact_tests {
+    use super::*;
+
+    fn local(global_dir: PathBuf) -> LocalHostConnector {
+        let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
+        LocalHostConnector::new(None, None, None, None, run_store, global_dir)
+    }
+
+    #[tokio::test]
+    async fn pull_finding_artifact_copies_from_the_global_artifact_store() {
+        let global = tempfile::tempdir().unwrap();
+        let sha = "cd".repeat(32);
+        let store = rupu_coverage::report::ArtifactStore::new(
+            global.path().join("findings").join("artifacts"),
+        );
+        let blob = store.blob_path(&sha);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"evidence").unwrap();
+
+        let conn = local(global.path().to_path_buf());
+        let dest = global.path().join("pulled");
+        conn.pull_finding_artifact(&sha, &dest, 8).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"evidence");
+
+        // Bigger than the recorded size: refused.
+        assert!(matches!(
+            conn.pull_finding_artifact(&sha, &dest, 7).await,
+            Err(HostConnectorError::Invalid(_))
+        ));
+        // A well-formed digest the store doesn't hold.
+        assert!(matches!(
+            conn.pull_finding_artifact(&"ef".repeat(32), &dest, 8).await,
+            Err(HostConnectorError::NotFound(_))
+        ));
+        // Not a digest at all: refused before it touches a path.
+        assert!(matches!(
+            conn.pull_finding_artifact("../../etc/passwd", &dest, 8)
+                .await,
+            Err(HostConnectorError::Invalid(_))
+        ));
     }
 }

@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../lib/api';
-import type { RunEvent, RunStartedEvent } from '../lib/api';
+import type { RunEvent, RunStartedEvent, TimedRunEvent } from '../lib/api';
 import Events from './Events';
 
 afterEach(() => {
@@ -78,6 +78,22 @@ describe('Live Events (Situation Room) page', () => {
     expect(await screen.findByText('boom-live-xyz')).toBeInTheDocument();
     // The history row is still present — the live event prepended, not replaced.
     expect(screen.getByText('Workflow run started')).toBeInTheDocument();
+  });
+
+  it('a step_warning from history renders as a warning row on the global feed', async () => {
+    vi.spyOn(api, 'getEvents').mockResolvedValue([
+      {
+        type: 'step_warning', run_id: 'run_warn_1', step_id: 'sweep', index: 3,
+        message: 'host gpu-9 did not stream coverage', ts: 2_000, pos: 1,
+      } as TimedRunEvent,
+    ]);
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+
+    renderPage();
+
+    expect(await screen.findByText('host gpu-9 did not stream coverage')).toHaveClass('text-warn');
+    expect(screen.getByText('Warning', { selector: 'span' })).toHaveClass('text-warn');
+    expect(screen.getByText('sweep · unit 3 warning')).toBeInTheDocument();
   });
 
   it('an SSE replay of an already-loaded history event renders once, not twice', async () => {

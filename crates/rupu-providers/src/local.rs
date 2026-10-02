@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ProviderError;
+use crate::openai_wire::finalize_stop;
 use crate::provider::LlmProvider;
 use crate::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
@@ -40,8 +41,9 @@ impl LocalModelProvider {
         // `FlowCtx::system(Origin::Provider("local"))`. Plan 2 threads
         // the real run id through once the provider factory is touched.
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("local".into()));
-        let client = rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink)
-            .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
+        let client =
+            rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink)
+                .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model_name: model_name.to_string(),
@@ -115,6 +117,61 @@ fn extract_text_content(msg: &Message) -> String {
         .join("")
 }
 
+/// Parse a local server's chat-completions reply. Text only: local models are
+/// not given tools, so `tool_calls` are not read.
+fn parse_local_response(
+    json: &serde_json::Value,
+    model_name: &str,
+) -> Result<LlmResponse, ProviderError> {
+    if json.get("choices").is_none() && json.get("error").is_some_and(|e| !e.is_null()) {
+        return Err(ProviderError::Reply(Box::new(
+            crate::reply_error::parse_error_value(
+                "local",
+                crate::reply_error::ErrorOrigin::Http { status: 200 },
+                json,
+            ),
+        )));
+    }
+
+    let choice = &json["choices"][0];
+    let content = choice["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let finish = choice["finish_reason"].as_str();
+    // A refusal is the model declining: it is not reply text.
+    let refusal = choice["message"]["refusal"]
+        .as_str()
+        .filter(|r| !r.is_empty());
+    // Local models are sent no tools, so no tool block is ever parsed.
+    let mut stop = finalize_stop("local", finish, false, refusal.unwrap_or(""), None);
+    // A server may still report `tool_calls`. With no tool block in the
+    // reply there is nothing to dispatch, so the turn is a plain end; the
+    // wire value stays as the server sent it.
+    if stop.reason == StopReason::ToolUse {
+        stop.reason = StopReason::EndTurn;
+    }
+
+    let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+
+    Ok(LlmResponse {
+        id: json["id"].as_str().unwrap_or("local").to_string(),
+        model: model_name.to_string(),
+        content: if refusal.is_some() && content.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text { text: content }]
+        },
+        stop,
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        },
+    })
+}
+
 #[async_trait]
 impl LlmProvider for LocalModelProvider {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
@@ -134,9 +191,10 @@ impl LlmProvider for LocalModelProvider {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             return Err(crate::error::api_error_from_response(
+                "local",
                 status.as_u16(),
                 &headers,
-                text,
+                &text,
             ));
         }
 
@@ -145,26 +203,7 @@ impl LlmProvider for LocalModelProvider {
             .await
             .map_err(|e| ProviderError::Json(format!("cannot parse local model response: {e}")))?;
 
-        // Parse OpenAI-compatible response
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-        let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
-
-        Ok(LlmResponse {
-            id: json["id"].as_str().unwrap_or("local").to_string(),
-            model: self.model_name.clone(),
-            content: vec![ContentBlock::Text { text: content }],
-            stop_reason: Some(StopReason::EndTurn),
-            usage: Usage {
-                input_tokens,
-                output_tokens,
-                ..Default::default()
-            },
-        })
+        parse_local_response(&json, &self.model_name)
     }
 
     async fn stream(
@@ -190,7 +229,7 @@ impl LlmProvider for LocalModelProvider {
     }
 
     fn provider_id(&self) -> crate::provider_id::ProviderId {
-        crate::provider_id::ProviderId::Anthropic
+        crate::provider_id::ProviderId::Local
     }
 }
 
@@ -261,6 +300,19 @@ pub enum RoutingDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_id_is_local() {
+        let provider = LocalModelProvider::new(
+            "http://localhost:8080",
+            "phi-local",
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
+        assert_eq!(
+            provider.provider_id(),
+            crate::provider_id::ProviderId::Local
+        );
+    }
 
     #[test]
     fn test_local_model_provider_new_trims_trailing_slash() {
@@ -501,5 +553,56 @@ mod tests {
             policy.route("anything_else", true),
             RoutingDecision::Frontier
         );
+    }
+
+    #[test]
+    fn local_reads_finish_reason() {
+        let body = |finish: serde_json::Value| {
+            serde_json::json!({
+                "id": "l1",
+                "choices": [{"message": {"content": "hello"}, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+            })
+        };
+        let r = parse_local_response(&body(serde_json::json!("length")), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::MaxTokens);
+        assert_eq!(r.stop.wire.provider, "local");
+        assert_eq!(r.stop.wire.value.as_deref(), Some("length"));
+        assert_eq!(r.usage.input_tokens, 3);
+
+        let r = parse_local_response(&body(serde_json::json!("stop")), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::EndTurn);
+
+        let r = parse_local_response(&body(serde_json::Value::Null), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::Unreported);
+        assert_eq!(r.stop.wire.value, None);
+
+        let r = parse_local_response(&body(serde_json::json!("content_filter")), "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::Safety);
+    }
+
+    #[test]
+    fn local_message_refusal_is_a_refusal() {
+        let json = serde_json::json!({
+            "choices": [{"message": {"content": null, "refusal": "No."}, "finish_reason": "stop"}]
+        });
+        let r = parse_local_response(&json, "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::Refusal);
+        assert_eq!(r.stop.refusal.unwrap().explanation.as_deref(), Some("No."));
+        assert!(r.content.is_empty());
+    }
+
+    #[test]
+    fn local_tool_calls_finish_without_tool_blocks_is_end_turn() {
+        let json = serde_json::json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "tool_calls"}]
+        });
+        let r = parse_local_response(&json, "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::EndTurn);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("tool_calls"));
+        assert!(!r
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
     }
 }

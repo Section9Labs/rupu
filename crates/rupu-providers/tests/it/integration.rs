@@ -29,7 +29,7 @@ fn test_full_request_response_type_flow() {
         id: "msg_test".into(),
         model: "claude-sonnet-4-6".into(),
         content: vec![ContentBlock::Text { text: "4".into() }],
-        stop_reason: Some(StopReason::EndTurn),
+        stop: Stop::synthetic(StopReason::EndTurn, "mock"),
         usage: Usage {
             input_tokens: 15,
             output_tokens: 1,
@@ -83,7 +83,7 @@ fn test_tool_use_flow() {
                 input: serde_json::json!({"path": "/tmp/test.txt"}),
             },
         ],
-        stop_reason: Some(StopReason::ToolUse),
+        stop: Stop::synthetic(StopReason::ToolUse, "mock"),
         usage: Usage::default(),
     };
     assert_eq!(response.tool_calls().len(), 1);

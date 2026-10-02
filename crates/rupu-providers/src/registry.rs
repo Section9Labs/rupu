@@ -38,7 +38,7 @@ impl ProviderRegistry {
             .get(id)
             .ok_or_else(|| ProviderError::MissingAuth {
                 provider: id.auth_key().to_string(),
-                env_hint: id.env_var_name().to_string(),
+                env_hint: id.env_var_name().unwrap_or_default().to_string(),
             })?;
 
         match id {
@@ -91,6 +91,9 @@ impl ProviderRegistry {
                 info!(provider = "github-copilot", "provider created");
                 Ok(Box::new(client))
             }
+            ProviderId::Local | ProviderId::Broker => Err(ProviderError::NotImplemented {
+                provider: format!("{id} (not an OAuth registry provider)"),
+            }),
             ProviderId::OpenaiCompatible => Err(ProviderError::NotImplemented {
                 provider:
                     "openai-compatible (built via runtime provider factory, not the OAuth registry)"
