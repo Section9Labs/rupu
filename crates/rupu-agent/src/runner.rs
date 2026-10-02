@@ -460,6 +460,23 @@ self-contained.";
         .collect::<Vec<_>>()
         .join("\n");
 
+    // A refused, truncated or empty summary must never replace the history it
+    // was meant to condense: the caller treats this `Err` as a failed
+    // compaction and keeps the original messages. An empty reply is reported
+    // as an empty summary, the title that says what was lost.
+    let rejection = match crate::outcome::classify_response(&summary_resp) {
+        Some(o) if o.severity() == Severity::Error && o.class != OutcomeClass::EmptyReply => {
+            Some(o.title)
+        }
+        _ if summary.trim().is_empty() => Some("empty summary".to_string()),
+        _ => None,
+    };
+    if let Some(title) = rejection {
+        return Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(
+            "compaction summary rejected: {title}"
+        )));
+    }
+
     // Extract task text from messages[0].
     let task_text: String = messages[0]
         .content
@@ -4712,6 +4729,92 @@ mod compaction_tests {
             outcome.summarized_messages > 0,
             "summarized_messages must be > 0"
         );
+    }
+
+    /// A dense history `compact_messages` finds a middle in, driven through
+    /// `reply` as the summariser's one scripted turn.
+    async fn compact_with_summary_reply(
+        content: Vec<ContentBlock>,
+        reason: StopReason,
+    ) -> Result<Option<CompactionOutcome>, rupu_providers::ProviderError> {
+        let dense_chunk = "x".repeat(1000);
+        let mut msgs = vec![text_msg(Role::User, &format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("assistant {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("user {i}: {dense_chunk}")));
+        }
+        let mut provider = MockProvider::new(vec![ScriptedTurn::Reply {
+            content,
+            stop: Stop::synthetic(reason, "mock"),
+            usage: Usage::default(),
+        }]);
+        compact_messages(&msgs, &mut provider, "mock-1", 800, 900).await
+    }
+
+    fn summary_text(text: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text {
+            text: text.to_string(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn compact_messages_rejects_a_refused_summary() {
+        let err = compact_with_summary_reply(summary_text("I cannot help"), StopReason::Refusal)
+            .await
+            .err()
+            .expect("a refused summary must not replace history");
+        assert!(
+            err.to_string()
+                .contains("compaction summary rejected: refused"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_rejects_a_truncated_summary() {
+        let err = compact_with_summary_reply(summary_text("Summary cut o"), StopReason::MaxTokens)
+            .await
+            .err()
+            .expect("a truncated summary must not replace history");
+        assert!(
+            err.to_string()
+                .contains("compaction summary rejected: truncated"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_rejects_an_empty_summary() {
+        let err = compact_with_summary_reply(vec![], StopReason::EndTurn)
+            .await
+            .err()
+            .expect("an empty summary must not replace history");
+        assert!(
+            err.to_string()
+                .contains("compaction summary rejected: empty summary"),
+            "got: {err}"
+        );
+
+        // Text that is only whitespace has content for the classifier but
+        // nothing to summarise with.
+        let err = compact_with_summary_reply(summary_text("  \n "), StopReason::EndTurn)
+            .await
+            .err()
+            .expect("a whitespace-only summary must not replace history");
+        assert!(err.to_string().contains("empty summary"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn compact_messages_keeps_a_normal_summary() {
+        let outcome =
+            compact_with_summary_reply(summary_text("Summary of prior work."), StopReason::EndTurn)
+                .await
+                .expect("no provider error")
+                .expect("should compact");
+        assert!(outcome.summarized_messages > 0);
     }
 
     #[tokio::test]
