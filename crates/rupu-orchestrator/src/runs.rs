@@ -507,6 +507,18 @@ impl RunRecord {
         }
     }
 
+    /// Drop the pending-resume marker
+    /// ([`RunStore::list_pending_resume`]): `resume_requested_at` and the
+    /// mode, gate and approver it carries. The claim (`resume_claimed_at`
+    /// / `resume_claimed_by`) is the lease of the worker holding it, and is
+    /// left alone.
+    pub fn clear_resume_marker(&mut self) {
+        self.resume_requested_at = None;
+        self.resume_mode = None;
+        self.resume_gate_id = None;
+        self.resume_approver = None;
+    }
+
     /// The recorded, not-yet-applied decision on gate `step_id`, if any.
     pub fn pending_decision(&self, step_id: &str) -> Option<&GateDecision> {
         self.gate_decisions.iter().find(|d| d.step_id == step_id)
@@ -3392,12 +3404,9 @@ impl RunStore {
         // wrote stays, and a `Cancelled` is left alone entirely. The wait
         // blocks its thread: async callers go through [`RunStore::blocking`].
         self.modify_unless_cancelled(run_id, |record| {
-            record.resume_requested_at = None;
+            record.clear_resume_marker();
             record.resume_claimed_at = None;
             record.resume_claimed_by = None;
-            record.resume_mode = None;
-            record.resume_gate_id = None;
-            record.resume_approver = None;
             true
         })?;
         Ok(())
@@ -3426,10 +3435,7 @@ impl RunStore {
             record.resume_claimed_at = None;
             record.resume_claimed_by = None;
             if marked_at.is_some() && record.resume_requested_at == marked_at {
-                record.resume_requested_at = None;
-                record.resume_mode = None;
-                record.resume_gate_id = None;
-                record.resume_approver = None;
+                record.clear_resume_marker();
                 cleared.set(true);
             }
             true

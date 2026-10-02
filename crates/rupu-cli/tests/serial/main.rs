@@ -92,4 +92,5 @@ mod netflow_run;
 mod netflow_workflow;
 mod policy_lock;
 mod reject_mode_inheritance;
+mod resume_clears_web_marker;
 mod workflow_runs_no_side_effects;

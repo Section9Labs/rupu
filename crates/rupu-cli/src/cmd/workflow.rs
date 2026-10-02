@@ -3242,6 +3242,16 @@ fn resume_refused_by_status_change(
 /// `awaiting_step_id` (with no prompt), and the web reads any
 /// `awaiting_step_id` as a parked gate — leaving it set showed a phantom
 /// "Awaiting approval" on a run that was running again.
+///
+/// The pending-resume marker goes too. Made under the run lock, at the
+/// flip, this edit sees every marker recorded before it, and each one asks
+/// for what this resume does — a web resume of the pause being resumed, or
+/// a runner for gate decisions recorded on the run, which this resume's
+/// runner applies — or is one a cancel or failure left behind (the resume
+/// worker never lists a terminal run). Left on the running run, the worker
+/// would pick it up when the run next parks and approve that gate as the
+/// marker's actor. A marker recorded after the flip is for a later park and
+/// stays. The claim is the worker's lease, left for it to give back.
 fn mark_resumed(record: &mut rupu_orchestrator::runs::RunRecord, pid: u32) {
     record.status = rupu_orchestrator::RunStatus::Running;
     record.finished_at = None;
@@ -3252,6 +3262,7 @@ fn mark_resumed(record: &mut rupu_orchestrator::runs::RunRecord, pid: u32) {
     record.approval_prompt = None;
     record.awaiting_since = None;
     record.expires_at = None;
+    record.clear_resume_marker();
 }
 
 pub(crate) async fn resume_run(
@@ -6509,6 +6520,14 @@ mod tests {
         record.awaiting_since = Some(Utc::now());
         record.error_message = Some("runner process 4242 is no longer alive".into());
         record.finished_at = Some(Utc::now());
+        // The web asked to resume this pause; a worker holds the claim.
+        record.resume_requested_at = Some(Utc::now());
+        record.resume_mode = Some("bypass".into());
+        record.resume_gate_id = Some("assess".into());
+        record.resume_approver = Some("web".into());
+        let claimed_at = Utc::now();
+        record.resume_claimed_at = Some(claimed_at);
+        record.resume_claimed_by = Some("worker".into());
 
         mark_resumed(&mut record, 7);
 
@@ -6521,6 +6540,103 @@ mod tests {
         assert!(record.awaiting.is_empty());
         assert_eq!(record.error_message, None);
         assert_eq!(record.finished_at, None);
+        assert_eq!(record.resume_requested_at, None);
+        assert_eq!(record.resume_mode, None);
+        assert_eq!(record.resume_gate_id, None);
+        assert_eq!(record.resume_approver, None);
+        assert_eq!(
+            (
+                record.resume_claimed_at,
+                record.resume_claimed_by.as_deref()
+            ),
+            (Some(claimed_at), Some("worker")),
+            "the claim is the worker's to give back"
+        );
+    }
+
+    /// The marker is consumed by the flip, under the run lock — not by
+    /// what the resume read when it loaded the run. A web resume request
+    /// recorded between that load and the flip asks for the very pause the
+    /// flip resumes; left on the run, the resume worker would approve the
+    /// run's next gate as "web". Driven exactly, as in
+    /// `resume_refuses_a_run_cancelled_since_it_was_loaded`: the test holds
+    /// `run.json.lock` while the resume loads the run (no marker yet) and
+    /// passes its guards, records the request, then releases the lock the
+    /// flip waits on. The run parks at its gate with no request left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_consumes_a_web_resume_request_recorded_since_it_loaded_the_run() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", tmp.path());
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let mut record = sample_run_record(RunStatus::Paused, None);
+        record.workspace_path = tmp.path().join("workspace");
+        record.transcript_dir = tmp.path().join("transcripts");
+        std::fs::create_dir_all(&record.workspace_path).unwrap();
+        store
+            .create(
+                record.clone(),
+                "name: sample\nsteps:\n  - id: gate\n    approval:\n      prompt: ship?\n",
+            )
+            .unwrap();
+        store.set_pause_marker(&record.id).unwrap();
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(
+                tmp.path()
+                    .join("runs")
+                    .join(&record.id)
+                    .join("run.json.lock"),
+            )
+            .unwrap();
+        rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let run_id = record.id.clone();
+        let resume = tokio::spawn(async move { resume_run(&run_id, None, true).await });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.pause_marker_exists(&record.id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resume never got past its guards"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !resume.is_finished(),
+            "the resume is still in flight (its flip waits on the lock)"
+        );
+        // What `request_resume_approval` writes for a `Paused` run, landing
+        // before the flip takes the lock.
+        let mut marked = store.load(&record.id).unwrap();
+        assert_eq!(marked.status, RunStatus::Paused);
+        marked.resume_requested_at = Some(Utc::now());
+        marked.resume_mode = Some("bypass".into());
+        marked.resume_approver = Some("web".into());
+        store.update(&marked).unwrap();
+        drop(lock_file);
+
+        resume.await.unwrap().expect("the resume runs to its gate");
+        let reloaded = store.load(&record.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate"));
+        assert_eq!(
+            (
+                reloaded.resume_requested_at,
+                reloaded.resume_mode.as_deref(),
+                reloaded.resume_approver.as_deref(),
+            ),
+            (None, None, None),
+            "the request was for the pause the flip resumed"
+        );
+        assert!(store
+            .list_pending_resume(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap()
+            .is_empty());
+        std::env::remove_var("RUPU_HOME");
     }
 
     /// A cancel that lands between the resume's load and its flip to
