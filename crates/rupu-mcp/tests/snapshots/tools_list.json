@@ -824,6 +824,34 @@
               "description": "How the surface is reached, including authentication or user interaction required, or 'Unknown'.",
               "type": "string"
             },
+            "blocks": {
+              "description": "Typed evidence blocks (engagement profiles): each an object with a 'kind' tag and that kind's fields, e.g. {\"kind\":\"scan_output\",\"tool\":\"nmap\",\"output\":\"...\"} or {\"kind\":\"http_exchange\",\"request\":\"...\",\"response\":\"...\"}. Optional; additive to 'evidence'.",
+              "items": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "text",
+                      "code_slice",
+                      "diff",
+                      "table",
+                      "image",
+                      "hexdump",
+                      "disasm",
+                      "decompile",
+                      "http_exchange",
+                      "scan_output",
+                      "pcap_ref"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
             "call_chain": {
               "anyOf": [
                 {
@@ -916,6 +944,28 @@
                 }
               ],
               "description": "A pipeline check that fails the build when this class of issue is present, or 'Not Provided — <justification>'."
+            },
+            "classifications": {
+              "description": "Classifications across taxonomies (engagement profiles), e.g. {\"system\":\"CVE\",\"id\":\"CVE-2024-1234\"} or {\"system\":\"ATT&CK\",\"id\":\"T1190\"}. Optional; additive to 'cwe'.",
+              "items": {
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "system": {
+                    "type": "string"
+                  },
+                  "vector": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "system",
+                  "id"
+                ],
+                "type": "object"
+              },
+              "type": "array"
             },
             "cross_references": {
               "anyOf": [

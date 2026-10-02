@@ -8,8 +8,8 @@ use crate::number;
 use crate::text::{longest_backtick_run, one_line};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::report::{
-    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, FindingReport, HopRole, Likelihood,
-    OrSentinel, Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
+    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, EvidenceBlock, FindingReport, HopRole,
+    Likelihood, OrSentinel, Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
 };
 use rupu_coverage::FindingRecord;
 use rupu_coverage::{FindingProfile, FindingScope, Severity, Surface};
@@ -85,6 +85,83 @@ fn nonblank(s: &Option<String>) -> Option<&str> {
 
 /// An inline code span holding `s` verbatim: the delimiter is longer than
 /// any backtick run inside, padded when the text starts or ends with one.
+/// Map one typed engagement [`EvidenceBlock`] onto the renderer-neutral
+/// [`Block`] model the emitters already draw. No emitter changes are needed —
+/// every block lowers to Prose / Code / Table / Note.
+fn render_evidence_block(blk: &EvidenceBlock, out: &mut Vec<Block>) {
+    match blk {
+        EvidenceBlock::Text { text } => out.push(prose(text.clone())),
+        EvidenceBlock::CodeSlice {
+            file,
+            excerpt,
+            lang,
+        } => {
+            if let Some(f) = nonblank(file) {
+                out.push(prose(format!("**{}**", code_span(f))));
+            }
+            out.push(code(lang.as_deref(), excerpt));
+        }
+        EvidenceBlock::Diff { diff } => out.push(code(Some("diff"), diff)),
+        EvidenceBlock::Table { headers, rows } => out.push(Block::Table {
+            headers: headers.clone(),
+            rows: rows.clone(),
+        }),
+        EvidenceBlock::Image { artifact, caption } => {
+            let cap = caption.as_deref().unwrap_or("Image");
+            out.push(Block::Note(format!(
+                "{cap} — {}",
+                code_span(&artifact.path)
+            )));
+        }
+        EvidenceBlock::Hexdump {
+            base,
+            artifact,
+            rendered,
+        } => {
+            out.push(prose(format!(
+                "**Hexdump** (base {base:#x}) — {}",
+                code_span(&artifact.path)
+            )));
+            if let Some(r) = nonblank(rendered) {
+                out.push(code(None, r));
+            }
+        }
+        EvidenceBlock::Disasm { arch, listing } => {
+            out.push(prose(format!("**Disassembly** ({arch})")));
+            let text = listing
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{:#010x}  {:<12} {} {}",
+                        l.address, l.bytes, l.mnemonic, l.ops
+                    )
+                    .trim_end()
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push(code(None, &text));
+        }
+        EvidenceBlock::Decompile { lang, listing } => out.push(code(Some(lang), listing)),
+        EvidenceBlock::HttpExchange { request, response } => {
+            out.push(prose("**HTTP request**".to_string()));
+            out.push(code(Some("http"), request));
+            out.push(prose("**HTTP response**".to_string()));
+            out.push(code(Some("http"), response));
+        }
+        EvidenceBlock::ScanOutput { tool, output } => {
+            out.push(prose(format!("**Scan output** ({tool})")));
+            out.push(code(None, output));
+        }
+        EvidenceBlock::PcapRef { artifact, summary } => {
+            out.push(Block::Note(format!(
+                "Packet capture: {summary} — {}",
+                code_span(&artifact.path)
+            )));
+        }
+    }
+}
+
 fn code_span(s: &str) -> String {
     let s = one_line(s);
     let ticks = "`".repeat(longest_backtick_run(&s) + 1);
@@ -374,6 +451,15 @@ fn full_blocks(
     if !r.cwe.is_empty() {
         identity.push(kv("CWE", r.cwe.join(", ")));
     }
+    if !r.classifications.is_empty() {
+        let joined = r
+            .classifications
+            .iter()
+            .map(|c| format!("{} {}", c.system, c.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        identity.push(kv("Classifications", joined));
+    }
     identity.extend([
         kv("Attack Vector", r.attack_vector.clone()),
         kv("Likelihood", likelihood(r.rating.likelihood)),
@@ -405,7 +491,7 @@ fn full_blocks(
     });
 
     b.push(heading("Evidence"));
-    if r.evidence.is_empty() {
+    if r.evidence.is_empty() && r.blocks.is_empty() {
         b.push(Block::Note("No evidence recorded.".to_string()));
     }
     for e in &r.evidence {
@@ -424,6 +510,9 @@ fn full_blocks(
         if let Some(x) = nonblank(&e.excerpt) {
             b.push(code(e.lang.as_deref(), x));
         }
+    }
+    for blk in &r.blocks {
+        render_evidence_block(blk, &mut b);
     }
 
     b.push(heading("Remediation"));

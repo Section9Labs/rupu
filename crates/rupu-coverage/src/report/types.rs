@@ -206,6 +206,105 @@ pub struct EvidenceClaim {
     pub artifact: Option<String>,
 }
 
+/// A classification spanning any taxonomy, generalizing `cwe`/`cvss_v3`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Classification {
+    /// e.g. `"CWE"`, `"CVE"`, `"CAPEC"`, `"ATT&CK"`, `"OWASP"`, `"MASVS"`.
+    pub system: String,
+    /// e.g. `"CWE-306"`, `"CVE-2024-1234"`, `"T1190"`.
+    pub id: String,
+    /// e.g. a CVSS vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<String>,
+}
+
+/// One line of a disassembly listing (a [`EvidenceBlock::Disasm`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisasmLine {
+    pub address: u64,
+    pub bytes: String,
+    pub mnemonic: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ops: String,
+}
+
+/// A typed evidence block. Carried in [`FindingReport::blocks`] alongside the
+/// legacy `evidence` claim list; profile completeness checks the block kinds
+/// present via `has_block_kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EvidenceBlock {
+    Text {
+        text: String,
+    },
+    CodeSlice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        excerpt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+    },
+    Diff {
+        diff: String,
+    },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Image {
+        artifact: ArtifactRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    Hexdump {
+        base: u64,
+        artifact: ArtifactRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rendered: Option<String>,
+    },
+    Disasm {
+        arch: String,
+        listing: Vec<DisasmLine>,
+    },
+    Decompile {
+        lang: String,
+        listing: String,
+    },
+    HttpExchange {
+        request: String,
+        response: String,
+    },
+    ScanOutput {
+        tool: String,
+        output: String,
+    },
+    PcapRef {
+        artifact: ArtifactRef,
+        summary: String,
+    },
+}
+
+impl EvidenceBlock {
+    /// The serialized `kind` tag, matching a profile's `has_block_kind`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EvidenceBlock::Text { .. } => "text",
+            EvidenceBlock::CodeSlice { .. } => "code_slice",
+            EvidenceBlock::Diff { .. } => "diff",
+            EvidenceBlock::Table { .. } => "table",
+            EvidenceBlock::Image { .. } => "image",
+            EvidenceBlock::Hexdump { .. } => "hexdump",
+            EvidenceBlock::Disasm { .. } => "disasm",
+            EvidenceBlock::Decompile { .. } => "decompile",
+            EvidenceBlock::HttpExchange { .. } => "http_exchange",
+            EvidenceBlock::ScanOutput { .. } => "scan_output",
+            EvidenceBlock::PcapRef { .. } => "pcap_ref",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Patch {
@@ -336,6 +435,46 @@ pub struct FindingReport {
     pub artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+    /// Typed evidence blocks (engagement profiles). Additive to `evidence`:
+    /// code findings keep using `evidence`; binary/network/web findings attach
+    /// `disasm`/`scan_output`/`http_exchange`/… blocks here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<EvidenceBlock>,
+    /// Classifications across taxonomies (engagement profiles). Additive to
+    /// `cwe`: legacy `cwe` entries fold in as `CWE` via [`FindingReport::all_classifications`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classifications: Vec<Classification>,
+}
+
+impl FindingReport {
+    /// Every classification, folding legacy `cwe` entries in as `CWE`. Profile
+    /// `has_classification_system` evaluates against this.
+    pub fn all_classifications(&self) -> Vec<Classification> {
+        let mut out: Vec<Classification> = self
+            .cwe
+            .iter()
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| Classification {
+                system: "CWE".to_string(),
+                id: c.clone(),
+                vector: None,
+            })
+            .collect();
+        out.extend(self.classifications.iter().cloned());
+        out
+    }
+
+    /// The evidence-block kinds present, folding a legacy `evidence` claim with
+    /// an `excerpt` in as a `code_slice`. Profile `has_block_kind` evaluates
+    /// against this.
+    pub fn block_kinds(&self) -> std::collections::BTreeSet<&str> {
+        let mut kinds: std::collections::BTreeSet<&str> =
+            self.blocks.iter().map(|b| b.kind()).collect();
+        if self.evidence.iter().any(|e| e.excerpt.is_some()) {
+            kinds.insert("code_slice");
+        }
+        kinds
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +492,37 @@ mod tests {
         serde_path_to_error::deserialize::<_, FindingReport>(v)
             .unwrap_err()
             .to_string()
+    }
+
+    fn report_fixture() -> FindingReport {
+        serde_json::from_value(fixture()).unwrap()
+    }
+
+    #[test]
+    fn all_classifications_folds_legacy_cwe() {
+        let mut r = report_fixture();
+        r.cwe = vec!["CWE-306".into()];
+        r.classifications = vec![Classification {
+            system: "CVE".into(),
+            id: "CVE-2024-1".into(),
+            vector: None,
+        }];
+        let all = r.all_classifications();
+        assert!(all.iter().any(|c| c.system == "CWE" && c.id == "CWE-306"));
+        assert!(all.iter().any(|c| c.system == "CVE"));
+    }
+
+    #[test]
+    fn block_kinds_includes_typed_blocks_and_legacy_code_slice() {
+        let mut r = report_fixture();
+        r.blocks = vec![EvidenceBlock::ScanOutput {
+            tool: "nmap".into(),
+            output: "open".into(),
+        }];
+        // the fixture's evidence carries an excerpt → folds in as code_slice
+        let kinds = r.block_kinds();
+        assert!(kinds.contains("scan_output"));
+        assert!(kinds.contains("code_slice"));
     }
 
     #[test]

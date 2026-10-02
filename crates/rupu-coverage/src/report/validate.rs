@@ -157,6 +157,22 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
             c.err(format!("report.cwe[{i}]"), "must look like `CWE-306`");
         }
     }
+    // Engagement-profile classifications: system + id non-empty (mirrors the
+    // schema's `minLength: 1`). The taxonomy itself is open (CVE/CAPEC/ATT&CK/…).
+    for (i, cls) in r.classifications.iter().enumerate() {
+        if cls.system.is_empty() {
+            c.err(
+                format!("report.classifications[{i}].system"),
+                "must not be empty",
+            );
+        }
+        if cls.id.is_empty() {
+            c.err(
+                format!("report.classifications[{i}].id"),
+                "must not be empty",
+            );
+        }
+    }
     c.text("report.description", &r.description);
     c.text("report.impact", &r.impact);
     c.text("report.location.input", &r.location.input);
