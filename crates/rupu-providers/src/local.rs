@@ -8,11 +8,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ProviderError;
+use crate::openai_wire::finalize_stop;
 use crate::provider::LlmProvider;
-use crate::stop::map;
 use crate::types::{
-    ContentBlock, LlmRequest, LlmResponse, Message, RefusalDetail, RefusalSource, Role, Stop,
-    StopReason, StreamEvent, Usage,
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
 };
 
 /// Provider backed by a local HTTP inference server (llama.cpp, Ollama, vLLM).
@@ -140,22 +139,17 @@ fn parse_local_response(
         .unwrap_or("")
         .to_string();
     let finish = choice["finish_reason"].as_str();
-    let mut stop = match finish {
-        Some(v) => Stop::from_wire(map::chat_finish(v), "local", Some(v)),
-        None => Stop::from_wire(StopReason::Unreported, "local", None),
-    };
     // A refusal is the model declining: it is not reply text.
     let refusal = choice["message"]["refusal"]
         .as_str()
         .filter(|r| !r.is_empty());
-    if let Some(text) = refusal {
-        stop.reason = StopReason::Refusal;
-        stop.refusal = Some(RefusalDetail {
-            category: None,
-            explanation: Some(text.to_string()),
-            recommended_model: None,
-            source: RefusalSource::Model,
-        });
+    // Local models are sent no tools, so no tool block is ever parsed.
+    let mut stop = finalize_stop("local", finish, false, refusal.unwrap_or(""), None);
+    // A server may still report `tool_calls`. With no tool block in the
+    // reply there is nothing to dispatch, so the turn is a plain end; the
+    // wire value stays as the server sent it.
+    if stop.reason == StopReason::ToolUse {
+        stop.reason = StopReason::EndTurn;
     }
 
     let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
@@ -583,5 +577,19 @@ mod tests {
         assert_eq!(r.stop.reason, StopReason::Refusal);
         assert_eq!(r.stop.refusal.unwrap().explanation.as_deref(), Some("No."));
         assert!(r.content.is_empty());
+    }
+
+    #[test]
+    fn local_tool_calls_finish_without_tool_blocks_is_end_turn() {
+        let json = serde_json::json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "tool_calls"}]
+        });
+        let r = parse_local_response(&json, "m").unwrap();
+        assert_eq!(r.stop.reason, StopReason::EndTurn);
+        assert_eq!(r.stop.wire.value.as_deref(), Some("tool_calls"));
+        assert!(!r
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
     }
 }

@@ -1527,14 +1527,7 @@ fn finalize_stop(stop: Option<Stop>, refusal: &str, bad_tool: Option<serde_json:
             source: RefusalSource::Model,
         });
     }
-    if let Some(bad) = bad_tool {
-        if stop.reason == StopReason::MaxTokens {
-            stop.set_detail("truncated_tool", bad);
-        } else {
-            stop.reason = StopReason::MalformedToolCall;
-            stop.set_detail("malformed_tool", bad);
-        }
-    }
+    stop.apply_bad_tool(bad_tool);
     stop
 }
 

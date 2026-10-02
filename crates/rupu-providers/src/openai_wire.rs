@@ -196,7 +196,7 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
 /// sent `null`. A reply that carries tool calls but reports `stop` (or
 /// nothing) is `ToolUse`: several servers answer a tool turn that way. The
 /// provider's own wire value is kept either way.
-fn finalize_stop(
+pub(crate) fn finalize_stop(
     provider: &str,
     finish: Option<&str>,
     has_tool_use: bool,
@@ -219,14 +219,7 @@ fn finalize_stop(
             source: RefusalSource::Model,
         });
     }
-    if let Some(bad) = bad_tool {
-        if stop.reason == StopReason::MaxTokens {
-            stop.set_detail("truncated_tool", bad);
-        } else {
-            stop.reason = StopReason::MalformedToolCall;
-            stop.set_detail("malformed_tool", bad);
-        }
-    }
+    stop.apply_bad_tool(bad_tool);
     stop
 }
 
@@ -1694,5 +1687,33 @@ mod tests {
             assert_eq!(resp.stop.reason, StopReason::ToolUse, "sent {args:?}");
             assert!(resp.stop.wire.details.is_none());
         }
+    }
+
+    #[test]
+    fn refusal_plus_bad_tool_stays_refusal() {
+        let resp = parse_chat_completion(
+            &send_body(serde_json::json!({
+                "message": {"content": null, "refusal": "No.", "tool_calls": [
+                    {"id": "call_3", "function": {"name": "read_file", "arguments": "{\"a\":"}}
+                ]},
+                "finish_reason": "stop"
+            })),
+            "openai-compatible",
+        )
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Refusal);
+        assert_eq!(
+            resp.stop.wire.details.as_ref().unwrap()["malformed_tool"]["id"],
+            "call_3"
+        );
+
+        let resp = stream_chunks(&[
+            r#"{"id":"c","model":"m","choices":[{"delta":{"refusal":"No."}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_4","function":{"name":"f","arguments":"{bad"}}]},"finish_reason":"stop"}]}"#,
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.stop.reason, StopReason::Refusal);
+        assert!(resp.stop.wire.details.as_ref().unwrap()["malformed_tool"].is_object());
     }
 }

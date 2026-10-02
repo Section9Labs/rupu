@@ -140,6 +140,28 @@ impl Stop {
         }
     }
 
+    /// Record a tool call whose arguments did not parse (the call itself was
+    /// dropped). The reply's own outcome decides how it shows: `MaxTokens`
+    /// stays and gets a `truncated_tool` detail; `ToolUse`, `EndTurn`,
+    /// `Unreported` and `Unrecognized` become `MalformedToolCall` with a
+    /// `malformed_tool` detail; any other reason (a refusal, a safety stop,
+    /// an incomplete reply, ...) is the more important outcome, so it stays
+    /// and only gains the `malformed_tool` detail.
+    pub fn apply_bad_tool(&mut self, bad_tool: Option<serde_json::Value>) {
+        let Some(bad) = bad_tool else { return };
+        match self.reason {
+            StopReason::MaxTokens => self.set_detail("truncated_tool", bad),
+            StopReason::ToolUse
+            | StopReason::EndTurn
+            | StopReason::Unreported
+            | StopReason::Unrecognized => {
+                self.reason = StopReason::MalformedToolCall;
+                self.set_detail("malformed_tool", bad);
+            }
+            _ => self.set_detail("malformed_tool", bad),
+        }
+    }
+
     /// The provider's value, or the reason's name when it sent none —
     /// what `TurnEnd.stop_reason` records.
     pub fn wire_value_or_reason(&self) -> String {
@@ -357,5 +379,59 @@ mod tests {
         );
         let back: Stop = serde_json::from_value(v).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn bad_tool_under_max_tokens_is_truncated_tool() {
+        let mut s = Stop::from_wire(StopReason::MaxTokens, "p", Some("length"));
+        s.apply_bad_tool(Some(serde_json::json!({"name": "f"})));
+        assert_eq!(s.reason, StopReason::MaxTokens);
+        let d = s.wire.details.as_ref().unwrap();
+        assert_eq!(d["truncated_tool"]["name"], "f");
+        assert!(d.get("malformed_tool").is_none());
+    }
+
+    #[test]
+    fn bad_tool_after_a_normal_stop_is_malformed_tool_call() {
+        for r in [
+            StopReason::ToolUse,
+            StopReason::EndTurn,
+            StopReason::Unreported,
+            StopReason::Unrecognized,
+        ] {
+            let mut s = Stop::from_wire(r.clone(), "p", None);
+            s.apply_bad_tool(Some(serde_json::json!({"name": "f"})));
+            assert_eq!(s.reason, StopReason::MalformedToolCall, "from {r:?}");
+            assert_eq!(
+                s.wire.details.as_ref().unwrap()["malformed_tool"]["name"],
+                "f"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_tool_never_masks_a_more_important_outcome() {
+        for r in [
+            StopReason::Refusal,
+            StopReason::Safety,
+            StopReason::Incomplete,
+            StopReason::ContextWindowExceeded,
+            StopReason::PauseTurn,
+            StopReason::MalformedToolCall,
+            StopReason::StopSequence,
+        ] {
+            let mut s = Stop::from_wire(r.clone(), "p", None);
+            s.apply_bad_tool(Some(serde_json::json!({"name": "f"})));
+            assert_eq!(s.reason, r);
+            assert!(s.wire.details.as_ref().unwrap()["malformed_tool"].is_object());
+        }
+    }
+
+    #[test]
+    fn no_bad_tool_changes_nothing() {
+        let mut s = Stop::from_wire(StopReason::EndTurn, "p", Some("stop"));
+        let before = s.clone();
+        s.apply_bad_tool(None);
+        assert_eq!(s, before);
     }
 }

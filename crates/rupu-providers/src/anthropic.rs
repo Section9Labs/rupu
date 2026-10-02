@@ -2912,14 +2912,7 @@ impl StreamAccumulator {
             self.iterations.as_ref(),
             &self.model,
         );
-        if let Some(bad) = self.bad_tool {
-            if stop.reason == StopReason::MaxTokens {
-                stop.set_detail("truncated_tool", bad);
-            } else {
-                stop.reason = StopReason::MalformedToolCall;
-                stop.set_detail("malformed_tool", bad);
-            }
-        }
+        stop.apply_bad_tool(self.bad_tool);
 
         Ok(LlmResponse {
             id: self.id,
