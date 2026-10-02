@@ -589,23 +589,28 @@ the imported report` for a call chain, patch, CI/CD detection or regression test
 section the file lacks. A part missing from a section that is present, such as
 the stage of a CI check, is `Not stated in the imported report.` Text with no
 field to hold it is kept at the end of References, under `Other imported text:`,
-one `From <where>:` block per place it came from (text before the first
-replication step included: it is not a step).
+one `From <where>:` block per place it came from (text before `Step 1:`
+included: it is not a step; in a plain list of steps, text before the first
+item is the first step).
 
 **Cross-references, evidence and artifacts.** The Cross-References text is kept
 verbatim in References. Each `fnd_` id it names also becomes a cross-reference
 link, but only to another finding in the same ledger: an id in a different
 ledger, and the finding's own id, are not linked. Code blocks in a call chain
 become evidence claims. A claim's location is the first `path:lines` in it
-whose path has a directory (`src/routes/notes.rs:40-58`), else a bare file name
-in a code span or with a range of lines (`` `notes.rs:40` ``, `notes.rs:40-58`).
-A host and port that reads as one is not a location: an address
-(`10.0.0.5:9229`), a user before an `@` (`admin@db:5432`), or a name ending in a
-common top-level domain (`notebin.example.com:443`); a bare name such as
-`` `db.prod:5432` `` cannot be told from a file and is read as one. A list right
-after a line that introduces it (`The handler skips two checks:`) is part of
-that line's claim, unless an item names a place of its own; a claim of several
-paragraphs comes back as one claim per paragraph. Artifacts the report lists (an Artifacts table or list)
+whose path has a directory (`src/routes/notes.rs:40-58`,
+`node_modules/@types/node/index.d.ts:10`), else a bare file name with a range of
+lines (`notes.test.ts:10-20`), or in a code span when it has one dot at most
+(`` `notes.rs:40` ``, `` `.env.local:3` ``). A host and port that reads as one is
+not a location: an address (`10.0.0.5:9229`), a user before an `@`
+(`admin@db:5432`), a name ending in a common top-level domain
+(`notebin.example.com:443`), or a name with several dots and no range
+(`` `debug.notebin.de:9229` ``); a bare name such as `` `db.prod:5432` `` cannot be
+told from a file and is read as one. A list right after a line that introduces
+it (`The handler skips two checks:`) is part of that line's claim, unless an
+item names a place of its own (in a report `rupu findings export` wrote, which
+prints each claim as one paragraph, always); a claim of several paragraphs
+comes back as one claim per paragraph. Artifacts the report lists (an Artifacts table or list)
 must exist in the finding's workspace; the report is refused with the reason
 when one does not. A list item's path is its leading code span (`` `poc/x.sh` ``),
 else its first word; an item that says more than its path is also kept as
@@ -620,10 +625,11 @@ wrote reads back field for field, with these exceptions: its Classifications
 come back without their vectors (not printed), and a classification whose id
 holds a space or a comma does not read (the field is kept as other text); its
 typed evidence blocks (scan output, HTTP exchanges, disassembly, …) come back as
-evidence claims, text and code kept, type not; a claim of several paragraphs
-comes back as several claims; and in an export made by a rupu that predates
-`rupu findings import` (whose exporter printed no `Command:` line), a CI/CD or
-regression command stays in that section's text.
+evidence claims, text and code kept, type not; and a claim of several
+paragraphs comes back as several claims. An export made by a rupu that predates
+`rupu findings import`, whose exporter printed its command blocks without a
+`Command:` line, reads back too: each section's last `sh` block is its
+command.
 
 **Output.** One line per file: `attached` (`would attach` on a dry run),
 `skipped` (not a report, or the finding already has one) or `failed` with the

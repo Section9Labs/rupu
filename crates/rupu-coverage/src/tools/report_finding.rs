@@ -1210,6 +1210,33 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_lock_handle_refused_as_unwritable_appends_unlocked() {
+        use std::io::{Error, ErrorKind};
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root opens the lock file writable: no read-only handle
+        }
+        let ebadf = || Error::from_raw_os_error(rustix::io::Errno::BADF.raw_os_error());
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        paths.ensure_dir().unwrap();
+        // A writable handle refused with EBADF is a real error.
+        let err = append_line(&paths, b"{\"n\":1}\n", |_| Err(ebadf())).unwrap_err();
+        assert_ne!(err.kind(), ErrorKind::Unsupported);
+        assert!(!paths.findings.exists());
+        // A read-only one (the lock file is another user's) is NFS refusing
+        // an exclusive lock it cannot take: the finding is still recorded.
+        let sidecar = paths.root.join("findings.jsonl.lock");
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+        append_line(&paths, b"{\"n\":1}\n", |_| Err(ebadf())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&paths.findings).unwrap(),
+            "{\"n\":1}\n"
+        );
+    }
+
     #[test]
     fn claim_hashes_are_skipped_on_request() {
         let ws = tempfile::TempDir::new().unwrap();

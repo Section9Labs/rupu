@@ -403,26 +403,35 @@ fn replace_ledger(
 
 /// Give the replacement the ledger's owner and group. Replaced by another
 /// user (an import run with `sudo`), the ledger would otherwise become that
-/// user's, and its owner's agents could no longer append to it; where that
-/// cannot be done (an importer who is neither the owner nor root), the
-/// import is refused rather than taking the ledger over.
+/// user's, and its owner's agents could no longer append to it; where the
+/// owner cannot be kept (an importer who is neither the owner nor root), the
+/// import is refused rather than taking the ledger over. A group the
+/// importer cannot give it (the owner, not in the ledger's group, as when a
+/// container wrote it) changes to the importer's with a warning: its owner
+/// can still append.
 #[cfg(unix)]
 fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let now = f.metadata()?;
-    let uid = (now.uid() != ledger.uid()).then(|| rustix::fs::Uid::from_raw(ledger.uid()));
     let gid = (now.gid() != ledger.gid()).then(|| rustix::fs::Gid::from_raw(ledger.gid()));
-    if uid.is_none() && gid.is_none() {
-        return Ok(());
+    if now.uid() != ledger.uid() {
+        let uid = rustix::fs::Uid::from_raw(ledger.uid());
+        return rustix::fs::fchown(f, Some(uid), gid).map_err(|e| {
+            std::io::Error::other(format!(
+                "cannot keep the ledger's owner ({}) on its replacement: {}; run the import as the ledger's owner",
+                ledger.uid(),
+                std::io::Error::from(e)
+            ))
+        });
     }
-    rustix::fs::fchown(f, uid, gid).map_err(|e| {
-        std::io::Error::other(format!(
-            "cannot keep the ledger's owner and group ({}:{}) on its replacement: {}; run the import as the ledger's owner",
-            ledger.uid(),
-            ledger.gid(),
-            std::io::Error::from(e)
-        ))
-    })
+    if let Err(e) = gid.map_or(Ok(()), |g| rustix::fs::fchown(f, None, Some(g))) {
+        tracing::warn!(
+            error = %std::io::Error::from(e),
+            group = ledger.gid(),
+            "cannot keep the findings ledger's group; the rewritten ledger takes the importer's"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]

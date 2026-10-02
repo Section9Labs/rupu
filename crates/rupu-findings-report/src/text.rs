@@ -67,6 +67,43 @@ pub(crate) fn split_unescaped_semicolons(s: &str) -> Vec<&str> {
     out
 }
 
+/// `s` split at each `;` that is not in a code span (a run of backticks up
+/// to the next run of exactly as many; one with no match is literal).
+pub(crate) fn split_semicolons_outside_code(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let run_at = |i: usize| b[i..].iter().take_while(|c| **c == b'`').count();
+    let mut out = Vec::new();
+    let (mut from, mut i) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            b'`' => {
+                let n = run_at(i);
+                // The closing run: the next run of exactly `n` backticks.
+                let mut j = i + n;
+                let close = loop {
+                    let Some(p) = b[j..].iter().position(|c| *c == b'`') else {
+                        break None;
+                    };
+                    let m = run_at(j + p);
+                    if m == n {
+                        break Some(j + p + m);
+                    }
+                    j += p + m;
+                };
+                i = close.unwrap_or(i + n);
+            }
+            b';' => {
+                out.push(&s[from..i]);
+                from = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push(&s[from..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +121,13 @@ mod tests {
             escape_semicolons("B `y; z")
         );
         assert_eq!(split_unescaped_semicolons(&joined), ["A `x", r" B `y\; z"]);
+    }
+
+    #[test]
+    fn a_semicolon_in_a_code_span_does_not_split() {
+        assert_eq!(
+            split_semicolons_outside_code("NB-42 (`a;b`); ``c;`d``; e ` f; g"),
+            ["NB-42 (`a;b`)", " ``c;`d``", " e ` f", " g"]
+        );
     }
 }

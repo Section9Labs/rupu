@@ -45,7 +45,7 @@
 //! The result must still pass `validate_report`; the caller runs it.
 
 use crate::markdown::starts_autolink;
-use crate::text::{split_unescaped_semicolons, unescape_semicolons};
+use crate::text::{split_semicolons_outside_code, split_unescaped_semicolons, unescape_semicolons};
 use rupu_coverage::report::{
     ArtifactRef, ChainHop, CiDetection, Classification, CrossRef, EvidenceClaim, FindingReport,
     HopRole, Likelihood, OrSentinel, Ownership, Patch, Rating, RegressionTest, Relation,
@@ -282,7 +282,8 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
         affected_component: header.take(&["affected component"]).unwrap_or_else(unknown),
         source_repository: header.take(&["source repository"]).unwrap_or_else(unknown),
     };
-    let (tickets, ticket_text) = tickets(header.take(&["existing ticket references"]));
+    let (tickets, ticket_text) =
+        tickets(header.take(&["existing ticket references"]), doc.exported);
     let (impact, impact_note) = risk("Impact", header.take(&["impact"]))?;
     let (likelihood, likelihood_note) = likelihood(header.take(&["likelihood"]))?;
     let (risk_rating, risk_rating_note) = risk("Risk Rating", header.take(&["risk rating"]))?;
@@ -311,15 +312,29 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
     let location = location(&required(Sec::Location)?);
     let root_cause = required(Sec::RootCause)?.text();
     let (call_chain, chain_claims) = call_chain(section(&doc, Sec::CallChain).as_ref());
-    let mut evidence = evidence(&required(Sec::Evidence)?);
+    let mut evidence = evidence(&required(Sec::Evidence)?, doc.exported);
     if evidence.is_empty() {
         return Err(ImportError::MissingSection(Sec::Evidence.name()));
     }
     evidence.extend(chain_claims);
     let remediation = required(Sec::Remediation)?.text();
     let recommended_patch = patch(section(&doc, Sec::Patch).as_ref());
-    let ci_cd_detection = ci(section(&doc, Sec::CiCd).as_ref(), doc.exported);
-    let regression_test = regression(section(&doc, Sec::Regression).as_ref(), doc.exported);
+    // The exporter labels a command block (`Command:`), and a regression
+    // test always has a command: an export whose regression test has no
+    // labelled block is an older one, which printed its commands unlabelled.
+    let older_export = || {
+        section(&doc, Sec::Regression)
+            .is_some_and(|b| stands_in(&b.text()).is_none() && labelled_fence(&b.0).is_none())
+    };
+    let layout = if !doc.exported {
+        Commands::Author
+    } else if older_export() {
+        Commands::OlderExport
+    } else {
+        Commands::Export
+    };
+    let ci_cd_detection = ci(section(&doc, Sec::CiCd).as_ref(), layout);
+    let regression_test = regression(section(&doc, Sec::Regression).as_ref(), layout);
     let (replication_steps, steps_preamble) = steps(&required(Sec::Replication)?);
     if replication_steps.is_empty() {
         return Err(ImportError::MissingSection(Sec::Replication.name()));
@@ -343,8 +358,11 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
 
     other.extend(header.leftovers());
     other.extend(id_text);
-    for (name, lines) in &doc.unknown {
-        other.push((name.clone(), Body::parse(lines).text()));
+    for u in &doc.unknown {
+        let text = Body::parse(&u.lines).text();
+        if !(u.gave_ratings && text.is_empty()) {
+            other.push((u.name.clone(), text));
+        }
     }
     let notes = [
         ("Ticket references", ticket_text),
@@ -526,7 +544,7 @@ fn take_id_lines(doc: &mut Doc) -> (Vec<String>, Vec<(String, String)>) {
     let unknown = doc
         .unknown
         .iter_mut()
-        .map(|(name, body)| (name.clone(), true, body));
+        .map(|u| (u.name.clone(), true, &mut u.lines));
     for (name, kept_whole, body) in known.chain(unknown) {
         let code = code_mask(body);
         let earlier = (name == Sec::References.name())
@@ -666,7 +684,7 @@ struct Doc {
     /// Headings at the sections' level that name no section of the layout
     /// (`## Disclosure Timeline`), each with the text under it: kept as other
     /// text under the heading's name, not run into the section before it.
-    unknown: Vec<(String, Vec<String>)>,
+    unknown: Vec<Unknown>,
     /// `Filename: ….pdf` lines outside code: the layout starts every
     /// finding with one.
     filename_lines: usize,
@@ -678,6 +696,19 @@ struct Doc {
     /// The layout `rupu findings export` writes: `##` sections, and a
     /// Provenance section with the rows the exporter writes there.
     exported: bool,
+}
+
+/// A section under a heading that names no section of the layout.
+#[derive(Debug, Default)]
+struct Unknown {
+    name: String,
+    lines: Vec<String>,
+    /// It comes after a References section (where a rating section of its
+    /// own, `## Scoring`, would be).
+    after_references: bool,
+    /// Rating lines were taken out of it ([`take_trailing_fields`]): emptied,
+    /// it leaves no heading behind in the other text.
+    gave_ratings: bool,
 }
 
 /// Number of leading `#`s (0 for a bare or bold heading line).
@@ -785,7 +816,11 @@ fn split(md: &str) -> Doc {
             && atx_level.is_some_and(|l| atx_heading(line) == Some(l))
             && heading_step(line).is_none();
         if unknown_heading {
-            doc.unknown.push((heading_title(line), Vec::new()));
+            doc.unknown.push(Unknown {
+                name: heading_title(line),
+                after_references: doc.sections.iter().any(|(s, _)| *s == Sec::References),
+                ..Unknown::default()
+            });
             into_unknown = true;
             continue;
         }
@@ -795,7 +830,7 @@ fn split(md: &str) -> Doc {
             doc.filename_lines += 1;
         }
         let body = match (into_unknown, doc.sections.last_mut()) {
-            (true, _) => doc.unknown.last_mut().map(|(_, b)| b),
+            (true, _) => doc.unknown.last_mut().map(|u| &mut u.lines),
             (false, Some((_, b))) => Some(b),
             (false, None) => None,
         };
@@ -886,8 +921,11 @@ fn take_trailing_fields(doc: &mut Doc, into: &mut Header) -> Vec<usize> {
             take_ratings(body, true, &mut found, into, &mut taken);
         }
     }
-    for (_, body) in &mut doc.unknown {
-        take_ratings(body, false, &mut found, into, &mut taken);
+    // The last such line after References: the sections in reverse.
+    for u in doc.unknown.iter_mut().rev().filter(|u| u.after_references) {
+        let before = taken.len();
+        take_ratings(&mut u.lines, false, &mut found, into, &mut taken);
+        u.gave_ratings |= taken.len() > before;
     }
     taken
 }
@@ -1428,9 +1466,11 @@ fn split_level(v: &str) -> (String, Option<String>) {
 
 /// Whether a rating's note makes it a range, which no one level states: a
 /// `/`, `-` or `–` right before a level (`High/Critical`, `Medium-High`), or
-/// a separator (those, `to`, `or`) and a level that ends the value
-/// (`Medium to High`, `Medium - High`). `High - critical customer data
-/// exposed` and `Critical — high-value tenants only` are notes.
+/// a separator (those, `to`, `or`) and then a level that ends the value, is
+/// capitalised, or has punctuation after it (`Medium to High`, `Low to
+/// Medium depending on exposure`, `Medium - High (if sharing is enabled)`).
+/// `High - critical customer data exposed` and `Critical — high-value
+/// tenants only` are notes.
 fn range_note(note: &Option<String>) -> bool {
     let Some(n) = note else { return false };
     let n = n.trim_start();
@@ -1451,8 +1491,9 @@ fn range_note(note: &Option<String>) -> bool {
     }
     let after = &rest[word.len()..];
     let whole = !after.starts_with(|c: char| c.is_alphanumeric() || c == '-');
-    let ends = !after.chars().any(char::is_alphanumeric);
-    whole && (tight || ends)
+    let capitalised = rest.starts_with(|c: char| c.is_ascii_uppercase());
+    let no_word_after = !after.trim_start().starts_with(char::is_alphanumeric);
+    whole && (tight || capitalised || no_word_after)
 }
 
 fn risk(
@@ -1633,7 +1674,7 @@ fn loose_ticket(item: &str) -> Ticket {
 
 /// The tickets, and any text of the field no ticket took (a structured
 /// entry's `Status:` line, the reason after `Not provided`).
-fn tickets(v: Option<String>) -> (OrSentinel<Vec<Ticket>>, Option<String>) {
+fn tickets(v: Option<String>, exported: bool) -> (OrSentinel<Vec<Ticket>>, Option<String>) {
     let unknown = || OrSentinel::Sentinel("Unknown".to_string());
     let Some(v) = v else {
         return (unknown(), None);
@@ -1680,10 +1721,18 @@ fn tickets(v: Option<String>) -> (OrSentinel<Vec<Ticket>>, Option<String>) {
             }
         }
     } else {
-        // The exporter escapes a `;` in a ticket's own text (`\;`).
+        // The exporter escapes every `;` in a ticket's own text (`\;`);
+        // elsewhere a `;` in a code span is the code's.
+        let split = |line| {
+            if exported {
+                split_unescaped_semicolons(line)
+            } else {
+                split_semicolons_outside_code(line)
+            }
+        };
         out = v
             .split('\n')
-            .flat_map(split_unescaped_semicolons)
+            .flat_map(split)
             .map(|s| unescape_semicolons(strip_marker(s)))
             .filter(|s| !s.is_empty())
             .map(|s| loose_ticket(&s))
@@ -1939,10 +1988,12 @@ fn exported_location(s: &str) -> Option<Place> {
 /// A `path:12` / `path:12-30` token whose path is workspace-relative, with
 /// backticks and punctuation around it ignored: the first whose path has a
 /// `/` in it (`node_modules/@types/node/index.d.ts:10` included), else the
-/// first that names a file on its own (`notes.rs`, `.env`) in a code span or
-/// with a range of lines. Not a host and port that reads like one: an
-/// address, a user before an `@`, or a name ending in a common top-level
-/// domain (`10.0.0.5:9229`, `admin@db:5432`, `notebin.example.com:443`).
+/// first that names a file on its own (a [`file_name`]: `notes.rs`, `.env`)
+/// with a range of lines, or in a code span when it has one dot at most. Not
+/// a host and port that reads like one: an address, a user before an `@`, a
+/// name ending in a common top-level domain, a dotted name with no range
+/// (`10.0.0.5:9229`, `admin@db:5432`, `notebin.example.com:443`,
+/// `debug.notebin.de:9229`).
 fn location_token(text: &str) -> Option<(String, [u32; 2])> {
     let mut bare_file = None;
     for raw in text.split_whitespace() {
@@ -1968,27 +2019,28 @@ fn location_token(text: &str) -> Option<(String, [u32; 2])> {
         if path.contains('/') {
             return Some((path.to_string(), [a, b]));
         }
+        // A name with several dots (`notes.test.ts`) could as well be a host
+        // (`debug.notebin.de:9229`): only a range of lines says it is a file.
         let ranged = range.contains(['-', '–']);
-        if bare_file.is_none() && (spanned || ranged) && file_name(path) {
+        let one_dot = path.trim_start_matches('.').matches('.').count() <= 1;
+        if bare_file.is_none() && (ranged || (spanned && one_dot)) && file_name(path) {
             bare_file = Some((path.to_string(), [a, b]));
         }
     }
     bare_file
 }
 
-/// A host rather than a file, as `exported_location` reads a path without a
-/// directory: an address (`10.0.0.5`), a user before an `@` (`admin@db`), or
-/// a dotted name that is not a [`file_name`] (`notebin.example.com`).
+/// A host rather than a file, where the exporter prints a location (it only
+/// ever prints files there): an address (`10.0.0.5`), or a user before an
+/// `@` in a path without a directory (`admin@db`).
 fn host_like(p: &str) -> bool {
-    !p.contains('/')
-        && (p.contains('@')
-            || p.chars().all(|c| c.is_ascii_digit() || c == '.')
-            || (p.contains('.') && !file_name(p)))
+    !p.contains('/') && (p.contains('@') || p.chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
 
-/// A file named without a directory (`notes.rs`, `notes.test.ts`, `.env`),
-/// not a host: no `@`, and a last extension that is not a number or a
-/// common top-level domain (so not `10.0.0.5` or `example.com`).
+/// A file named without a directory, not a host: a dotfile (`.env`,
+/// `.env.local`), or a name whose last extension is not a number or a
+/// common top-level domain (`notes.rs`, `notes.test.ts`; not `10.0.0.5` or
+/// `example.com`). Never with an `@`.
 fn file_name(s: &str) -> bool {
     const DOMAINS: &[&str] = &[
         "com",
@@ -2012,7 +2064,7 @@ fn file_name(s: &str) -> bool {
             !s.contains('@')
                 && !ext.is_empty()
                 && !ext.chars().all(|c| c.is_ascii_digit())
-                && !DOMAINS.contains(&ext.to_ascii_lowercase().as_str())
+                && (s.starts_with('.') || !DOMAINS.contains(&ext.to_ascii_lowercase().as_str()))
         }
         None => false,
     }
@@ -2225,8 +2277,9 @@ fn call_chain(body: Option<&Body>) -> (OrSentinel<Vec<ChainHop>>, Vec<EvidenceCl
 /// The claims of a run of text lines. In a list each item is a claim, but a
 /// list a line introduces (`The handler skips two checks:`) is part of that
 /// line's claim, unless an item names a place (a file, an address) of its
-/// own.
-fn paragraphs(lines: &[String]) -> Vec<String> {
+/// own. In the exporter's layout, which prints each claim as one paragraph,
+/// a list is always part of the claim it is in.
+fn paragraphs(lines: &[String], exported: bool) -> Vec<String> {
     let mut out: Vec<Vec<&str>> = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
     for l in lines {
@@ -2240,7 +2293,9 @@ fn paragraphs(lines: &[String]) -> Vec<String> {
             }
             continue;
         }
-        if is_list_item(t) && !cur.is_empty() {
+        // The exporter prints each claim as one paragraph: in its layout a
+        // list never starts a claim.
+        if is_list_item(t) && !cur.is_empty() && !exported {
             let in_items = cur.first().is_some_and(|f| is_list_item(f));
             let introduced =
                 cur.iter().any(|l| is_list_item(l)) || cur.last().is_some_and(|l| l.ends_with(':'));
@@ -2330,14 +2385,16 @@ fn file_label(claim: &str) -> bool {
         .is_some_and(|(loc, rest)| rest == "**" && exported_location(loc).is_some())
 }
 
-fn evidence(body: &Body) -> Vec<EvidenceClaim> {
+fn evidence(body: &Body, exported: bool) -> Vec<EvidenceClaim> {
     if unwrap_emphasis(body.text().trim()) == NO_EVIDENCE {
         return Vec::new();
     }
     let mut claims: Vec<EvidenceClaim> = Vec::new();
     for b in &body.0 {
         match b {
-            Block::Text(lines) => claims.extend(paragraphs(lines).iter().map(|p| claim_from(p))),
+            Block::Text(lines) => {
+                claims.extend(paragraphs(lines, exported).iter().map(|p| claim_from(p)))
+            }
             Block::Fence { info, content, .. } => match claims.last_mut() {
                 Some(c) if c.excerpt.is_none() => {
                     // `**`file`**` alone, then code: the code at that file.
@@ -2437,11 +2494,24 @@ fn fence_content(b: Block) -> Option<String> {
     }
 }
 
-/// The code block right after a `Command:` line with nothing after the
-/// colon (as the exporter writes one), taken out with that line: the last
-/// such pair, as the exporter's comes after the section's own text.
-fn take_labelled_fence(blocks: &mut Vec<Block>) -> Option<String> {
-    let i = (1..blocks.len()).rev().find(|&i| {
+/// How a section's command is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commands {
+    /// A report not from the exporter: a `Command:` line or block, or a
+    /// shell block.
+    Author,
+    /// The exporter's: the block after its `Command:` line, only.
+    Export,
+    /// An export from before the exporter printed that line: its trailing
+    /// `sh` block.
+    OlderExport,
+}
+
+/// Where the last code block right after a `Command:` line with nothing
+/// after the colon (as the exporter writes one) is: the last such pair, as
+/// the exporter's comes after the section's own text.
+fn labelled_fence(blocks: &[Block]) -> Option<usize> {
+    (1..blocks.len()).rev().find(|&i| {
         let Block::Text(lines) = &blocks[i - 1] else {
             return false;
         };
@@ -2450,7 +2520,12 @@ fn take_labelled_fence(blocks: &mut Vec<Block>) -> Option<String> {
             && label.is_some_and(
                 |l| matches!(labelled(l), Some((k, v)) if k == "command" && v.is_empty()),
             )
-    })?;
+    })
+}
+
+/// The [`labelled_fence`], taken out with its `Command:` line.
+fn take_labelled_fence(blocks: &mut Vec<Block>) -> Option<String> {
+    let i = labelled_fence(blocks)?;
     if let Block::Text(lines) = &mut blocks[i - 1] {
         let at = lines.iter().rposition(|l| !l.trim().is_empty())?;
         lines.remove(at);
@@ -2458,21 +2533,36 @@ fn take_labelled_fence(blocks: &mut Vec<Block>) -> Option<String> {
     fence_content(blocks.remove(i))
 }
 
-/// A section's command: the code block after a `Command:` line; else, but
-/// in the exporter's layout, a `Command: …` line or the code block
-/// [`take_command_fence`] finds. The exporter prints a command only after
-/// its `Command:` line, so in its layout any other code block or `Command:
-/// …` line is the section's own text and stays there (an export made
-/// before the exporter printed that line keeps its command block in the
-/// text).
-fn take_command(blocks: &mut Vec<Block>, exported: bool) -> Option<String> {
+/// A code block tagged `sh` with nothing but blank lines after it.
+fn take_trailing_sh(blocks: &mut Vec<Block>) -> Option<String> {
+    let i = blocks
+        .iter()
+        .rposition(|b| matches!(b, Block::Fence { .. }))?;
+    let sh = matches!(&blocks[i], Block::Fence { info, .. } if fence_word(info) == "sh");
+    let last = blocks[i + 1..]
+        .iter()
+        .all(|b| matches!(b, Block::Text(ls) if ls.iter().all(|l| l.trim().is_empty())));
+    if sh && last {
+        fence_content(blocks.remove(i))
+    } else {
+        None
+    }
+}
+
+/// A section's command: the code block after a `Command:` line; else, as
+/// `layout` says, a `Command: …` line or the code block
+/// [`take_command_fence`] finds (a report not from the exporter), the
+/// trailing `sh` block (an older export), or none (an export: any other code
+/// block or `Command: …` line is the section's own text and stays there).
+fn take_command(blocks: &mut Vec<Block>, layout: Commands) -> Option<String> {
     if let Some(c) = take_labelled_fence(blocks) {
         return Some(c);
     }
-    if exported {
-        return None;
+    match layout {
+        Commands::Author => take_label(blocks, &["command"]).or_else(|| take_command_fence(blocks)),
+        Commands::Export => None,
+        Commands::OlderExport => take_trailing_sh(blocks),
     }
-    take_label(blocks, &["command"]).or_else(|| take_command_fence(blocks))
 }
 
 /// The command's code block, taken out: the last one tagged `sh`, else the
@@ -2501,7 +2591,7 @@ const VULNERABLE: &[&str] = &[
 ];
 const PATCHED: &[&str] = &["patched build", "on the patched build", "expect patched"];
 
-fn ci(body: Option<&Body>, exported: bool) -> OrSentinel<CiDetection> {
+fn ci(body: Option<&Body>, layout: Commands) -> OrSentinel<CiDetection> {
     let Some(body) = body else { return missing() };
     if let Some(s) = stands_in(&body.text()) {
         return OrSentinel::Sentinel(s);
@@ -2509,7 +2599,7 @@ fn ci(body: Option<&Body>, exported: bool) -> OrSentinel<CiDetection> {
     let mut blocks = body.0.clone();
     let stage = take_label(&mut blocks, &["stage"]);
     let expect = take_label(&mut blocks, EXPECT);
-    let command = take_command(&mut blocks, exported);
+    let command = take_command(&mut blocks, layout);
     OrSentinel::Value(CiDetection {
         stage: stage.unwrap_or_else(|| NOT_STATED.into()),
         body: non_blank_or_not_stated(render(&blocks)),
@@ -2518,7 +2608,7 @@ fn ci(body: Option<&Body>, exported: bool) -> OrSentinel<CiDetection> {
     })
 }
 
-fn regression(body: Option<&Body>, exported: bool) -> OrSentinel<RegressionTest> {
+fn regression(body: Option<&Body>, layout: Commands) -> OrSentinel<RegressionTest> {
     let Some(body) = body else { return missing() };
     if let Some(s) = stands_in(&body.text()) {
         return OrSentinel::Sentinel(s);
@@ -2526,7 +2616,7 @@ fn regression(body: Option<&Body>, exported: bool) -> OrSentinel<RegressionTest>
     let mut blocks = body.0.clone();
     let vulnerable = take_label(&mut blocks, VULNERABLE);
     let patched = take_label(&mut blocks, PATCHED);
-    let command = take_command(&mut blocks, exported);
+    let command = take_command(&mut blocks, layout);
     OrSentinel::Value(RegressionTest {
         body: non_blank_or_not_stated(render(&blocks)),
         command: command.unwrap_or_else(|| NOT_STATED.into()),

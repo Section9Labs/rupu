@@ -2232,3 +2232,134 @@ fn a_bold_file_name_with_prose_after_it_keeps_its_text() {
         "The claims struct has no expiry field."
     );
 }
+
+// ---- regression check fixes ----------------------------------------------------
+
+#[test]
+fn a_dotfile_keeps_its_location() {
+    let mut original = full_report();
+    original.evidence[0].file = Some(".env.local".into());
+    original.evidence[0].lines = Some([3, 3]);
+    let (r, _) = report_of(&exported(original.clone()));
+    let mut want = original.evidence.clone();
+    want[0].sha256 = None;
+    assert_eq!(r.evidence, want);
+
+    let md = PLAIN.replace(
+        "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+        "The API key is committed (`.env.local:3`):",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.evidence[0].file.as_deref(), Some(".env.local"));
+}
+
+#[test]
+fn a_dotted_host_in_a_code_span_is_not_a_file() {
+    for claim in [
+        "The debugger listens on `debug.notebin.de:9229`.",
+        "The service is `payments.default.svc:8080`.",
+    ] {
+        let md = PLAIN.replace(
+            "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+            claim,
+        );
+        let (r, _) = report_of(&md);
+        assert_eq!(r.evidence[0].file, None, "{claim}");
+    }
+}
+
+#[test]
+fn a_range_with_a_qualifier_is_still_a_range() {
+    for range in [
+        "Impact: Medium - High (if sharing is enabled)",
+        "Impact: Low or Medium, see notes",
+    ] {
+        assert!(
+            matches!(
+                parse_report(&PLAIN.replace("Impact: High", range)).unwrap_err(),
+                ImportError::BadValue { .. }
+            ),
+            "{range}"
+        );
+    }
+    let md = PLAIN.replace(
+        "Likelihood: High",
+        "Likelihood: Low to Medium depending on exposure",
+    );
+    assert!(matches!(
+        parse_report(&md).unwrap_err(),
+        ImportError::BadValue { .. }
+    ));
+}
+
+#[test]
+fn an_exported_claim_listing_located_items_stays_one_claim() {
+    let mut original = full_report();
+    original.evidence[0].claim =
+        "Two code paths confirm it:\n- `src/a.rs:1-2` reads by id\n- `src/b.rs:3-4` never filters"
+            .into();
+    let (r, _) = report_of(&exported(original.clone()));
+    let mut want = original.evidence.clone();
+    want[0].sha256 = None;
+    assert_eq!(r.evidence, want);
+}
+
+#[test]
+fn an_export_from_before_the_command_label_keeps_its_commands() {
+    // The exporter used to print each command block with no `Command:`
+    // line before it.
+    let original = full_report();
+    let md = exported(original.clone()).replace("**Command:**\n\n", "");
+    assert!(!md.contains("**Command:**"));
+    let (r, _) = report_of(&md);
+    assert_eq!(r.ci_cd_detection, original.ci_cd_detection);
+    assert_eq!(r.regression_test, original.regression_test);
+}
+
+#[test]
+fn rating_lines_before_references_are_not_taken() {
+    let md = MARKDOWN
+        .replace("**CVSS v3 Base Score:** 6.5\n", "")
+        .replace(
+            "## Impact\n",
+            "## Background\n\nCVSS: 9.8 (upstream CVE score)\n\n## Impact\n",
+        );
+    assert!(md.contains("## Background"), "the fixture changed");
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.cvss_v3, "Unknown");
+    assert!(
+        other_text(&r).contains("From Background:\n\nCVSS: 9.8 (upstream CVE score)"),
+        "{}",
+        r.references
+    );
+    // A section of its own after References gives its ratings, and leaves
+    // no empty heading behind.
+    let md = MARKDOWN.replace("**CVSS v3 Base Score:** 6.5\n**Risk Factor:** Medium\n", "")
+        + "\n## Scoring\n\n**CVSS v3 Base Score:** 6.5\n**Risk Factor:** Medium\n";
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.cvss_v3, "6.5");
+    assert!(!r.references.contains("Scoring"), "{}", r.references);
+}
+
+#[test]
+fn a_semicolon_in_a_code_span_of_a_written_ticket_field_does_not_split() {
+    let md = PLAIN.replace(
+        "Existing Ticket References: None Provided",
+        "Existing Ticket References: NB-42 (`a;b`); NB-43",
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(tickets) = &r.tickets else {
+        panic!("{:?}", r.tickets)
+    };
+    assert_eq!(tickets.len(), 2, "{tickets:?}");
+}
+
+#[test]
+fn an_exported_claim_with_a_list_and_no_colon_stays_one_claim() {
+    let mut original = full_report();
+    original.evidence[0].claim = "The handler skips the owner check\n- on GET\n- on PUT".into();
+    let (r, _) = report_of(&exported(original.clone()));
+    let mut want = original.evidence.clone();
+    want[0].sha256 = None;
+    assert_eq!(r.evidence, want);
+}
