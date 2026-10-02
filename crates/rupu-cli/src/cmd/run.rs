@@ -77,6 +77,17 @@ pub struct Args {
         value_delimiter = ','
     )]
     pub engagement_profiles: Vec<String>,
+    /// Continue an interrupted run of this agent from its transcript instead
+    /// of starting fresh: the earlier conversation is rebuilt and the agent
+    /// is told it was interrupted. A run that had already finished prints
+    /// its recorded answer without calling the model. Run it from the same
+    /// project as the original run.
+    #[arg(
+        long = "continue",
+        value_name = "AGENT_RUN_ID",
+        conflicts_with_all = ["target", "prompt", "prompt_flag", "into", "tmp"]
+    )]
+    pub continue_from: Option<String>,
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -586,6 +597,41 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
+    // `--continue <agent_run_id>`: rebuild the interrupted run's conversation
+    // from its transcript (recover-on-interrupt spec §1). Same transcripts
+    // dir as the new run, so run it from the same project.
+    let mut resume_from: Option<(Vec<rupu_providers::types::Message>, std::path::PathBuf)> =
+        match args.continue_from.as_deref() {
+            None => None,
+            Some(prev) => {
+                use rupu_agent::continuation::{
+                    prepare_continuation, transcript_agent, Continuation,
+                };
+                let prev_path = transcripts.join(format!("{prev}.jsonl"));
+                let prev_agent = transcript_agent(&prev_path)?;
+                if prev_agent != spec.name {
+                    anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
+                }
+                match prepare_continuation(&prev_path)? {
+                    Continuation::Finished { output } => {
+                        println!("{output}");
+                        eprintln!(
+                            "run {prev} had already finished — printed its recorded answer without calling the model"
+                        );
+                        return Ok(());
+                    }
+                    Continuation::Failed { error } => anyhow::bail!(
+                        "run {prev} ended in failure{} — start it fresh instead",
+                        error.map(|e| format!(" ({e})")).unwrap_or_default()
+                    ),
+                    Continuation::Resume {
+                        messages,
+                        seed_source,
+                    } => Some((messages, seed_source)),
+                }
+            }
+        };
+
     // Netflow capture. Two destinations: this run's own ledger FILE
     // (`<run_id>.jsonl`, rooted at the project when one already has a
     // `.rupu/netflow/` directory, global otherwise — see
@@ -942,7 +988,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         )
         .await;
 
-        let opts = AgentRunOpts {
+        let mut opts = AgentRunOpts {
             seed_source: None,
             agent_name: spec.name.clone(),
             agent_system_prompt,
@@ -991,6 +1037,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             pause: None,
             codename: Some(codename.to_string()),
         };
+        if let Some((messages, seed_source)) = resume_from.take() {
+            rupu_agent::continuation::apply_continuation(&mut opts, messages, seed_source);
+        }
 
         // Spawn the agent in a background task and tail the transcript with
         // the line-stream printer while it runs.
