@@ -116,9 +116,11 @@ pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, Continuat
                 Err(ContinuationError::DanglingToolCall { path })
             } else {
                 // The final answer's turn completed; the process died before
-                // `RunComplete` landed. Nothing left to do.
+                // `RunComplete` landed. Nothing left to do. The answer is read
+                // the same way as after a `RunComplete`, so it can't depend on
+                // whether that last flush landed.
                 Ok(Continuation::Finished {
-                    output: text_of(last),
+                    output: final_assistant_text(&events),
                 })
             }
         }
@@ -129,28 +131,23 @@ pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, Continuat
     }
 }
 
-/// The last non-empty assistant text in the transcript — the run's answer.
+/// The run's answer: the last assistant text event with anything in it.
+///
+/// The runner emits one `AssistantMessage` per text block, so this is the
+/// final text block of the final turn that produced one. Both `Finished`
+/// paths use it, so the recovered answer never depends on whether
+/// `RunComplete` landed.
 fn final_assistant_text(events: &[Event]) -> String {
     events
         .iter()
         .rev()
         .find_map(|e| match e {
-            Event::AssistantMessage { content, .. } if !content.is_empty() => Some(content.clone()),
+            Event::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                Some(content.clone())
+            }
             _ => None,
         })
         .unwrap_or_default()
-}
-
-fn text_of(message: &Message) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]
@@ -297,6 +294,60 @@ mod tests {
             Continuation::Finished { output } => assert_eq!(output, "all done"),
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    /// A real run whose final turn answers in several text blocks (the
+    /// runner writes one `assistant_message` per block).
+    async fn finished_transcript_with_answer_blocks(dir: &Path, blocks: &[&str]) -> PathBuf {
+        let transcript = dir.join("blocks.jsonl");
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantBlocks {
+            content: blocks
+                .iter()
+                .map(|t| ContentBlock::Text {
+                    text: (*t).to_string(),
+                })
+                .collect(),
+            stop: StopReason::EndTurn,
+        }]);
+        let mut opts = opts_for(Box::new(provider), dir, transcript.clone());
+        opts.user_message = "answer in pieces".into();
+        run_agent(opts).await.unwrap();
+        transcript
+    }
+
+    fn finished_output(t: &Path) -> String {
+        match prepare_continuation(t).unwrap() {
+            Continuation::Finished { output } => output,
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recovered_answer_does_not_depend_on_run_complete_landing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript_with_answer_blocks(tmp.path(), &["a", "b"]).await;
+        let with_complete = finished_output(&t);
+        let without: Vec<_> = lines(&t)
+            .into_iter()
+            .filter(|v| kind(v) != "run_complete")
+            .collect();
+        write_lines(&t, &without);
+        let without_complete = finished_output(&t);
+        assert_eq!(with_complete, "b");
+        assert_eq!(without_complete, with_complete);
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_only_trailing_chunk_is_not_the_answer_on_either_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript_with_answer_blocks(tmp.path(), &["the answer", " \n"]).await;
+        assert_eq!(finished_output(&t), "the answer");
+        let without: Vec<_> = lines(&t)
+            .into_iter()
+            .filter(|v| kind(v) != "run_complete")
+            .collect();
+        write_lines(&t, &without);
+        assert_eq!(finished_output(&t), "the answer");
     }
 
     #[tokio::test]
