@@ -24,7 +24,10 @@ pub use tools::{
     ReportFindingInput, ReportFindingOutput, SearchResult, SearchResultForm, SearchResultSummary,
 };
 
-pub use asset::{Coordinate, Locator, Proto};
+pub use asset::{
+    from_assets, profile_of, read_assets, upsert_asset, Asset, AssetId, AssetStoreError,
+    Coordinate, Locator, Proto,
+};
 
 pub use audit::generate::audit as run_audit;
 pub use audit::{
