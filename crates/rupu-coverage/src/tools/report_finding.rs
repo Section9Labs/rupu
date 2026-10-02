@@ -401,7 +401,17 @@ fn ingest_block_files(
                     max: limits.max_total_bytes,
                 },
                 other => other,
-            })?;
+            });
+        let got = match got {
+            Ok(got) => got,
+            // These name the block's own file: point at it.
+            Err(
+                e @ (ArtifactError::Missing { .. }
+                | ArtifactError::Escapes { .. }
+                | ArtifactError::Path { .. }),
+            ) => return Err(field_error(i, &e.to_string())),
+            Err(e) => return Err(e.into()),
+        };
         let [one] = got.as_slice() else {
             return Err(field_error(i, "must name exactly one file"));
         };
@@ -1468,13 +1478,47 @@ mod tests {
             &full_opts(store.path()),
         )
         .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ReportFindingError::Artifact(crate::report::ArtifactError::Missing { .. })
-            ),
-            "{err}"
-        );
+        match &err {
+            ReportFindingError::Report(e) => {
+                assert_eq!(e.0.len(), 1, "{err}");
+                assert_eq!(e.0[0].path, "report.blocks[0].artifact.path");
+                assert!(e.0[0].message.contains("caps/none.pcap"), "{err}");
+                assert!(e.0[0].message.contains("does not exist"), "{err}");
+            }
+            other => panic!("expected a report field error, got {other}"),
+        }
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn a_block_path_leaving_the_workspace_is_a_field_error_at_its_index() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let mut r = fixture_report();
+        r.blocks = vec![
+            crate::report::EvidenceBlock::Text {
+                text: "note".into(),
+            },
+            crate::report::EvidenceBlock::PcapRef {
+                artifact: file_ref("../outside.pcap"),
+                summary: "three SYNs".into(),
+            },
+        ];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let err = report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap_err();
+        match &err {
+            ReportFindingError::Report(e) => {
+                assert_eq!(e.0.len(), 1, "{err}");
+                assert_eq!(e.0[0].path, "report.blocks[1].artifact.path");
+            }
+            other => panic!("expected a report field error, got {other}"),
+        }
         assert!(!paths.findings.exists());
     }
 
