@@ -6348,6 +6348,7 @@ async fn execute_run_step(
                     skipped: false,
                     kind: crate::runs::StepKind::Run,
                     transcript_path,
+                    error: Some(source.to_string()),
                     ..Default::default()
                 });
             }
@@ -6585,6 +6586,7 @@ async fn execute_action_step(
                     skipped: false,
                     kind: crate::runs::StepKind::Action,
                     transcript_path,
+                    error: Some(source.to_string()),
                     ..Default::default()
                 })
             } else {
@@ -7112,6 +7114,8 @@ async fn run_on_reject_chain(
                         success: false,
                         skipped: false,
                         kind: crate::runs::StepKind::Action,
+                        error: Some(e.to_string()),
+                        cause: e.outcome().cloned().map(Box::new),
                         ..Default::default()
                     }
                 }
@@ -7172,6 +7176,7 @@ async fn run_on_reject_chain(
                     skipped: false,
                     kind: crate::runs::StepKind::Linear,
                     codename: Some(codename.to_string()),
+                    error: Some(e.to_string()),
                     ..Default::default()
                 };
                 persist_step_result(opts, run_id, &result);
@@ -7246,8 +7251,8 @@ async fn run_on_reject_chain(
                     &crate::executor::Event::StepFailed {
                         run_id: run_id.to_string(),
                         step_id: step.id.clone(),
-                        error: error_text,
-                        cause,
+                        error: error_text.clone(),
+                        cause: cause.clone(),
                     },
                 );
             }
@@ -7263,6 +7268,8 @@ async fn run_on_reject_chain(
             skipped: false,
             kind: crate::runs::StepKind::Linear,
             codename: Some(codename.to_string()),
+            error: (!success).then_some(error_text),
+            cause: cause.map(Box::new),
             ..Default::default()
         };
         persist_step_result(opts, run_id, &result);

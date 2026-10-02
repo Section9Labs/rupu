@@ -789,6 +789,12 @@ steps:
         !comment.success,
         "the connector error must be recorded as a failure"
     );
+    // The tolerated failure says why it failed, in memory and on disk.
+    assert!(comment.error.is_some(), "{:?}", comment.error);
+    assert!(comment.cause.is_none());
+    let persisted = store.read_step_results(&res.run_id).unwrap();
+    let rec = persisted.iter().find(|r| r.step_id == "comment").unwrap();
+    assert_eq!(rec.error, comment.error);
 
     // Failure case: the audit line still gets written (exactly once),
     // with `applied: false` and the connector's error string carried in

@@ -11,8 +11,10 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::{Event, EventSink};
-use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
-use rupu_orchestrator::{RunStatus, RunStore, Workflow};
+use rupu_orchestrator::runner::{
+    run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, StepFactory,
+};
+use rupu_orchestrator::{ApprovalDecision, RunStatus, RunStore, StepResult, Workflow};
 use rupu_providers::types::{ContentBlock, Stop, StopReason, Usage};
 use rupu_tools::ToolContext;
 
@@ -296,5 +298,66 @@ async fn a_refused_fanout_unit_carries_the_cause_on_its_item_only() {
     assert!(
         unit_causes.contains(&(1, Some("refusal".to_string()))),
         "{unit_causes:?}"
+    );
+}
+
+const WF_GATE_CLEANUP_REFUSES: &str = r#"
+name: gate-cleanup-refuses
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve?"
+      on_reject:
+        - id: notify_fail
+          agent: ag
+          prompt: "REFUSE the cleanup"
+"#;
+
+#[tokio::test]
+async fn a_refused_on_reject_cleanup_step_records_its_error_and_cause() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let sink = Arc::new(CollectSink::default());
+    let run_id = "run_cause_cleanup";
+
+    let res = run_workflow(opts(&tmp, &store, &sink, WF_GATE_CLEANUP_REFUSES, run_id))
+        .await
+        .expect("parks at the gate");
+    assert!(res.awaiting.is_some());
+
+    let decision = store
+        .reject(run_id, "operator", "not today", chrono::Utc::now())
+        .expect("reject succeeds");
+    let ApprovalDecision::Rejected {
+        step_id, reason, ..
+    } = decision
+    else {
+        panic!("expected Rejected, got {decision:?}");
+    };
+    let prior: Vec<StepResult> = store
+        .read_step_results(run_id)
+        .unwrap()
+        .iter()
+        .map(StepResult::from)
+        .collect();
+    let mut cleanup = opts(&tmp, &store, &sink, WF_GATE_CLEANUP_REFUSES, run_id);
+    cleanup.run_id_override = None;
+    cleanup.resume_from = Some(ResumeState::from_rejection(
+        run_id.to_string(),
+        prior,
+        step_id.clone(),
+        reason.clone(),
+    ));
+    run_reject_cleanup(cleanup, &step_id, &reason, "human", None)
+        .await
+        .expect("cleanup never errors");
+
+    let steps = store.read_step_results(run_id).unwrap();
+    let notify = steps.iter().find(|s| s.step_id == "notify_fail").unwrap();
+    assert!(!notify.success);
+    assert!(notify.error.is_some(), "{notify:?}");
+    assert_eq!(
+        notify.cause.as_ref().map(|c| c.class.as_str()),
+        Some("refusal")
     );
 }

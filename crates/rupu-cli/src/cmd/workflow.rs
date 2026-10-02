@@ -3383,6 +3383,7 @@ fn mark_resumed(record: &mut rupu_orchestrator::runs::RunRecord, pid: u32) {
     record.status = rupu_orchestrator::RunStatus::Running;
     record.finished_at = None;
     record.error_message = None;
+    record.cause = None;
     record.runner_pid = Some(pid);
     record.awaiting.clear();
     record.awaiting_step_id = None;
@@ -6818,6 +6819,16 @@ mod tests {
         record.awaiting_step_id = Some("assess".into());
         record.awaiting_since = Some(Utc::now());
         record.error_message = Some("runner process 4242 is no longer alive".into());
+        // A resumed failed run must not keep its old failure cause.
+        record.cause = Some(rupu_transcript::OutcomeRecord {
+            id: "o1".into(),
+            class: "refusal".into(),
+            severity: rupu_transcript::Severity::Error,
+            title: "refused".into(),
+            detail: None,
+            error_class: None,
+            wire: serde_json::Value::Null,
+        });
         record.finished_at = Some(Utc::now());
         // The web asked to resume this pause; a worker holds the claim.
         record.resume_requested_at = Some(Utc::now());
@@ -6838,6 +6849,7 @@ mod tests {
         assert_eq!(record.expires_at, None);
         assert!(record.awaiting.is_empty());
         assert_eq!(record.error_message, None);
+        assert_eq!(record.cause, None);
         assert_eq!(record.finished_at, None);
         assert_eq!(record.resume_requested_at, None);
         assert_eq!(record.resume_mode, None);
