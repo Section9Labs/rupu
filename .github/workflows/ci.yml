@@ -532,3 +532,9 @@ jobs:
       # counter regression here silently republishes an old version, so a PR
       # that touches scripts/ runs them before it merges.
       - run: scripts/tests/release-cadence-tests.sh
+      # Not release-related, but the same kind of unattended shell: a Claude
+      # Code hook runs it on dev machines and it deletes files, so it gets the
+      # same gate.
+      # The runner's cargo also exercises the real-build case (on Linux there
+      # are no loose objects, so that case checks only that nothing rebuilds).
+      - run: scripts/tests/sweep-cargo-targets-tests.sh

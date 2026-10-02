@@ -81,6 +81,7 @@ Native macOS control-plane client, replacing the GPUI `rupu-app` (deletion track
 - Errors: `thiserror` for libraries; `anyhow` for the CLI binary (Plan 2).
 - Async: `tokio`.
 - Logging: `tracing` + `tracing-subscriber`.
+- Disk: cargo never garbage-collects `target/`, and every worktree has its own — tens of GB a day each (macOS debug builds leak a full `.o` set per rebuild; each `-p`/`--workspace`/toolchain combination rebuilds every test binary under a new hash). The Claude Code hook in `.claude/settings.json` (`scripts/claude-hook-sweep-target.sh`) sweeps a session's own `target/` after its cargo/make runs (log: `target/.sweep.log`); `make sweep-targets` sweeps every worktree by hand (`ARGS=--dry-run` previews). Don't "fix" disk by sharing one `CARGO_TARGET_DIR` across worktrees — same-named path crates overwrite each other.
 - Integration tests: ONE binary per crate — modules under `crates/<c>/tests/it/` (`main.rs` lists them), never a new top-level `tests/*.rs` (each is a binary linking the whole dep graph; `rupu-cli`'s `tests/it/test_layout.rs` fails on one). They share a process: env-mutating tests are `#[serial]`, and `rupu-cli` keeps env/cwd-mutating tests in a second binary, `tests/serial/`, every test holding its `ENV_LOCK`. Run one file with `cargo test -p <c> --test it <file>::`.
 
 ## Heritage
