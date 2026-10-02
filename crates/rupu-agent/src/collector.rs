@@ -158,6 +158,73 @@ fn est_tokens(content: &str) -> usize {
     content.len() / 4 + 1
 }
 
+/// Runs a read-only command out-of-band and injects its stdout as ambient
+/// observation each turn (spec §8.5). Best-effort: a timeout or error injects
+/// nothing rather than failing the turn.
+pub struct CommandCollector {
+    name: String,
+    source: String,
+    program: String,
+    args: Vec<String>,
+    timeout: std::time::Duration,
+    priority: u8,
+}
+
+impl CommandCollector {
+    pub fn new(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        program: impl Into<String>,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+        priority: u8,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+            program: program.into(),
+            args,
+            timeout,
+            priority,
+        }
+    }
+}
+
+impl TurnCollector for CommandCollector {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn collect(&self, _ctx: &TurnContext) -> Vec<Injection> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let program = self.program.clone();
+        let args = self.args.clone();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&program).args(&args).output();
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(self.timeout) {
+            Ok(Ok(output)) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string();
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                vec![Injection {
+                    source: self.source.clone(),
+                    kind: InjectionKind::Observation,
+                    cadence: Cadence::EveryTurn,
+                    priority: self.priority,
+                    content: text,
+                }]
+            }
+            // non-zero exit, spawn error, or timeout: inject nothing
+            _ => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +418,35 @@ mod tests {
         let out = pipe.run(&ctx());
         assert!(out.once.is_empty());
         assert!(out.every_turn.is_empty());
+    }
+
+    #[test]
+    fn command_collector_injects_stdout_as_every_turn_observation() {
+        let c = CommandCollector::new(
+            "echo",
+            "cmd:echo",
+            "echo",
+            vec!["port 443 open".to_string()],
+            std::time::Duration::from_secs(5),
+            5,
+        );
+        let injections = c.collect(&ctx());
+        assert_eq!(injections.len(), 1);
+        assert_eq!(injections[0].cadence, Cadence::EveryTurn);
+        assert_eq!(injections[0].kind, InjectionKind::Observation);
+        assert!(injections[0].content.contains("port 443 open"));
+    }
+
+    #[test]
+    fn command_collector_injects_nothing_on_failure() {
+        let c = CommandCollector::new(
+            "nope",
+            "cmd:nope",
+            "this-binary-does-not-exist-xyz",
+            vec![],
+            std::time::Duration::from_secs(5),
+            5,
+        );
+        assert!(c.collect(&ctx()).is_empty());
     }
 }
