@@ -15,7 +15,7 @@ import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
 import { memberLabel } from '../../lib/codename';
 import { AgentIdentity } from '../codename/AgentIdentity';
-import WarnMark from './WarnMark';
+import WarnMark, { unitWarningSuffix } from './WarnMark';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -114,7 +114,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
             <button
               key={u.index}
               type="button"
-              title={`${u.codename ? memberLabel(u.codename, u.agent, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}${u.warnings?.length ? ` · ⚠ ${u.warnings.join(' · ⚠ ')}` : ''}`}
+              title={`${u.codename ? memberLabel(u.codename, u.agent, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}${unitWarningSuffix(u.warnings)}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
               className="flex w-full min-w-0 items-start gap-1 rounded bg-panel/80 px-1.5 py-0.5 text-left text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
             >

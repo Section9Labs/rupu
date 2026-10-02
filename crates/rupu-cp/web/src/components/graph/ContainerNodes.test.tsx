@@ -337,6 +337,13 @@ describe('step warnings on container nodes', () => {
     expect(screen.getByTestId('rg-warn')).toHaveAttribute('aria-label', '1 warning');
   });
 
+  it('FanoutNode with no units yet (placeholder card) still marks a warning', () => {
+    const node = { id: 'shard', kind: 'for_each', state: 'running', warnings: [W] } as unknown as GraphNode;
+    renderFanout(node);
+    expect(screen.getByText('starting units…')).toBeInTheDocument();
+    expect(screen.getByTestId('rg-warn')).toHaveAttribute('aria-label', '1 warning');
+  });
+
   it('FanoutNode with no warnings renders no marker', () => {
     renderFanout(FANOUT);
     expect(screen.queryByTestId('rg-warn')).toBeNull();

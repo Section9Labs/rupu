@@ -11,6 +11,7 @@
 import type {
   RunGraphResponse,
   StepNodeDto,
+  StepWarningEvent,
   RunEvent,
 } from './api';
 import { isKnownRunEvent } from './api';
@@ -208,6 +209,11 @@ function emptyByState(): Record<StepState, number> {
 export function buildRunGraphModel(
   g: RunGraphResponse,
   events: RunEvent[],
+  /** Every `step_warning` the run has emitted, uncapped and in arrival order.
+   *  `events` is a bounded live window, so a long run scrolls early warnings
+   *  out of it; the caller keeps them separately and passes them here. A
+   *  warning also present in `events` is shown once. */
+  warnings: readonly StepWarningEvent[] = [],
 ): RunGraphModel {
   // ------------------------------------------------------------------
   // Phase 1: Build skeleton from workflow.steps — all pending.
@@ -311,7 +317,13 @@ export function buildRunGraphModel(
   // live events below layer on top, field by field (live wins).
   // `step_warning`s are likewise applied after the loop (a unit warning can
   // beat its unit_started) and never touch a status: they only annotate.
-  const warningEvents: Array<{ stepId: string; index?: number; message: string }> = [];
+  const warningEvents: Array<{ stepId: string; index?: number; message: string }> = warnings.map(
+    (w) => ({
+      stepId: w.step_id,
+      index: typeof w.index === 'number' ? w.index : undefined,
+      message: w.message,
+    }),
+  );
   const stepIdentities = new Map<string, AgentIdentity>(Object.entries(g.step_identities ?? {}));
   const unitIdentities = new Map<string, Map<number, AgentIdentity>>();
   for (const [stepId, byIndex] of Object.entries(g.unit_identities ?? {})) {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildRunGraphModel, collectWarnings } from './runGraphModel';
-import type { RunGraphResponse, StepNodeDto, UnitCheckpoint, StepResultRecord, RunEvent } from './api';
+import type { RunGraphResponse, StepNodeDto, UnitCheckpoint, StepResultRecord, RunEvent, StepWarningEvent } from './api';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1193,6 +1193,38 @@ describe('step_warning', () => {
     const model = buildRunGraphModel(g, [warn('a', 'kept')]);
     expect(model.nodeById('a')!.state).toBe('done');
     expect(model.nodeById('a')!.warnings).toEqual([{ message: 'kept' }]);
+  });
+});
+
+describe('step_warning — beyond the live event window', () => {
+  const warning = (step_id: string, message: string, index?: number): StepWarningEvent => ({
+    type: 'step_warning',
+    run_id: runId(),
+    step_id,
+    message,
+    ...(index === undefined ? {} : { index }),
+  });
+
+  it('folds warnings passed alongside a window that no longer holds them', () => {
+    const model = buildRunGraphModel(makeGraph(), [], [warning('a', 'early note'), warning('b', 'unit note', 1)]);
+    expect(model.nodeById('a')!.warnings).toEqual([{ message: 'early note' }]);
+    expect(model.nodeById('b')!.warnings).toEqual([{ index: 1, message: 'unit note' }]);
+  });
+
+  it('a warning present in both the full list and the window is shown once, in arrival order', () => {
+    const early = warning('a', 'first');
+    const late = warning('a', 'second');
+    const model = buildRunGraphModel(makeGraph(), [late as RunEvent], [early, late]);
+    expect(model.nodeById('a')!.warnings!.map((w) => w.message)).toEqual(['first', 'second']);
+  });
+
+  it('still attaches a passed unit warning to a unit the window knows', () => {
+    const events: RunEvent[] = [
+      { type: 'unit_started', run_id: runId(), step_id: 'b', index: 4, unit_key: 'u4', transcript_path: '/t' },
+    ];
+    const model = buildRunGraphModel(makeGraph(), events, [warning('b', 'lost coverage', 4)]);
+    expect(model.nodeById('b')!.fanout!.units[0].warnings).toEqual(['lost coverage']);
+    expect(model.nodeById('b')!.state).toBe('running');
   });
 });
 

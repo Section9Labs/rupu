@@ -63,8 +63,7 @@ function KindIcon({ form, badge, className }: { form: CardForm; badge: string; c
  *  violet = routine; findings tint by severity. */
 function statusVisual(card: StreamCard): { tone: BadgeTone; dot: DotColor } {
   if (card.accent === 'error') return { tone: 'red', dot: 'failed' };
-  if (card.accent === 'warn') return { tone: 'amber', dot: 'awaiting' };
-  if (card.accent === 'await') return { tone: 'amber', dot: 'awaiting' };
+  if (card.accent === 'await' || card.accent === 'warn') return { tone: 'amber', dot: 'awaiting' };
   if (card.form === 'finding') {
     const s = card.severity;
     if (s === 'critical' || s === 'high') return { tone: 'red', dot: 'failed' };

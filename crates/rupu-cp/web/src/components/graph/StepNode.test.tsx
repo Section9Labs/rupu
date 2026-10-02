@@ -109,9 +109,17 @@ describe('StepNode', () => {
     expect(screen.queryByTestId('rg-warn')).toBeNull();
   });
 
-  it('adding a marker does not change the node box', () => {
-    const { container } = renderNode({ agent: 'security-reviewer', warnings: [{ message: 'x' }] });
-    const root = container.querySelector('.shadow-card') as HTMLElement;
-    expect(root.style.minHeight).toBe(`${STEP_AGENT_H}px`);
+  it('keeps the marker inside the header row, so it adds no row to the node', () => {
+    const { container } = renderNode({ state: 'done', agent: 'security-reviewer', warnings: [{ message: 'x' }] });
+    const mark = screen.getByTestId('rg-warn');
+    // same flex row as the step name and its status label …
+    expect(mark.parentElement).toBe(screen.getByText('done').parentElement);
+    expect(mark.parentElement).toBe(screen.getByText('build').parentElement);
+    // … so the node has the same number of rows as an unwarned one.
+    const rows = (root: Element) => root.querySelector('.shadow-card')!.children.length;
+    const warned = rows(container);
+    cleanup();
+    const clean = renderNode({ state: 'done', agent: 'security-reviewer' });
+    expect(warned).toBe(rows(clean.container));
   });
 });
