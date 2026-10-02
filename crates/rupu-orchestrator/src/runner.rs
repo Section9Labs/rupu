@@ -972,6 +972,9 @@ fn resume_gate_cleared_step_ids(opts: &OrchestratorRunOpts) -> std::collections:
         .resume_from
         .iter()
         .flat_map(|r| r.recovery.0.iter())
+        // Only Continue/Recovered clear the gate. A discovery-`Restart` step is
+        // intentionally NOT gate-cleared: it re-asks its approval gate
+        // (conservative, and exactly what it did before recovery existed).
         .filter(|(_, plan)| {
             matches!(
                 plan.linear,
