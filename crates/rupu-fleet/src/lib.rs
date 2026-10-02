@@ -5,8 +5,10 @@
 
 mod board;
 mod error;
+mod mailbox;
 mod types;
 
 pub use board::Board;
 pub use error::FleetError;
+pub use mailbox::Mailbox;
 pub use types::{BoardPost, ClaimGuard, ClaimOutcome, Directive, FleetMessage, PostKind};
