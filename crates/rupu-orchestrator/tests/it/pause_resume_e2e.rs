@@ -42,7 +42,9 @@ use rupu_orchestrator::runner::{
 };
 use rupu_orchestrator::runs::AttemptRecord;
 use rupu_orchestrator::{RunStatus, RunStore, StepResult, Workflow};
-use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent};
+use rupu_providers::types::{
+    ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent,
+};
 use rupu_providers::{LlmProvider, ProviderError, ProviderId};
 use rupu_tools::ToolContext;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1307,29 +1309,65 @@ impl StepFactory for RecoverFactory {
     }
 }
 
-/// A three-unit `for_each` run whose runner died after unit `a` finished,
-/// with unit `b` mid-turn (one tool turn on disk, the next model call in
-/// flight) and unit `c` never started.
+/// A run whose runner died after `a` finished, with `b` mid-turn (one tool
+/// turn on disk, the next model call in flight) and `c` (if any) never
+/// started. `a`/`b`/`c` are `for_each` units or linear steps, per the
+/// workflow.
 struct Killed {
     tmp: tempfile::TempDir,
     store: Arc<RunStore>,
     wf: Workflow,
+    /// The workflow's YAML, as the run's snapshot.
+    yaml: &'static str,
     run_id: String,
     /// `b`'s interrupted attempt, as the ledger recorded it.
     b: AttemptRecord,
 }
 
 async fn kill_fanout_mid_unit_b() -> Killed {
+    kill_mid_b(
+        WF_FANOUT_RECOVER,
+        "run_recover_fanout",
+        // `a` is checkpointed ...
+        |store, run_id| {
+            !store
+                .read_unit_checkpoints(run_id)
+                .unwrap_or_default()
+                .is_empty()
+        },
+        // ... and `b` is the second unit.
+        |attempt| attempt.unit_index == Some(1),
+    )
+    .await
+}
+
+/// Run `yaml` (via [`RecoverFactory`] with `b` hanging) until `a_done` says
+/// `a` is recorded and `b` (the attempt `is_b` picks out of the ledger) has
+/// its first turn on disk — the runner is then stuck inside the next model
+/// call — and kill the runner there.
+async fn kill_mid_b(
+    yaml: &'static str,
+    run_id: &str,
+    a_done: fn(&RunStore, &str) -> bool,
+    is_b: fn(&AttemptRecord) -> bool,
+) -> Killed {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
     let store = Arc::new(RunStore::new(tmp.path().join("runs")));
-    let wf = Workflow::parse(WF_FANOUT_RECOVER).unwrap();
-    let run_id = "run_recover_fanout".to_string();
+    let wf = Workflow::parse(yaml).unwrap();
+    // The runner registry is process-wide and keyed by run id, so tests
+    // running side by side in this process must not share one: a resume that
+    // met another test's live runner would hand off and do nothing.
+    static NEXT_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let run_id = format!(
+        "{run_id}_{}",
+        NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let opts = OrchestratorRunOpts {
         run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
-        workspace_id: "ws_recover_fanout".into(),
+        workspace_id: "ws_recover".into(),
         workspace_path: tmp.path().to_path_buf(),
         transcript_dir: tmp.path().join("transcripts"),
         factory: RecoverFactory::new(true),
@@ -1337,7 +1375,7 @@ async fn kill_fanout_mid_unit_b() -> Killed {
         issue: None,
         issue_ref: None,
         run_store: Some(Arc::clone(&store)),
-        workflow_yaml: Some(WF_FANOUT_RECOVER.to_string()),
+        workflow_yaml: Some(yaml.to_string()),
         resume_from: None,
         run_id_override: Some(run_id.clone()),
         strict_templates: false,
@@ -1349,40 +1387,39 @@ async fn kill_fanout_mid_unit_b() -> Killed {
     };
     let run = tokio::spawn(run_workflow(opts));
 
-    // `a` is checkpointed, and `b`'s first (tool) turn is on disk — the runner
-    // is stuck inside the next model call.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let b = loop {
-        let a_done = !store
-            .read_unit_checkpoints(&run_id)
-            .unwrap_or_default()
-            .is_empty();
         let b = store
             .read_attempts(&run_id)
             .unwrap_or_default()
             .into_iter()
-            .find(|a| a.unit_index == Some(1));
+            .find(is_b);
         let b_tool_turn_done = b.as_ref().is_some_and(|a| {
             std::fs::read_to_string(&a.transcript_path)
                 .map(|t| t.contains("\"turn_end\""))
                 .unwrap_or(false)
         });
-        if a_done && b_tool_turn_done {
+        if a_done(&store, &run_id) && b_tool_turn_done {
             break b.unwrap();
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the runner never reached unit b's second model call"
+            "the runner never reached b's second model call"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert!(!run.is_finished(), "unit b must keep the fan-out in flight");
-    // The runner dies here.
+    assert!(!run.is_finished(), "b must keep the run in flight");
+    // The runner dies here. Awaiting the aborted task is what drops its
+    // future — and with it the in-process runner registration — before the
+    // resume claims the run; without it a resume racing that drop would meet
+    // a "live" runner and hand off, doing nothing.
     run.abort();
+    let _ = run.await;
     Killed {
         tmp,
         store,
         wf,
+        yaml,
         run_id,
         b,
     }
@@ -1419,6 +1456,16 @@ impl Killed {
         completed
     }
 
+    /// Steps with a recorded result, as `rupu workflow resume` reads them.
+    fn done_step_ids(&self) -> BTreeSet<String> {
+        self.store
+            .read_step_results(&self.run_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.step_id)
+            .collect()
+    }
+
     /// What resume's discovery makes of the attempts the dead runner left.
     fn plans(&self) -> RecoveryPlans {
         let settled: BTreeMap<String, BTreeMap<usize, ()>> = self
@@ -1430,7 +1477,7 @@ impl Killed {
             &self.store,
             &self.run_id,
             &self.wf,
-            &BTreeSet::new(),
+            &self.done_step_ids(),
             &settled,
         )
     }
@@ -1451,6 +1498,18 @@ impl Killed {
         factory: Arc<RecoverFactory>,
         plans: RecoveryPlans,
     ) -> (OrchestratorRunResult, Arc<EventRecorder>) {
+        self.resume_with(wf, factory, plans, Vec::new()).await
+    }
+
+    /// [`Self::resume_on`], also carrying `paused_steps` (what a manual
+    /// pause left, as `rupu workflow resume` reads them off the run).
+    async fn resume_with(
+        &self,
+        wf: Workflow,
+        factory: Arc<RecoverFactory>,
+        plans: RecoveryPlans,
+        paused_steps: Vec<PausedStep>,
+    ) -> (OrchestratorRunResult, Arc<EventRecorder>) {
         let record = self.store.load(&self.run_id).unwrap();
         let recorder = Arc::new(EventRecorder::default());
         let opts = OrchestratorRunOpts {
@@ -1465,11 +1524,19 @@ impl Killed {
             issue: None,
             issue_ref: None,
             run_store: Some(Arc::clone(&self.store)),
-            workflow_yaml: Some(WF_FANOUT_RECOVER.to_string()),
+            workflow_yaml: Some(self.yaml.to_string()),
             resume_from: Some(ResumeState {
                 run_id: self.run_id.clone(),
+                prior_step_results: self
+                    .store
+                    .read_step_results(&self.run_id)
+                    .unwrap()
+                    .iter()
+                    .map(StepResult::from)
+                    .collect(),
                 completed_units: self.completed_units(),
                 reason: PauseReason::Approval,
+                paused_steps,
                 recovery: plans,
                 ..Default::default()
             }),
@@ -1872,4 +1939,449 @@ async fn resume_ignores_plans_when_the_fanout_list_changed() {
         "no plan was honoured, got {:?}",
         attempt_resumed(&recorder)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resume continues / recovers / restarts what a dead runner left mid-step
+// (linear steps)
+// ---------------------------------------------------------------------------
+
+const WF_LINEAR_RECOVER: &str = r#"
+name: linear-recover
+steps:
+  - id: first
+    agent: worker
+    prompt: "Process a"
+  - id: second
+    agent: worker
+    prompt: "Process b"
+  - id: third
+    agent: worker
+    prompt: "Process c"
+"#;
+
+/// A three-step linear run whose runner died after `first` finished, with
+/// `second` mid-turn and `third` never started.
+async fn kill_linear_mid_second() -> Killed {
+    kill_mid_b(
+        WF_LINEAR_RECOVER,
+        "run_recover_linear",
+        // `first` has its result recorded ...
+        |store, run_id| {
+            store
+                .read_step_results(run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.step_id == "first")
+        },
+        // ... and `second` is the attempt in flight.
+        |attempt| attempt.step_id == "second",
+    )
+    .await
+}
+
+impl Killed {
+    /// The ledger rows of step `step_id`, in append order.
+    fn attempts_of_step(&self, step_id: &str) -> Vec<AttemptRecord> {
+        self.store
+            .read_attempts(&self.run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.step_id == step_id)
+            .collect()
+    }
+}
+
+/// The recorded outputs of a linear run, by step id.
+fn step_outputs(res: &OrchestratorRunResult) -> Vec<(String, String)> {
+    res.step_results
+        .iter()
+        .map(|r| (r.step_id.clone(), r.output.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn resume_continues_a_linear_step_killed_mid_turn() {
+    let killed = kill_linear_mid_second().await;
+
+    // Discovery: `first` is done, `third` never started; only `second` has
+    // something to continue.
+    let plans = killed.plans();
+    assert_eq!(plans.0.len(), 1, "got {plans:?}");
+    match plans.0["second"].linear.as_ref() {
+        Some(AttemptPlan::Continue {
+            from_agent_run_id, ..
+        }) => assert_eq!(from_agent_run_id, &killed.b.agent_run_id),
+        other => panic!("expected Continue for second, got {other:?}"),
+    }
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed.resume(factory.clone(), plans).await;
+    assert!(res.awaiting.is_none(), "the resumed run completes");
+    assert_eq!(
+        step_outputs(&res),
+        [
+            ("first".to_string(), "a done".to_string()),
+            ("second".to_string(), "b done".to_string()),
+            ("third".to_string(), "c done".to_string()),
+        ]
+    );
+
+    // `first` was replayed from its result, never re-dispatched.
+    assert_eq!(
+        factory.built(),
+        ["Process b", "Process c"],
+        "first must not be re-dispatched"
+    );
+
+    // `second`'s provider was sent the rebuilt conversation — prompt, the
+    // tool turn it had completed — with the continuation note joined onto the
+    // trailing user turn (the tool result), and NOT its prompt a second time.
+    let b_requests = factory.requests("Process b");
+    assert_eq!(b_requests.len(), 1);
+    let b_messages = &b_requests[0].messages;
+    assert_eq!(b_messages.len(), 3, "user, assistant tool call, user");
+    assert!(sent_text(&b_requests[0]).contains("Process b"));
+    let last = b_messages.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    assert!(last.content.iter().any(
+        |b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("alpha"))
+    ));
+    assert!(last
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Text { text } if text == CONTINUATION_NOTE)));
+
+    // `third` ran fresh: just its prompt, no note.
+    let c_requests = factory.requests("Process c");
+    assert_eq!(c_requests[0].messages.len(), 1);
+    assert!(!sent_text(&c_requests[0]).contains(CONTINUATION_NOTE));
+
+    // The resumed attempt is its own ledger row, linked to the one it
+    // continued; the others are not linked to anything.
+    let b_rows = killed.attempts_of_step("second");
+    assert_eq!(b_rows.len(), 2, "interrupted attempt + its continuation");
+    assert_eq!(b_rows[0].agent_run_id, killed.b.agent_run_id);
+    assert_eq!(b_rows[0].continued_from, None);
+    assert_ne!(b_rows[1].agent_run_id, killed.b.agent_run_id);
+    assert_eq!(
+        b_rows[1].continued_from.as_deref(),
+        Some(killed.b.agent_run_id.as_str())
+    );
+    assert_eq!(killed.attempts_of_step("first").len(), 1);
+    assert_eq!(killed.attempts_of_step("third")[0].continued_from, None);
+
+    // Announced once, for `second` only (a linear step has no unit index).
+    assert_eq!(
+        attempt_resumed(&recorder),
+        vec![(
+            None,
+            AttemptResumeMode::Continued,
+            Some(killed.b.agent_run_id.clone()),
+            None
+        )]
+    );
+    // A continuation is not a pause resume: no `StepResumed`.
+    assert!(
+        !recorder.labels().contains(&"StepResumed".to_string()),
+        "got {:?}",
+        recorder.labels()
+    );
+    assert_eq!(
+        killed.store.load(&killed.run_id).unwrap().status,
+        RunStatus::Completed
+    );
+}
+
+/// `--restart-interrupted` leaves discovery out: the resume carries no plans,
+/// so the interrupted step starts over from its prompt, as resume always did.
+#[tokio::test]
+async fn resume_restarts_a_linear_step_when_no_plans_are_carried() {
+    let killed = kill_linear_mid_second().await;
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed
+        .resume(factory.clone(), RecoveryPlans::default())
+        .await;
+    assert!(res.awaiting.is_none());
+    assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
+    assert_eq!(factory.built(), ["Process b", "Process c"]);
+
+    let b_requests = factory.requests("Process b");
+    assert_eq!(b_requests[0].messages.len(), 1, "just the prompt");
+    assert!(!sent_text(&b_requests[0]).contains(CONTINUATION_NOTE));
+    assert_eq!(killed.attempts_of_step("second")[1].continued_from, None);
+    assert!(
+        attempt_resumed(&recorder).is_empty(),
+        "got {:?}",
+        attempt_resumed(&recorder)
+    );
+}
+
+#[tokio::test]
+async fn resume_recovers_a_finished_linear_step_whose_result_never_landed() {
+    let killed = kill_linear_mid_second().await;
+    let first = killed.attempts_of_step("first").remove(0);
+
+    // The runner died after `first`'s agent finished but before its step
+    // result was written.
+    std::fs::write(
+        killed
+            .tmp
+            .path()
+            .join("runs")
+            .join(&killed.run_id)
+            .join("step_results.jsonl"),
+        "",
+    )
+    .unwrap();
+    assert!(killed.done_step_ids().is_empty());
+
+    let plans = killed.plans();
+    match plans.0["first"].linear.as_ref() {
+        Some(AttemptPlan::Recovered {
+            output,
+            agent_run_id,
+            ..
+        }) => {
+            assert_eq!(output, "a done");
+            assert_eq!(agent_run_id, &first.agent_run_id);
+        }
+        other => panic!("expected Recovered for first, got {other:?}"),
+    }
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed.resume(factory.clone(), plans).await;
+    assert!(res.awaiting.is_none());
+    assert_eq!(
+        step_outputs(&res),
+        [
+            ("first".to_string(), "a done".to_string()),
+            ("second".to_string(), "b done".to_string()),
+            ("third".to_string(), "c done".to_string()),
+        ]
+    );
+
+    // No dispatch — and so no model call — for the recovered step.
+    assert_eq!(factory.built(), ["Process b", "Process c"]);
+    assert_eq!(
+        killed.attempts_of_step("first").len(),
+        1,
+        "no new attempt for first"
+    );
+
+    // The recovered step is the finished attempt itself ...
+    let first_result = &res.step_results[0];
+    assert!(first_result.success);
+    assert_eq!(first_result.run_id, first.agent_run_id);
+    assert_eq!(first_result.transcript_path, first.transcript_path);
+    // ... recorded again, so the next resume sees it as done.
+    assert!(killed.done_step_ids().contains("first"));
+
+    let resumed = attempt_resumed(&recorder);
+    assert!(
+        resumed.contains(&(
+            None,
+            AttemptResumeMode::Recovered,
+            Some(first.agent_run_id.clone()),
+            None
+        )),
+        "got {resumed:?}"
+    );
+    assert!(
+        resumed.contains(&(
+            None,
+            AttemptResumeMode::Continued,
+            Some(killed.b.agent_run_id.clone()),
+            None
+        )),
+        "second is still continued, got {resumed:?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_restarts_a_linear_step_whose_transcript_can_not_be_continued() {
+    let killed = kill_linear_mid_second().await;
+    // `second`'s transcript is gone: nothing to continue.
+    std::fs::remove_file(&killed.b.transcript_path).unwrap();
+
+    let plans = killed.plans();
+    assert!(
+        matches!(plans.0["second"].linear, Some(AttemptPlan::Restart { .. })),
+        "got {plans:?}"
+    );
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed.resume(factory.clone(), plans).await;
+    assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
+
+    // A fresh attempt: just the prompt, no note, and no link to the old one.
+    let b_requests = factory.requests("Process b");
+    assert_eq!(b_requests[0].messages.len(), 1);
+    assert!(!sent_text(&b_requests[0]).contains(CONTINUATION_NOTE));
+    assert_eq!(killed.attempts_of_step("second")[1].continued_from, None);
+
+    let resumed = attempt_resumed(&recorder);
+    assert_eq!(resumed.len(), 1, "got {resumed:?}");
+    let (idx, mode, from, reason) = &resumed[0];
+    assert_eq!(*idx, None);
+    assert_eq!(*mode, AttemptResumeMode::Restarted);
+    assert_eq!(*from, None);
+    assert!(reason.is_some(), "a restart says why");
+}
+
+#[tokio::test]
+async fn resume_restarts_a_linear_step_when_a_planned_continuation_turns_out_unreadable() {
+    let killed = kill_linear_mid_second().await;
+    // Discovery saw a continuable transcript ...
+    let plans = killed.plans();
+    assert!(matches!(
+        plans.0["second"].linear,
+        Some(AttemptPlan::Continue { .. })
+    ));
+    // ... which is gone by the time the step is dispatched.
+    std::fs::remove_file(&killed.b.transcript_path).unwrap();
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed.resume(factory.clone(), plans).await;
+    assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
+
+    let b_requests = factory.requests("Process b");
+    assert_eq!(b_requests[0].messages.len(), 1, "started from the prompt");
+    assert!(!sent_text(&b_requests[0]).contains(CONTINUATION_NOTE));
+    assert_eq!(
+        killed.attempts_of_step("second")[1].continued_from,
+        None,
+        "a restart is not recorded as a continuation"
+    );
+
+    let resumed = attempt_resumed(&recorder);
+    assert_eq!(resumed.len(), 1, "got {resumed:?}");
+    assert_eq!(resumed[0].1, AttemptResumeMode::Restarted);
+    assert!(resumed[0].3.is_some(), "a restart says why");
+}
+
+/// A step can carry both a paused-step seed (a manual pause landed inside it)
+/// and a recovery plan. A continuation rebuilds the conversation from the
+/// attempt's own transcript — the most recent thing the step did — so it wins,
+/// and the step is seeded once, not twice.
+#[tokio::test]
+async fn a_continuation_wins_over_a_paused_step_seed() {
+    let killed = kill_linear_mid_second().await;
+    let plans = killed.plans();
+    assert!(matches!(
+        plans.0["second"].linear,
+        Some(AttemptPlan::Continue { .. })
+    ));
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed
+        .resume_with(
+            killed.wf.clone(),
+            factory.clone(),
+            plans,
+            vec![PausedStep {
+                step_id: "second".into(),
+                seed_messages: vec![Message::user("STALE-PAUSED-SEED")],
+            }],
+        )
+        .await;
+    assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
+
+    let b_requests = factory.requests("Process b");
+    assert_eq!(b_requests.len(), 1);
+    let sent = sent_text(&b_requests[0]);
+    assert!(!sent.contains("STALE-PAUSED-SEED"), "double-seeded: {sent}");
+    assert_eq!(b_requests[0].messages.len(), 3);
+    assert!(sent.contains(CONTINUATION_NOTE));
+    assert_eq!(
+        killed.attempts_of_step("second")[1]
+            .continued_from
+            .as_deref(),
+        Some(killed.b.agent_run_id.as_str())
+    );
+    assert_eq!(
+        attempt_resumed(&recorder)
+            .iter()
+            .map(|(_, mode, ..)| *mode)
+            .collect::<Vec<_>>(),
+        [AttemptResumeMode::Continued]
+    );
+}
+
+/// A restart carries no conversation, so when the step also paused with a seed
+/// that seed — the only conversation left — is what it resumes from, as a plain
+/// paused-step resume (`StepResumed`), not as an announced restart.
+#[tokio::test]
+async fn a_restart_leaves_a_paused_step_seed_in_charge() {
+    let killed = kill_linear_mid_second().await;
+    std::fs::remove_file(&killed.b.transcript_path).unwrap();
+    let plans = killed.plans();
+    assert!(matches!(
+        plans.0["second"].linear,
+        Some(AttemptPlan::Restart { .. })
+    ));
+
+    let factory = RecoverFactory::new(false);
+    let (res, recorder) = killed
+        .resume_with(
+            killed.wf.clone(),
+            factory.clone(),
+            plans,
+            vec![PausedStep {
+                step_id: "second".into(),
+                seed_messages: vec![Message::user("Process b")],
+            }],
+        )
+        .await;
+    assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
+    assert!(
+        attempt_resumed(&recorder).is_empty(),
+        "no restart is announced: {:?}",
+        attempt_resumed(&recorder)
+    );
+    assert!(recorder.labels().contains(&"StepResumed".to_string()));
+    assert_eq!(killed.attempts_of_step("second")[1].continued_from, None);
+}
+
+const WF_LINEAR_RECOVER_GATED: &str = r#"
+name: linear-recover
+steps:
+  - id: first
+    agent: worker
+    prompt: "Process a"
+  - id: second
+    agent: worker
+    prompt: "Process b"
+    approval:
+      required: true
+      prompt: "Run second?"
+  - id: third
+    agent: worker
+    prompt: "Process c"
+"#;
+
+/// A step with an attempt on record is past its `approval:` gate (the gate
+/// precedes dispatch), so continuing that attempt must not park the run at the
+/// gate a second time.
+#[tokio::test]
+async fn a_continued_step_is_not_gated_again() {
+    let killed = kill_linear_mid_second().await;
+    let plans = killed.plans();
+
+    let factory = RecoverFactory::new(false);
+    let (res, _recorder) = killed
+        .resume_on(
+            Workflow::parse(WF_LINEAR_RECOVER_GATED).unwrap(),
+            factory.clone(),
+            plans,
+        )
+        .await;
+    assert!(
+        res.awaiting.is_none(),
+        "the continued step must not re-park at its approval gate: {:?}",
+        res.awaiting
+    );
+    assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
+    assert!(sent_text(&factory.requests("Process b")[0]).contains(CONTINUATION_NOTE));
 }

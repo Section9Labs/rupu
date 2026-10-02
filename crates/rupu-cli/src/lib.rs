@@ -578,11 +578,25 @@ mod arg_parse_tests {
                 run_id,
                 mode,
                 plain,
+                restart_interrupted,
             } => {
                 assert_eq!(run_id, "run_01ABC");
                 assert_eq!(mode.as_deref(), Some("bypass"));
                 assert!(plain);
+                assert!(!restart_interrupted, "continuing is the default");
             }
+            other => panic!("expected RunAction::Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_resume_parses_restart_interrupted() {
+        let argv = parse_run_argv(&["resume", "run_01ABC", "--restart-interrupted"]);
+        match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Resume {
+                restart_interrupted,
+                ..
+            } => assert!(restart_interrupted),
             other => panic!("expected RunAction::Resume, got {other:?}"),
         }
     }
@@ -687,6 +701,7 @@ mod arg_parse_tests {
                         mode,
                         plain,
                         if_unfinished,
+                        restart_interrupted,
                     },
             } => {
                 assert_eq!(run_id, "run_01ABC");
@@ -696,6 +711,7 @@ mod arg_parse_tests {
                     !if_unfinished,
                     "an operator's resume may retry a finished run"
                 );
+                assert!(!restart_interrupted, "continuing is the default");
             }
             other => panic!("expected Workflow(Resume), got {other:?}"),
         }
@@ -744,6 +760,28 @@ mod arg_parse_tests {
         let cli =
             Cli::try_parse_from(["rupu", rupu_cp::node::protocol::FEATURES_SUBCOMMAND]).unwrap();
         assert!(matches!(cli.command, Cmd::Features), "{:?}", cli.command);
+    }
+
+    #[test]
+    fn workflow_resume_parses_restart_interrupted() {
+        let cli = Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "resume",
+            "run_01ABC",
+            "--restart-interrupted",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Workflow {
+                action:
+                    cmd::workflow::Action::Resume {
+                        restart_interrupted,
+                        ..
+                    },
+            } => assert!(restart_interrupted),
+            other => panic!("expected Workflow(Resume), got {other:?}"),
+        }
     }
 
     #[test]
