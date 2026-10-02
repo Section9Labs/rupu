@@ -268,8 +268,11 @@ it depends on the transport:
 - A bucket worker uploaded every blob its run's findings reference to
   `artifacts/<sha256>` in the bucket when the run finished, whatever the
   outcome — before it published the run as finished, so a run the control
-  plane sees as finished already has its blobs there (a failed upload holds
-  the run and is retried) — and the control plane reads it from there.
+  plane sees as finished already has its blobs there — and the control plane
+  reads it from there. A failed upload holds the run and is retried, but a
+  blob that still fails after 3 passes is logged and released, and the
+  control plane reports it unavailable. Coverage lines, by contrast, are held
+  until they land.
 
 A pull is capped at the recorded size, then checked against the recorded size
 and sha256 before the blob enters the store. Concurrent first downloads of the

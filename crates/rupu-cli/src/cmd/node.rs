@@ -167,7 +167,8 @@ struct BucketStream {
     pending_end: Option<u64>,
 }
 
-/// The cursors for every file the bucket worker ships for a run.
+/// The cursors for every file the bucket worker ships for a run, plus the
+/// failure budget of the artifact blobs its terminal pass uploads.
 #[derive(Debug, Default)]
 struct BucketStreams {
     events: BucketStream,
@@ -175,6 +176,9 @@ struct BucketStreams {
     unit_checkpoints: BucketStream,
     usage: BucketStream,
     coverage: BucketStream,
+    /// Terminal passes each referenced artifact blob (by sha256) has failed;
+    /// see [`upload_referenced_artifacts`].
+    artifact_failures: HashMap<String, u32>,
 }
 
 impl BucketStreams {
@@ -1406,50 +1410,94 @@ fn referenced_artifacts(stream: &Path) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// Terminal passes a referenced artifact blob may fail (its existence check,
+/// its upload, or reading it from the store) before the bucket worker stops
+/// holding the run for it. Passes, not wall-clock, so `--once`'s iteration
+/// window always reaches the give-up.
+const ARTIFACT_UPLOAD_ATTEMPTS: u32 = 3;
+
 /// Upload every blob this run's findings reference to `artifacts/<sha256>`,
 /// so the coordinator can pull them later without this worker online (spec
 /// 2026-09-30-rupu-remote-findings-transport-design.md §B1). A bucket worker
 /// may never be polled again once its run finishes, so this is the only
 /// chance — which makes the blobs part of what [`finish_bucket_run`] holds
-/// the terminal run for. Returns `true` when nothing is left to upload.
+/// the terminal run for, within a budget. Returns `true` when nothing is left
+/// to upload.
 ///
-/// A bucket error (the existence check or the upload) returns `false`: the
-/// caller keeps the run active and retries next tick, and a blob that landed
-/// meanwhile is skipped by its existence check. A blob this worker's store
-/// does not hold as a regular file can never land, so it is logged and
-/// skipped rather than holding the run forever — the coordinator reports it
-/// unavailable.
-async fn upload_referenced_artifacts(bucket: &dyn Bucket, global: &Path, run_dir: &Path) -> bool {
+/// A failed blob (its existence check, its upload, or reading it from the
+/// store — they all surface as a bucket error) returns `false`: the caller
+/// keeps the run active and retries next tick, and a blob that landed
+/// meanwhile is skipped by its existence check. Each blob gets
+/// [`ARTIFACT_UPLOAD_ATTEMPTS`] failed passes (counted in `failures`); then
+/// it is logged and released, never tried again for this run, and the
+/// terminal `run.json` and `finished` land without it — the coordinator
+/// reports it unavailable. Without that budget a blob that can never upload
+/// (a bucket that keeps rejecting it, an uplink too slow for its size) would
+/// hold the run non-terminal on the coordinator forever and re-upload every
+/// tick, stalling the worker's other runs. A blob this worker's store does
+/// not hold as a regular file can never land, so it is logged and skipped at
+/// once.
+async fn upload_referenced_artifacts(
+    bucket: &dyn Bucket,
+    rid: &str,
+    global: &Path,
+    run_dir: &Path,
+    failures: &mut HashMap<String, u32>,
+) -> bool {
     let mut landed = true;
     for sha in referenced_artifacts(&run_dir.join(rupu_coverage::STREAM_FILE)) {
-        match bucket.artifact_exists(&sha).await {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(e) => {
-                warn!(sha = %sha, error = %e, "node pull: artifact existence check failed; holding the run to retry");
-                landed = false;
-                continue;
-            }
+        if failures
+            .get(&sha)
+            .is_some_and(|n| *n >= ARTIFACT_UPLOAD_ATTEMPTS)
+        {
+            continue;
         }
-        let Ok(src) = crate::cmd::findings_helper::blob_path(global, &sha) else {
+        let Err(e) = upload_one_artifact(bucket, global, &sha).await else {
             continue;
         };
-        // Not followed: the store only ever holds regular files, and a FIFO
-        // or a dangling link would fail every retry.
-        let in_store = std::fs::symlink_metadata(&src).is_ok_and(|m| m.file_type().is_file());
-        if !in_store {
+        let failed = failures.entry(sha.clone()).or_insert(0);
+        *failed += 1;
+        if *failed >= ARTIFACT_UPLOAD_ATTEMPTS {
             warn!(
-                sha = %sha, path = %src.display(),
-                "node pull: a referenced artifact is not in this worker's store; the coordinator will report it unavailable"
+                run_id = %rid, sha = %sha, passes = *failed, error = %e,
+                "node pull: artifact upload still failing; releasing the run without it — the coordinator will report it unavailable"
             );
-            continue;
-        }
-        if let Err(e) = bucket.put_artifact_file(&sha, &src).await {
-            warn!(sha = %sha, error = %e, "node pull: artifact upload failed; holding the run to retry");
+        } else {
+            warn!(
+                run_id = %rid, sha = %sha, passes = *failed, error = %e,
+                "node pull: artifact upload failed; holding the run to retry"
+            );
             landed = false;
         }
     }
     landed
+}
+
+/// One referenced blob's upload: `Ok` once it is in the bucket (already, or
+/// now) or when this worker's store does not hold it (logged — it can never
+/// land); `Err` for a bucket error, which the caller retries within budget.
+async fn upload_one_artifact(
+    bucket: &dyn Bucket,
+    global: &Path,
+    sha: &str,
+) -> Result<(), BucketError> {
+    if bucket.artifact_exists(sha).await? {
+        return Ok(());
+    }
+    let Ok(src) = crate::cmd::findings_helper::blob_path(global, sha) else {
+        return Ok(());
+    };
+    // Not followed: the store only ever holds regular files, and a FIFO or a
+    // dangling link would fail every retry.
+    let in_store = std::fs::symlink_metadata(&src).is_ok_and(|m| m.file_type().is_file());
+    if !in_store {
+        warn!(
+            sha = %sha, path = %src.display(),
+            "node pull: a referenced artifact is not in this worker's store; the coordinator will report it unavailable"
+        );
+        return Ok(());
+    }
+    bucket.put_artifact_file(sha, &src).await
 }
 
 /// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
@@ -1463,15 +1511,19 @@ async fn upload_referenced_artifacts(bucket: &dyn Bucket, global: &Path, run_dir
 /// would finish the run short. The CP finishes a run on the terminal
 /// `run.json` body and stops polling it from then on, so that body and the
 /// marker are the CP's "nothing more is coming" signals: each is written ONLY
-/// after everything before it landed — so a CP that sees the run terminal can
-/// already pull every artifact blob its findings reference (a bucket worker
-/// may never be polled again). The blobs go after the final coverage drain,
-/// so the references are read from the run's complete stream. If any stream
-/// or blob upload fails, nothing after it is attempted (no `run.json`, no
-/// marker); if `run.json` or the marker fails, the marker is not written /
-/// reported. Either way this returns `false` and the caller keeps the run
-/// active, retrying next tick (a failed chunk retries byte-exact under its own
-/// key; a blob that already landed is not re-uploaded). Every stream is still
+/// after everything before it landed. The artifact blobs go after the final
+/// coverage drain, so the references are read from the run's complete stream,
+/// and before `run.json`, so a CP view right after the run finishes can
+/// already pull them (the CP fetches `artifacts/<sha>` by key on a view; a
+/// bucket worker may never be polled again). If any stream upload fails, or a
+/// blob upload fails within its [`ARTIFACT_UPLOAD_ATTEMPTS`] budget, nothing
+/// after it is attempted (no `run.json`, no marker); if `run.json` or the
+/// marker fails, the marker is not written / reported. Either way this
+/// returns `false` and the caller keeps the run active, retrying next tick (a
+/// failed chunk retries byte-exact under its own key; a blob that already
+/// landed is not re-uploaded). A stream chunk holds the run for as long as it
+/// takes — its lines would be lost for good — while a blob past its budget is
+/// released and reported unavailable by the CP. Every stream is still
 /// attempted when one fails.
 async fn finish_bucket_run(
     bucket: &dyn Bucket,
@@ -1485,7 +1537,9 @@ async fn finish_bucket_run(
     if !streams.upload_all(bucket, rid, run_dir).await {
         return false;
     }
-    if !upload_referenced_artifacts(bucket, global, run_dir).await {
+    if !upload_referenced_artifacts(bucket, rid, global, run_dir, &mut streams.artifact_failures)
+        .await
+    {
         return false;
     }
     // The routine pass withholds a terminal run.json (see `upload_routine`), so
@@ -2182,8 +2236,9 @@ mod tests {
     /// - `attempts`: every `put_result` tried, failed ones included. A failed
     ///   put is recorded as an attempt because a real one can have landed
     ///   before it errored (a timeout).
-    /// - `fail_prefix`: a `put_result` whose key starts with it fails, and
-    ///   `"finished"` fails the marker.
+    /// - `fail_prefix`: a `put_result` whose key starts with it fails,
+    ///   `"finished"` fails the marker, `"artifact:"` fails a blob upload and
+    ///   `"exists:"` fails a blob's existence check (HEAD).
     #[derive(Default)]
     struct RecordingBucket {
         ops: std::sync::Mutex<Vec<(String, String)>>,
@@ -2288,7 +2343,13 @@ mod tests {
         async fn probe(&self) -> Result<(), BucketError> {
             unreachable!()
         }
+        /// Fails (the HEAD) when the fail prefix matches `exists:<sha256>`.
         async fn artifact_exists(&self, sha256: &str) -> Result<bool, BucketError> {
+            if self.fails(&format!("exists:{sha256}")) {
+                return Err(BucketError::Io(format!(
+                    "injected HEAD failure for {sha256}"
+                )));
+            }
             Ok(self.artifacts.lock().unwrap().contains_key(sha256))
         }
         /// Stored under `artifacts/<sha256>`; logged as an `artifact:<sha256>`
@@ -3308,55 +3369,170 @@ mod tests {
         assert!(!stored.contains_key(&absent) && !stored.contains_key(&external));
     }
 
-    /// A blob upload that fails is part of what the terminal pass holds the
-    /// run for: neither the terminal `run.json` nor the `finished` marker is
-    /// written (the CP would stop polling the run and never learn the blob is
-    /// there), and the next tick retries — the blob, then `run.json`, then
-    /// `finished`, with the coverage chunk that already landed not re-sent.
-    #[tokio::test]
-    async fn a_failed_blob_upload_holds_the_terminal_run_until_it_lands() {
+    /// A run dir whose coverage stream references one copied blob `sha`, and a
+    /// global dir whose store holds it.
+    fn run_referencing_one_blob(sha: &str) -> (tempfile::TempDir, tempfile::TempDir) {
         use rupu_coverage::report::ArtifactStorage;
         let global = tempdir().unwrap();
         let run_dir = tempdir().unwrap();
-        let sha = "ab".repeat(32);
-        store_blob(global.path(), &sha, b"poc");
+        store_blob(global.path(), sha, b"poc");
         std::fs::write(
             run_dir.path().join(rupu_coverage::STREAM_FILE),
-            begin_stream_line()
-                + &findings_stream_line("f1", vec![(&sha, ArtifactStorage::Copied)]),
+            begin_stream_line() + &findings_stream_line("f1", vec![(sha, ArtifactStorage::Copied)]),
         )
         .unwrap();
+        (global, run_dir)
+    }
+
+    /// One terminal pass for `rid` (the run.json body is [`RUN_JSON`]).
+    async fn terminal_pass(
+        bucket: &RecordingBucket,
+        rid: &str,
+        run_dir: &Path,
+        global: &Path,
+        streams: &mut BucketStreams,
+    ) -> bool {
+        finish_bucket_run(bucket, rid, run_dir, global, streams, RUN_JSON, "completed").await
+    }
+
+    /// A blob upload that fails holds the terminal run for up to
+    /// [`ARTIFACT_UPLOAD_ATTEMPTS`] passes: neither the terminal `run.json` nor
+    /// the `finished` marker is written meanwhile. The coordinator fetches
+    /// `artifacts/<sha>` by key whenever someone views it, so the order only
+    /// matters for a view right after `finished` — holding the run a few
+    /// passes lets a blob that lands late still be there for that view. Here
+    /// it fails twice, then lands on the third pass: the blob, then
+    /// `run.json`, then `finished`, with the coverage chunk that already
+    /// landed not re-sent.
+    #[tokio::test]
+    async fn a_failed_blob_upload_holds_the_terminal_run_until_it_lands_within_its_budget() {
+        let sha = "ab".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
         let bucket = RecordingBucket::failing("artifact:");
         let mut streams = BucketStreams::default();
 
-        assert!(
-            !finish_bucket_run(
-                &bucket,
-                "run_HOLD",
-                run_dir.path(),
-                global.path(),
-                &mut streams,
-                RUN_JSON,
-                "completed",
-            )
-            .await,
-            "an unlanded blob means the run is not finished"
-        );
-        assert_eq!(bucket.landed_keys(), vec![result_key("coverage", 0)]);
+        for pass in 1..ARTIFACT_UPLOAD_ATTEMPTS {
+            assert!(
+                !terminal_pass(&bucket, "run_HOLD", r, g, &mut streams).await,
+                "pass {pass}: an unlanded blob within its budget holds the run"
+            );
+            assert_eq!(bucket.landed_keys(), vec![result_key("coverage", 0)]);
+        }
 
         bucket.set_failing(None);
-        assert!(
-            finish_bucket_run(
-                &bucket,
-                "run_HOLD",
-                run_dir.path(),
-                global.path(),
-                &mut streams,
-                RUN_JSON,
-                "completed",
-            )
-            .await
+        assert!(terminal_pass(&bucket, "run_HOLD", r, g, &mut streams).await);
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                format!("artifact:{sha}"),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
         );
+    }
+
+    /// A blob that never uploads (a bucket that keeps rejecting it, an uplink
+    /// too slow for it) cannot hold the run forever: after
+    /// [`ARTIFACT_UPLOAD_ATTEMPTS`] failed passes the worker gives up on it
+    /// and the terminal `run.json` and `finished` land without it — the
+    /// coordinator reports that artifact unavailable. A later pass (were one
+    /// needed) does not try the given-up blob again.
+    #[tokio::test]
+    async fn a_blob_that_never_uploads_is_released_after_its_budget() {
+        let sha = "ab".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("artifact:");
+        let mut streams = BucketStreams::default();
+
+        for pass in 1..ARTIFACT_UPLOAD_ATTEMPTS {
+            assert!(
+                !terminal_pass(&bucket, "run_GIVEUP", r, g, &mut streams).await,
+                "pass {pass} holds the run"
+            );
+        }
+        assert!(
+            terminal_pass(&bucket, "run_GIVEUP", r, g, &mut streams).await,
+            "the last budgeted pass releases the run"
+        );
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
+        assert!(bucket.artifacts.lock().unwrap().is_empty(), "no artifact");
+        let tries = |b: &RecordingBucket| {
+            b.attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with("artifact:"))
+                .count()
+        };
+        assert_eq!(tries(&bucket), ARTIFACT_UPLOAD_ATTEMPTS as usize);
+
+        // Released for good: another pass does not upload the blob again.
+        assert!(terminal_pass(&bucket, "run_GIVEUP", r, g, &mut streams).await);
+        assert_eq!(tries(&bucket), ARTIFACT_UPLOAD_ATTEMPTS as usize);
+    }
+
+    /// A failing existence check (HEAD) spends the same budget as a failing
+    /// upload: the run is released after [`ARTIFACT_UPLOAD_ATTEMPTS`] passes.
+    #[tokio::test]
+    async fn a_blob_whose_existence_check_keeps_failing_is_released_after_its_budget() {
+        let sha = "cd".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("exists:");
+        let mut streams = BucketStreams::default();
+
+        for pass in 1..ARTIFACT_UPLOAD_ATTEMPTS {
+            assert!(
+                !terminal_pass(&bucket, "run_HEAD", r, g, &mut streams).await,
+                "pass {pass} holds the run"
+            );
+        }
+        assert!(terminal_pass(&bucket, "run_HEAD", r, g, &mut streams).await);
+        assert_eq!(
+            bucket.landed_keys(),
+            vec![
+                result_key("coverage", 0),
+                "run.json".to_string(),
+                "finished".to_string(),
+            ]
+        );
+    }
+
+    /// The artifact budget is for blobs only: a coverage chunk that keeps
+    /// failing still holds the terminal run however many passes it takes (the
+    /// lines would be lost for good once the CP stops reading the run).
+    #[tokio::test]
+    async fn a_failing_coverage_chunk_holds_the_run_past_the_artifact_budget() {
+        let sha = "ab".repeat(32);
+        let (global, run_dir) = run_referencing_one_blob(&sha);
+        let (g, r) = (global.path(), run_dir.path());
+        let bucket = RecordingBucket::failing("coverage");
+        let mut streams = BucketStreams::default();
+
+        for pass in 0..ARTIFACT_UPLOAD_ATTEMPTS + 3 {
+            assert!(
+                !terminal_pass(&bucket, "run_COV", r, g, &mut streams).await,
+                "pass {pass}: an unlanded coverage chunk holds the run"
+            );
+        }
+        assert!(
+            bucket.landed_keys().is_empty(),
+            "{:?}",
+            bucket.landed_keys()
+        );
+
+        bucket.set_failing(None);
+        assert!(terminal_pass(&bucket, "run_COV", r, g, &mut streams).await);
         assert_eq!(
             bucket.landed_keys(),
             vec![
