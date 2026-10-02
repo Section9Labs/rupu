@@ -1,7 +1,8 @@
 use crate::error::FleetError;
-use crate::types::{ClaimGuard, ClaimOutcome, ClaimRecord};
+use crate::types::{BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -86,7 +87,6 @@ impl Board {
         owner: &str,
         ttl: Duration,
     ) -> Result<bool, FleetError> {
-        use std::io::Write;
         let now = Utc::now();
         let expires =
             now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -170,6 +170,20 @@ impl Board {
     pub fn claim_holder(&self, key: &str) -> Result<Option<String>, FleetError> {
         Ok(read_claim(&self.claim_path(key))?.map(|r| r.owner))
     }
+
+    fn posts_path(&self) -> PathBuf {
+        self.root.join("board").join("posts.jsonl")
+    }
+
+    /// Append one post to the board's append-only `posts.jsonl`.
+    pub fn post(&self, post: &BoardPost) -> Result<(), FleetError> {
+        append_jsonl(&self.posts_path(), post)
+    }
+
+    /// All posts, oldest first. An absent log is an empty board, not an error.
+    pub fn read_posts(&self) -> Result<Vec<BoardPost>, FleetError> {
+        read_jsonl(&self.posts_path())
+    }
 }
 
 fn is_expired(rec: &ClaimRecord) -> bool {
@@ -212,6 +226,56 @@ fn read_claim(path: &Path) -> Result<Option<ClaimRecord>, FleetError> {
     }
 }
 
+/// Append one JSON line to `path`, creating the file and parent dirs as
+/// needed. The whole line is written with a single `write_all` on an
+/// `O_APPEND` handle so concurrent appenders do not interleave mid-line.
+fn append_jsonl<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FleetError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
+            action: format!("create dir {}", parent.display()),
+            source: e,
+        })?;
+    }
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| FleetError::Io {
+            action: format!("open {}", path.display()),
+            source: e,
+        })?;
+    f.write_all(&line).map_err(|e| FleetError::Io {
+        action: format!("append {}", path.display()),
+        source: e,
+    })
+}
+
+/// Read every JSON line of `path`, oldest first. A missing file is an empty
+/// log; blank lines are skipped; a malformed line is a `Parse` error.
+fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, FleetError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(FleetError::Io {
+                action: format!("read {}", path.display()),
+                source: e,
+            })
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        out.push(serde_json::from_str(line).map_err(|e| FleetError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?);
+    }
+    Ok(out)
+}
+
 /// Filename stem for a work-unit key: a readable sanitized prefix (for
 /// debuggability) plus a short hex SHA-256 of the RAW key, so distinct keys
 /// never collide (`a:b` vs `a-b`).
@@ -235,6 +299,7 @@ fn claim_stem(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PostKind;
 
     #[test]
     fn claim_grants_then_denies_same_key() {
@@ -453,5 +518,36 @@ mod tests {
             .claim("held:key", "agent-b", Duration::from_secs(60))
             .unwrap();
         assert!(matches!(outcome, ClaimOutcome::Granted(_)));
+    }
+
+    #[test]
+    fn posts_round_trip_in_append_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        assert!(board.read_posts().unwrap().is_empty());
+
+        board
+            .post(&BoardPost {
+                author: "recon".into(),
+                ts: "2026-10-01T00:00:00Z".into(),
+                kind: PostKind::Observation,
+                body: "port 443 open on 1.1.2.2".into(),
+                addressed_to: None,
+            })
+            .unwrap();
+        board
+            .post(&BoardPost {
+                author: "lead".into(),
+                ts: "2026-10-01T00:01:00Z".into(),
+                kind: PostKind::Note,
+                body: "focus on tls".into(),
+                addressed_to: Some("recon".into()),
+            })
+            .unwrap();
+
+        let posts = board.read_posts().unwrap();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].body, "port 443 open on 1.1.2.2");
+        assert_eq!(posts[1].addressed_to.as_deref(), Some("recon"));
     }
 }
