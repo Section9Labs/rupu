@@ -19,10 +19,28 @@ A browser opens to `accounts.google.com/o/oauth2/v2/auth`. rupu signs in as the 
 
 The token is used against Google's **Cloud Code Assist** API, the backend the Gemini CLI itself talks to — not Vertex AI, and not `generativelanguage.googleapis.com` (that one is the API-key path). No Vertex AI project setup is involved, and rupu never calls a Vertex endpoint.
 
-- **Gemini CLI** (what `rupu auth login` gives you, and what any stored credential without a `variant` field uses): requests go to `https://cloudcode-pa.googleapis.com` (`/v1internal:generateContent` and `/v1internal:streamGenerateContent`), and the token is refreshed with the Gemini CLI client's id and secret.
-- **Antigravity**: requests go to the sandbox endpoint `https://daily-cloudcode-pa.sandbox.googleapis.com`, with Antigravity's own client id and secret. rupu selects it only when the stored credential carries `"variant": "antigravity"`; `rupu auth login` does not write that field.
+- **Gemini CLI** (what `rupu auth login` gives you — it stores `"variant": "gemini-cli"` — and what any stored credential without a `variant` field uses): requests go to `https://cloudcode-pa.googleapis.com` (`/v1internal:generateContent` and `/v1internal:streamGenerateContent`), and the token is refreshed with the Gemini CLI client's id and secret.
+- **Antigravity**: requests go to the sandbox endpoint `https://daily-cloudcode-pa.sandbox.googleapis.com`, with Antigravity's own client id and secret. rupu selects it only when the stored credential carries `"variant": "antigravity"`, which `rupu auth login` never writes (it signs in as the Gemini CLI client); such a credential is set up with the same calls as below, against the sandbox endpoint — that path is not verified against the live service.
 
-Every Code Assist request carries a `project` field. rupu takes it from the stored credential's `project_id` and sends an empty string when the credential has none. `rupu auth login` does not discover or store a project id, and `config.toml` has no key for one.
+### Code Assist project
+
+Every Code Assist request names a `project`: the **Google Cloud project ID** Google bills and meters the account's Code Assist usage against. It is not a rupu project, a directory, or a repo, and the API-key (AI Studio) path has none.
+
+rupu finds it the way the Gemini CLI does (its `setupUser`, `packages/core/src/code_assist/setup.ts`):
+
+1. `POST /v1internal:loadCodeAssist` asks which tier and project the account has. An account that is already set up gets its project straight back.
+2. An account with no tier yet is onboarded with `POST /v1internal:onboardUser`, using the tier Google marks as default. The free tier is onboarded without a project — Google provisions a managed one — and the call returns a long-running operation that rupu polls (`GET /v1internal/operations/…`, every 5s, giving up after 5 minutes) until it reports the project.
+
+**When it runs.** `rupu auth login --provider gemini --mode sso` runs it once the sign-in is saved, and records the project in the stored credential (`project_id` in `~/.rupu/auth.json`, next to `variant`). Interrupting it (Ctrl-C during a slow onboarding) keeps the sign-in. A credential stored without one — a login from before this, or one whose setup failed — is set up by the first Code Assist request instead, and the project is recorded in the credential then (under the `auth.json.lock` lock, and only if the stored credential is still the same login), so later runs skip the setup. Clients in one process that need the setup at once (a fan-out's first requests) share a single one. Token refreshes keep it. A stored project is reused as is (the Gemini CLI repeats the setup every session; rupu does not): if the account's project changes — say, it moves off the free tier onto your own project — set `GOOGLE_CLOUD_PROJECT`, or run `rupu auth login --provider gemini --mode sso` again to store the new one.
+
+**`GOOGLE_CLOUD_PROJECT`.** Set `GOOGLE_CLOUD_PROJECT` (or `GOOGLE_CLOUD_PROJECT_ID`) to use your own project — a paid (standard-tier) account needs one. While it is set, the setup asks Google for that project and requests use the project the setup returns — normally that one, though Google can answer with another project the account already uses, as it does for the Gemini CLI; it overrides the stored project and is never written to `auth.json`. It must be the project ID (`my-project-123`), not the numeric project number. `config.toml` has no key for the project.
+
+**When there is none.** If Google assigns no project and none is set, the request fails before anything is sent, with an error naming `GOOGLE_CLOUD_PROJECT` and the API-key alternative (and Google's ineligibility reasons, or its account-validation link, when it gives them). rupu never sends an empty project. At login the same failure is a warning — the sign-in is kept, and the first request retries the setup:
+
+```text
+rupu: signed in, but Gemini Code Assist setup failed: … Set GOOGLE_CLOUD_PROJECT (or GOOGLE_CLOUD_PROJECT_ID) …
+rupu: the first Gemini request retries the setup.
+```
 
 ## Configuration
 
@@ -80,4 +98,4 @@ Gemini budgets input and output independently, so compaction triggers at `compac
 
 - **Vertex AI region** — `region` in config is parsed but unused; no shipped Gemini client targets a regional Vertex endpoint. Setting it changes nothing.
 - **AI Studio vs Code Assist** — two different APIs behind one `gemini` provider. AI Studio (API key) has a model listing and reports limits; Code Assist (SSO) has neither, so declare limits in `[[providers.gemini.models]]` (see [Model limits](#model-limits)).
-- **Code Assist project** — SSO requests carry a `project` taken from the stored credential's `project_id`, which `rupu auth login` does not populate (see [SSO via Google account](#sso-via-google-account)). There is no Vertex AI setup step.
+- **Code Assist project** — SSO requests carry a Google Cloud project ID that rupu sets up at login (or on the first request) the way the Gemini CLI does, overridable with `GOOGLE_CLOUD_PROJECT`; see [Code Assist project](#code-assist-project). There is no Vertex AI setup step.

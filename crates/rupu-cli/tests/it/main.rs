@@ -10,6 +10,7 @@
 //! `tests/serial/`; `test_layout.rs` rejects `set_var` / `remove_var` /
 //! `set_current_dir` here.
 
+mod auth_login_gemini;
 mod auth_login_gitlab;
 mod auth_login_modes;
 mod auth_status_table;

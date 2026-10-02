@@ -11,6 +11,8 @@ use crate::error::ProviderError;
 use crate::sse::SseParser;
 use crate::types::*;
 
+pub mod code_assist;
+
 // ── Endpoint URLs ────────────────────────────────────────────────────
 
 const GEMINI_CLI_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
@@ -88,6 +90,17 @@ impl GeminiVariant {
         }
     }
 
+    /// The `extra.variant` hint a credential issued to this variant's OAuth
+    /// client carries — the inverse of [`Self::from_credential_hint`].
+    /// `None` for AI Studio, which has no OAuth client.
+    pub fn credential_hint(&self) -> Option<&'static str> {
+        match self {
+            GeminiVariant::GeminiCli => Some("gemini-cli"),
+            GeminiVariant::Antigravity => Some("antigravity"),
+            GeminiVariant::AiStudio => None,
+        }
+    }
+
     /// `true` when this variant uses an AI Studio api-key (no OAuth
     /// refresh, different URL pattern, different request body shape).
     fn is_api_key(&self) -> bool {
@@ -155,7 +168,25 @@ pub struct GoogleGeminiClient {
     access_token: String,
     refresh_token: String,
     expires_ms: u64,
+    /// The Code Assist project (a Google Cloud project ID) the credential
+    /// stores: `extra.project_id`. Empty until the account is set up — at
+    /// login, or by this client's first request ([`Self::ensure_project`]).
     project_id: String,
+    /// The `GOOGLE_CLOUD_PROJECT` override's project, once
+    /// [`Self::ensure_project`] set the account up with it: requests carry it
+    /// instead of `project_id`. Never stored.
+    override_project: Option<String>,
+    /// [`Self::ensure_project`] has settled the project requests carry.
+    project_settled: bool,
+    /// Where Code Assist calls go (setup and generateContent):
+    /// [`code_assist::endpoint`] — the variant's endpoint, or the
+    /// `RUPU_CODE_ASSIST_ENDPOINT_OVERRIDE` test seam.
+    code_assist_base: String,
+    /// How the client reads `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_PROJECT_ID`
+    /// (`std::env::var`; tests swap it out).
+    env: fn(&str) -> Option<String>,
+    /// The onboarding operation's poll ([`code_assist::OnboardPoll`]).
+    onboard_poll: code_assist::OnboardPoll,
     auth_json_path: Option<PathBuf>,
     /// Test seam: replaces variant.endpoint() for model listing only.
     pub(crate) api_base_override: Option<String>,
@@ -196,8 +227,9 @@ impl GoogleGeminiClient {
     ///
     /// Auth-mode rules:
     /// - `GeminiCli` / `Antigravity` (Cloud Code Assist) require
-    ///   OAuth credentials with a `project_id` in `extra`. Bare
-    ///   api-key creds are rejected.
+    ///   OAuth credentials. Their Code Assist project is the credential's
+    ///   `extra.project_id`, or is set up before the first request
+    ///   ([`Self::ensure_project`]). Bare api-key creds are rejected.
     /// - `AiStudio` requires `ApiKey` credentials. The api-key is
     ///   stored in `access_token` and `refresh_token` is empty so
     ///   `ensure_valid_token` never tries to refresh.
@@ -221,7 +253,7 @@ impl GoogleGeminiClient {
                 GeminiVariant::GeminiCli | GeminiVariant::Antigravity,
             ) => {
                 let project_id = extra
-                    .get("project_id")
+                    .get(code_assist::EXTRA_PROJECT_ID)
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -234,6 +266,11 @@ impl GoogleGeminiClient {
                     refresh_token: refresh,
                     expires_ms: expires,
                     project_id,
+                    override_project: None,
+                    project_settled: false,
+                    code_assist_base: code_assist::endpoint(variant),
+                    env: read_env,
+                    onboard_poll: code_assist::OnboardPoll::default(),
                     auth_json_path,
                     api_base_override: None,
                     token_url: GOOGLE_TOKEN_URL.to_string(),
@@ -249,6 +286,11 @@ impl GoogleGeminiClient {
                 refresh_token: String::new(),
                 expires_ms: 0,
                 project_id: String::new(),
+                override_project: None,
+                project_settled: false,
+                code_assist_base: code_assist::endpoint(variant),
+                env: read_env,
+                onboard_poll: code_assist::OnboardPoll::default(),
                 auth_json_path: None,
                 api_base_override: None,
                 token_url: GOOGLE_TOKEN_URL.to_string(),
@@ -273,6 +315,7 @@ impl GoogleGeminiClient {
     /// Non-streaming send.
     pub async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
         self.ensure_valid_token().await?;
+        self.ensure_project().await?;
         let body = self.build_request_body(request);
         let url = self.build_url(&request.model);
 
@@ -306,6 +349,7 @@ impl GoogleGeminiClient {
         on_event: &mut (impl FnMut(StreamEvent) + Send + ?Sized),
     ) -> Result<LlmResponse, ProviderError> {
         self.ensure_valid_token().await?;
+        self.ensure_project().await?;
         let body = self.build_request_body(request);
         let url = self.build_stream_url(&request.model);
 
@@ -352,7 +396,7 @@ impl GoogleGeminiClient {
                 self.variant.endpoint(),
                 model
             ),
-            _ => format!("{}/v1internal:generateContent", self.variant.endpoint()),
+            _ => format!("{}/v1internal:generateContent", self.code_assist_base),
         }
     }
 
@@ -365,7 +409,7 @@ impl GoogleGeminiClient {
             ),
             _ => format!(
                 "{}/v1internal:streamGenerateContent?alt=sse",
-                self.variant.endpoint()
+                self.code_assist_base
             ),
         }
     }
@@ -503,12 +547,150 @@ impl GoogleGeminiClient {
             "phi-coding-agent"
         };
         serde_json::json!({
-            "project": self.project_id,
+            "project": self.override_project.as_deref().unwrap_or(&self.project_id),
             "model": request.model,
             "userAgent": user_agent,
             "requestId": format!("phi-{}-{}", now_ms(), request_counter()),
             "request": inner_request,
         })
+    }
+
+    /// Settle the Google Cloud project this client's Code Assist requests
+    /// carry, before the first one — gemini-cli runs its `setupUser` before
+    /// its first request too ([`code_assist`]):
+    ///
+    /// - `GOOGLE_CLOUD_PROJECT` (else `GOOGLE_CLOUD_PROJECT_ID`) overrides:
+    ///   the account is set up with it — unless it already is the stored
+    ///   project — and its project is used by this client only, never stored;
+    /// - else the credential's stored `project_id`;
+    /// - else the account is set up now (a login from before rupu stored
+    ///   projects, or one whose login-time setup failed) and the project is
+    ///   recorded in the credential store, so the next process skips this.
+    ///
+    /// Fails with the setup's actionable error rather than let a request go
+    /// out with an empty project; a failed setup is retried by the next call.
+    async fn ensure_project(&mut self) -> Result<(), ProviderError> {
+        if self.variant.is_api_key() || self.project_settled {
+            return Ok(());
+        }
+        match code_assist::project_override(self.env)? {
+            Some(o) if o.project == self.project_id => {}
+            Some(o) => {
+                let (project, _) = self.set_up_user(Some(&o.project)).await?;
+                info!(var = o.var, requested = %o.project, project = %project, "Code Assist project set up from the environment");
+                self.override_project = Some(project);
+            }
+            None if !self.project_id.is_empty() => {}
+            None => {
+                let (project, ran_it) = self.set_up_user(None).await?;
+                // Settled before the record, so a caller dropped while the
+                // store waits for its lock leaves this client settled.
+                self.project_id = project.clone();
+                self.project_settled = true;
+                // The client that ran the setup records it; the ones that
+                // shared its result (see `shared_setup`) leave it to that one.
+                if ran_it {
+                    self.record_project(&project).await;
+                }
+                return Ok(());
+            }
+        }
+        self.project_settled = true;
+        Ok(())
+    }
+
+    /// The setup for this client's account at its endpoint, shared with
+    /// every other client in the process asking for the same
+    /// ([`code_assist::shared_setup`]); `true` when this call ran it. The
+    /// grant is keyed by a hash of its refresh token (the access token when
+    /// there is none), so no token is kept beyond the clients holding it.
+    async fn set_up_user(&self, project: Option<&str>) -> Result<(String, bool), ProviderError> {
+        use std::hash::{Hash, Hasher};
+        let grant = if self.refresh_token.is_empty() {
+            &self.access_token
+        } else {
+            &self.refresh_token
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        grant.hash(&mut hasher);
+        let key = format!(
+            "{}\n{:?}\n{:016x}\n{}",
+            self.code_assist_base,
+            self.variant,
+            hasher.finish(),
+            project.unwrap_or_default()
+        );
+        code_assist::shared_setup(
+            key,
+            code_assist::setup_user(
+                &self.client,
+                &self.code_assist_base,
+                self.variant,
+                &self.access_token,
+                project,
+                &self.onboard_poll,
+            ),
+        )
+        .await
+    }
+
+    /// Record a freshly set-up project (and the variant it was set up for)
+    /// in the stored credential. Best-effort: this client has the project
+    /// either way, and a process that finds none stored sets it up again.
+    async fn record_project(&self, project: &str) {
+        match (&self.oauth_refresher, &self.auth_json_path) {
+            (Some(store), _) => {
+                let mut fields = HashMap::new();
+                fields.insert(
+                    code_assist::EXTRA_PROJECT_ID.to_string(),
+                    serde_json::Value::String(project.to_string()),
+                );
+                if let Some(hint) = self.variant.credential_hint() {
+                    fields.insert(
+                        code_assist::EXTRA_VARIANT.to_string(),
+                        serde_json::Value::String(hint.to_string()),
+                    );
+                }
+                let holder = AuthCredentials::OAuth {
+                    access: self.access_token.clone(),
+                    refresh: self.refresh_token.clone(),
+                    expires: self.expires_ms,
+                    extra: HashMap::new(),
+                };
+                match store.record_extra(holder, fields).await {
+                    Ok(true) => info!(project, "recorded the Code Assist project in the stored credential"),
+                    Ok(false) => info!(project, "the stored credential is no longer the one this client holds (a re-login or logout since, or another holder's token rotation); the Code Assist project was not recorded in it"),
+                    Err(e) => warn!(project, error = %e, "the Code Assist project could not be recorded in the stored credential; the next process sets it up again"),
+                }
+            }
+            // The legacy auth.json (`ProviderRegistry`): keyed per variant,
+            // written whole, as its refresh writes it.
+            (None, Some(path)) => {
+                let mut extra = HashMap::new();
+                extra.insert(
+                    code_assist::EXTRA_PROJECT_ID.to_string(),
+                    serde_json::Value::String(project.to_string()),
+                );
+                let creds = AuthCredentials::OAuth {
+                    access: self.access_token.clone(),
+                    refresh: self.refresh_token.clone(),
+                    expires: self.expires_ms,
+                    extra,
+                };
+                let (path, provider) = (path.clone(), self.variant.provider_id());
+                let written = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || save_provider_auth(&path, provider, &creds)
+                })
+                .await
+                .map_err(|e| ProviderError::AuthConfig(format!("write task failed: {e}")))
+                .and_then(|r| r);
+                if let Err(e) = written {
+                    warn!(path = %path.display(), project, error = %e, "the Code Assist project could not be written; the next process sets it up again");
+                }
+            }
+            (None, None) => warn!(project, "no credential store to record the Code Assist project in; the next process sets it up again"),
+        }
     }
 
     /// Hand token refreshes to the credential store's refresher (see the
@@ -595,6 +777,11 @@ impl GoogleGeminiClient {
         }
         Ok(())
     }
+}
+
+/// The process environment, as [`GoogleGeminiClient`] reads it.
+fn read_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
 /// Refresh a Google OAuth token and persist the refreshed credentials to
@@ -947,10 +1134,21 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 // ── Response Parsing ─────────────────────────────────────────────────
 
 /// Parse a complete GenerateContentResponse into LlmResponse.
+/// The GenerateContentResponse inside `json`. Code Assist wraps every answer
+/// — a whole one, or each stream chunk — as `{"response": …, "traceId": …}`
+/// (gemini-cli's `CaGenerateContentResponse`, read by its
+/// `fromGenerateContentResponse`); AI Studio sends it bare.
+fn generate_content_payload(json: &serde_json::Value) -> &serde_json::Value {
+    json.get("response")
+        .filter(|inner| inner.is_object())
+        .unwrap_or(json)
+}
+
 fn parse_generate_content_response(
     json: &serde_json::Value,
     model: &str,
 ) -> Result<LlmResponse, ProviderError> {
+    let json = generate_content_payload(json);
     let mut content = Vec::new();
     let mut stop_reason = Some(StopReason::EndTurn);
     let mut tool_call_counter: u32 = 0;
@@ -1148,6 +1346,7 @@ fn process_gemini_sse(
     }
 
     let data: serde_json::Value = serde_json::from_str(&event.data)?;
+    let data = generate_content_payload(&data);
 
     // Process candidates
     if let Some(candidates) = data.get("candidates").and_then(|c| c.as_array()) {
@@ -3212,5 +3411,519 @@ mod llm_provider_impl_tests {
 
         // Verify page 51 (pageToken t50) was never called — the cap stopped at 50
         page51.assert_hits(0);
+    }
+}
+
+/// The Code Assist project a request carries: settled before the first
+/// request (stored, `GOOGLE_CLOUD_PROJECT`, or set up and recorded), never
+/// sent empty.
+#[cfg(test)]
+mod code_assist_project_tests {
+    use super::*;
+    use crate::credential_writes::OAuthRefresher;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    /// A credential store that records what the client asks it to record.
+    #[derive(Default)]
+    struct RecordingStore {
+        recorded: std::sync::Mutex<Vec<(String, HashMap<String, serde_json::Value>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OAuthRefresher for RecordingStore {
+        async fn refresh(&self, _stale: AuthCredentials) -> Result<AuthCredentials, ProviderError> {
+            Err(ProviderError::TokenRefreshFailed(
+                "no refresh expected".into(),
+            ))
+        }
+
+        async fn record_extra(
+            &self,
+            holder: AuthCredentials,
+            fields: HashMap<String, serde_json::Value>,
+        ) -> Result<bool, ProviderError> {
+            if let AuthCredentials::OAuth { refresh, .. } = holder {
+                self.recorded.lock().unwrap().push((refresh, fields));
+            }
+            Ok(true)
+        }
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn env_project(k: &str) -> Option<String> {
+        (k == "GOOGLE_CLOUD_PROJECT").then(|| "env-project".to_string())
+    }
+
+    fn creds(project: Option<&str>, variant: Option<&str>) -> AuthCredentials {
+        let mut extra = HashMap::new();
+        if let Some(p) = project {
+            extra.insert("project_id".to_string(), json!(p));
+        }
+        if let Some(v) = variant {
+            extra.insert("variant".to_string(), json!(v));
+        }
+        AuthCredentials::OAuth {
+            access: "access-1".into(),
+            refresh: "refresh-1".into(),
+            expires: 9_999_999_999_999,
+            extra,
+        }
+    }
+
+    fn client_for(
+        server: &MockServer,
+        creds: AuthCredentials,
+        variant: GeminiVariant,
+        store: Option<Arc<RecordingStore>>,
+    ) -> GoogleGeminiClient {
+        let mut client =
+            GoogleGeminiClient::new(creds, variant, None, Arc::new(rupu_netflow::NullSink))
+                .unwrap()
+                .with_oauth_refresher(store.map(|s| s as Arc<dyn OAuthRefresher>));
+        client.code_assist_base = server.url("");
+        client.env = no_env;
+        client
+    }
+
+    fn request() -> LlmRequest {
+        LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            system: None,
+            messages: vec![Message::user("Hello")],
+            max_tokens: Some(16),
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            disable_prompt_cache: false,
+        }
+    }
+
+    /// A Code Assist `generateContent` answer: the response wrapped in
+    /// gemini-cli's `CaGenerateContentResponse` envelope.
+    fn wrapped_answer() -> serde_json::Value {
+        json!({
+            "response": {
+                "candidates": [{
+                    "content": { "role": "model", "parts": [{ "text": "hello back" }] },
+                    "finishReason": "STOP",
+                }],
+                "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 2 },
+            },
+            "traceId": "trace-1",
+        })
+    }
+
+    fn text_of(response: &LlmResponse) -> String {
+        response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A login from before rupu stored projects: the first request sets the
+    /// account up, carries the project, and has the store record it (with
+    /// the variant) against the grant the client holds. The second request
+    /// reuses it.
+    #[tokio::test]
+    async fn a_credential_without_a_project_is_set_up_on_the_first_request_and_recorded() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:loadCodeAssist")
+                .header("authorization", "Bearer access-1");
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "free-tier" },
+                "cloudaicompanionProject": "managed-1",
+            }));
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:generateContent")
+                .json_body_partial(r#"{ "project": "managed-1" }"#);
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut client = client_for(
+            &server,
+            creds(None, None),
+            GeminiVariant::GeminiCli,
+            Some(store.clone()),
+        );
+
+        let first = client.send(&request()).await.unwrap();
+        client.send(&request()).await.unwrap();
+
+        assert_eq!(text_of(&first), "hello back");
+        load.assert_hits(1);
+        generate.assert_hits(2);
+        let recorded = store.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "refresh-1");
+        assert_eq!(recorded[0].1["project_id"], json!("managed-1"));
+        assert_eq!(recorded[0].1["variant"], json!("gemini-cli"));
+    }
+
+    /// An Antigravity credential is set up against its own endpoint, and
+    /// its variant is recorded with the project.
+    #[tokio::test]
+    async fn an_antigravity_credential_records_its_variant_with_the_project() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "standard-tier" },
+                "cloudaicompanionProject": "ag-1",
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:generateContent")
+                .json_body_partial(r#"{ "project": "ag-1" }"#);
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut client = client_for(
+            &server,
+            creds(None, Some("antigravity")),
+            GeminiVariant::Antigravity,
+            Some(store.clone()),
+        );
+
+        client.send(&request()).await.unwrap();
+
+        let recorded = store.recorded.lock().unwrap();
+        assert_eq!(recorded[0].1["variant"], json!("antigravity"));
+        assert_eq!(recorded[0].1["project_id"], json!("ag-1"));
+    }
+
+    /// A stored project is used as is: no setup call, nothing recorded.
+    #[tokio::test]
+    async fn a_stored_project_is_used_without_setup() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(500);
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:streamGenerateContent")
+                .query_param("alt", "sse")
+                .json_body_partial(r#"{ "project": "stored-1" }"#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(format!("data: {}\n\n", wrapped_answer()));
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut client = client_for(
+            &server,
+            creds(Some("stored-1"), None),
+            GeminiVariant::GeminiCli,
+            Some(store.clone()),
+        );
+
+        let response = client.stream(&request(), &mut |_| {}).await.unwrap();
+
+        assert_eq!(text_of(&response), "hello back");
+        load.assert_hits(0);
+        generate.assert_hits(1);
+        assert!(store.recorded.lock().unwrap().is_empty());
+    }
+
+    /// `GOOGLE_CLOUD_PROJECT` overrides the stored project: the account is
+    /// set up with it and requests carry it, but it is never recorded — the
+    /// stored project is still there once the variable goes.
+    #[tokio::test]
+    async fn the_env_override_is_set_up_and_used_but_never_recorded() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:loadCodeAssist")
+                .json_body_partial(r#"{ "cloudaicompanionProject": "env-project" }"#);
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "standard-tier" },
+                "cloudaicompanionProject": "env-project",
+            }));
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:generateContent")
+                .json_body_partial(r#"{ "project": "env-project" }"#);
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut client = client_for(
+            &server,
+            creds(Some("stored-1"), None),
+            GeminiVariant::GeminiCli,
+            Some(store.clone()),
+        );
+        client.env = env_project;
+
+        client.send(&request()).await.unwrap();
+        client.send(&request()).await.unwrap();
+
+        load.assert_hits(1);
+        generate.assert_hits(2);
+        assert!(store.recorded.lock().unwrap().is_empty());
+        assert_eq!(client.project_id, "stored-1");
+    }
+
+    /// An override equal to the stored project needs no setup.
+    #[tokio::test]
+    async fn an_override_equal_to_the_stored_project_needs_no_setup() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(500);
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:generateContent")
+                .json_body_partial(r#"{ "project": "env-project" }"#);
+            then.status(200).json_body(wrapped_answer());
+        });
+        let mut client = client_for(
+            &server,
+            creds(Some("env-project"), None),
+            GeminiVariant::GeminiCli,
+            None,
+        );
+        client.env = env_project;
+
+        client.send(&request()).await.unwrap();
+
+        load.assert_hits(0);
+        generate.assert_hits(1);
+    }
+
+    /// No project to be had: the request fails with the actionable setup
+    /// error and nothing goes out with an empty project — on either path.
+    #[tokio::test]
+    async fn no_project_fails_before_any_request_goes_out() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .json_body(json!({ "currentTier": { "id": "standard-tier" } }));
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST).path_contains("GenerateContent");
+            then.status(200).json_body(wrapped_answer());
+        });
+        let generate_lower = server.mock(|when, then| {
+            when.method(POST).path_contains("generateContent");
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut client = client_for(
+            &server,
+            creds(None, None),
+            GeminiVariant::GeminiCli,
+            Some(store.clone()),
+        );
+
+        let sent = client.send(&request()).await.unwrap_err().to_string();
+        let streamed = client
+            .stream(&request(), &mut |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+
+        for msg in [sent, streamed] {
+            assert!(msg.contains("GOOGLE_CLOUD_PROJECT"), "{msg}");
+        }
+        generate.assert_hits(0);
+        generate_lower.assert_hits(0);
+        assert!(store.recorded.lock().unwrap().is_empty());
+    }
+
+    /// The first requests of a fan-out on an account with no stored project
+    /// (several clients in one process at once) set the account up once —
+    /// one `loadCodeAssist`, one record — and all carry the project.
+    #[tokio::test]
+    async fn concurrent_first_requests_set_the_account_up_once() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(200))
+                .json_body(json!({
+                    "currentTier": { "id": "free-tier" },
+                    "cloudaicompanionProject": "managed-fan",
+                }));
+        });
+        let generate = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:generateContent")
+                .json_body_partial(r#"{ "project": "managed-fan" }"#);
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+        let mut clients: Vec<GoogleGeminiClient> = (0..3)
+            .map(|_| {
+                client_for(
+                    &server,
+                    creds(None, None),
+                    GeminiVariant::GeminiCli,
+                    Some(store.clone()),
+                )
+            })
+            .collect();
+        let req = request();
+
+        let results =
+            futures_util::future::join_all(clients.iter_mut().map(|c| c.send(&req))).await;
+
+        for r in results {
+            r.unwrap();
+        }
+        load.assert_hits(1);
+        generate.assert_hits(3);
+        assert_eq!(store.recorded.lock().unwrap().len(), 1);
+    }
+
+    /// The setup is shared only while it runs: a client that asks after it
+    /// finished sets the account up afresh (a long-lived process never pins
+    /// a result, and a record that failed is retried by the next client).
+    #[tokio::test]
+    async fn a_setup_is_shared_only_while_it_runs() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "free-tier" },
+                "cloudaicompanionProject": "managed-seq",
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:generateContent");
+            then.status(200).json_body(wrapped_answer());
+        });
+        let store = Arc::new(RecordingStore::default());
+
+        for _ in 0..2 {
+            let mut client = client_for(
+                &server,
+                creds(None, None),
+                GeminiVariant::GeminiCli,
+                Some(store.clone()),
+            );
+            client.send(&request()).await.unwrap();
+        }
+
+        load.assert_hits(2);
+        assert_eq!(store.recorded.lock().unwrap().len(), 2);
+    }
+
+    /// Clients waiting on a setup that fails get its failure, rather than
+    /// each running the setup again one after another.
+    #[tokio::test]
+    async fn clients_waiting_on_a_failed_setup_share_its_failure() {
+        let server = MockServer::start();
+        let load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(200))
+                .json_body(json!({ "currentTier": { "id": "standard-tier" } }));
+        });
+        let mut clients: Vec<GoogleGeminiClient> = (0..3)
+            .map(|_| client_for(&server, creds(None, None), GeminiVariant::GeminiCli, None))
+            .collect();
+        let req = request();
+
+        let results =
+            futures_util::future::join_all(clients.iter_mut().map(|c| c.send(&req))).await;
+
+        for r in results {
+            let msg = r.unwrap_err().to_string();
+            assert!(msg.contains("GOOGLE_CLOUD_PROJECT"), "{msg}");
+        }
+        load.assert_hits(1);
+    }
+
+    /// A client of the legacy auth file (`ProviderRegistry`, no credential
+    /// store) writes the project there, as its token refresh does.
+    #[tokio::test]
+    async fn the_legacy_auth_file_records_the_project() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200).json_body(json!({
+                "currentTier": { "id": "free-tier" },
+                "cloudaicompanionProject": "managed-legacy",
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1internal:generateContent");
+            then.status(200).json_body(wrapped_answer());
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        let mut client = GoogleGeminiClient::new(
+            creds(None, None),
+            GeminiVariant::GeminiCli,
+            Some(path.clone()),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.code_assist_base = server.url("");
+        client.env = no_env;
+
+        client.send(&request()).await.unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["google-gemini-cli"]["project_id"],
+            json!("managed-legacy"),
+            "{saved}"
+        );
+        assert_eq!(saved["google-gemini-cli"]["refresh"], json!("refresh-1"));
+    }
+
+    #[test]
+    fn a_variant_s_credential_hint_maps_back_to_it() {
+        for variant in [GeminiVariant::GeminiCli, GeminiVariant::Antigravity] {
+            let hint = variant.credential_hint();
+            assert!(hint.is_some(), "{variant:?}");
+            assert_eq!(GeminiVariant::from_credential_hint(hint), variant);
+        }
+        assert_eq!(GeminiVariant::AiStudio.credential_hint(), None);
+    }
+
+    /// Code Assist wraps every answer — a whole one, or each stream chunk —
+    /// as `{"response": …, "traceId": …}` (gemini-cli's
+    /// `CaGenerateContentResponse`); both parsers read through it.
+    #[test]
+    fn the_code_assist_envelope_is_read_through() {
+        let whole = parse_generate_content_response(&wrapped_answer(), "gemini-2.5-pro").unwrap();
+        assert_eq!(text_of(&whole), "hello back");
+        assert_eq!(whole.usage.input_tokens, 3);
+
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let event = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: wrapped_answer().to_string(),
+        };
+        process_gemini_sse(&event, &mut acc, &mut |_| {}).unwrap();
+        let streamed = acc.into_response().unwrap();
+        assert_eq!(text_of(&streamed), "hello back");
+        assert_eq!(streamed.usage.input_tokens, 3);
     }
 }

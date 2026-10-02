@@ -9,6 +9,7 @@
 //! share one process, so an unserialized one would leak into its neighbours.
 
 mod anthropic_prompt_cache;
+mod gemini_code_assist_project;
 mod model_limits;
 mod netflow_capture;
 mod oauth_refresh_persists;
