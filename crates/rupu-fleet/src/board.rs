@@ -9,26 +9,12 @@ use std::time::Duration;
 /// `RETRY_INTERVAL`). Exhausting it yields `Denied`, never `Err`.
 const CLAIM_ATTEMPTS: u32 = 200;
 const RETRY_INTERVAL: Duration = Duration::from_millis(5);
-/// A `.reap` mutex older than this was left behind by a crashed reaper.
-const REAP_MUTEX_STALE: Duration = Duration::from_secs(30);
 /// Longest readable prefix kept in a claim filename.
 const STEM_PREFIX_MAX: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct Board {
     pub root: PathBuf,
-}
-
-/// Holder of a per-key reap mutex (`<stem>.reap`, created `O_EXCL`). Dropping
-/// it releases the mutex.
-struct ReapGuard {
-    path: PathBuf,
-}
-
-impl Drop for ReapGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 impl Board {
@@ -44,8 +30,11 @@ impl Board {
         self.claims_dir().join(format!("{}.json", claim_stem(key)))
     }
 
-    fn reap_path(&self, key: &str) -> PathBuf {
-        self.claims_dir().join(format!("{}.reap", claim_stem(key)))
+    /// Lock target for serializing reaps of `key`. Never `O_EXCL`-created and
+    /// never removed: it only exists so `flock` has something to lock.
+    fn reap_lock_path(&self, key: &str) -> PathBuf {
+        self.claims_dir()
+            .join(format!("{}.reaplock", claim_stem(key)))
     }
 
     /// Atomically claim a work unit. Returns `Granted` with an RAII guard, or
@@ -127,19 +116,40 @@ impl Board {
         }
     }
 
-    /// Try to remove an expired lease under the per-key reap mutex. Returns
-    /// `Ok(true)` if this call held the mutex (the caller should retry the
-    /// create immediately) and `Ok(false)` if another claimant is reaping (the
-    /// caller should back off briefly, then retry).
+    /// Try to remove an expired lease while holding the per-key reap lock (an
+    /// advisory `flock` on `<stem>.reaplock`). Returns `Ok(true)` if this call
+    /// was the sole reaper (the caller should retry the create immediately) and
+    /// `Ok(false)` if another claimant holds the lock (the caller should back
+    /// off briefly, then retry).
     ///
-    /// The lease is re-read UNDER the mutex and removed only if it is still
+    /// The lease is re-read UNDER the lock and removed only if it is still
     /// expired: a stale read taken before another claimant reaped and
     /// re-granted must never delete that claimant's live lease. A lease that is
-    /// already gone is not an error — someone else reaped it.
+    /// already gone is not an error — someone else reaped it. The OS drops the
+    /// lock when the `File` closes or the process dies, so a crashed reaper can
+    /// never wedge the key.
     fn reap_expired(&self, key: &str, claim_path: &Path) -> Result<bool, FleetError> {
-        let Some(_guard) = self.acquire_reap_mutex(key)? else {
-            return Ok(false);
-        };
+        let lock_path = self.reap_lock_path(key);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| FleetError::Io {
+                action: format!("open reap lock {}", lock_path.display()),
+                source: e,
+            })?;
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
+            Err(e) => {
+                return Err(FleetError::Io {
+                    action: format!("lock reap lock {}", lock_path.display()),
+                    source: e.into(),
+                })
+            }
+        }
+        // Sole reaper until `lock` drops at the end of this function.
         if let Some(rec) = read_claim(claim_path)? {
             if is_expired(&rec) {
                 match std::fs::remove_file(claim_path) {
@@ -155,35 +165,6 @@ impl Board {
             }
         }
         Ok(true)
-    }
-
-    /// `O_EXCL`-create the per-key reap mutex. `None` if someone else holds it.
-    /// A mutex older than `REAP_MUTEX_STALE` belongs to a crashed reaper and is
-    /// cleared so the key cannot stay wedged.
-    fn acquire_reap_mutex(&self, key: &str) -> Result<Option<ReapGuard>, FleetError> {
-        let path = self.reap_path(key);
-        match std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(Some(ReapGuard { path })),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age > REAP_MUTEX_STALE);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                }
-                Ok(None)
-            }
-            Err(e) => Err(FleetError::Io {
-                action: format!("create reap mutex {}", path.display()),
-                source: e,
-            }),
-        }
     }
 
     pub fn claim_holder(&self, key: &str) -> Result<Option<String>, FleetError> {
@@ -409,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_reap_mutex_from_a_crashed_reaper_does_not_wedge_the_key() {
+    fn leftover_reaplock_with_no_live_holder_does_not_wedge_the_key() {
         let tmp = tempfile::tempdir().unwrap();
         let board = Board::new(tmp.path());
 
@@ -422,19 +403,55 @@ mod tests {
         };
         std::mem::forget(g);
 
-        // ...and a reap mutex left by a reaper that crashed an hour ago.
-        let reap = board.reap_path("wedge:key");
-        let f = std::fs::File::create(&reap).unwrap();
-        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
-        drop(f);
+        // A `.reaplock` left behind by a reaper that crashed. The OS dropped
+        // its flock with the process, so there is no live holder.
+        std::fs::File::create(board.reap_lock_path("wedge:key")).unwrap();
 
         let outcome = board
             .claim("wedge:key", "agent-b", Duration::from_secs(60))
             .unwrap();
         assert!(
             matches!(outcome, ClaimOutcome::Granted(_)),
-            "a stale reap mutex must be cleared, not wedge the key"
+            "a leftover reaplock with no live holder must not wedge the key"
         );
+    }
+
+    #[test]
+    fn live_reap_lock_holder_blocks_reaping_without_erroring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+
+        let ClaimOutcome::Granted(g) = board
+            .claim("held:key", "dead-owner", Duration::from_secs(0))
+            .unwrap()
+        else {
+            panic!("seed claim must be granted");
+        };
+        std::mem::forget(g);
+
+        // Another reaper is live in the critical section.
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(board.reap_lock_path("held:key"))
+            .unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+
+        // We must back off: Denied (never Err), and the lease is left alone.
+        let outcome = board
+            .claim("held:key", "agent-b", Duration::from_secs(60))
+            .unwrap();
+        match outcome {
+            ClaimOutcome::Denied { holder } => assert_eq!(holder, "dead-owner"),
+            ClaimOutcome::Granted(_) => panic!("must not reap while another reaper holds the lock"),
+        }
+
+        // Once that reaper is gone (lock released on close), the key is free.
+        drop(held);
+        let outcome = board
+            .claim("held:key", "agent-b", Duration::from_secs(60))
+            .unwrap();
+        assert!(matches!(outcome, ClaimOutcome::Granted(_)));
     }
 }

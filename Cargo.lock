@@ -4744,6 +4744,7 @@ name = "rupu-fleet"
 version = "0.81.0"
 dependencies = [
  "chrono",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
