@@ -216,6 +216,7 @@ impl StepFactory for DispatchFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -393,6 +394,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }

@@ -926,6 +926,8 @@ pub struct AgentRunOpts {
     /// Pre-turn collectors (spec §8). Empty = no injection; the loop behaves
     /// exactly as before. Run off the async runtime via spawn_blocking.
     pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
+    /// Recovery ladder inputs (spec 2026-10-01 §5–§6). Default: no fallback chain and no hop builder — rungs 1 and 2 are unavailable, rung 0 still applies.
+    pub recovery: crate::recovery::RecoveryOpts,
 }
 
 /// Outcome of a finished run.
@@ -2280,6 +2282,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -2383,6 +2386,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         };
 
         let result = run_agent(opts)
@@ -2507,6 +2511,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         };
 
         let result = run_agent(opts)
@@ -2583,6 +2588,7 @@ mod on_tool_call_tests {
             scope_name: None,
             surface_tag: None,
             pause: None,
+            recovery: Default::default(),
         };
         let result = run_agent(opts).await.unwrap();
         assert_eq!(result.status, RunStatus::Ok);
@@ -2683,6 +2689,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         };
 
         let result = run_agent(opts)
@@ -2760,6 +2767,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -2859,6 +2867,7 @@ mod on_tool_call_tests {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             };
 
             let result = run_agent(opts).await.expect("agent run succeeds");
@@ -3696,6 +3705,7 @@ mod compaction_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         };
 
         let mut messages = vec![
@@ -4061,6 +4071,7 @@ mod pause_tests {
             surface_tag: None,
             pause,
             codename: None,
+            recovery: Default::default(),
         }
     }
 
@@ -4400,6 +4411,7 @@ mod reasoning_tests {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 

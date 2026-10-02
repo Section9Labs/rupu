@@ -146,6 +146,7 @@ impl StepFactory for UsageFactory {
             scope_name: None,
             surface_tag: None,
             pause: None,
+            recovery: Default::default(),
         }
     }
 }

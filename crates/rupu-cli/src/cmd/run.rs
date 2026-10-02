@@ -1094,6 +1094,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             surface_tag: None,
             pause: None,
             codename: Some(codename.to_string()),
+            recovery: Default::default(),
         };
         if let Some((messages, seed_source)) = resume_from.take() {
             rupu_agent::continuation::apply_continuation(&mut opts, messages, seed_source);

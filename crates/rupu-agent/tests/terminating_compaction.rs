@@ -142,6 +142,7 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
         surface_tag: None,
         pause: None,
         codename: None,
+        recovery: Default::default(),
     })
     .await;
     match res {

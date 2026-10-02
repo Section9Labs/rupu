@@ -7858,6 +7858,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             seed_source,
             collectors: Vec::new(),
             codename: Some(codename.clone()),
+            recovery: Default::default(),
         };
 
         // `run_agent_with_limits`, not `run_agent`: the run's final limits come

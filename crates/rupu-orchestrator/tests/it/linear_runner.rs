@@ -91,6 +91,7 @@ impl StepFactory for FakeFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -564,6 +565,7 @@ impl StepFactory for FailingFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -1371,6 +1373,7 @@ impl StepFactory for PanelFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -1636,6 +1639,7 @@ impl StepFactory for LoopingPanelFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -2184,6 +2188,7 @@ impl StepFactory for RecordingFailingFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }

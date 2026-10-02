@@ -470,6 +470,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             surface_tag: None,
             pause: None,
             codename: codename.clone(),
+            recovery: Default::default(),
         };
 
         let started = std::time::Instant::now();

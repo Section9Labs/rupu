@@ -12230,6 +12230,7 @@ steps:
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 
@@ -13478,6 +13479,7 @@ mod dag_scheduler_golden {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -14024,6 +14026,7 @@ steps:
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -14545,6 +14548,7 @@ loops:
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -14740,6 +14744,7 @@ loops:
                     surface_tag: None,
                     pause: None,
                     codename: None,
+                    recovery: Default::default(),
                 }
             }
         }
@@ -15030,6 +15035,7 @@ loops:
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -15226,6 +15232,7 @@ loops:
                     surface_tag: None,
                     pause: None,
                     codename: None,
+                    recovery: Default::default(),
                 }
             }
         }
@@ -15466,6 +15473,7 @@ loops:
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -15771,6 +15779,7 @@ loops:
                     surface_tag: None,
                     pause: None,
                     codename: None,
+                    recovery: Default::default(),
                 }
             }
         }
@@ -15922,6 +15931,7 @@ loops:
                     surface_tag: None,
                     pause: None,
                     codename: None,
+                    recovery: Default::default(),
                 }
             }
         }
@@ -16152,6 +16162,7 @@ loops:
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -16801,6 +16812,7 @@ mod join_and_prune {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -18433,6 +18445,7 @@ mod resume_and_cancel {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -19211,6 +19224,7 @@ mod agent_terminal_status {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }
@@ -19620,6 +19634,7 @@ mod manual_pause_drain {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }

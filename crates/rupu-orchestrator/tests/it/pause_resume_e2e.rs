@@ -209,6 +209,7 @@ fn linear_agent_opts(
         surface_tag: None,
         pause: None,
         codename: None,
+        recovery: Default::default(),
     }
 }
 

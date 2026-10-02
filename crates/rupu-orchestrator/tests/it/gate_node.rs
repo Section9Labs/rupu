@@ -120,6 +120,7 @@ impl StepFactory for EchoFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -187,6 +188,7 @@ impl StepFactory for FailFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }

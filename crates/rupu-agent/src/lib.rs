@@ -30,6 +30,8 @@ pub mod permission;
 // conversation from a v2 transcript — the inverse of the runner's emission
 // contract.
 pub mod replay;
+// The recovery ladder: policy table, per-run state and the HopBuilder port (response-outcomes plan 2).
+pub mod recovery;
 // implemented in Task 5/7
 pub mod runner;
 // implemented in Task 2
@@ -44,6 +46,7 @@ pub use collector::{
 pub use fd_budget::load_agent_admitted;
 pub use loader::{load_agent, load_agents, AgentLoadError};
 pub use permission::{parse_mode, resolve_mode, PermissionDecision, PermissionPrompt};
+pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, run_agent, run_agent_with_limits, AgentRunOpts, BypassDecider,
     CompactionOutcome, MockProvider, OnToolCallCallback, OnUsageCallback, RunError, RunResult,

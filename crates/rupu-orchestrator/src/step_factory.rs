@@ -532,6 +532,7 @@ impl StepFactory for DefaultStepFactory {
             surface_tag: Some("workflow".to_string()),
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 
