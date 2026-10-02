@@ -3749,8 +3749,9 @@ impl RunStore {
 
     /// Finalize `record` as `Failed` when it is stuck: `Pending` or
     /// `Running` with a recorded `runner_pid` whose process is no
-    /// longer alive on this machine. This is the gate sweep's
-    /// counterpart to [`cancel`](Self::cancel) — cancel is an
+    /// longer alive on this machine. This is the counterpart to
+    /// [`cancel`](Self::cancel) for `cp serve`'s gate sweep and an
+    /// operator's `workflow resume` — cancel is an
     /// operator-initiated terminal transition, this is a
     /// crash-recovery one (the process that was supposed to run the
     /// workflow died — killed, OOM'd, machine rebooted — without ever
@@ -3799,8 +3800,9 @@ impl RunStore {
             *record = current;
             return Ok(false);
         };
-        let error =
-            format!("runner process {pid} is no longer alive; run marked failed by the gate sweep");
+        // Called by both `cp serve`'s gate sweep and an operator's `workflow
+        // resume`, so the reason names neither.
+        let error = format!("runner process {pid} is no longer alive; run marked failed");
         self.finalize_failed(&mut current, error, now)?;
         *record = current;
         Ok(true)
@@ -7791,6 +7793,10 @@ mod tests {
         assert_eq!(reloaded.finished_at, Some(now));
         let err = reloaded.error_message.expect("error message set");
         assert!(err.contains(&dead_pid.to_string()), "error: {err}");
+        // The reaper is called by both the gate sweep and an operator's
+        // `workflow resume`; the reason must not name either actor.
+        assert!(err.contains("no longer alive"), "error: {err}");
+        assert!(!err.contains("gate sweep"), "error names an actor: {err}");
         assert!(reloaded.runner_pid.is_none());
         assert!(reloaded.active_step_id.is_none());
         assert!(reloaded.active_step_agent.is_none());
