@@ -165,11 +165,32 @@ pub fn apply_continuation(
     opts.user_message = CONTINUATION_NOTE.to_string();
 }
 
+/// The transcript `opts` continues, when it describes a continuation: a run
+/// seeded by reference whose conversation ends with [`CONTINUATION_NOTE`].
+/// `run_agent` records it on the run's coverage manifest.
+pub(crate) fn continued_from(opts: &crate::runner::AgentRunOpts) -> Option<&Path> {
+    let source = opts.seed_source.as_deref()?;
+    (opts.user_message == CONTINUATION_NOTE).then_some(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runner::{run_agent, tests::opts_for, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
+
+    fn stride_concerns() -> rupu_coverage::ConcernsBlock {
+        rupu_coverage::ConcernsBlock {
+            entries: vec![rupu_coverage::ConcernsEntry::Include(
+                rupu_coverage::IncludeDirective {
+                    include: "stride".to_string(),
+                    overrides: vec![],
+                    mode: rupu_coverage::CatalogMode::Auto,
+                    filter: None,
+                },
+            )],
+        }
+    }
 
     /// A real two-turn run: turn 1 reads `notes.txt`, turn 2 answers.
     async fn finished_transcript(dir: &Path) -> PathBuf {
@@ -491,5 +512,51 @@ mod tests {
             Continuation::Finished { output } => assert_eq!(output, "finished after resume"),
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    /// The coverage manifest of a continued run records what it continued: its
+    /// own `user_prompt` is only the continuation note, so `rupu coverage
+    /// rerun` needs the link to find the run that has the real prompt. An
+    /// ordinary run records nothing.
+    #[tokio::test]
+    async fn a_continued_run_records_what_it_continued_on_its_coverage_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = finished_transcript(tmp.path()).await;
+        write_lines(&first, &through_first_turn_end(&lines(&first)));
+        let Continuation::Resume {
+            messages,
+            seed_source,
+        } = prepare_continuation(&first).unwrap()
+        else {
+            panic!("expected Resume");
+        };
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let second = tmp.path().join("second.jsonl");
+        let mut opts = opts_for(Box::new(provider), tmp.path(), second);
+        opts.run_id = "run_second".into();
+        opts.concerns = Some(stride_concerns());
+        apply_continuation(&mut opts, messages, seed_source);
+        run_agent(opts).await.unwrap();
+
+        let paths = rupu_coverage::CoveragePaths::new(
+            tmp.path(),
+            &rupu_coverage::target_id(tmp.path(), "test-agent"),
+        );
+        let m = rupu_coverage::find_manifest(&paths, "run_second")
+            .unwrap()
+            .expect("the continued run wrote a manifest");
+        assert_eq!(m.user_prompt, CONTINUATION_NOTE);
+        assert_eq!(m.continued_from, Some(first.display().to_string()));
+        // ...and rerun refuses it, pointing at the run it continued.
+        assert!(matches!(
+            rupu_coverage::plan_rerun(&m),
+            Err(rupu_coverage::RerunError::ContinuedRun { continued, .. }) if continued == "first"
+        ));
     }
 }

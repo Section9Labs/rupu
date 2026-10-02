@@ -1495,6 +1495,7 @@ mod tests {
             },
             scope_name: "ses_1".to_string(),
             workspace_path: tmp.path().to_path_buf(),
+            continued_from: None,
         };
         append_manifest(&paths, &m).unwrap();
         let loaded = find_manifest(&paths, "run_sess").unwrap().unwrap();
@@ -1732,6 +1733,7 @@ mod tests {
             },
             scope_name: "a".to_string(),
             workspace_path: tmp.path().to_path_buf(),
+            continued_from: None,
         };
         append_manifest(&paths, &m).unwrap();
 
