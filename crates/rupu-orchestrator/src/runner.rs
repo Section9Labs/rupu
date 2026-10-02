@@ -14372,6 +14372,18 @@ mod loop_resume {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    /// Take the fixture run, which ran to completion, back to the state a
+    /// resume re-enters a paused run from: `Running`, as `rupu workflow
+    /// resume`'s flip leaves it before it calls `run_workflow`. A runner
+    /// never re-enters a run that is finished on disk
+    /// ([`crate::RunStore::claim_runner`]).
+    fn reopen_for_resume(store: &crate::runs::RunStore, run_id: &str) {
+        let mut rec = store.load(run_id).unwrap();
+        rec.status = crate::runs::RunStatus::Running;
+        rec.finished_at = None;
+        store.update(&rec).unwrap();
+    }
+
     const REFINE_WF: &str = r#"
 name: refine
 steps:
@@ -14658,6 +14670,7 @@ loops:
         let mut rec = store.load(&run_id).unwrap();
         rec.loop_progress.insert("refine".to_string(), 2);
         store.update(&rec).unwrap();
+        reopen_for_resume(&store, &run_id);
 
         // --- Resume. Only `critique` of iteration 2 must be
         // re-dispatched (not gen/test again); the global critique
@@ -14763,6 +14776,7 @@ loops:
             .filter(|sr| sr.step_id != "ship")
             .cloned()
             .collect();
+        reopen_for_resume(&store, &run_id);
 
         // --- Resume. A factory that panics if ANY loop member is
         // dispatched again — only `ship` may run.

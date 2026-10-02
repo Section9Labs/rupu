@@ -510,6 +510,14 @@ async fn run_then_resume(
             completed_units.insert(sr.step_id.clone(), done);
         }
     }
+    // `rupu workflow resume` takes the finished run back to `Running` before
+    // it re-enters `run_workflow`: a runner never re-enters a run that is
+    // finished on disk (`RunStore::claim_runner`).
+    let mut reopened = store.load(&first.run_id).expect("first pass recorded");
+    reopened.status = rupu_orchestrator::RunStatus::Running;
+    reopened.finished_at = None;
+    reopened.error_message = None;
+    store.update(&reopened).expect("reopen the run");
     let resume = rupu_orchestrator::runner::ResumeState {
         run_id: first.run_id.clone(),
         prior_step_results: Vec::new(),
