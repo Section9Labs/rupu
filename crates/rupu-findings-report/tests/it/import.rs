@@ -2363,3 +2363,97 @@ fn an_exported_claim_with_a_list_and_no_colon_stays_one_claim() {
     want[0].sha256 = None;
     assert_eq!(r.evidence, want);
 }
+
+// ---- final regression check fixes --------------------------------------------
+
+#[test]
+fn a_capitalised_level_after_a_spaced_dash_is_a_note() {
+    for (from, to, want) in [
+        (
+            "Impact: High",
+            "Impact: High - Critical customer data exposed",
+            RiskLevel::High,
+        ),
+        (
+            "Risk Rating: Critical",
+            "Risk Rating: Medium - High impact, low likelihood",
+            RiskLevel::Medium,
+        ),
+    ] {
+        let (r, _) = report_of(&PLAIN.replace(from, to));
+        let got = if from.starts_with("Impact") {
+            r.rating.impact
+        } else {
+            r.rating.risk_rating
+        };
+        assert_eq!(got, want, "{to}");
+    }
+}
+
+#[test]
+fn a_risk_factor_in_a_section_before_references_is_read() {
+    let md = MARKDOWN
+        .replace("**CVSS v3 Base Score:** 6.5\n**Risk Factor:** Medium\n", "")
+        .replace(
+            "## Impact\n",
+            "## Scoring\n\n**CVSS v3 Base Score:** 6.5\n**Risk Factor:** Medium\n\n## Impact\n",
+        );
+    assert_eq!(
+        md.matches("**Risk Factor:**").count(),
+        1,
+        "the fixture changed"
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.risk_factor, RiskLevel::Medium);
+    // The CVSS score has a sentinel, so it is not taken from before
+    // References: it stays text.
+    assert_eq!(r.rating.cvss_v3, "Unknown");
+    assert!(other_text(&r).contains("From Scoring:\n\n**CVSS v3 Base Score:** 6.5"));
+}
+
+#[test]
+fn a_host_in_the_exporters_claim_spelling_is_not_a_file() {
+    let md = MARKDOWN.replace(
+        "- The token claims have no expiry (`src/share/token.rs:5-9`).",
+        "**`notebin.example.com:443`** — serves the admin API without auth.",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.evidence[0].file, None);
+    assert!(
+        r.evidence[0].claim.contains("notebin.example.com:443"),
+        "{}",
+        r.evidence[0].claim
+    );
+}
+
+#[test]
+fn an_escaped_semicolon_in_a_written_ticket_field_does_not_split() {
+    let md = PLAIN.replace(
+        "Existing Ticket References: None Provided",
+        "Existing Ticket References: Jira SEC-1 — covers a\\; b",
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(tickets) = &r.tickets else {
+        panic!("{:?}", r.tickets)
+    };
+    assert_eq!(tickets.len(), 1, "{tickets:?}");
+    assert_eq!(tickets[0].notes.as_deref(), Some("covers a; b"));
+}
+
+#[test]
+fn a_dotted_source_file_in_a_code_span_is_a_file() {
+    for (claim, file) in [
+        (
+            "The guard is missing (`user.service.ts:42`).",
+            "user.service.ts",
+        ),
+        ("The type allows it (`index.d.ts:10`).", "index.d.ts"),
+    ] {
+        let md = PLAIN.replace(
+            "The handler looks the note up by id alone (src/routes/notes.rs:40-58):",
+            claim,
+        );
+        let (r, _) = report_of(&md);
+        assert_eq!(r.evidence[0].file.as_deref(), Some(file), "{claim}");
+    }
+}

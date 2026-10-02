@@ -906,8 +906,9 @@ fn heading_title(line: &str) -> String {
 /// `CVSS:` or `Risk factor:` stays prose, unless neither the header nor the
 /// run gives that rating: then the last such line in References is taken,
 /// else the last in a section of its own after them (`## Scoring`, an
-/// unknown section). Nothing else is searched, so a prose line elsewhere
-/// stays prose.
+/// unknown section), else, for the Risk Factor (which has no sentinel to
+/// fall back on), the last in one before them. Nothing else is searched, so
+/// a prose line elsewhere stays prose.
 fn take_trailing_fields(doc: &mut Doc, into: &mut Header) -> Vec<usize> {
     let mut found = [false; 2];
     for f in &into.fields {
@@ -918,13 +919,36 @@ fn take_trailing_fields(doc: &mut Doc, into: &mut Header) -> Vec<usize> {
     let mut taken = Vec::new();
     for (s, body) in &mut doc.sections {
         if *s == Sec::References {
-            take_ratings(body, true, &mut found, into, &mut taken);
+            take_ratings(body, true, &mut found, [true, true], into, &mut taken);
         }
     }
-    // The last such line after References: the sections in reverse.
-    for u in doc.unknown.iter_mut().rev().filter(|u| u.after_references) {
+    // The last such line after References: the sections in reverse. A Risk
+    // Factor, which has no sentinel, is then looked for before References
+    // too, rather than fail the report.
+    let after = doc.unknown.iter_mut().rev().filter(|u| u.after_references);
+    for u in after {
         let before = taken.len();
-        take_ratings(&mut u.lines, false, &mut found, into, &mut taken);
+        take_ratings(
+            &mut u.lines,
+            false,
+            &mut found,
+            [true, true],
+            into,
+            &mut taken,
+        );
+        u.gave_ratings |= taken.len() > before;
+    }
+    let before_refs = doc.unknown.iter_mut().rev().filter(|u| !u.after_references);
+    for u in before_refs {
+        let before = taken.len();
+        take_ratings(
+            &mut u.lines,
+            false,
+            &mut found,
+            [false, true],
+            into,
+            &mut taken,
+        );
         u.gave_ratings |= taken.len() > before;
     }
     taken
@@ -937,12 +961,13 @@ fn rating_of(key: &str) -> usize {
 }
 
 /// Move `body`'s rating lines into `into` (their indices onto `taken`): its
-/// closing run when `closing`, then, for a rating not yet `found`, the last
-/// line before the run that gives it.
+/// closing run when `closing`, then, for a rating `wanted` and not yet
+/// `found`, the last line before the run that gives it.
 fn take_ratings(
     body: &mut Vec<String>,
     closing: bool,
     found: &mut [bool; 2],
+    wanted: [bool; 2],
     into: &mut Header,
     taken: &mut Vec<usize>,
 ) {
@@ -977,7 +1002,7 @@ fn take_ratings(
         }
     }
     for (which, done) in found.iter_mut().enumerate() {
-        if *done {
+        if *done || !wanted[which] {
             continue;
         }
         let gives = |i: &usize| {
@@ -1465,19 +1490,19 @@ fn split_level(v: &str) -> (String, Option<String>) {
 }
 
 /// Whether a rating's note makes it a range, which no one level states: a
-/// `/`, `-` or `–` right before a level (`High/Critical`, `Medium-High`), or
-/// a separator (those, `to`, `or`) and then a level that ends the value, is
-/// capitalised, or has punctuation after it (`Medium to High`, `Low to
-/// Medium depending on exposure`, `Medium - High (if sharing is enabled)`).
-/// `High - critical customer data exposed` and `Critical — high-value
-/// tenants only` are notes.
+/// `/`, `-` or `–` right before a level (`High/Critical`, `Medium-High`); a
+/// separator (those, `to`, `or`) and then a level that ends the value or has
+/// punctuation after it (`Medium - High`, `Medium - High (if sharing is
+/// enabled)`, `Low or Medium, see notes`); or `to`/`or` and a capitalised
+/// level (`Low to Medium depending on exposure`). `High - Critical customer
+/// data exposed` and `Critical — high-value tenants only` are notes.
 fn range_note(note: &Option<String>) -> bool {
     let Some(n) = note else { return false };
     let n = n.trim_start();
-    let (tight, rest) = if let Some(r) = n.strip_prefix(['/', '-', '–']) {
-        (!r.starts_with(char::is_whitespace), r.trim_start())
+    let (tight, worded, rest) = if let Some(r) = n.strip_prefix(['/', '-', '–']) {
+        (!r.starts_with(char::is_whitespace), false, r.trim_start())
     } else if let Some(r) = n.strip_prefix("to ").or_else(|| n.strip_prefix("or ")) {
-        (false, r.trim_start())
+        (false, true, r.trim_start())
     } else {
         return false;
     };
@@ -1493,7 +1518,7 @@ fn range_note(note: &Option<String>) -> bool {
     let whole = !after.starts_with(|c: char| c.is_alphanumeric() || c == '-');
     let capitalised = rest.starts_with(|c: char| c.is_ascii_uppercase());
     let no_word_after = !after.trim_start().starts_with(char::is_alphanumeric);
-    whole && (tight || capitalised || no_word_after)
+    whole && (tight || no_word_after || (worded && capitalised))
 }
 
 fn risk(
@@ -2019,22 +2044,81 @@ fn location_token(text: &str) -> Option<(String, [u32; 2])> {
         if path.contains('/') {
             return Some((path.to_string(), [a, b]));
         }
-        // A name with several dots (`notes.test.ts`) could as well be a host
-        // (`debug.notebin.de:9229`): only a range of lines says it is a file.
+        // A name with several dots could as well be a host
+        // (`debug.notebin.de:9229`): a range of lines, or a source file's
+        // extension (`user.service.ts:42`), says it is a file.
         let ranged = range.contains(['-', '–']);
         let one_dot = path.trim_start_matches('.').matches('.').count() <= 1;
-        if bare_file.is_none() && (ranged || (spanned && one_dot)) && file_name(path) {
+        let source = path
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()));
+        if bare_file.is_none() && (ranged || (spanned && (one_dot || source))) && file_name(path) {
             bare_file = Some((path.to_string(), [a, b]));
         }
     }
     bare_file
 }
 
-/// A host rather than a file, where the exporter prints a location (it only
-/// ever prints files there): an address (`10.0.0.5`), or a user before an
-/// `@` in a path without a directory (`admin@db`).
+/// Extensions of source and config files: a dotted name in a code span that
+/// ends in one is a file (`user.service.ts`, `index.d.ts`), not a host.
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "c",
+    "cc",
+    "cjs",
+    "conf",
+    "cpp",
+    "cs",
+    "css",
+    "cxx",
+    "dart",
+    "erl",
+    "ex",
+    "exs",
+    "go",
+    "gradle",
+    "h",
+    "hpp",
+    "hs",
+    "html",
+    "ini",
+    "java",
+    "js",
+    "json",
+    "jsx",
+    "kt",
+    "kts",
+    "lua",
+    "mjs",
+    "php",
+    "properties",
+    "proto",
+    "py",
+    "rb",
+    "rs",
+    "scala",
+    "scss",
+    "sql",
+    "svelte",
+    "swift",
+    "tf",
+    "toml",
+    "ts",
+    "tsx",
+    "vue",
+    "xml",
+    "yaml",
+    "yml",
+    "zig",
+];
+
+/// A host rather than a file, in a path without a directory: an address
+/// (`10.0.0.5`), a user before an `@` (`admin@db`), or a dotted name that is
+/// not a [`file_name`] (`notebin.example.com`; `.env.local` is a file).
 fn host_like(p: &str) -> bool {
-    !p.contains('/') && (p.contains('@') || p.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    !p.contains('/')
+        && (p.contains('@')
+            || p.chars().all(|c| c.is_ascii_digit() || c == '.')
+            || (p.contains('.') && !file_name(p)))
 }
 
 /// A file named without a directory, not a host: a dotfile (`.env`,

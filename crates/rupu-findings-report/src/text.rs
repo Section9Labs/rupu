@@ -67,8 +67,9 @@ pub(crate) fn split_unescaped_semicolons(s: &str) -> Vec<&str> {
     out
 }
 
-/// `s` split at each `;` that is not in a code span (a run of backticks up
-/// to the next run of exactly as many; one with no match is literal).
+/// `s` split at each `;` that is neither escaped (`\;`) nor in a code span
+/// (a run of backticks up to the next run of exactly as many; one with no
+/// match is literal).
 pub(crate) fn split_semicolons_outside_code(s: &str) -> Vec<&str> {
     let b = s.as_bytes();
     let run_at = |i: usize| b[i..].iter().take_while(|c| **c == b'`').count();
@@ -92,7 +93,7 @@ pub(crate) fn split_semicolons_outside_code(s: &str) -> Vec<&str> {
                 };
                 i = close.unwrap_or(i + n);
             }
-            b';' => {
+            b';' if i == 0 || b[i - 1] != b'\\' => {
                 out.push(&s[from..i]);
                 from = i + 1;
                 i += 1;

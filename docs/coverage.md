@@ -499,7 +499,11 @@ the first line after `Filename:` when that line is not a field; failing that,
 the first line that is not a field. A line before the title (a banner) is kept
 as other text (below). A heading at the sections' level that names none of
 them (`## Disclosure Timeline`) is kept with its text as other text, not run
-into the section before it.
+into the section before it. The CVSS and Risk Factor lines are read where the
+layout puts them, at the end of References (a line of the references
+themselves that starts `CVSS:` stays a reference), else from a section of
+their own after References (`## Scoring`), else, for the Risk Factor, one
+before it.
 
 **Which finding.** The one id the report's Finding ID line states. The labels
 read, in any case and as `Label:`, `**Label:**` or `**Label**:`, are `Finding
@@ -600,8 +604,9 @@ ledger, and the finding's own id, are not linked. Code blocks in a call chain
 become evidence claims. A claim's location is the first `path:lines` in it
 whose path has a directory (`src/routes/notes.rs:40-58`,
 `node_modules/@types/node/index.d.ts:10`), else a bare file name with a range of
-lines (`notes.test.ts:10-20`), or in a code span when it has one dot at most
-(`` `notes.rs:40` ``, `` `.env.local:3` ``). A host and port that reads as one is
+lines (`notes.test.ts:10-20`), or in a code span when it has one dot at most or
+ends in a source file's extension (`` `notes.rs:40` ``, `` `.env.local:3` ``,
+`` `user.service.ts:42` ``). A host and port that reads as one is
 not a location: an address (`10.0.0.5:9229`), a user before an `@`
 (`admin@db:5432`), a name ending in a common top-level domain
 (`notebin.example.com:443`), or a name with several dots and no range
@@ -628,8 +633,11 @@ typed evidence blocks (scan output, HTTP exchanges, disassembly, …) come back 
 evidence claims, text and code kept, type not; and a claim of several
 paragraphs comes back as several claims. An export made by a rupu that predates
 `rupu findings import`, whose exporter printed its command blocks without a
-`Command:` line, reads back too: each section's last `sh` block is its
-command.
+`Command:` line, is told apart by its Regression Test (which always has a
+command) and reads back too: each section's last `sh` block is its command (so
+a CI/CD check that had no command, whose text ends in an `sh` block, gets that
+block as its command). With no regression test to tell, its commands stay in
+their sections' text.
 
 **Output.** One line per file: `attached` (`would attach` on a dry run),
 `skipped` (not a report, or the finding already has one) or `failed` with the

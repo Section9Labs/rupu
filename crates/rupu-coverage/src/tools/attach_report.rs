@@ -407,8 +407,8 @@ fn replace_ledger(
 /// owner cannot be kept (an importer who is neither the owner nor root), the
 /// import is refused rather than taking the ledger over. A group the
 /// importer cannot give it (the owner, not in the ledger's group, as when a
-/// container wrote it) changes to the importer's with a warning: its owner
-/// can still append.
+/// container wrote it) changes to the importer's, with no group access and a
+/// warning: its owner can still append.
 #[cfg(unix)]
 fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -425,10 +425,15 @@ fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<
         });
     }
     if let Err(e) = gid.map_or(Ok(()), |g| rustix::fs::fchown(f, None, Some(g))) {
+        // Before any content is written: the ledger's group permissions
+        // must not pass to the importer's group.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = ledger.permissions().mode() & !0o070;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         tracing::warn!(
             error = %std::io::Error::from(e),
             group = ledger.gid(),
-            "cannot keep the findings ledger's group; the rewritten ledger takes the importer's"
+            "cannot keep the findings ledger's group; the rewritten ledger takes the importer's, with no group access"
         );
     }
     Ok(())
