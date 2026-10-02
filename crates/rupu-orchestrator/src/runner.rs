@@ -1059,6 +1059,7 @@ pub async fn run_workflow(
                 resume_mode: None,
                 resume_gate_id: None,
                 resume_approver: None,
+                resume_rerequested_at: None,
                 reject_cleanup_pending: None,
                 // ISSUES.md I-24: capture the launch mode straight off the
                 // factory so it's on disk from the very first write —
@@ -15554,6 +15555,7 @@ loops:
                     resume_mode: None,
                     resume_gate_id: None,
                     resume_approver: None,
+                    resume_rerequested_at: None,
                     reject_cleanup_pending: None,
                     permission_mode: None,
                     final_output: None,

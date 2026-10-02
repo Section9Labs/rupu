@@ -67,6 +67,7 @@ fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -
         resume_mode: None,
         resume_gate_id: None,
         resume_approver: None,
+        resume_rerequested_at: None,
         reject_cleanup_pending: None,
         permission_mode: None,
         issue_ref: None,

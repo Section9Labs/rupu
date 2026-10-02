@@ -1250,6 +1250,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             final_output: None,

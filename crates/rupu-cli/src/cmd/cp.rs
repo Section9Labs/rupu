@@ -927,12 +927,51 @@ async fn give_back_resume(
     }
 }
 
+/// Reap a child this process spawned and does not wait for — the resume
+/// worker's `workflow resume` / `approve`, the gate sweep's hand-off and
+/// decision runner — on a thread of its own, so it never stays a zombie:
+/// a dropped `Child` is never waited on, and a zombie holds a slot against
+/// the per-user process limit for as long as `cp serve` lives (one per
+/// spawn), and its pid still reads as running to `pid_is_running` — to the
+/// orphan reaper and the stranded-decision check alike — after it has
+/// died. The exit is logged: a child that exited non-zero changed nothing
+/// it was spawned for (its decisions stay recorded; the sweep re-requests a
+/// runner after a lease), which is otherwise invisible from here.
+fn reap_detached(child: std::process::Child, run_id: &str, what: &'static str) {
+    let pid = child.id();
+    let in_thread = run_id.to_string();
+    let spawned = std::thread::Builder::new()
+        .name(format!("reap-{pid}"))
+        .spawn(move || {
+            let run_id = in_thread;
+            let mut child = child;
+            match child.wait() {
+                Ok(status) if status.success() => {
+                    tracing::info!(run_id = %run_id, pid, "{what}: child exited cleanly");
+                }
+                Ok(status) => {
+                    tracing::warn!(run_id = %run_id, pid, %status, "{what}: child exited without success; what it was spawned for stays on the record for the next attempt");
+                }
+                Err(e) => {
+                    tracing::warn!(run_id = %run_id, pid, error = %e, "{what}: waiting for the child failed");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(run_id = %run_id, pid, error = %e, "{what}: could not start the reaper thread; the child is left unreaped");
+    }
+}
+
 /// Resolve + spawn the detached `rupu workflow <subcommand> <run_id> [...]`
 /// child for ONE already-claimed run (the resume worker's per-run body,
 /// extracted so tests can drive it directly instead of waiting out the
-/// worker's 4s poll interval), then clear its resume marker on either a
-/// successful spawn (the child now owns the run) or a failed one (so a
-/// poisoned run isn't retried forever).
+/// worker's 4s poll interval), then give its resume marker back
+/// ([`give_back_resume`]) on either a successful spawn — the child now owns
+/// the run and is reaped when it exits ([`reap_detached`]); a child that
+/// then fails leaves its decisions recorded, and the gate sweep asks for a
+/// runner again once a lease has passed — or a failed one: the marker is
+/// consumed so the same spawn is not retried every 4s, and a run with
+/// recorded decisions is retried by the sweep's re-request, once per lease.
 ///
 /// Captures the requested resume mode AND the targeted gate (T5b-2b-i) from
 /// the run's marker fields (`resume_mode`/`resume_gate_id`) while the
@@ -978,14 +1017,18 @@ async fn resume_one_run(
     );
 
     match std::process::Command::new(&exe).args(&argv).spawn() {
-        Ok(_child) => {
-            // Detached: do NOT wait. The child now owns the run;
-            // clear the marker so we don't re-claim it.
+        Ok(child) => {
+            // Detached: not awaited here. The child now owns the run and is
+            // reaped on its own thread when it exits; the marker is given
+            // back so it is not re-claimed.
             tracing::info!(run_id = %run_id, subcommand, "spawned workflow subprocess to resume");
+            reap_detached(child, &run_id, "resume worker");
             give_back_resume(&store, &run_id, marked_at, "resume worker").await;
         }
         Err(e) => {
-            // Don't retry a poisoned spawn forever; clear marker.
+            // The marker is consumed so this spawn is not retried every
+            // 4s; a run with recorded decisions is retried by the sweep's
+            // re-request, once per lease.
             tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: spawn workflow subprocess failed; clearing marker");
             give_back_resume(&store, &run_id, marked_at, "resume worker").await;
         }
@@ -1092,8 +1135,9 @@ async fn hand_off_timed_out_approve(
         }
     }
     match std::process::Command::new(exe).args(&argv).spawn() {
-        Ok(_child) => {
+        Ok(child) => {
             tracing::info!(run_id = %run_id, gate = %gate_step_id, "gate sweep: on_timeout=approve → spawned detached workflow approve");
+            reap_detached(child, run_id, "gate sweep");
             // The detached child now owns approving THIS gate: its
             // `approve_gate` removes `gate_step_id` from `awaiting` under
             // the run lock. The marker for this gate is consumed exactly
@@ -1542,8 +1586,9 @@ async fn spawn_decision_runner(
         argv.push(m);
     }
     match std::process::Command::new(exe).args(&argv).spawn() {
-        Ok(_child) => {
+        Ok(child) => {
             tracing::info!(run_id = %run_id, "gate sweep: on_timeout=reject → spawned detached workflow resume");
+            reap_detached(child, run_id, "gate sweep");
             // The marker read with `rec` (if any) is consumed; one written
             // since — a web decision on a sibling — stays for the resume
             // worker, and only the claim is given back.
@@ -1888,6 +1933,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -2018,6 +2064,61 @@ mod tests {
         );
     }
 
+    /// Wait for `pid` to stop being reported as running, within the
+    /// spawned-script budget; `true` when it did.
+    async fn poll_pid_gone(pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + SPAWNED_SCRIPT_BUDGET;
+        while std::time::Instant::now() < deadline {
+            if !rupu_orchestrator::runs::pid_is_running(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A child the resume worker spawned is reaped once it exits: its pid
+    /// is no longer reported running. Before, every child `cp serve`
+    /// spawned was dropped without a wait, so each one stayed a zombie —
+    /// one per spawn against the per-user process limit — and a crashed
+    /// runner's pid still read as alive to the orphan reaper and to the
+    /// stranded-decision check.
+    #[tokio::test]
+    async fn the_resume_worker_reaps_the_child_it_spawned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let mut rec = multi_gate_resume_record("run_resume_worker_reaps");
+        rec.awaiting.truncate(1);
+        rec.sync_awaiting_compat();
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n",
+            )
+            .unwrap();
+        store
+            .request_resume_approval(&rec.id, "web", None, chrono::Utc::now(), None)
+            .unwrap();
+        // The fake `rupu` records its own pid and exits at once.
+        let pid_path = tmp.path().join("child.pid");
+        let exe = exec_ready_script(
+            &tmp.path().join("pid.sh"),
+            &format!("echo $$ > {}\n", pid_path.display()),
+        );
+
+        resume_one_run(Arc::clone(&store), rec.id.clone(), "resume", Some(exe)).await;
+
+        let pid: u32 = poll_captured_argv(&pid_path)
+            .await
+            .trim()
+            .parse()
+            .expect("the child wrote its pid");
+        assert!(
+            poll_pid_gone(pid).await,
+            "the exited child {pid} is still reported running: it was never reaped"
+        );
+    }
+
     /// gate_a: `timeout_seconds: 10`, `on_timeout: reject`, no `on_reject:`
     /// (an empty chain). gate_b: a plain gate with NO timeout — must never be
     /// touched by timing out gate_a.
@@ -2103,6 +2204,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -2224,6 +2326,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -3307,6 +3410,76 @@ mod tests {
         );
     }
 
+    /// A re-request is made at most once per `RESUME_LEASE` per run: once
+    /// the resume worker has consumed the marker (claimed, spawned, given
+    /// it back) and the child it spawned died again, the next ticks do not
+    /// re-request until a lease has passed since that attempt — the
+    /// attempt is persisted on the record, and the grace is measured from
+    /// the later of the decision and it. Before, every tick re-requested:
+    /// a `workflow resume` spawned every 60s per stranded run for as long
+    /// as the config stayed broken.
+    #[tokio::test]
+    async fn run_gate_sweep_re_requests_a_stranded_decision_at_most_once_per_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        let exe = std::env::current_exe().unwrap();
+        let now = chrono::Utc::now();
+        let stale = now - rupu_orchestrator::RunStore::RESUME_LEASE - chrono::Duration::seconds(1);
+        let mut rec = multi_gate_resume_record("run_stranded_backoff");
+        rec.status = RunStatus::Running;
+        rec.awaiting.clear();
+        rec.sync_awaiting_compat();
+        rec.gate_decisions = vec![rupu_orchestrator::GateDecision {
+            step_id: "gate_b".into(),
+            verdict: rupu_orchestrator::GateVerdict::Rejected,
+            via: "timeout".into(),
+            approver: None,
+            reason: Some("gate timed out".into()),
+            decided_at: stale,
+        }];
+        store
+            .create(rec.clone(), SPLIT_GATE_B_TIMEOUT_REJECT_YAML)
+            .unwrap();
+        let sweep = || {
+            run_gate_sweep(
+                Arc::clone(&store),
+                hosts.clone(),
+                exe.clone(),
+                "sweep-test".to_string(),
+                tmp.path().to_path_buf(),
+            )
+        };
+
+        // Tick 1 re-requests; the worker consumes the marker and its child
+        // dies before claiming the run (nothing on the record changes).
+        sweep().await;
+        let requested = store.load(&rec.id).unwrap();
+        let marked_at = requested
+            .resume_requested_at
+            .expect("the first tick asks for a runner");
+        assert!(store
+            .claim_resume(&rec.id, "resume-worker", chrono::Utc::now())
+            .unwrap());
+        assert!(store
+            .clear_resume_if_marked_at(&rec.id, Some(marked_at))
+            .unwrap());
+
+        // Ticks 2 and 3, seconds later: no new request until a lease has
+        // passed since the attempt.
+        sweep().await;
+        sweep().await;
+        let after = store.load(&rec.id).unwrap();
+        assert_eq!(
+            after.resume_requested_at, None,
+            "the run is not re-requested again within the lease"
+        );
+        assert_eq!(after.resume_claimed_at, None);
+        assert_eq!(after.gate_decisions.len(), 1, "the decision stays recorded");
+    }
+
     /// Single-gate parity: a legacy-shaped record (empty `awaiting`, only
     /// the derived-compat fields populated) with exactly ONE overdue gate
     /// must reach the SAME terminal routing the sweep reached before Task
@@ -3361,6 +3534,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -3453,6 +3627,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -3779,6 +3954,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             resume_approver: None,
+            resume_rerequested_at: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),

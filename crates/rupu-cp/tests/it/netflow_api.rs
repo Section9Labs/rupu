@@ -239,6 +239,7 @@ fn seed_run(id: &str, workspace_path: PathBuf) -> RunRecord {
         resume_mode: None,
         resume_gate_id: None,
         resume_approver: None,
+        resume_rerequested_at: None,
         reject_cleanup_pending: None,
         permission_mode: None,
         issue_ref: None,
