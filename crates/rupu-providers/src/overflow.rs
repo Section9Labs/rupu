@@ -1,7 +1,7 @@
 //! Context-overflow error formats (spec 2026-09-30 §7), shared by the error classifier and the agent runner.
 
 use crate::error::ProviderError;
-use crate::reply_error::ErrorClass;
+use crate::reply_error::{ApiErrorBody, ErrorClass};
 
 /// A provider context-overflow error, with the numbers when the message
 /// carries them (spec 2026-09-30 §7; formats are observed, not documented).
@@ -152,13 +152,39 @@ fn numbers(s: &str) -> Vec<u32> {
     out
 }
 
+/// The error's full message text. `ApiErrorBody.message` is a preview (see
+/// `MESSAGE_PREVIEW_CHARS`), so numbers past its cut would be lost; the full
+/// text is read back from `raw`: the parsed error object's `message` (else
+/// `detail`), or the raw string for a non-JSON body. Falls back to `message`.
+fn full_reply_text(b: &ApiErrorBody) -> String {
+    use serde_json::Value;
+    let from_raw = match &b.raw {
+        Value::String(s) => Some(s.clone()),
+        raw => {
+            let v = match raw {
+                Value::Array(items) if !items.is_empty() => &items[0],
+                other => other,
+            };
+            match v.get("error").unwrap_or(v) {
+                Value::String(s) => Some(s.clone()),
+                err @ Value::Object(_) => ["message", "detail"]
+                    .iter()
+                    .find_map(|k| err.get(*k).and_then(Value::as_str))
+                    .map(str::to_string),
+                _ => None,
+            }
+        }
+    };
+    from_raw.unwrap_or_else(|| b.message.clone())
+}
+
 /// Overflow read off an error (spec 2026-10-01 §4.4): a reply body's
-/// message is parsed for numbers; a `ContextOverflow`-class reply is an
+/// full message is parsed for numbers; a `ContextOverflow`-class reply is an
 /// overflow even when no numbers parse. Errors without a body fall back to
 /// their display text (the three generic phrases still match there).
 pub fn context_overflow_of(e: &ProviderError) -> Option<Overflow> {
     match e {
-        ProviderError::Reply(b) => parse_context_overflow(&b.message).or((b.class
+        ProviderError::Reply(b) => parse_context_overflow(&full_reply_text(b)).or((b.class
             == ErrorClass::ContextOverflow)
             .then_some(Overflow {
                 tokens: None,
@@ -170,7 +196,7 @@ pub fn context_overflow_of(e: &ProviderError) -> Option<Overflow> {
 
 pub fn output_cap_overflow_of(e: &ProviderError) -> Option<OutputCapOverflow> {
     match e {
-        ProviderError::Reply(b) => parse_output_cap_overflow(&b.message),
+        ProviderError::Reply(b) => parse_output_cap_overflow(&full_reply_text(b)),
         other => parse_output_cap_overflow(&other.to_string()),
     }
 }
@@ -398,6 +424,62 @@ mod tests {
         assert_eq!(
             context_overflow_of(&ProviderError::Http("boom".into())),
             None
+        );
+    }
+
+    /// The reply's `message` is a 500-char preview, so numbers past the cut
+    /// must be read from the full text kept in `raw`.
+    #[test]
+    fn overflow_parsers_read_numbers_past_the_message_preview() {
+        let padding = "lorem ipsum dolor sit amet ".repeat(40);
+        let overflow = ProviderError::api(
+            "anthropic",
+            400,
+            &format!(
+                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{padding}prompt is too long: 215000 tokens > 200000 maximum"}}}}"#
+            ),
+        );
+        let ProviderError::Reply(b) = &overflow else {
+            panic!("expected a reply error");
+        };
+        assert!(
+            !b.message.contains("215000"),
+            "preview cut before the numbers"
+        );
+        assert_eq!(
+            context_overflow_of(&overflow),
+            Some(Overflow {
+                tokens: Some(215_000),
+                max: Some(200_000)
+            })
+        );
+        let cap = ProviderError::api(
+            "anthropic",
+            400,
+            &format!(
+                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{padding}input length and `max_tokens` exceed context limit: 183500 + 20000 > 201000, decrease input length"}}}}"#
+            ),
+        );
+        assert_eq!(
+            output_cap_overflow_of(&cap),
+            Some(OutputCapOverflow {
+                input: 183_500,
+                max_tokens: 20_000,
+                window: 201_000,
+            })
+        );
+        // A non-JSON body is read from its raw string.
+        let plain = ProviderError::api(
+            "openai",
+            400,
+            &format!("{padding}This model's maximum context length is 128000 tokens. However, your messages resulted in 130500 tokens."),
+        );
+        assert_eq!(
+            context_overflow_of(&plain),
+            Some(Overflow {
+                tokens: Some(130_500),
+                max: Some(128_000)
+            })
         );
     }
 }
