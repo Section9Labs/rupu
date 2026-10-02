@@ -7270,7 +7270,6 @@ fn take_coverage(r: &mut Result<UnitOutcome, UnitFailure>) -> UnitCoverage {
 /// Merge a remote unit's coverage into the coordinator workspace (spec
 /// 2026-09-30-rupu-remote-findings-transport-design.md §A4) and surface
 /// anything that went wrong as a `StepWarning`. Never fails the unit.
-#[allow(clippy::too_many_arguments)]
 async fn ingest_remote_unit_coverage(
     workspace: &Path,
     host: &str,
