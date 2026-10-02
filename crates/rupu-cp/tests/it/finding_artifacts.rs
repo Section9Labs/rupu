@@ -665,3 +665,77 @@ async fn a_streamed_remote_finding_downloads_end_to_end() {
     assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
     assert_eq!(std::fs::read(stored(coord.path(), &sha)).unwrap(), body);
 }
+
+/// An `image` evidence block's file travels the same road as a listed
+/// artifact: ingest marks it external on the executing host, the coordinator
+/// pulls and verifies it on first view, and serves it inline as the image it
+/// is (by magic bytes).
+#[tokio::test]
+async fn a_remote_image_block_downloads_end_to_end() {
+    let remote = tempfile::tempdir().unwrap();
+    let mut body = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    body.extend_from_slice(b"pretend pixels");
+    let sha = sha_of(&body);
+    store_blob(remote.path(), &sha, &body);
+    let remote_addr = serve(state(remote.path())).await;
+
+    let coord = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let (st, host) = coordinator(coord.path(), ws.path(), &format!("http://{remote_addr}"));
+
+    let copied = ArtifactRef {
+        path: "shots/crash.png".into(),
+        sha256: sha.clone(),
+        size: body.len() as u64,
+        kind: Some(ArtifactKind::Binary),
+        stored: Some(ArtifactStorage::Copied),
+        host: None,
+    };
+    let mut rec = finding_with("find_IMG", copied.clone());
+    {
+        let report = rec.report.as_mut().unwrap();
+        report.artifacts = vec![];
+        report
+            .blocks
+            .push(rupu_coverage::report::EvidenceBlock::Image {
+                artifact: copied,
+                caption: Some("the crash".into()),
+            });
+    }
+    let lines = [
+        rupu_coverage::StreamLine::Begin {
+            v: rupu_coverage::STREAM_VERSION,
+            run_id: "run_UNIT".into(),
+        },
+        rupu_coverage::StreamLine::Findings {
+            scope_name: "repo".into(),
+            record: rec,
+        },
+    ];
+    let stream: String = lines
+        .iter()
+        .map(|l| serde_json::to_string(l).unwrap() + "\n")
+        .collect();
+    let ingested = rupu_coverage::ingest_unit_stream(
+        ws.path(),
+        &rupu_coverage::IngestSource {
+            host: Some(host.clone()),
+        },
+        stream.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(ingested.appended, 1);
+    assert!(!stored(coord.path(), &sha).exists());
+
+    let addr = serve(st).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/findings/find_IMG/artifacts/{sha}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    assert_eq!(resp.headers()["content-security-policy"], "sandbox");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), body.as_slice());
+    assert_eq!(std::fs::read(stored(coord.path(), &sha)).unwrap(), body);
+}
