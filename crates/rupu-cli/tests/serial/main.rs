@@ -72,6 +72,7 @@ impl Drop for ProcessStateGuard<'_> {
 
 mod accounts_sso_e2e;
 mod approve_resume_run_step;
+mod attach_loop_persists;
 mod cli_agent;
 mod cli_auth;
 mod cli_autoflow;

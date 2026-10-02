@@ -805,9 +805,8 @@ async fn run_resume_worker(
 
             // Spawn the resuming subprocess off-thread so claiming the next
             // run doesn't block on process creation. Move owned data in.
-            // Which subcommand to spawn depends on the run's CURRENT state
-            // (captured from `list_pending_resume`, still fresh — the claim
-            // lease above prevents a concurrent worker from racing it):
+            // Which subcommand to spawn depends on the run's state as
+            // `resume_one_run` reloads it (the listing is stale by then):
             // `workflow resume` for a `Paused` run (cooperative-pause
             // resume, T4 — it reads the persisted mid-step seeds via
             // `RunStore::read_paused_seeds`) and for one with recorded gate
@@ -815,10 +814,9 @@ async fn run_resume_worker(
             // itself; the runner applies every one, or hands off to a runner
             // already executing the run); `workflow approve --gate` for a
             // marker an older binary set without recording its decision.
-            let subcommand = resume_subcommand(&run);
             let store = Arc::clone(&store);
             let run_id = run.id.clone();
-            tokio::spawn(resume_one_run(store, run_id, subcommand, None));
+            tokio::spawn(resume_one_run(store, run_id, None));
         }
     }
 }
@@ -883,46 +881,39 @@ fn build_resume_argv<'a>(
     argv
 }
 
-/// What a spawner's post-spawn clear did to the run's resume marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarkerGiveBack {
-    /// The marker the spawner read is consumed, with the claim.
-    Cleared,
-    /// The marker is not the one the spawner read (a decision recorded
-    /// since wrote a newer one, or it read none): only the claim is given
-    /// back and the marker stays for the resume worker.
-    Kept,
-}
-
 /// `RunStore::clear_resume_if_marked_at` on the blocking pool (it takes
 /// the run lock, whose bounded wait blocks its thread): consume the marker
-/// the spawner read — `marked_at`, its `resume_requested_at` — and give
-/// back the claim; a marker written since the spawner's look is kept, and
-/// only the claim is given back. A failure is logged, never propagated: the
-/// child owns the run either way, and a leftover claim expires with its
-/// lease.
+/// the spawner read — `marked_at`, its `resume_requested_at`; `None` when
+/// it took no marker as its own — and give back the claim; any other
+/// marker on the run is kept, and only the claim is given back. What it
+/// did is logged, a failure included, never propagated: the child owns the
+/// run either way, and a leftover claim expires with its lease.
 async fn give_back_resume(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
     marked_at: Option<chrono::DateTime<chrono::Utc>>,
     who: &'static str,
-) -> MarkerGiveBack {
+) {
+    use rupu_orchestrator::runs::ResumeGiveBack;
     let id = run_id.to_string();
     match store
         .blocking(move |s| s.clear_resume_if_marked_at(&id, marked_at))
         .await
     {
-        Ok(true) => {
-            tracing::info!(run_id = %run_id, "{who}: cleared the resume marker");
-            MarkerGiveBack::Cleared
+        Ok(ResumeGiveBack::Cleared) => {
+            tracing::info!(run_id = %run_id, "{who}: cleared the resume marker it read and released its claim");
         }
-        Ok(false) => {
-            tracing::info!(run_id = %run_id, "{who}: released the resume claim; a marker written since the look stays for the resume worker");
-            MarkerGiveBack::Kept
+        Ok(ResumeGiveBack::ClaimReleased) if marked_at.is_none() => {
+            tracing::info!(run_id = %run_id, "{who}: released its claim; it took no marker as its own, so any marker on the run stays for the resume worker");
+        }
+        Ok(ResumeGiveBack::ClaimReleased) => {
+            tracing::info!(run_id = %run_id, "{who}: released its claim; the marker it read was replaced or consumed since, so any marker on the run now stays for the resume worker");
+        }
+        Ok(ResumeGiveBack::Cancelled) => {
+            tracing::info!(run_id = %run_id, "{who}: the run is cancelled; its resume marker and claim are left as they are");
         }
         Err(e) => {
             tracing::warn!(run_id = %run_id, error = %e, "{who}: giving back the resume marker and claim failed");
-            MarkerGiveBack::Kept
         }
     }
 }
@@ -973,13 +964,18 @@ fn reap_detached(child: std::process::Child, run_id: &str, what: &'static str) {
 /// consumed so the same spawn is not retried every 4s, and a run with
 /// recorded decisions is retried by the sweep's re-request, once per lease.
 ///
-/// Captures the requested resume mode AND the targeted gate (T5b-2b-i) from
-/// the run's marker fields (`resume_mode`/`resume_gate_id`) while the
-/// marker is still present, then hands off to
-/// [`build_resume_argv`]. The clear afterwards is for that marker only
-/// ([`give_back_resume`]): a decision recorded between this look and the
-/// clear wrote a newer marker the child was not spawned for, which is kept
-/// for the next tick. `exe_override` lets tests point at a fake
+/// Reloads the run first — the listing is stale by now — and takes
+/// everything from that reload: the subcommand ([`resume_subcommand`]: a
+/// decision recorded on the run since the listing makes it a `workflow
+/// resume`, which `approve` would refuse as already decided), the
+/// requested resume mode AND the targeted gate (T5b-2b-i) from the run's
+/// marker fields (`resume_mode`/`resume_gate_id`), then hands off to
+/// [`build_resume_argv`]. A marker gone by the reload — consumed between
+/// the listing and the claim, by another spawner or the `workflow resume`
+/// it asked for — spawns nothing: the claim is given back and that is all. The clear afterwards is for the marker read
+/// here only ([`give_back_resume`]): a decision recorded between this look
+/// and the clear wrote a newer marker the child was not spawned for, which
+/// is kept for the next tick. `exe_override` lets tests point at a fake
 /// executable instead of `std::env::current_exe()` (the production
 /// default, used when `None`) — e.g. a capture script that records its
 /// argv, so a test can assert on the EXACT argv the real `rupu` binary
@@ -987,14 +983,26 @@ fn reap_detached(child: std::process::Child, run_id: &str, what: &'static str) {
 async fn resume_one_run(
     store: Arc<RunStore>,
     run_id: String,
-    subcommand: &'static str,
     exe_override: Option<std::path::PathBuf>,
 ) {
-    let loaded = store.load(&run_id).ok();
-    let marked_at = loaded.as_ref().and_then(|r| r.resume_requested_at);
-    let mode = loaded.as_ref().and_then(|r| r.resume_mode.clone());
-    let gate = loaded.as_ref().and_then(|r| r.resume_gate_id.clone());
-    let approver = loaded.as_ref().and_then(|r| r.resume_approver.clone());
+    let loaded = match store.load(&run_id) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::warn!(run_id = %run_id, error = %e, "resume worker: could not reload the claimed run; giving the claim back");
+            give_back_resume(&store, &run_id, None, "resume worker").await;
+            return;
+        }
+    };
+    let Some(marked_at) = loaded.resume_requested_at else {
+        tracing::info!(run_id = %run_id, "resume worker: the marker it listed is gone, consumed since; nothing to spawn");
+        give_back_resume(&store, &run_id, None, "resume worker").await;
+        return;
+    };
+    let marked_at = Some(marked_at);
+    let subcommand = resume_subcommand(&loaded);
+    let mode = loaded.resume_mode.clone();
+    let gate = loaded.resume_gate_id.clone();
+    let approver = loaded.resume_approver.clone();
 
     let exe = match exe_override {
         Some(p) => p,
@@ -1065,6 +1073,9 @@ async fn resume_one_run(
 /// also being picked up by the web-approve `run_resume_worker` — both
 /// paths race on the same lease field regardless of which one requested
 /// the resume, so whichever claims first wins and the other backs off.
+///
+/// `true` when it spawned the child: the run then has a runner on its way,
+/// which applies every decision recorded on it.
 async fn hand_off_timed_out_approve(
     store: &Arc<RunStore>,
     exe: &std::path::Path,
@@ -1072,17 +1083,17 @@ async fn hand_off_timed_out_approve(
     run_id: &str,
     gate_step_id: &str,
     now: chrono::DateTime<chrono::Utc>,
-) {
+) -> bool {
     let fresh = match store.load(run_id) {
         Ok(rec) => rec,
         Err(e) => {
             tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: could not reload the run for its on_timeout=approve hand-off");
-            return;
+            return false;
         }
     };
     if fresh.status != rupu_orchestrator::RunStatus::AwaitingApproval {
         tracing::info!(run_id = %run_id, gate = %gate_step_id, status = fresh.status.as_str(), "gate sweep: run no longer awaiting approval; nothing to hand off");
-        return;
+        return false;
     }
     if !fresh
         .awaiting_gates()
@@ -1090,7 +1101,7 @@ async fn hand_off_timed_out_approve(
         .any(|g| g.step_id == gate_step_id)
     {
         tracing::info!(run_id = %run_id, gate = %gate_step_id, "gate sweep: gate no longer parked (approved meanwhile); nothing to hand off");
-        return;
+        return false;
     }
     let claimed = {
         let (id, worker) = (run_id.to_string(), worker_id.to_string());
@@ -1102,12 +1113,12 @@ async fn hand_off_timed_out_approve(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(run_id = %run_id, error = %e, "gate sweep: claim_resume failed");
-            return;
+            return false;
         }
     };
     if !claimed {
         tracing::info!(run_id = %run_id, "gate-sweep: approve already claimed for run_id, skipping");
-        return;
+        return false;
     }
     // The pending marker is this gate's when it names it — or names no
     // gate while this gate is the run's sole parked gate: a gate-less
@@ -1147,6 +1158,7 @@ async fn hand_off_timed_out_approve(
             // the look) is left, and only the claim is released.
             let marked_at = fresh.resume_requested_at.filter(|_| marker_is_this_gate);
             give_back_resume(store, run_id, marked_at, "gate sweep").await;
+            true
         }
         Err(e) => {
             // I-43: deliberately do NOT clear_resume here. No child was
@@ -1163,6 +1175,7 @@ async fn hand_off_timed_out_approve(
             // than retrying every tick. The gate itself stays genuinely
             // parked on disk either way.
             tracing::error!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve; leaving resume claim in place to back off retries");
+            false
         }
     }
 }
@@ -1433,8 +1446,9 @@ async fn run_gate_sweep(
                 }
                 // Every sibling's reject and its cleanup are done: the
                 // children now read a `step_results.jsonl` that holds them.
+                let mut handed_off = false;
                 for gate_step_id in handoffs {
-                    hand_off_timed_out_approve(
+                    handed_off |= hand_off_timed_out_approve(
                         &store,
                         &exe,
                         &worker_id,
@@ -1445,8 +1459,14 @@ async fn run_gate_sweep(
                     .await;
                 }
                 // A decision recorded on a still-parked run (a sibling's)
-                // that no runner is applying.
-                rerequest_runner_if_stranded(&store, &rec, now).await;
+                // that no runner is applying — unless a gate was handed off
+                // just now: that child becomes the run's runner and applies
+                // every recorded decision, so a re-request on top would
+                // only have the resume worker spawn a redundant `workflow
+                // resume` that hands off at once.
+                if !handed_off {
+                    rerequest_runner_if_stranded(&store, &rec, now).await;
+                }
             }
             rupu_orchestrator::RunStatus::Running | rupu_orchestrator::RunStatus::Pending => {
                 let pid_alive = rec.runner_pid.map(rupu_orchestrator::runs::pid_is_running);
@@ -1692,9 +1712,9 @@ pub(crate) fn try_claim_asn_refresh(guard: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_resume_argv, hand_off_timed_out_approve, resume_one_run, resume_subcommand,
-        run_gate_sweep, run_periodic_tick, should_refresh_asn, sweep_decision, sweep_loop_enabled,
-        try_claim_asn_refresh, SweepAction,
+        build_resume_argv, give_back_resume, hand_off_timed_out_approve, resume_one_run,
+        resume_subcommand, run_gate_sweep, run_periodic_tick, should_refresh_asn, sweep_decision,
+        sweep_loop_enabled, try_claim_asn_refresh, SweepAction,
     };
     use rupu_orchestrator::{RunStatus, TimeoutAction};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1945,21 +1965,23 @@ mod tests {
     }
 
     /// The full round-trip this bug slipped through on: a web operator
-    /// approves gate_b of a 2-gate run (`request_resume_approval` — the
-    /// EXACT call `api/runs.rs`'s `approve_run` makes), which sets the
-    /// `resume_gate_id` marker; `resume_one_run` (the resume worker's
-    /// per-run body) then reads that marker and spawns the child with
-    /// `--gate gate_b` in its REAL argv — verified by pointing the spawn at
-    /// a capture script instead of a real `rupu` binary, so this asserts on
-    /// the literal argv a production spawn would receive, not just on
-    /// marker-field plumbing. Must FAIL on the pre-fix code (which had no
+    /// approved gate_b of a 2-gate run on a binary that recorded the
+    /// approve on the marker alone (`resume_gate_id`, no decision — spec
+    /// §7 records the decision itself since), so the resume worker spawns
+    /// `workflow approve` for it; `resume_one_run` (the worker's per-run
+    /// body) reads that marker and spawns the child with `--gate gate_b` in
+    /// its REAL argv — verified by pointing the spawn at a capture script
+    /// instead of a real `rupu` binary, so this asserts on the literal argv
+    /// a production spawn would receive, not just on marker-field
+    /// plumbing. Must FAIL on the pre-fix code (which had no
     /// `resume_gate_id` field/argv wiring at all — verified via a temporary
     /// revert, see the T5b-2b-i report) and PASS with the fix.
     #[tokio::test]
     async fn resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
-        let rec = multi_gate_resume_record("run_resume_worker_gate_b");
+        let mut rec = multi_gate_resume_record("run_resume_worker_gate_b");
+        legacy_web_marker(&mut rec, Some("gate_b"));
         store
             .create(
                 rec.clone(),
@@ -1967,48 +1989,23 @@ mod tests {
             )
             .unwrap();
 
-        // Simulate the web operator approving gate_b specifically — the
-        // exact `RunStore` call `POST /api/runs/:id/approve?gate=gate_b`
-        // makes (api/runs.rs's `approve_run`).
-        let now = chrono::Utc::now();
-        store
-            .request_resume_approval(&rec.id, "web", None, now, Some("gate_b"))
-            .expect("approving gate_b of a 2-gate run should succeed");
-        // Sanity: the marker really does carry the target gate.
-        assert_eq!(
-            store.load(&rec.id).unwrap().resume_gate_id.as_deref(),
-            Some("gate_b")
-        );
-
         // A capture script standing in for the real `rupu` binary: appends
         // its argv to a file instead of actually running anything.
         let capture_path = tmp.path().join("captured_argv.txt");
         let script_path = capture_script(&tmp.path().join("capture.sh"), &capture_path);
 
-        resume_one_run(
-            Arc::clone(&store),
-            rec.id.clone(),
-            "approve",
-            Some(script_path),
-        )
-        .await;
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(script_path)).await;
 
         // The script runs asynchronously (detached, not awaited by
-        // `resume_one_run` itself) — poll briefly for its output.
-        let captured = poll_captured_argv(&capture_path).await;
-        assert!(
-            captured.contains("--gate gate_b"),
-            "spawned child's argv was: {captured:?} — missing --gate gate_b"
-        );
-        // gate_a must not appear as the target.
-        assert!(!captured.contains("--gate gate_a"));
-        // ISSUES.md I-82: the web approve's true actor ("web", passed to
-        // `request_resume_approval` above) must reach the spawned child so
-        // it lands on the gate decision row, instead of the child silently
+        // `resume_one_run` itself) — poll briefly for its output. gate_b,
+        // not gate_a, is the target; and (ISSUES.md I-82) the web
+        // approve's true actor, "web", reaches the spawned child so it
+        // lands on the gate decision row, instead of the child silently
         // re-deriving `whoami::username()`.
-        assert!(
-            captured.contains("--approver web"),
-            "spawned child's argv was: {captured:?} — missing --approver web"
+        let captured = poll_captured_argv(&capture_path).await;
+        assert_eq!(
+            captured.trim(),
+            format!("workflow approve {} --gate gate_b --approver web", rec.id)
         );
 
         // The marker was cleared (spawn succeeded) — the child now owns
@@ -2020,8 +2017,8 @@ mod tests {
     }
 
     /// Single-gate parity: a legacy/sole-gate marker (`resume_gate_id:
-    /// None`) must still spawn a working `workflow approve` — `--gate`
-    /// omitted, exactly like before this field existed.
+    /// None`, no decision recorded) must still spawn a working `workflow
+    /// approve` — `--gate` omitted, exactly like before this field existed.
     #[tokio::test]
     async fn resume_one_run_omits_gate_for_a_sole_gate_marker() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2030,6 +2027,7 @@ mod tests {
         // Collapse to a single parked gate.
         rec.awaiting.truncate(1);
         rec.sync_awaiting_compat();
+        legacy_web_marker(&mut rec, None);
         store
             .create(
                 rec.clone(),
@@ -2037,31 +2035,26 @@ mod tests {
             )
             .unwrap();
 
-        let now = chrono::Utc::now();
-        store
-            .request_resume_approval(&rec.id, "web", None, now, None)
-            .expect("approving the sole gate with no explicit id should work as today");
-        assert_eq!(store.load(&rec.id).unwrap().resume_gate_id, None);
-
         let capture_path = tmp.path().join("captured_argv.txt");
         let script_path = capture_script(&tmp.path().join("capture.sh"), &capture_path);
 
-        resume_one_run(
-            Arc::clone(&store),
-            rec.id.clone(),
-            "approve",
-            Some(script_path),
-        )
-        .await;
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(script_path)).await;
 
-        // Must wait for a non-empty capture: this assertion is a negative
-        // one, so an empty string would satisfy it vacuously and let the
-        // test pass even if the child never spawned.
         let captured = poll_captured_argv(&capture_path).await;
-        assert!(
-            !captured.contains("--gate"),
-            "sole-gate resume must not pass --gate: {captured:?}"
+        assert_eq!(
+            captured.trim(),
+            format!("workflow approve {} --approver web", rec.id),
+            "a sole-gate approve passes no --gate"
         );
+    }
+
+    /// A web approve as a binary from before spec §7 recorded it: on the
+    /// run's marker alone (naming `gate`, or none for a sole gate), with no
+    /// decision — the resume worker spawns `workflow approve` for it.
+    fn legacy_web_marker(rec: &mut rupu_orchestrator::RunRecord, gate: Option<&str>) {
+        rec.resume_requested_at = Some(chrono::Utc::now());
+        rec.resume_gate_id = gate.map(str::to_string);
+        rec.resume_approver = Some("web".into());
     }
 
     /// Wait for `pid` to stop being reported as running, within the
@@ -2106,7 +2099,7 @@ mod tests {
             &format!("echo $$ > {}\n", pid_path.display()),
         );
 
-        resume_one_run(Arc::clone(&store), rec.id.clone(), "resume", Some(exe)).await;
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
 
         let pid: u32 = poll_captured_argv(&pid_path)
             .await
@@ -2117,6 +2110,182 @@ mod tests {
             poll_pid_gone(pid).await,
             "the exited child {pid} is still reported running: it was never reaped"
         );
+    }
+
+    /// The resume worker spawns nothing for a marker that is gone by the
+    /// time it reloads the run — consumed by another spawner between the
+    /// listing and the claim — and only gives its claim back.
+    #[tokio::test]
+    async fn the_resume_worker_spawns_nothing_when_the_marker_is_gone_on_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let rec = multi_gate_resume_record("run_resume_worker_marker_gone");
+        store
+            .create(rec.clone(), SPLIT_GATE_B_TIMEOUT_REJECT_YAML)
+            .unwrap();
+        let now = chrono::Utc::now();
+        store
+            .request_resume_approval(&rec.id, "web", None, now, Some("gate_a"))
+            .unwrap();
+        let listed = store.list_pending_resume(now).unwrap();
+        assert_eq!(listed.len(), 1, "listed with its marker");
+        // Claimed by another spawner, which consumes the marker and gives
+        // the claim back — then the worker claims the run it listed.
+        assert!(store.claim_resume(&rec.id, "other-spawner", now).unwrap());
+        assert_eq!(
+            store
+                .clear_resume_if_marked_at(&rec.id, listed[0].resume_requested_at)
+                .unwrap(),
+            rupu_orchestrator::runs::ResumeGiveBack::Cleared
+        );
+        assert!(store.claim_resume(&rec.id, "resume-worker", now).unwrap());
+        let (exe, capture_path) = capture_exe(tmp.path());
+
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !capture_path.exists(),
+            "no child for a marker that is gone: {:?}",
+            std::fs::read_to_string(&capture_path)
+        );
+        let after = store.load(&rec.id).unwrap();
+        assert_eq!(after.resume_claimed_at, None, "the claim is given back");
+        assert_eq!(after.resume_requested_at, None);
+    }
+
+    /// The subcommand comes from the run as it is at the reload, not from
+    /// the listing: a marker an older binary set without a decision lists
+    /// as a `workflow approve`, but a decision recorded on the run by the
+    /// time the worker reloads it — which `approve` would refuse as already
+    /// decided — makes it a `workflow resume`, which applies every one.
+    #[tokio::test]
+    async fn the_resume_worker_picks_its_subcommand_from_the_reloaded_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let now = chrono::Utc::now();
+        let mut rec = multi_gate_resume_record("run_resume_worker_reloaded_subcommand");
+        legacy_web_marker(&mut rec, Some("gate_a"));
+        store
+            .create(rec.clone(), SPLIT_GATE_B_TIMEOUT_REJECT_YAML)
+            .unwrap();
+        let listed = store.list_pending_resume(now).unwrap();
+        assert_eq!(resume_subcommand(&listed[0]), "approve", "as listed");
+        assert!(store.claim_resume(&rec.id, "resume-worker", now).unwrap());
+        // By the reload, gate_a's approval has been recorded on the run.
+        store
+            .approve_gate(&rec.id, "operator", now, Some("gate_a"))
+            .unwrap();
+        let (exe, capture_path) = capture_exe(tmp.path());
+
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
+
+        let captured = poll_captured_argv(&capture_path).await;
+        assert_eq!(
+            captured.trim(),
+            format!("workflow resume {}", rec.id),
+            "the child applies the recorded decision instead of re-deciding the gate"
+        );
+    }
+
+    /// A `MakeWriter` that keeps what a test's subscriber writes.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `fut`, run with this thread's log output captured: what it logged.
+    async fn logs_of<T>(fut: impl std::future::Future<Output = T>) -> String {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        fut.await;
+        drop(guard);
+        let text = log.0.lock().unwrap().clone();
+        String::from_utf8(text).unwrap()
+    }
+
+    /// What a spawner's give-back logs is what it did to the run's marker:
+    /// cleared while it is the one the spawner read; kept, with only the
+    /// claim released, when the spawner took no marker as its own or the
+    /// one it read was replaced since; and nothing at all on a cancelled
+    /// run. Before, every kept marker was logged as "written since the
+    /// look" — false for a spawner that read none — and a cancelled run as
+    /// a released claim.
+    #[tokio::test]
+    async fn give_back_resume_logs_exactly_what_it_did_to_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let now = chrono::Utc::now();
+        let earlier = now - chrono::Duration::seconds(5);
+        let claimed_with_marker = |id: &str, status: RunStatus| {
+            let mut rec = multi_gate_resume_record(id);
+            rec.status = status;
+            rec.resume_requested_at = Some(now);
+            rec.resume_claimed_at = Some(now);
+            rec.resume_claimed_by = Some("spawner".into());
+            store
+                .create(rec.clone(), SPLIT_GATE_B_TIMEOUT_REJECT_YAML)
+                .unwrap();
+            rec.id
+        };
+        let cleared = claimed_with_marker("run_give_back_cleared", RunStatus::AwaitingApproval);
+        let none_read = claimed_with_marker("run_give_back_none_read", RunStatus::AwaitingApproval);
+        let replaced = claimed_with_marker("run_give_back_replaced", RunStatus::AwaitingApproval);
+        let cancelled = claimed_with_marker("run_give_back_cancelled", RunStatus::Cancelled);
+
+        for (id, read, logged) in [
+            (
+                &cleared,
+                Some(now),
+                "spawner: cleared the resume marker it read and released its claim",
+            ),
+            (
+                &none_read,
+                None,
+                "spawner: released its claim; it took no marker as its own, so any marker on the run stays for the resume worker",
+            ),
+            (
+                &replaced,
+                Some(earlier),
+                "spawner: released its claim; the marker it read was replaced or consumed since, so any marker on the run now stays for the resume worker",
+            ),
+            (
+                &cancelled,
+                Some(now),
+                "spawner: the run is cancelled; its resume marker and claim are left as they are",
+            ),
+        ] {
+            let log = logs_of(give_back_resume(&store, id, read, "spawner")).await;
+            assert!(log.contains(logged), "{id}: {log}");
+        }
+
+        let after = |id: &str| {
+            let rec = store.load(id).unwrap();
+            (rec.resume_requested_at, rec.resume_claimed_at)
+        };
+        assert_eq!(after(&cleared), (None, None));
+        assert_eq!(after(&none_read), (Some(now), None));
+        assert_eq!(after(&replaced), (Some(now), None));
+        assert_eq!(after(&cancelled), (Some(now), Some(now)));
     }
 
     /// gate_a: `timeout_seconds: 10`, `on_timeout: reject`, no `on_reject:`
@@ -2624,7 +2793,10 @@ mod tests {
             .request_resume_approval(&rec.id, "web", None, now, Some("gate_b"))
             .unwrap();
         let (exe, argv_path, _copy) = handoff_script(tmp.path(), &store.root, &rec.id);
-        hand_off_timed_out_approve(&store, &exe, "sweep-test", &rec.id, "gate_a", now).await;
+        assert!(
+            !hand_off_timed_out_approve(&store, &exe, "sweep-test", &rec.id, "gate_a", now).await,
+            "nothing handed off"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !argv_path.exists(),
@@ -2661,7 +2833,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.load(&rec.id).unwrap().status, RunStatus::Running);
         let (exe, argv_path, _copy) = handoff_script(tmp.path(), &store.root, &rec.id);
-        hand_off_timed_out_approve(&store, &exe, "sweep-test", &rec.id, "gate_a", now).await;
+        assert!(
+            !hand_off_timed_out_approve(&store, &exe, "sweep-test", &rec.id, "gate_a", now).await,
+            "nothing handed off"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!argv_path.exists(), "no child for a run that is Running");
         let reloaded = store.load(&rec.id).unwrap();
@@ -2831,27 +3006,18 @@ mod tests {
         assert_eq!(after.resume_claimed_by, None);
 
         // The resume worker consumes it as if the sweep had never been
-        // there: its claim, then its spawn with gate_b's own gate,
-        // approver and mode.
+        // there: its claim, then its spawn of the runner that applies
+        // gate_b's recorded approve, with gate_b's mode.
         assert!(store
             .claim_resume(&rec.id, "resume-worker", chrono::Utc::now())
             .unwrap());
         let worker_argv = tmp.path().join("worker.argv.txt");
         let worker_exe = capture_script(&tmp.path().join("worker.sh"), &worker_argv);
-        resume_one_run(
-            Arc::clone(&store),
-            rec.id.clone(),
-            "approve",
-            Some(worker_exe),
-        )
-        .await;
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(worker_exe)).await;
         let consumed = poll_captured_argv(&worker_argv).await;
         assert_eq!(
             consumed.trim(),
-            format!(
-                "workflow approve {} --gate gate_b --approver web --mode bypass",
-                rec.id
-            ),
+            format!("workflow resume {} --mode bypass", rec.id),
             "the resume worker's child: {consumed:?}"
         );
     }
@@ -3011,7 +3177,10 @@ mod tests {
         });
         locked_rx.recv().unwrap();
 
-        hand_off_timed_out_approve(&store, &exe, "sweep-test", &rec.id, "gate_a", now).await;
+        assert!(
+            hand_off_timed_out_approve(&store, &exe, "sweep-test", &rec.id, "gate_a", now).await,
+            "gate_a handed off"
+        );
         holder.join().unwrap();
 
         let argv = poll_captured_argv(&argv_path).await;
@@ -3099,7 +3268,7 @@ mod tests {
         });
         locked_rx.recv().unwrap();
 
-        resume_one_run(Arc::clone(&store), rec.id.clone(), "resume", Some(exe)).await;
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
         holder.join().unwrap();
 
         let captured = poll_captured_argv(&capture_path).await;
@@ -3225,7 +3394,7 @@ mod tests {
         assert_eq!(resume_subcommand(&pending[0]), "resume");
 
         let (exe, capture_path) = capture_exe(tmp.path());
-        resume_one_run(Arc::clone(&store), rec.id.clone(), "resume", Some(exe)).await;
+        resume_one_run(Arc::clone(&store), rec.id.clone(), Some(exe)).await;
         let captured = poll_captured_argv(&capture_path).await;
         assert_eq!(captured.trim(), format!("workflow resume {}", rec.id));
 
@@ -3463,9 +3632,12 @@ mod tests {
         assert!(store
             .claim_resume(&rec.id, "resume-worker", chrono::Utc::now())
             .unwrap());
-        assert!(store
-            .clear_resume_if_marked_at(&rec.id, Some(marked_at))
-            .unwrap());
+        assert_eq!(
+            store
+                .clear_resume_if_marked_at(&rec.id, Some(marked_at))
+                .unwrap(),
+            rupu_orchestrator::runs::ResumeGiveBack::Cleared
+        );
 
         // Ticks 2 and 3, seconds later: no new request until a lease has
         // passed since the attempt.
@@ -3478,6 +3650,70 @@ mod tests {
         );
         assert_eq!(after.resume_claimed_at, None);
         assert_eq!(after.gate_decisions.len(), 1, "the decision stays recorded");
+    }
+
+    /// A run whose gate was handed off this tick is not also re-requested:
+    /// the hand-off's child becomes the run's runner and applies every
+    /// recorded decision, a stranded sibling's included, so a re-request on
+    /// top would only have the resume worker spawn a redundant `workflow
+    /// resume` that hands off at once. Before, the re-request ran right
+    /// after the hand-off gave back its claim, and found the run stranded.
+    #[tokio::test]
+    async fn run_gate_sweep_does_not_re_request_a_run_it_just_handed_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().to_path_buf();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(global.join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: global.join("hosts"),
+        };
+        let now = chrono::Utc::now();
+        let stale = now - rupu_orchestrator::RunStore::RESUME_LEASE - chrono::Duration::seconds(1);
+        // gate_a overdue with `on_timeout: approve`; gate_b's rejection was
+        // recorded a lease ago and its runner never came.
+        let mut rec =
+            overdue_gates_record("run_sweep_handoff_no_rerequest", tmp.path(), &["gate_a"]);
+        rec.gate_decisions = vec![rupu_orchestrator::GateDecision {
+            step_id: "gate_b".into(),
+            verdict: rupu_orchestrator::GateVerdict::Rejected,
+            via: "timeout".into(),
+            approver: None,
+            reason: Some("gate timed out".into()),
+            decided_at: stale,
+        }];
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: fanout\n    split: [gate_a, gate_b]\n  - id: gate_a\n    approval:\n      timeout_seconds: 10\n      on_timeout: approve\n  - id: gate_b\n    approval:\n      timeout_seconds: 10\n      on_timeout: reject\n",
+            )
+            .unwrap();
+        let (exe, argv_path, _copy) = handoff_script(tmp.path(), &store.root, &rec.id);
+
+        run_gate_sweep(
+            Arc::clone(&store),
+            hosts,
+            exe,
+            "sweep-test".to_string(),
+            global,
+        )
+        .await;
+
+        let argv = poll_captured_argv(&argv_path).await;
+        assert_eq!(
+            argv.trim(),
+            format!("workflow approve {} --gate gate_a", rec.id),
+            "gate_a was handed off"
+        );
+        let after = store.load(&rec.id).unwrap();
+        assert_eq!(
+            after.resume_requested_at, None,
+            "the handed-off child applies gate_b's decision; no re-request on top"
+        );
+        assert_eq!(after.resume_rerequested_at, None);
+        assert_eq!(
+            after.resume_claimed_at, None,
+            "the hand-off gave back its lease"
+        );
+        assert_eq!(parked(&after), ["gate_a"]);
     }
 
     /// Single-gate parity: a legacy-shaped record (empty `awaiting`, only
