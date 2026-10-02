@@ -3,6 +3,7 @@
 //! registered collectors immediately before assembling each LLM request.
 
 use rupu_providers::types::Message;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cadence {
@@ -91,10 +92,75 @@ pub fn wrap_injection(inj: &Injection) -> Message {
     Message::user(&body)
 }
 
+/// Default token budget for `EveryTurn` injections per turn.
+pub const INJECTION_TOKEN_BUDGET: usize = 4000;
+
+/// Runs the registered collectors before each turn and assembles their
+/// injections: all `Once` injections are kept, `EveryTurn` injections fill the
+/// remaining token budget highest-priority first.
+#[derive(Clone)]
+pub struct CollectorPipeline {
+    collectors: Vec<Arc<dyn TurnCollector>>,
+    budget_tokens: usize,
+}
+
+#[derive(Default)]
+pub struct TurnAssembly {
+    /// Injected into this turn only (transient; not persisted).
+    pub every_turn: Vec<Message>,
+    /// Persisted into the running transcript (delivered once).
+    pub once: Vec<Message>,
+}
+
+impl CollectorPipeline {
+    pub fn new(collectors: Vec<Arc<dyn TurnCollector>>, budget_tokens: usize) -> Self {
+        Self {
+            collectors,
+            budget_tokens,
+        }
+    }
+
+    pub fn run(&self, ctx: &TurnContext) -> TurnAssembly {
+        let mut all: Vec<Injection> = Vec::new();
+        for c in &self.collectors {
+            all.extend(c.collect(ctx));
+        }
+        let mut assembly = TurnAssembly::default();
+
+        // Once: always kept, in collection order.
+        for inj in all.iter().filter(|i| i.cadence == Cadence::Once) {
+            assembly.once.push(wrap_injection(inj));
+        }
+
+        // EveryTurn: highest priority first, fill remaining token budget.
+        let mut every: Vec<&Injection> = all
+            .iter()
+            .filter(|i| i.cadence == Cadence::EveryTurn)
+            .collect();
+        // Stable, descending by priority (higher kept first; ties keep
+        // collection order).
+        every.sort_by_key(|i| std::cmp::Reverse(i.priority));
+        let mut used = 0usize;
+        for inj in every {
+            let cost = est_tokens(&inj.content);
+            if used + cost > self.budget_tokens {
+                continue;
+            }
+            used += cost;
+            assembly.every_turn.push(wrap_injection(inj));
+        }
+        assembly
+    }
+}
+
+/// Cheap token estimate: ~4 chars per token, +1 to avoid zero.
+fn est_tokens(content: &str) -> usize {
+    content.len() / 4 + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     struct StubCollector(Vec<Injection>);
     impl TurnCollector for StubCollector {
@@ -223,5 +289,56 @@ mod tests {
         let c: Arc<dyn TurnCollector> = Arc::new(StubCollector(vec![]));
         assert_eq!(c.name(), "stub");
         assert!(c.collect(&ctx()).is_empty());
+    }
+
+    fn pinj(source: &str, cadence: Cadence, priority: u8, content: &str) -> Injection {
+        Injection {
+            source: source.into(),
+            kind: InjectionKind::Observation,
+            cadence,
+            priority,
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn once_injections_always_kept_and_separated_from_every_turn() {
+        let c: Arc<dyn TurnCollector> = Arc::new(StubCollector(vec![
+            pinj("mailbox:lead", Cadence::Once, 9, "message one"),
+            pinj("cmd:uptime", Cadence::EveryTurn, 5, "load 0.1"),
+        ]));
+        let pipe = CollectorPipeline::new(vec![c], INJECTION_TOKEN_BUDGET);
+        let out = pipe.run(&ctx());
+        assert_eq!(out.once.len(), 1);
+        assert_eq!(out.every_turn.len(), 1);
+    }
+
+    #[test]
+    fn every_turn_truncates_lowest_priority_first_under_budget() {
+        // est_tokens counts content only: "AAAA" costs 2, the 16-char "B…" costs 5.
+        // A budget of 5 fits exactly one of them. The LOW-priority injection is
+        // listed FIRST, so keeping the high-priority one proves the pipeline
+        // sorts descending by priority rather than relying on collection order.
+        let c: Arc<dyn TurnCollector> = Arc::new(StubCollector(vec![
+            pinj("cmd:b", Cadence::EveryTurn, 1, "BBBBBBBBBBBBBBBB"), // low priority, dropped
+            pinj("cmd:a", Cadence::EveryTurn, 9, "AAAA"),             // high priority, kept
+        ]));
+        let pipe = CollectorPipeline::new(vec![c], 5);
+        let out = pipe.run(&ctx());
+        assert_eq!(
+            out.every_turn.len(),
+            1,
+            "only the high-priority injection fits"
+        );
+        let text = text_of(&out.every_turn[0]);
+        assert!(text.contains("AAAA"));
+        assert!(!text.contains("BBBB"));
+    }
+
+    #[test]
+    fn empty_collectors_produce_nothing() {
+        let pipe = CollectorPipeline::new(vec![], INJECTION_TOKEN_BUDGET);
+        let out = pipe.run(&ctx());
+        assert!(out.once.is_empty() && out.every_turn.is_empty());
     }
 }

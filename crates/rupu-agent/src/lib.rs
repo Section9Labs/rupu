@@ -35,7 +35,9 @@ pub mod spec;
 // implemented in Task 6
 pub mod tool_registry;
 
-pub use collector::{Cadence, Injection, InjectionKind, TurnCollector, TurnContext};
+pub use collector::{
+    Cadence, CollectorPipeline, Injection, InjectionKind, TurnCollector, TurnContext,
+};
 pub use fd_budget::load_agent_admitted;
 pub use loader::{load_agent, load_agents, AgentLoadError};
 pub use permission::{parse_mode, resolve_mode, PermissionDecision, PermissionPrompt};
