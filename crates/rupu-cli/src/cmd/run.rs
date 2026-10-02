@@ -759,7 +759,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         );
 
         // `--provider` / `--model` override the agent and the config, ahead
-        // of the dispatchable pre-flight below.
+        // of the dispatchable pre-flight below. The agent's own provider is
+        // resolved too: its `auth:` names how it reaches that provider only.
+        let agent_provider = provider_factory::resolve_provider_name(
+            spec.provider.as_deref(),
+            cfg.default_provider.as_deref(),
+        );
         let provider_name = provider_factory::resolve_provider_name(
             args.provider.as_deref().or(spec.provider.as_deref()),
             cfg.default_provider.as_deref(),
@@ -795,7 +800,18 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             cfg.default_model.as_deref(),
             oai_params.as_ref().map(|p| p.default_model.as_str()),
         );
-        let auth_hint = spec.auth;
+        let agent_model = provider_factory::resolve_model(
+            spec.model.as_deref(),
+            cfg.default_model.as_deref(),
+            provider_factory::openai_compatible_params(&agent_provider, &cfg.providers)
+                .as_ref()
+                .map(|p| p.default_model.as_str()),
+        );
+        // What the agent pins for its own model and provider applies only
+        // there — the rule a fallback hop follows (`hop_builder`). An
+        // "override" naming the agent's own model/provider changes nothing.
+        let pins = AgentPins::for_run(&spec, provider_name != agent_provider, model != agent_model);
+        let auth_hint = pins.auth;
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             anthropic_prompt_cache: spec.anthropic_prompt_cache,
@@ -1060,7 +1076,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // config → live model list → unknown. Resolved through the same
         // provider the run is about to use, before it moves into the opts.
         let limits = rupu_runtime::model_limits::resolve(
-            rupu_runtime::model_limits::LimitOverrides::from_spec(&spec),
+            pins.limits,
             &provider_name,
             &model,
             provider.as_mut(),
@@ -1073,7 +1089,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let hop_overrides = rupu_runtime::hop_builder::AgentOverrides {
             oauth_prefix: spec.anthropic_oauth_prefix,
             prompt_cache: spec.anthropic_prompt_cache,
-            auth: spec.auth,
+            auth: pins.auth,
             origin_provider: provider_name.clone(),
         };
         let mut opts = AgentRunOpts {
@@ -1104,7 +1120,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             suppress_stream_stdout: true,
             mcp_registry: Some(scm_registry),
             effort: spec.effort,
-            context_window: spec.context_window,
+            context_window: pins.context_window,
             output_format: spec.output_format,
             output_schema: spec.output_schema.clone(),
             anthropic_task_budget: spec.anthropic_task_budget,
@@ -1404,6 +1420,34 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     body_result
 }
 
+/// The agent's model- and provider-specific settings, as they apply to this
+/// run: a `--model` onto another model drops the agent's limit pins and
+/// `contextWindow`; a `--provider` onto another provider drops its `auth:`.
+#[derive(Debug)]
+struct AgentPins {
+    limits: rupu_runtime::model_limits::LimitOverrides,
+    context_window: Option<rupu_providers::model_tier::ContextWindow>,
+    auth: Option<rupu_providers::AuthMode>,
+}
+
+impl AgentPins {
+    fn for_run(spec: &rupu_agent::AgentSpec, other_provider: bool, other_model: bool) -> Self {
+        Self {
+            limits: if other_model {
+                rupu_runtime::model_limits::LimitOverrides::default()
+            } else {
+                rupu_runtime::model_limits::LimitOverrides::from_spec(spec)
+            },
+            context_window: if other_model {
+                None
+            } else {
+                spec.context_window
+            },
+            auth: if other_provider { None } else { spec.auth },
+        }
+    }
+}
+
 /// What `rupu run --continue` picks up: the rebuilt conversation, the
 /// transcript it is seeded from, and — for a failed run continued on another
 /// model — the outcome it failed on.
@@ -1424,7 +1468,7 @@ struct RunFailure {
 /// Fold a run's result into success or [`RunFailure`]. An `Ok` whose own
 /// status failed ([`rupu_agent::RunResult::terminal_error`]) is a failure,
 /// reported in the run's own words (`RunResult.error`, which carries the
-/// rung-3 `--continue` hint).
+/// rung-3 `--continue` hint); an `Err` gets its hint appended.
 fn standalone_run_outcome(
     result: Result<rupu_agent::RunResult, rupu_agent::RunError>,
 ) -> Result<rupu_agent::RunResult, RunFailure> {
@@ -1436,8 +1480,13 @@ fn standalone_run_outcome(
                 cause: err.outcome().cloned().map(Box::new),
             }),
         },
+        // An outcome the ladder ran out on carries its rung-3 hint apart from
+        // the error text; the operator reads both.
         Err(err) => Err(RunFailure {
-            message: err.to_string(),
+            message: match err.hint() {
+                Some(hint) => format!("{err}; {hint}"),
+                None => err.to_string(),
+            },
             cause: err.outcome().cloned().map(Box::new),
         }),
     }
@@ -1754,6 +1803,34 @@ mod tests {
 
     fn launch_args(argv: &[&str]) -> Result<Args, clap::Error> {
         parse_launch_args(argv.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn pinned_spec() -> rupu_agent::AgentSpec {
+        rupu_agent::AgentSpec::parse(
+            "---\nname: pinned\nprovider: anthropic\nmodel: claude-sonnet-4-6\nauth: api-key\n\
+             contextWindow: 1m\nmaxTokens: 777\ncontextWindowTokens: 9000\n---\nhi\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_pins_follow_the_agents_own_model_and_provider() {
+        let spec = pinned_spec();
+        let own = AgentPins::for_run(&spec, false, false);
+        assert_eq!(own.limits.max_tokens, Some(777));
+        assert_eq!(own.limits.context_window_tokens, Some(9000));
+        assert!(own.context_window.is_some());
+        assert_eq!(own.auth, Some(rupu_providers::AuthMode::ApiKey));
+
+        let other_model = AgentPins::for_run(&spec, false, true);
+        assert_eq!(other_model.limits.max_tokens, None);
+        assert_eq!(other_model.limits.context_window_tokens, None);
+        assert_eq!(other_model.context_window, None);
+        assert_eq!(other_model.auth, Some(rupu_providers::AuthMode::ApiKey));
+
+        let other_provider = AgentPins::for_run(&spec, true, false);
+        assert_eq!(other_provider.auth, None);
+        assert_eq!(other_provider.limits.max_tokens, Some(777));
     }
 
     #[test]

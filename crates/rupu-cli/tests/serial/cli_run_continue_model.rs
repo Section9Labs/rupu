@@ -224,3 +224,74 @@ async fn model_and_provider_flags_override_the_agent() {
     assert_eq!(start["data"]["model"], "mock-2");
     assert_eq!(start["data"]["provider"], "openai");
 }
+
+/// The `model_limits` notice a run's transcript opens with.
+fn limits_notice(dir: &Path, run_id: &str) -> String {
+    events(&transcript(dir, run_id))
+        .into_iter()
+        .find(|v| v["type"] == "notice" && v["data"]["kind"] == "model_limits")
+        .and_then(|v| v["data"]["message"].as_str().map(str::to_string))
+        .expect("a model_limits notice")
+}
+
+/// The agent's `maxTokens` pin is for its own model: `--model` onto another
+/// model drops it (as a fallback hop does), while naming the agent's own
+/// model changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_override_drops_the_agents_model_pins() {
+    let _guard = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "pinned", "maxTokens: 777\n");
+    let answer = r#"[{ "AssistantText": { "text": "ok", "stop": "end_turn" } }]"#;
+    for (run_id, model) in [
+        ("run_pinned", None),
+        ("run_same", Some("claude-sonnet-4-6")),
+        ("run_other", Some("mock-2")),
+    ] {
+        let mut cmd = rupu(dir.path(), answer);
+        cmd.env("RUPU_CACHE_DIR_OVERRIDE", dir.path().join("cache"))
+            .args(["run", "pinned", "--mode", "bypass", "--run-id", run_id]);
+        if let Some(m) = model {
+            cmd.args(["--model", m]);
+        }
+        cmd.arg("go").assert().success();
+    }
+    let pinned = limits_notice(dir.path(), "run_pinned");
+    assert!(pinned.contains("output 777"), "{pinned}");
+    assert_eq!(limits_notice(dir.path(), "run_same"), pinned);
+    let other = limits_notice(dir.path(), "run_other");
+    assert!(!other.contains("output 777"), "{other}");
+    assert!(!other.contains("agent frontmatter"), "{other}");
+}
+
+/// A provider error the ladder could not route around fails the command with
+/// its rung-3 hint on stderr, like a refusal does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exhausted_provider_error_prints_the_continue_hint() {
+    let _guard = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "guarded", "");
+    rupu(dir.path(), r#"[{ "ProviderError": "boom" }]"#)
+        .args([
+            "run",
+            "guarded",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_boom",
+            "do the thing",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("boom"))
+        .stderr(predicate::str::contains("--continue run_boom --model"));
+    let rec = run_record(dir.path(), "run_boom");
+    assert_eq!(rec.status, rupu_orchestrator::RunStatus::Failed);
+    assert!(
+        rec.error_message
+            .as_deref()
+            .is_some_and(|e| e.contains("boom") && e.contains("no recovery left")),
+        "{:?}",
+        rec.error_message
+    );
+}

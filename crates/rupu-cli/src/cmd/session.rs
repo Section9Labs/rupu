@@ -7994,6 +7994,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     run.total_tokens_cached = cached_tokens;
                     run.duration_ms = duration_ms_from_transcript(&transcript_path).unwrap_or(0);
                     duration_ms = run.duration_ms;
+                    if result.status != RunStatus::Ok {
+                        // The run's own words, as `last_error` gets below.
+                        run.error = result.error.clone();
+                    }
                 }
                 Err(err) => {
                     let error = failed_turn_error(err);
@@ -8078,33 +8082,44 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 }
 
 /// Adopt a failed turn's conversation as it stood when the turn failed — its
-/// prompt and any completed tool work — with the turn's own transcript as the
-/// next turn's seed source.
+/// prompt and any completed tool work (spec 2026-10-01 §7.3).
 ///
-/// Only when that transcript replays to exactly `messages` (a seed source
-/// must, or the next turn's replay fails its hash check), and never an empty
-/// conversation: a run that failed before it loaded the session's history
-/// (transcript or coverage setup) hands back none, and adopting it would drop
-/// the whole session. Otherwise the history is left as the last good turn
-/// left it.
+/// The turn's own transcript becomes the next turn's seed source only when it
+/// replays to exactly `messages` (a seed source must, or the next turn's
+/// replay fails its hash check); otherwise the reference is cleared and the
+/// next turn seeds inline. An empty conversation is never adopted: a run that
+/// failed before it loaded the session's history (transcript or coverage
+/// setup) hands back none, and adopting it would drop the whole session.
 fn keep_failed_turn_history(
     session: &mut SessionRecord,
     transcript: &Path,
     messages: Vec<Message>,
 ) {
-    if !messages.is_empty() && rupu_agent::replay::replays_to(transcript, &messages) {
-        session.message_history = messages;
-        session.history_source_transcript = Some(transcript.to_path_buf());
+    if messages.is_empty() {
+        return;
     }
+    let replays = rupu_agent::replay::replays_to(transcript, &messages);
+    if !replays {
+        tracing::warn!(
+            transcript = %transcript.display(),
+            "the failed turn's transcript does not replay to its conversation; the next turn seeds inline"
+        );
+    }
+    session.message_history = messages;
+    session.history_source_transcript = replays.then(|| transcript.to_path_buf());
 }
 
 /// A failed turn's `last_error`: the outcome's title ahead of the error
 /// (`title — error`) when the failure is a classified outcome, else the
-/// error.
+/// error; then the rung-3 hint when the ladder ran out on it.
 fn failed_turn_error(err: &rupu_agent::RunError) -> String {
-    match err.outcome() {
+    let error = match err.outcome() {
         Some(outcome) => format!("{} — {err}", outcome.title),
         None => err.to_string(),
+    };
+    match err.hint() {
+        Some(hint) => format!("{error}; {hint}"),
+        None => error,
     }
 }
 
@@ -10772,7 +10787,7 @@ mod tests {
             after_turn2
                 .last_error
                 .as_deref()
-                .is_some_and(|e| e.contains("boom")),
+                .is_some_and(|e| e.contains("boom") && e.contains("send another message")),
             "{:?}",
             after_turn2.last_error
         );
@@ -10868,8 +10883,8 @@ mod tests {
     }
 
     /// A turn that failed before it loaded the session's history hands back
-    /// no conversation and a transcript that does not replay to one: the
-    /// session's history is left as the last good turn left it.
+    /// no conversation: the session's history is left as the last good turn
+    /// left it.
     #[test]
     fn a_turn_that_failed_during_setup_leaves_the_history_alone() {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
@@ -10881,12 +10896,35 @@ mod tests {
         let empty = tmp.path().join("empty.jsonl");
         std::fs::write(&empty, "").expect("write empty transcript");
         keep_failed_turn_history(&mut session, &empty, Vec::new());
-        // A conversation that the transcript does not replay to is not
-        // adopted either.
-        keep_failed_turn_history(&mut session, &empty, vec![Message::user("first")]);
 
         assert_eq!(session.message_history.len(), 2);
         assert_eq!(session.history_source_transcript, Some(earlier));
+    }
+
+    /// A failed turn whose transcript does not replay to its conversation
+    /// still keeps the conversation (its prompt); only the seed reference is
+    /// dropped, so the next turn seeds inline.
+    #[test]
+    fn a_failed_turn_that_does_not_replay_keeps_its_prompt_and_seeds_inline() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let mut session = test_session_record();
+        session.message_history = vec![Message::user("first"), Message::assistant("ack")];
+        session.history_source_transcript = Some(tmp.path().join("earlier.jsonl"));
+
+        let empty = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty, "").expect("write empty transcript");
+        let failed = vec![
+            Message::user("first"),
+            Message::assistant("ack"),
+            Message::user("second"),
+        ];
+        keep_failed_turn_history(&mut session, &empty, failed.clone());
+
+        assert_eq!(
+            serde_json::to_value(&session.message_history).unwrap(),
+            serde_json::to_value(&failed).unwrap()
+        );
+        assert_eq!(session.history_source_transcript, None);
     }
 
     /// A turn refused with no fallback chain ends `Failed`; its prompt stays
@@ -10921,7 +10959,21 @@ mod tests {
         record.worker_pid = None;
         record.last_run_id = None;
         record.last_transcript_path = None;
-        record.runs = Vec::new();
+        // The entry `session send` records before the worker runs the turn.
+        record.runs = vec![SessionRunRecord {
+            run_id: "run_refused_1".into(),
+            prompt: "do the thing".into(),
+            transcript_path: record.transcripts_dir.join("run_refused_1.jsonl"),
+            started_at: Utc::now(),
+            completed_at: None,
+            status: None,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            total_tokens_cached: 0,
+            duration_ms: 0,
+            pid: None,
+            error: None,
+        }];
         record.total_turns = 0;
         write_session(&global, SessionScope::Active, &record).expect("write session");
 
@@ -10954,14 +11006,18 @@ mod tests {
             serde_json::to_value(vec![Message::user("do the thing")]).unwrap(),
             "the refused reply is discarded; the prompt survives"
         );
-        assert!(
-            after
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.starts_with("refused")),
-            "{:?}",
-            after.last_error
-        );
+        let last_error = after.last_error.clone().unwrap_or_default();
+        assert!(last_error.starts_with("refused"), "{last_error}");
+        // A session's rung 3 is the next message, not a `rupu run`.
+        assert!(!last_error.contains("rupu run"), "{last_error}");
+        assert!(last_error.contains("send another message"), "{last_error}");
+        let run = after
+            .runs
+            .iter()
+            .find(|r| r.run_id == "run_refused_1")
+            .expect("the turn's run entry");
+        assert_eq!(run.status, Some(RunStatus::Error));
+        assert_eq!(run.error.as_deref(), Some(last_error.as_str()));
     }
 
     fn usage_event(input: u32, output: u32, purpose: Option<&str>) -> TranscriptEvent {

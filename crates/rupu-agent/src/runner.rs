@@ -707,6 +707,11 @@ pub enum RunError {
     Outcome {
         message: String,
         outcome: Box<rupu_transcript::OutcomeRecord>,
+        /// The rung-3 hint written to the transcript's `Recovery` reason:
+        /// what the operator can do next. Not part of the Display (callers
+        /// match on the error text); a caller that shows the error to an
+        /// operator appends it ([`RunError::hint`]).
+        hint: Option<String>,
     },
 }
 
@@ -719,6 +724,14 @@ impl RunError {
                 outcome: Some(outcome),
                 ..
             } => Some(outcome),
+            _ => None,
+        }
+    }
+
+    /// The rung-3 hint behind this failure, when the ladder ran out on it.
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            RunError::Outcome { hint, .. } => hint.as_deref(),
             _ => None,
         }
     }
@@ -878,9 +891,16 @@ fn rung0_step(
     }
 }
 
+/// What a session turn's rung-3 hint says: the operator's next `session
+/// send` is the answer to rung 3 (spec 2026-10-01 §7.3).
+pub const SESSION_NO_RECOVERY_HINT: &str =
+    "no recovery left — send another message to continue, or start a new session on another model";
+
 /// The rung-3 hint: what the operator can do once nothing is left to try.
 fn no_recovery_hint(opts: &AgentRunOpts) -> String {
-    if opts.step_id.is_empty() {
+    if opts.surface_tag.as_deref() == Some("session") {
+        SESSION_NO_RECOVERY_HINT.to_string()
+    } else if opts.step_id.is_empty() {
         format!(
             "no recovery left — continue with another model: rupu run {} --continue {} --model <model> [--provider <provider>]",
             opts.agent_name, opts.run_id
@@ -951,10 +971,11 @@ fn provider_exhausted(
     total_tokens: u64,
     started: Instant,
 ) -> RunError {
+    let hint = no_recovery_hint(opts);
     let closed = RecoveryEvent {
         outcome_id: &outcome.id,
         rung: 3,
-        reason: Some(no_recovery_hint(opts)),
+        reason: Some(hint.clone()),
         ..Default::default()
     }
     .write(writer, RecoveryAction::Failed)
@@ -974,6 +995,7 @@ fn provider_exhausted(
         Ok(()) => RunError::Outcome {
             message,
             outcome: Box::new(outcome.record()),
+            hint: Some(hint),
         },
         Err(e) => e,
     }

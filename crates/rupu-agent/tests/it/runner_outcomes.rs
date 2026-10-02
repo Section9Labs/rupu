@@ -285,6 +285,28 @@ async fn truncation_budget_exhausted_fails_with_an_outcome() {
     );
 }
 
+/// A session turn's rung 3 is the operator's next message (spec §7.3), not
+/// a `rupu run --continue` its transcripts could never satisfy.
+#[tokio::test]
+async fn a_session_turn_hints_at_sending_another_message() {
+    let provider = CapturingMockProvider::new(
+        (0..4)
+            .map(|_| reply(StopReason::MaxTokens, vec![text("piece")]))
+            .collect(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = build_opts(Box::new(provider), &tmp, tmp.path().join("run.jsonl"));
+    opts.step_id = String::new();
+    opts.surface_tag = Some("session".into());
+    let result = run_agent(opts).await.expect("the loop itself completes");
+    let err = result.error.as_deref().unwrap();
+    assert!(
+        err.ends_with(rupu_agent::runner::SESSION_NO_RECOVERY_HINT),
+        "{err}"
+    );
+    assert!(!err.contains("rupu run"), "{err}");
+}
+
 #[tokio::test]
 async fn a_standalone_run_hints_at_continue() {
     let turns = (0..4)
@@ -1332,6 +1354,12 @@ async fn auth_error_does_not_hop() {
         err.to_string(),
         "provider: API error 401: invalid x-api-key",
         "the error text is unchanged"
+    );
+    assert!(
+        err.hint()
+            .is_some_and(|h| h.starts_with("no recovery left")),
+        "the rung-3 hint travels with the error: {:?}",
+        err.hint()
     );
     assert_eq!(
         err.outcome().and_then(|o| o.error_class.as_deref()),
