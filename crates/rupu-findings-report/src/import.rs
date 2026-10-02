@@ -2614,22 +2614,62 @@ fn typed_block(pieces: &[Piece], exported: bool) -> Option<(EvidenceBlock, usize
         }
         return None;
     }
+    // A `PcapRef` the exporter writes as a bold label plus the file facts
+    // (`blocks.rs`), with its summary as the following paragraph. (An
+    // author's `_Packet capture: … — `path`_` note is read above.)
+    if exported {
+        if let Some(rest) = p.strip_prefix("**Packet capture** — ") {
+            if let Some((path, after)) = split_code_span(rest) {
+                if workspace_file(path) && is_file_facts_tail(after) {
+                    let (summary, used) = match pieces.get(1) {
+                        Some(Piece::Para(sum)) if is_block_summary(sum) => (sum.clone(), 2),
+                        _ => (String::new(), 1),
+                    };
+                    return Some((
+                        EvidenceBlock::PcapRef {
+                            artifact: block_file(path),
+                            summary,
+                        },
+                        used,
+                    ));
+                }
+            }
+        }
+        // An `Image` whose file was not embedded: the exporter writes a bold
+        // label, the file facts, and a `*not embedded: …*` reason
+        // (`blocks.rs`). The embedded form is an `![caption](path)` link,
+        // read by `image_link` above.
+        if let Some(blk) = image_not_embedded(p) {
+            return Some((blk, 1));
+        }
+    }
     if let Some(rest) = p.strip_prefix("**Hexdump** (base ") {
         let (base, file) = rest.split_once(") — ")?;
         let base = u64::from_str_radix(base.strip_prefix("0x")?, 16).ok()?;
         let (path, after) = split_code_span(file)?;
-        if !after.is_empty() || !workspace_file(path) {
+        if !workspace_file(path) || !is_file_facts_tail(after) {
             return None;
         }
-        // The rendered dump is an untagged code block; with none, the block
-        // is the label alone.
-        let rendered = fence(1).filter(|(info, _)| info.trim().is_empty());
-        let used = 1 + usize::from(rendered.is_some());
+        // The rendered dump is an untagged code block; with none, the
+        // exporter writes a note in its place, which we consume too so it
+        // does not read back as a stray claim.
+        let (rendered, used) = match fence(1) {
+            Some((info, content)) if info.trim().is_empty() => (Some(content), 2),
+            _ => {
+                let no_dump = matches!(
+                    pieces.get(1),
+                    Some(Piece::Para(n))
+                        if note_text(n)
+                            == Some("No rendered dump was recorded; the bytes are in the file above.")
+                );
+                (None, 1 + usize::from(no_dump))
+            }
+        };
         return Some((
             EvidenceBlock::Hexdump {
                 base,
                 artifact: block_file(path),
-                rendered: rendered.map(|(_, c)| c),
+                rendered,
             },
             used,
         ));
@@ -2695,6 +2735,88 @@ fn with_file(s: &str) -> Option<(&str, &str)> {
     let (text, span) = s.rsplit_once(" — ")?;
     let (path, rest) = split_code_span(span)?;
     (rest.is_empty() && workspace_file(path)).then_some((text, path))
+}
+
+/// The ` · N bytes` tail of `blocks::file_facts`, with its optional
+/// `· sha256 `…`` (before the size) and `· on host `…`` (after it). `true`
+/// when `s` is exactly that tail, so a trailing file-facts run can be told
+/// from a caption that happens to contain ` · `.
+fn is_file_facts_tail(s: &str) -> bool {
+    // Optional ` · sha256 `<hex>`` comes first.
+    let rest = match s.strip_prefix(" · sha256 ") {
+        Some(r) => match split_code_span(r) {
+            Some((_, after)) => after,
+            None => return false,
+        },
+        None => s,
+    };
+    let Some(rest) = rest.strip_prefix(" · ") else {
+        return false;
+    };
+    let Some((n, rest)) = rest.split_once(" bytes") else {
+        return false;
+    };
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Optional ` · on host `<name>`` comes last.
+    match rest.strip_prefix(" · on host ") {
+        Some(r) => matches!(split_code_span(r), Some((_, after)) if after.is_empty()),
+        None => rest.is_empty(),
+    }
+}
+
+/// Split `{label} — {file_facts}` into `(label, path)`, matched from the
+/// RIGHT so a label with its own ` — ` (an image caption like
+/// `Before — after`) splits at the file facts, not inside the caption. With
+/// no separator, the whole string is the file facts and the label is empty.
+fn split_file_facts(s: &str) -> Option<(&str, &str)> {
+    let mut end = s.len();
+    while let Some(rel) = s[..end].rfind(" — ") {
+        let after = &s[rel + " — ".len()..];
+        if let Some((path, tail)) = split_code_span(after) {
+            if workspace_file(path) && is_file_facts_tail(tail) {
+                return Some((&s[..rel], path));
+            }
+        }
+        end = rel;
+    }
+    match split_code_span(s) {
+        Some((path, tail)) if workspace_file(path) && is_file_facts_tail(tail) => Some(("", path)),
+        _ => None,
+    }
+}
+
+/// A paragraph the exporter writes as a `PcapRef`'s summary: plain prose, so
+/// not the bold label / table / image / italic-note start of another block.
+fn is_block_summary(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with(['*', '|', '!', '_', '#'])
+}
+
+/// An `Image` the exporter wrote by reference because its file was not
+/// embedded: `**Image:** <caption> — <file facts> — *not embedded: …*`, or
+/// `**Image** — <file facts> — *not embedded: …*` with no caption.
+fn image_not_embedded(p: &str) -> Option<EvidenceBlock> {
+    let body = p.strip_prefix("**Image")?;
+    if !body.ends_with('*') {
+        return None;
+    }
+    let (before_reason, _why) = body.rsplit_once(" — *not embedded: ")?;
+    let (caption, path) = if let Some(cap_and_facts) = before_reason.strip_prefix(":** ") {
+        let (caption, path) = split_file_facts(cap_and_facts)?;
+        (Some(caption.to_string()).filter(|c| !c.is_empty()), path)
+    } else {
+        let facts = before_reason.strip_prefix("** — ")?;
+        let (label, path) = split_file_facts(facts)?;
+        if !label.is_empty() {
+            return None;
+        }
+        (None, path)
+    };
+    Some(EvidenceBlock::Image {
+        artifact: block_file(path),
+        caption,
+    })
 }
 
 /// `![caption](path)` alone, with a workspace-relative path (`<path>` when it
