@@ -106,7 +106,9 @@ export default function Sessions() {
   // scrolling keeps loading (a later page may match).
   const waiting = waitingLabel(slices);
   const missing = notIncluded(slices);
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: rows.length });
+  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
+  // the footer (still mounted, to keep paging) does not repeat it.
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: rows.length, waitingShown: visible.length === 0 });
 
   // Row-level archive / restore / delete — each drops the row and re-syncs
   // just its host after success.

@@ -787,10 +787,12 @@ export default function AutoflowRuns() {
   // them, so scrolling keeps loading (a later page may match).
   const eventsWaiting = waitingLabel(events.slices);
   const eventsMissing = notIncluded(events.slices);
-  const eventsFooter = perHostFooterText({ slices: events.slices, loading: events.loading, hasMore: events.hasMore, ended: events.ended, count: events.rows.length });
+  // With every loaded row filtered out a feed shows "No matches yet · Waiting on X…" itself, so its
+  // footer (still mounted, to keep paging) does not repeat it.
+  const eventsFooter = perHostFooterText({ slices: events.slices, loading: events.loading, hasMore: events.hasMore, ended: events.ended, count: events.rows.length, waitingShown: visibleEvents.length === 0 });
   const cyclesWaiting = waitingLabel(cycles.slices);
   const cyclesMissing = notIncluded(cycles.slices);
-  const cyclesFooter = perHostFooterText({ slices: cycles.slices, loading: cycles.loading, hasMore: cycles.hasMore, ended: cycles.ended, count: cycles.rows.length });
+  const cyclesFooter = perHostFooterText({ slices: cycles.slices, loading: cycles.loading, hasMore: cycles.hasMore, ended: cycles.ended, count: cycles.rows.length, waitingShown: visibleCycles.length === 0 });
 
   return (
     <div className="p-8">

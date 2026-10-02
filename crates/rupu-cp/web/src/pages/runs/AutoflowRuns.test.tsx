@@ -734,3 +734,38 @@ describe('AutoflowRuns — per-host state (events + cycles)', () => {
     expect(screen.getByText('fix-issue')).toBeInTheDocument();
   });
 });
+
+describe('AutoflowRuns — Find while a host is still loading', () => {
+  it('Runs tab: says who it is waiting on once, not again in the footer', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([{ ...REMOTE_EVENT, event_id: 'evt-l', host_id: 'local' }])
+        : new Promise(() => {}),
+    );
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find autoflows…'), { target: { value: 'zzz-no-match' } });
+
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+  });
+
+  it('Cycles tab: says who it is waiting on once, not again in the footer', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([{ ...CYCLE, host_id: 'local' }]) : new Promise(() => {}),
+    );
+    renderPage();
+    fireEvent.click(screen.getByText('Cycles'));
+    await waitFor(() => expect(screen.getByText('worker-1')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find autoflows…'), { target: { value: 'zzz-no-match' } });
+
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+  });
+});

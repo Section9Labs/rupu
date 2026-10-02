@@ -313,6 +313,8 @@ describe('WorkflowRuns — the trigger filter while hosts are still loading or p
     fireEvent.click(screen.getByRole('button', { name: 'Cron' }));
     await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
     expect(screen.queryByText('No runs match this filter')).not.toBeInTheDocument();
+    // Said once: the footer below does not repeat who it is waiting on.
+    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
   });
 
   it('keeps paging while the filter hides every loaded row, so a later page can match', async () => {

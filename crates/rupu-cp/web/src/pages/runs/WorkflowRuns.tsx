@@ -260,7 +260,9 @@ export default function WorkflowRuns() {
   // all of them, so scrolling keeps loading (a later page may match).
   const waiting = waitingLabel(slices);
   const missing = notIncluded(slices);
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: filtered.length });
+  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
+  // the footer (still mounted, to keep paging) does not repeat it.
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: filtered.length, waitingShown: visible.length === 0 });
   const footer = (text: string) =>
     !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
 

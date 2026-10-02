@@ -270,4 +270,24 @@ describe('Usage page — background refreshes are quiet', () => {
     expect(api.getUsageRuns).toHaveBeenCalledTimes(2);
     expect(screen.getByRole('status', { name: 'updating' })).toBeInTheDocument();
   });
+
+  it('drops the "updating" cue once every host has failed for the new window, leaving the error chip', async () => {
+    vi.mocked(api.getUsageRuns).mockResolvedValue([runRow()]);
+    vi.mocked(api.getUsage)
+      .mockResolvedValueOnce(usageResponse())
+      // Every host's request for the new window fails: nothing is left to wait on.
+      .mockRejectedValue(new Error('usage down'));
+    renderUsage();
+    await flush();
+    expect(screen.queryByRole('status', { name: 'updating' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await flush();
+    await flush();
+    expect(api.getUsage).toHaveBeenCalledTimes(2);
+    // The last good headline still stands in for the window...
+    expect(screen.getByText(/refresh failed/)).toBeInTheDocument();
+    // ...but a spinner beside "refresh failed" would never end (a drag-selected window never retries).
+    expect(screen.queryByRole('status', { name: 'updating' })).not.toBeInTheDocument();
+  });
 });

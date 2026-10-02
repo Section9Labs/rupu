@@ -116,7 +116,10 @@ export default function Usage() {
   if (current) lastGood.current = current;
   const data = current ?? lastGood.current;
   // The last good headline is standing in for a window no host has answered yet.
-  const headlineStale = current === null && data !== null;
+  // If every host has failed for it (`error`), the "refresh failed" chip says so
+  // and the cue stops: a drag-selected window never retries, so a spinner beside
+  // that chip would spin forever.
+  const headlineStale = current === null && data !== null && !error;
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   // Task loading-ux: pivot switches and filter-exclusion toggles trigger a

@@ -466,3 +466,19 @@ describe('Sessions — codenames', () => {
     expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
   });
 });
+
+describe('Sessions — Find while a host is still loading', () => {
+  it('says who it is waiting on once, not again in the footer', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([{ ...REMOTE_SESSION, host_id: 'local' }]) : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
+
+    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
+    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+  });
+});

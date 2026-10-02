@@ -293,7 +293,9 @@ export default function AgentRuns() {
   // Standalone) or Find hides all of them, so scrolling keeps loading (a later page may match).
   const waiting = waitingLabel(slices);
   const missing = notIncluded(slices);
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: sorted.length });
+  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
+  // the footer (still mounted, to keep paging) does not repeat it.
+  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: sorted.length, waitingShown: visible.length === 0 });
   const footer = (text: string) => (
     <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />
   );

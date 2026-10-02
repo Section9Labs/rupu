@@ -15,18 +15,24 @@ export function PerHostStrip<T>({ slices }: { slices: HostSlice<T>[] }) {
   );
 }
 
-/** The sentinel line under a per-host list (`count` = rows the page shows after its own filters). */
+/**
+ * The sentinel line under a per-host list (`count` = rows the page shows after its own filters).
+ * `waitingShown`: the page already says who it is waiting on (the "No matches yet · Waiting on
+ * X…" state), so the footer leaves that line blank instead of repeating it. The sentinel itself
+ * still renders, so paging keeps going.
+ */
 export function perHostFooterText<T>(p: {
   slices: HostSlice<T>[];
   loading: boolean;
   hasMore: boolean;
   ended: boolean;
   count: number;
+  waitingShown?: boolean;
 }): string {
   if (p.loading) return 'loading more…';
   if (p.hasMore) return 'scroll for more';
   const waiting = waitingOn(p.slices);
-  if (!p.ended && waiting.length) return `waiting on ${waiting.join(', ')}…`;
+  if (!p.ended && waiting.length) return p.waitingShown ? '' : `waiting on ${waiting.join(', ')}…`;
   const missing = notIncluded(p.slices);
   const suffix = missing ? ` · not included: ${missing}` : '';
   // A host whose older rows could not load has not ended: no "end of" claim (PagingFailures says why).
