@@ -1381,10 +1381,16 @@ async fn upload_usage_ledger(
 /// sha256s of the `stored: copied` artifacts that findings in a run's
 /// coverage stream reference. A torn trailing line, an unparseable line, or
 /// an entry whose hash isn't a store key is skipped, never an error.
+///
+/// The file is read as bytes and decoded lossily: a run that was killed
+/// mid-write can leave its last line cut inside a multi-byte character, and a
+/// strict UTF-8 read would fail the WHOLE stream — losing every reference on
+/// the valid lines before it. The torn line just fails to parse and is skipped.
 fn referenced_artifacts(stream: &Path) -> std::collections::BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(stream) else {
+    let Ok(bytes) = std::fs::read(stream) else {
         return Default::default();
     };
+    let text = String::from_utf8_lossy(&bytes);
     text.lines()
         .filter_map(|l| serde_json::from_str::<rupu_coverage::StreamLine>(l).ok())
         .filter_map(|l| match l {
@@ -3172,6 +3178,33 @@ mod tests {
         assert_eq!(
             referenced_artifacts(&stream),
             std::collections::BTreeSet::from([a, b])
+        );
+    }
+
+    /// A run killed mid-write can leave the stream's last line cut inside a
+    /// multi-byte UTF-8 character. That torn tail is skipped like any other
+    /// unparseable line; it must not lose the references on the valid lines
+    /// before it.
+    #[test]
+    fn referenced_artifacts_survive_a_tail_torn_mid_utf8_character() {
+        use rupu_coverage::report::ArtifactStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join(rupu_coverage::STREAM_FILE);
+        let a = "ab".repeat(32);
+        let mut body = (begin_stream_line()
+            + &findings_stream_line("f1", vec![(&a, ArtifactStorage::Copied)]))
+            .into_bytes();
+        // `{"ledger":"findings","scope_name":"caf` + the first byte of "é".
+        body.extend_from_slice(b"{\"ledger\":\"findings\",\"scope_name\":\"caf");
+        body.push(0xC3);
+        assert!(
+            String::from_utf8(body.clone()).is_err(),
+            "tail must be invalid UTF-8"
+        );
+        std::fs::write(&stream, body).unwrap();
+        assert_eq!(
+            referenced_artifacts(&stream),
+            std::collections::BTreeSet::from([a])
         );
     }
 

@@ -347,8 +347,9 @@ impl HostConnector for BucketHostConnector {
             .await
             .map_err(|e| match e {
                 BucketError::NotFound(_) => HostConnectorError::NotFound(format!(
-                    "artifact {sha256} was not uploaded to bucket host {} (its worker may \
-                     predate artifact upload, or the upload failed)",
+                    "artifact {sha256} was not uploaded to bucket host {} (the run may not \
+                     have finished yet — a worker uploads its blobs when the run ends — its \
+                     worker may predate artifact upload, or the upload failed)",
                     self.host_id
                 )),
                 other => bucket_err_to_unreachable(other),
@@ -771,6 +772,8 @@ mod tests {
                 assert!(msg.contains(&sha), "{msg}");
                 assert!(msg.contains("host_bucket_1"), "{msg}");
                 assert!(msg.contains("not uploaded"), "{msg}");
+                // Blobs upload when the run ends, so "not there yet" is a cause.
+                assert!(msg.contains("may not have finished"), "{msg}");
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
