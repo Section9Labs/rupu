@@ -96,6 +96,10 @@ pub const CAP_MIRROR_COVERAGE: &str = "mirror.coverage";
 /// `GET /api/runs/:id/coverage`.
 pub const CAP_RUN_COVERAGE_STREAM: &str = "run.coverage_stream";
 
+/// HTTP `/api/host/info` `features` entry: this CP serves
+/// `GET /api/findings/artifacts/:sha256` from its artifact store.
+pub const CAP_FINDINGS_ARTIFACT_BLOB: &str = "findings.artifact_blob";
+
 /// What this CP advertises to a node in `Welcome`.
 pub fn cp_capabilities() -> Vec<String> {
     vec![
@@ -126,6 +130,7 @@ pub fn host_features() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
+        CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
     ]
 }
 

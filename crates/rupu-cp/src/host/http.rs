@@ -22,6 +22,10 @@ use crate::{
     session_starter::SessionStartRequest,
 };
 
+/// Whole-transfer bound for one artifact pull. Replaces the client's 30 s
+/// total timeout (sized for JSON calls) on that request alone.
+const ARTIFACT_PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 // ── Struct ────────────────────────────────────────────────────────────────────
 
 /// Remote-host connector: forwards every [`HostConnector`] call as an HTTP
@@ -549,13 +553,60 @@ impl HostConnector for HttpHostConnector {
     }
     async fn pull_finding_artifact(
         &self,
-        _sha256: &str,
-        _dest: &std::path::Path,
-        _max_bytes: u64,
+        sha256: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
     ) -> Result<(), HostConnectorError> {
-        Err(HostConnectorError::Unsupported(
-            "artifact pull over this transport is not implemented yet".into(),
-        ))
+        use tokio::io::AsyncWriteExt;
+        crate::host::connector::validate_sha256(sha256)?;
+        // An older remote answers an unknown /api path with the SPA and 200,
+        // so the feature — not the status — says whether this is a blob.
+        self.require_feature(
+            crate::node::protocol::CAP_FINDINGS_ARTIFACT_BLOB,
+            "this finding artifact cannot be pulled",
+        )
+        .await?;
+        // The client's 30 s total timeout would cut a large blob short, and a
+        // per-request timeout overrides it: an artifact pull gets its own
+        // bound (the whole transfer, not an idle gap).
+        let resp = self
+            .send(
+                self.client
+                    .get(self.url(&format!("/api/findings/artifacts/{sha256}")))
+                    .timeout(ARTIFACT_PULL_TIMEOUT),
+            )
+            .await?;
+        let too_big = || {
+            HostConnectorError::Invalid(format!(
+                "artifact {sha256} exceeds its recorded {max_bytes} bytes"
+            ))
+        };
+        // A declared length over the cap is refused before anything is
+        // written; a chunked body is held to the cap as it arrives.
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(too_big());
+        }
+        let write_err =
+            |e: std::io::Error| HostConnectorError::Invalid(format!("local write failed: {e}"));
+        // On any failure past this point `dest` may be partially written; the
+        // caller owns its cleanup and only a returned `Ok` means it is whole.
+        let mut file = tokio::fs::File::create(dest).await.map_err(write_err)?;
+        let mut stream = resp.bytes_stream();
+        let mut total: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                HostConnectorError::Unreachable(format!(
+                    "reading artifact {sha256} from the remote failed: {e}"
+                ))
+            })?;
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(too_big());
+            }
+            file.write_all(&chunk).await.map_err(write_err)?;
+        }
+        file.flush().await.map_err(write_err)?;
+        Ok(())
     }
 
     async fn proxy_get_json(

@@ -34,6 +34,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/:id/export", get(export_finding))
         .route("/api/findings/:id/artifacts/:sha256", get(get_artifact))
+        .route("/api/findings/artifacts/:sha256", get(get_artifact_blob))
 }
 
 /// A single finding plus its provenance (which workspace / project / coverage
@@ -647,12 +648,26 @@ async fn get_artifact(
         })?,
     };
 
+    Ok(artifact_response(file, artifact.kind, &artifact.path))
+}
+
+/// The one way artifact bytes leave this CP: streamed from `file`, never
+/// renderable as HTML. Text is `text/plain; charset=utf-8` inline; anything
+/// else (`kind` binary or unknown) an `application/octet-stream` attachment.
+/// ALWAYS `X-Content-Type-Options: nosniff` and
+/// `Content-Security-Policy: sandbox`. `name` (a recorded path or any label)
+/// becomes the download's `filename`, reduced to a safe basename.
+pub(crate) fn artifact_response(
+    file: tokio::fs::File,
+    kind: Option<ArtifactKind>,
+    name: &str,
+) -> Response {
     let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
         file,
         STREAM_CHUNK_BYTES,
     ));
-    let name = safe_filename(&artifact.path);
-    let (ctype, disposition) = match artifact.kind {
+    let name = safe_filename(name);
+    let (ctype, disposition) = match kind {
         Some(ArtifactKind::Text) => (
             "text/plain; charset=utf-8",
             format!("inline; filename=\"{name}\""),
@@ -680,7 +695,44 @@ async fn get_artifact(
         HeaderValue::from_str(&disposition)
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
-    Ok(resp)
+    resp
+}
+
+/// `GET /api/findings/artifacts/:sha256` — a blob from THIS host's artifact
+/// store, by hash, for a coordinator pulling a placed unit's artifact (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §B1). Unlike
+/// `get_artifact` it does not check that any finding references the blob: the
+/// coordinator's own `/api/findings/:id/artifacts/:sha256` decides what a
+/// browser may see, and this is the host-to-coordinator channel behind the
+/// CP's bearer token. Only the content-addressed store is reachable (a
+/// malformed digest is a 400 before any path is built), and the bytes leave
+/// through [`artifact_response`] like every other artifact.
+async fn get_artifact_blob(
+    State(s): State<AppState>,
+    Path(sha): Path<String>,
+) -> Result<Response, ApiError> {
+    let blob = ArtifactStore::new(s.global_dir.join("findings").join("artifacts"))
+        .blob_path_checked(&sha)
+        .ok_or_else(|| {
+            ApiError::bad_request("artifact id must be a 64-character lowercase sha256")
+        })?;
+    let absent = || ApiError::not_found(format!("artifact {sha} is not in this host's store"));
+    // Open first, then read the type off the handle we got: a path check
+    // followed by a later open is a race, and a plain open of a FIFO parks a
+    // blocking-pool thread forever. `open_regular_file` is non-blocking and
+    // refuses anything but a regular file.
+    let file = tokio::task::spawn_blocking(move || crate::api::fs_open::open_regular_file(&blob))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => absent(),
+            _ => ApiError::internal(e.to_string()),
+        })?;
+    Ok(artifact_response(
+        tokio::fs::File::from_std(file),
+        None,
+        &sha,
+    ))
 }
 
 // ── report exports ──────────────────────────────────────────────────────────

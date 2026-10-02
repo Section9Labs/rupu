@@ -1013,3 +1013,252 @@ async fn unit_coverage_refuses_a_remote_with_no_host_info_route() {
     );
     stream.assert_hits(0);
 }
+// ── Remote findings Plan B, Task 3: artifact blobs over HTTP ─────────────────
+
+fn store_blob(global: &std::path::Path, sha: &str, body: &[u8]) {
+    let p = rupu_coverage::report::ArtifactStore::new(global.join("findings").join("artifacts"))
+        .blob_path(sha);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, body).unwrap();
+}
+
+/// [`serve_cp`] over a CP whose global dir is `global`.
+async fn serve_cp_at(global: &std::path::Path) -> std::net::SocketAddr {
+    serve_cp(rupu_cp::state::AppState::new(
+        global.to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    ))
+    .await
+}
+
+/// End to end against a real remote CP: the connector sees the feature on
+/// `/api/host/info`, streams the blob into `dest`, and refuses a blob that
+/// outgrows its recorded size or is absent.
+#[tokio::test]
+async fn pull_finding_artifact_streams_a_real_remotes_blob() {
+    let remote = tempfile::tempdir().unwrap();
+    let sha = "ab".repeat(32);
+    store_blob(remote.path(), &sha, b"remote poc");
+    let addr = serve_cp_at(remote.path()).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let dest = tempfile::tempdir().unwrap();
+    let out = dest.path().join("pulled");
+    c.pull_finding_artifact(&sha, &out, 10).await.unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"remote poc");
+
+    // Over the recorded size: refused mid-stream.
+    assert!(matches!(
+        c.pull_finding_artifact(&sha, &out, 3).await,
+        Err(HostConnectorError::Invalid(_))
+    ));
+    // Absent on the remote.
+    assert!(matches!(
+        c.pull_finding_artifact(&"cd".repeat(32), &out, 10).await,
+        Err(HostConnectorError::NotFound(_))
+    ));
+    // A malformed digest never reaches the wire.
+    assert!(matches!(
+        c.pull_finding_artifact("../x", &out, 10).await,
+        Err(HostConnectorError::Invalid(_))
+    ));
+}
+
+/// An older remote answers an unknown /api path with the SPA, so the
+/// connector must check the feature before it trusts a status.
+#[tokio::test]
+async fn pull_finding_artifact_refuses_a_remote_without_the_feature() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(serde_json::json!({"version": "0.70.0", "features": []}));
+    });
+    let blob = server.mock(|when, then| {
+        when.method("GET")
+            .path_matches(httpmock::Regex::new(r"^/api/findings/artifacts/").unwrap());
+        then.status(200).body("<!doctype html>");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let dest = tempfile::tempdir().unwrap();
+    let out = dest.path().join("x");
+    let err = c
+        .pull_finding_artifact(&"ab".repeat(32), &out, 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err:?}");
+    blob.assert_hits(0);
+    assert!(!out.exists(), "a refused pull must not create dest");
+}
+
+/// A remote that errors (not 404) surfaces as `Remote`, and leaves no claim
+/// of success.
+#[tokio::test]
+async fn pull_finding_artifact_maps_a_remote_error_status() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.70.0",
+            "features": ["findings.artifact_blob"]
+        }));
+    });
+    let sha = "ab".repeat(32);
+    server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/findings/artifacts/{sha}"));
+        then.status(500).body("boom");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let dest = tempfile::tempdir().unwrap();
+    let err = c
+        .pull_finding_artifact(&sha, &dest.path().join("x"), 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HostConnectorError::Remote(500, _)), "{err:?}");
+}
+
+/// The endpoint is a security surface: every success response is a
+/// `nosniff` + `sandbox` octet-stream attachment; a malformed digest is 400
+/// before any path is built; a directory where a blob should be is 404.
+#[tokio::test]
+async fn artifact_blob_endpoint_headers_and_validation() {
+    let remote = tempfile::tempdir().unwrap();
+    let sha = "ab".repeat(32);
+    store_blob(remote.path(), &sha, b"<script>alert(1)</script>");
+    // A directory squatting on a (never written) blob's path.
+    let dir_sha = "ee".repeat(32);
+    let squat =
+        rupu_coverage::report::ArtifactStore::new(remote.path().join("findings").join("artifacts"))
+            .blob_path(&dir_sha);
+    std::fs::create_dir_all(&squat).unwrap();
+    // A FIFO with no writer: a blocking open would park forever.
+    let fifo_sha = "ff".repeat(32);
+    let fifo =
+        rupu_coverage::report::ArtifactStore::new(remote.path().join("findings").join("artifacts"))
+            .blob_path(&fifo_sha);
+    std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    let have_fifo = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|s| s.success());
+    let addr = serve_cp_at(remote.path()).await;
+
+    #[allow(clippy::disallowed_methods)]
+    let ok = reqwest::get(format!("http://{addr}/api/findings/artifacts/{sha}"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let h = ok.headers().clone();
+    assert_eq!(h["content-type"], "application/octet-stream");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["content-security-policy"], "sandbox");
+    assert!(
+        h["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment"),
+        "{:?}",
+        h["content-disposition"]
+    );
+    assert_eq!(
+        ok.bytes().await.unwrap().as_ref(),
+        b"<script>alert(1)</script>"
+    );
+
+    // Well-formed but absent: a JSON 404.
+    #[allow(clippy::disallowed_methods)]
+    let absent = reqwest::get(format!(
+        "http://{addr}/api/findings/artifacts/{}",
+        "cd".repeat(32)
+    ))
+    .await
+    .unwrap();
+    assert_eq!(absent.status(), 404);
+    let body: serde_json::Value = absent.json().await.unwrap();
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("not in this host's store"));
+
+    // Not a regular file: 404, never an open attempt that could hang.
+    #[allow(clippy::disallowed_methods)]
+    let squatted = reqwest::get(format!("http://{addr}/api/findings/artifacts/{dir_sha}"))
+        .await
+        .unwrap();
+    assert_eq!(squatted.status(), 404);
+    if have_fifo {
+        #[allow(clippy::disallowed_methods)]
+        let piped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reqwest::get(format!("http://{addr}/api/findings/artifacts/{fifo_sha}")),
+        )
+        .await
+        .expect("a FIFO in the store must not hang the handler")
+        .unwrap();
+        assert_eq!(piped.status(), 404);
+    }
+
+    for bad in [
+        "AB".repeat(32),      // uppercase
+        "a".repeat(63),       // short
+        "a".repeat(65),       // long
+        "..%2Fx".to_string(), // decodes to a traversal
+    ] {
+        #[allow(clippy::disallowed_methods)]
+        let r = reqwest::get(format!("http://{addr}/api/findings/artifacts/{bad}"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+}
+
+/// A host that serves the blob endpoint says so on `/api/host/info`.
+#[tokio::test]
+async fn host_info_advertises_the_artifact_blob_feature() {
+    let remote = tempfile::tempdir().unwrap();
+    let addr = serve_cp_at(remote.path()).await;
+    #[allow(clippy::disallowed_methods)]
+    let info: serde_json::Value = reqwest::get(format!("http://{addr}/api/host/info"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let features: Vec<&str> = info["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f.as_str())
+        .collect();
+    assert!(features.contains(&"findings.artifact_blob"), "{features:?}");
+}
+
+/// A remote that declares a length over the recorded size is refused before
+/// anything is written.
+#[tokio::test]
+async fn pull_finding_artifact_refuses_a_declared_oversize_before_writing() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.70.0",
+            "features": ["findings.artifact_blob"]
+        }));
+    });
+    let sha = "ab".repeat(32);
+    server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/findings/artifacts/{sha}"));
+        then.status(200).body("0123456789");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let dest = tempfile::tempdir().unwrap();
+    let out = dest.path().join("x");
+    let err = c.pull_finding_artifact(&sha, &out, 4).await.unwrap_err();
+    assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    assert!(
+        !out.exists(),
+        "an oversize declaration must not create dest"
+    );
+}
