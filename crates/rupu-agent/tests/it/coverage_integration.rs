@@ -142,6 +142,7 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
     assert_eq!(m.surface, Surface::Agent);
     assert_eq!(m.scope_name, "test-agent");
     assert_eq!(m.user_prompt, "Check coverage.");
+    assert_eq!(m.continued_from, None, "an ordinary run continues nothing");
     assert_eq!(m.workspace_path, workspace);
 }
 

@@ -164,6 +164,21 @@ pub(crate) fn seed_sha256(messages: &[Message]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// Append a user turn without breaking role alternation. When the
+/// conversation already ends in a user message (a seed that ends on the
+/// prompt or on tool results), `text` joins that message as an extra block
+/// instead of becoming a second consecutive user message, which some
+/// providers reject. `replay::reconstruct_messages` applies the same rule,
+/// so replaying a transcript keeps reproducing what the runner sent.
+pub(crate) fn push_user_turn(messages: &mut Vec<Message>, text: &str) {
+    match messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.push(ContentBlock::Text {
+            text: text.to_string(),
+        }),
+        _ => messages.push(Message::user(text)),
+    }
+}
+
 /// Drop the oldest assistant↔user exchange from the conversation so the
 /// next request fits the model's context window. Preserves Anthropic's
 /// invariants: the message list still starts with the original (user)
@@ -1238,6 +1253,8 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 concerns: block.clone(),
                 scope_name: resolved_scope.to_string(),
                 workspace_path: opts.workspace_path.clone(),
+                continued_from: crate::continuation::continued_from(opts)
+                    .map(|p| p.display().to_string()),
             };
             if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
                 tracing::warn!(error = %e, "failed to write coverage run manifest");
@@ -1454,16 +1471,16 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
         })?;
     }
     // Conditional user-turn append. An EMPTY `user_message` means "seed-only":
-    // the caller has supplied a complete, ready-to-send transcript via
-    // `initial_messages` (e.g. the orchestrator resuming a tool-boundary pause,
-    // where the seed already ends in a `tool_result` that pairs with the
-    // preceding assistant `tool_use`). Appending a fresh user turn there would
-    // either double the user turn or — worse — strand the assistant's
-    // `tool_use` with no matching `tool_result`, which real Anthropic rejects
-    // with a 400. So we only append when there is an actual message to add.
-    // Every existing caller passes a non-empty `user_message` and is unaffected.
+    // `initial_messages` is a complete, ready-to-send conversation (e.g. the
+    // orchestrator resuming a tool-boundary pause, where the seed already ends
+    // in a `tool_result` that pairs with the preceding assistant `tool_use`, or
+    // a continuation whose seed already ends in the continuation note), and
+    // nothing is appended. A non-empty `user_message` goes through
+    // `push_user_turn`: it becomes a new user turn, or — when the seed ends in
+    // a user turn, as after a tool turn — joins that turn rather than creating
+    // two consecutive user messages, which providers reject.
     if !opts.user_message.is_empty() {
-        messages.push(Message::user(&opts.user_message));
+        push_user_turn(&mut messages, &opts.user_message);
         writer.write(&Event::UserMessage {
             content: opts.user_message.clone(),
         })?;

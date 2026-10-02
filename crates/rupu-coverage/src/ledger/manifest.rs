@@ -25,6 +25,13 @@ pub struct RunManifest {
     /// (agent name for agent runs, session id for session runs, etc.).
     pub scope_name: String,
     pub workspace_path: std::path::PathBuf,
+    /// Set when this run continued an interrupted one (`rupu run --continue`):
+    /// the transcript it was seeded from. Such a run's `user_prompt` is only
+    /// the continuation note — the real prompt lives with the run it
+    /// continued — so a rerun must start from that run instead. Absent on
+    /// manifests written before continuation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
 }
 
 /// Append a manifest row to `runs.jsonl` (creates the file if absent).
@@ -86,6 +93,7 @@ mod tests {
             },
             scope_name: "reviewer".to_string(),
             workspace_path: std::path::PathBuf::from("/tmp/repo"),
+            continued_from: None,
         }
     }
 
@@ -113,6 +121,30 @@ mod tests {
             "run_b"
         );
         assert!(find_manifest(&paths, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_manifest_written_before_continuation_still_reads() {
+        // No `continued_from` key at all — the shape every pre-continuation
+        // run wrote.
+        let mut v = serde_json::to_value(sample("run_old")).unwrap();
+        assert!(v
+            .as_object_mut()
+            .unwrap()
+            .remove("continued_from")
+            .is_none());
+        let m: RunManifest = serde_json::from_value(v).unwrap();
+        assert_eq!(m, sample("run_old"));
+    }
+
+    #[test]
+    fn continued_from_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let mut m = sample("run_b");
+        m.continued_from = Some("/t/run_a.jsonl".to_string());
+        append_manifest(&paths, &m).unwrap();
+        assert_eq!(read_manifests(&paths).unwrap(), vec![m]);
     }
 
     #[test]

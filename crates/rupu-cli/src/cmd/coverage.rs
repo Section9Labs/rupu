@@ -1233,6 +1233,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         // Rerun uses the code path unless/until the run manifest records the
         // engagement selection (follow-on); it never silently guesses one.
         engagement_profiles: Vec::new(),
+        continue_from: None,
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),
@@ -1494,6 +1495,7 @@ mod tests {
             },
             scope_name: "ses_1".to_string(),
             workspace_path: tmp.path().to_path_buf(),
+            continued_from: None,
         };
         append_manifest(&paths, &m).unwrap();
         let loaded = find_manifest(&paths, "run_sess").unwrap().unwrap();
@@ -1731,6 +1733,7 @@ mod tests {
             },
             scope_name: "a".to_string(),
             workspace_path: tmp.path().to_path_buf(),
+            continued_from: None,
         };
         append_manifest(&paths, &m).unwrap();
 

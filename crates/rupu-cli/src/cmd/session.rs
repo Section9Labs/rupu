@@ -11387,8 +11387,20 @@ mod tests {
 
         let full = rupu_agent::replay::reconstruct_transcript(&transcript_next)
             .expect("post-compact transcript reconstructs cleanly");
+        // The compacted history ends on a user turn, so the new prompt joins
+        // it as an extra text block (the role-alternation rule in
+        // `runner::push_user_turn`) instead of following it as a second
+        // consecutive user message.
         let mut expected = after_compact.message_history.clone();
-        expected.push(Message::user("post-compact prompt"));
+        let trailing = expected.last_mut().expect("compacted history is not empty");
+        assert_eq!(
+            trailing.role,
+            rupu_providers::types::Role::User,
+            "this scenario must exercise the merge: compacted history ends on a user turn"
+        );
+        trailing.content.push(rupu_providers::types::ContentBlock::Text {
+            text: "post-compact prompt".to_string(),
+        });
         expected.push(Message::assistant("ack"));
         assert_eq!(
             serde_json::to_value(&full).unwrap(),

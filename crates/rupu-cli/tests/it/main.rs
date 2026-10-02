@@ -38,6 +38,7 @@ mod models_subcommand;
 mod multi_provider_e2e;
 mod no_stream_flag;
 mod output_line_stream;
+mod run_continue;
 mod run_header;
 mod run_model_limits;
 mod run_target_parse;
