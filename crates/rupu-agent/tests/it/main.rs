@@ -6,7 +6,7 @@
 //!
 //! `tests/fd_pressure.rs` deliberately stays its own binary: it lowers the
 //! process's `RLIMIT_NOFILE`, which would starve every other test here. So
-//! do `tests/terminating{,_compact_messages,_compaction,_overflow}.rs`: they
+//! do `tests/terminating{,_compact_messages,_compaction,_fallback,_overflow}.rs`: they
 //! raise `credential_writes::request_termination()`'s process-wide flag,
 //! which is never cleared and would make every other run here abort as
 //! terminating.

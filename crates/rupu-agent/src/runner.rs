@@ -931,6 +931,9 @@ fn provider_exhausted(
 enum FallBack {
     /// Nothing left to try, or the action cap is reached: rung 3.
     Exhausted,
+    /// SIGTERM has arrived: no hop was selected, built or announced. The
+    /// caller closes the run with [`terminated`].
+    Terminated,
     /// A hop now serves the attempt. `messages_changed`: it compacted the
     /// history or added the retry note, so a request built before the hop
     /// is stale.
@@ -941,8 +944,12 @@ enum FallBack {
 /// next fallback in the chain that builds — same-provider entries when
 /// `p.rung1`, then other providers when `p.rung2`.
 ///
+/// - Unnamed entries resolve to the provider the attempt started on
+///   (`RecoveryState::with_origin`), wherever it has hopped since.
 /// - Every candidate costs one recovery action, a skipped one included;
-///   at `MAX_RECOVERY_ACTIONS` the ladder stops.
+///   at `MAX_RECOVERY_ACTIONS` the ladder stops without selecting another.
+/// - Once SIGTERM has arrived no hop is selected, built or announced:
+///   [`FallBack::Terminated`].
 /// - A candidate with no hop builder, or one that fails to build, writes
 ///   `Recovery { Skipped, reason }` and the next is tried.
 /// - A built hop replaces `opts.provider`, `provider_name`, `model` and
@@ -968,16 +975,20 @@ async fn fall_back(
     compacted_this_turn: &mut bool,
     last_input_tokens: u32,
 ) -> Result<FallBack, RunError> {
-    while let Some((rung, entry)) = recovery.next_hop(
-        &opts.recovery.chain,
-        &opts.provider_name,
-        &opts.model,
-        p.rung1,
-        p.rung2,
-    ) {
-        if !recovery.take_action() {
-            break;
+    loop {
+        if rupu_providers::credential_writes::terminating() {
+            return Ok(FallBack::Terminated);
         }
+        let Some((rung, entry)) = recovery.take_hop(
+            &opts.recovery.chain,
+            &opts.provider_name,
+            &opts.model,
+            p.rung1,
+            p.rung2,
+        ) else {
+            return Ok(FallBack::Exhausted);
+        };
+        // `next_hop` resolves an unnamed entry's provider (to the origin).
         let provider_name = entry
             .provider
             .clone()
@@ -986,6 +997,10 @@ async fn fall_back(
             None => Err("no hop builder in this context".to_string()),
             Some(builder) => builder.build(&provider_name, &entry.model).await,
         };
+        // SIGTERM during the build: the hop is never announced or used.
+        if rupu_providers::credential_writes::terminating() {
+            return Ok(FallBack::Terminated);
+        }
         let hop = match built {
             Ok(hop) => hop,
             Err(reason) => {
@@ -1062,7 +1077,6 @@ async fn fall_back(
         writer.flush()?;
         return Ok(FallBack::Hopped { messages_changed });
     }
-    Ok(FallBack::Exhausted)
 }
 
 /// The malformed-tool correction note for a `malformed_tool_call` stop.
@@ -1791,7 +1805,9 @@ async fn run_agent_inner(
         let mut last_turn_input_tokens: u32 = 0;
         // Rung-0 recovery state (spec 2026-10-01 §5.2): outcome ids, per-turn
         // budgets and the run's action cap.
-        let mut recovery = crate::recovery::RecoveryState::new();
+        // Unnamed chain entries mean the provider the attempt started on.
+        let mut recovery =
+            crate::recovery::RecoveryState::with_origin(&opts.provider_name, &opts.model);
         // The turn a rung-0 continuation chain started on. Budgets are per
         // logical turn: a truncated answer and its continuations share one
         // budget, though each continuation is its own provider turn. Reset
@@ -2187,6 +2203,18 @@ async fn run_agent_inner(
                             writer.flush()?;
                             return Err(RunError::Preflight(e_str));
                         }
+                        // SIGTERM: the process is exiting. No outcome, no
+                        // ladder, no hop — the run closes as aborted.
+                        if matches!(e, rupu_providers::ProviderError::Terminating)
+                            || rupu_providers::credential_writes::terminating()
+                        {
+                            return Err(terminated(
+                                &mut writer,
+                                &opts.run_id,
+                                total_in + total_out,
+                                started,
+                            ));
+                        }
                         // The overflow pipeline above recognised this error
                         // (by class or by its text): it is a context overflow
                         // whatever the provider's own error class says.
@@ -2234,6 +2262,14 @@ async fn run_agent_inner(
                             last_turn_input_tokens,
                         )
                         .await?;
+                        if let FallBack::Terminated = hopped {
+                            return Err(terminated(
+                                &mut writer,
+                                &opts.run_id,
+                                total_in + total_out,
+                                started,
+                            ));
+                        }
                         if let FallBack::Hopped { messages_changed } = hopped {
                             // Retry the same request on the hop: its model and
                             // output cap, and every once-per-turn guard reset
@@ -2501,7 +2537,7 @@ async fn run_agent_inner(
                     }
                 }
                 // Rungs 1–2: retry the turn on a fallback.
-                if let FallBack::Hopped { .. } = fall_back(
+                match fall_back(
                     &mut writer,
                     opts,
                     messages,
@@ -2514,12 +2550,23 @@ async fn run_agent_inner(
                 )
                 .await?
                 {
-                    turn_idx += 1;
-                    chain_turn = None;
-                    if is_paused(&pause) {
-                        break 'turns LoopOutcome::Paused;
+                    FallBack::Hopped { .. } => {
+                        turn_idx += 1;
+                        chain_turn = None;
+                        if is_paused(&pause) {
+                            break 'turns LoopOutcome::Paused;
+                        }
+                        continue 'turns;
                     }
-                    continue 'turns;
+                    FallBack::Terminated => {
+                        return Err(terminated(
+                            &mut writer,
+                            &opts.run_id,
+                            total_in + total_out,
+                            started,
+                        ));
+                    }
+                    FallBack::Exhausted => {}
                 }
                 break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?;
             }
@@ -2773,7 +2820,7 @@ async fn run_agent_inner(
                             };
                             // Rungs 1–2: retry on a fallback. The `Capped`
                             // case takes no hop: every hop costs an action.
-                            if let FallBack::Hopped { .. } = fall_back(
+                            match fall_back(
                                 &mut writer,
                                 opts,
                                 messages,
@@ -2786,12 +2833,23 @@ async fn run_agent_inner(
                             )
                             .await?
                             {
-                                turn_idx += 1;
-                                chain_turn = None;
-                                if is_paused(&pause) {
-                                    break 'turns LoopOutcome::Paused;
+                                FallBack::Hopped { .. } => {
+                                    turn_idx += 1;
+                                    chain_turn = None;
+                                    if is_paused(&pause) {
+                                        break 'turns LoopOutcome::Paused;
+                                    }
+                                    continue 'turns;
                                 }
-                                continue 'turns;
+                                FallBack::Terminated => {
+                                    return Err(terminated(
+                                        &mut writer,
+                                        &opts.run_id,
+                                        total_in + total_out,
+                                        started,
+                                    ));
+                                }
+                                FallBack::Exhausted => {}
                             }
                             break 'turns exhausted(&mut writer, opts, o, &mut turn_idx)?;
                         }

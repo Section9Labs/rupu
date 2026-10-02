@@ -158,11 +158,30 @@ pub struct RecoveryState {
     /// `(provider, model)` pairs already hopped to.
     tried: HashSet<(Option<String>, String)>,
     outcomes: u32,
+    /// The provider/model the attempt started on. An entry without a
+    /// `provider` means this provider, wherever the attempt has hopped to
+    /// since (spec §6.1). `None`: the current provider/model stand in.
+    origin: Option<(String, String)>,
 }
 
 impl RecoveryState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// State for an attempt that starts on `provider`/`model`: unnamed
+    /// chain entries resolve against this provider, and rungs are counted
+    /// from it, for the whole run.
+    pub fn with_origin(provider: &str, model: &str) -> Self {
+        Self {
+            origin: Some((provider.to_string(), model.to_string())),
+            ..Self::default()
+        }
+    }
+
+    /// Whether [`MAX_RECOVERY_ACTIONS`] still leaves room for one more.
+    pub fn can_act(&self) -> bool {
+        self.actions < MAX_RECOVERY_ACTIONS
     }
 
     /// Count one action; false once [`MAX_RECOVERY_ACTIONS`] is reached.
@@ -186,8 +205,17 @@ impl RecoveryState {
     }
 
     /// Next untried hop: rung-1 entries first (if `allow_rung1`), then rung-2
-    /// (if `allow_rung2`). Skips the current provider/model and entries
-    /// already tried, and marks the returned entry tried.
+    /// (if `allow_rung2`), in chain order within each rung.
+    ///
+    /// - An entry without a `provider` resolves to the origin provider
+    ///   ([`RecoveryState::with_origin`]), not to the provider the attempt
+    ///   is on now. Rung 1 is an entry whose resolved provider is the
+    ///   origin's; rung 2 is every other.
+    /// - The current provider/model and the origin pair (the attempt
+    ///   already ran there) are never returned.
+    /// - The returned entry is marked tried (keyed on its resolved pair).
+    ///
+    /// The returned entry carries its resolved provider.
     pub fn next_hop(
         &mut self,
         chain: &[FallbackEntry],
@@ -196,20 +224,21 @@ impl RecoveryState {
         allow_rung1: bool,
         allow_rung2: bool,
     ) -> Option<(u8, FallbackEntry)> {
+        let (origin_provider, origin_model) = match &self.origin {
+            Some((p, m)) => (p.clone(), m.clone()),
+            None => (current_provider.to_string(), current_model.to_string()),
+        };
         for rung in [1u8, 2u8] {
             if (rung == 1 && !allow_rung1) || (rung == 2 && !allow_rung2) {
                 continue;
             }
             for entry in chain {
-                let same_provider = entry
-                    .provider
-                    .as_deref()
-                    .is_none_or(|p| p == current_provider);
-                if (rung == 1) != same_provider {
+                let provider = entry.provider.as_deref().unwrap_or(&origin_provider);
+                if (rung == 1) != (provider == origin_provider) {
                     continue;
                 }
-                let provider = entry.provider.as_deref().unwrap_or(current_provider);
-                if provider == current_provider && entry.model == current_model {
+                let is = |p: &str, m: &str| provider == p && entry.model == m;
+                if is(current_provider, current_model) || is(&origin_provider, &origin_model) {
                     continue;
                 }
                 let key = (Some(provider.to_string()), entry.model.clone());
@@ -217,10 +246,40 @@ impl RecoveryState {
                     continue;
                 }
                 self.tried.insert(key);
-                return Some((rung, entry.clone()));
+                return Some((
+                    rung,
+                    FallbackEntry {
+                        provider: Some(provider.to_string()),
+                        model: entry.model.clone(),
+                    },
+                ));
             }
         }
         None
+    }
+
+    /// [`Self::next_hop`] charged as one recovery action. At the action cap
+    /// it returns `None` without selecting, so no entry is marked tried.
+    pub fn take_hop(
+        &mut self,
+        chain: &[FallbackEntry],
+        current_provider: &str,
+        current_model: &str,
+        allow_rung1: bool,
+        allow_rung2: bool,
+    ) -> Option<(u8, FallbackEntry)> {
+        if !self.can_act() {
+            return None;
+        }
+        let hop = self.next_hop(
+            chain,
+            current_provider,
+            current_model,
+            allow_rung1,
+            allow_rung2,
+        )?;
+        self.take_action();
+        Some(hop)
     }
 
     /// Run-local outcome ids: `oc_1`, `oc_2`, ...
@@ -366,7 +425,10 @@ mod tests {
         let mut s = RecoveryState::new();
         let hop =
             |s: &mut RecoveryState| s.next_hop(&chain, "anthropic", "claude-opus-5-5", true, true);
-        assert_eq!(hop(&mut s), Some((1, chain[0].clone())));
+        assert_eq!(
+            hop(&mut s),
+            Some((1, entry(Some("anthropic"), "claude-opus-4-8")))
+        );
         assert_eq!(hop(&mut s), Some((1, chain[2].clone())));
         assert_eq!(hop(&mut s), Some((2, chain[1].clone())));
         assert_eq!(hop(&mut s), None);
@@ -387,7 +449,7 @@ mod tests {
         let mut s = RecoveryState::new();
         assert_eq!(
             s.next_hop(&chain, "anthropic", "claude-opus-5-5", true, false),
-            Some((1, chain[0].clone()))
+            Some((1, entry(Some("anthropic"), "claude-opus-4-8")))
         );
         assert_eq!(
             s.next_hop(&chain, "anthropic", "claude-opus-5-5", true, false),
@@ -407,6 +469,79 @@ mod tests {
             s.next_hop(&chain, "anthropic", "claude-opus-5-5", true, true),
             Some((2, chain[2].clone()))
         );
+    }
+
+    /// After a hop to another provider, an unnamed entry still means the
+    /// origin provider (spec §6.1) and is still rung 1.
+    #[test]
+    fn unnamed_entries_resolve_against_the_origin_after_a_hop() {
+        let chain = vec![
+            entry(None, "claude-a"),
+            entry(Some("codex"), "gpt-x"),
+            entry(Some("gemini"), "gemini-y"),
+        ];
+        let mut s = RecoveryState::with_origin("anthropic", "claude-opus-5-5");
+        // On the origin, overloaded: rung 2 only.
+        assert_eq!(
+            s.next_hop(&chain, "anthropic", "claude-opus-5-5", false, true),
+            Some((2, chain[1].clone()))
+        );
+        // Now on codex, refused: the unnamed entry is anthropic's, rung 1.
+        assert_eq!(
+            s.next_hop(&chain, "codex", "gpt-x", true, true),
+            Some((1, entry(Some("anthropic"), "claude-a")))
+        );
+        assert_eq!(
+            s.next_hop(&chain, "codex", "gpt-x", true, true),
+            Some((2, chain[2].clone()))
+        );
+        assert_eq!(s.next_hop(&chain, "codex", "gpt-x", true, true), None);
+    }
+
+    /// Neither the current pair nor the origin pair (already run) is a hop.
+    #[test]
+    fn next_hop_never_returns_to_the_origin_model() {
+        let chain = vec![
+            entry(Some("anthropic"), "claude-opus-5-5"),
+            entry(Some("gemini"), "gemini-y"),
+        ];
+        let mut s = RecoveryState::with_origin("anthropic", "claude-opus-5-5");
+        assert_eq!(
+            s.next_hop(&chain, "codex", "gpt-x", true, true),
+            Some((2, chain[1].clone()))
+        );
+        assert_eq!(s.next_hop(&chain, "gemini", "gemini-y", true, true), None);
+    }
+
+    /// At the action cap no entry is selected, so none is marked tried.
+    #[test]
+    fn take_hop_at_the_cap_marks_nothing_tried() {
+        let chain = vec![entry(None, "claude-opus-4-8")];
+        let mut s = RecoveryState::with_origin("anthropic", "claude-opus-5-5");
+        while s.take_action() {}
+        assert!(!s.can_act());
+        assert_eq!(
+            s.take_hop(&chain, "anthropic", "claude-opus-5-5", true, true),
+            None
+        );
+        assert_eq!(
+            s.next_hop(&chain, "anthropic", "claude-opus-5-5", true, true),
+            Some((1, entry(Some("anthropic"), "claude-opus-4-8"))),
+            "the capped call left the entry untried"
+        );
+    }
+
+    #[test]
+    fn take_hop_charges_one_action() {
+        let chain = vec![entry(None, "claude-opus-4-8")];
+        let mut s = RecoveryState::with_origin("anthropic", "claude-opus-5-5");
+        for _ in 1..MAX_RECOVERY_ACTIONS {
+            assert!(s.take_action());
+        }
+        assert!(s
+            .take_hop(&chain, "anthropic", "claude-opus-5-5", true, true)
+            .is_some());
+        assert!(!s.can_act());
     }
 
     #[test]

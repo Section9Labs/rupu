@@ -1241,6 +1241,28 @@ async fn overloaded_after_retries_goes_cross_provider() {
     )
     .await;
     assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    // Every transient retry ran before the ladder took over.
+    let fell_back_at = run
+        .events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::Recovery {
+                    action: RecoveryAction::FellBack,
+                    ..
+                }
+            )
+        })
+        .expect("a FellBack row");
+    let retries = run.events[..fell_back_at]
+        .iter()
+        .filter(|e| matches!(e, Event::Notice { kind, .. } if kind == "provider_retry"))
+        .count();
+    assert_eq!(retries, 10, "MAX_HTTP_RETRIES retries, then the hop");
+    assert!(!run.events[fell_back_at..]
+        .iter()
+        .any(|e| matches!(e, Event::Notice { kind, .. } if kind == "provider_retry")));
     let hop_requests = hop_requests.lock().unwrap();
     assert_eq!(hop_requests.len(), 1);
     assert_eq!(
@@ -1544,4 +1566,144 @@ async fn pause_turn_past_its_budget_hops_as_incomplete() {
     });
     assert!(fell_back, "rung 1 answers the incomplete outcome");
     assert_hop_lockstep(&run);
+}
+
+/// Unnamed chain entries mean the provider the attempt started on, even
+/// after a hop to another provider (spec §6.1): anthropic overloaded →
+/// rung 2 to codex; codex refuses → rung 1 is `(anthropic, A)`, not
+/// `(codex, A)`; that fails to build → gemini.
+#[tokio::test(start_paused = true)]
+async fn unnamed_entries_stay_on_the_origin_provider_after_a_hop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new((0..11).map(|_| overloaded()).collect());
+    let codex = MockProvider::new(vec![ScriptedTurn::Reply {
+        content: vec![text("no")],
+        stop: Stop::synthetic(StopReason::Refusal, "openai-codex"),
+        usage: Usage::default(),
+    }])
+    .with_provider_id(ProviderId::OpenaiCodex);
+    let run = run_with_hops(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![
+            fallback(None, "claude-a"),
+            fallback(Some("openai-codex"), "gpt-x"),
+            fallback(Some("gemini"), "gemini-y"),
+        ],
+        Some(TestHops::new(vec![
+            ("openai-codex", "gpt-x", Box::new(codex)),
+            (
+                "gemini",
+                "gemini-y",
+                Box::new(MockProvider::new(vec![reply(
+                    StopReason::EndTurn,
+                    vec![text("done")],
+                )])),
+            ),
+        ])),
+        &tmp,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    let pair = |p: &str, m: &str| (p.to_string(), m.to_string());
+    assert_eq!(
+        run.builds,
+        vec![
+            pair("openai-codex", "gpt-x"),
+            pair("anthropic", "claude-a"),
+            pair("gemini", "gemini-y"),
+        ]
+    );
+    let rows: Vec<(u8, RecoveryAction, Option<String>, Option<String>)> =
+        recovery_rows(&run.events)
+            .into_iter()
+            .map(|(rung, action, provider, model, _)| (rung, action, provider, model))
+            .collect();
+    let some = |s: &str| Some(s.to_string());
+    assert_eq!(
+        rows,
+        vec![
+            (
+                2,
+                RecoveryAction::FellBack,
+                some("openai-codex"),
+                some("gpt-x")
+            ),
+            (
+                1,
+                RecoveryAction::Skipped,
+                some("anthropic"),
+                some("claude-a")
+            ),
+            (
+                2,
+                RecoveryAction::FellBack,
+                some("gemini"),
+                some("gemini-y")
+            ),
+        ]
+    );
+}
+
+/// A provider that fails every call with `ProviderError::Terminating`.
+struct TerminatingError;
+
+#[async_trait::async_trait]
+impl LlmProvider for TerminatingError {
+    async fn send(&mut self, _req: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+        Err(ProviderError::Terminating)
+    }
+
+    async fn stream(
+        &mut self,
+        req: &LlmRequest,
+        _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<LlmResponse, ProviderError> {
+        self.send(req).await
+    }
+
+    fn default_model(&self) -> &str {
+        "mock-1"
+    }
+
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Anthropic
+    }
+}
+
+/// `ProviderError::Terminating` closes the run as aborted: no outcome, no
+/// ladder, no hop built.
+#[tokio::test]
+async fn a_terminating_provider_error_aborts_without_the_ladder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = run_with_hops(
+        Box::new(TerminatingError),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(Some("openai-codex"), "gpt-test")],
+        Some(TestHops::new(vec![(
+            "openai-codex",
+            "gpt-test",
+            Box::new(MockProvider::new(vec![reply(
+                StopReason::EndTurn,
+                vec![text("never")],
+            )])),
+        )])),
+        &tmp,
+    )
+    .await;
+    assert!(
+        matches!(run.result, Err(rupu_agent::runner::RunError::Terminating)),
+        "{:?}",
+        run.result.as_ref().err()
+    );
+    assert!(run.builds.is_empty(), "no hop was built");
+    assert!(outcomes(&run.events).is_empty());
+    assert!(recovery_rows(&run.events).is_empty());
+    assert!(run.events.iter().any(|e| matches!(
+        e,
+        Event::RunComplete {
+            status: RunStatus::Aborted,
+            ..
+        }
+    )));
 }

@@ -14,6 +14,7 @@ const OWN_BINARY: &[&str] = &[
     "crates/rupu-agent/tests/terminating.rs",
     "crates/rupu-agent/tests/terminating_compact_messages.rs",
     "crates/rupu-agent/tests/terminating_compaction.rs",
+    "crates/rupu-agent/tests/terminating_fallback.rs",
     "crates/rupu-agent/tests/terminating_overflow.rs",
     "crates/rupu-orchestrator/tests/terminating.rs",
 ];
