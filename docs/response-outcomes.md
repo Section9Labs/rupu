@@ -28,7 +28,7 @@ has no outcome. Anything else gets one of these classes:
 | `refusal` | error | The model refused. The title carries the provider's category when it gave one (`refused · cyber`) |
 | `safety` | error | A safety filter blocked the reply |
 | `malformed_tool_call` | error | The model called a tool with arguments that could not be used |
-| `incomplete` | error | The provider reported the reply as incomplete. Also what a reply that is still paused after every continuation becomes |
+| `incomplete` | error | The provider reported the reply as incomplete. Also what a reply that is still paused after every continuation becomes (handled slightly differently; see the notes below the ladder table) |
 | `empty_reply` | error | A normal stop with no text and no tool call |
 | `unrecognized_stop` | warning | The provider sent a stop reason rupu does not know. The raw value is kept |
 | `unreported_stop` | warning | The provider reported no stop reason at all |
@@ -91,7 +91,10 @@ Notes on the budgets:
 - A rung-0 budget is per logical turn. A turn that is continued three times and
   then moves on through tool calls starts the next turn with fresh budgets.
 - A reply still paused after its five continuations is reclassified as
-  `incomplete` and climbs the ladder under the `incomplete` row.
+  `incomplete` (titled `incomplete reply · still paused after 5 continuations`).
+  It skips the rung-0 retry and goes straight to the fallback hops (rungs 1 and
+  2), and the paused partial reply is kept in the conversation, not discarded.
+  With no fallback left, the run fails.
 - A **discarded** partial reply is written to the transcript but left out of the
   conversation: it is not sent back to the model, and a later `rupu run
   --continue` does not replay it.
@@ -228,8 +231,9 @@ set `server_side_fallback = false` for that account.
 ## 5. When nothing is left
 
 When the ladder runs out, the run ends with status `error`. The failure message
-is the outcome's title followed by a hint. The hint depends on where the run was
-started:
+is the outcome's title followed by a hint. For a provider error it is instead the
+provider's own error text (`provider: <error>`, as before the ladder existed)
+followed by the hint. The hint depends on where the run was started:
 
 - **`rupu run <agent>`** (a dispatched sub-agent gets the same hint):
 
@@ -294,12 +298,16 @@ recovery arrow:
 ↺ recovery  rung 1 · fell back to anthropic/claude-opus-5
 ```
 
-The exact columns follow each viewer's own layout; the glyph (`✗` error, `!`
-warning, `●` info, `↺` recovery) and the text after it are the same everywhere.
+The exact columns follow each viewer's own layout. The CLI rows use `✗` for an
+error, `!` for a warning, `●` for info and `↺` for a recovery. The plain-text
+one-line form that `rupu-transcript` provides for other renderers uses `·` for
+info instead of `●`.
 
-A line is cut at 96 columns. An event type this version of rupu does not know,
-written by a newer rupu, prints as `unrecognized event · <type>` followed by its
-data, and is preserved byte for byte when a transcript is copied or re-written.
+Outcome and recovery rows are cut at 96 columns. An event type this version of
+rupu does not know, written by a newer rupu, prints as an `event` row reading
+`unrecognized event · <type>` followed by its data, cut at 240 columns. Its `type`
+and `data` are preserved when a transcript is copied or re-written; other
+top-level keys on that line are not.
 
 **Control plane.** The transcript view shows an outcome as a block with a
 severity-colored edge, its title and its detail, and a recovery as a one-line
