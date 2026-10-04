@@ -346,10 +346,84 @@ Emitted at the end of each agent turn, after all tool calls for that turn are co
 | `turn_idx`   | u32            | Matches the `turn_start` `turn_idx`            |
 | `tokens_in`  | u64, optional  | Input tokens consumed this turn (if reported)  |
 | `tokens_out` | u64, optional  | Output tokens produced this turn (if reported) |
+| `stop_reason` | string, optional | The provider's wire stop value (e.g. `end_turn`, `max_output_tokens`) |
+| `response_id` | string, optional | Provider response id, when non-empty         |
+| `stop`       | StopRecord, optional | The typed stop (see below). Absent on transcripts written before the response-outcomes work |
+| `discarded`  | bool, optional | `true` when the turn's content was thrown away (a refused, blocked or retried turn). Replay drops a discarded turn and `final_turn_text` ignores it. Omitted when `false` |
+
+`StopRecord`: `reason` (string; the normalized stop such as `end_turn`, `max_tokens`, `refusal`,
+`pause_turn`), `wire` (the provider's own words as JSON: provider name, raw value, extras),
+and optional `refusal` and `served_by` (JSON; `served_by` names the model that answered when a
+server-side fallback served the turn).
 
 ```json
 {"type":"turn_end","data":{"turn_idx":0,"tokens_in":1024,"tokens_out":312}}
 ```
+
+---
+
+### `outcome`
+
+A classified non-normal reply or provider error, written ahead of the turn's content. See
+[response-outcomes.md](response-outcomes.md) for the classes and what each one does.
+
+| Field      | Type          | Description                                    |
+|------------|---------------|------------------------------------------------|
+| `turn_idx` | u32           | The turn the outcome belongs to                |
+| `outcome`  | OutcomeRecord | The record below                               |
+
+`OutcomeRecord`:
+
+| Field         | Type             | Description |
+|---------------|------------------|-------------|
+| `id`          | string           | Unique within the run (`oc_1`, `oc_2`, ...); a `recovery` points back to it |
+| `class`       | string           | `pause_turn`, `max_tokens`, `context_window_exceeded`, `refusal`, `safety`, `malformed_tool_call`, `incomplete`, `empty_reply`, `unrecognized_stop`, `unreported_stop` or `provider_error`. A string, so a class a newer writer adds still parses |
+| `severity`    | string           | `info`, `warning` or `error` |
+| `title`       | string           | One line, e.g. `refused · cyber` |
+| `detail`      | string, optional | Longer text: a refusal explanation, the tool call that was cut off, the provider's error message |
+| `error_class` | string, optional | For `provider_error`: the normalized class (`rate_limited`, `overloaded`, `server`, `timeout`, `context_overflow`, `quota`, `not_found`, `policy`, `auth`, `permission`, `invalid_request`, `too_large`, `unrecognized`) |
+| `wire`        | object, optional | The provider's own stop value or error body, kept verbatim. Omitted when null |
+
+```json
+{"type":"outcome","data":{"turn_idx":5,"outcome":{"id":"oc_2","class":"refusal","severity":"error","title":"refused · cyber","wire":{"provider":"anthropic","value":"refusal"}}}}
+```
+
+---
+
+### `recovery`
+
+One recovery action taken for an outcome. Written after its `outcome`, so the pair reads as a
+timeline.
+
+| Field        | Type             | Description |
+|--------------|------------------|-------------|
+| `outcome_id` | string           | The `outcome` this action answers |
+| `rung`       | u8               | `0` in place, `1` fallback on the same provider, `2` fallback on another provider, `3` nothing left (the run fails) |
+| `action`     | string           | `continued`, `retried`, `compacted`, `fell_back`, `served_by_fallback`, `skipped`, `asked`, `parked` or `failed`. A reader treats an action it does not know as `other` |
+| `attempt`    | u32, optional    | Which attempt this is, against `budget` (rung 0) |
+| `budget`     | u32, optional    | The rung-0 budget for this outcome's turn |
+| `provider`   | string, optional | The fallback's provider (`fell_back`, `served_by_fallback`, `skipped`) |
+| `model`      | string, optional | The fallback's model |
+| `reason`     | string, optional | Why: the hint on `failed`, the build error on `skipped` |
+| `merge_into_previous` | bool, optional | The next turn's assistant content joins the previous assistant message (a `pause_turn` continuation). Omitted when `false` |
+| `continues_output`    | bool, optional | The next turn's text continues this turn's answer (a truncation continuation); `final_turn_text` joins across the boundary. Omitted when `false` |
+
+`asked` and `parked` are reserved for operator-decided recovery and are not written yet.
+
+```json
+{"type":"recovery","data":{"outcome_id":"oc_2","rung":1,"action":"fell_back","provider":"anthropic","model":"claude-opus-5"}}
+```
+
+---
+
+### Unknown event types
+
+A line whose `type` this reader does not know is not an error. Readers surface it as an
+`Unknown { tag, data }` event holding the raw `type` and `data`, and writing it back emits the
+same `type` and `data`, so a newer rupu's transcript survives being read and copied by an older
+one. rupu itself never writes an unknown event. A line that is not a JSON object, has no `type`,
+or has a non-string `type` is corruption and still fails to parse. The CLI prints an unknown
+event as `unrecognized event · <type>` and the control plane shows an "unrecognized event" block.
 
 ---
 
@@ -364,6 +438,7 @@ Emitted once at the very end of a run. Its presence signals a clean (non-aborted
 | `total_tokens` | u64              | Cumulative tokens across all turns              |
 | `duration_ms`  | u64              | Total wall-clock duration, in ms                |
 | `error`        | string, optional | Error description when `status` is `error`      |
+| `outcome`      | OutcomeRecord, optional | The outcome the run failed on, when it ended because the recovery ladder ran out (see `outcome`) |
 
 ```json
 {"type":"run_complete","data":{"run_id":"run_01HXX3Y7K8NQ","status":"ok","total_tokens":4096,"duration_ms":12340}}
@@ -390,12 +465,18 @@ Within a single run file the event ordering is:
 run_start
   (turn_start
     usage
+    outcome?
     assistant_delta*
     assistant_message*
     (tool_call  tool_result  file_edit?  command_run?  action_emitted?  tool_audit?)*
-  turn_end)*
+  turn_end
+  recovery*)*
 run_complete
 ```
+
+An `outcome` follows the turn's `usage` and precedes its content. Its `recovery` events follow it,
+usually after `turn_end`. A hop to a fallback model writes a `notice` of kind `model_limits`
+just before its `fell_back` recovery, and a note sent back to the model is a `user_message`.
 
 `gate_requested` events (Slice B) appear between `turn_end` and the next `turn_start` when a
 gate interrupts the loop.

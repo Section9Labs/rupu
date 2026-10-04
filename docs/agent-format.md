@@ -73,6 +73,7 @@ Everything after the closing `---` is the system prompt.
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
+| `fallbacks` | array of `{model, provider?}` | no | `[recovery].fallbacks` from config, else none | Ordered fallback models tried when a reply cannot be used (a refusal, say). Wins over the config table; not merged with it. See [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) |
 | `maxTokens` | integer | no | discovered output cap | Per-request output-token cap. Overrides the cap discovered from the provider's model list; when neither is known, Anthropic gets `8192` and other providers get no cap (model max). `0` is ignored. Extended thinking (`effort`) draws from this budget |
 | `contextWindowTokens` | integer | no | discovered input limit | Input-token limit used for proactive compaction. Overrides the discovered limit; compaction is off only when neither is known. `0` is ignored |
 | `compactAtPercent` | integer | no | `80` | Percentage of the input limit at which compaction triggers; clamped to `[10, 95]`. When the output cap is known and shares the input window, compaction also triggers early enough that a full-length reply still fits |
@@ -286,6 +287,19 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 ```
 
 See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
+
+### `fallbacks`
+
+An ordered list of models to try when the agent's own model cannot give a usable reply or the provider fails the request (a refusal, repeated truncation, an overloaded provider). Each entry has a `model` and an optional `provider`; an entry without a `provider` means the provider the run started on.
+
+```yaml
+fallbacks:
+  - model: claude-sonnet-5-5        # same provider as the agent
+  - provider: openai-codex          # another provider
+    model: gpt-5.6-cyber
+```
+
+The list replaces `[recovery].fallbacks` from `config.toml` for this agent; it is not merged with it, and `fallbacks: []` means no fallbacks. Unknown keys inside an entry are an error. A rupu release that predates `fallbacks:` refuses to load an agent file that sets it, so upgrade remote hosts before adding it. A cross-provider entry sends the conversation to that provider; see [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) for the ladder, the rung split and that data-handling note.
 
 ### `maxTokens`
 
