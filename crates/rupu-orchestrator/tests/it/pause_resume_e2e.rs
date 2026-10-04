@@ -1449,6 +1449,8 @@ impl Killed {
                         success: true,
                         is_fixer: false,
                         codename: cp.codename.clone(),
+                        error: None,
+                        cause: None,
                     },
                 );
             } else {
@@ -1918,6 +1920,8 @@ async fn resume_ignores_plans_when_the_fanout_list_changed() {
                 finished_at: chrono::Utc::now(),
                 host: None,
                 codename: None,
+                error: None,
+                cause: None,
             },
         )
         .unwrap();

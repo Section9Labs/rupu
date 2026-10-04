@@ -1279,6 +1279,7 @@ mod tests {
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         }
     }
 

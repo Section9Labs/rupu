@@ -7817,7 +7817,7 @@ async fn run_linear_step(
                 },
             );
         }
-        return Ok(LinearStepOutcome::Completed(StepResult {
+        return Ok(LinearStepOutcome::Completed(Box::new(StepResult {
             step_id: step.id.clone(),
             rendered_prompt: rendered,
             run_id: agent_run_id.clone(),
@@ -7829,7 +7829,7 @@ async fn run_linear_step(
             host: None,
             codename: codename.map(|c| c.to_string()),
             ..Default::default()
-        }));
+        })));
     }
 
     let run_id = format!("run_{}", Ulid::new());
@@ -8411,6 +8411,8 @@ fn record_recovered_unit(
                 finished_at: chrono::Utc::now(),
                 host: None,
                 codename: unit.codename.clone(),
+                error: None,
+                cause: None,
             };
             if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
                 warn!(step = %step.id, index = unit.index, error = %e, "failed to append unit checkpoint");
@@ -8457,6 +8459,7 @@ fn record_recovered_unit(
             tokens_in,
             tokens_out,
             host: None,
+            cause: None,
         },
     );
 }
@@ -8602,6 +8605,8 @@ async fn run_fanout_step(
                         .as_ref()
                         .zip(step.agent.as_deref())
                         .map(|(n, a)| n.unit(&step.id, a, idx).to_string()),
+                    error: None,
+                    cause: None,
                 };
                 record_recovered_unit(opts, workflow_run_id, step, &unit);
                 resumed.insert(idx, unit);
@@ -9792,6 +9797,7 @@ impl ContinuationSeed {
             Ok(Continuation::Resume {
                 messages,
                 seed_source,
+                ..
             }) => Ok(Self {
                 messages,
                 user_message: String::new(),

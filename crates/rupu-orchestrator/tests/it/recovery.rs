@@ -49,6 +49,7 @@ impl Fx {
     fn opts(&self, provider: MockProvider, name: &str) -> AgentRunOpts {
         AgentRunOpts {
             seed_source: None,
+            recovery: Default::default(),
             collectors: Vec::new(),
             agent_name: "worker".into(),
             agent_system_prompt: "test".into(),
