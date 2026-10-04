@@ -1,10 +1,11 @@
 ---
 source: crates/rupu-cli/src/output/live_view/panes.rs
+assertion_line: 1544
 expression: s
 ---
 assess-fleet  ● mint-tundra  ◐ running · 3m 40s
 step 3/13  ██████░░░░░░░░░░░░░░░░░░  ◐ hunt +1
-⇡3400000 ⇣210000 $9.85 · ⚑3
+⇡3.4M ⇣210k $9.85 · ⚑3
 ─ structure ────────────────────────────────────┬─ stream · sweep ──────────────────────────────────────────────────────
   ✓  preflight  scanner · her… ···· ✓ 18s @kuki │ otter#2 ▸ list_files
   │                                             │ otter#2 ▸ read_file deploy/ingress.yaml
@@ -17,9 +18,9 @@ step 3/13  ██████░░░░░░░░░░░░░░░░░
   │                                             │
   ├─╭─ ⊞ hunt  for_each · runti… ···· ◐ running │
   │ │ ▓▓▓▓▓░░░░░░░░░░░░░░░ 1/4 ✓1 ◐2 ○1         │
-  │ ◐├─ svc-1  wren#1 ···· ◐ running @kuki      │
-  │ ◐├─ svc-2  egret#1 ···· ◐ running @mini     │
-  │ ✓├─ svc-0  lynx#1 ···· ✓ done @mini         │
+  │ ◐├─ svc-1 ···· ◐ running @kuki · wren#1     │
+  │ ◐├─ svc-2 ···· ◐ running @mini · egret#1    │
+  │ ✓├─ svc-0 ···· ✓ done @mini · lynx#1        │
   │ ○├─ svc-3 ···· ○ queued                     │
   │ ◄─╰─                                        │
   │                                             │

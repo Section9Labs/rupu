@@ -242,6 +242,41 @@ pub enum Cmd {
     },
 }
 
+/// Commands that take over the terminal with a live, in-place view
+/// (alternate screen or a live stdout feed). Their `tracing` output MUST go
+/// to the log file via [`logging::init_to_file`], never stderr — otherwise a
+/// log line (e.g. the provider's `WARN transient provider error, retry …`)
+/// punches through, and because it ends in a newline it scrolls the
+/// alternate screen out from under the diff renderer, corrupting the fixed
+/// header / footer regions.
+///
+/// Every command that opens such a view belongs here. In particular both
+/// `workflow run` AND `workflow resume` reach `run_workflow_with_live_view`
+/// (the dashboard), so BOTH must be listed — a `resume` left on stderr was
+/// the "bars hopping" corruption. `workflow approve` / `reject` only drive
+/// the headless `crate::resume` primitives (line printers), so they stay on
+/// stderr. The exhaustive unit test below pins this set.
+fn owns_live_terminal(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Run { .. }
+            | Cmd::Watch(_)
+            | Cmd::Session {
+                action: cmd::session::Action::Start(_)
+                    | cmd::session::Action::Send(_)
+                    | cmd::session::Action::Attach { .. }
+                    | cmd::session::Action::RunTurn(_)
+            }
+            | Cmd::Workflow {
+                action: cmd::workflow::Action::Run { .. }
+                    | cmd::workflow::Action::Resume { .. }
+            }
+            | Cmd::Autoflow {
+                action: cmd::autoflow::Action::Run { .. }
+            }
+    )
+}
+
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
 /// dispatches, and returns an `ExitCode`. Tests pass synthetic argv.
 pub async fn run(args: Vec<String>) -> ExitCode {
@@ -288,27 +323,12 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     }
     exit::hold_test_credential_write();
 
-    // Run / Workflow Run / Watch / Session Attach own a live stdout view.
-    // Tracing on stderr would bleed through and corrupt that output.
-    // Route logs to the rupu log file for those commands; everything
-    // else keeps stderr.
-    let is_output_cmd = matches!(
-        cli.command,
-        Cmd::Run { .. }
-            | Cmd::Watch(_)
-            | Cmd::Session {
-                action: cmd::session::Action::Start(_)
-                    | cmd::session::Action::Send(_)
-                    | cmd::session::Action::Attach { .. }
-                    | cmd::session::Action::RunTurn(_)
-            }
-            | Cmd::Workflow {
-                action: cmd::workflow::Action::Run { .. }
-            }
-            | Cmd::Autoflow {
-                action: cmd::autoflow::Action::Run { .. }
-            }
-    );
+    // Run / Workflow Run+Resume / Watch / Session live views own a live
+    // stdout surface. Tracing on stderr would bleed through and corrupt it,
+    // so route logs to the rupu log file for those commands; everything else
+    // keeps stderr. [`owns_live_terminal`] is the single, tested home for
+    // this set.
+    let is_output_cmd = owns_live_terminal(&cli.command);
     // Load config BEFORE logging init so `log_level` can act as the
     // `RUPU_LOG` fallback (ISSUES.md I-14). This is the same cheap layered
     // read the update-notice block below does; it is reused there.
@@ -559,6 +579,38 @@ mod arg_parse_tests {
             Cmd::Run { argv } => argv,
             other => panic!("expected Cmd::Run, got {other:?}"),
         }
+    }
+
+    /// `workflow resume` opens the SAME live dashboard as `workflow run`
+    /// (both reach `run_workflow_with_live_view`), so both MUST route tracing
+    /// to the log file. A `resume` left on stderr let the provider's retry
+    /// WARN punch through and scroll the alternate screen, corrupting the
+    /// header/footer ("the bars hopping" bug). `approve` / `reject` are
+    /// headless line printers and stay on stderr.
+    #[test]
+    fn owns_live_terminal_covers_both_dashboard_opening_workflow_actions() {
+        let owns = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).expect("parse");
+            owns_live_terminal(&cli.command)
+        };
+        // Both dashboard-opening workflow actions route to the log file.
+        assert!(owns(&["rupu", "workflow", "run", "mywf"]), "workflow run");
+        assert!(
+            owns(&["rupu", "workflow", "resume", "run_01ABC"]),
+            "workflow resume"
+        );
+        // The in-place `run` view keeps file logging too.
+        assert!(owns(&["rupu", "run", "echo", "hi"]), "run");
+        // Headless line-printer / query commands stay on stderr.
+        assert!(
+            !owns(&["rupu", "workflow", "approve", "run_01ABC"]),
+            "workflow approve is headless"
+        );
+        assert!(
+            !owns(&["rupu", "workflow", "reject", "run_01ABC"]),
+            "workflow reject is headless"
+        );
+        assert!(!owns(&["rupu", "workflow", "list"]), "workflow list");
     }
 
     #[test]

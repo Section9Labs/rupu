@@ -151,6 +151,30 @@ impl StepView {
         }
         c
     }
+
+    /// The live frontier unit of a fan-out: the newest *running* unit (units
+    /// start in index order, so the highest index is the most recent), else —
+    /// when none is running — the newest unit that has started at all. A queued
+    /// unit has no transcript yet, so it is never the frontier. `None` for a
+    /// step with no started units.
+    ///
+    /// The live view auto-follows this unit's transcript when a fan-out step is
+    /// selected but no single unit is drilled (the stream pane would otherwise
+    /// sit idle while 69 units stream in the firehose). Shared by the stream
+    /// pin ([`crate::output::live_run`]) and the stream title
+    /// ([`crate::output::live_view::panes`]) so the two stay in lockstep.
+    pub fn frontier_unit(&self) -> Option<&UnitView> {
+        self.units
+            .values()
+            .filter(|u| u.status == UnitStatus::Running)
+            .max_by_key(|u| u.index)
+            .or_else(|| {
+                self.units
+                    .values()
+                    .filter(|u| u.status != UnitStatus::Queued)
+                    .max_by_key(|u| u.index)
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -225,7 +249,17 @@ impl RunView {
                 run_id, started_at, ..
             } => {
                 self.run_id = run_id.clone();
-                self.started_at = Some(*started_at);
+                // `events.jsonl` spans every generation. Keep the FIRST start
+                // so the header elapsed is cumulative since the run began and
+                // never visibly "resets" on resume, and clear any finish the
+                // prior generation recorded — a new generation is live, so
+                // `elapsed_ms` must measure against `now`, not a stale
+                // `finished_at` (which read earlier than the resume's start
+                // and clamped elapsed to `0s`).
+                if self.started_at.is_none() {
+                    self.started_at = Some(*started_at);
+                }
+                self.finished_at = None;
                 self.status = RunStatus::Running;
                 self.error = None;
                 self.generation += 1;
@@ -1371,6 +1405,88 @@ mod tests {
         // Finished wins: `finished_at`, not `now`.
         v.finished_at = Some(t0 + Duration::seconds(3));
         assert_eq!(v.elapsed_ms(t0 + Duration::seconds(100)), Some(3_000));
+    }
+
+    /// A resumed run must not show `0s`. `events.jsonl` spans every
+    /// generation, so on attach the view replays the prior generation's
+    /// `RunFailed` (which set `finished_at`) and then the resume's
+    /// `RunStarted`. Keeping the ORIGINAL start (cumulative, so the timer
+    /// never visibly "resets") and clearing the stale `finished_at` (a new
+    /// generation is live again) is what stops `elapsed_ms` going
+    /// negative-then-clamped-to-0.
+    #[test]
+    fn a_resume_keeps_the_original_start_and_clears_the_stale_finish() {
+        use chrono::{Duration, TimeZone};
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap();
+        let start = |at: DateTime<Utc>| Event::RunStarted {
+            event_version: 1,
+            run_id: "r".into(),
+            workflow_path: "wf".into(),
+            started_at: at,
+        };
+        let mut v = RunView::default();
+        v.apply(&start(t0));
+        v.apply(&Event::RunFailed {
+            run_id: "r".into(),
+            error: "interrupted".into(),
+            finished_at: t0 + Duration::hours(1),
+        });
+        // Prior generation's outcome is frozen at its failure (1h).
+        assert_eq!(v.elapsed_ms(t0 + Duration::hours(2)), Some(3_600_000));
+
+        // Resumed three hours after the original start.
+        v.apply(&start(t0 + Duration::hours(3)));
+        assert_eq!(v.started_at, Some(t0), "keeps the original start");
+        assert_eq!(v.finished_at, None, "clears the stale finish");
+        assert_eq!(v.generation, 2, "still a new generation");
+        // Elapsed now advances against `now` cumulatively — never 0, never
+        // negative.
+        assert_eq!(
+            v.elapsed_ms(t0 + Duration::hours(3) + Duration::minutes(5)),
+            Some((3 * 3600 + 5 * 60) * 1000)
+        );
+    }
+
+    #[test]
+    fn frontier_unit_is_the_newest_running_then_the_newest_started() {
+        let mk = |index: usize, status: UnitStatus| UnitView {
+            index,
+            unit_key: format!("u{index}"),
+            agent: None,
+            codename: None,
+            provider: None,
+            model: None,
+            host: None,
+            status,
+            resumed: None,
+        };
+        let mut v = RunView::default();
+        // No units: no frontier.
+        assert!(v.step_mut("hunt").frontier_unit().is_none());
+        // Running wins, highest index among running (newest-started).
+        let s = v.step_mut("hunt");
+        for (i, st) in [
+            (0, UnitStatus::Done),
+            (1, UnitStatus::Running),
+            (2, UnitStatus::Running),
+            (3, UnitStatus::Queued),
+        ] {
+            s.units.insert(i, mk(i, st));
+        }
+        assert_eq!(s.frontier_unit().map(|u| u.index), Some(2));
+        // None running: the newest unit that has *started* (queued excluded —
+        // it has no transcript to stream yet).
+        let mut v = RunView::default();
+        let s = v.step_mut("hunt");
+        s.units.insert(0, mk(0, UnitStatus::Done));
+        s.units.insert(1, mk(1, UnitStatus::Failed));
+        s.units.insert(9, mk(9, UnitStatus::Queued));
+        assert_eq!(s.frontier_unit().map(|u| u.index), Some(1));
+        // Only queued units: nothing to follow yet.
+        let mut v = RunView::default();
+        let s = v.step_mut("hunt");
+        s.units.insert(0, mk(0, UnitStatus::Queued));
+        assert!(s.frontier_unit().is_none());
     }
 
     #[test]

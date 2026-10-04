@@ -1,5 +1,6 @@
 ---
 source: crates/rupu-cli/src/output/live_view/panes.rs
+assertion_line: 1702
 expression: s
 ---
 breakers  ● mint-tundra  ◐ running · 6m 02s
@@ -9,14 +10,14 @@ step 1/3  ████████░░░░░░░░░░░░░░░�
   │                                             │ otter#6 ◇ thinking amounts are summed as f64 before rounding
 ▸ ├─╭─ ⊞ hunt  for_each · runti… ···· ◐ running │ otter#6 ▸ grep as f64
   │ │ ▓▓▓▓▓▓▓▓░░░░░░░░░░░░ 4/10 ✓4 ◐3 ✗1 ○2     │ otter#6 ⚑ MEDIUM ledger totals lose cents
-  │ ✓├─ svc-0  otter#1 · ant… ···· ✓ done @mini │ otter#6 ▸ read_file svc/billing/rounding.rs
-  │ ✓├─ svc-1  heron#2 · ant… ···· ✓ done @kuki │ otter#6 ▪ Two call sites convert cents to f64 before summing.
-  │ ✓├─ svc-2  wren#3 · anth… ···· ✓ done @mini │
-  │ ✓├─ svc-3  egret#4 · ant… ···· ✓ done @kuki │
-  │ ✗├─ svc-4  lynx#5 · an… ···· ✗ failed @mini │
-▸ │ ◐├─ svc-5  otter#6 · … ···· ◐ running @kuki │
-  │ ◐├─ svc-6  heron#7 · … ···· ◐ running @mini │
-  │ ◐├─ svc-7  wren#8 · a… ···· ◐ running @kuki │
+  │ ✓├─ svc-0  ant… ···· ✓ done @mini · otter#1 │ otter#6 ▸ read_file svc/billing/rounding.rs
+  │ ✓├─ svc-1  ant… ···· ✓ done @kuki · heron#2 │ otter#6 ▪ Two call sites convert cents to f64 before summing.
+  │ ✓├─ svc-2  anth… ···· ✓ done @mini · wren#3 │
+  │ ✓├─ svc-3  ant… ···· ✓ done @kuki · egret#4 │
+  │ ✗├─ svc-4  an… ···· ✗ failed @mini · lynx#5 │
+▸ │ ◐├─ svc-5  … ···· ◐ running @kuki · otter#6 │
+  │ ◐├─ svc-6  … ···· ◐ running @mini · heron#7 │
+  │ ◐├─ svc-7  a… ···· ◐ running @kuki · wren#8 │
   │ ○├─ svc-8 ···· ○ queued                     │
   │ ○├─ svc-9 ···· ○ queued                     │
   │ ◄─╰─                                        │
