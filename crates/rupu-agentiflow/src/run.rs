@@ -363,12 +363,17 @@ impl LeadDriver for RecordingLead<'_> {
 /// 4. On a stop, writes the final record (`completed`, with the stop reason,
 ///    round count and goal statuses) and returns the [`EnvelopeOutcome`].
 ///
-/// # Blocking context only
+/// # Threading
 ///
-/// The lead driver owns a tokio runtime and `block_on`s it each round, which
-/// panics inside an async context (so does dropping that runtime there). Call
-/// this from a blocking context: a plain thread or `spawn_blocking`. Called
-/// from within a tokio runtime it returns an error instead.
+/// The lead driver owns a tokio runtime and `block_on`s it each round, so the
+/// flow must not run on a thread that already has an ambient tokio runtime
+/// (that panics, and so does dropping the driver's runtime there).
+/// `run_agentiflow` therefore runs the whole flow on a dedicated OS thread and
+/// blocks the caller until it finishes, which makes it safe to call from any
+/// context: a plain thread, a sync fn, or `tokio::task::spawn_blocking`.
+/// Because it blocks the calling thread for the life of the flow, an async
+/// caller should invoke it from `spawn_blocking`, not inline on an executor
+/// thread. A panic on the worker thread is re-raised on the caller.
 ///
 /// # Budget in this build
 ///
@@ -387,186 +392,188 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         run_id: id,
     } = opts;
 
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(AgentiflowError::Invalid(
-            "run_agentiflow must be called from a blocking context (a plain thread or \
-             spawn_blocking), not from inside an async runtime"
-                .into(),
-        ));
-    }
+    // A thread-scoped tracing subscriber (a test's, say) does not follow the
+    // flow to its worker thread, so carry the caller's dispatcher over.
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    std::thread::scope(|s| {
+        s.spawn(move || -> Result<EnvelopeOutcome, AgentiflowError> {
+            let _log_scope = tracing::dispatcher::set_default(&dispatch);
 
-    // ---- everything that can be rejected without touching the disk ----------
-    def.validate(&active)?;
-    validate_run_id(&id)?;
+            // ---- everything that can be rejected without touching the disk ----------
+            def.validate(&active)?;
+            validate_run_id(&id)?;
 
-    let ceiling = def.round.as_ref().and_then(|r| r.ceiling.as_ref());
-    let ceiling_wall_clock = match ceiling.and_then(|c| c.wall_clock.as_deref()) {
-        Some(w) => Some(
-            parse_duration(w)
-                .map_err(|e| AgentiflowError::Invalid(format!("round.ceiling.wall_clock: {e}")))?,
-        ),
-        None => None,
-    };
-    let ceiling_rounds = ceiling.and_then(|c| c.rounds);
-    let per_round_max_turns = def
-        .round
-        .as_ref()
-        .and_then(|r| r.lead_max_turns)
-        .unwrap_or(DEFAULT_LEAD_MAX_TURNS);
-    if per_round_max_turns == 0 {
-        return Err(AgentiflowError::Invalid(
-            "round.lead_max_turns must be at least 1".into(),
-        ));
-    }
+            let ceiling = def.round.as_ref().and_then(|r| r.ceiling.as_ref());
+            let ceiling_wall_clock = match ceiling.and_then(|c| c.wall_clock.as_deref()) {
+                Some(w) => Some(parse_duration(w).map_err(|e| {
+                    AgentiflowError::Invalid(format!("round.ceiling.wall_clock: {e}"))
+                })?),
+                None => None,
+            };
+            let ceiling_rounds = ceiling.and_then(|c| c.rounds);
+            let per_round_max_turns = def
+                .round
+                .as_ref()
+                .and_then(|r| r.lead_max_turns)
+                .unwrap_or(DEFAULT_LEAD_MAX_TURNS);
+            if per_round_max_turns == 0 {
+                return Err(AgentiflowError::Invalid(
+                    "round.lead_max_turns must be at least 1".into(),
+                ));
+            }
 
-    if !has_automatic_terminator(&def) {
-        tracing::warn!(
-            name = %def.name,
-            run_id = %id,
-            "agentiflow has no automatic terminator; it will run until an operator stop"
-        );
-    }
-    if def
-        .budget
-        .as_ref()
-        .is_some_and(|b| b.usd.is_some() || b.tokens.is_some())
-    {
-        tracing::warn!(
-            name = %def.name,
-            run_id = %id,
-            "budget.usd / budget.tokens are not enforced yet (usage is not metered); \
-             only budget.wall_clock / budget.rounds can stop this run"
-        );
-    }
+            if !has_automatic_terminator(&def) {
+                tracing::warn!(
+                    name = %def.name,
+                    run_id = %id,
+                    "agentiflow has no automatic terminator; it will run until an operator stop"
+                );
+            }
+            if def
+                .budget
+                .as_ref()
+                .is_some_and(|b| b.usd.is_some() || b.tokens.is_some())
+            {
+                tracing::warn!(
+                    name = %def.name,
+                    run_id = %id,
+                    "budget.usd / budget.tokens are not enforced yet (usage is not metered); \
+                     only budget.wall_clock / budget.rounds can stop this run"
+                );
+            }
 
-    // ---- run directory ------------------------------------------------------
-    let run_dir = agentiflow_dir(&global).join(&id);
-    if run_dir.join(RECORD_FILE).exists() {
-        return Err(AgentiflowError::Invalid(format!(
-            "agentiflow run `{id}` already exists at {}",
-            run_dir.display()
-        )));
-    }
-    // `steering/` may already exist: an operator can queue a message for a run
-    // they were told the id of before it started.
-    std::fs::create_dir_all(run_dir.join("lead"))?;
+            // ---- run directory ------------------------------------------------------
+            let run_dir = agentiflow_dir(&global).join(&id);
+            if run_dir.join(RECORD_FILE).exists() {
+                return Err(AgentiflowError::Invalid(format!(
+                    "agentiflow run `{id}` already exists at {}",
+                    run_dir.display()
+                )));
+            }
+            // `steering/` may already exist: an operator can queue a message for a run
+            // they were told the id of before it started.
+            std::fs::create_dir_all(run_dir.join("lead"))?;
 
-    let mut record = AgentiflowRecord {
-        id: id.clone(),
-        name: def.name.clone(),
-        engagement_profiles: def.engagement_profiles.clone(),
-        trigger: RunTriggerSource::Agentiflow,
-        status: "running".into(),
-        stop_reason: None,
-        rounds: 0,
-        goals: Vec::new(),
-        started_at: started,
-        ended_at: None,
-        codename: None,
-    };
-    record.write(&run_dir)?;
+            let mut record = AgentiflowRecord {
+                id: id.clone(),
+                name: def.name.clone(),
+                engagement_profiles: def.engagement_profiles.clone(),
+                trigger: RunTriggerSource::Agentiflow,
+                status: "running".into(),
+                stop_reason: None,
+                rounds: 0,
+                goals: Vec::new(),
+                started_at: started,
+                ended_at: None,
+                codename: None,
+            };
+            record.write(&run_dir)?;
 
-    // From here a failure must not leave the record claiming `running`.
-    let fail = |record: &mut AgentiflowRecord, e: std::io::Error| -> AgentiflowError {
-        record.status = "failed".into();
-        record.stop_reason = Some(format!("error: {e}"));
-        record.ended_at = Some(now());
-        if let Err(werr) = record.write(&run_dir) {
-            tracing::error!(error = %werr, "could not record the failed agentiflow run");
-        }
-        AgentiflowError::Io(e)
-    };
+            // From here a failure must not leave the record claiming `running`.
+            let fail = |record: &mut AgentiflowRecord, e: std::io::Error| -> AgentiflowError {
+                record.status = "failed".into();
+                record.stop_reason = Some(format!("error: {e}"));
+                record.ended_at = Some(now());
+                if let Err(werr) = record.write(&run_dir) {
+                    tracing::error!(error = %werr, "could not record the failed agentiflow run");
+                }
+                AgentiflowError::Io(e)
+            };
 
-    // ---- envelope and lead ----------------------------------------------------
-    let paths = CoveragePaths::new(&workspace, &target_id(&workspace, &id));
-    let cfg = EnvelopeConfig {
-        goals: def.goals.clone(),
-        coverage: def.coverage.clone(),
-        ceiling_rounds,
-        ceiling_wall_clock,
-    };
-    let mut envelope = Envelope::new(
-        paths,
-        active,
-        cfg,
-        def.budget.clone().unwrap_or_default(),
-        OperatorQueue::new(&run_dir),
-        started,
-    );
+            // ---- envelope and lead ----------------------------------------------------
+            let paths = CoveragePaths::new(&workspace, &target_id(&workspace, &id));
+            let cfg = EnvelopeConfig {
+                goals: def.goals.clone(),
+                coverage: def.coverage.clone(),
+                ceiling_rounds,
+                ceiling_wall_clock,
+            };
+            let mut envelope = Envelope::new(
+                paths,
+                active,
+                cfg,
+                def.budget.clone().unwrap_or_default(),
+                OperatorQueue::new(&run_dir),
+                started,
+            );
 
-    let lead_cfg = LeadConfig {
-        agent_name: lead.agent_name,
-        system_prompt: lead.system_prompt,
-        provider_name: lead.provider_name,
-        model: lead.model,
-        per_round_max_turns,
-        run_id: id.clone(),
-        transcript_path: run_dir.join("lead").join("transcript.jsonl"),
-        objective: mission_objective(&def),
-        goals: def.goals.clone(),
-        workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
-        workspace_path: workspace.clone(),
-        agent_tools: lead.agent_tools,
-        // Real limit resolution is Plan 4's; unknown limits are the safe start.
-        limits: ModelLimits::unknown(),
-    };
-    let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
-        Ok(d) => d,
-        Err(e) => return Err(fail(&mut record, e)),
-    };
+            let lead_cfg = LeadConfig {
+                agent_name: lead.agent_name,
+                system_prompt: lead.system_prompt,
+                provider_name: lead.provider_name,
+                model: lead.model,
+                per_round_max_turns,
+                run_id: id.clone(),
+                transcript_path: run_dir.join("lead").join("transcript.jsonl"),
+                objective: mission_objective(&def),
+                goals: def.goals.clone(),
+                workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
+                workspace_path: workspace.clone(),
+                agent_tools: lead.agent_tools,
+                // Real limit resolution is Plan 4's; unknown limits are the safe start.
+                limits: ModelLimits::unknown(),
+            };
+            let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
+                Ok(d) => d,
+                Err(e) => return Err(fail(&mut record, e)),
+            };
 
-    let events = EventLog {
-        path: run_dir.join(EVENTS_FILE),
-    };
-    let mut lead = RecordingLead {
-        inner: driver,
-        events: &events,
-        now: &*now,
-    };
+            let events = EventLog {
+                path: run_dir.join(EVENTS_FILE),
+            };
+            let mut lead = RecordingLead {
+                inner: driver,
+                events: &events,
+                now: &*now,
+            };
 
-    events.emit(
-        now(),
-        "run_started",
-        json!({
-            "id": id,
-            "name": def.name,
-            "goals": def.goals.len(),
-            "engagement_profiles": def.engagement_profiles,
-        }),
-    );
-    let outcome = envelope.run(&mut lead, &UnmeteredUsage, &*now);
-    // Drop the driver here, in the blocking context its runtime ran in, before
-    // anything else can return early.
-    drop(lead);
-    let ended = now();
-    let goals = goal_statuses(&outcome);
-    events.emit(
-        ended,
-        "run_stopped",
-        json!({
-            "stop_reason": stop_code(&outcome.stop),
-            "detail": outcome.stop.to_string(),
-            "rounds": outcome.rounds,
-            "goals": goals,
-            "summary": outcome.summary,
-        }),
-    );
+            events.emit(
+                now(),
+                "run_started",
+                json!({
+                    "id": id,
+                    "name": def.name,
+                    "goals": def.goals.len(),
+                    "engagement_profiles": def.engagement_profiles,
+                }),
+            );
+            let outcome = envelope.run(&mut lead, &UnmeteredUsage, &*now);
+            // Drop the driver here, in the blocking context its runtime ran in, before
+            // anything else can return early.
+            drop(lead);
+            let ended = now();
+            let goals = goal_statuses(&outcome);
+            events.emit(
+                ended,
+                "run_stopped",
+                json!({
+                    "stop_reason": stop_code(&outcome.stop),
+                    "detail": outcome.stop.to_string(),
+                    "rounds": outcome.rounds,
+                    "goals": goals,
+                    "summary": outcome.summary,
+                }),
+            );
 
-    record.status = "completed".into();
-    record.stop_reason = Some(stop_code(&outcome.stop));
-    record.rounds = outcome.rounds;
-    record.goals = goals;
-    record.ended_at = Some(ended);
-    if let Err(e) = record.write(&run_dir) {
-        tracing::error!(
-            id = %id,
-            stop = %outcome.stop,
-            error = %e,
-            "agentiflow reached a stop but its final record could not be written"
-        );
-        return Err(AgentiflowError::Io(e));
-    }
-    Ok(outcome)
+            record.status = "completed".into();
+            record.stop_reason = Some(stop_code(&outcome.stop));
+            record.rounds = outcome.rounds;
+            record.goals = goals;
+            record.ended_at = Some(ended);
+            if let Err(e) = record.write(&run_dir) {
+                tracing::error!(
+                    id = %id,
+                    stop = %outcome.stop,
+                    error = %e,
+                    "agentiflow reached a stop but its final record could not be written"
+                );
+                return Err(AgentiflowError::Io(e));
+            }
+            Ok(outcome)
+        })
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 #[cfg(test)]
@@ -930,7 +937,7 @@ mod tests {
     }
 
     /// Run `f` with a thread-local tracing subscriber and return what it
-    /// logged. `run_agentiflow` logs its warnings on the calling thread.
+    /// logged. `run_agentiflow` carries the caller's dispatcher to its worker thread.
     fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         use std::sync::{Arc, Mutex};
         #[derive(Clone)]
@@ -1068,18 +1075,37 @@ mod tests {
         );
     }
 
+    /// One lead round, then the ceiling stops the flow: the lead really runs
+    /// (its per-round `block_on`), and the flow terminates without a seeded finding.
+    const CEILING_ONE_ROUND: &str = "round: { ceiling: { rounds: 1 } }";
+
     #[test]
-    fn calling_from_an_async_context_is_an_error_not_a_panic() {
+    fn running_from_inside_a_tokio_runtime_succeeds() {
         let fx = fixture();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let o = opts(&fx, def_with(""), "af_async");
-        let err = rt
-            .block_on(async move { run_agentiflow(o) })
-            .expect_err("must refuse");
-        assert!(err.to_string().contains("blocking"), "{err}");
-        assert!(!run_dir(&fx, "af_async").exists());
+        let o = opts(&fx, def_with(CEILING_ONE_ROUND), "af_async");
+        let out = rt.block_on(async move { run_agentiflow(o) });
+        assert_eq!(out.expect("flow runs").stop, StopReason::Ceiling);
+        assert!(run_dir(&fx, "af_async").exists());
+    }
+
+    #[test]
+    fn running_from_spawn_blocking_succeeds() {
+        let fx = fixture();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let o = opts(&fx, def_with(CEILING_ONE_ROUND), "af_spawnblk");
+        let out = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || run_agentiflow(o))
+                .await
+                .unwrap()
+        });
+        assert_eq!(out.expect("flow runs").stop, StopReason::Ceiling);
+        assert!(run_dir(&fx, "af_spawnblk").exists());
     }
 }
