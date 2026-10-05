@@ -106,6 +106,11 @@ mod fsops {
     #[derive(Debug, Clone)]
     pub struct CaptureRoot {
         root: PathBuf,
+        /// The cgroup we created `root` under (Direct mode only). `Some`
+        /// means we own `root` and must tear it down in
+        /// [`shutdown`](CaptureRoot::shutdown); `None` (Scope mode) leaves
+        /// teardown to systemd, which reaps the transient scope.
+        parent: Option<PathBuf>,
     }
 
     /// The cgroup of one tool call.
@@ -139,6 +144,29 @@ mod fsops {
                 id,
                 procs_path: dir.join("cgroup.procs"),
             })
+        }
+
+        /// Tear down a Direct-mode root: move this process back into the
+        /// cgroup the root was created under, then remove any leftover
+        /// empty call cgroups, `supervisor` and the root itself. Scope mode
+        /// is a no-op (systemd reaps the scope). Best-effort: every error is
+        /// ignored, and a cgroup that still holds a process stays behind.
+        pub fn shutdown(&self) {
+            let Some(parent) = &self.parent else {
+                return;
+            };
+            if fs::write(parent.join("cgroup.procs"), b"0").is_err() {
+                // Still inside `supervisor`: it cannot be removed.
+                return;
+            }
+            if let Ok(entries) = fs::read_dir(&self.root) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                        let _ = fs::remove_dir(entry.path());
+                    }
+                }
+            }
+            let _ = fs::remove_dir(&self.root);
         }
     }
 
@@ -343,7 +371,10 @@ mod fsops {
             }
             return Err(e);
         }
-        Ok(CaptureRoot { root })
+        Ok(CaptureRoot {
+            root,
+            parent: created_here.then_some(dir),
+        })
     }
 
     #[cfg(test)]
