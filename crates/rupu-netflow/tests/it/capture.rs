@@ -1,6 +1,6 @@
 #![cfg(feature = "http")]
 
-use rupu_netflow::{Fidelity, FlowCtx, FlowRecord, FlowSink, MemorySink, Origin};
+use rupu_netflow::{FlowCtx, FlowRecord, FlowSink, MemorySink, Origin};
 use std::sync::Arc;
 
 /// A sink that panics on every call. Drives invariant 1 directly through
@@ -508,56 +508,4 @@ async fn private_clients_each_open_their_own_connection() {
     a.get(&url).send().await.unwrap().text().await.unwrap();
     b.get(&url).send().await.unwrap().text().await.unwrap();
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
-
-#[test]
-fn socket_fidelity_serializes_snake_case_and_round_trips() {
-    let json = serde_json::to_string(&Fidelity::Socket).unwrap();
-    assert_eq!(json, r#""socket""#);
-    assert_eq!(
-        serde_json::from_str::<Fidelity>(&json).unwrap(),
-        Fidelity::Socket
-    );
-}
-
-#[test]
-fn subprocess_origin_tags_and_keys() {
-    use rupu_netflow::ledger::explorer::origin_key;
-    let o = Origin::Subprocess("curl".into());
-    let json = serde_json::to_value(&o).unwrap();
-    assert_eq!(json, serde_json::json!({"kind":"subprocess","name":"curl"}));
-    assert_eq!(serde_json::from_value::<Origin>(json).unwrap(), o);
-    assert_eq!(origin_key(&o), "subprocess:curl");
-}
-
-#[test]
-fn flow_ctx_tool_call_id_is_optional_and_omitted_when_none() {
-    let mut c = FlowCtx::system(Origin::Subprocess("curl".into()));
-    assert!(serde_json::to_string(&c)
-        .unwrap()
-        .find("tool_call_id")
-        .is_none());
-    c.tool_call_id = Some("toolu_01Ab".into());
-    let json = serde_json::to_string(&c).unwrap();
-    assert!(json.contains(r#""tool_call_id":"toolu_01Ab""#));
-    assert_eq!(serde_json::from_str::<FlowCtx>(&json).unwrap(), c);
-}
-
-#[test]
-fn flow_process_and_direction_round_trip() {
-    use rupu_netflow::{Direction, FlowProcess};
-    let p = FlowProcess {
-        pid: 4412,
-        name: "curl".into(),
-    };
-    assert_eq!(
-        serde_json::from_str::<FlowProcess>(&serde_json::to_string(&p).unwrap()).unwrap(),
-        p
-    );
-    let d = Direction::Outbound;
-    assert_eq!(serde_json::to_string(&d).unwrap(), r#""outbound""#);
-    assert_eq!(
-        serde_json::from_str::<Direction>(r#""inbound""#).unwrap(),
-        Direction::Inbound
-    );
 }

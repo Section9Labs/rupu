@@ -83,6 +83,10 @@ impl FlowSink for NetflowWriter {
             duration_ms,
         });
     }
+
+    async fn complete_socket(&self, c: crate::record::SocketCompletion) {
+        self.offer(LedgerLine::SocketComplete(c));
+    }
 }
 
 pub struct NetflowWriterHandle {

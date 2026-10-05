@@ -113,6 +113,23 @@ pub struct FlowRecord {
     pub duration_ms: Option<u64>,
 }
 
+/// Finalizes a socket flow at close: byte counts, final outcome and an
+/// optional note. Any `Some` field overwrites the flow when folded;
+/// `None` leaves it as written. `duration_ms` always applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketCompletion {
+    pub id: FlowId,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_out: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// One line of the append-only ledger.
 ///
 /// `Flow` is boxed because it dwarfs the other variants — clippy's
@@ -132,6 +149,10 @@ pub enum LedgerLine {
         count: u64,
         ts: DateTime<Utc>,
     },
+    /// Finalizes a socket flow at close. Separate from `Complete` (the
+    /// HTTP streamed-body finalizer) so the HTTP path is untouched. Any
+    /// `Some` field overwrites the flow; `None` leaves it as written.
+    SocketComplete(SocketCompletion),
 }
 
 #[cfg(test)]

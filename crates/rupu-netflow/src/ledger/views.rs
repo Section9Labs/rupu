@@ -57,6 +57,24 @@ pub fn read_flows_and_dropped(path: &Path) -> std::io::Result<(Vec<FlowRecord>, 
                     flows[i].body_complete = true;
                 }
             }
+            LedgerLine::SocketComplete(c) => {
+                if let Some(&i) = index.get(&c.id) {
+                    if let Some(b) = c.bytes_in {
+                        flows[i].bytes_in = Some(b);
+                    }
+                    if let Some(b) = c.bytes_out {
+                        flows[i].bytes_out = Some(b);
+                    }
+                    if let Some(o) = c.outcome {
+                        flows[i].outcome = o;
+                    }
+                    if c.error.is_some() {
+                        flows[i].error = c.error;
+                    }
+                    flows[i].duration_ms = Some(c.duration_ms);
+                    flows[i].body_complete = true;
+                }
+            }
             LedgerLine::Dropped { count, .. } => {
                 dropped += count;
             }

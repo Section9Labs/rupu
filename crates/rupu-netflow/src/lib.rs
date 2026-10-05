@@ -50,5 +50,7 @@ pub use ledger::{
     project_local_netflow_dir, NetflowPaths, NetflowWriter, NetflowWriterHandle,
     LEGACY_LEDGER_FILENAME,
 };
-pub use record::{Direction, Fidelity, FlowId, FlowProcess, FlowRecord, LedgerLine, Outcome};
+pub use record::{
+    Direction, Fidelity, FlowId, FlowProcess, FlowRecord, LedgerLine, Outcome, SocketCompletion,
+};
 pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};
