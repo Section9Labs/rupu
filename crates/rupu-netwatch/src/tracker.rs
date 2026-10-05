@@ -8,7 +8,9 @@
 
 use crate::types::{CallId, Emission, Emit, OwnerId, SocketId, SocketSnapshot, Transport};
 use chrono::{DateTime, Utc};
-use rupu_netflow::{CallAttribution, Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
+use rupu_netflow::{
+    CallAttribution, Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome, SocketCompletion,
+};
 use std::collections::HashMap;
 
 /// What a backend hands the tracker when a bash call begins.
@@ -118,15 +120,90 @@ impl Tracker {
         }]
     }
 
-    /// Report that a socket closed. Filled in by the close task.
+    /// Report that a socket closed, with its final snapshot.
+    ///
+    /// A socket that already emitted a `Flow` is finalized with a
+    /// `Complete`. A TCP socket that never reached ESTABLISHED never emitted
+    /// one, so it is reported now as a single `TransportError` flow — the
+    /// attempt happened and failed, and a `Complete` with no `Flow` to
+    /// finalize would be dropped.
     pub fn close(
         &mut self,
         sock: SocketId,
-        _snap: SocketSnapshot,
-        _now: DateTime<Utc>,
+        snap: SocketSnapshot,
+        now: DateTime<Utc>,
     ) -> Vec<Emission> {
-        self.sockets.remove(&sock);
-        Vec::new()
+        let Some(mut state) = self.sockets.remove(&sock) else {
+            return Vec::new();
+        };
+        let Some(call) = self.calls.get(&state.call_id) else {
+            return Vec::new();
+        };
+        state.ever_established |= snap.established;
+        state.last = snap;
+        let sink = call.attribution.sink.clone();
+
+        if state.flow_emitted {
+            let (outcome, error) = settle_outcome(
+                state.last.transport,
+                state.ever_established,
+                state.last.bytes_in,
+            );
+            return vec![Emission {
+                sink,
+                emit: Emit::Complete(completion(&state, now, outcome, error)),
+            }];
+        }
+
+        // Attributed but never reportable: the never-established case.
+        let mut record = flow_record_from(&call.attribution, &state);
+        record.outcome = Outcome::TransportError;
+        record.error = Some(NEVER_ESTABLISHED.to_string());
+        record.body_complete = true;
+        record.bytes_in = state.last.bytes_in;
+        record.bytes_out = state.last.bytes_out;
+        record.duration_ms = Some(elapsed_ms(state.first_seen, now));
+        vec![Emission {
+            sink,
+            emit: Emit::Flow(Box::new(record)),
+        }]
+    }
+}
+
+const NEVER_ESTABLISHED: &str = "connection never established";
+
+fn elapsed_ms(from: DateTime<Utc>, to: DateTime<Utc>) -> u64 {
+    (to - from).num_milliseconds().max(0) as u64
+}
+
+/// The final outcome of a socket that emitted a flow, and the error note
+/// that goes with a failure.
+fn settle_outcome(
+    transport: Transport,
+    ever_established: bool,
+    bytes_in: Option<u64>,
+) -> (Outcome, Option<String>) {
+    if ever_established || transport == Transport::Udp || bytes_in.is_some_and(|b| b > 0) {
+        (Outcome::Ok, None)
+    } else {
+        (Outcome::TransportError, Some(NEVER_ESTABLISHED.to_string()))
+    }
+}
+
+/// The `Complete` for a socket, from its latest snapshot.
+fn completion(
+    sock: &SockState,
+    now: DateTime<Utc>,
+    outcome: Outcome,
+    error: Option<String>,
+) -> SocketCompletion {
+    SocketCompletion {
+        id: sock.id,
+        duration_ms: elapsed_ms(sock.first_seen, now),
+        bytes_in: sock.last.bytes_in,
+        bytes_out: sock.last.bytes_out,
+        outcome: Some(outcome),
+        error,
     }
 }
 
@@ -276,5 +353,65 @@ mod tests {
         let (mut t, _sink) = tracker_with_call(100);
         assert!(t.observe(7, 999, tcp(true), t0()).is_empty());
         assert!(t.close(7, tcp(true), t0()).is_empty());
+    }
+
+    fn only_complete(mut v: Vec<Emission>) -> rupu_netflow::SocketCompletion {
+        assert_eq!(v.len(), 1, "expected exactly one emission");
+        match v.remove(0).emit {
+            Emit::Complete(c) => c,
+            Emit::Flow(_) => panic!("expected a Complete"),
+        }
+    }
+
+    fn ms(n: i64) -> chrono::Duration {
+        chrono::Duration::milliseconds(n)
+    }
+
+    #[test]
+    fn established_socket_closes_with_complete_ok() {
+        let (mut t, _sink) = tracker_with_call(100);
+        let flow = only_flow(t.observe(7, 100, tcp(true), t0()));
+
+        let mut fin = tcp(true);
+        fin.bytes_in = Some(50_000);
+        fin.bytes_out = Some(1_300);
+        let c = only_complete(t.close(7, fin, t0() + ms(1_500)));
+        assert_eq!(c.id, flow.id);
+        assert_eq!(c.bytes_in, Some(50_000));
+        assert_eq!(c.bytes_out, Some(1_300));
+        assert_eq!(c.outcome, Some(Outcome::Ok));
+        assert_eq!(c.error, None);
+        assert_eq!(c.duration_ms, 1_500);
+    }
+
+    #[test]
+    fn tcp_never_established_closes_with_single_transport_error_flow() {
+        let (mut t, _sink) = tracker_with_call(100);
+        assert!(t.observe(7, 100, tcp(false), t0()).is_empty());
+
+        let f = only_flow(t.close(7, tcp(false), t0() + ms(200)));
+        assert_eq!(f.outcome, Outcome::TransportError);
+        assert_eq!(f.error.as_deref(), Some("connection never established"));
+        assert!(f.body_complete);
+        assert_eq!(f.duration_ms, Some(200));
+        assert_eq!(f.fidelity, Fidelity::Socket);
+    }
+
+    #[test]
+    fn close_of_unknown_socket_is_noop() {
+        let (mut t, _sink) = tracker_with_call(100);
+        assert!(t.close(42, tcp(true), t0()).is_empty());
+    }
+
+    #[test]
+    fn udp_closes_with_complete_ok() {
+        let (mut t, _sink) = tracker_with_call(100);
+        let mut snap = tcp(false);
+        snap.transport = Transport::Udp;
+        let flow = only_flow(t.observe(8, 100, snap.clone(), t0()));
+        let c = only_complete(t.close(8, snap, t0() + ms(50)));
+        assert_eq!(c.id, flow.id);
+        assert_eq!(c.outcome, Some(Outcome::Ok));
+        assert_eq!(c.error, None);
     }
 }
