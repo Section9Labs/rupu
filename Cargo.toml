@@ -22,6 +22,7 @@ members = [
     "crates/rupu-cli",
     "crates/rupu-update",
     "crates/rupu-netflow",
+    "crates/rupu-netwatch",
     "crates/rupu-fleet",
 ]
 
@@ -192,6 +193,7 @@ rupu-codename = { path = "crates/rupu-codename" }
 
 # Network egress observability (netflow)
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
+rupu-netwatch = { path = "crates/rupu-netwatch" }
 
 # File-backed fleet comms store (agentiflows)
 rupu-fleet = { path = "crates/rupu-fleet" }

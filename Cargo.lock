@@ -4802,6 +4802,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-netwatch"
+version = "0.82.0"
+dependencies = [
+ "chrono",
+ "rupu-netflow",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "rupu-orchestrator"
 version = "0.82.0"
 dependencies = [
