@@ -299,6 +299,11 @@ impl AgentiflowDef {
         let mut evaluated: Vec<&rupu_coverage::EngagementProfile> = Vec::new();
         match &ct.kinds {
             None => evaluated.extend(active.profiles()),
+            Some(kinds) if kinds.is_empty() => {
+                // Zero enumerated kinds ⇒ the fraction is always 0.0, so the
+                // stop could never reach any `reach > 0`.
+                return Err(Invalid("coverage.kinds must not be empty when set".into()));
+            }
             Some(kinds) => {
                 // Namespaced kinds each entry resolves to; two entries that
                 // resolve to the same kind would be counted twice.
@@ -698,6 +703,23 @@ trigger: manual
             r.contains("duplicate kind `network:host` (resolves to `network:host`)"),
             "{r}"
         );
+    }
+
+    #[test]
+    fn validate_coverage_explicit_empty_kinds_is_rejected() {
+        // `kinds: []` enumerates zero kinds, so the fraction is always 0.0 and
+        // the stop can never reach any `reach > 0`: fail closed rather than
+        // accept a coverage stop that cannot fire.
+        let r = reason(&with_coverage("{ reach: 0.5, kinds: [] }"));
+        assert!(
+            r.contains("coverage.kinds must not be empty when set"),
+            "{r}"
+        );
+
+        // A non-empty `kinds` still validates (and an unset `kinds` is fine).
+        with_coverage("{ reach: 0.5, kinds: [host] }")
+            .validate(&active())
+            .unwrap();
     }
 
     #[test]

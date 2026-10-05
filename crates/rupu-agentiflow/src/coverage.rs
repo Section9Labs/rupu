@@ -19,8 +19,6 @@ pub struct CoverageTarget {
 pub enum CoverageEvalError {
     #[error("reading assets: {0}")]
     Io(String),
-    #[error("{0}")]
-    Bad(String),
 }
 
 /// The result of evaluating a [`CoverageTarget`] against the asset ledger.
