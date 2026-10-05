@@ -174,9 +174,13 @@ only in model. Three details:
 - The agent's `auth:` mode applies only to a hop on the provider the run started
   on. It says how the agent reaches that provider and says nothing about another
   provider's credentials.
-- A hop does not inherit the agent's `maxTokens`, `contextWindowTokens` or
-  `contextWindow`. Those were chosen for the original model. The hop's limits
-  come from `[[providers.X.models]]` and the provider's model list.
+- A hop does not inherit the agent's `maxTokens` or `contextWindowTokens`.
+  Those were chosen for the original model. The hop's limits come from
+  `[[providers.X.models]]` and the provider's model list.
+- A hop to a different model does not send the agent's `contextWindow` or
+  `anthropicSpeed` either: the 1M beta and fast mode exist only on some
+  models. A hop that keeps the original model's name, on another provider,
+  keeps both.
 
 ### Cross-provider fallback sends the conversation to another vendor
 

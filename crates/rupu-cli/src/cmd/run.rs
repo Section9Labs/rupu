@@ -808,7 +808,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .map(|p| p.default_model.as_str()),
         );
         // What the agent pins for its own model and provider applies only
-        // there — the rule a fallback hop follows (`hop_builder`). An
+        // there — the rule a fallback hop follows (`hop_builder` for limits,
+        // the runner's `OriginPins` for `contextWindow` / `anthropicSpeed`). An
         // "override" naming the agent's own model/provider changes nothing.
         let pins = AgentPins::for_run(&spec, provider_name != agent_provider, model != agent_model);
         let auth_hint = pins.auth;

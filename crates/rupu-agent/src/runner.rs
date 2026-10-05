@@ -1001,6 +1001,38 @@ fn provider_exhausted(
     }
 }
 
+/// The origin model's model-specific request pins (`contextWindow`,
+/// `anthropicSpeed`). They describe that model: a hop to a different model
+/// sends neither (a 1M beta or `speed: fast` the hop's model may not
+/// support), and a hop that keeps the origin's model string keeps both —
+/// the rule `rupu run --model` applies to an agent's pins.
+struct OriginPins {
+    model: String,
+    context_window: Option<rupu_providers::model_tier::ContextWindow>,
+    anthropic_speed: Option<rupu_providers::types::Speed>,
+}
+
+impl OriginPins {
+    fn of(opts: &AgentRunOpts) -> Self {
+        Self {
+            model: opts.model.clone(),
+            context_window: opts.context_window,
+            anthropic_speed: opts.anthropic_speed,
+        }
+    }
+
+    /// Set the pins for the model `opts` now runs on.
+    fn apply_to(&self, opts: &mut AgentRunOpts) {
+        if opts.model == self.model {
+            opts.context_window = self.context_window;
+            opts.anthropic_speed = self.anthropic_speed;
+        } else {
+            opts.context_window = None;
+            opts.anthropic_speed = None;
+        }
+    }
+}
+
 /// What rungs 1 and 2 did.
 enum FallBack {
     /// Nothing left to try, or the action cap is reached: rung 3.
@@ -1027,7 +1059,9 @@ enum FallBack {
 /// - A candidate with no hop builder, or one that fails to build, writes
 ///   `Recovery { Skipped, reason }` and the next is tried.
 /// - A built hop replaces `opts.provider`, `provider_name`, `model` and
-///   `limits`. The swap is sticky: every later turn uses `opts`. It writes
+///   `limits`, and drops the origin's `context_window` / `anthropic_speed`
+///   pins when its model differs from the origin's ([`OriginPins`]). The
+///   swap is sticky: every later turn uses `opts`. It writes
 ///   the hop's `model_limits` notice, then `Recovery { FellBack }`.
 /// - When the last measured input is over the hop's compaction threshold,
 ///   the history is compacted first (not twice in one turn).
@@ -1048,6 +1082,7 @@ async fn fall_back(
     compaction_seq: &mut u32,
     compacted_this_turn: &mut bool,
     last_input_tokens: u32,
+    origin: &OriginPins,
 ) -> Result<FallBack, RunError> {
     loop {
         if rupu_providers::credential_writes::terminating() {
@@ -1095,6 +1130,7 @@ async fn fall_back(
         opts.provider_name = hop.provider_name;
         opts.model = hop.model;
         opts.limits = hop.limits;
+        origin.apply_to(opts);
         writer.write(&Event::Notice {
             kind: "model_limits".into(),
             message: opts.limits.describe(&opts.provider_name, Utc::now()),
@@ -1882,6 +1918,8 @@ async fn run_agent_inner(
         // Unnamed chain entries mean the provider the attempt started on.
         let mut recovery =
             crate::recovery::RecoveryState::with_origin(&opts.provider_name, &opts.model);
+        // The origin model's request pins: a hop to another model drops them.
+        let origin_pins = OriginPins::of(opts);
         // The turn a rung-0 continuation chain started on. Budgets are per
         // logical turn: a truncated answer and its continuations share one
         // budget, though each continuation is its own provider turn. Reset
@@ -2334,6 +2372,7 @@ async fn run_agent_inner(
                             &mut compaction_seq,
                             &mut compacted_this_turn,
                             last_turn_input_tokens,
+                            &origin_pins,
                         )
                         .await?;
                         if let FallBack::Terminated = hopped {
@@ -2345,11 +2384,13 @@ async fn run_agent_inner(
                             ));
                         }
                         if let FallBack::Hopped { messages_changed } = hopped {
-                            // Retry the same request on the hop: its model and
-                            // output cap, and every once-per-turn guard reset
-                            // for the new client.
+                            // Retry the same request on the hop: its model,
+                            // output cap and model pins, and every
+                            // once-per-turn guard reset for the new client.
                             req.model = opts.model.clone();
                             req.max_tokens = opts.limits.output.tokens;
+                            req.context_window = opts.context_window;
+                            req.anthropic_speed = opts.anthropic_speed;
                             if messages_changed {
                                 req.messages = messages.clone();
                             }
@@ -2621,6 +2662,7 @@ async fn run_agent_inner(
                     &mut compaction_seq,
                     &mut compacted_this_turn,
                     last_turn_input_tokens,
+                    &origin_pins,
                 )
                 .await?
                 {
@@ -2904,6 +2946,7 @@ async fn run_agent_inner(
                                 &mut compaction_seq,
                                 &mut compacted_this_turn,
                                 last_turn_input_tokens,
+                                &origin_pins,
                             )
                             .await?
                             {

@@ -1031,15 +1031,28 @@ struct HopRun {
 
 async fn run_with_hops(
     primary: Box<dyn LlmProvider>,
+    origin: (&str, &str),
+    chain: Vec<rupu_config::FallbackEntry>,
+    hops: Option<TestHops>,
+    tmp: &tempfile::TempDir,
+) -> HopRun {
+    run_with_hops_and(primary, origin, chain, hops, tmp, |_| {}).await
+}
+
+/// [`run_with_hops`], with `edit` applied to the run's options first.
+async fn run_with_hops_and(
+    primary: Box<dyn LlmProvider>,
     (provider_name, model): (&str, &str),
     chain: Vec<rupu_config::FallbackEntry>,
     hops: Option<TestHops>,
     tmp: &tempfile::TempDir,
+    edit: impl FnOnce(&mut AgentRunOpts),
 ) -> HopRun {
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(primary, tmp, transcript.clone());
     opts.provider_name = provider_name.into();
     opts.model = model.into();
+    edit(&mut opts);
     let builds = hops.as_ref().map(|h| h.calls.clone()).unwrap_or_default();
     opts.recovery = rupu_agent::RecoveryOpts {
         chain,
@@ -1670,6 +1683,126 @@ async fn unnamed_entries_stay_on_the_origin_provider_after_a_hop() {
                 some("gemini-y")
             ),
         ]
+    );
+}
+
+/// The origin model's `contextWindow: 1m` + `anthropicSpeed: fast`.
+fn pin_origin_model(opts: &mut AgentRunOpts) {
+    opts.context_window = Some(rupu_providers::model_tier::ContextWindow::OneMillion);
+    opts.anthropic_speed = Some(rupu_providers::types::Speed::Fast);
+}
+
+/// `(context_window, anthropic_speed)` per request.
+fn pins(
+    requests: &Arc<Mutex<Vec<LlmRequest>>>,
+) -> Vec<(
+    Option<rupu_providers::model_tier::ContextWindow>,
+    Option<rupu_providers::types::Speed>,
+)> {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| (r.context_window, r.anthropic_speed))
+        .collect()
+}
+
+/// A hop to another model drops the origin model's request pins: the hop's
+/// model may have no 1M window, and `speed: fast` errors on a model without
+/// fast mode (the rule `rupu run --model` applies).
+#[tokio::test]
+async fn a_hop_to_another_model_drops_the_origin_model_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = CapturingMockProvider::new(vec![refusal_reply()]);
+    let primary_requests = primary.captured.clone();
+    let hop = CapturingMockProvider::new(vec![reply(StopReason::EndTurn, vec![text("answer")])]);
+    let hop_requests = hop.captured.clone();
+    let run = run_with_hops_and(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(None, "claude-sonnet-4-6")],
+        Some(TestHops::new(vec![(
+            "anthropic",
+            "claude-sonnet-4-6",
+            Box::new(hop),
+        )])),
+        &tmp,
+        pin_origin_model,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    use rupu_providers::model_tier::ContextWindow;
+    use rupu_providers::types::Speed;
+    assert_eq!(
+        pins(&primary_requests),
+        vec![(Some(ContextWindow::OneMillion), Some(Speed::Fast))],
+        "the origin model sends its pins"
+    );
+    assert_eq!(pins(&hop_requests), vec![(None, None)]);
+}
+
+/// The error path retries the request it already built: the pins come off
+/// that request too.
+#[tokio::test]
+async fn an_error_path_hop_to_another_model_drops_the_origin_model_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new(vec![ScriptedTurn::ReplyError {
+        body: rupu_providers::reply_error::parse_error_body(
+            "anthropic",
+            rupu_providers::reply_error::ErrorOrigin::Http { status: 404 },
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-opus-5-5"}}"#,
+            None,
+            None,
+        ),
+    }]);
+    let hop = CapturingMockProvider::new(vec![reply(StopReason::EndTurn, vec![text("answer")])]);
+    let hop_requests = hop.captured.clone();
+    let run = run_with_hops_and(
+        Box::new(primary),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(None, "claude-sonnet-4-6")],
+        Some(TestHops::new(vec![(
+            "anthropic",
+            "claude-sonnet-4-6",
+            Box::new(hop),
+        )])),
+        &tmp,
+        pin_origin_model,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    assert!(recovery_rows(&run.events)
+        .iter()
+        .any(|r| r.1 == RecoveryAction::FellBack));
+    assert_eq!(pins(&hop_requests), vec![(None, None)]);
+}
+
+/// A hop that keeps the origin's model string (another provider serving the
+/// same model) keeps its pins.
+#[tokio::test]
+async fn a_hop_that_keeps_the_origin_model_keeps_its_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hop = CapturingMockProvider::new(vec![reply(StopReason::EndTurn, vec![text("answer")])]);
+    let hop_requests = hop.captured.clone();
+    let run = run_with_hops_and(
+        Box::new(MockProvider::new(vec![refusal_reply()])),
+        ("anthropic", "claude-opus-5-5"),
+        vec![fallback(Some("other-gateway"), "claude-opus-5-5")],
+        Some(TestHops::new(vec![(
+            "other-gateway",
+            "claude-opus-5-5",
+            Box::new(hop),
+        )])),
+        &tmp,
+        pin_origin_model,
+    )
+    .await;
+    assert_eq!(run.result.as_ref().unwrap().status, RunStatus::Ok);
+    use rupu_providers::model_tier::ContextWindow;
+    use rupu_providers::types::Speed;
+    assert_eq!(
+        pins(&hop_requests),
+        vec![(Some(ContextWindow::OneMillion), Some(Speed::Fast))]
     );
 }
 
