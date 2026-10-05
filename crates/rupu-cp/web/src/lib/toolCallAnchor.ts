@@ -52,9 +52,19 @@ const HIGHLIGHT_CLASSES = ['ring-2', 'ring-brand-500', 'rounded-md'];
  * On mount and on every hash change, when the hash is `#call-<id>`, poll for
  * the card (the transcript may still be loading) and scroll it to the centre,
  * briefly ringing it. `enabled` false pauses the search (e.g. the transcript
- * tab is not showing) without discarding the target.
+ * tab is not showing) and resets to `idle`, so a stale "missing" notice never
+ * outlives the tab it described.
+ *
+ * `rearmKey` identifies the transcript currently on screen (step / unit /
+ * path). When it changes — the user picked another step, as the "missing"
+ * notice tells them to — the search starts over from `searching`, so the card
+ * is scrolled to as soon as the owning step's transcript renders it.
  */
-export function useToolCallAnchor(hash: string, enabled = true): ToolCallAnchorState {
+export function useToolCallAnchor(
+  hash: string,
+  enabled = true,
+  rearmKey = '',
+): ToolCallAnchorState {
   const [state, setState] = useState<ToolCallAnchorState>({ status: 'idle' });
 
   useEffect(() => {
@@ -63,7 +73,10 @@ export function useToolCallAnchor(hash: string, enabled = true): ToolCallAnchorS
       setState({ status: 'idle' });
       return;
     }
-    if (!enabled) return;
+    if (!enabled) {
+      setState({ status: 'idle' });
+      return;
+    }
 
     setState({ status: 'searching', callId });
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -94,7 +107,7 @@ export function useToolCallAnchor(hash: string, enabled = true): ToolCallAnchorS
       if (ringTimer) clearTimeout(ringTimer);
       ringed?.classList.remove(...HIGHLIGHT_CLASSES);
     };
-  }, [hash, enabled]);
+  }, [hash, enabled, rearmKey]);
 
   return state;
 }

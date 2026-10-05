@@ -177,7 +177,6 @@ export default function RunDetail() {
   useEffect(() => {
     if (parseCallHash(hash) !== null) setTab('transcript');
   }, [hash]);
-  const callAnchor = useToolCallAnchor(hash, tab === 'transcript');
 
   // Live state, fed by the single SSE subscription below.
   const [events, setEvents] = useState<SeqEvent[]>([]);
@@ -750,6 +749,15 @@ export default function RunDetail() {
   );
   const selectedFanout = useMemo(() => fanoutOf(selectedNode ?? undefined), [selectedNode]);
   const selectedTranscriptPath = selectedNode?.transcriptPath ?? null;
+
+  // `#call-<id>` scroll (see the hash effect near `tab`). Re-armed whenever the
+  // transcript on screen changes, so picking the step that ran the call — what
+  // the "not in the transcript shown" notice asks for — scrolls to it.
+  const callAnchor = useToolCallAnchor(
+    hash,
+    tab === 'transcript',
+    `${selection?.stepId ?? ''}:${selection?.unitIndex ?? ''}:${selectedTranscriptPath ?? ''}`,
+  );
 
   // Events filtered to the selected step (run-level events, which carry no
   // step_id, drop out naturally); the whole feed when nothing is selected.

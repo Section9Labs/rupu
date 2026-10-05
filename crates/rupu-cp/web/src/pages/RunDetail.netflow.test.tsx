@@ -177,6 +177,26 @@ function renderWithNav() {
   );
 }
 
+// A Link to this run's `#call-<id>` anchor — what a socket flow's "transcript"
+// link renders — alongside RunDetail, to navigate hash-only without remounting.
+function renderWithCallLink() {
+  return render(
+    <MemoryRouter initialEntries={['/runs/run-1']}>
+      <Routes>
+        <Route
+          path="/runs/:id"
+          element={
+            <>
+              <Link to="/runs/run-1#call-toolu%2F1">go-to-call</Link>
+              <RunDetailLoaded />
+            </>
+          }
+        />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
 // Imported here so the vi.mock factories above are hoisted before the module
 // graph resolves RunDetail's child imports.
 import RunDetailLoaded from './RunDetail';
@@ -338,5 +358,40 @@ describe('RunDetail netflow tab', () => {
     await waitFor(() =>
       expect(screen.getByText(/no network flows in this range/i)).toBeInTheDocument(),
     );
+  });
+
+  it('switches to the Transcript tab when navigated to a #call- anchor from another tab', async () => {
+    stubApi(GRAPH);
+    renderWithCallLink();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /events/i }));
+    expect(screen.getByTestId('event-feed')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('go-to-call'));
+    await waitFor(() => expect(screen.queryByTestId('event-feed')).toBeNull());
+  });
+
+  it('leaves the active tab alone for a non-call hash', async () => {
+    stubApi(GRAPH);
+    render(
+      <MemoryRouter initialEntries={['/runs/run-1']}>
+        <Routes>
+          <Route
+            path="/runs/:id"
+            element={
+              <>
+                <Link to="/runs/run-1#other">go-other</Link>
+                <RunDetailLoaded />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /events/i }));
+    fireEvent.click(screen.getByText('go-other'));
+    expect(screen.getByTestId('event-feed')).toBeInTheDocument();
   });
 });

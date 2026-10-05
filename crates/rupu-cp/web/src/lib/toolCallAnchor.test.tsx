@@ -15,8 +15,18 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function Harness({ hash, ids }: { hash: string; ids: string[] }) {
-  const st = useToolCallAnchor(hash);
+function Harness({
+  hash,
+  ids,
+  rearmKey = '',
+  enabled = true,
+}: {
+  hash: string;
+  ids: string[];
+  rearmKey?: string;
+  enabled?: boolean;
+}) {
+  const st = useToolCallAnchor(hash, enabled, rearmKey);
   return (
     <div>
       {ids.map((id) => (
@@ -81,6 +91,41 @@ describe('useToolCallAnchor', () => {
   it('stays idle for a non-call hash', () => {
     render(<Harness hash="#something" ids={['a']} />);
     expect(scrollSpy).not.toHaveBeenCalled();
+    expect(screen.getByTestId('status').textContent).toBe('idle');
+  });
+
+  it('re-arms when the shown transcript changes after giving up', () => {
+    const { rerender } = render(<Harness hash="#call-c1" ids={['other']} rearmKey="step_a" />);
+    act(() => {
+      vi.advanceTimersByTime(9000);
+    });
+    expect(screen.getByTestId('status').textContent).toBe('missing');
+    expect(scrollSpy).not.toHaveBeenCalled();
+
+    // The user picks the step that ran the call: its transcript has the card.
+    rerender(<Harness hash="#call-c1" ids={['c1']} rearmKey="step_b" />);
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+    expect(scrollSpy.mock.instances[0]).toBe(screen.getByTestId('card-c1'));
+    expect(screen.getByTestId('status').textContent).toBe('found');
+  });
+
+  it('goes back to searching (clearing the missing state) on re-arm', () => {
+    const { rerender } = render(<Harness hash="#call-c1" ids={[]} rearmKey="step_a" />);
+    act(() => {
+      vi.advanceTimersByTime(9000);
+    });
+    expect(screen.getByTestId('status').textContent).toBe('missing');
+    rerender(<Harness hash="#call-c1" ids={[]} rearmKey="step_b" />);
+    expect(screen.getByTestId('status').textContent).toBe('searching');
+  });
+
+  it('resets to idle when disabled', () => {
+    const { rerender } = render(<Harness hash="#call-c1" ids={[]} />);
+    act(() => {
+      vi.advanceTimersByTime(9000);
+    });
+    expect(screen.getByTestId('status').textContent).toBe('missing');
+    rerender(<Harness hash="#call-c1" ids={[]} enabled={false} />);
     expect(screen.getByTestId('status').textContent).toBe('idle');
   });
 });
