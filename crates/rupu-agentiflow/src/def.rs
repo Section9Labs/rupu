@@ -139,6 +139,119 @@ impl AgentiflowDef {
     pub fn parse_str(s: &str) -> Result<Self, crate::error::AgentiflowError> {
         Ok(serde_yaml::from_str(s)?)
     }
+
+    /// Resolve `engagement_profiles` against `registry` into the active set
+    /// the rest of validation (and the envelope) routes kinds through.
+    pub fn resolve_profiles(
+        &self,
+        registry: &rupu_coverage::ProfileRegistry,
+    ) -> Result<rupu_coverage::ActiveSet, crate::error::AgentiflowError> {
+        registry
+            .active_set(&self.engagement_profiles)
+            .map_err(|e| crate::error::AgentiflowError::UnknownProfile(e.to_string()))
+    }
+
+    /// Fail-closed validation against the resolved profile set: the scope
+    /// must be authorized, there must be something to steer toward, the lead
+    /// must be in the pool, every goal predicate must be well-formed and name
+    /// a kind/depth an active profile actually defines, and every scope root
+    /// must be a ROOT kind of an active profile.
+    pub fn validate(
+        &self,
+        active: &rupu_coverage::ActiveSet,
+    ) -> Result<(), crate::error::AgentiflowError> {
+        use crate::error::AgentiflowError::Invalid;
+        if !self.scope.authorized {
+            return Err(Invalid("scope.authorized must be true".into()));
+        }
+        if self.goals.is_empty() && self.coverage.is_none() {
+            return Err(Invalid("at least one of goals/coverage is required".into()));
+        }
+        if !self.pool.agents.iter().any(|a| a == &self.lead) {
+            return Err(Invalid(format!(
+                "lead `{}` is not in pool.agents",
+                self.lead
+            )));
+        }
+        // goal predicates
+        for g in &self.goals {
+            match (&g.target.findings, &g.target.asset) {
+                (Some(_), Some(_)) => {
+                    return Err(Invalid(format!(
+                        "goal `{}`: target has both findings and asset",
+                        g.id
+                    )))
+                }
+                (None, None) => {
+                    return Err(Invalid(format!(
+                        "goal `{}`: target has neither findings nor asset",
+                        g.id
+                    )))
+                }
+                (Some(_), None) => {
+                    if g.target.count_gte.is_none() {
+                        return Err(Invalid(format!(
+                            "goal `{}`: findings target requires count_gte",
+                            g.id
+                        )));
+                    }
+                }
+                (None, Some(a)) => {
+                    let Some(depth) = g.target.depth_at_least.as_deref() else {
+                        return Err(Invalid(format!(
+                            "goal `{}`: asset target requires depth_at_least",
+                            g.id
+                        )));
+                    };
+                    if g.target.verified {
+                        return Err(Invalid(format!(
+                            "goal `{}`: `verified` is not valid on an asset target (the depth rung is the evidence)",
+                            g.id
+                        )));
+                    }
+                    // kind must be owned by an active profile; depth a rung of its ladder
+                    let profile = active.profile_for_kind(&a.kind).ok_or_else(|| {
+                        Invalid(format!(
+                            "goal `{}`: asset kind `{}` not owned by any active profile",
+                            g.id, a.kind
+                        ))
+                    })?;
+                    if !profile.coverage.depth_ladder.iter().any(|d| d == depth) {
+                        return Err(Invalid(format!(
+                            "goal `{}`: depth `{}` is not a rung of `{}`'s ladder",
+                            g.id, depth, profile.id
+                        )));
+                    }
+                }
+            }
+        }
+        // scope roots must name a ROOT kind (parent == None) of an active profile
+        for root in &self.scope.roots {
+            let profile = active.profile_for_kind(&root.kind).ok_or_else(|| {
+                Invalid(format!(
+                    "scope root kind `{}` not owned by any active profile",
+                    root.kind
+                ))
+            })?;
+            // The registry namespaces every kind id (and `parent`) as
+            // `"<profile>:<kind>"`, so compare against the full kind string.
+            let is_root = profile
+                .asset_kinds
+                .iter()
+                .any(|k| k.id == root.kind && k.parent.is_none());
+            if !is_root {
+                return Err(Invalid(format!(
+                    "scope root `{}` is not a root asset kind of profile `{}`",
+                    root.kind, profile.id
+                )));
+            }
+        }
+        // budget sanity
+        if let Some(b) = &self.budget {
+            b.validate().map_err(Invalid)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -167,10 +280,9 @@ scope:
   authorized: true
   mode: bypass
   roots:
-    - kind: network:scope
-      cidrs: ["10.0.0.0/24"]
-      hosts: ["1.1.2.2"]
-    - kind: web:target
+    - kind: network:host
+      host: "1.1.2.2"
+    - kind: web:site
       url: "https://app.acme.test"
 pool:
   agents: [recon, exploit-verifier, orchestrator-lead]
@@ -190,7 +302,7 @@ trigger: manual
         assert_eq!(def.goals[0].target.count_gte, Some(10));
         assert!(def.goals[0].target.verified);
         assert_eq!(def.scope.roots.len(), 2);
-        assert_eq!(def.scope.roots[0].kind, "network:scope");
+        assert_eq!(def.scope.roots[0].kind, "network:host");
         assert_eq!(def.pool.agents.len(), 3);
     }
 
@@ -198,5 +310,139 @@ trigger: manual
     fn rejects_unknown_top_level_field() {
         let bad = "name: x\nlead: y\nengagement_profiles: [code]\nscope: {authorized: true}\npool: {}\nbogus: 1\n";
         assert!(AgentiflowDef::parse_str(bad).is_err());
+    }
+
+    fn active() -> rupu_coverage::ActiveSet {
+        rupu_coverage::builtin_registry()
+            .unwrap()
+            .active_set(&["network".into(), "web".into()])
+            .unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_the_sample() {
+        let def = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        def.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_unauthorized_scope() {
+        let mut def = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        def.scope.authorized = false;
+        assert!(def.validate(&active()).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_lead_not_in_pool() {
+        let mut def = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        def.lead = "ghost".into();
+        assert!(def.validate(&active()).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_goal_with_both_findings_and_asset() {
+        let yaml = SAMPLE.replace(
+            "target: { findings: { classification: \"CWE-94\" }, count_gte: 10, verified: true }",
+            "target: { findings: { classification: \"CWE-94\" }, asset: { kind: \"network:host\" }, count_gte: 1 }",
+        );
+        let def = AgentiflowDef::parse_str(&yaml).unwrap();
+        assert!(def.validate(&active()).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_scope_root_kind_not_a_profile_root() {
+        let mut def = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        def.scope.roots[0].kind = "network:service".into(); // service has a parent (host) → not a root
+        assert!(def.validate(&active()).is_err());
+    }
+
+    /// The five brief tests only assert `is_err()`; pin the REASON so a
+    /// rejection can't pass for the wrong cause.
+    fn reason(def: &AgentiflowDef) -> String {
+        def.validate(&active()).unwrap_err().to_string()
+    }
+
+    fn with_target(target: &str) -> AgentiflowDef {
+        let yaml = SAMPLE.replace(
+            "target: { findings: { classification: \"CWE-94\" }, count_gte: 10, verified: true }",
+            &format!("target: {target}"),
+        );
+        AgentiflowDef::parse_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn validate_rejection_reasons_are_specific() {
+        let mut d = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        d.scope.authorized = false;
+        assert!(reason(&d).contains("scope.authorized"));
+
+        let mut d = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        d.lead = "ghost".into();
+        assert!(reason(&d).contains("not in pool.agents"));
+
+        let mut d = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        d.goals.clear();
+        d.coverage = None;
+        assert!(reason(&d).contains("goals/coverage"));
+
+        let d = with_target(
+            "{ findings: { classification: \"CWE-94\" }, asset: { kind: \"network:host\" }, count_gte: 1 }",
+        );
+        assert!(reason(&d).contains("both findings and asset"));
+
+        let d = with_target("{ count_gte: 1 }");
+        assert!(reason(&d).contains("neither findings nor asset"));
+
+        let d = with_target("{ findings: { classification: \"CWE-94\" } }");
+        assert!(reason(&d).contains("requires count_gte"));
+
+        let mut d = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        d.scope.roots[0].kind = "network:service".into();
+        assert!(reason(&d).contains("not a root asset kind"));
+
+        let mut d = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        d.scope.roots[0].kind = "code:repo".into(); // `code` is not active
+        assert!(reason(&d).contains("not owned by any active profile"));
+    }
+
+    #[test]
+    fn validate_asset_goal_checks_kind_depth_and_verified() {
+        let ok = with_target(
+            "{ asset: { kind: \"network:host\", locator: { host: \"1.1.2.2\" } }, depth_at_least: exploited }",
+        );
+        ok.validate(&active()).unwrap();
+
+        let d = with_target("{ asset: { kind: \"network:host\" } }");
+        assert!(reason(&d).contains("requires depth_at_least"));
+
+        let d = with_target(
+            "{ asset: { kind: \"network:host\" }, depth_at_least: exploited, verified: true }",
+        );
+        assert!(reason(&d).contains("`verified` is not valid on an asset target"));
+
+        let d = with_target("{ asset: { kind: \"code:file\" }, depth_at_least: exploited }");
+        assert!(reason(&d).contains("not owned by any active profile"));
+
+        // `mapped` is a web rung, not a network rung.
+        let d = with_target("{ asset: { kind: \"network:host\" }, depth_at_least: mapped }");
+        assert!(reason(&d).contains("not a rung of `network`'s ladder"));
+
+        // ...but it is valid against a web kind.
+        let d = with_target("{ asset: { kind: \"web:site\" }, depth_at_least: mapped }");
+        d.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn resolve_profiles_maps_registry_errors_to_unknown_profile() {
+        let registry = rupu_coverage::builtin_registry().unwrap();
+        let def = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        assert!(def.resolve_profiles(&registry).is_ok());
+
+        let mut bad = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        bad.engagement_profiles = vec!["no-such-profile".into()];
+        assert!(matches!(
+            bad.resolve_profiles(&registry),
+            Err(crate::error::AgentiflowError::UnknownProfile(_))
+        ));
     }
 }
