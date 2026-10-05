@@ -230,9 +230,16 @@ fn finalize(call: &CallState, state: &SockState, now: DateTime<Utc>, still_open:
             emit: Emit::Complete(completion(state, now, outcome, error)),
         };
     }
+    // Not yet reported, but it may have connected between the last
+    // observation and the close, so the outcome is judged, not assumed.
+    let (outcome, error) = settle_outcome(
+        state.last.transport,
+        state.ever_established,
+        state.last.bytes_in,
+    );
     let mut record = flow_record_from(&call.attribution, state);
-    record.outcome = Outcome::TransportError;
-    record.error = Some(NEVER_ESTABLISHED.to_string());
+    record.outcome = outcome;
+    record.error = error;
     record.body_complete = true;
     record.bytes_in = state.last.bytes_in;
     record.bytes_out = state.last.bytes_out;
@@ -555,5 +562,56 @@ mod tests {
         // run-2's call is still live and attributing.
         let c = only_complete(t.close(13, tcp(true), t0() + ms(200)));
         assert_eq!(c.outcome, Some(Outcome::Ok));
+    }
+
+    #[test]
+    fn socket_established_only_at_close_is_not_a_transport_error() {
+        let (mut t, _sink) = tracker_with_call(100);
+        assert!(t.observe(7, 100, tcp(false), t0()).is_empty());
+
+        let mut fin = tcp(true);
+        fin.bytes_in = Some(500);
+        let f = only_flow(t.close(7, fin, t0() + ms(300)));
+        assert_eq!(f.outcome, Outcome::Ok);
+        assert_eq!(f.error, None);
+        assert!(f.body_complete);
+        assert_eq!(f.bytes_in, Some(500));
+    }
+
+    fn assert_never_established_flow(f: &FlowRecord) {
+        assert_eq!(f.outcome, Outcome::TransportError);
+        assert_eq!(f.error.as_deref(), Some("connection never established"));
+        assert!(f.body_complete);
+        assert!(f.duration_ms.is_some());
+    }
+
+    #[test]
+    fn tick_flushes_never_established_open_socket_as_single_flow() {
+        let (mut t, _sink) = tracker_with_call(100);
+        assert!(t.observe(7, 100, tcp(false), t0()).is_empty());
+        t.finish_call(1, t0());
+        let f = only_flow(t.tick(t0() + ms(4_000)));
+        assert_never_established_flow(&f);
+        assert!(t.tick(t0() + ms(9_000)).is_empty());
+    }
+
+    #[test]
+    fn finish_run_flushes_never_established_open_socket_as_single_flow() {
+        let (mut t, _sink) = tracker_with_call(100);
+        assert!(t.observe(7, 100, tcp(false), t0()).is_empty());
+        let f = only_flow(t.finish_run("run-1", t0() + ms(250)));
+        assert_never_established_flow(&f);
+    }
+
+    #[test]
+    fn finish_call_twice_keeps_the_first_deadline() {
+        let (mut t, _sink) = tracker_with_call(100);
+        only_flow(t.observe(7, 100, tcp(true), t0()));
+        t.finish_call(1, t0());
+        t.finish_call(1, t0() + ms(2_000));
+        // First deadline + linger (3s) has passed; a pushed-out deadline
+        // (2s + 3s) would not have.
+        let c = only_complete(t.tick(t0() + ms(3_500)));
+        assert!(c.error.as_deref().unwrap().contains("still open"));
     }
 }
