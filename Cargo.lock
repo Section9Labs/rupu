@@ -4499,6 +4499,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-agentiflow"
+version = "0.82.0"
+dependencies = [
+ "chrono",
+ "rupu-coverage",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rupu-app-canvas"
 version = "0.82.0"
 dependencies = [
