@@ -326,6 +326,7 @@ and are not repeated here.
 - [ ] Host selector on the create/generate modals (its stated blocker — multi-host — has landed).
 - [ ] Full `ModelRegistry` in the generate model dropdown (one model per provider today).
 - [ ] Tool/thinking deltas over the live-session SSE (text-only today).
+- [ ] **netflow: populate `ctx.step_id` on subprocess flows** so the CP can auto-select the owning step for a socket row's transcript link (today the link is best-effort: it scrolls only when the owning step's transcript is shown). Proper fix also enables filtering the Network table by step.
 
 ### rupu-orchestrator / rupu-tools
 - [ ] **Pause/resume a workflow containing `workspace: sync`** — refused outright (`runner.rs:162,171`); the workflows that most need a long pause are the ones that cannot pause.

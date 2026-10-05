@@ -509,6 +509,90 @@ async fn run_netflow_missing_ledger_is_empty_not_an_error() {
     assert_eq!(body["dropped_total"], 0);
 }
 
+#[tokio::test]
+async fn run_netflow_reports_the_latest_capture_state_and_loss_notes() {
+    use rupu_netflow::CaptureState;
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run("run_cap", project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let t0 = chrono::Utc::now();
+    write_ledger(
+        project.path(),
+        "run_cap",
+        &[
+            LedgerLine::Capture {
+                ts: t0,
+                state: CaptureState::Active {
+                    backend: "lsof".into(),
+                },
+                tool_call_id: None,
+                note: None,
+            },
+            LedgerLine::Flow(Box::new(flow(
+                None,
+                "api.anthropic.com",
+                Fidelity::Http,
+                None,
+            ))),
+            LedgerLine::Capture {
+                ts: t0 + chrono::Duration::seconds(5),
+                state: CaptureState::Unavailable {
+                    reason: "permission denied".into(),
+                },
+                tool_call_id: Some("tc1".into()),
+                note: Some("2 short connections missed".into()),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/runs/run_cap/netflow"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["flows"].as_array().unwrap().len(),
+        1,
+        "flows unchanged"
+    );
+    assert_eq!(body["capture"]["state"], "unavailable", "latest line wins");
+    assert_eq!(body["capture"]["reason"], "permission denied");
+    assert_eq!(
+        body["capture"]["notes"],
+        serde_json::json!(["2 short connections missed"])
+    );
+
+    // A run with no capture lines omits the field entirely.
+    let global2 = tempfile::tempdir().unwrap();
+    let project2 = tempfile::tempdir().unwrap();
+    let state2 = new_state(global2.path());
+    state2
+        .run_store
+        .create(
+            seed_run("run_nocap", project2.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let addr2 = serve(state2).await;
+    let body2: serde_json::Value =
+        reqwest::get(format!("http://{addr2}/api/runs/run_nocap/netflow"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(body2.get("capture").is_none());
+}
+
 // ── Project scope: must include a flow whose OWN `run_id` field is
 //    `None`, from the same ledger directory as a normal run-scoped one ──
 //

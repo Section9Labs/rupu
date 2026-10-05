@@ -158,3 +158,30 @@ export function flowView(overrides: Partial<FlowView> = {}): FlowView {
     ...overrides,
   };
 }
+
+/** A `socket`-fidelity flow: a bash subprocess's TCP connection, attributed
+ *  to the tool call that spawned it. No method/path/status — a socket sees
+ *  none of them. */
+export function socketFlowView(overrides: Partial<FlowView> = {}): FlowView {
+  return flowView({
+    id: 'sock1',
+    ctx: {
+      origin: { kind: 'subprocess', name: 'curl' },
+      run_id: 'run1',
+      tool_call_id: 'toolu_1',
+    },
+    fidelity: 'socket',
+    process: { pid: 4412, name: 'curl' },
+    scheme: 'tcp',
+    host: '140.82.116.3',
+    port: 443,
+    method: '',
+    path: '',
+    status: undefined,
+    local_addr: '10.0.0.2:51000',
+    direction: 'outbound',
+    bytes_in: 4096,
+    bytes_out: 128,
+    ...overrides,
+  });
+}

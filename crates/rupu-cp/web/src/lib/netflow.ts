@@ -32,21 +32,26 @@ import { ApiError } from './api';
 // reads true for an absent key, so a `.toFixed()` on it throws.
 // ---------------------------------------------------------------------------
 
-export type Fidelity = 'coarse' | 'http' | 'full';
+/** Ordered weakest to strongest: `coarse < socket < http < full`. `socket` is
+ *  the OS-socket-table observation of a subprocess's connection — process,
+ *  remote IP:port, bytes and timing, but no URL, method or HTTP status. */
+export type Fidelity = 'coarse' | 'socket' | 'http' | 'full';
 
 export type Outcome = 'ok' | 'http_error' | 'transport_error' | 'timeout';
 
 /**
  * `rupu_netflow::ctx::Origin` — adjacently tagged (`tag = "kind", content =
  * "name"`). `name` is present only for the variants that carry data
- * (`provider` / `scm`); the unit variants (`update` / `cp` / `system`)
+ * (`provider` / `scm` / `subprocess`); the unit variants (`update` / `cp` / `system`)
  * serialize with no `name` key at all, not `name: null`.
  *
  * Careful: "can occur" is not "is captured". `update` / `cp` / `system`
  * can be constructed, but every production call site wires them to a
  * `NullSink`, so no flow with those origins ever reaches a ledger at any
  * scope — see `rupu-netflow`'s crate doc. Only `provider` and `scm` are
- * actually recorded.
+ * actually recorded — plus `subprocess`, which IS present and captured: the
+ * connections made by the bash tool's child processes (Plan 6), named by the
+ * process, at `socket` fidelity.
  *
  * This lists only egress that can actually occur, mirroring the Rust enum:
  * `mcp` and `webhook` don't exist because neither subsystem makes outbound
@@ -54,7 +59,7 @@ export type Outcome = 'ok' | 'http_error' | 'transport_error' | 'timeout';
  * `scm`; the webhook server is inbound-only).
  */
 export interface Origin {
-  kind: 'provider' | 'scm' | 'update' | 'cp' | 'system';
+  kind: 'provider' | 'scm' | 'subprocess' | 'update' | 'cp' | 'system';
   name?: string;
 }
 
@@ -68,6 +73,8 @@ export interface FlowCtx {
   step_id?: string;
   agent?: string;
   workspace_id?: string;
+  /** The tool call that spawned the connecting subprocess (`socket` flows). */
+  tool_call_id?: string;
   origin: Origin;
 }
 
@@ -103,6 +110,12 @@ export interface FlowView {
   bytes_out?: number;
   bytes_in?: number;
   body_complete: boolean;
+  /** `socket` fidelity: the connecting process (omitted otherwise). */
+  process?: { pid: number; name: string };
+  /** `socket` fidelity: the local `ip:port` of the connection. */
+  local_addr?: string;
+  /** `socket` fidelity: connection direction. */
+  direction?: 'outbound' | 'inbound';
   ttfb_ms?: number;
   duration_ms?: number;
   asn?: AsnInfo;
@@ -181,6 +194,18 @@ export interface NetflowResponse {
    *  Absent (not `[]`) when nothing is missing — the server omits the field
    *  entirely, so treat `undefined` as complete. */
   incomplete?: IncompleteSource[];
+  /** Subprocess-capture availability — run scope only. Flattened by the
+   *  server from the run's `capture` ledger lines: `state` is the LATEST
+   *  line's, `reason` is set when unavailable, `notes` are every
+   *  visible-loss note. Absent when the run recorded no capture line. */
+  capture?: RunCaptureStatus;
+}
+
+/** `rupu_cp::api::netflow::CaptureSummary`. */
+export interface RunCaptureStatus {
+  state: 'active' | 'unavailable';
+  reason?: string | null;
+  notes: string[];
 }
 
 // ---------------------------------------------------------------------------

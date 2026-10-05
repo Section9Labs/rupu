@@ -9,6 +9,7 @@ import type { Fidelity } from '../../lib/netflow';
 
 const FIDELITY_TONE: Record<Fidelity, BadgeTone> = {
   coarse: 'amber',
+  socket: 'violet',
   http: 'green',
   full: 'sky',
 };
@@ -19,6 +20,8 @@ const FIDELITY_TONE: Record<Fidelity, BadgeTone> = {
 export const FIDELITY_TITLE: Record<Fidelity, string> = {
   coarse:
     'Coarse — host, outcome and timing are real; byte counts and peer IP were not observable for this connector.',
+  socket:
+    'Socket — process, remote IP:port, bytes and timing observed from the OS socket table; no URL, method or HTTP status.',
   http: 'HTTP — exact request and response metadata from the instrumented client.',
   full: 'Full — frame-level capture from the isolated runtime.',
 };
