@@ -116,6 +116,7 @@ pub fn origin_key(origin: &Origin) -> String {
     match origin {
         Origin::Provider(name) => format!("provider:{name}"),
         Origin::Scm(name) => format!("scm:{name}"),
+        Origin::Subprocess(name) => format!("subprocess:{name}"),
         Origin::Update => "update".to_string(),
         Origin::Cp => "cp".to_string(),
         Origin::System => "system".to_string(),

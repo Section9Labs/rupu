@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// deliberately: `rupu-mcp` makes no outbound HTTP (it dispatches into
 /// `rupu-scm`'s connectors, which tag their own calls `Scm`), and
 /// `rupu-webhook` is an inbound server. A variant nothing can construct
-/// is a promise of coverage that does not exist.
+/// is a promise of coverage that does not exist. `Subprocess` IS present
+/// and CAN occur — it is emitted by the subprocess-capture backend (spec
+/// 2026-10-04).
 ///
 /// "Can occur" is not "is captured", though: `Update`, `Cp` and `System`
 /// CAN be constructed (every one of their production call sites does), but
@@ -29,6 +31,11 @@ pub enum Origin {
     Provider(String),
     /// SCM / issue connector, by platform (`github`, `gitlab`, …).
     Scm(String),
+    /// A process the agent started through the `bash` tool, by process
+    /// name (`curl`, `git`, `nmap`…), or `"unknown"` when the owning
+    /// process could not be resolved. Flows tagged this way are
+    /// `Fidelity::Socket` and carry `FlowCtx.tool_call_id`.
+    Subprocess(String),
     Update,
     Cp,
     System,
@@ -88,6 +95,7 @@ mod tests {
         for json in [
             r#"{"kind":"provider","name":"anthropic"}"#,
             r#"{"kind":"scm","name":"github"}"#,
+            r#"{"kind":"subprocess","name":"curl"}"#,
             r#"{"kind":"update"}"#,
             r#"{"kind":"cp"}"#,
             r#"{"kind":"system"}"#,

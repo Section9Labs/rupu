@@ -517,3 +517,13 @@ fn socket_fidelity_serializes_snake_case_and_round_trips() {
         Fidelity::Socket
     );
 }
+
+#[test]
+fn subprocess_origin_tags_and_keys() {
+    use rupu_netflow::ledger::explorer::origin_key;
+    let o = Origin::Subprocess("curl".into());
+    let json = serde_json::to_value(&o).unwrap();
+    assert_eq!(json, serde_json::json!({"kind":"subprocess","name":"curl"}));
+    assert_eq!(serde_json::from_value::<Origin>(json).unwrap(), o);
+    assert_eq!(origin_key(&o), "subprocess:curl");
+}
