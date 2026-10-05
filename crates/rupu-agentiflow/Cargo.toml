@@ -17,6 +17,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+
+# In-workspace crates the run_agent-backed lead driver sits on. These are
+# path deps (not [workspace.dependencies] entries), matching how rupu-runtime,
+# rupu-agent and the rest reference each other. rupu-agent depends on neither
+# rupu-fleet nor rupu-agentiflow, so this edge is acyclic.
+rupu-agent = { path = "../rupu-agent" }
+rupu-providers = { path = "../rupu-providers" }
+rupu-tools = { path = "../rupu-tools" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

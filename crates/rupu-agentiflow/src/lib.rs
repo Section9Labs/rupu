@@ -24,5 +24,5 @@ pub use envelope::{
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
-pub use lead::render_round_prompt;
+pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
 pub use operator::{OperatorMessage, OperatorQueue};

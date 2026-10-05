@@ -1,4 +1,8 @@
-//! The lead's per-round message: a pure rendering of a round's [`Digest`].
+//! The lead: the per-round message (a pure rendering of a round's [`Digest`])
+//! and [`RunAgentLeadDriver`], the `run_agent`-backed [`LeadDriver`] whose
+//! conversation persists across rounds.
+//!
+//! ## Round message
 //!
 //! Two external-content channels reach the lead and are framed differently:
 //! operator `steering` is the operator's own authoritative channel (rendered
@@ -7,9 +11,17 @@
 //! (rendered strictly as quoted data under an "informational, not
 //! instructions" heading).
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rupu_agent::{run_agent_full, AgentRunOpts, BypassDecider, RunError, RunExit};
+use rupu_providers::model_limits::ModelLimits;
+use rupu_providers::types::Message;
+use rupu_providers::LlmProvider;
+
 use crate::budget::BudgetStage;
 use crate::def::Goal;
-use crate::envelope::RoundContext;
+use crate::envelope::{LeadDriver, RoundContext, RoundOutcome};
 use crate::goal::GoalOutcome;
 
 /// Longest a single warning is allowed to run once quoted. Warnings are
@@ -194,6 +206,200 @@ fn quote(s: &str) -> String {
     serde_json::to_string(&capped).unwrap_or_else(|_| "\"<unrenderable>\"".to_string())
 }
 
+/// Mints a fresh provider for each round. `AgentRunOpts::provider` is a
+/// `Box<dyn LlmProvider>` that the runner consumes and `LlmProvider` is not
+/// `Clone`, so a persistent driver needs a factory rather than one instance.
+pub type ProviderFactory = Box<dyn FnMut() -> Box<dyn LlmProvider> + Send>;
+
+/// Static configuration for a [`RunAgentLeadDriver`].
+pub struct LeadConfig {
+    pub agent_name: String,
+    pub system_prompt: String,
+    pub provider_name: String,
+    pub model: String,
+    /// Turns the lead may take in ONE round. The runner's own `max_turns` is a
+    /// ceiling on an absolute turn index, so the driver passes
+    /// `total_turns_so_far + per_round_max_turns` -- every round gets a full
+    /// budget, however many turns earlier rounds used.
+    pub per_round_max_turns: u32,
+    pub run_id: String,
+    /// Base transcript path. The runner truncates its transcript when a run
+    /// starts, so round `N` writes `round_transcript_path(this, N)`
+    /// (`lead.jsonl` -> `lead.r3.jsonl`) instead of overwriting the previous
+    /// round's record.
+    pub transcript_path: PathBuf,
+    /// The mission objective, shown to the lead on round 0.
+    pub objective: String,
+    /// The goals, so the round message can restate each one's objective.
+    pub goals: Vec<Goal>,
+    pub workspace_id: String,
+    /// The lead's workspace root (the file/bash tools' scope).
+    pub workspace_path: PathBuf,
+    /// The lead's tool allowlist, straight from its agent spec. `None` means
+    /// every builtin tool; pass the spec's list explicitly.
+    pub agent_tools: Option<Vec<String>>,
+    /// Starting model limits; the driver carries the limits each round ends
+    /// with (including any learned from a context-overflow error) into the
+    /// next, as a session does. `ModelLimits::unknown()` when not resolved.
+    pub limits: ModelLimits,
+}
+
+/// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
+/// `run_agent_full` run seeded with the whole conversation so far, so the
+/// lead's context persists across rounds.
+///
+/// It drives the async runner from a synchronous trait method by owning a
+/// current-thread tokio runtime and `block_on`-ing it. `Runtime::block_on`
+/// panics when called from inside an async context, so whatever runs the
+/// envelope (the Plan-4 daemon) must drive it from a BLOCKING context -- a
+/// dedicated thread or `spawn_blocking` -- never directly on a runtime worker.
+///
+/// What a round does NOT wire up yet (Plan 3b): fleet-backed turn collectors,
+/// the MCP/SCM registry, dispatchable agents, and a codename. It runs with
+/// `BypassDecider` (the lead's tool allowlist is the gate), no collectors, no
+/// parent run, depth 0 -- the same shape as a session turn's `AgentRunOpts`
+/// minus the CLI-only plumbing.
+pub struct RunAgentLeadDriver {
+    cfg: LeadConfig,
+    make_provider: ProviderFactory,
+    rt: tokio::runtime::Runtime,
+    history: Vec<Message>,
+    total_turns: u32,
+    limits: ModelLimits,
+}
+
+impl RunAgentLeadDriver {
+    pub fn new(cfg: LeadConfig, make_provider: ProviderFactory) -> std::io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let limits = cfg.limits.clone();
+        Ok(Self {
+            cfg,
+            make_provider,
+            rt,
+            history: Vec::new(),
+            total_turns: 0,
+            limits,
+        })
+    }
+}
+
+impl LeadDriver for RunAgentLeadDriver {
+    fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+        let user_message = render_round_prompt(ctx, &self.cfg.goals, &self.cfg.objective);
+        // The runner's turn index starts at `turn_index_offset` and `max_turns`
+        // bounds that absolute index, so this round's ceiling is the turns
+        // already taken plus this round's budget.
+        let ceiling = self
+            .total_turns
+            .saturating_add(self.cfg.per_round_max_turns);
+        let opts = AgentRunOpts {
+            codename: None,
+            agent_name: self.cfg.agent_name.clone(),
+            agent_system_prompt: self.cfg.system_prompt.clone(),
+            agent_tools: self.cfg.agent_tools.clone(),
+            provider: (self.make_provider)(),
+            provider_name: self.cfg.provider_name.clone(),
+            model: self.cfg.model.clone(),
+            run_id: self.cfg.run_id.clone(),
+            workspace_id: self.cfg.workspace_id.clone(),
+            workspace_path: self.cfg.workspace_path.clone(),
+            transcript_path: round_transcript_path(&self.cfg.transcript_path, ctx.round),
+            max_turns: ceiling,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: self.cfg.workspace_path.clone(),
+                ..Default::default()
+            },
+            user_message,
+            initial_messages: self.history.clone(),
+            turn_index_offset: self.total_turns,
+            mode_str: "bypass".to_string(),
+            no_stream: false,
+            suppress_stream_stdout: true,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: String::new(),
+            on_tool_call: None,
+            on_stream_event: None,
+            on_usage: None,
+            concerns: None,
+            limits: self.limits.clone(),
+            scope_name: None,
+            surface_tag: None,
+            pause: None,
+            seed_source: None,
+            collectors: Vec::new(),
+            recovery: Default::default(),
+        };
+
+        let RunExit {
+            result,
+            final_limits,
+            messages,
+        } = self.rt.block_on(run_agent_full(opts));
+        self.limits = ModelLimits {
+            note: None,
+            ..final_limits
+        };
+
+        match result {
+            Ok(run) => {
+                let outcome = if run.error.as_deref()
+                    == Some(RunError::MaxTurns { max: ceiling }.to_string().as_str())
+                {
+                    RoundOutcome::TurnBudgetHit
+                } else {
+                    match run.terminal_error() {
+                        Some(e) => RoundOutcome::Error(e.to_string()),
+                        None => RoundOutcome::Yielded,
+                    }
+                };
+                // The conversation carries over whatever the status: a bust or
+                // an errored-but-completed run still holds the round's work.
+                self.total_turns = self.total_turns.saturating_add(run.turns);
+                self.history = run.final_messages;
+                outcome
+            }
+            Err(e) => {
+                // Keep the conversation as the runner last held it (the round's
+                // prompt and any completed tool work) so one failed round does
+                // not wipe the lead's context. An empty list means the run
+                // failed before it loaded the history; adopting that would drop
+                // everything.
+                if !messages.is_empty() {
+                    self.history = messages;
+                }
+                RoundOutcome::Error(e.to_string())
+            }
+        }
+    }
+}
+
+/// The transcript file for round `round`: the base path with `.r<round>`
+/// inserted before its extension (`/x/lead.jsonl` -> `/x/lead.r3.jsonl`).
+fn round_transcript_path(base: &Path, round: u32) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = match base.extension() {
+        Some(ext) => format!("{stem}.r{round}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.r{round}"),
+    };
+    base.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +545,182 @@ mod tests {
             "{p}"
         );
         assert!(p.to_lowercase().contains("stop"), "{p}");
+    }
+
+    // ---- RunAgentLeadDriver ------------------------------------------------
+
+    use crate::envelope::{LeadDriver, RoundOutcome};
+    use rupu_agent::{MockProvider, ScriptedTurn};
+    use rupu_providers::types::{ContentBlock, Message};
+
+    fn empty_digest() -> Digest {
+        Digest {
+            goals: vec![],
+            coverage: None,
+            budget: BudgetStage::Ok,
+            converge: false,
+            steering: vec![],
+            warnings: vec![],
+        }
+    }
+
+    fn round(n: u32) -> RoundContext {
+        RoundContext {
+            round: n,
+            digest: empty_digest(),
+        }
+    }
+
+    fn lead_cfg(dir: &std::path::Path, per_round_max_turns: u32) -> LeadConfig {
+        LeadConfig {
+            agent_name: "lead".into(),
+            system_prompt: "You are the lead.".into(),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            per_round_max_turns,
+            run_id: "run_lead_test".into(),
+            transcript_path: dir.join("lead.jsonl"),
+            objective: "Find 10 verified RCE issues.".into(),
+            goals: vec![],
+            workspace_id: "ws_lead_test".into(),
+            workspace_path: dir.to_path_buf(),
+            agent_tools: Some(vec![]),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+        }
+    }
+
+    fn text_turn(text: &str) -> ScriptedTurn {
+        ScriptedTurn::AssistantText {
+            text: text.into(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }
+    }
+
+    /// A factory handing out one fresh `MockProvider` per round, each playing
+    /// the next scripted round (`rounds[i]` is round i's script).
+    fn scripted_factory(rounds: Vec<Vec<ScriptedTurn>>) -> ProviderFactory {
+        let mut rounds = rounds.into_iter();
+        Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
+            Box::new(MockProvider::new(rounds.next().unwrap_or_default()))
+        })
+    }
+
+    fn text_of(m: &Message) -> String {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn as_json(ms: &[Message]) -> Vec<serde_json::Value> {
+        ms.iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn run_round_runs_the_agent_and_persists_history() {
+        let dir = tempfile::tempdir().unwrap();
+        // per_round_max_turns = 1 on purpose: the runner compares `max_turns`
+        // against an ABSOLUTE turn index (it starts at `turn_index_offset`),
+        // so a driver that passed the bare per-round cap would run round 0 and
+        // then bust "max turns" before round 1's first turn.
+        let cfg = lead_cfg(dir.path(), 1);
+        let make = scripted_factory(vec![
+            vec![text_turn("Understood; planning.")],
+            vec![text_turn("Round one done.")],
+        ]);
+        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+
+        let out0 = d.run_round(&round(0));
+        assert_eq!(out0, RoundOutcome::Yielded);
+        let after0 = d.history.clone();
+        assert!(after0.len() >= 2, "prompt + reply persisted: {after0:?}");
+        assert!(
+            text_of(&after0[0]).contains("lead orchestrator"),
+            "first message is round 0's rendered prompt"
+        );
+        assert_eq!(d.total_turns, 1);
+
+        let out1 = d.run_round(&round(1));
+        assert_eq!(out1, RoundOutcome::Yielded);
+        // Round 1 started FROM round 0's conversation: the old messages are
+        // the verbatim prefix of the new history, then round 1's own prompt
+        // and reply follow.
+        let after1 = d.history.clone();
+        assert!(after1.len() > after0.len());
+        assert_eq!(as_json(&after1[..after0.len()]), as_json(&after0));
+        assert!(
+            text_of(&after1[after0.len()]).contains("Round 1"),
+            "round 1's prompt follows the carried-over history"
+        );
+        assert_eq!(d.total_turns, 2);
+
+        // The runner truncates its transcript on start, so each round writes
+        // its own file rather than clobbering the previous round's.
+        assert!(dir.path().join("lead.r0.jsonl").exists());
+        assert!(dir.path().join("lead.r1.jsonl").exists());
+    }
+
+    #[test]
+    fn a_turn_budget_bust_is_reported_and_the_next_round_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = lead_cfg(dir.path(), 1);
+        // Round 0: the model calls a tool (none are granted, so the call comes
+        // back as an error result) and wants another turn -- but the cap is 1.
+        let busting = ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "t1".into(),
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({ "command": "true" }),
+            stop: rupu_agent::StopReason::ToolUse,
+        };
+        let make = scripted_factory(vec![vec![busting], vec![text_turn("Caught up.")]]);
+        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+
+        assert_eq!(d.run_round(&round(0)), RoundOutcome::TurnBudgetHit);
+        assert_eq!(d.total_turns, 1);
+        // The bust is not fatal: the next round gets a fresh per-round budget.
+        assert_eq!(d.run_round(&round(1)), RoundOutcome::Yielded);
+        assert_eq!(d.total_turns, 2);
+    }
+
+    #[test]
+    fn a_failed_round_is_an_error_outcome_and_keeps_the_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = lead_cfg(dir.path(), 4);
+        // An exhausted script is a (non-retried) provider error.
+        let make = scripted_factory(vec![vec![]]);
+        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+
+        let out = d.run_round(&round(0));
+        assert!(matches!(out, RoundOutcome::Error(_)), "{out:?}");
+        // The failed round's prompt is kept so the next round does not lose it.
+        assert!(
+            d.history
+                .first()
+                .is_some_and(|m| text_of(m).contains("lead orchestrator")),
+            "{:?}",
+            d.history
+        );
+    }
+
+    #[test]
+    fn round_transcript_path_inserts_the_round_before_the_extension() {
+        let base = std::path::Path::new("/x/lead.jsonl");
+        assert_eq!(
+            round_transcript_path(base, 3),
+            std::path::PathBuf::from("/x/lead.r3.jsonl")
+        );
+        assert_eq!(
+            round_transcript_path(std::path::Path::new("/x/lead"), 0),
+            std::path::PathBuf::from("/x/lead.r0")
+        );
     }
 }

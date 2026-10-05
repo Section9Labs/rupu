@@ -4503,12 +4503,16 @@ name = "rupu-agentiflow"
 version = "0.82.0"
 dependencies = [
  "chrono",
+ "rupu-agent",
  "rupu-coverage",
+ "rupu-providers",
+ "rupu-tools",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
