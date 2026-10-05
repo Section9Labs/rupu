@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { recoveryLine } from './outcome';
+import { assistantBlockLine, recoveryLine } from './outcome';
 
 describe('recoveryLine (port of rupu_transcript::outcome::recovery_line)', () => {
   const base = { rung: 1 };
@@ -21,5 +21,28 @@ describe('recoveryLine (port of rupu_transcript::outcome::recovery_line)', () =>
     expect(recoveryLine({ ...base, action: 'asked' })).toBe('↺ rung 1 · asked');
     expect(recoveryLine({ ...base, action: 'parked' })).toBe('↺ rung 1 · parked');
     expect(recoveryLine({ ...base, action: 'teleported' })).toBe('↺ rung 1 · teleported');
+  });
+});
+
+describe('assistantBlockLine (port of rupu_transcript::outcome::assistant_block_line)', () => {
+  it('names a fallback boundary, an unrecognized block and an abandoned block like the Rust formatter', () => {
+    expect(assistantBlockLine({ type: 'fallback', from_model: 'model-a', to_model: 'model-b' }, false)).toBe(
+      'served by fallback · model-a → model-b',
+    );
+    expect(
+      assistantBlockLine({ type: 'unknown', provider: 'anthropic', raw: { type: 'lantern_note', n: 1 } }, false),
+    ).toBe('unrecognized block · lantern_note {"n":1,"type":"lantern_note"}');
+    expect(assistantBlockLine({ type: 'tool_use', id: 'c1', name: 'bash', input: {} }, true)).toBe(
+      'abandoned · tool call · bash',
+    );
+    expect(assistantBlockLine({ type: 'reasoning', provider: 'anthropic', model: 'm', raw: {} }, true)).toBe(
+      'abandoned · reasoning',
+    );
+  });
+
+  it('cuts a long raw payload at 200 characters', () => {
+    const s = assistantBlockLine({ type: 'unknown', raw: { type: 'x', pad: 'y'.repeat(400) } }, false);
+    expect(s.endsWith('…')).toBe(true);
+    expect(Array.from(s).length).toBeLessThanOrEqual('unrecognized block · x '.length + 200);
   });
 });

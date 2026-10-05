@@ -38,6 +38,7 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "notice",
     "outcome",
     "recovery",
+    "assistant_block",
 ];
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -313,6 +314,25 @@ pub enum Event {
         /// continuation): `final_turn_text` joins across the boundary.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         continues_output: bool,
+    },
+    /// A reply content block with no event of its own, in its position
+    /// among the turn's `AssistantMessage` / `Thinking` / `ToolCall` events
+    /// (spec 2026-10-01 §4.5, §7.1): an Anthropic server-side `fallback`
+    /// boundary, or a block rupu does not model (`unknown`, with the
+    /// provider's raw payload). `block` is the provider-neutral
+    /// `ContentBlock` JSON (`{"type":"fallback","from_model":…,"to_model":…}`
+    /// / `{"type":"unknown","provider":…,"raw":…}`); replay folds it back
+    /// into the assistant message at this position, so the conversation it
+    /// rebuilds matches what the runner sent.
+    ///
+    /// `abandoned`: a block the API discarded at a mid-output server-side
+    /// fallback (a `tool_use` or reasoning block before the turn's last
+    /// `fallback`). It was never dispatched or kept in the conversation;
+    /// it is written so the reply is shown whole, and replay skips it.
+    AssistantBlock {
+        block: Value,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        abandoned: bool,
     },
     /// Forward-compatibility catch-all: a line whose `type` this binary
     /// doesn't know. Keeps the payload so readers can render it and the CP

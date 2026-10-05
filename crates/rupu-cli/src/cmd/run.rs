@@ -1251,6 +1251,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                         }
                         rupu_transcript::Event::Outcome { .. }
                         | rupu_transcript::Event::Recovery { .. }
+                        | rupu_transcript::Event::AssistantBlock { .. }
                         | rupu_transcript::Event::Unknown { .. } => {
                             crate::output::outcome_row::print_outcome_event(&mut printer, &ev);
                         }

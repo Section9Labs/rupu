@@ -2041,7 +2041,7 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
-        TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::Unknown { .. } => {
+        TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::AssistantBlock { .. } | TxEvent::Unknown { .. } => {
             super::outcome_row::outcome_event_row(event)
                 .into_iter()
                 .map(|(status, label, text)| WorkflowViewLine {
@@ -3532,7 +3532,10 @@ fn process_event(
                 }
             }
         }
-        ev @ (TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::Unknown { .. }) => {
+        ev @ (TxEvent::Outcome { .. }
+        | TxEvent::Recovery { .. }
+        | TxEvent::AssistantBlock { .. }
+        | TxEvent::Unknown { .. }) => {
             super::outcome_row::print_outcome_event(printer, &ev);
         }
         _ => {}
@@ -4902,6 +4905,12 @@ mod tests {
                 merge_into_previous: false,
                 continues_output: false,
             },
+            TxEvent::AssistantBlock {
+                block: serde_json::json!({
+                    "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                }),
+                abandoned: false,
+            },
             TxEvent::Unknown {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
@@ -4924,6 +4933,7 @@ mod tests {
         let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
         assert!(find("refused · cyber"));
         assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("served by fallback · model-a → model-b"));
         assert!(find("unrecognized event · future_event"));
         assert!(workflow_transcript_event_lines(
             &TxEvent::ThinkingDelta {

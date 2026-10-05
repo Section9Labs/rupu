@@ -4680,6 +4680,7 @@ fn live_run_event_lines(
         }
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::AssistantBlock { .. }
         | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
             .into_iter()
             .map(|(status, label, text)| serve_event_line(status, format!("{label}  ·  {text}")))
@@ -6152,6 +6153,12 @@ mod serve_heartbeat_tests {
                 merge_into_previous: false,
                 continues_output: false,
             },
+            TranscriptEvent::AssistantBlock {
+                block: serde_json::json!({
+                    "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                }),
+                abandoned: false,
+            },
             TranscriptEvent::Unknown {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
@@ -6174,6 +6181,7 @@ mod serve_heartbeat_tests {
         let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
         assert!(find("refused · cyber"));
         assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("served by fallback · model-a → model-b"));
         assert!(find("unrecognized event · future_event"));
         assert!(live_run_event_lines(
             &TranscriptEvent::ThinkingDelta {

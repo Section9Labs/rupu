@@ -30,8 +30,8 @@ pub fn outcome_status(severity: Severity) -> Status {
     }
 }
 
-/// `(tone, label, detail)` for `Outcome`, `Recovery` and `Unknown` events;
-/// `None` for every other variant. The detail is a single line.
+/// `(tone, label, detail)` for `Outcome`, `Recovery`, `AssistantBlock` and
+/// `Unknown` events; `None` for every other variant. The detail is a single line.
 pub fn outcome_event_row(ev: &Event) -> Option<(Status, &'static str, String)> {
     match ev {
         Event::Outcome { outcome, .. } => Some((
@@ -75,12 +75,24 @@ pub fn outcome_event_row(ev: &Event) -> Option<(Status, &'static str, String)> {
                 UNKNOWN_ROW_MAX,
             ),
         )),
+        // A reply block with no event of its own: a server-side fallback
+        // boundary, an unrecognized block (raw JSON, cut like an unknown
+        // event), or a block abandoned at a mid-output fallback. Info rows.
+        Event::AssistantBlock { block, abandoned } => Some((
+            Status::Active,
+            "block",
+            truncate_single_line(
+                &rupu_transcript::outcome::assistant_block_line(block, *abandoned),
+                UNKNOWN_ROW_MAX,
+            ),
+        )),
         _ => None,
     }
 }
 
-/// Print an `Outcome` / `Recovery` / `Unknown` event as a sideband row on a
-/// pretty live printer. Returns `false` for any other variant. Shared by the
+/// Print an `Outcome` / `Recovery` / `AssistantBlock` / `Unknown` event as a
+/// sideband row on a pretty live printer. Returns `false` for any other
+/// variant. Shared by the
 /// `run` live printer, `watch` replay, the workflow printer's `process_event`
 /// and the pretty transcript renderer, so none of them can drop one of these.
 pub fn print_outcome_event(printer: &mut LineStreamPrinter, ev: &Event) -> bool {
@@ -191,6 +203,15 @@ mod tests {
         assert!(!text.contains('\n'));
         assert!(text.starts_with("unrecognized event · new event"));
         assert!(text.chars().count() <= UNKNOWN_ROW_MAX);
+
+        let block = Event::AssistantBlock {
+            block: serde_json::json!({"type": "unknown", "raw": {"type": "x", "pad": "y".repeat(500)}}),
+            abandoned: false,
+        };
+        let (_, _, text) = outcome_event_row(&block).unwrap();
+        assert!(!text.contains('\n'));
+        assert!(text.starts_with("unrecognized block · x"));
+        assert!(text.chars().count() <= UNKNOWN_ROW_MAX);
     }
 
     #[test]
@@ -222,6 +243,33 @@ mod tests {
                 unknown,
                 "│  ● event  unrecognized event · brand_new_event {\"x\":1}",
             ),
+            (
+                Event::AssistantBlock {
+                    block: serde_json::json!({
+                        "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                    }),
+                    abandoned: false,
+                },
+                "│  ● block  served by fallback · model-a → model-b",
+            ),
+            (
+                Event::AssistantBlock {
+                    block: serde_json::json!({
+                        "type": "unknown", "raw": {"type": "lantern_note"}
+                    }),
+                    abandoned: false,
+                },
+                "│  ● block  unrecognized block · lantern_note {\"type\":\"lantern_note\"}",
+            ),
+            (
+                Event::AssistantBlock {
+                    block: serde_json::json!({
+                        "type": "tool_use", "id": "c1", "name": "bash", "input": {}
+                    }),
+                    abandoned: true,
+                },
+                "│  ● block  abandoned · tool call · bash",
+            ),
         ];
         for (ev, expected) in &cases {
             let (status, label, text) = outcome_event_row(ev).expect("row");
@@ -232,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn print_outcome_event_covers_all_three_and_only_those() {
+    fn print_outcome_event_covers_all_four_and_only_those() {
         crate::output::palette::disable_color();
         let mut printer = LineStreamPrinter::new();
         let unknown = Event::Unknown {
@@ -247,6 +295,13 @@ mod tests {
         assert!(print_outcome_event(
             &mut printer,
             &recovery(RecoveryAction::Retried, None)
+        ));
+        assert!(print_outcome_event(
+            &mut printer,
+            &Event::AssistantBlock {
+                block: serde_json::json!({"type": "unknown", "raw": null}),
+                abandoned: false,
+            }
         ));
         assert!(!print_outcome_event(
             &mut printer,

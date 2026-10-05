@@ -36,7 +36,8 @@
  *     before that turn's `assistant` block, so both eras render the same
  *     block shape.
  *   • `gate_requested` / `seed` / `user_message` / `notice` / `compaction` /
- *     `outcome` / `recovery` each become their own block kind. Anything else
+ *     `outcome` / `recovery` / `assistant_block` each become their own block
+ *     kind. Anything else
  *     unrecognised becomes an `unknown` block carrying the raw event `type`
  *     and its `data` — nothing is ever
  *     silently dropped, EXCEPT `net_flow`: TranscriptSink appends one into
@@ -57,7 +58,7 @@
  */
 
 import type { TranscriptEvent, OutcomeSeverity } from '../../lib/transcript';
-import { recoveryLine } from '../../lib/outcome';
+import { assistantBlockLine, recoveryLine } from '../../lib/outcome';
 
 // ---------------------------------------------------------------------------
 // View model
@@ -157,6 +158,7 @@ export type TurnBlock =
   | { kind: 'compaction'; seq: number; summarized: number }
   | { kind: 'outcome'; severity: OutcomeSeverity; title: string; detail: string | null }
   | { kind: 'recovery'; text: string }
+  | { kind: 'assistant_block'; text: string; abandoned: boolean; raw: unknown }
   | { kind: 'unknown'; type: string; data?: unknown };
 
 export interface TurnView {
@@ -721,6 +723,17 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
             model: asString(data.model),
             reason: asString(data.reason),
           }),
+        });
+        break;
+      }
+
+      case 'assistant_block': {
+        const abandoned = data.abandoned === true;
+        ensureTurn().blocks.push({
+          kind: 'assistant_block',
+          text: assistantBlockLine(data.block, abandoned),
+          abandoned,
+          raw: data.block ?? null,
         });
         break;
       }

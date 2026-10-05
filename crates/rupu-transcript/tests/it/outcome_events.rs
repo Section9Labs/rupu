@@ -1,5 +1,5 @@
 use rupu_transcript::outcome::{
-    outcome_body, outcome_line, recovery_body, recovery_line, unknown_line,
+    assistant_block_line, outcome_body, outcome_line, recovery_body, recovery_line, unknown_line,
 };
 use rupu_transcript::{Event, OutcomeRecord, RecoveryAction, Severity, StopRecord};
 use serde_json::json;
@@ -282,5 +282,77 @@ fn bodies_are_the_lines_without_their_leading_glyph() {
             None
         ),
         format!("↺ {body}")
+    );
+}
+
+#[test]
+fn assistant_block_round_trips_and_abandoned_defaults_to_false() {
+    let fallback = Event::AssistantBlock {
+        block: json!({"type": "fallback", "from_model": "model-a", "to_model": "model-b"}),
+        abandoned: false,
+    };
+    roundtrip(&fallback);
+    let v = serde_json::to_value(&fallback).unwrap();
+    assert_eq!(v["type"], "assistant_block");
+    assert_eq!(v["data"]["block"]["to_model"], "model-b");
+    assert!(
+        v["data"].get("abandoned").is_none(),
+        "abandoned: false is not written: {v}"
+    );
+    let legacy: Event = serde_json::from_value(json!({
+        "type": "assistant_block",
+        "data": {"block": {"type": "unknown", "raw": {"type": "x"}}}
+    }))
+    .unwrap();
+    assert!(matches!(
+        legacy,
+        Event::AssistantBlock {
+            abandoned: false,
+            ..
+        }
+    ));
+    let abandoned = Event::AssistantBlock {
+        block: json!({"type": "tool_use", "id": "c1", "name": "bash", "input": {}}),
+        abandoned: true,
+    };
+    roundtrip(&abandoned);
+    assert!(serde_json::to_string(&abandoned)
+        .unwrap()
+        .contains(r#""abandoned":true"#));
+}
+
+#[test]
+fn assistant_block_line_names_each_kind() {
+    assert_eq!(
+        assistant_block_line(
+            &json!({"type": "fallback", "from_model": "model-a", "to_model": "model-b"}),
+            false
+        ),
+        "served by fallback · model-a → model-b"
+    );
+    assert_eq!(
+        assistant_block_line(
+            &json!({"type": "unknown", "provider": "anthropic", "raw": {"type": "lantern_note", "n": 1}}),
+            false
+        ),
+        r#"unrecognized block · lantern_note {"n":1,"type":"lantern_note"}"#
+    );
+    let big = json!({"type": "unknown", "raw": {"type": "x", "pad": "y".repeat(400)}});
+    let s = assistant_block_line(&big, false);
+    assert!(s.ends_with('…'), "{s}");
+    assert!(s.chars().count() <= "unrecognized block · x ".chars().count() + 200);
+    assert_eq!(
+        assistant_block_line(
+            &json!({"type": "tool_use", "id": "c1", "name": "bash", "input": {}}),
+            true
+        ),
+        "abandoned · tool call · bash"
+    );
+    assert_eq!(
+        assistant_block_line(
+            &json!({"type": "reasoning", "provider": "anthropic", "model": "m", "raw": {}}),
+            true
+        ),
+        "abandoned · reasoning"
     );
 }

@@ -167,11 +167,60 @@ pub fn unknown_line(tag: &str, data: &Value) -> String {
     if data.is_null() {
         return head;
     }
-    let json = data.to_string();
+    format!("{head} {}", cut_json(data))
+}
+
+/// One-line, glyph-free rendering of an `AssistantBlock` event's block (the
+/// provider-neutral `ContentBlock` JSON):
+///
+/// - `fallback` → `served by fallback · <from> → <to>`
+/// - `unknown` → `unrecognized block · <type> <raw JSON>`, where `<type>` is
+///   the provider's own block type and the JSON is cut at 200 characters
+///   like [`unknown_line`]
+/// - anything else (an abandoned `tool_use` / `reasoning`) → its kind, and
+///   the tool name for a tool call
+///
+/// An abandoned block is prefixed `abandoned · `. Plan 3 restyles these
+/// rows; the text is shared by the CLI and (as a port) the web.
+pub fn assistant_block_line(block: &Value, abandoned: bool) -> String {
+    let str_at = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let kind = str_at(block, "type").unwrap_or_else(|| "?".to_string());
+    let body = match kind.as_str() {
+        "fallback" => format!(
+            "served by fallback · {} → {}",
+            str_at(block, "from_model").unwrap_or_else(|| "?".to_string()),
+            str_at(block, "to_model").unwrap_or_else(|| "?".to_string()),
+        ),
+        "unknown" => {
+            let raw = block.get("raw").unwrap_or(&Value::Null);
+            let inner = str_at(raw, "type").unwrap_or_else(|| "?".to_string());
+            let head = format!("unrecognized block · {inner}");
+            if raw.is_null() {
+                head
+            } else {
+                format!("{head} {}", cut_json(raw))
+            }
+        }
+        "tool_use" => match str_at(block, "name") {
+            Some(name) => format!("tool call · {name}"),
+            None => "tool call".to_string(),
+        },
+        other => other.to_string(),
+    };
+    if abandoned {
+        format!("abandoned · {body}")
+    } else {
+        body
+    }
+}
+
+/// Compact JSON cut at [`UNKNOWN_DATA_MAX_CHARS`] characters.
+fn cut_json(v: &Value) -> String {
+    let json = v.to_string();
     if json.chars().count() <= UNKNOWN_DATA_MAX_CHARS {
-        format!("{head} {json}")
+        json
     } else {
         let cut: String = json.chars().take(UNKNOWN_DATA_MAX_CHARS - 1).collect();
-        format!("{head} {cut}…")
+        format!("{cut}…")
     }
 }

@@ -1,8 +1,8 @@
 //! Rebuild the exact provider conversation from a v2 transcript (spec §4).
 //!
 //! Inverse of the runner's emission contract: per turn, `Thinking` /
-//! `AssistantMessage` / `ToolCall` events (in on-disk order) fold into one
-//! assistant `Message`; the turn's `ToolResult`s fold into the following
+//! `AssistantMessage` / `ToolCall` / `AssistantBlock` events (in on-disk
+//! order; an `abandoned` block is skipped) fold into one assistant `Message`; the turn's `ToolResult`s fold into the following
 //! user message using the SAME error-formatting + clamp the runner feeds
 //! the model; `Seed` initializes state; `Compaction` replaces it. A turn
 //! with no `TurnEnd` (paused / aborted mid-turn) is dropped, matching the
@@ -26,6 +26,8 @@ pub enum ReplayError {
     Seed(serde_json::Error),
     #[error("malformed compaction messages: {0}")]
     Compaction(serde_json::Error),
+    #[error("malformed assistant block: {0}")]
+    AssistantBlock(serde_json::Error),
     #[error("seed references transcript {path}; use reconstruct_transcript to resolve chains")]
     SeedUnresolved { path: String },
     #[error("seed references transcript {path} but it could not be read: {source}")]
@@ -306,6 +308,18 @@ fn reconstruct_with(
                     input: input.clone(),
                 });
                 accum.call_order.push(call_id.clone());
+            }
+            // A block with no event of its own (a server-side `fallback`
+            // boundary, an `unknown` block) joins the assistant message at
+            // its position, as the runner kept it. An abandoned block (from
+            // before a mid-output fallback) never joined the conversation.
+            Event::AssistantBlock {
+                abandoned: true, ..
+            } => {}
+            Event::AssistantBlock { block, .. } => {
+                accum.assistant_blocks.push(
+                    serde_json::from_value(block.clone()).map_err(ReplayError::AssistantBlock)?,
+                );
             }
             Event::ToolResult {
                 call_id,
@@ -830,5 +844,70 @@ mod tests {
             turn_end(false),
         ];
         assert_eq!(reconstruct_messages(&events).unwrap().len(), 4);
+    }
+
+    /// `assistant_block` events fold into the assistant message at their
+    /// position; an abandoned one is skipped; a discarded turn drops them
+    /// with the rest of its content.
+    #[test]
+    fn assistant_blocks_fold_in_position_and_abandoned_ones_are_skipped() {
+        let fallback = ContentBlock::Fallback {
+            from_model: "model-a".into(),
+            to_model: "model-b".into(),
+        };
+        let unknown = ContentBlock::Unknown {
+            provider: Some("anthropic".into()),
+            raw: serde_json::json!({"type": "lantern_note"}),
+        };
+        let block = |b: &ContentBlock, abandoned: bool| Event::AssistantBlock {
+            block: serde_json::to_value(b).unwrap(),
+            abandoned,
+        };
+        let abandoned_call = ContentBlock::ToolUse {
+            id: "c0".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        };
+        let events = vec![
+            Event::UserMessage {
+                content: "go".into(),
+            },
+            assistant("before"),
+            block(&abandoned_call, true),
+            block(&fallback, false),
+            block(&unknown, false),
+            assistant("after"),
+            turn_end(false),
+            // A discarded turn's blocks go with it.
+            block(&fallback, false),
+            turn_end(true),
+        ];
+        let rebuilt = reconstruct_messages(&events).unwrap();
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("go"),
+                Message {
+                    role: rupu_providers::types::Role::Assistant,
+                    content: vec![text("before"), fallback, unknown, text("after")],
+                },
+            ])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_malformed_assistant_block_is_an_error() {
+        let events = vec![
+            Event::AssistantBlock {
+                block: serde_json::json!({"type": "fallback", "from_model": 3}),
+                abandoned: false,
+            },
+            turn_end(false),
+        ];
+        assert!(matches!(
+            reconstruct_messages(&events),
+            Err(ReplayError::AssistantBlock(_))
+        ));
     }
 }

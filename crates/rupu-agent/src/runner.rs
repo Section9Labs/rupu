@@ -762,9 +762,22 @@ fn terminated(
     }
 }
 
+/// An `AssistantBlock` transcript event carrying `block`'s own
+/// `ContentBlock` JSON (spec 2026-10-01 §7.1).
+fn assistant_block_event(block: &ContentBlock, abandoned: bool) -> Event {
+    Event::AssistantBlock {
+        // Infallible: every `ContentBlock` field is a string, bool or JSON
+        // value.
+        block: serde_json::to_value(block).unwrap_or_default(),
+        abandoned,
+    }
+}
+
 /// Write a turn's content blocks to the transcript in the provider's own
-/// order — thinking, text and tool_use land exactly as the model produced
-/// them (spec §3 emission-order contract) — and return the tool calls to
+/// order — thinking, text, tool_use, and the blocks with no event of their
+/// own (`fallback`, `unknown`) as `AssistantBlock` — exactly as the model
+/// produced them (spec §3 emission-order contract; Anthropic requires a
+/// `fallback` echoed where it appeared), and return the tool calls to
 /// dispatch, as `(call_id, tool, input)`.
 fn emit_turn_content(
     writer: &mut JsonlWriter,
@@ -801,10 +814,31 @@ fn emit_turn_content(
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
             ContentBlock::ToolResult { .. } => {}
-            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {}
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. } => {
+                writer.write(&assistant_block_event(block, false))?;
+            }
         }
     }
     Ok(tool_uses)
+}
+
+/// A discarded turn's blocks with no event of their own (`fallback`,
+/// `unknown`): the turn's text arrives as `AssistantDelta`s, these as
+/// `AssistantBlock`s, so the reply is still shown whole. Replay drops them
+/// with the rest of the discarded turn.
+fn emit_discarded_blocks(
+    writer: &mut JsonlWriter,
+    content: &[ContentBlock],
+) -> Result<(), RunError> {
+    for block in content {
+        if matches!(
+            block,
+            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. }
+        ) {
+            writer.write(&assistant_block_event(block, false))?;
+        }
+    }
+    Ok(())
 }
 
 /// A turn's `TurnEnd`: token counts, the provider's stop (as a transcript
@@ -2566,6 +2600,7 @@ async fn run_agent_inner(
             // and not kept. Rung 0 can retry it (with the output cap raised,
             // or once for an incomplete reply); otherwise it climbs the ladder.
             if let (true, Some(o), Some(p)) = (discard, outcome.as_ref(), policy) {
+                emit_discarded_blocks(&mut writer, &resp.content)?;
                 writer.write(&turn_end_event(
                     turn_idx,
                     &resp,

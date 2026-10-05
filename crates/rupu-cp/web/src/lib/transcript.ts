@@ -33,6 +33,10 @@ export type TranscriptEvent =
   | { type: 'net_flow'; data: { flow: unknown } }
   | { type: 'outcome'; data: { turn_idx: number; outcome: OutcomeRecord } }
   | { type: 'recovery'; data: RecoveryData }
+  // A reply content block with no event of its own (`fallback`, `unknown`,
+  // or a block abandoned at a mid-output server-side fallback): `block` is the
+  // provider-neutral ContentBlock JSON.
+  | { type: 'assistant_block'; data: { block: Record<string, unknown>; abandoned?: boolean } }
   // Catch-all for forward-compat: the server passes an unrecognized event's
   // `data` through verbatim; the view model keeps it on the `unknown` block.
   | { type: string; data: Record<string, unknown> };

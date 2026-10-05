@@ -147,6 +147,15 @@ pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
                 reason.as_deref(),
             ))),
         ),
+        // A reply block with no event of its own: a server-side fallback
+        // boundary, an unrecognized block, or one abandoned at a mid-output
+        // fallback.
+        Event::AssistantBlock { block, abandoned } => Some(Line::new().dim(format!(
+            "· {}",
+            squash(&rupu_transcript::outcome::assistant_block_line(
+                block, *abandoned
+            ))
+        ))),
         _ => None,
     }?;
 
@@ -870,6 +879,15 @@ mod tests {
         };
         let row = project_event(&recovery, None).expect("recovery row");
         assert!(render_plain(std::slice::from_ref(&row.line)).contains("↺ rung 1 · retried"));
+        let block = Event::AssistantBlock {
+            block: serde_json::json!({
+                "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+            }),
+            abandoned: false,
+        };
+        let row = project_event(&block, None).expect("assistant_block row");
+        assert!(render_plain(std::slice::from_ref(&row.line))
+            .contains("served by fallback · model-a → model-b"));
     }
 
     // ---- TranscriptMux -------------------------------------------------

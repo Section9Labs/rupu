@@ -1868,3 +1868,85 @@ async fn a_terminating_provider_error_aborts_without_the_ladder() {
         }
     )));
 }
+
+// ---------------------------------------------------------------------------
+// Blocks with no event of their own (spec 2026-10-01 §4.5, §5.4, §7.1).
+// ---------------------------------------------------------------------------
+
+fn fallback_block() -> ContentBlock {
+    ContentBlock::Fallback {
+        from_model: "claude-opus-5-5".into(),
+        to_model: "claude-opus-4-8".into(),
+    }
+}
+
+fn served_by_stop(reason: StopReason) -> Stop {
+    let mut stop = Stop::synthetic(reason, "anthropic");
+    stop.served_by = Some(rupu_providers::ServedBy {
+        model: "claude-opus-4-8".into(),
+        hops: vec![rupu_providers::FallbackHop {
+            from_model: "claude-opus-5-5".into(),
+            to_model: "claude-opus-4-8".into(),
+        }],
+    });
+    stop
+}
+
+/// `(block, abandoned)` per `AssistantBlock` event.
+fn assistant_blocks(events: &[Event]) -> Vec<(serde_json::Value, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AssistantBlock { block, abandoned } => Some((block.clone(), *abandoned)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A turn a server-side fallback served from the start carries a leading
+/// `fallback` block; an unrecognized block is kept verbatim. Both reach the
+/// transcript in position, and replay rebuilds the conversation byte for
+/// byte — the runner keeps both in its messages.
+#[tokio::test]
+async fn fallback_and_unknown_blocks_are_transcribed_and_replay_in_lockstep() {
+    let unknown = ContentBlock::Unknown {
+        provider: Some("anthropic".into()),
+        raw: serde_json::json!({ "type": "lantern_note", "glow": 3 }),
+    };
+    let ran = run_script(
+        vec![ScriptedTurn::Reply {
+            content: vec![fallback_block(), unknown.clone(), text("the answer")],
+            stop: served_by_stop(StopReason::EndTurn),
+            usage: Usage::default(),
+        }],
+        "s1",
+    )
+    .await;
+    assert_eq!(ran.result.status, RunStatus::Ok);
+    let blocks = assistant_blocks(&ran.events);
+    assert_eq!(
+        blocks,
+        vec![
+            (serde_json::to_value(fallback_block()).unwrap(), false),
+            (serde_json::to_value(&unknown).unwrap(), false),
+        ]
+    );
+    // In position: both before the text.
+    let first_text = ran
+        .events
+        .iter()
+        .position(|e| matches!(e, Event::AssistantMessage { .. }))
+        .unwrap();
+    let last_block = ran
+        .events
+        .iter()
+        .rposition(|e| matches!(e, Event::AssistantBlock { .. }))
+        .unwrap();
+    assert!(last_block < first_text);
+    let last = ran.result.final_messages.last().unwrap();
+    assert_eq!(
+        last.content,
+        vec![fallback_block(), unknown, text("the answer")]
+    );
+    assert_replay_lockstep(&ran);
+}

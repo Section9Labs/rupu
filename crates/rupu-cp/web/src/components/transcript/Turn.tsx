@@ -241,6 +241,15 @@ function TurnBlockView({
     }
     case 'recovery':
       return <div className="text-meta text-ink-mute">{block.text}</div>;
+    case 'assistant_block':
+      return (
+        <details className="text-meta text-ink-mute">
+          <summary className="cursor-pointer">{block.text}</summary>
+          <pre className="mt-1 max-h-40 overflow-auto rounded bg-surface p-1.5 font-mono">
+            {JSON.stringify(block.raw, null, 2)}
+          </pre>
+        </details>
+      );
     case 'unknown':
       return (
         <div className="text-meta italic text-ink-mute">

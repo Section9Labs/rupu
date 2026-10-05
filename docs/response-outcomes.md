@@ -206,7 +206,10 @@ reply in one request.
   beta and `"fallbacks": "default"`.
 - **In the transcript:** when the fallback answers, the turn proceeds normally.
   The refusal is recorded as an `outcome` titled `refused · served by <model>`,
-  followed by a `recovery` with action `served_by_fallback` on rung 1.
+  followed by a `recovery` with action `served_by_fallback` on rung 1. The
+  reply's `fallback` boundary is written in place as an `assistant_block`
+  event, and replay puts it back where it was: Anthropic requires it echoed in
+  that position on the next request.
 
 ### Turning it off
 
@@ -319,10 +322,16 @@ rupu does not know, written by a newer rupu, prints as an `event` row reading
 and `data` are preserved when a transcript is copied or re-written; other
 top-level keys on that line are not.
 
+A reply block that has no event of its own prints as a `block` row:
+`served by fallback · <from> → <to>` for a server-side fallback boundary and
+`unrecognized block · <type>` followed by the provider's raw JSON (cut at 240
+columns) for a block rupu does not model. A block marked `abandoned` says so.
+
 **Control plane.** The transcript view shows an outcome as a block with a
 severity-colored edge, its title and its detail, and a recovery as a one-line
 timeline entry. An unknown event type shows as an "unrecognized event" block with
-its raw payload.
+its raw payload. A reply block with no event of its own shows as a one-line row
+with the same text as the CLI's, and expands to its raw JSON.
 
 Beyond the transcript, a failed workflow step, fan-out unit or run records the
 outcome that caused it (its `cause`) on the run record, so a failure is stored as

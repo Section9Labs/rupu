@@ -783,6 +783,34 @@ describe('v2 blocks model', () => {
     });
   });
 
+  it('an assistant_block event becomes a one-line block with its raw JSON', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      {
+        type: 'assistant_block',
+        data: { block: { type: 'fallback', from_model: 'model-a', to_model: 'model-b' } },
+      },
+      {
+        type: 'assistant_block',
+        data: { block: { type: 'tool_use', id: 'c1', name: 'bash', input: {} }, abandoned: true },
+      },
+    ]);
+    expect(view.turns.flatMap((t) => t.blocks)).toEqual([
+      {
+        kind: 'assistant_block',
+        text: 'served by fallback · model-a → model-b',
+        abandoned: false,
+        raw: { type: 'fallback', from_model: 'model-a', to_model: 'model-b' },
+      },
+      {
+        kind: 'assistant_block',
+        text: 'abandoned · tool call · bash',
+        abandoned: true,
+        raw: { type: 'tool_use', id: 'c1', name: 'bash', input: {} },
+      },
+    ]);
+  });
+
   it('an unknown event keeps its raw data', () => {
     const view = buildTranscriptView([
       { type: 'turn_start', data: { turn_idx: 0 } },

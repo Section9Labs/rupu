@@ -1192,6 +1192,7 @@ fn transcript_event_lines(
         }
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::AssistantBlock { .. }
         | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
             .into_iter()
             .map(|(status, label, text)| {
@@ -1666,6 +1667,7 @@ pub(crate) fn render_pretty_transcript_event(
         }
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::AssistantBlock { .. }
         | TranscriptEvent::Unknown { .. } => {
             crate::output::outcome_row::print_outcome_event(printer, event);
         }
@@ -2745,6 +2747,12 @@ mod tests {
                 merge_into_previous: false,
                 continues_output: false,
             },
+            TranscriptEvent::AssistantBlock {
+                block: serde_json::json!({
+                    "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                }),
+                abandoned: false,
+            },
             TranscriptEvent::Unknown {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
@@ -2767,6 +2775,7 @@ mod tests {
         let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
         assert!(find("refused · cyber"));
         assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("served by fallback · model-a → model-b"));
         assert!(find("unrecognized event · future_event"));
         // thinking_delta stays dropped, like assistant_delta.
         assert!(transcript_event_lines(

@@ -2866,6 +2866,7 @@ impl SessionInteractiveState {
             }
             TranscriptEvent::Outcome { .. }
             | TranscriptEvent::Recovery { .. }
+            | TranscriptEvent::AssistantBlock { .. }
             | TranscriptEvent::Unknown { .. } => {
                 if let Some((status, label, text)) =
                     crate::output::outcome_row::outcome_event_row(event)
@@ -5418,6 +5419,7 @@ fn transcript_event_lines(
         }
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::AssistantBlock { .. }
         | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
             .into_iter()
             .map(|(status, label, text)| SessionViewLine {
@@ -8026,8 +8028,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 // at every `Ok(RunResult)` exit (success, max-turns, or a
                 // cooperative pause) immediately before returning, so the
                 // transcript on disk at `transcript_path` and the message
-                // list assigned above are the same snapshot. Safe to record
-                // as the seed source regardless of `result.status`.
+                // list assigned above are the same snapshot — and every block
+                // the runner keeps in its messages is transcribed, including
+                // a server-side `fallback` boundary and blocks rupu does not
+                // model (`assistant_block`, spec 2026-10-01 §5.4). Safe to
+                // record as the seed source regardless of `result.status`.
                 session.history_source_transcript = Some(transcript_path.clone());
                 session.last_error = if result.status == RunStatus::Ok {
                     None
@@ -9882,6 +9887,12 @@ mod tests {
                 merge_into_previous: false,
                 continues_output: false,
             },
+            TranscriptEvent::AssistantBlock {
+                block: serde_json::json!({
+                    "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                }),
+                abandoned: false,
+            },
             TranscriptEvent::Unknown {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
@@ -9904,6 +9915,7 @@ mod tests {
         let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
         assert!(find("refused · cyber"));
         assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("served by fallback · model-a → model-b"));
         assert!(find("unrecognized event · future_event"));
         assert!(transcript_event_lines(
             &TranscriptEvent::ThinkingDelta {
@@ -10674,6 +10686,143 @@ mod tests {
             ])
             .unwrap(),
             "replay must reconstruct the full two-turn conversation across the seed reference"
+        );
+    }
+
+    /// A turn a server-side fallback served carries a `fallback` block (and
+    /// may carry blocks rupu does not model) in its assistant message. Both
+    /// are written to the transcript as `assistant_block` events and folded
+    /// back by replay (spec 2026-10-01 §4.5, §5.4), so the turn's transcript
+    /// replays to exactly `message_history`: the next turn seeds from it by
+    /// reference and the seed hash verifies.
+    #[tokio::test]
+    async fn fallback_served_turn_seeds_the_next_turn_by_reference() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_seed_fallback01".into();
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.history_source_transcript = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        record.total_tokens_in = 0;
+        record.total_tokens_out = 0;
+        record.total_tokens_cached = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let transcript_1 = record.transcripts_dir.join("run_seed_fb_1.jsonl");
+        let transcript_2 = record.transcripts_dir.join("run_seed_fb_2.jsonl");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "Reply": {
+                "content": [
+                    { "type": "fallback", "from_model": "model-a", "to_model": "model-b" },
+                    { "type": "unknown", "provider": "anthropic", "raw": { "type": "lantern_note", "glow": 2 } },
+                    { "type": "text", "text": "served answer" }
+                ],
+                "stop": {
+                    "reason": "end_turn",
+                    "wire": { "provider": "anthropic", "value": "end_turn" },
+                    "served_by": { "model": "model-b", "hops": [{ "from_model": "model-a", "to_model": "model-b" }] }
+                }
+            } }]"#,
+        );
+        let turn1 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fb_1".into(),
+            prompt: "first prompt".into(),
+        })
+        .await;
+        turn1.expect("turn 1 completes");
+
+        let (after_turn1, _) =
+            read_session(&global, &record.session_id).expect("read session after turn 1");
+        assert_eq!(after_turn1.status, SessionStatus::Idle, "{after_turn1:?}");
+        assert_eq!(
+            after_turn1.history_source_transcript,
+            Some(transcript_1.clone())
+        );
+        assert!(
+            rupu_agent::replay::replays_to(&transcript_1, &after_turn1.message_history),
+            "the fallback-served turn's transcript replays to its message_history"
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack2", "stop": "end_turn" } }]"#,
+        );
+        let turn2 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fb_2".into(),
+            prompt: "second prompt".into(),
+        })
+        .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        turn2.expect("turn 2 completes");
+
+        let seed_source = JsonlReader::iter(&transcript_2)
+            .expect("open turn 2 transcript")
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript, ..
+                } => Some(source_transcript),
+                _ => None,
+            })
+            .expect("turn 2 has a Seed event");
+        assert_eq!(
+            seed_source,
+            Some(transcript_1.display().to_string()),
+            "turn 2 seeds from turn 1 by reference"
+        );
+        // The seed hash verifies: replay resolves the chain.
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_2)
+            .expect("turn 2 reconstructs via the seed chain");
+        assert_eq!(full.len(), 4, "{full:?}");
+        assert_eq!(
+            full[1].content,
+            vec![
+                rupu_providers::types::ContentBlock::Fallback {
+                    from_model: "model-a".into(),
+                    to_model: "model-b".into(),
+                },
+                rupu_providers::types::ContentBlock::Unknown {
+                    provider: Some("anthropic".into()),
+                    raw: serde_json::json!({ "type": "lantern_note", "glow": 2 }),
+                },
+                rupu_providers::types::ContentBlock::Text {
+                    text: "served answer".into(),
+                },
+            ]
         );
     }
 
