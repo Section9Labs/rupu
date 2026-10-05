@@ -154,8 +154,9 @@ impl AgentiflowDef {
     /// Fail-closed validation against the resolved profile set: the scope
     /// must be authorized, there must be something to steer toward, the lead
     /// must be in the pool, every goal predicate must be well-formed and name
-    /// a kind/depth an active profile actually defines, and every scope root
-    /// must be a ROOT kind of an active profile.
+    /// a kind/depth an active profile actually defines, every scope root
+    /// must be a ROOT kind of an active profile, and the coverage stop (if
+    /// any) must be reachable (reach, kinds and depth are all checked).
     pub fn validate(
         &self,
         active: &rupu_coverage::ActiveSet,
@@ -267,9 +268,97 @@ impl AgentiflowDef {
                 )));
             }
         }
+        // coverage stop must be reachable: a stop that can never fire just burns
+        // the budget to the ceiling with no explanation
+        if let Some(ct) = &self.coverage {
+            Self::validate_coverage(ct, active)?;
+        }
         // budget sanity
         if let Some(b) = &self.budget {
             b.validate().map_err(Invalid)?;
+        }
+        Ok(())
+    }
+
+    /// The `coverage:` block must describe a stop that can actually fire:
+    /// `reach` in `(0.0, 1.0]`, every `kinds` entry a distinct kind an active
+    /// profile defines, and `depth` a rung of the ladder of EVERY profile the
+    /// evaluator would measure (all active profiles when `kinds` is unset,
+    /// else the profiles owning the named kinds).
+    fn validate_coverage(
+        ct: &crate::coverage::CoverageTarget,
+        active: &rupu_coverage::ActiveSet,
+    ) -> Result<(), crate::error::AgentiflowError> {
+        use crate::error::AgentiflowError::Invalid;
+        if !(ct.reach.is_finite() && ct.reach > 0.0 && ct.reach <= 1.0) {
+            return Err(Invalid(
+                "coverage.reach must be finite and in (0.0, 1.0]".into(),
+            ));
+        }
+        // The profiles whose ladders the evaluator will measure `depth` on.
+        let mut evaluated: Vec<&rupu_coverage::EngagementProfile> = Vec::new();
+        match &ct.kinds {
+            None => evaluated.extend(active.profiles()),
+            Some(kinds) => {
+                // Namespaced kinds each entry resolves to; two entries that
+                // resolve to the same kind would be counted twice.
+                let mut seen: std::collections::BTreeSet<String> = Default::default();
+                for entry in kinds {
+                    let owners: Vec<(&rupu_coverage::EngagementProfile, String)> = if entry
+                        .contains(':')
+                    {
+                        let profile = active.profile_for_kind(entry).ok_or_else(|| {
+                            Invalid(format!(
+                                "coverage.kinds entry `{entry}` not owned by any active profile"
+                            ))
+                        })?;
+                        if !profile.asset_kinds.iter().any(|k| &k.id == entry) {
+                            return Err(Invalid(format!(
+                                "coverage.kinds entry `{entry}` is not defined by profile `{}`",
+                                profile.id
+                            )));
+                        }
+                        vec![(profile, entry.clone())]
+                    } else {
+                        // Bare: the evaluator namespaces it under each active
+                        // profile; only profiles that define it measure anything.
+                        let owners: Vec<_> = active
+                            .profiles()
+                            .filter_map(|p| {
+                                let nk = format!("{}:{entry}", p.id);
+                                p.asset_kinds.iter().any(|k| k.id == nk).then_some((p, nk))
+                            })
+                            .collect();
+                        if owners.is_empty() {
+                            return Err(Invalid(format!(
+                                    "coverage.kinds entry `{entry}` is not defined by any active profile"
+                                )));
+                        }
+                        owners
+                    };
+                    for (profile, nk) in owners {
+                        if !seen.insert(nk.clone()) {
+                            return Err(Invalid(format!(
+                                "coverage.kinds contains duplicate kind `{entry}` (resolves to `{nk}`)"
+                            )));
+                        }
+                        if !evaluated.iter().any(|p| p.id == profile.id) {
+                            evaluated.push(profile);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(depth) = ct.depth.as_deref() {
+            if let Some(profile) = evaluated
+                .iter()
+                .find(|p| !p.coverage.depth_ladder.iter().any(|d| d == depth))
+            {
+                return Err(Invalid(format!(
+                    "coverage.depth `{depth}` is not a rung of profile `{}`'s ladder",
+                    profile.id
+                )));
+            }
         }
         Ok(())
     }
@@ -510,6 +599,145 @@ trigger: manual
             "{ asset: { kind: \"network:host\", locator: { host: \"1.1.2.2\" } }, depth_at_least: exploited }",
         );
         d.validate(&active()).unwrap();
+    }
+
+    /// `SAMPLE` with its `coverage:` block replaced by `inline` (a YAML flow
+    /// mapping, e.g. `{ reach: 0.5 }`).
+    fn with_coverage(inline: &str) -> AgentiflowDef {
+        let old = "coverage:\n  reach: 0.9\n  depth: tested\n";
+        assert!(SAMPLE.contains(old), "SAMPLE coverage block changed");
+        let yaml = SAMPLE.replace(old, &format!("coverage: {inline}\n"));
+        AgentiflowDef::parse_str(&yaml).unwrap()
+    }
+
+    /// Validate `def` against an arbitrary active set. The scope roots are cut
+    /// to the first (a `network:` root) so a profile set without `web` doesn't
+    /// trip the scope-root check before the coverage check.
+    fn validate_against(
+        mut def: AgentiflowDef,
+        ids: &[&str],
+    ) -> Result<(), crate::error::AgentiflowError> {
+        def.scope.roots.truncate(1);
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        let active = rupu_coverage::builtin_registry()
+            .unwrap()
+            .active_set(&ids)
+            .unwrap();
+        def.validate(&active)
+    }
+
+    #[test]
+    fn validate_coverage_accepts_well_formed_blocks() {
+        // The sample's own block (network+web both have a `tested` rung).
+        AgentiflowDef::parse_str(SAMPLE)
+            .unwrap()
+            .validate(&active())
+            .unwrap();
+        // reach is inclusive at 1.0; depth/kinds are optional.
+        with_coverage("{ reach: 1.0 }").validate(&active()).unwrap();
+        // Bare and namespaced kinds, each owned by an active profile.
+        with_coverage("{ reach: 0.5, kinds: [host, \"web:site\"], depth: tested }")
+            .validate(&active())
+            .unwrap();
+        // Only the OWNING profile's ladder is consulted when kinds are given:
+        // `enumerated` is a network rung and web is not evaluated.
+        with_coverage("{ reach: 0.5, kinds: [\"network:host\"], depth: enumerated }")
+            .validate(&active())
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_coverage_reach_must_be_finite_and_in_unit_interval() {
+        for bad in ["1.5", "0.0", "-0.1", ".nan", ".inf"] {
+            let d = with_coverage(&format!("{{ reach: {bad} }}"));
+            let r = reason(&d);
+            assert!(
+                r.contains("coverage.reach must be finite and in (0.0, 1.0]"),
+                "reach {bad}: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_coverage_kinds_must_be_defined_and_unique() {
+        // Namespaced, owner active, but not a kind the profile defines.
+        let r = reason(&with_coverage("{ reach: 0.5, kinds: [\"network:bogus\"] }"));
+        assert!(
+            r.contains("coverage.kinds entry `network:bogus` is not defined by profile `network`"),
+            "{r}"
+        );
+
+        // Namespaced, owner not active (`code` is not in network+web).
+        let r = reason(&with_coverage("{ reach: 0.5, kinds: [\"code:file\"] }"));
+        assert!(
+            r.contains("coverage.kinds entry `code:file` not owned by any active profile"),
+            "{r}"
+        );
+
+        // Bare, defined by no active profile.
+        let r = reason(&with_coverage("{ reach: 0.5, kinds: [bogus] }"));
+        assert!(
+            r.contains("coverage.kinds entry `bogus` is not defined by any active profile"),
+            "{r}"
+        );
+        // ...including a bare kind that only an INACTIVE profile defines.
+        let r = reason(&with_coverage("{ reach: 0.5, kinds: [file] }"));
+        assert!(
+            r.contains("`file` is not defined by any active profile"),
+            "{r}"
+        );
+
+        // Exact duplicate.
+        let r = reason(&with_coverage("{ reach: 0.5, kinds: [host, host] }"));
+        assert!(r.contains("duplicate kind `host`"), "{r}");
+        // Bare + namespaced spelling of the same kind would be counted twice.
+        let r = reason(&with_coverage(
+            "{ reach: 0.5, kinds: [host, \"network:host\"] }",
+        ));
+        assert!(
+            r.contains("duplicate kind `network:host` (resolves to `network:host`)"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn validate_coverage_depth_must_be_on_every_evaluated_profiles_ladder() {
+        // No kinds: EVERY active profile is evaluated. `mapped` is a web rung
+        // only, so network (first by id) is the offender.
+        let r = reason(&with_coverage("{ reach: 0.5, depth: mapped }"));
+        assert!(
+            r.contains("coverage.depth `mapped` is not a rung of profile `network`'s ladder"),
+            "{r}"
+        );
+
+        // network+code, no kinds: `tested` is a network rung but not a code
+        // rung, so the coverage stop could never be reached for code's assets.
+        let d = with_coverage("{ reach: 0.5, depth: tested }");
+        let r = validate_against(d, &["network", "code"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            r.contains("coverage.depth `tested` is not a rung of profile `code`'s ladder"),
+            "{r}"
+        );
+
+        // With kinds given only the OWNING profiles are checked: scoping to
+        // network's kind makes `tested` fine even though code lacks it...
+        let d = with_coverage("{ reach: 0.5, kinds: [\"network:host\"], depth: tested }");
+        validate_against(d, &["network", "code"]).unwrap();
+        // ...but naming code's kind brings code's ladder back in.
+        let d = with_coverage("{ reach: 0.5, kinds: [\"code:file\"], depth: tested }");
+        let r = validate_against(d, &["network", "code"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            r.contains("coverage.depth `tested` is not a rung of profile `code`'s ladder"),
+            "{r}"
+        );
+
+        // A rung every evaluated profile shares passes.
+        let d = with_coverage("{ reach: 0.5, depth: tested }");
+        validate_against(d, &["network", "web"]).unwrap();
     }
 
     #[test]

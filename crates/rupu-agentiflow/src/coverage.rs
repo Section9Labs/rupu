@@ -250,14 +250,19 @@ mod tests {
             host_asset("b", Some("exploited")),
             host_asset("c", Some("discovered")),
         ]);
+        // `enumerated` is a rung of network's ladder ONLY (web's is mapped,
+        // crawled, tested, exploited), so measuring `network:host` on web's
+        // ladder would cover nothing and change the FRACTION, not just the
+        // per_kind count.
         let out = CoverageEvaluator::evaluate(
-            &target(0.5, Some("tested"), Some(&["network:host"])),
+            &target(0.5, Some("enumerated"), Some(&["network:host"])),
             &paths,
             &active(&["network", "web"]),
         )
         .unwrap();
-        // 2 of 3, counted under `network` only (not re-measured on web's ladder).
-        assert!((out.fraction - 2.0 / 3.0).abs() < 1e-9);
+        // 2 of 3 (tested + exploited are >= enumerated), counted under
+        // `network` only. Re-measured on web it would be 2 of 6 = 0.333.
+        assert!((out.fraction - 2.0 / 3.0).abs() < 1e-9, "{}", out.fraction);
         assert!(out.met);
         assert_eq!(out.per_kind.len(), 1);
     }
