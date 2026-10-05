@@ -7,6 +7,7 @@
 //! their native socket events into [`SocketSnapshot`]s and an opaque
 //! [`OwnerId`]; the tracker returns [`Emission`]s for the caller to deliver.
 
+pub mod linux;
 pub mod tracker;
 pub mod types;
 pub mod unsupported;
