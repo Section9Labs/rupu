@@ -255,6 +255,15 @@ pub struct LeadConfig {
     /// with (including any learned from a context-overflow error) into the
     /// next, as a session does. `ModelLimits::unknown()` when not resolved.
     pub limits: ModelLimits,
+    /// Coverage scope the lead's `report_finding` / `asset_mark` write to. Set
+    /// to the agentiflow id so findings pool under the same target the
+    /// envelope's goal evaluator reads (`target_id(workspace, id)`); `None`
+    /// falls back to the runner's default, `target_id(workspace, agent_name)`.
+    pub scope_name: Option<String>,
+    /// The run's resolved engagement profile set. `Some` enables `asset_mark`
+    /// and makes the lead's findings profile-typed; `None` records bare
+    /// findings with no engagement routing.
+    pub findings_engagement: Option<Arc<rupu_coverage::ActiveSet>>,
 }
 
 /// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
@@ -336,6 +345,12 @@ impl LeadDriver for RunAgentLeadDriver {
             decider: Arc::new(BypassDecider),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: self.cfg.workspace_path.clone(),
+                findings: self.cfg.findings_engagement.clone().map(|engagement| {
+                    rupu_coverage::FindingWriteOptions {
+                        engagement: Some(engagement),
+                        ..Default::default()
+                    }
+                }),
                 ..Default::default()
             },
             user_message,
@@ -361,7 +376,7 @@ impl LeadDriver for RunAgentLeadDriver {
             on_usage: None,
             concerns: None,
             limits: self.limits.clone(),
-            scope_name: None,
+            scope_name: self.cfg.scope_name.clone(),
             surface_tag: None,
             pause: None,
             seed_source: None,
@@ -623,6 +638,8 @@ mod tests {
             workspace_path: dir.to_path_buf(),
             agent_tools: vec![],
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            scope_name: None,
+            findings_engagement: None,
         }
     }
 

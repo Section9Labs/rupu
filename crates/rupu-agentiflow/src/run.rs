@@ -47,6 +47,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::{target_id, ActiveSet, CoveragePaths};
@@ -482,6 +483,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
 
             // ---- envelope and lead ----------------------------------------------------
             let paths = CoveragePaths::new(&workspace, &target_id(&workspace, &id));
+            // The lead records findings against the same engagement the envelope
+            // evaluates, so hand it its own shared copy before `active` moves.
+            let findings_engagement = Arc::new(active.clone());
             let cfg = EnvelopeConfig {
                 goals: def.goals.clone(),
                 coverage: def.coverage.clone(),
@@ -497,6 +501,13 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 started,
             );
 
+            // The lead records findings through `report_finding`; the runner only
+            // registers it for an agent that lists it. Dedup so a caller that
+            // already granted it does not get it twice.
+            let mut agent_tools = lead.agent_tools;
+            if !agent_tools.iter().any(|t| t == "report_finding") {
+                agent_tools.push("report_finding".to_string());
+            }
             let lead_cfg = LeadConfig {
                 agent_name: lead.agent_name,
                 system_prompt: lead.system_prompt,
@@ -509,9 +520,13 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 goals: def.goals.clone(),
                 workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
                 workspace_path: workspace.clone(),
-                agent_tools: lead.agent_tools,
+                agent_tools,
                 // Real limit resolution is Plan 4's; unknown limits are the safe start.
                 limits: ModelLimits::unknown(),
+                // Pool the lead's findings and assets under the run id: the same
+                // `target_id(workspace, id)` the envelope's goal evaluator reads.
+                scope_name: Some(id.clone()),
+                findings_engagement: Some(findings_engagement),
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,
@@ -1038,6 +1053,78 @@ mod tests {
             pooled_paths(&fx, "af_mine").root,
             pooled_paths(&fx, "af_other").root
         );
+    }
+
+    /// A synthetic, complete full-profile report: the same fixture
+    /// `rupu-coverage`'s own report tests validate.
+    fn sample_report() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        )))
+        .unwrap()
+    }
+
+    /// A factory whose every round makes one `report_finding` call (a
+    /// complete report plus the `network:service` asset the active profile
+    /// requires), then stops.
+    fn report_finding_factory() -> ProviderFactory {
+        Box::new(|| -> Box<dyn rupu_providers::LlmProvider> {
+            Box::new(MockProvider::new(vec![
+                ScriptedTurn::AssistantToolUse {
+                    text: None,
+                    tool_id: "t1".into(),
+                    tool_name: "report_finding".into(),
+                    tool_input: json!({
+                        "scope": "repo",
+                        "report": sample_report(),
+                        "asset": {
+                            "kind": "network:service",
+                            "coordinates": [
+                                { "t": "host", "v": "10.0.0.5" },
+                                { "t": "port", "v": { "number": 22, "proto": "tcp" } }
+                            ]
+                        }
+                    }),
+                    stop: rupu_agent::StopReason::ToolUse,
+                },
+                ScriptedTurn::AssistantText {
+                    text: "Round done.".into(),
+                    stop: rupu_agent::StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ]))
+        })
+    }
+
+    #[test]
+    fn a_lead_finding_lands_in_the_pooled_scope() {
+        // The goal evaluator reads `target_id(workspace, run id)`; the lead's
+        // `report_finding` must write there, not under `target_id(workspace,
+        // <lead agent name>)`, or no finding-goal could ever be met.
+        let fx = fixture();
+        let id = "af_finding";
+        let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = report_finding_factory();
+        let out = run_agentiflow(o).unwrap();
+
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap_or_default();
+        assert!(
+            !findings.trim().is_empty(),
+            "the lead's finding is in the pooled scope ledger"
+        );
+        // ...and the lead's own default scope stayed empty.
+        let stray = CoveragePaths::new(&fx.workspace, &target_id(&fx.workspace, "lead"));
+        assert!(
+            std::fs::read_to_string(&stray.findings)
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "nothing leaked into the lead's own scope"
+        );
+        // The evaluator saw it: the finding goal is met from the pooled ledger.
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
     }
 
     #[test]
