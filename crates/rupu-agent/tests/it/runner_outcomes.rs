@@ -377,6 +377,70 @@ async fn refusal_with_no_chain_fails_and_discards_the_partial() {
     assert_replay_lockstep(&ran);
 }
 
+/// A refused (discarded) turn is shown whole: its reasoning and tool call
+/// are written as `assistant_block`s, nothing is dispatched, and replay
+/// still drops the whole turn.
+#[tokio::test]
+async fn a_discarded_turn_writes_its_tool_calls_and_reasoning_as_blocks() {
+    let reasoning = ContentBlock::Reasoning {
+        text: Some("considering".into()),
+        provider: "mock".into(),
+        model: "mock-1".into(),
+        raw: serde_json::json!({"type": "thinking", "thinking": "considering", "signature": "s"}),
+    };
+    let call = ContentBlock::ToolUse {
+        id: "refused_1".into(),
+        name: "write_file".into(),
+        input: serde_json::json!({ "path": "out.txt", "content": "x" }),
+    };
+    let ran = run_script(
+        vec![ScriptedTurn::Reply {
+            content: vec![reasoning.clone(), text("partial"), call.clone()],
+            stop: Stop::synthetic(StopReason::Refusal, "mock"),
+            usage: Usage::default(),
+        }],
+        "s1",
+    )
+    .await;
+    assert_eq!(ran.result.status, RunStatus::Error);
+    assert!(!ran
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::ToolCall { .. })));
+    assert!(!ran
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::ToolResult { .. })));
+    assert_eq!(
+        assistant_blocks(&ran.events),
+        vec![
+            (serde_json::to_value(&reasoning).unwrap(), false),
+            (serde_json::to_value(&call).unwrap(), false),
+        ]
+    );
+    // The blocks precede the discarded TurnEnd.
+    let last_block = ran
+        .events
+        .iter()
+        .rposition(|e| matches!(e, Event::AssistantBlock { .. }))
+        .unwrap();
+    let discarded_end = ran
+        .events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::TurnEnd {
+                    discarded: true,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(last_block < discarded_end);
+    assert_replay_lockstep(&ran);
+}
+
 #[tokio::test]
 async fn empty_reply_is_nudged_once() {
     let ran = run_script(empty_script(), "s1").await;

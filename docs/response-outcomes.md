@@ -337,7 +337,9 @@ A reply block that has no event of its own prints as a `block` row:
 `served by fallback · <from> → <to>` for a server-side fallback boundary,
 `unrecognized block · <type>` followed by the provider's raw JSON (cut at 240
 columns) for a block rupu does not model, and `abandoned · …` for a tool call or
-reasoning block abandoned at a mid-output fallback.
+reasoning block abandoned at a mid-output fallback. A refused or retried turn's
+tool calls and reasoning print as `block` rows too (`tool call · <name>`,
+`reasoning`): they were never run or kept, and the rows show the reply whole.
 
 **Control plane.** The transcript view shows an outcome as a block with a
 severity-colored edge, its title and its detail, and a recovery as a one-line

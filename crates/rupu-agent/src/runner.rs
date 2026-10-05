@@ -845,21 +845,26 @@ fn emit_turn_content(
     Ok(tool_uses)
 }
 
-/// A discarded turn's blocks with no event of their own (`fallback`,
-/// `unknown`): the turn's text arrives as `AssistantDelta`s, these as
-/// `AssistantBlock`s, so the reply is still shown whole. Replay drops them
-/// with the rest of the discarded turn.
+/// A discarded turn's (refused, blocked or retried) non-text blocks — tool
+/// calls, reasoning, `fallback`, `unknown` — as `AssistantBlock`s, so the
+/// reply is still shown whole; its text arrives as `AssistantDelta`s when
+/// streamed. Nothing here is dispatched, and replay drops it all with the
+/// rest of the discarded turn. A block before the reply's last `fallback` is
+/// marked abandoned, as [`emit_turn_content`] marks it.
 fn emit_discarded_blocks(
     writer: &mut JsonlWriter,
     content: &[ContentBlock],
 ) -> Result<(), RunError> {
-    for block in content {
+    let boundary = crate::outcome::fallback_boundary(content);
+    for (i, block) in content.iter().enumerate() {
         if matches!(
             block,
-            ContentBlock::Unknown { .. } | ContentBlock::Fallback { .. }
+            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. }
         ) {
-            writer.write(&assistant_block_event(block, false))?;
+            continue;
         }
+        let abandoned = crate::outcome::is_abandoned(boundary, i, block);
+        writer.write(&assistant_block_event(block, abandoned))?;
     }
     Ok(())
 }
