@@ -65,6 +65,11 @@ pub struct FlowCtx {
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// The `bash` tool call that caused this flow. Set only on
+    /// `Fidelity::Socket` flows; `None` for every HTTP flow and for
+    /// `FlowCtx::system`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub origin: Origin,
 }
 
@@ -76,6 +81,7 @@ impl FlowCtx {
             step_id: None,
             agent: None,
             workspace_id: None,
+            tool_call_id: None,
             origin,
         }
     }

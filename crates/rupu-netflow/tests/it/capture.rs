@@ -74,6 +74,7 @@ async fn records_a_successful_request() {
             step_id: Some("step-2".into()),
             agent: Some("reviewer".into()),
             workspace_id: Some("ws".into()),
+            tool_call_id: None,
             origin: Origin::Provider("anthropic".into()),
         },
         reqwest::Client::builder(),
@@ -448,6 +449,7 @@ fn run_ctx(run: &str) -> FlowCtx {
         step_id: None,
         agent: None,
         workspace_id: None,
+        tool_call_id: None,
         origin: Origin::Provider("anthropic".into()),
     }
 }
@@ -526,4 +528,17 @@ fn subprocess_origin_tags_and_keys() {
     assert_eq!(json, serde_json::json!({"kind":"subprocess","name":"curl"}));
     assert_eq!(serde_json::from_value::<Origin>(json).unwrap(), o);
     assert_eq!(origin_key(&o), "subprocess:curl");
+}
+
+#[test]
+fn flow_ctx_tool_call_id_is_optional_and_omitted_when_none() {
+    let mut c = FlowCtx::system(Origin::Subprocess("curl".into()));
+    assert!(serde_json::to_string(&c)
+        .unwrap()
+        .find("tool_call_id")
+        .is_none());
+    c.tool_call_id = Some("toolu_01Ab".into());
+    let json = serde_json::to_string(&c).unwrap();
+    assert!(json.contains(r#""tool_call_id":"toolu_01Ab""#));
+    assert_eq!(serde_json::from_str::<FlowCtx>(&json).unwrap(), c);
 }

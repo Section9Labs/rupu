@@ -26,6 +26,7 @@ fn flow(ts_secs: i64, host: &str, ok: bool) -> FlowRecord {
             step_id: None,
             agent: None,
             workspace_id: None,
+            tool_call_id: None,
             origin: Origin::Provider("anthropic".into()),
         },
         fidelity: Fidelity::Http,

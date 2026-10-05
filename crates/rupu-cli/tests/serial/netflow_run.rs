@@ -60,6 +60,7 @@ async fn a_flow_reaches_both_the_ledger_and_the_transcript() {
             step_id: None,
             agent: None,
             workspace_id: None,
+            tool_call_id: None,
             origin: Origin::Provider("anthropic".into()),
         },
         reqwest::Client::builder(),

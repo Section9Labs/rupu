@@ -376,6 +376,7 @@ mod tests {
                 step_id: Some("s1".into()),
                 agent: Some("reviewer".into()),
                 workspace_id: Some("ws".into()),
+                tool_call_id: None,
                 origin: Origin::Provider("anthropic".into()),
             },
             fidelity: Fidelity::Http,
