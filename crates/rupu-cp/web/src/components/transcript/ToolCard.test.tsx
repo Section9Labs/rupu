@@ -819,3 +819,22 @@ it('subrun card prefers the SubrunIdentityContext entry (provider/model) for its
   );
   expect(screen.getByText('lead>lynx#1 · scanner · anthropic/claude-opus-5-5')).not.toBeNull();
 });
+
+describe('ToolCard call anchor', () => {
+  it('wraps the card with the raw call id as data-call-id', () => {
+    const { container } = render(
+      <ToolCard tool={makeToolView({ tool: 'bash', kind: 'generic', callId: 'call/1:x' })} />,
+    );
+    expect(container.querySelector('[data-call-id="call/1:x"]')).not.toBeNull();
+  });
+
+  it('marks finding cards too, and omits the attribute when there is no call id', () => {
+    const f = render(
+      <ToolCard tool={{ tool: 'report_finding', kind: 'finding', input: {}, finding: FINDING, callId: 'f9' }} />,
+    );
+    expect(f.container.querySelector('[data-call-id="f9"]')).not.toBeNull();
+    cleanup();
+    const n = render(<ToolCard tool={makeToolView({ tool: 'bash', kind: 'generic' })} />);
+    expect(n.container.querySelector('[data-call-id]')).toBeNull();
+  });
+});

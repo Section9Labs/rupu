@@ -981,7 +981,7 @@ function AstGrepBody({ tool, runId, host }: { tool: ToolView; runId?: string; ho
 // Public component
 // ---------------------------------------------------------------------------
 
-export default function ToolCard({
+function ToolCardBody({
   tool,
   onOpenTranscript,
   runId,
@@ -1054,6 +1054,21 @@ export default function ToolCard({
 
       {/* Error block — shown when tool.error is set */}
       {tool.error && <ErrorBlock error={tool.error} />}
+    </div>
+  );
+}
+
+/**
+ * One tool call's card. The wrapper carries `data-call-id` (the RAW call id,
+ * never URL-encoded) so a `#call-<id>` link — the netflow table's "transcript"
+ * link for a socket flow — can find the card; see `lib/toolCallAnchor.ts`.
+ * A data attribute (not an `id`) so ids containing `/`, `:` etc. need no CSS
+ * escaping on lookup. Absent when the call has no id (orphaned results).
+ */
+export default function ToolCard(props: Parameters<typeof ToolCardBody>[0]) {
+  return (
+    <div data-call-id={props.tool.callId}>
+      <ToolCardBody {...props} />
     </div>
   );
 }
