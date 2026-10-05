@@ -37,12 +37,32 @@ const FRAGMENT_SEPARATOR: &str = "\n\n";
 pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String> {
     let mut saw_turn_start = false;
     let mut turn_fragments: Vec<String> = Vec::new();
+    // Fragments of earlier turns this answer continues (a truncation
+    // continuation's `Recovery { continues_output }`).
+    let mut carried: Vec<String> = Vec::new();
+    let mut carry_next = false;
     let mut last_non_empty: Option<String> = None;
+    // `last_non_empty` as it stood when the current turn began, so a
+    // discarded turn can be rolled back out of the fallback too.
+    let mut last_before_turn: Option<String> = None;
+    // The chain state as it stood when the current turn began. A discarded
+    // turn (a refused, retried or empty reply) is transparent to the chain:
+    // its `TurnEnd` restores this, so the earlier pieces survive it and the
+    // next turn continues them.
+    let mut chain_before_turn: (Vec<String>, Vec<String>, bool) = (Vec::new(), Vec::new(), false);
     for event in events {
         match event {
             Event::TurnStart { .. } => {
                 saw_turn_start = true;
-                turn_fragments.clear();
+                chain_before_turn = (carried.clone(), turn_fragments.clone(), carry_next);
+                if carry_next {
+                    carried.append(&mut turn_fragments);
+                } else {
+                    carried.clear();
+                    turn_fragments.clear();
+                }
+                carry_next = false;
+                last_before_turn = last_non_empty.clone();
             }
             Event::AssistantMessage { content, .. } if !content.trim().is_empty() => {
                 if saw_turn_start {
@@ -50,13 +70,24 @@ pub fn final_turn_text(events: impl IntoIterator<Item = Event>) -> Option<String
                 }
                 last_non_empty = Some(content);
             }
+            Event::TurnEnd {
+                discarded: true, ..
+            } => {
+                (carried, turn_fragments, carry_next) = chain_before_turn.clone();
+                last_non_empty = last_before_turn.clone();
+            }
+            Event::Recovery {
+                continues_output: true,
+                ..
+            } => carry_next = true,
             _ => {}
         }
     }
-    if turn_fragments.is_empty() {
+    carried.append(&mut turn_fragments);
+    if carried.is_empty() {
         last_non_empty
     } else {
-        Some(turn_fragments.join(FRAGMENT_SEPARATOR))
+        Some(carried.join(FRAGMENT_SEPARATOR))
     }
 }
 

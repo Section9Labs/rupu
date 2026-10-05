@@ -97,6 +97,13 @@ pub struct CliAgentDispatcher {
     limits_ctx: rupu_runtime::model_limits::LimitsContext,
     /// The parent `rupu run`'s coverage stream; children append to it.
     coverage_stream: Option<PathBuf>,
+    /// `[providers.<name>]` from `config.toml`: what a dispatched child's
+    /// fallback hops are built from (`rupu_runtime::hop_builder`).
+    providers: std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+    /// `[recovery]` from `config.toml`: the fallback table a child uses when
+    /// its agent declares no `fallbacks:`, and the server-side-fallback
+    /// toggle for the child's provider and its hops.
+    recovery: rupu_config::RecoveryConfig,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -135,6 +142,8 @@ impl CliAgentDispatcher {
         usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
         limits_ctx: rupu_runtime::model_limits::LimitsContext,
         coverage_stream: Option<PathBuf>,
+        providers: std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+        recovery: rupu_config::RecoveryConfig,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -157,6 +166,8 @@ impl CliAgentDispatcher {
             usage_ledger,
             limits_ctx,
             coverage_stream,
+            providers,
+            recovery,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -197,7 +208,8 @@ impl CliAgentDispatcher {
     /// Best-effort `DispatchCompleted` emission — guards the `Option` and
     /// never fails the child (or parent) run. Called from every exit
     /// path of `dispatch()` reached after the matching `DispatchStarted`
-    /// was emitted.
+    /// was emitted. `cause` is the child's typed failure, when it failed
+    /// on a classified response outcome.
     fn emit_dispatch_completed(
         &self,
         parent_run_id: &str,
@@ -205,6 +217,7 @@ impl CliAgentDispatcher {
         success: bool,
         tokens_in: u64,
         tokens_out: u64,
+        cause: Option<rupu_transcript::OutcomeRecord>,
     ) {
         if let Some(sink) = &self.event_sink {
             sink.emit(
@@ -215,6 +228,7 @@ impl CliAgentDispatcher {
                     success,
                     tokens_in,
                     tokens_out,
+                    cause,
                 },
             );
         }
@@ -328,6 +342,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             anthropic_prompt_cache: spec.anthropic_prompt_cache,
+            anthropic_server_side_fallback: Some(self.recovery.server_side_fallback),
             openai_compatible: oai_params,
             tuning: self.provider_tuning.get(&provider_name).cloned(),
             kind: self.kinds.get(&provider_name).cloned(),
@@ -338,7 +353,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             spec.auth,
             self.resolver.as_ref(),
             &provider_config,
-            netflow_sink,
+            netflow_sink.clone(),
         )
         .await;
 
@@ -364,7 +379,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let mut provider = match built {
             Ok((_resolved, p)) => p,
             Err(e) => {
-                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0, None);
                 if let Some(h) = netflow_handle {
                     h.shutdown().await;
                 }
@@ -411,6 +426,14 @@ impl AgentDispatcher for CliAgentDispatcher {
             coverage_stream: self.coverage_stream.clone(),
         };
 
+        // What a fallback hop keeps from this child's agent: exactly what its
+        // primary provider's `ProviderConfig` and auth hint above carry.
+        let hop_overrides = rupu_runtime::hop_builder::AgentOverrides {
+            oauth_prefix: spec.anthropic_oauth_prefix,
+            prompt_cache: spec.anthropic_prompt_cache,
+            auth: spec.auth,
+            origin_provider: provider_name.clone(),
+        };
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
@@ -469,13 +492,29 @@ impl AgentDispatcher for CliAgentDispatcher {
             surface_tag: None,
             pause: None,
             codename: codename.clone(),
+            recovery: rupu_runtime::hop_builder::recovery_opts(
+                &self.recovery,
+                spec.fallbacks.as_deref(),
+                self.resolver.clone(),
+                self.providers.clone(),
+                self.limits_ctx.clone(),
+                netflow_sink,
+                hop_overrides,
+            ),
         };
 
         let started = std::time::Instant::now();
         let run_result = match run_agent(opts).await {
             Ok(r) => r,
             Err(e) => {
-                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                self.emit_dispatch_completed(
+                    parent_run_id,
+                    &sub_run_id,
+                    false,
+                    0,
+                    0,
+                    e.outcome().cloned(),
+                );
                 if let Some(h) = netflow_handle {
                     h.shutdown().await;
                 }
@@ -492,8 +531,6 @@ impl AgentDispatcher for CliAgentDispatcher {
 
         write_delegation_narrowing_notice(&transcript_path, agent_name, parent_run_id);
 
-        let output = read_final_assistant_text(&transcript_path).unwrap_or_default();
-
         // `run_agent` returning `Ok` does NOT mean the child did its job: an
         // `Err` is reserved for failures that stopped the loop from
         // proceeding at all, so a child that burned its whole `max_turns`
@@ -504,12 +541,15 @@ impl AgentDispatcher for CliAgentDispatcher {
         // sibling of the workflow-step bug fixed in `rupu-orchestrator`'s
         // `dispatch_one`.
         //
-        // The child's partial `output` is deliberately still returned rather
-        // than collapsed into `DispatchError::ChildRun`: the parent gets both
-        // whatever the child managed to produce AND an honest `ok: false`.
-        // The reason itself lives in the child's own transcript
-        // (`RunComplete.error`) and in the warning below — `DispatchOutcome`
-        // has no error channel to carry it.
+        // A failed child is still an `Ok(DispatchOutcome)` rather than a
+        // `DispatchError::ChildRun`, so the parent gets the child's sub-run
+        // id and transcript with an honest `ok: false`. Its `output` is
+        // empty (spec 2026-10-01 §5.3): the child's last text is an interim
+        // message or a cut-off chain, not an answer. `error` carries why it
+        // failed, which the dispatch tools put in the body the parent reads —
+        // without the rung-3 hint (`RunResult::failure_reason`): the parent
+        // model cannot `rupu run --continue` its child. The child's own
+        // transcript and run record keep the hint.
         let terminal = run_result.terminal_error();
         if let Some(err) = &terminal {
             tracing::warn!(
@@ -520,6 +560,12 @@ impl AgentDispatcher for CliAgentDispatcher {
             );
         }
         let success = terminal.is_none();
+        let output = if success {
+            read_final_assistant_text(&transcript_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let error = run_result.failure_reason();
 
         self.emit_dispatch_completed(
             parent_run_id,
@@ -527,6 +573,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             success,
             run_result.total_tokens_in,
             run_result.total_tokens_out,
+            terminal.as_ref().and_then(|e| e.outcome()).cloned(),
         );
 
         Ok(DispatchOutcome {
@@ -536,6 +583,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             transcript_path,
             output,
             success,
+            error,
             tokens_used: run_result.total_tokens_in + run_result.total_tokens_out,
             duration_ms,
         })
@@ -677,6 +725,7 @@ mod tests {
             total_tokens: 0,
             duration_ms: 0,
             error: None,
+            outcome: None,
         })
         .unwrap();
         w.flush().unwrap();
@@ -806,6 +855,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -926,6 +977,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -999,6 +1052,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             Some(stream.clone()),
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1100,6 +1155,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -1208,6 +1265,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -1275,6 +1334,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1289,6 +1350,91 @@ mod tests {
         assert!(
             result.is_ok(),
             "dispatch with no event sink should behave exactly as before"
+        );
+    }
+
+    /// Spec 2026-10-01 §5.3: a child that ran and failed reports `ok:
+    /// false`, an EMPTY `output` (not its interim text from an earlier
+    /// turn), and the reason its run recorded as `error`.
+    #[tokio::test]
+    async fn a_failed_child_returns_no_output_and_its_error() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+            None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
+            None,
+            Default::default(),
+            Default::default(),
+        );
+
+        // An interim message with a tool call, then a refusal on the final
+        // turn with no fallback chain.
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[
+              { "AssistantToolUse": { "text": "Let me read the settings first", "tool_id": "call_1", "tool_name": "read_file", "tool_input": { "path": "absent.toml" }, "stop": "tool_use" } },
+              { "Reply": {
+                  "content": [{ "type": "text", "text": "I won't do that." }],
+                  "stop": { "reason": "refusal", "wire": { "provider": "anthropic", "value": "refusal" } }
+              } }
+            ]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("a failed child is an outcome, not a dispatch error");
+        assert!(!outcome.success);
+        assert_eq!(outcome.output, "", "no stale interim text as the answer");
+        let error = outcome.error.expect("the child's error reaches the parent");
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            !error.contains("no recovery left") && !error.contains("--continue"),
+            "the parent gets no rung-3 hint it cannot act on: {error}"
+        );
+        // The child's own transcript keeps the hint.
+        let child_complete = rupu_transcript::JsonlReader::iter(&outcome.transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                rupu_transcript::Event::RunComplete { error, .. } => error,
+                _ => None,
+            })
+            .expect("the child's RunComplete records its error");
+        assert!(
+            child_complete.contains("no recovery left"),
+            "{child_complete}"
         );
     }
 
@@ -1348,6 +1494,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1431,6 +1579,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1521,6 +1671,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1616,6 +1768,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(
@@ -1696,6 +1850,8 @@ mod tests {
                 dir.path().join("cache/models"),
             ),
             None,
+            Default::default(),
+            Default::default(),
         );
 
         std::env::set_var(

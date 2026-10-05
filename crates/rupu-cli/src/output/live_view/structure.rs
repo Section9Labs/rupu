@@ -1998,6 +1998,7 @@ steps:
             tokens_in: 0,
             tokens_out: 0,
             host: None,
+            cause: None,
         });
     }
 
@@ -2141,6 +2142,7 @@ steps:
             run_id: "r".into(),
             step_id: "build".into(),
             error: "make failed".into(),
+            cause: None,
         });
         start(
             &mut v,
@@ -3448,6 +3450,7 @@ steps:
             run_id: "r".into(),
             step_id: "join1".into(),
             error: "x".into(),
+            cause: None,
         });
         assert!(!pane(&v, &wf, &NavState::default(), W, 60).contains('⟦'));
     }

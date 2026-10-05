@@ -774,6 +774,18 @@ impl LineStreamPrinter {
     /// callers like autoflow to surface tool-driven issue/PR updates in
     /// real time while preserving ticker coordination.
     pub fn sideband_event(&mut self, status: Status, label: &str, detail: Option<&str>) {
+        let buf = self.sideband_event_text(status, label, detail);
+        self.out(&buf);
+    }
+
+    /// The row [`Self::sideband_event`] prints: rail, `status` glyph, label,
+    /// dim detail. Split out so the exact text is testable.
+    pub(crate) fn sideband_event_text(
+        &self,
+        status: Status,
+        label: &str,
+        detail: Option<&str>,
+    ) -> String {
         let mut buf = String::new();
         self.push_content_prefix(&mut buf);
         let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
@@ -783,7 +795,7 @@ impl LineStreamPrinter {
             buf.push_str("  ");
             let _ = palette::write_colored(&mut buf, detail, DIM);
         }
-        self.out(&buf);
+        buf
     }
 
     /// `│  ✓ <step_id>  · N findings · Xs`  — panel-step footer with

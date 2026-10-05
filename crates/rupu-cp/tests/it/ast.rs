@@ -54,6 +54,7 @@ fn seed_run(id: &str, workspace: &std::path::Path) -> RunRecord {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     }
 }
 

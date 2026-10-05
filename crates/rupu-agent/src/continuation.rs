@@ -9,7 +9,7 @@
 
 use crate::replay::{reconstruct_transcript, ReplayError};
 use rupu_providers::types::{ContentBlock, Message, Role};
-use rupu_transcript::{Event, JsonlReader, ReadError, RunStatus};
+use rupu_transcript::{Event, JsonlReader, OutcomeRecord, ReadError, RunStatus};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -28,6 +28,9 @@ pub enum Continuation {
     Resume {
         messages: Vec<Message>,
         seed_source: PathBuf,
+        /// The outcome the run failed on, when it is a failed run resumed by
+        /// [`prepare_recovery_continuation`]; `None` for an interruption.
+        stopped_on: Option<OutcomeRecord>,
     },
     /// The run ended in failure — not an interruption. Start fresh.
     /// `seeded_from` is the transcript it was seeded from, when it was itself
@@ -87,29 +90,51 @@ pub fn transcript_agent(transcript: &Path) -> Result<String, ContinuationError> 
 /// | `RunComplete { status: error }`          | `Failed`   |
 /// | `RunComplete { status: aborted }`, none  | `Resume` — or `Finished` when the rebuilt conversation already ends in the final answer |
 pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, ContinuationError> {
+    prepare(transcript, false)
+}
+
+/// Like [`prepare_continuation`], but a run that ended in error WITH a
+/// `RunComplete.outcome` is `Resume` (its conversation is intact; the failure
+/// was provider-side), carrying that outcome as `stopped_on`. Every other
+/// classification is unchanged. `rupu run --continue --model/--provider`
+/// uses it: a different model may answer what this one would not.
+///
+/// A failed run is never read as finished, even when its rebuilt
+/// conversation ends in an assistant reply: it did not finish.
+pub fn prepare_recovery_continuation(transcript: &Path) -> Result<Continuation, ContinuationError> {
+    prepare(transcript, true)
+}
+
+fn prepare(transcript: &Path, recovery: bool) -> Result<Continuation, ContinuationError> {
     let path = transcript.display().to_string();
     let events = read_events(transcript)?;
     if !events.iter().any(|e| matches!(e, Event::RunStart { .. })) {
         return Err(ContinuationError::NotAnAgentRun { path });
     }
     let completion = events.iter().rev().find_map(|e| match e {
-        Event::RunComplete { status, error, .. } => Some((*status, error.clone())),
+        Event::RunComplete {
+            status,
+            error,
+            outcome,
+            ..
+        } => Some((*status, error.clone(), outcome.clone())),
         _ => None,
     });
-    match completion {
-        Some((RunStatus::Ok, _)) => {
+    let stopped_on = match completion {
+        Some((RunStatus::Ok, _, _)) => {
             return Ok(Continuation::Finished {
                 output: final_assistant_text(&events),
             })
         }
-        Some((RunStatus::Error, error)) => {
+        Some((RunStatus::Error, _, Some(outcome))) if recovery => Some(outcome),
+        Some((RunStatus::Error, error, _)) => {
             return Ok(Continuation::Failed {
                 error,
                 seeded_from: seeded_from(&events),
             })
         }
-        Some((RunStatus::Aborted, _)) | None => {}
-    }
+        Some((RunStatus::Aborted, _, _)) | None => None,
+    };
     let messages =
         reconstruct_transcript(transcript).map_err(|source| ContinuationError::Replay {
             path: path.clone(),
@@ -117,26 +142,28 @@ pub fn prepare_continuation(transcript: &Path) -> Result<Continuation, Continuat
         })?;
     match messages.last() {
         None => Err(ContinuationError::NotAnAgentRun { path }),
-        Some(last) if last.role == Role::Assistant => {
-            if last
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-            {
-                Err(ContinuationError::DanglingToolCall { path })
-            } else {
-                // The final answer's turn completed; the process died before
-                // `RunComplete` landed. Nothing left to do. The answer is read
-                // the same way as after a `RunComplete`, so it can't depend on
-                // whether that last flush landed.
-                Ok(Continuation::Finished {
-                    output: final_assistant_text(&events),
-                })
-            }
+        Some(last)
+            if last.role == Role::Assistant
+                && last
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })) =>
+        {
+            Err(ContinuationError::DanglingToolCall { path })
+        }
+        Some(last) if last.role == Role::Assistant && stopped_on.is_none() => {
+            // The final answer's turn completed; the process died before
+            // `RunComplete` landed. Nothing left to do. The answer is read
+            // the same way as after a `RunComplete`, so it can't depend on
+            // whether that last flush landed.
+            Ok(Continuation::Finished {
+                output: final_assistant_text(&events),
+            })
         }
         Some(_) => Ok(Continuation::Resume {
             messages,
             seed_source: transcript.to_path_buf(),
+            stopped_on,
         }),
     }
 }
@@ -180,11 +207,24 @@ pub fn apply_continuation(
     messages: Vec<Message>,
     seed_source: PathBuf,
 ) {
-    opts.user_message = if ends_with_note(&messages) {
+    let note = if ends_with_note(&messages) {
         String::new()
     } else {
         CONTINUATION_NOTE.to_string()
     };
+    apply_continuation_with(opts, messages, seed_source, note);
+}
+
+/// [`apply_continuation`] with the caller's `note` as the `user_message` —
+/// a failed run continued on another model gets
+/// [`crate::recovery::recovery_retry_note`] instead of [`CONTINUATION_NOTE`].
+pub fn apply_continuation_with(
+    opts: &mut crate::runner::AgentRunOpts,
+    messages: Vec<Message>,
+    seed_source: PathBuf,
+    note: String,
+) {
+    opts.user_message = note;
     opts.initial_messages = messages;
     opts.seed_source = Some(seed_source);
 }
@@ -204,11 +244,13 @@ fn ends_with_note(messages: &[Message]) -> bool {
 
 /// The transcript `opts` continues, when it describes a continuation: a run
 /// seeded by reference whose conversation ends with [`CONTINUATION_NOTE`]
-/// (sent as its `user_message`, or already in the seed). `run_agent` records
+/// (sent as its `user_message`, or already in the seed), or that is sent a
+/// recovery retry note (a failed run continued on another model). `run_agent` records
 /// it on the run's coverage manifest.
 pub(crate) fn continued_from(opts: &crate::runner::AgentRunOpts) -> Option<&Path> {
     let source = opts.seed_source.as_deref()?;
     let carries_note = opts.user_message == CONTINUATION_NOTE
+        || crate::recovery::is_recovery_retry_note(&opts.user_message)
         || (opts.user_message.is_empty() && ends_with_note(&opts.initial_messages));
     carries_note.then_some(source)
 }
@@ -286,6 +328,7 @@ mod tests {
             Continuation::Resume {
                 messages,
                 seed_source,
+                ..
             } => {
                 assert_eq!(seed_source, transcript);
                 let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
@@ -540,6 +583,7 @@ mod tests {
         let Continuation::Resume {
             messages,
             seed_source,
+            ..
         } = prepare_continuation(&first).unwrap()
         else {
             panic!("expected Resume");
@@ -607,6 +651,7 @@ mod tests {
         let Continuation::Resume {
             messages,
             seed_source,
+            ..
         } = prepare_continuation(&first).unwrap()
         else {
             panic!("expected Resume");
@@ -647,6 +692,7 @@ mod tests {
         let Continuation::Resume {
             messages,
             seed_source,
+            ..
         } = prepare_continuation(interrupted).unwrap()
         else {
             panic!("expected Resume");
@@ -778,6 +824,157 @@ mod tests {
             }
             other => panic!("expected Replay(SeedHashMismatch), got {other:?}"),
         }
+    }
+
+    /// A real run that refuses on its only turn with no fallback chain: it
+    /// ends `RunComplete { status: error, outcome: Some(refusal) }`.
+    async fn refused_transcript(dir: &Path) -> PathBuf {
+        let transcript = dir.join("refused.jsonl");
+        let provider = MockProvider::new(vec![ScriptedTurn::Reply {
+            content: vec![ContentBlock::Text {
+                text: "I won't do that.".into(),
+            }],
+            stop: rupu_providers::types::Stop::synthetic(StopReason::Refusal, "mock"),
+            usage: Default::default(),
+        }]);
+        let mut opts = opts_for(Box::new(provider), dir, transcript.clone());
+        opts.user_message = "do the thing".into();
+        let result = run_agent(opts).await.unwrap();
+        assert_eq!(result.status, RunStatus::Error);
+        assert!(result.outcome.is_some(), "the refusal is the run's outcome");
+        transcript
+    }
+
+    #[tokio::test]
+    async fn a_run_that_failed_on_an_outcome_resumes_only_for_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = refused_transcript(tmp.path()).await;
+        assert!(matches!(
+            prepare_continuation(&t).unwrap(),
+            Continuation::Failed { .. }
+        ));
+        match prepare_recovery_continuation(&t).unwrap() {
+            Continuation::Resume {
+                messages,
+                seed_source,
+                stopped_on,
+            } => {
+                assert_eq!(seed_source, t);
+                assert_eq!(
+                    serde_json::to_value(&messages).unwrap(),
+                    serde_json::to_value(vec![Message::user("do the thing")]).unwrap(),
+                    "the refused turn was discarded; the prompt survives"
+                );
+                let outcome = stopped_on.expect("a failed run names its outcome");
+                assert_eq!(outcome.class, "refusal");
+                assert!(outcome.title.starts_with("refused"), "{}", outcome.title);
+            }
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_failed_without_an_outcome_is_failed_for_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript(tmp.path()).await;
+        let mut all = lines(&t);
+        let i = all.iter().position(|v| kind(v) == "run_complete").unwrap();
+        all[i]["data"]["status"] = "error".into();
+        all[i]["data"]["error"] = "max turns (5) reached".into();
+        write_lines(&t, &all);
+        assert!(matches!(
+            prepare_continuation(&t).unwrap(),
+            Continuation::Failed { .. }
+        ));
+        match prepare_recovery_continuation(&t).unwrap() {
+            Continuation::Failed { error, .. } => {
+                assert_eq!(error.as_deref(), Some("max turns (5) reached"))
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A failed run whose conversation ends in an assistant message (a kept
+    /// reply, then a provider failure) is resumed, not read as finished: it
+    /// did not finish.
+    #[tokio::test]
+    async fn a_failed_run_ending_on_an_assistant_reply_resumes_for_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript(tmp.path()).await;
+        let mut all = lines(&t);
+        let i = all.iter().position(|v| kind(v) == "run_complete").unwrap();
+        all[i]["data"]["status"] = "error".into();
+        all[i]["data"]["outcome"] = serde_json::json!({
+            "id": "oc_1",
+            "class": "provider_error",
+            "severity": "error",
+            "title": "provider error · overloaded",
+        });
+        write_lines(&t, &all);
+        match prepare_recovery_continuation(&t).unwrap() {
+            Continuation::Resume {
+                messages,
+                stopped_on,
+                ..
+            } => {
+                assert_eq!(messages.last().unwrap().role, Role::Assistant);
+                assert_eq!(stopped_on.unwrap().title, "provider error · overloaded");
+            }
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// An interrupted run classifies the same way under both entry points.
+    #[tokio::test]
+    async fn an_interrupted_run_resumes_the_same_way_for_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript(tmp.path()).await;
+        write_lines(&t, &through_first_turn_end(&lines(&t)));
+        match prepare_recovery_continuation(&t).unwrap() {
+            Continuation::Resume { stopped_on, .. } => assert!(stopped_on.is_none()),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+        assert_resumes_after_tool_turn(prepare_recovery_continuation(&t).unwrap(), &t);
+    }
+
+    #[test]
+    fn apply_continuation_with_sends_the_given_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), tmp.path().join("t.jsonl"));
+        let messages = vec![Message::user("do the thing")];
+        let note = crate::recovery::recovery_retry_note("refused", "anthropic", "mock-2");
+        apply_continuation_with(
+            &mut opts,
+            messages.clone(),
+            PathBuf::from("/t/a.jsonl"),
+            note.clone(),
+        );
+        assert_eq!(opts.user_message, note);
+        assert_eq!(
+            serde_json::to_value(&opts.initial_messages).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        assert_eq!(opts.seed_source, Some(PathBuf::from("/t/a.jsonl")));
+        // A recovery continuation is a continuation: its coverage manifest
+        // points `rupu coverage rerun` at the run with the real prompt.
+        assert_eq!(continued_from(&opts), Some(Path::new("/t/a.jsonl")));
+    }
+
+    /// A seeded run with an ordinary prompt (a session's next turn) is not a
+    /// continuation.
+    #[test]
+    fn a_seeded_run_with_an_ordinary_prompt_is_not_a_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), tmp.path().join("t.jsonl"));
+        apply_continuation_with(
+            &mut opts,
+            vec![Message::user("first")],
+            PathBuf::from("/t/a.jsonl"),
+            "A previous attempt at this task stopped early; carry on".into(),
+        );
+        assert_eq!(continued_from(&opts), None);
     }
 
     /// A failed continuation says which run it was seeded from — that run

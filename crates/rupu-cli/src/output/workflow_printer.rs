@@ -2041,17 +2041,18 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
-        TxEvent::Unknown => vec![WorkflowViewLine {
-            status: UiStatus::Active,
-            text: retained_workflow_event_line_raw(
-                UiStatus::Active,
-                "event",
-                "unrecognized event type (newer rupu wrote this transcript)",
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+        TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::AssistantBlock { .. } | TxEvent::Unknown { .. } => {
+            super::outcome_row::outcome_event_row(event)
+                .into_iter()
+                .map(|(status, label, text)| WorkflowViewLine {
+                    status,
+                    text: retained_workflow_event_line_raw(status, label, &text),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                })
+                .collect()
+        }
     }
 }
 
@@ -3531,6 +3532,12 @@ fn process_event(
                 }
             }
         }
+        ev @ (TxEvent::Outcome { .. }
+        | TxEvent::Recovery { .. }
+        | TxEvent::AssistantBlock { .. }
+        | TxEvent::Unknown { .. }) => {
+            super::outcome_row::print_outcome_event(printer, &ev);
+        }
         _ => {}
     }
 }
@@ -4189,6 +4196,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 
@@ -4347,6 +4355,8 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            cause: None,
+            error: None,
         }
     }
 
@@ -4667,6 +4677,7 @@ mod tests {
                     total_tokens: 321,
                     duration_ms: 1200,
                     error: None,
+                    outcome: None,
                 },
             ],
         );
@@ -4688,6 +4699,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         std::fs::write(
             &step_results,
@@ -4737,6 +4750,7 @@ mod tests {
                     total_tokens: 42,
                     duration_ms: 250,
                     error: None,
+                    outcome: None,
                 },
             ],
         );
@@ -4867,7 +4881,40 @@ mod tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
-            TxEvent::Unknown,
+            TxEvent::Outcome {
+                turn_idx: 1,
+                outcome: rupu_transcript::OutcomeRecord {
+                    id: "oc_1".into(),
+                    class: "refusal".into(),
+                    severity: rupu_transcript::Severity::Error,
+                    title: "refused · cyber".into(),
+                    detail: Some("Declined for this example.".into()),
+                    error_class: None,
+                    wire: serde_json::Value::Null,
+                },
+            },
+            TxEvent::Recovery {
+                outcome_id: "oc_1".into(),
+                rung: 1,
+                action: rupu_transcript::RecoveryAction::FellBack,
+                attempt: None,
+                budget: None,
+                provider: Some("anthropic".into()),
+                model: Some("claude-opus-4-8".into()),
+                reason: None,
+                merge_into_previous: false,
+                continues_output: false,
+            },
+            TxEvent::AssistantBlock {
+                block: serde_json::json!({
+                    "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                }),
+                abandoned: false,
+            },
+            TxEvent::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null,
+            },
         ];
         for ev in &cases {
             assert!(
@@ -4875,6 +4922,19 @@ mod tests {
                 "no row for {ev:?} — silent drop"
             );
         }
+        // The rows carry the text an operator needs, not just a placeholder.
+        let rows = |ev: &TxEvent| -> String {
+            workflow_transcript_event_lines(ev, LiveViewMode::Compact, &prefs)
+                .iter()
+                .map(|l| l.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
+        assert!(find("refused · cyber"));
+        assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("served by fallback · model-a → model-b"));
+        assert!(find("unrecognized event · future_event"));
         assert!(workflow_transcript_event_lines(
             &TxEvent::ThinkingDelta {
                 content: "c".into()
@@ -5028,6 +5088,7 @@ mod tests {
                 total_tokens: 42,
                 duration_ms: 1000,
                 error: None,
+                outcome: None,
             },
         ];
         let body = events
@@ -5058,6 +5119,8 @@ mod tests {
                 success: true,
                 is_fixer: false,
                 codename: None,
+                cause: None,
+                error: None,
             }],
             findings: Vec::new(),
             iterations: 0,
@@ -5066,6 +5129,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),
@@ -5161,6 +5226,7 @@ mod tests {
                 total_tokens: 21,
                 duration_ms: 800,
                 error: None,
+                outcome: None,
             },
         ];
         let mut body = String::new();

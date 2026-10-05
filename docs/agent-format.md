@@ -73,6 +73,7 @@ Everything after the closing `---` is the system prompt.
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
+| `fallbacks` | array of `{model, provider?}` | no | `[recovery].fallbacks` from config, else none | Ordered fallback models tried when a reply cannot be used (a refusal, say). Wins over the config table; not merged with it. See [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) |
 | `maxTokens` | integer | no | discovered output cap | Per-request output-token cap. Overrides the cap discovered from the provider's model list; when neither is known, Anthropic gets `8192` and other providers get no cap (model max). `0` is ignored. Extended thinking (`effort`) draws from this budget |
 | `contextWindowTokens` | integer | no | discovered input limit | Input-token limit used for proactive compaction. Overrides the discovered limit; compaction is off only when neither is known. `0` is ignored |
 | `compactAtPercent` | integer | no | `80` | Percentage of the input limit at which compaction triggers; clamped to `[10, 95]`. When the output cap is known and shares the input window, compaction also triggers early enough that a full-length reply still fits |
@@ -287,6 +288,19 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 
 See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
 
+### `fallbacks`
+
+An ordered list of models to try when the agent's own model cannot give a usable reply or the provider fails the request (a refusal, repeated truncation, an overloaded provider). Each entry has a `model` and an optional `provider`; an entry without a `provider` means the provider the run started on.
+
+```yaml
+fallbacks:
+  - model: claude-sonnet-5-5        # same provider as the agent
+  - provider: openai-codex          # another provider
+    model: gpt-5.6-cyber
+```
+
+The list replaces `[recovery].fallbacks` from `config.toml` for this agent; it is not merged with it, and `fallbacks: []` means no fallbacks. Unknown keys inside an entry are an error. A rupu release that predates `fallbacks:` refuses to load an agent file that sets it, so upgrade remote hosts before adding it. A cross-provider entry sends the conversation to that provider; see [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) for the ladder, the rung split and that data-handling note.
+
 ### `maxTokens`
 
 Per-request output-token cap (the LLM request's `max_tokens`). You rarely need to set it: rupu discovers each model's real output cap from the provider's model list, where the provider reports one (Codex/OpenAI and OpenAI-compatible servers report none), and sends that on every turn. A `maxTokens` value overrides the discovered cap. When neither is known, Anthropic requests carry `8192` (the API requires a cap) and every other provider gets no cap, so the model's own maximum applies. Extended thinking (`effort`) draws from this same budget, so a low `maxTokens` can starve an agent that both reasons heavily and produces long output.
@@ -480,3 +494,14 @@ calling the model; a run that failed can't be continued — start it fresh.
 Run the command from the same project as the original run. The new run needs
 its own run id: a `--run-id` that already has a transcript (the run being
 continued, or any other run) is refused rather than overwritten.
+
+A run that failed on a provider-side outcome — a refusal, a reply that kept
+getting cut off — with no fallback left ends with a hint naming this command.
+Its conversation is intact, so it can be continued on another model:
+
+    rupu run <agent> --continue <agent_run_id> --model <model> [--provider <provider>]
+
+The agent is told the earlier attempt stopped and why, and which model it is
+continuing on. `--model` and `--provider` override the agent's own `model:` /
+`provider:` for any `rupu run`, not only a continuation. A run that failed for
+another reason (max turns, say) still can't be continued this way.

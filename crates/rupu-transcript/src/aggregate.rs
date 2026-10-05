@@ -274,6 +274,7 @@ mod tests {
             total_tokens: 0,
             duration_ms: 100,
             error: None,
+            outcome: None,
         }
     }
 

@@ -146,6 +146,7 @@ impl StepFactory for UsageFactory {
             scope_name: None,
             surface_tag: None,
             pause: None,
+            recovery: Default::default(),
         }
     }
 }
@@ -249,6 +250,7 @@ fn write_mirrored_transcript(path: &Path, run_id: &str) {
         total_tokens: 17,
         duration_ms: 1,
         error: None,
+        outcome: None,
     })
     .unwrap();
     w.flush().unwrap();

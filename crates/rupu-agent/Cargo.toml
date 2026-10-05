@@ -38,6 +38,8 @@ rupu-codename = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused-clock tests (`start_paused`) for the provider retry backoff.
+tokio = { workspace = true, features = ["test-util"] }
 assert_fs.workspace = true
 predicates.workspace = true
 serde_yaml.workspace = true

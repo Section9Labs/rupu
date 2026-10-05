@@ -994,6 +994,8 @@ pub(crate) mod tests {
                     run_outcome: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -1073,6 +1075,7 @@ pub(crate) mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         store.create(record, "").unwrap();
         store
@@ -1096,6 +1099,8 @@ pub(crate) mod tests {
                     run_outcome: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

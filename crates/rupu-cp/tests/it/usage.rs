@@ -143,6 +143,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
     run_store.create(record, "name: wf\n").unwrap();
@@ -168,6 +169,8 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
                 loop_iteration: None,
                 host: None,
                 codename: None,
+                cause: None,
+                error: None,
             },
         )
         .unwrap();
@@ -247,6 +250,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     };
     let transcript_path = dir.path().join("run_priced.jsonl");
     run_store.create(record, "name: wf\n").unwrap();
@@ -302,6 +306,8 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 loop_iteration: None,
                 host: None,
                 codename: None,
+                cause: None,
+                error: None,
             },
         )
         .unwrap();
@@ -626,6 +632,7 @@ fn seed_run_with_usage(
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
     run_store.create(record, "name: wf\n").unwrap();
@@ -658,6 +665,8 @@ fn seed_run_with_usage(
                 loop_iteration: None,
                 host: None,
                 codename: None,
+                cause: None,
+                error: None,
             },
         )
         .unwrap();
@@ -1250,6 +1259,7 @@ fn create_workflow_run(
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        cause: None,
     };
     run_store.create(record, "name: wf-fold\n").unwrap();
     run_store
@@ -1278,6 +1288,8 @@ fn step_result(
         finished_at: chrono::Utc::now(),
         loop_iteration: None,
         host: None,
+        cause: None,
+        error: None,
     }
 }
 

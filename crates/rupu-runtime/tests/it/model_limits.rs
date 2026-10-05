@@ -7,6 +7,7 @@ use rupu_providers::{LlmProvider, ModelCost, ModelInfo, ModelStatus, ProviderErr
 use rupu_runtime::model_limits::{
     resolve, CatalogProvider, LimitOverrides, LimitsContext, RefreshOutcome, UnknownProvider,
 };
+use serial_test::serial;
 
 /// A provider whose `fetch_models` result is scripted and counted.
 struct Fake {
@@ -426,6 +427,7 @@ fn oracle_cfg(base_url: String) -> rupu_config::Config {
 }
 
 #[tokio::test]
+#[serial]
 async fn refresh_writes_the_cache_that_catalog_reads() {
     use httpmock::prelude::*;
     let server = MockServer::start();
@@ -459,6 +461,7 @@ async fn refresh_writes_the_cache_that_catalog_reads() {
 }
 
 #[tokio::test]
+#[serial]
 async fn refresh_reports_a_failing_provider_without_failing_the_call() {
     use httpmock::prelude::*;
     let server = MockServer::start();
@@ -480,6 +483,7 @@ async fn refresh_reports_a_failing_provider_without_failing_the_call() {
 }
 
 #[tokio::test]
+#[serial]
 async fn refresh_and_catalog_reject_an_unknown_provider() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = rupu_config::Config::default();
@@ -738,6 +742,7 @@ impl rupu_auth::CredentialResolver for SlowResolver {
 }
 
 #[tokio::test]
+#[serial]
 async fn refresh_bounds_the_whole_provider_job_not_just_the_fetch() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = rupu_config::Config::default();
@@ -798,6 +803,7 @@ async fn refreshed_oracle(
 }
 
 #[tokio::test]
+#[serial]
 async fn catalog_fills_a_config_models_unset_limits_from_live() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = refreshed_oracle(
@@ -926,6 +932,7 @@ async fn resolve_writes_no_cache_for_an_empty_listing() {
 /// `refresh` reports an empty listing as a failure and leaves the cache file
 /// byte-identical.
 #[tokio::test]
+#[serial]
 async fn refresh_reports_an_empty_listing_and_keeps_the_cache() {
     use httpmock::prelude::*;
     let server = MockServer::start();
@@ -956,6 +963,7 @@ async fn refresh_reports_an_empty_listing_and_keeps_the_cache() {
 /// resolve that seam at the edge). Proved with a dir no derivation would
 /// produce, without touching the process environment.
 #[tokio::test]
+#[serial]
 async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
     use httpmock::prelude::*;
     let server = MockServer::start();
@@ -994,6 +1002,7 @@ async fn refresh_and_catalog_use_the_cache_dir_they_are_given() {
 /// `unfinished`, so a one-shot caller (the CLI, whose runtime would cancel
 /// it on exit) can wait for it; awaiting it completes its cache write.
 #[tokio::test]
+#[serial]
 async fn a_timed_out_refresh_job_comes_back_unfinished_and_completes() {
     use httpmock::prelude::*;
     let server = MockServer::start();
@@ -1038,6 +1047,7 @@ async fn a_timed_out_refresh_job_comes_back_unfinished_and_completes() {
 
 /// A job that finishes in time leaves nothing unfinished.
 #[tokio::test]
+#[serial]
 async fn a_refresh_that_finishes_in_time_leaves_nothing_unfinished() {
     use httpmock::prelude::*;
     let server = MockServer::start();
@@ -1090,6 +1100,7 @@ impl rupu_auth::CredentialResolver for NoCredentials {
 /// not a misleading "missing credential" from a credential lookup that never
 /// needed to run.
 #[tokio::test]
+#[serial]
 async fn refresh_reports_a_local_provider_as_not_wired_without_credentials() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = rupu_config::Config::default();
@@ -1268,6 +1279,7 @@ async fn the_negative_cache_expires_after_5_minutes() {
 /// A manual refresh (`rupu models refresh`, the CP's Refetch) ignores the
 /// marker — the user asked — and clears it on success.
 #[tokio::test]
+#[serial]
 async fn a_manual_refresh_ignores_and_clears_the_marker() {
     use httpmock::prelude::*;
     let server = MockServer::start();

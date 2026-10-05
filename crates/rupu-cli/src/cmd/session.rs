@@ -2864,15 +2864,18 @@ impl SessionInteractiveState {
                     ),
                 );
             }
-            TranscriptEvent::Unknown => {
-                self.push_line(
-                    crate::output::palette::Status::Active,
-                    retained_session_event_line_raw(
-                        crate::output::palette::Status::Active,
-                        "event",
-                        "unrecognized event type (newer rupu wrote this transcript)",
-                    ),
-                );
+            TranscriptEvent::Outcome { .. }
+            | TranscriptEvent::Recovery { .. }
+            | TranscriptEvent::AssistantBlock { .. }
+            | TranscriptEvent::Unknown { .. } => {
+                if let Some((status, label, text)) =
+                    crate::output::outcome_row::outcome_event_row(event)
+                {
+                    self.push_line(
+                        status,
+                        retained_session_event_line_raw(status, label, &text),
+                    );
+                }
             }
         }
     }
@@ -5414,15 +5417,17 @@ fn transcript_event_lines(
                 continuation: false,
             }]
         }
-        TranscriptEvent::Unknown => vec![SessionViewLine {
-            status: Status::Active,
-            text: retained_session_event_line_raw(
-                Status::Active,
-                "event",
-                "unrecognized event type (newer rupu wrote this transcript)",
-            ),
-            continuation: false,
-        }],
+        TranscriptEvent::Outcome { .. }
+        | TranscriptEvent::Recovery { .. }
+        | TranscriptEvent::AssistantBlock { .. }
+        | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
+            .into_iter()
+            .map(|(status, label, text)| SessionViewLine {
+                status,
+                text: retained_session_event_line_raw(status, label, &text),
+                continuation: false,
+            })
+            .collect(),
     }
 }
 
@@ -6905,6 +6910,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         anthropic_prompt_cache: session.anthropic_prompt_cache,
+        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -6967,6 +6973,16 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             println!("nothing to compact: history is too short or already compact");
         }
         Err(e) => {
+            // A rejected summary was still billed: record its spend the same
+            // way a successful compaction's is, then surface the reason.
+            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+                record_offline_compaction_usage(
+                    latest_transcript.as_deref(),
+                    &session.provider_name,
+                    &session.model,
+                    usage,
+                );
+            }
             anyhow::bail!("compaction failed: {e}");
         }
     }
@@ -7300,6 +7316,7 @@ async fn run_compact_request(
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         anthropic_prompt_cache: session.anthropic_prompt_cache,
+        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7358,6 +7375,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: None,
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7386,6 +7404,7 @@ async fn run_compact_request(
             total_tokens: 0,
             duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
             error: None,
+            outcome: None,
         })?;
         writer.flush()?;
         finalize_compact_run(
@@ -7476,6 +7495,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: None,
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7499,6 +7519,7 @@ async fn run_compact_request(
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: None,
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7514,12 +7535,22 @@ async fn run_compact_request(
         }
         Err(e) => {
             let err_str = e.to_string();
+            // A rejected summary was billed: record it in this pseudo-run's
+            // transcript like a successful compaction's usage.
+            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+                writer.write(&compaction_usage_event(
+                    &session.provider_name,
+                    &session.model,
+                    usage,
+                ))?;
+            }
             writer.write(&TranscriptEvent::RunComplete {
                 run_id: request.run_id.clone(),
                 status: RunStatus::Error,
                 total_tokens: 0,
                 duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
                 error: Some(err_str.clone()),
+                outcome: None,
             })?;
             writer.flush()?;
             finalize_compact_run(
@@ -7595,6 +7626,49 @@ fn finalize_compact_run(
     Ok(())
 }
 
+/// The fallback chain a session turn runs with. The session record keeps the
+/// agent's prompt, tools and pins but not its `fallbacks:`, so each turn
+/// re-reads the agent file from the same agent dirs `rupu session start`
+/// loaded it from. An agent that no longer loads (renamed, deleted, broken
+/// frontmatter) yields `None`, and the turn uses the `[recovery].fallbacks`
+/// table, the same as an agent that declares no chain.
+fn session_agent_fallbacks(
+    global: &Path,
+    session: &SessionRecord,
+) -> Option<Vec<rupu_config::FallbackEntry>> {
+    let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
+    match load_agent(
+        global,
+        project_agents_parent.as_deref(),
+        &session.agent_name,
+    ) {
+        Ok(spec) => spec.fallbacks,
+        Err(e) => {
+            // Loading one agent parses every file in the agent dirs, so a
+            // broken file that is NOT this agent's also lands here: name the
+            // file, not only the agent.
+            let cause = match &e {
+                rupu_agent::AgentLoadError::Parse { path, .. }
+                | rupu_agent::AgentLoadError::Io { path, .. } => format!(
+                    "agent file {path} in the agent dirs did not load (it need not be this \
+                     agent's own file)"
+                ),
+                rupu_agent::AgentLoadError::NotFound(_) => {
+                    "no agent by this name in the agent dirs".to_string()
+                }
+            };
+            tracing::warn!(
+                agent = %session.agent_name,
+                global_agents = %global.join("agents").display(),
+                project_agents = ?project_agents_parent.as_ref().map(|p| p.join("agents")),
+                error = %e,
+                "{cause}; the turn uses the [recovery].fallbacks table"
+            );
+            None
+        }
+    }
+}
+
 async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // See `run_worker`: `log_level` is the `RUPU_LOG` fallback (I-14).
     let turn_cfg = crate::cmd::update::load_cli_config();
@@ -7609,7 +7683,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = crate::accounts::resolver_for(&cfg);
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -7639,12 +7713,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // this turn's sink had buffered — including a `Dropped` accounting
     // line, which has no other way to reach disk — stays unflushed.
     let body_result: anyhow::Result<()> = async move {
-        let scm_registry =
-            Arc::new(rupu_scm::Registry::discover(&resolver, &cfg, netflow_sink.clone()).await);
+        let scm_registry = Arc::new(
+            rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
+        );
 
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
             anthropic_prompt_cache: session.anthropic_prompt_cache,
+            anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
             // `openai_compatible` stays `None` here — a separate,
             // pre-existing limitation (the session worker doesn't support
             // custom openai-compatible endpoints), unrelated to kind
@@ -7660,9 +7736,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             &session.provider_name,
             &session.model,
             session.auth_mode,
-            &resolver,
+            resolver.as_ref(),
             &provider_config,
-            netflow_sink,
+            netflow_sink.clone(),
         )
         .await?;
 
@@ -7778,6 +7854,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // stored value with NO known side is a transient first-turn failure
         // (timeout, network blip), not an answer: resolve again — a cache read
         // unless stale — and persist the result below.
+        let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
         let limits = match session.model_limits.clone() {
             // Without its note: a note describes the resolution that wrote
             // it, often relative to that moment ("refresh failed 2m ago"),
@@ -7795,11 +7872,27 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     &session.provider_name,
                     &session.model,
                     provider.as_mut(),
-                    &rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global),
+                    &limits_ctx,
                 )
                 .await
             }
         };
+        let recovery = rupu_runtime::hop_builder::recovery_opts(
+            &cfg.recovery,
+            session_agent_fallbacks(&global, &session).as_deref(),
+            resolver.clone(),
+            cfg.providers.clone(),
+            limits_ctx,
+            netflow_sink,
+            // Exactly what this turn's primary `ProviderConfig` and auth hint
+            // above carry, so a hop keeps the session's settings.
+            rupu_runtime::hop_builder::AgentOverrides {
+                oauth_prefix: session.anthropic_oauth_prefix,
+                prompt_cache: session.anthropic_prompt_cache,
+                auth: session.auth_mode,
+                origin_provider: session.provider_name.clone(),
+            },
+        );
 
         let opts = AgentRunOpts {
             agent_name: session.agent_name.clone(),
@@ -7847,13 +7940,19 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             seed_source,
             collectors: Vec::new(),
             codename: Some(codename.clone()),
+            recovery,
         };
 
-        // `run_agent_with_limits`, not `run_agent`: the run's final limits come
-        // back on an `Err` too, so a limit learned from an overflow (and the
-        // first turn's resolution) is persisted even when the turn then fails
-        // (spec 2026-09-30 §6.5).
-        let (outcome, final_limits) = rupu_agent::run_agent_with_limits(opts).await;
+        // `run_agent_full`, not `run_agent`: the run's final limits come back
+        // on an `Err` too, so a limit learned from an overflow (and the first
+        // turn's resolution) is persisted even when the turn then fails (spec
+        // 2026-09-30 §6.5) — and so does the conversation as it stood, so a
+        // failed turn keeps its prompt and tool work (spec 2026-10-01 §7.3).
+        let rupu_agent::RunExit {
+            result: outcome,
+            final_limits,
+            messages: exit_messages,
+        } = rupu_agent::run_agent_full(opts).await;
         // The turn's cached tokens: the provider-reported total summed over
         // every call (`RunResult.total_tokens_cached`), not the worker's
         // streaming snapshot, which only ever held the last call's figure
@@ -7897,9 +7996,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     run.total_tokens_cached = cached_tokens;
                     run.duration_ms = duration_ms_from_transcript(&transcript_path).unwrap_or(0);
                     duration_ms = run.duration_ms;
+                    if result.status != RunStatus::Ok {
+                        // The run's own words, as `last_error` gets below.
+                        run.error = result.error.clone();
+                    }
                 }
                 Err(err) => {
-                    let error = err.to_string();
+                    let error = failed_turn_error(err);
                     run.status = Some(RunStatus::Error);
                     run.error = Some(error.clone());
                     error_message = Some(error.clone());
@@ -7925,21 +8028,31 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 // at every `Ok(RunResult)` exit (success, max-turns, or a
                 // cooperative pause) immediately before returning, so the
                 // transcript on disk at `transcript_path` and the message
-                // list assigned above are the same snapshot. Safe to record
-                // as the seed source regardless of `result.status`.
+                // list assigned above are the same snapshot — and every block
+                // the runner keeps in its messages is transcribed, including
+                // a server-side `fallback` boundary and blocks rupu does not
+                // model (`assistant_block`, spec 2026-10-01 §5.4). Safe to
+                // record as the seed source regardless of `result.status`.
                 session.history_source_transcript = Some(transcript_path.clone());
                 session.last_error = if result.status == RunStatus::Ok {
                     None
                 } else {
-                    Some(format!(
-                        "turn ended with status {}",
-                        format!("{:?}", result.status).to_lowercase()
-                    ))
+                    // The run's own words (an outcome's title and hint, or
+                    // "max turns (N) reached").
+                    Some(result.error.clone().unwrap_or_else(|| {
+                        format!(
+                            "turn ended with status {}",
+                            format!("{:?}", result.status).to_lowercase()
+                        )
+                    }))
                 };
             }
             Err(err) => {
                 session.status = SessionStatus::Failed;
-                session.last_error = Some(err.to_string());
+                session.last_error = Some(failed_turn_error(&err));
+                // Token and turn totals are unchanged: nothing measures them
+                // here.
+                keep_failed_turn_history(&mut session, &transcript_path, exit_messages);
             }
         }
 
@@ -7971,6 +8084,48 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         handle.shutdown().await;
     }
     body_result
+}
+
+/// Adopt a failed turn's conversation as it stood when the turn failed — its
+/// prompt and any completed tool work (spec 2026-10-01 §7.3).
+///
+/// The turn's own transcript becomes the next turn's seed source only when it
+/// replays to exactly `messages` (a seed source must, or the next turn's
+/// replay fails its hash check); otherwise the reference is cleared and the
+/// next turn seeds inline. An empty conversation is never adopted: a run that
+/// failed before it loaded the session's history (transcript or coverage
+/// setup) hands back none, and adopting it would drop the whole session.
+fn keep_failed_turn_history(
+    session: &mut SessionRecord,
+    transcript: &Path,
+    messages: Vec<Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let replays = rupu_agent::replay::replays_to(transcript, &messages);
+    if !replays {
+        tracing::warn!(
+            transcript = %transcript.display(),
+            "the failed turn's transcript does not replay to its conversation; the next turn seeds inline"
+        );
+    }
+    session.message_history = messages;
+    session.history_source_transcript = replays.then(|| transcript.to_path_buf());
+}
+
+/// A failed turn's `last_error`: the outcome's title ahead of the error
+/// (`title — error`) when the failure is a classified outcome, else the
+/// error; then the rung-3 hint when the ladder ran out on it.
+fn failed_turn_error(err: &rupu_agent::RunError) -> String {
+    let error = match err.outcome() {
+        Some(outcome) => format!("{} — {err}", outcome.title),
+        None => err.to_string(),
+    };
+    match err.hint() {
+        Some(hint) => format!("{error}; {hint}"),
+        None => error,
+    }
 }
 
 fn duration_ms_from_transcript(path: &Path) -> anyhow::Result<u64> {
@@ -9708,7 +9863,40 @@ mod tests {
                 backup_path: "/b".into(),
                 messages: serde_json::json!([]),
             },
-            TranscriptEvent::Unknown,
+            TranscriptEvent::Outcome {
+                turn_idx: 1,
+                outcome: rupu_transcript::OutcomeRecord {
+                    id: "oc_1".into(),
+                    class: "refusal".into(),
+                    severity: rupu_transcript::Severity::Error,
+                    title: "refused · cyber".into(),
+                    detail: Some("Declined for this example.".into()),
+                    error_class: None,
+                    wire: serde_json::Value::Null,
+                },
+            },
+            TranscriptEvent::Recovery {
+                outcome_id: "oc_1".into(),
+                rung: 1,
+                action: rupu_transcript::RecoveryAction::FellBack,
+                attempt: None,
+                budget: None,
+                provider: Some("anthropic".into()),
+                model: Some("claude-opus-4-8".into()),
+                reason: None,
+                merge_into_previous: false,
+                continues_output: false,
+            },
+            TranscriptEvent::AssistantBlock {
+                block: serde_json::json!({
+                    "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+                }),
+                abandoned: false,
+            },
+            TranscriptEvent::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null,
+            },
         ];
         for ev in &cases {
             assert!(
@@ -9716,6 +9904,19 @@ mod tests {
                 "no row for {ev:?} — silent drop"
             );
         }
+        // The rows carry the text an operator needs, not just a placeholder.
+        let rows = |ev: &TranscriptEvent| -> String {
+            transcript_event_lines(ev, LiveViewMode::Compact, &prefs)
+                .iter()
+                .map(|l| l.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let find = |needle: &str| cases.iter().any(|ev| rows(ev).contains(needle));
+        assert!(find("refused · cyber"));
+        assert!(find("fell back to anthropic/claude-opus-4-8"));
+        assert!(find("served by fallback · model-a → model-b"));
+        assert!(find("unrecognized event · future_event"));
         assert!(transcript_event_lines(
             &TranscriptEvent::ThinkingDelta {
                 content: "c".into()
@@ -10488,28 +10689,156 @@ mod tests {
         );
     }
 
-    /// I-1 (transcript fidelity plan 1, whole-branch review): a turn's
-    /// transcript may only ever be referenced as a seed source when
-    /// `message_history` was actually advanced to match it — i.e. only at
-    /// the single successful-turn assignment site. `last_transcript_path`
-    /// is a UX pointer set unconditionally, including on a failed turn
-    /// (whose transcript already recorded a `UserMessage` from the runner
-    /// prologue with no matching assistant reply): deriving `seed_source`
-    /// from it would let a later turn reference that broken, incomplete
-    /// transcript and blow up at replay with a `SeedHashMismatch`.
+    /// A turn a server-side fallback served carries a `fallback` block (and
+    /// may carry blocks rupu does not model) in its assistant message. Both
+    /// are written to the transcript as `assistant_block` events and folded
+    /// back by replay (spec 2026-10-01 §4.5, §5.4), so the turn's transcript
+    /// replays to exactly `message_history`: the next turn seeds from it by
+    /// reference and the seed hash verifies.
+    #[tokio::test]
+    async fn fallback_served_turn_seeds_the_next_turn_by_reference() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_seed_fallback01".into();
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.history_source_transcript = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        record.total_tokens_in = 0;
+        record.total_tokens_out = 0;
+        record.total_tokens_cached = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let transcript_1 = record.transcripts_dir.join("run_seed_fb_1.jsonl");
+        let transcript_2 = record.transcripts_dir.join("run_seed_fb_2.jsonl");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "Reply": {
+                "content": [
+                    { "type": "fallback", "from_model": "model-a", "to_model": "model-b" },
+                    { "type": "unknown", "provider": "anthropic", "raw": { "type": "lantern_note", "glow": 2 } },
+                    { "type": "text", "text": "served answer" }
+                ],
+                "stop": {
+                    "reason": "end_turn",
+                    "wire": { "provider": "anthropic", "value": "end_turn" },
+                    "served_by": { "model": "model-b", "hops": [{ "from_model": "model-a", "to_model": "model-b" }] }
+                }
+            } }]"#,
+        );
+        let turn1 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fb_1".into(),
+            prompt: "first prompt".into(),
+        })
+        .await;
+        turn1.expect("turn 1 completes");
+
+        let (after_turn1, _) =
+            read_session(&global, &record.session_id).expect("read session after turn 1");
+        assert_eq!(after_turn1.status, SessionStatus::Idle, "{after_turn1:?}");
+        assert_eq!(
+            after_turn1.history_source_transcript,
+            Some(transcript_1.clone())
+        );
+        assert!(
+            rupu_agent::replay::replays_to(&transcript_1, &after_turn1.message_history),
+            "the fallback-served turn's transcript replays to its message_history"
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack2", "stop": "end_turn" } }]"#,
+        );
+        let turn2 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fb_2".into(),
+            prompt: "second prompt".into(),
+        })
+        .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        turn2.expect("turn 2 completes");
+
+        let seed_source = JsonlReader::iter(&transcript_2)
+            .expect("open turn 2 transcript")
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript, ..
+                } => Some(source_transcript),
+                _ => None,
+            })
+            .expect("turn 2 has a Seed event");
+        assert_eq!(
+            seed_source,
+            Some(transcript_1.display().to_string()),
+            "turn 2 seeds from turn 1 by reference"
+        );
+        // The seed hash verifies: replay resolves the chain.
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_2)
+            .expect("turn 2 reconstructs via the seed chain");
+        assert_eq!(full.len(), 4, "{full:?}");
+        assert_eq!(
+            full[1].content,
+            vec![
+                rupu_providers::types::ContentBlock::Fallback {
+                    from_model: "model-a".into(),
+                    to_model: "model-b".into(),
+                },
+                rupu_providers::types::ContentBlock::Unknown {
+                    provider: Some("anthropic".into()),
+                    raw: serde_json::json!({ "type": "lantern_note", "glow": 2 }),
+                },
+                rupu_providers::types::ContentBlock::Text {
+                    text: "served answer".into(),
+                },
+            ]
+        );
+    }
+
+    /// A failed turn keeps its prompt and any completed tool work (spec
+    /// 2026-10-01 response-outcomes §7.3): `message_history` becomes the
+    /// conversation as it stood when the turn failed (`RunExit.messages`),
+    /// and the turn's own transcript — which replays to exactly that — is
+    /// the next turn's seed source.
     ///
-    /// Drives three real turns through `run_turn`: turn 1 succeeds
-    /// (establishing a genuinely valid, still-replayable transcript), turn
-    /// 2 fails outright (`ProviderError`, scripted via the same
-    /// `RUPU_MOCK_PROVIDER_SCRIPT` seam used for the happy-path test above),
-    /// and turn 3 succeeds again. Because `history_source_transcript` is
-    /// only ever mutated at the one successful-assignment site, turn 2's
-    /// failure leaves it exactly as turn 1 left it — so turn 3 correctly
-    /// keeps referencing turn 1's transcript (the reference is still
-    /// perfectly valid; there is no reason to fall back to an inline
-    /// embed). What the fix actually prevents is turn 3 referencing turn
-    /// 2's transcript instead — which is exactly what `last_transcript_path`
-    /// would point to, and exactly what reproduces the corruption.
+    /// The I-1 hazard (transcript fidelity plan 1) still holds the other way
+    /// round: a seed source must replay to `message_history` byte-exact, or
+    /// the next turn's replay fails with a `SeedHashMismatch`. Drives three
+    /// real turns through `run_turn`: turn 1 succeeds, turn 2 fails outright
+    /// (`ProviderError`, scripted via `RUPU_MOCK_PROVIDER_SCRIPT`), turn 3
+    /// succeeds. Turn 3 references turn 2's transcript, and replay rebuilds
+    /// all three prompts — turn 2's included — with no hash mismatch.
     #[tokio::test]
     async fn failed_turn_does_not_poison_next_turns_seed_chain() {
         let _guard = crate::test_support::ENV_LOCK.lock().await;
@@ -10589,14 +10918,41 @@ mod tests {
             "turn 2 must be recorded as failed: {after_turn2:?}"
         );
         assert_eq!(
-            after_turn2.message_history.len(),
-            2,
-            "a failed turn must never advance message_history"
+            serde_json::to_value(&after_turn2.message_history).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("first prompt"),
+                Message::assistant("ack"),
+                Message::user("second prompt"),
+            ])
+            .unwrap(),
+            "a failed turn keeps its prompt in message_history"
         );
         assert_eq!(
             after_turn2.history_source_transcript,
-            Some(transcript_1.clone()),
-            "a failed turn must never touch history_source_transcript"
+            Some(transcript_2.clone()),
+            "a failed turn's own transcript replays to its message_history"
+        );
+        assert!(
+            after_turn2
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("boom") && e.contains("send another message")),
+            "{:?}",
+            after_turn2.last_error
+        );
+        let turn_2_seed = JsonlReader::iter(&transcript_2)
+            .expect("open turn 2 transcript")
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript, ..
+                } => source_transcript,
+                _ => None,
+            });
+        assert_eq!(
+            turn_2_seed,
+            Some(transcript_1.display().to_string()),
+            "turn 2 seeds from turn 1"
         );
 
         std::env::set_var(
@@ -10643,38 +10999,174 @@ mod tests {
             .expect("turn 3 transcript must contain a Seed event");
         assert_eq!(
             source_transcript,
-            Some(transcript_1.display().to_string()),
-            "turn 3 must reference turn 1's still-valid transcript — NEVER turn 2's, which is \
-             what `last_transcript_path` (unconditionally promoted on every turn, including \
-             failures) would incorrectly point to"
-        );
-        assert_ne!(
-            source_transcript,
             Some(transcript_2.display().to_string()),
-            "turn 3 must never reference the failed turn's own transcript"
+            "turn 3 seeds from the failed turn's transcript"
         );
         assert!(
             messages.is_none(),
             "a referenced seed must not also carry an inline copy of the messages"
         );
 
-        // End-to-end: replay must succeed (no SeedHashMismatch) and must
-        // reproduce exactly turn 1 + turn 3's conversation — turn 2's
-        // orphaned "second prompt" (recorded in transcript_2 but never
-        // folded into message_history) must not leak in.
+        // End-to-end: replay must succeed (no SeedHashMismatch) across
+        // turn 3 -> turn 2 -> turn 1. Turn 2's prompt was never answered, so
+        // turn 3's prompt joins that trailing user turn.
         let full = rupu_agent::replay::reconstruct_transcript(&transcript_3)
             .expect("turn 3 transcript reconstructs cleanly via the seed chain");
+        let mut unanswered = Message::user("second prompt");
+        unanswered
+            .content
+            .push(rupu_providers::types::ContentBlock::Text {
+                text: "third prompt".to_string(),
+            });
         assert_eq!(
             serde_json::to_value(&full).unwrap(),
             serde_json::to_value(vec![
                 Message::user("first prompt"),
                 Message::assistant("ack"),
-                Message::user("third prompt"),
+                unanswered,
                 Message::assistant("ack3"),
             ])
             .unwrap(),
-            "replay must skip turn 2 entirely — it never joined message_history"
+            "replay keeps turn 2's prompt — it joined message_history"
         );
+    }
+
+    /// A turn that failed before it loaded the session's history hands back
+    /// no conversation: the session's history is left as the last good turn
+    /// left it.
+    #[test]
+    fn a_turn_that_failed_during_setup_leaves_the_history_alone() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let earlier = tmp.path().join("earlier.jsonl");
+        let mut session = test_session_record();
+        session.message_history = vec![Message::user("first"), Message::assistant("ack")];
+        session.history_source_transcript = Some(earlier.clone());
+
+        let empty = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty, "").expect("write empty transcript");
+        keep_failed_turn_history(&mut session, &empty, Vec::new());
+
+        assert_eq!(session.message_history.len(), 2);
+        assert_eq!(session.history_source_transcript, Some(earlier));
+    }
+
+    /// A failed turn whose transcript does not replay to its conversation
+    /// still keeps the conversation (its prompt); only the seed reference is
+    /// dropped, so the next turn seeds inline.
+    #[test]
+    fn a_failed_turn_that_does_not_replay_keeps_its_prompt_and_seeds_inline() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let mut session = test_session_record();
+        session.message_history = vec![Message::user("first"), Message::assistant("ack")];
+        session.history_source_transcript = Some(tmp.path().join("earlier.jsonl"));
+
+        let empty = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty, "").expect("write empty transcript");
+        let failed = vec![
+            Message::user("first"),
+            Message::assistant("ack"),
+            Message::user("second"),
+        ];
+        keep_failed_turn_history(&mut session, &empty, failed.clone());
+
+        assert_eq!(
+            serde_json::to_value(&session.message_history).unwrap(),
+            serde_json::to_value(&failed).unwrap()
+        );
+        assert_eq!(session.history_source_transcript, None);
+    }
+
+    /// A turn refused with no fallback chain ends `Failed`; its prompt stays
+    /// in `message_history` and `last_error` is the outcome's own words, not
+    /// "turn ended with status error".
+    #[tokio::test]
+    async fn a_refused_turn_keeps_its_prompt_and_names_the_refusal() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_refused01".into();
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.history_source_transcript = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        // The entry `session send` records before the worker runs the turn.
+        record.runs = vec![SessionRunRecord {
+            run_id: "run_refused_1".into(),
+            prompt: "do the thing".into(),
+            transcript_path: record.transcripts_dir.join("run_refused_1.jsonl"),
+            started_at: Utc::now(),
+            completed_at: None,
+            status: None,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            total_tokens_cached: 0,
+            duration_ms: 0,
+            pid: None,
+            error: None,
+        }];
+        record.total_turns = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "Reply": {
+                "content": [{ "type": "text", "text": "I won't do that." }],
+                "stop": { "reason": "refusal", "wire": { "provider": "anthropic", "value": "refusal" } }
+            } }]"#,
+        );
+        let turn = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_refused_1".into(),
+            prompt: "do the thing".into(),
+        })
+        .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        turn.expect("a refused turn is recorded, not propagated");
+
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(after.status, SessionStatus::Failed, "{after:?}");
+        assert_eq!(
+            serde_json::to_value(&after.message_history).unwrap(),
+            serde_json::to_value(vec![Message::user("do the thing")]).unwrap(),
+            "the refused reply is discarded; the prompt survives"
+        );
+        let last_error = after.last_error.clone().unwrap_or_default();
+        assert!(last_error.starts_with("refused"), "{last_error}");
+        // A session's rung 3 is the next message, not a `rupu run`.
+        assert!(!last_error.contains("rupu run"), "{last_error}");
+        assert!(last_error.contains("send another message"), "{last_error}");
+        let run = after
+            .runs
+            .iter()
+            .find(|r| r.run_id == "run_refused_1")
+            .expect("the turn's run entry");
+        assert_eq!(run.status, Some(RunStatus::Error));
+        assert_eq!(run.error.as_deref(), Some(last_error.as_str()));
     }
 
     fn usage_event(input: u32, output: u32, purpose: Option<&str>) -> TranscriptEvent {
@@ -10782,6 +11274,9 @@ mod tests {
 
     const SUMMARY_SCRIPT: &str = r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#;
 
+    /// A summariser that refuses: billed, but its answer is rejected.
+    const REFUSED_SUMMARY_SCRIPT: &str = r#"[{ "AssistantText": { "text": "I cannot help.", "stop": "refusal", "input_tokens": 500, "output_tokens": 10 } }]"#;
+
     /// Ruling (Task 3 review): the compaction summariser's `Usage` event
     /// carries the WHOLE history as input — calibrating the next manual
     /// `session compact` against it would size the recent budget wrong.
@@ -10875,6 +11370,7 @@ mod tests {
                     total_tokens: 6_050,
                     duration_ms: 10,
                     error: None,
+                    outcome: None,
                 },
             ],
         );
@@ -10896,6 +11392,117 @@ mod tests {
         );
         // The appended event never mis-calibrates the next compaction.
         assert_eq!(last_turn_input_tokens(&last), Some(6_000));
+    }
+
+    /// A rejected (refused) summary was still billed: the offline compact
+    /// records its spend like a successful one's, leaves the history alone,
+    /// and fails with the rejection reason.
+    #[tokio::test]
+    async fn manual_compact_records_the_spend_of_a_rejected_summary() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_reject1");
+        let last = record.transcripts_dir.join("run_prev.jsonl");
+        write_events(
+            &last,
+            &[
+                TranscriptEvent::RunStart {
+                    codename: None,
+                    run_id: "run_prev".into(),
+                    workspace_id: "ws_test".into(),
+                    agent: "issue-reader".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    started_at: Utc::now(),
+                    mode: RunMode::Bypass,
+                    schema: None,
+                    system_prompt: None,
+                },
+                usage_event(6_000, 50, None),
+                TranscriptEvent::RunComplete {
+                    run_id: "run_prev".into(),
+                    status: RunStatus::Ok,
+                    total_tokens: 6_050,
+                    duration_ms: 10,
+                    error: None,
+                    outcome: None,
+                },
+            ],
+        );
+        record.last_run_id = Some("run_prev".into());
+        record.last_transcript_path = Some(last.clone());
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let history_len = record.message_history.len();
+
+        let err = with_mock_home(
+            &global,
+            REFUSED_SUMMARY_SCRIPT,
+            compact(&record.session_id, Some(1000)),
+        )
+        .await
+        .expect_err("a refused summary fails the compaction");
+        assert!(
+            err.to_string()
+                .contains("compaction summary rejected: refused"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            compaction_usage(&last),
+            vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
+        );
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(
+            after.message_history.len(),
+            history_len,
+            "history untouched"
+        );
+    }
+
+    /// Same for the worker's compact pseudo-run: the rejected summary's spend
+    /// lands in its own transcript, and the run ends in error with the reason.
+    #[tokio::test]
+    async fn compact_pseudo_run_records_the_spend_of_a_rejected_summary() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_reject2");
+        record.context_window_tokens = Some(1000);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let request = SessionTurnRequest {
+            version: SessionTurnRequest::VERSION,
+            request_id: "req_1".into(),
+            run_id: "run_compact02".into(),
+            prompt: "[compact]".into(),
+            transcript_path: record.transcripts_dir.join("run_compact02.jsonl"),
+            enqueued_at: Utc::now(),
+            compact: true,
+        };
+
+        with_mock_home(
+            &global,
+            REFUSED_SUMMARY_SCRIPT,
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request),
+        )
+        .await
+        .expect("the pseudo-run finishes even though the summary is rejected");
+
+        assert_eq!(
+            compaction_usage(&request.transcript_path),
+            vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
+        );
+        let failed = JsonlReader::iter(&request.transcript_path)
+            .expect("open transcript")
+            .filter_map(Result::ok)
+            .any(|e| match e {
+                TranscriptEvent::RunComplete { status, error, .. } => {
+                    status == RunStatus::Error
+                        && error
+                            .as_deref()
+                            .is_some_and(|m| m.contains("compaction summary rejected: refused"))
+                }
+                _ => false,
+            });
+        assert!(failed, "RunComplete carries the rejection reason");
     }
 
     /// Ruling (Task 3 review): the worker's compact pseudo-run writes its

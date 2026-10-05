@@ -1413,6 +1413,7 @@ mod tests {
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
                     codename: None,
+                    cause: None,
                 },
                 "name: demo\nsteps: []\n",
             )
@@ -1503,6 +1504,7 @@ mod tests {
                 total_tokens: 100,
                 duration_ms: 1000,
                 error: None,
+                outcome: None,
             })
             .unwrap();
         writer.flush().unwrap();
@@ -1528,6 +1530,8 @@ mod tests {
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

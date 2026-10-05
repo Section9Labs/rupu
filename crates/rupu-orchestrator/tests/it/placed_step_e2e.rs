@@ -86,6 +86,7 @@ impl StepFactory for FakeFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }

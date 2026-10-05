@@ -12,6 +12,8 @@ fn writes_events_one_per_line() {
         tokens_out: Some(20),
         stop_reason: None,
         response_id: None,
+        discarded: false,
+        stop: None,
     })
     .unwrap();
     w.flush().unwrap();
@@ -38,6 +40,8 @@ fn append_extends_existing_file() {
             tokens_out: Some(1),
             stop_reason: None,
             response_id: None,
+            discarded: false,
+            stop: None,
         })
         .unwrap();
     }
@@ -55,6 +59,7 @@ fn each_line_is_valid_json() {
         total_tokens: 0,
         duration_ms: 0,
         error: None,
+        outcome: None,
     })
     .unwrap();
     let content = std::fs::read_to_string(f.path()).unwrap();

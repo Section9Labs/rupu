@@ -143,6 +143,7 @@ impl StepFactory for Factory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }

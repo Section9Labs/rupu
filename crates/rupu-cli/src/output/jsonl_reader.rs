@@ -335,6 +335,8 @@ mod tests {
             tokens_out: None,
             stop_reason: None,
             response_id: None,
+            discarded: false,
+            stop: None,
         };
 
         let mut f = std::fs::File::create(&path).unwrap();
@@ -391,6 +393,8 @@ mod tests {
                 tokens_out: None,
                 stop_reason: None,
                 response_id: None,
+                discarded: false,
+                stop: None,
             },
         ];
 

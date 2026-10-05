@@ -124,6 +124,12 @@ function stepSubPaths(id: string, kind: StepKind): ExprEntry[] {
     { insert: `steps.${id}.output`, label: `steps.${id}.output`, detail: 'step output (text)', kind: 'path' },
     { insert: `steps.${id}.success`, label: `steps.${id}.success`, detail: 'step succeeded (bool)', kind: 'path' },
     { insert: `steps.${id}.skipped`, label: `steps.${id}.skipped`, detail: 'step was skipped (bool)', kind: 'path' },
+    {
+      insert: `steps.${id}.error`,
+      label: `steps.${id}.error`,
+      detail: 'why a tolerated step failed (empty on success)',
+      kind: 'path',
+    },
   ];
   if (kind === 'for_each' || kind === 'parallel') {
     out.push({
@@ -219,6 +225,12 @@ export function expressionReference(): { group: string; entries: ExprEntry[] }[]
         { insert: 'steps.<id>.output', label: 'steps.<id>.output', detail: 'step output (text)', kind: 'path' },
         { insert: 'steps.<id>.success', label: 'steps.<id>.success', detail: 'step succeeded (bool)', kind: 'path' },
         { insert: 'steps.<id>.skipped', label: 'steps.<id>.skipped', detail: 'step was skipped (bool)', kind: 'path' },
+        {
+          insert: 'steps.<id>.error',
+          label: 'steps.<id>.error',
+          detail: 'why a tolerated step failed (empty on success)',
+          kind: 'path',
+        },
         {
           insert: 'steps.<id>.results',
           label: 'steps.<id>.results',

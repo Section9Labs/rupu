@@ -75,6 +75,7 @@ fn write_usage_transcript(
             total_tokens: (input_tokens + output_tokens) as u64,
             duration_ms: 100,
             error: None,
+            outcome: None,
         })
         .unwrap();
     writer.flush().unwrap();
@@ -160,6 +161,7 @@ fn sample_run_record(
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     }
 }
 
@@ -228,6 +230,8 @@ fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord 
         loop_iteration: None,
         host: None,
         codename: None,
+        cause: None,
+        error: None,
     }
 }
 

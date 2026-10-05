@@ -2110,6 +2110,7 @@ const STEP_OUTPUT_FIELDS: &[&str] = &[
     "iterations",
     "resolved",
     "decision",
+    "error",
     // `run:` step fields (Bench Plan 0)
     "json",
     "stdout",

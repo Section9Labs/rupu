@@ -94,6 +94,7 @@ fn build_opts(
         scope_name: None,
         surface_tag: None,
         pause: None,
+        recovery: Default::default(),
     }
 }
 

@@ -155,8 +155,13 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
 /// `Unknown` blocks are dropped too: they serialize as `{"type":"unknown"}`,
 /// which no provider accepts. A `Fallback` block is rewritten into Anthropic's
 /// own `{"type":"fallback","from":{"model":…},"to":{"model":…}}` shape and
-/// echoed in place.
-fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
+/// echoed in place — only when `echo_fallback`, i.e. this request itself
+/// carries the server-side fallback opt-in (beta + `"fallbacks"`). A request
+/// without it (an OAuth client, an API-key model outside the supported set,
+/// the opt-in switched off or refused) drops the block on the wire: the API
+/// does not accept it there. The echo rule's pre-boundary drops apply either
+/// way.
+fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str, echo_fallback: bool) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
     };
@@ -209,8 +214,55 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
                 _ => restored.push(block.clone()),
             }
         }
+        // Echo rule (spec section 4.5): reasoning and tool calls from before
+        // the last fallback belong to the model that was swapped out; only the
+        // blocks from the fallback on are valid to echo. Text stays.
+        //
+        // The agent runner applies the same rule per RESPONSE (it never
+        // dispatches or keeps those blocks); this applies it per stored
+        // MESSAGE. They agree except when one assistant message holds several
+        // responses — a `pause_turn` merge chain — and a later response
+        // carries a fallback: then this also drops the earlier response's
+        // reasoning, which the runner kept. Runtime and replay messages still
+        // agree; only the wire differs. Unreachable today: a pause needs
+        // server tools, which rupu does not send.
+        let last_fallback = restored
+            .iter()
+            .rposition(|b| b.get("type").and_then(|v| v.as_str()) == Some("fallback"));
+        if let Some(boundary) = last_fallback {
+            let mut index = 0;
+            restored.retain(|b| {
+                let keep = index >= boundary
+                    || !matches!(
+                        b.get("type").and_then(|v| v.as_str()),
+                        Some("thinking" | "redacted_thinking" | "tool_use")
+                    );
+                index += 1;
+                keep
+            });
+        }
+        if !echo_fallback {
+            restored.retain(|b| b.get("type").and_then(|v| v.as_str()) != Some("fallback"));
+        }
         *blocks = restored;
     }
+}
+
+/// The `anthropic-beta` flag for server-side fallback.
+const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+
+/// Models that accept the server-side fallback opt-in. Matched on the model id
+/// with the client-side `[1m]` suffix stripped; the set is exact, so a newer
+/// model is added here deliberately.
+pub(crate) fn supports_server_side_fallback(model: &str) -> bool {
+    matches!(
+        crate::model_registry::strip_1m(model),
+        "claude-fable-5"
+            | "claude-fable-5-1"
+            | "claude-opus-5"
+            | "claude-opus-5-5"
+            | "claude-sonnet-5-5"
+    )
 }
 
 /// After `restore_reasoning_blocks`, a stored message can be left with no
@@ -1047,6 +1099,14 @@ pub struct AnthropicClient {
     /// extra-usage 429: the account has no entitlement, so the beta is never
     /// sent again by this client (the run falls back to the standard window).
     long_context_disabled: bool,
+    /// Opt API-key requests for supported models into Anthropic's
+    /// server-side fallback (`"fallbacks": "default"` + beta). Off on a bare
+    /// client; the provider factory turns it on (see `with_server_side_fallback`).
+    server_side_fallback: bool,
+    /// Set once a request carrying the fallback opt-in was refused with a 400
+    /// naming `fallbacks`: this account or gateway does not accept it, so the
+    /// opt-in is never sent again by this client.
+    server_side_fallback_disabled: bool,
     /// The OAuth token endpoint ([`ANTHROPIC_TOKEN_URL`]; tests point it at
     /// a mock).
     token_url: String,
@@ -1081,6 +1141,8 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            server_side_fallback: false,
+            server_side_fallback_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
             oauth_refresher: None,
@@ -1167,6 +1229,16 @@ impl AnthropicClient {
         self
     }
 
+    /// Server-side fallback opt-in (default OFF on a bare client; the
+    /// provider factory passes `[providers.anthropic]`'s setting, default
+    /// ON). Only API-key requests for [`supports_server_side_fallback`]
+    /// models carry it — never OAuth — and a 400 naming `fallbacks` turns it
+    /// off for the rest of this client's life.
+    pub fn with_server_side_fallback(mut self, enabled: bool) -> Self {
+        self.server_side_fallback = enabled;
+        self
+    }
+
     /// Create a client with an auth.json path for persisting refreshed tokens.
     ///
     /// `sink` is the run's netflow sink; there is no process-global
@@ -1190,6 +1262,8 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            server_side_fallback: false,
+            server_side_fallback_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
             oauth_refresher: None,
@@ -1219,6 +1293,8 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            server_side_fallback: false,
+            server_side_fallback_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
             oauth_refresher: None,
@@ -1262,6 +1338,8 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            server_side_fallback: false,
+            server_side_fallback_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
             oauth_refresher: None,
@@ -1293,6 +1371,8 @@ impl AnthropicClient {
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
             long_context_disabled: false,
+            server_side_fallback: false,
+            server_side_fallback_disabled: false,
             token_url: ANTHROPIC_TOKEN_URL.to_string(),
             pending_refresh: None,
             oauth_refresher: None,
@@ -1390,6 +1470,43 @@ impl AnthropicClient {
         }
     }
 
+    /// Whether a request for `model` goes out with the server-side fallback
+    /// opt-in: enabled on the client, not refused earlier, API-key auth, and a
+    /// model in the supported set.
+    fn sends_server_side_fallback(&self, model: &str) -> bool {
+        self.server_side_fallback
+            && !self.server_side_fallback_disabled
+            && matches!(self.auth, AuthMethod::ApiKey(_))
+            && supports_server_side_fallback(model)
+    }
+
+    /// The error for a non-success response. A 400 naming `fallbacks` on a
+    /// request that carried the opt-in means this account or gateway refuses
+    /// it: stop sending it for the rest of this client's life and report
+    /// [`ProviderError::FallbackUnavailable`] for the runner to retry on.
+    /// Anything else is the plain API error.
+    fn non_success_error(
+        &mut self,
+        request: &LlmRequest,
+        status: u16,
+        headers: &reqwest::header::HeaderMap,
+        body: String,
+    ) -> ProviderError {
+        if status == 400
+            && self.sends_server_side_fallback(&request.model)
+            && body.contains("fallbacks")
+        {
+            warn!(
+                model = request.model.as_str(),
+                "400 naming `fallbacks`; disabling server-side fallback"
+            );
+            self.server_side_fallback_disabled = true;
+            ProviderError::FallbackUnavailable { message: body }
+        } else {
+            crate::error::api_error_from_response("anthropic", status, headers, &body)
+        }
+    }
+
     /// The error for a 429 that refuses long context ("Extra usage is
     /// required for long context requests"). It is triggered by the 1M beta,
     /// not by the request's size, so when this request carried the beta the
@@ -1468,8 +1585,17 @@ impl AnthropicClient {
                 // `context-1m-2025-08-07` beta. OAuth path always sends
                 // it via the static beta CSV; the api-key path opts in
                 // per-request based on `LlmRequest.context_window`.
+                // Server-side fallback adds its own beta; the header is a
+                // CSV of whichever apply and is absent when none do.
+                let mut betas: Vec<&str> = Vec::new();
                 if self.sends_1m_beta(model, context_window) {
-                    b = b.header("anthropic-beta", "context-1m-2025-08-07");
+                    betas.push("context-1m-2025-08-07");
+                }
+                if self.sends_server_side_fallback(model) {
+                    betas.push(SERVER_SIDE_FALLBACK_BETA);
+                }
+                if !betas.is_empty() {
+                    b = b.header("anthropic-beta", betas.join(","));
                 }
                 b
             }
@@ -1824,12 +1950,7 @@ impl AnthropicClient {
             }
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
-                return Err(crate::error::api_error_from_response(
-                    "anthropic",
-                    status.as_u16(),
-                    &headers,
-                    &text,
-                ));
+                return Err(self.non_success_error(request, status.as_u16(), &headers, text));
             }
 
             let api_response: AnthropicResponse = response.json().await?;
@@ -1995,11 +2116,11 @@ impl AnthropicClient {
                         let bytes_in = text.len() as u64;
                         flow_guard.add_bytes(bytes_in);
                         flow_guard.complete().await;
-                        return Err(crate::error::api_error_from_response(
-                            "anthropic",
+                        return Err(self.non_success_error(
+                            request,
                             status.as_u16(),
                             &headers,
-                            &text,
+                            text,
                         ));
                     }
                     winner = Some((resp, permit, flow_guard));
@@ -2103,7 +2224,11 @@ impl AnthropicClient {
         // Must run after `sanitize_messages_tool_names`: restoring reasoning
         // blocks last guarantees `raw` is echoed byte-exact and is never
         // touched by the tool-name sanitizer's block-rewriting pass.
-        restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
+        restore_reasoning_blocks(
+            &mut messages_value,
+            PROVIDER_TAG,
+            self.sends_server_side_fallback(&request.model),
+        );
         drop_emptied_messages(&mut messages_value);
 
         let max_tokens = request
@@ -2337,6 +2462,12 @@ impl AnthropicClient {
                 crate::types::Speed::Fast => "fast",
             };
             body["speed"] = serde_json::Value::String(speed_str.to_string());
+        }
+
+        // Server-side fallback opt-in: the beta header is added in
+        // `apply_auth_headers` under the same predicate.
+        if self.sends_server_side_fallback(&request.model) {
+            body["fallbacks"] = serde_json::Value::String("default".to_string());
         }
 
         // Must stay LAST: it marks the final shape of `system` / `tools` /
@@ -4009,8 +4140,9 @@ mod tests {
     #[test]
     fn fallback_block_is_echoed_in_wire_shape() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
-            .with_prompt_cache(false);
-        let request = request_with_assistant_blocks(vec![
+            .with_prompt_cache(false)
+            .with_server_side_fallback(true);
+        let mut request = request_with_assistant_blocks(vec![
             ContentBlock::Fallback {
                 from_model: "a".into(),
                 to_model: "b".into(),
@@ -4019,12 +4151,59 @@ mod tests {
                 text: "the answer".into(),
             },
         ]);
+        // A request that itself carries the server-side fallback opt-in.
+        request.model = "claude-opus-5-5".into();
         let body = client.build_request_body(&request, false);
+        assert_eq!(body["fallbacks"], "default");
         assert_eq!(
             body["messages"][1]["content"][0],
             serde_json::json!({"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}})
         );
         assert_eq!(body["messages"][1]["content"][1]["type"], "text");
+    }
+
+    /// A request without the server-side fallback opt-in drops a stored
+    /// `fallback` block on the wire (the API accepts it only alongside the
+    /// beta), and still applies the echo rule's pre-boundary drops. OAuth
+    /// never opts in — e.g. a rupu-level hop onto an OAuth Anthropic provider,
+    /// or a `--continue` onto one.
+    #[test]
+    fn fallback_block_is_dropped_without_the_server_side_fallback_opt_in() {
+        let blocks = vec![
+            ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::Text { text: "a".into() },
+            ContentBlock::Fallback {
+                from_model: "x".into(),
+                to_model: "y".into(),
+            },
+            ContentBlock::Text { text: "b".into() },
+        ];
+        let expected = serde_json::json!([
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+        ]);
+        let mut request = request_with_assistant_blocks(blocks);
+        request.model = "claude-opus-5-5".into();
+
+        let oauth = oauth_client()
+            .with_prompt_cache(false)
+            .with_server_side_fallback(true);
+        let body = oauth.build_request_body(&request, false);
+        assert!(body.get("fallbacks").is_none());
+        assert!(!build_oauth_beta_csv(&request.model, false).contains(SERVER_SIDE_FALLBACK_BETA));
+        assert_eq!(body["messages"][1]["content"], expected);
+
+        // API key with the switch off: no opt-in, so no echo either.
+        let api_key = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false)
+            .with_server_side_fallback(false);
+        let body = api_key.build_request_body(&request, false);
+        assert!(body.get("fallbacks").is_none());
+        assert_eq!(body["messages"][1]["content"], expected);
     }
 
     #[test]
@@ -6351,6 +6530,233 @@ mod tests {
         without.assert_hits(1);
     }
 
+    // ── Server-side fallback (response-outcomes plan 2, task 4) ──────────
+
+    const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+
+    fn fallback_request(model: &str) -> LlmRequest {
+        let mut request = make_request(None);
+        request.model = model.into();
+        request
+    }
+
+    #[tokio::test]
+    async fn server_side_fallback_body_and_beta_on_api_key_for_supported_models() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("anthropic-beta", FALLBACK_BETA)
+                .json_body_partial(r#"{"fallbacks":"default"}"#);
+            then.status(400).body("stop here");
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_server_side_fallback(true);
+        let _ = client.send(&fallback_request("claude-opus-5-5")).await;
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn server_side_fallback_omitted_for_unsupported_model_oauth_and_when_off() {
+        use httpmock::prelude::*;
+        // Unsupported model and the explicit off switch: nothing on the wire.
+        for (model, enabled) in [("claude-haiku-4-5", true), ("claude-opus-5-5", false)] {
+            let server = MockServer::start();
+            let m = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .matches(no_beta_header);
+                then.status(400).body("stop here");
+            });
+            let mut client = AnthropicClient::with_url(
+                "sk-ant-test".into(),
+                format!("{}/v1/messages", server.url("")),
+                Arc::new(rupu_netflow::NullSink),
+            )
+            .with_server_side_fallback(enabled);
+            let request = fallback_request(model);
+            let body = client.build_request_body(&request, false);
+            assert!(body.get("fallbacks").is_none(), "{model} enabled={enabled}");
+            let _ = client.send(&request).await;
+            m.assert_hits(1);
+        }
+        // OAuth: never, even for a supported model with the switch on.
+        let client = AnthropicClient::from_auth(
+            AuthMethod::OAuth {
+                access_token: "tok".into(),
+                refresh_token: "r".into(),
+                expires_ms: u64::MAX,
+            },
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_server_side_fallback(true);
+        let body = client.build_request_body(&fallback_request("claude-opus-5-5"), false);
+        assert!(body.get("fallbacks").is_none());
+    }
+
+    #[test]
+    fn supported_model_set_is_exact_and_ignores_the_1m_suffix() {
+        for m in [
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5[1m]",
+        ] {
+            assert!(supports_server_side_fallback(m), "{m}");
+        }
+        for m in ["claude-opus-5-6", "claude-opus-4-7", "claude-haiku-4-5", ""] {
+            assert!(!supports_server_side_fallback(m), "{m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn beta_csv_combines_1m_and_fallback() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages").header(
+                "anthropic-beta",
+                "context-1m-2025-08-07,server-side-fallback-2026-07-01",
+            );
+            then.status(400).body("stop here");
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_server_side_fallback(true);
+        let mut request = fallback_request("claude-sonnet-5-5");
+        request.context_window = Some(crate::model_tier::ContextWindow::OneMillion);
+        let _ = client.send(&request).await;
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn a_400_naming_fallbacks_disables_it_for_the_client() {
+        use httpmock::prelude::*;
+        for streamed in [false, true] {
+            let server = MockServer::start();
+            let refused = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .header("anthropic-beta", FALLBACK_BETA);
+                then.status(400).body(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"fallbacks: not enabled for this organization"}}"#,
+                );
+            });
+            let without = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/messages")
+                    .matches(no_beta_header);
+                then.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            });
+            let mut client = AnthropicClient::with_url(
+                "sk-ant-test".into(),
+                format!("{}/v1/messages", server.url("")),
+                Arc::new(rupu_netflow::NullSink),
+            )
+            .with_server_side_fallback(true);
+            let request = fallback_request("claude-opus-5-5");
+            async fn call(
+                client: &mut AnthropicClient,
+                request: &LlmRequest,
+                streamed: bool,
+            ) -> Result<LlmResponse, ProviderError> {
+                if streamed {
+                    client.stream(request, |_ev| {}).await
+                } else {
+                    client.send(request).await
+                }
+            }
+            let first = call(&mut client, &request, streamed).await.unwrap_err();
+            assert!(
+                matches!(&first, ProviderError::FallbackUnavailable { message } if message.contains("fallbacks")),
+                "streamed={streamed}: {first:?}"
+            );
+            // The retry goes out without the opt-in: it reaches the second
+            // mock whatever its own outcome is.
+            let second = call(&mut client, &request, streamed).await;
+            assert!(
+                !matches!(&second, Err(ProviderError::FallbackUnavailable { .. })),
+                "streamed={streamed}: {second:?}"
+            );
+            refused.assert_hits(1);
+            without.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_400_not_naming_fallbacks_keeps_it_enabled() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("anthropic-beta", FALLBACK_BETA);
+            then.status(400).body("messages: bad shape");
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .with_server_side_fallback(true);
+        let request = fallback_request("claude-opus-5-5");
+        let first = client.send(&request).await.unwrap_err();
+        assert_eq!(first.status(), Some(400), "{first:?}");
+        let _ = client.send(&request).await;
+        m.assert_hits(2);
+    }
+
+    #[test]
+    fn echo_rule_drops_thinking_and_tool_use_before_the_last_fallback() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false)
+            .with_server_side_fallback(true);
+        let reasoning = |text: &str, sig: &str| ContentBlock::Reasoning {
+            text: Some(text.into()),
+            provider: PROVIDER_TAG.into(),
+            model: "claude-opus-5-5".into(),
+            raw: serde_json::json!({"type": "thinking", "thinking": text, "signature": sig}),
+        };
+        let mut request = request_with_assistant_blocks(vec![
+            reasoning("before", "sig-1"),
+            ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::Text { text: "a".into() },
+            ContentBlock::Fallback {
+                from_model: "x".into(),
+                to_model: "y".into(),
+            },
+            reasoning("after", "sig-2"),
+            ContentBlock::Text { text: "b".into() },
+        ]);
+        request.model = "claude-opus-5-5".into();
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "a"},
+                {"type": "fallback", "from": {"model": "x"}, "to": {"model": "y"}},
+                {"type": "thinking", "thinking": "after", "signature": "sig-2"},
+                {"type": "text", "text": "b"},
+            ])
+        );
+    }
+
     /// `LongContextUnavailable` is not retried by the retry layers either.
     #[test]
     fn long_context_unavailable_is_not_retryable() {
@@ -8043,7 +8449,7 @@ mod tests {
             Message::user("c"),
         ];
         let mut expected = sanitize_messages_tool_names(serde_json::to_value(&messages).unwrap());
-        restore_reasoning_blocks(&mut expected, PROVIDER_TAG);
+        restore_reasoning_blocks(&mut expected, PROVIDER_TAG, false);
         let got = body_messages(messages);
         assert_eq!(serde_json::Value::Array(got), expected);
     }

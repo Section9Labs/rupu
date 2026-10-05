@@ -126,6 +126,7 @@ fn opts(
         surface_tag: Some("agent".into()),
         pause: None,
         codename: None,
+        recovery: Default::default(),
     }
 }
 

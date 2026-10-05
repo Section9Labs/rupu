@@ -2863,6 +2863,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();
         write_agent_transcript(transcript_path, agent);
@@ -2887,6 +2888,8 @@ mod tests {
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

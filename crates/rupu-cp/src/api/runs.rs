@@ -1072,6 +1072,7 @@ pub(crate) fn synthesize_unpersisted_run(
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: Some(rupu_codename::crew_for(id)),
+        cause: None,
     };
     let mut v = serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({ "id": id }));
     v["cycle_id"] = serde_json::json!(cycle_id);
@@ -1777,6 +1778,7 @@ pub(crate) mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 
@@ -3849,6 +3851,7 @@ pub(crate) mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 

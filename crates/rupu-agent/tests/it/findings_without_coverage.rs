@@ -81,6 +81,7 @@ fn opts_for(
         surface_tag: Some("autoflow".into()),
         pause: None,
         codename: None,
+        recovery: Default::default(),
     }
 }
 

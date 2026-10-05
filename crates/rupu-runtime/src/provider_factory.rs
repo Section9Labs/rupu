@@ -34,6 +34,11 @@ pub struct ProviderConfig {
     /// both absent means on. `Some(_)` wins over the provider config — see
     /// [`resolve_anthropic_prompt_cache`].
     pub anthropic_prompt_cache: Option<bool>,
+    /// Anthropic server-side fallback opt-in (`"fallbacks": "default"` on
+    /// API-key requests for supported models). `None` defers to the default,
+    /// which is on; `Some(false)` is the explicit opt-out. Launch sites set
+    /// it from `[recovery]` and the agent's frontmatter.
+    pub anthropic_server_side_fallback: Option<bool>,
     /// Present when the provider name resolves to a config-declared
     /// OpenAI-compatible endpoint. Populated by callers that have a
     /// loaded `rupu_config::Config` (e.g. `rupu run`).
@@ -226,6 +231,7 @@ pub fn provider_config_for(
     ProviderConfig {
         anthropic_oauth_system_prefix: None,
         anthropic_prompt_cache: None,
+        anthropic_server_side_fallback: None,
         openai_compatible: openai_compatible_params(name, providers),
         tuning: Some(provider_tuning(name, providers)),
         kind: resolve_kind(name, providers),
@@ -353,7 +359,8 @@ pub enum FactoryError {
 /// Test-only seam: when `RUPU_MOCK_PROVIDER_SCRIPT` is set, the factory
 /// builds a `MockProvider` from the JSON script in the env var and
 /// ignores `name`/`resolver`. Production users never set this; tests
-/// use it to drive the agent loop end-to-end without an API key.
+/// use it to drive the agent loop end-to-end without an API key. See
+/// `build_mock_from_script` for the two script shapes.
 pub async fn build_for_provider(
     name: &str,
     model: &str,
@@ -396,7 +403,7 @@ pub async fn build_for_provider_with_config(
     if let Ok(json) = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT") {
         return Ok((
             rupu_providers::AuthMode::ApiKey,
-            build_mock_from_script(&json)?,
+            build_mock_from_script(&json, model)?,
         ));
     }
     let (mode, creds) =
@@ -540,10 +547,29 @@ fn provider_has_native_retry(kind: &str) -> bool {
     kind == "anthropic"
 }
 
-fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
+/// The `RUPU_MOCK_PROVIDER_SCRIPT` seam. Every provider the factory builds
+/// replays a script from its start, so:
+/// - a JSON array is the one script every build replays;
+/// - a JSON object `{"turns": [...], "models": {"<model>": [...]}}` gives a
+///   build for a listed model its own script and every other build `turns`.
+///   A fallback hop builds a second provider mid-run, and this is how a test
+///   scripts what that hop's model answers.
+fn build_mock_from_script(json: &str, model: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
     use rupu_agent::runner::{MockProvider, ScriptedTurn};
-    let turns: Vec<ScriptedTurn> =
-        serde_json::from_str(json).map_err(|e| FactoryError::Other(format!("mock script: {e}")))?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PerModel {
+        turns: Vec<ScriptedTurn>,
+        #[serde(default)]
+        models: std::collections::HashMap<String, Vec<ScriptedTurn>>,
+    }
+    let bad = |e: serde_json::Error| FactoryError::Other(format!("mock script: {e}"));
+    let turns: Vec<ScriptedTurn> = if json.trim_start().starts_with('{') {
+        let mut script: PerModel = serde_json::from_str(json).map_err(bad)?;
+        script.models.remove(model).unwrap_or(script.turns)
+    } else {
+        serde_json::from_str(json).map_err(bad)?
+    };
     Ok(Box::new(MockProvider::new(turns)))
 }
 
@@ -602,6 +628,7 @@ async fn build_anthropic(
     .with_tuning(tuning)
     .with_oauth_account_uuid(account_uuid)
     .with_prompt_cache(prompt_cache)
+    .with_server_side_fallback(config.anthropic_server_side_fallback.unwrap_or(true))
     .with_oauth_refresher(refresher);
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);

@@ -1256,6 +1256,7 @@ mod tests {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            cause: None,
         }
     }
 
@@ -1376,6 +1377,8 @@ mod tests {
             loop_iteration: None,
             run_outcome: None,
             host: None,
+            cause: None,
+            error: None,
         }
     }
 
@@ -2697,6 +2700,7 @@ mod tests {
             total_tokens: 2,
             duration_ms: 4200,
             error: None,
+            outcome: None,
         });
         append(
             &f,

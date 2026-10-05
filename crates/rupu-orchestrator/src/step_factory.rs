@@ -182,6 +182,13 @@ pub struct DefaultStepFactory {
     /// overrides). Each step resolves the limits of ITS agent's own
     /// provider/model through it (spec 2026-09-30 §6.1).
     pub limits_ctx: rupu_runtime::model_limits::LimitsContext,
+    /// `[providers.<name>]` from `config.toml`: what a step's fallback hops
+    /// are built from (`rupu_runtime::hop_builder`).
+    pub providers: std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+    /// `[recovery]` from `config.toml`: the fallback table a step uses when
+    /// its agent declares no `fallbacks:`, and the server-side-fallback
+    /// toggle for the step's provider and its hops.
+    pub recovery: rupu_config::RecoveryConfig,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -201,6 +208,7 @@ fn resolve_step_agent_spec(
         Err(e) => (
             rupu_agent::AgentSpec {
                 findings_profile: None,
+                fallbacks: None,
                 name: agent_name.to_string(),
                 description: None,
                 provider: None,
@@ -321,6 +329,9 @@ impl StepFactory for DefaultStepFactory {
         // False once `provider` is an error stub (the agent failed to load, or
         // its provider failed to build): there is no model to ask about limits.
         let mut provider_is_real = true;
+        // This step's netflow sink, set once a real provider is being built;
+        // its fallback hops reuse it so their requests land in the same ledger.
+        let mut step_sink: Option<Arc<dyn rupu_netflow::FlowSink>> = None;
         let mut provider: Box<dyn rupu_providers::LlmProvider> = match load_err {
             Some(msg) => {
                 provider_is_real = false;
@@ -344,6 +355,7 @@ impl StepFactory for DefaultStepFactory {
                 let provider_config = provider_factory::ProviderConfig {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
                     anthropic_prompt_cache: spec.anthropic_prompt_cache,
+                    anthropic_server_side_fallback: Some(self.recovery.server_side_fallback),
                     openai_compatible: oai_params,
                     tuning: self.provider_tuning.get(&provider_name).cloned(),
                     kind: self.kinds.get(&provider_name).cloned(),
@@ -358,6 +370,7 @@ impl StepFactory for DefaultStepFactory {
                     &run_id,
                     &transcript_path,
                 );
+                step_sink = Some(netflow_sink.clone());
                 match provider_factory::build_for_provider_with_config(
                     &provider_name,
                     &model,
@@ -398,6 +411,31 @@ impl StepFactory for DefaultStepFactory {
                 &self.limits_ctx,
             )
             .await
+        };
+
+        // The step's fallback ladder: its agent's `fallbacks:` (else the
+        // `[recovery].fallbacks` table) and a hop builder over this step's
+        // resolver, provider table, limits and sink. An error-stub step (the
+        // agent did not load, or its provider did not build) gets none: there
+        // is no reply to recover, only a configuration error to report.
+        let recovery = match (provider_is_real, step_sink) {
+            (true, Some(sink)) => rupu_runtime::hop_builder::recovery_opts(
+                &self.recovery,
+                spec.fallbacks.as_deref(),
+                self.resolver.clone(),
+                self.providers.clone(),
+                self.limits_ctx.clone(),
+                sink,
+                // Exactly what the step's primary `ProviderConfig` and auth
+                // hint above carry, so a hop keeps the agent's settings.
+                rupu_runtime::hop_builder::AgentOverrides {
+                    oauth_prefix: spec.anthropic_oauth_prefix,
+                    prompt_cache: spec.anthropic_prompt_cache,
+                    auth: auth_hint,
+                    origin_provider: provider_name.clone(),
+                },
+            ),
+            _ => Default::default(),
         };
 
         let agent_system_prompt = match self.system_prompt_suffix.as_deref() {
@@ -530,6 +568,7 @@ impl StepFactory for DefaultStepFactory {
             surface_tag: Some("workflow".to_string()),
             pause: None,
             codename: None,
+            recovery,
         }
     }
 
@@ -1287,6 +1326,8 @@ steps:
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
             limits_ctx,
+            providers: Default::default(),
+            recovery: Default::default(),
         }
     }
 
@@ -1958,6 +1999,8 @@ steps:
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
             limits_ctx: hermetic_limits_ctx(tmp.path()),
+            providers: Default::default(),
+            recovery: Default::default(),
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -2018,6 +2061,8 @@ steps:
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
             limits_ctx: hermetic_limits_ctx(tmp.path()),
+            providers: Default::default(),
+            recovery: Default::default(),
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -2102,6 +2147,8 @@ steps:
             bash_env_allowlist: Vec::new(),
             findings_base: rupu_coverage::FindingWriteOptions::default(),
             limits_ctx: hermetic_limits_ctx(tmp.path()),
+            providers: Default::default(),
+            recovery: Default::default(),
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
@@ -2305,6 +2352,8 @@ steps:
             limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 tmp.path().join("cache/models"),
             ),
+            providers: Default::default(),
+            recovery: Default::default(),
         };
         // The account `acct-x` is declared as kind `openai` — a builtin
         // vendor, but a name the factory's dispatch `match` would never
@@ -2377,6 +2426,8 @@ steps:
             limits_ctx: rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 tmp.join("cache/models"),
             ),
+            providers: Default::default(),
+            recovery: Default::default(),
         }
     }
 
@@ -2492,5 +2543,60 @@ steps:
             !tmp.path().join("cache/models").exists(),
             "no model-list cache may be written for a stub provider"
         );
+    }
+
+    /// A step's agent `fallbacks:` reach the runner with a hop builder; a step
+    /// whose agent does not load gets no ladder (there is no reply to recover).
+    #[tokio::test]
+    #[serial]
+    async fn a_step_carries_its_agents_fallback_chain_and_a_hop_builder() {
+        let _guard = ENV_LOCK.lock().await;
+        let _script = EnvVarGuard::set(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            std::path::Path::new(r#"[{"AssistantText":{"text":"ok","stop":"end_turn"}}]"#),
+        );
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("pinned.md"),
+            "---\nname: pinned\nprovider: anthropic\nmodel: claude-test-1\n\
+             fallbacks:\n  - model: claude-test-2\n---\nDo it.\n",
+        )
+        .unwrap();
+        let mut f = limits_factory(tmp.path());
+        f.recovery = rupu_config::RecoveryConfig {
+            fallbacks: vec![rupu_config::FallbackEntry {
+                provider: None,
+                model: "from-config".into(),
+            }],
+            server_side_fallback: true,
+        };
+        let build = |step: &'static str, agent: &'static str| {
+            f.build_opts_for_step(
+                step,
+                agent,
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join(format!("{step}.jsonl")),
+                None,
+            )
+        };
+
+        let opts = build("pinned_step", "pinned").await;
+        assert_eq!(
+            opts.recovery.chain,
+            vec![rupu_config::FallbackEntry {
+                provider: None,
+                model: "claude-test-2".into(),
+            }]
+        );
+        assert!(opts.recovery.hop_builder.is_some());
+
+        let stub = build("missing_step", "no_such_agent").await;
+        assert!(stub.recovery.chain.is_empty());
+        assert!(stub.recovery.hop_builder.is_none());
     }
 }

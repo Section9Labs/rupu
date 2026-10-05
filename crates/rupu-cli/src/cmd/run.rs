@@ -81,13 +81,23 @@ pub struct Args {
     /// of starting fresh: the earlier conversation is rebuilt and the agent
     /// is told it was interrupted. A run that had already finished prints
     /// its recorded answer without calling the model. Run it from the same
-    /// project as the original run.
+    /// project as the original run. With `--model` or `--provider`, a run
+    /// that failed on a provider-side outcome (a refusal, say) is continued
+    /// too, on that model.
     #[arg(
         long = "continue",
         value_name = "AGENT_RUN_ID",
         conflicts_with_all = ["target", "prompt", "prompt_flag", "into", "tmp"]
     )]
     pub continue_from: Option<String>,
+    /// Model for this run, overriding the agent's `model:` and the config
+    /// default.
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// Provider for this run, overriding the agent's `provider:` and the
+    /// config default.
+    #[arg(long, value_name = "PROVIDER")]
+    pub provider: Option<String>,
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -622,63 +632,72 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // `--continue <agent_run_id>`: rebuild the interrupted run's conversation
     // from its transcript (recover-on-interrupt spec §1). Same transcripts
     // dir as the new run, so run it from the same project.
-    let mut resume_from: Option<(Vec<rupu_providers::types::Message>, std::path::PathBuf)> =
-        match args.continue_from.as_deref() {
-            None => None,
-            Some(prev) => {
-                use rupu_agent::continuation::{
-                    prepare_continuation, transcript_agent, Continuation,
-                };
-                let prev_path = transcripts.join(format!("{prev}.jsonl"));
-                // The runner truncates its transcript when it starts, so a
-                // `--run-id` that already has one would wipe it — the run
-                // being continued (which the continued run seeds from, and
-                // whose `Seed` would then reference itself) or any other
-                // run, such as an ancestor further up a continuation chain.
-                if transcript_path.exists() {
-                    anyhow::bail!(
-                        "--continue {prev} needs a new run id; --run-id {run_id} already has a transcript and the new run would overwrite it"
-                    );
-                }
-                let prev_agent = transcript_agent(&prev_path)?;
-                if prev_agent != spec.name {
-                    anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
-                }
-                match prepare_continuation(&prev_path)? {
-                    Continuation::Finished { output } => {
-                        // This run records nothing, but it is still a
-                        // `rupu run`: start its stream so a coordinator reads
-                        // "nothing recorded", not "host can't stream".
-                        start_coverage_stream(&coverage_stream, &run_id);
-                        println!("{output}");
-                        eprintln!(
-                            "run {prev} had already finished — printed its recorded answer without calling the model"
-                        );
-                        return Ok(());
-                    }
-                    Continuation::Failed { error, seeded_from } => {
-                        // A failed continuation's source run may still be
-                        // continuable; name it so the user can.
-                        let source = seeded_from
-                            .as_deref()
-                            .and_then(|p| p.file_stem())
-                            .and_then(|s| s.to_str())
-                            .map(|src| {
-                                format!("; run {src}, which it continued, may still be continued with `--continue {src}`")
-                            })
-                            .unwrap_or_default();
-                        anyhow::bail!(
-                            "run {prev} ended in failure{} — that is not an interruption, so there is nothing to pick up; start a fresh run instead{source}",
-                            error.map(|e| format!(" ({e})")).unwrap_or_default()
-                        )
-                    }
-                    Continuation::Resume {
-                        messages,
-                        seed_source,
-                    } => Some((messages, seed_source)),
-                }
+    //
+    // With `--model`/`--provider`, a run that failed on an outcome is
+    // continued too (`prepare_recovery_continuation`); the third element is
+    // that outcome, `None` for an interrupted run.
+    let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref() {
+        None => None,
+        Some(prev) => {
+            use rupu_agent::continuation::{
+                prepare_continuation, prepare_recovery_continuation, transcript_agent, Continuation,
+            };
+            let prev_path = transcripts.join(format!("{prev}.jsonl"));
+            // The runner truncates its transcript when it starts, so a
+            // `--run-id` that already has one would wipe it — the run
+            // being continued (which the continued run seeds from, and
+            // whose `Seed` would then reference itself) or any other
+            // run, such as an ancestor further up a continuation chain.
+            if transcript_path.exists() {
+                anyhow::bail!(
+                    "--continue {prev} needs a new run id; --run-id {run_id} already has a transcript and the new run would overwrite it"
+                );
             }
-        };
+            let prev_agent = transcript_agent(&prev_path)?;
+            if prev_agent != spec.name {
+                anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
+            }
+            let prepared = if args.model.is_some() || args.provider.is_some() {
+                prepare_recovery_continuation(&prev_path)?
+            } else {
+                prepare_continuation(&prev_path)?
+            };
+            match prepared {
+                Continuation::Finished { output } => {
+                    // This run records nothing, but it is still a
+                    // `rupu run`: start its stream so a coordinator reads
+                    // "nothing recorded", not "host can't stream".
+                    start_coverage_stream(&coverage_stream, &run_id);
+                    println!("{output}");
+                    eprintln!(
+                        "run {prev} had already finished — printed its recorded answer without calling the model"
+                    );
+                    return Ok(());
+                }
+                Continuation::Failed { error, seeded_from } => {
+                    // A failed continuation's source run may still be
+                    // continuable; name it so the user can.
+                    let source = seeded_from
+                        .as_deref()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .map(|src| {
+                            format!("; run {src}, which it continued, may still be continued with `--continue {src}`")
+                        })
+                        .unwrap_or_default();
+                    anyhow::bail!(
+                        "run {prev} ended in failure{} — that is not an interruption, so there is nothing to pick up; start a fresh run instead{source}",
+                        error.map(|e| format!(" ({e})")).unwrap_or_default()
+                    )
+                }
+                Continuation::Resume {
+                    messages,
+                    seed_source,
+                    stopped_on,
+                } => Some((messages, seed_source, stopped_on)),
+            }
+        }
+    };
 
     // The begin line goes first, even if the run records nothing: its
     // absence is how the coordinator tells "this host can't stream" from
@@ -739,8 +758,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
         );
 
-        let provider_name = provider_factory::resolve_provider_name(
+        // `--provider` / `--model` override the agent and the config, ahead
+        // of the dispatchable pre-flight below. The agent's own provider is
+        // resolved too: its `auth:` names how it reaches that provider only.
+        let agent_provider = provider_factory::resolve_provider_name(
             spec.provider.as_deref(),
+            cfg.default_provider.as_deref(),
+        );
+        let provider_name = provider_factory::resolve_provider_name(
+            args.provider.as_deref().or(spec.provider.as_deref()),
             cfg.default_provider.as_deref(),
         );
         let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
@@ -770,14 +796,27 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // For an openai-compatible provider, prefer its configured default_model
         // when the agent/spec didn't pin one.
         let model = provider_factory::resolve_model(
-            spec.model.as_deref(),
+            args.model.as_deref().or(spec.model.as_deref()),
             cfg.default_model.as_deref(),
             oai_params.as_ref().map(|p| p.default_model.as_str()),
         );
-        let auth_hint = spec.auth;
+        let agent_model = provider_factory::resolve_model(
+            spec.model.as_deref(),
+            cfg.default_model.as_deref(),
+            provider_factory::openai_compatible_params(&agent_provider, &cfg.providers)
+                .as_ref()
+                .map(|p| p.default_model.as_str()),
+        );
+        // What the agent pins for its own model and provider applies only
+        // there — the rule a fallback hop follows (`hop_builder` for limits,
+        // the runner's `OriginPins` for `contextWindow` / `anthropicSpeed`). An
+        // "override" naming the agent's own model/provider changes nothing.
+        let pins = AgentPins::for_run(&spec, provider_name != agent_provider, model != agent_model);
+        let auth_hint = pins.auth;
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             anthropic_prompt_cache: spec.anthropic_prompt_cache,
+            anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
             openai_compatible: oai_params,
             tuning: Some(provider_factory::provider_tuning(
                 &provider_name,
@@ -955,6 +994,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             None,
             limits_ctx.clone(),
             Some(coverage_stream.clone()),
+            cfg.providers.clone(),
+            cfg.recovery.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -1036,7 +1077,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // config → live model list → unknown. Resolved through the same
         // provider the run is about to use, before it moves into the opts.
         let limits = rupu_runtime::model_limits::resolve(
-            rupu_runtime::model_limits::LimitOverrides::from_spec(&spec),
+            pins.limits,
             &provider_name,
             &model,
             provider.as_mut(),
@@ -1044,6 +1085,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         )
         .await;
 
+        // What a fallback hop keeps from this agent: exactly what the primary
+        // provider's `ProviderConfig` and auth hint above carry.
+        let hop_overrides = rupu_runtime::hop_builder::AgentOverrides {
+            oauth_prefix: spec.anthropic_oauth_prefix,
+            prompt_cache: spec.anthropic_prompt_cache,
+            auth: pins.auth,
+            origin_provider: provider_name.clone(),
+        };
         let mut opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
@@ -1072,12 +1121,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             suppress_stream_stdout: true,
             mcp_registry: Some(scm_registry),
             effort: spec.effort,
-            context_window: spec.context_window,
+            context_window: pins.context_window,
             output_format: spec.output_format,
             output_schema: spec.output_schema.clone(),
-            anthropic_task_budget: spec.anthropic_task_budget,
-            anthropic_context_management: spec.anthropic_context_management,
-            anthropic_speed: spec.anthropic_speed,
+            anthropic_task_budget: pins.anthropic_task_budget,
+            anthropic_context_management: pins.anthropic_context_management,
+            anthropic_speed: pins.anthropic_speed,
             // Top-level `rupu run` invocation — no parent, depth 0,
             // dispatch surface taken from the agent's frontmatter.
             parent_run_id: None,
@@ -1093,9 +1142,36 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             surface_tag: None,
             pause: None,
             codename: Some(codename.to_string()),
+            recovery: rupu_runtime::hop_builder::recovery_opts(
+                &cfg.recovery,
+                spec.fallbacks.as_deref(),
+                resolver.clone(),
+                cfg.providers.clone(),
+                limits_ctx.clone(),
+                netflow_sink.clone(),
+                hop_overrides,
+            ),
         };
-        if let Some((messages, seed_source)) = resume_from.take() {
-            rupu_agent::continuation::apply_continuation(&mut opts, messages, seed_source);
+        match resume_from.take() {
+            None => {}
+            // A failed run continued on another model: the note says why the
+            // last attempt stopped and what this one runs on.
+            Some((messages, seed_source, Some(stopped_on))) => {
+                let note = rupu_agent::recovery::recovery_retry_note(
+                    &stopped_on.title,
+                    &opts.provider_name,
+                    &opts.model,
+                );
+                rupu_agent::continuation::apply_continuation_with(
+                    &mut opts,
+                    messages,
+                    seed_source,
+                    note,
+                );
+            }
+            Some((messages, seed_source, None)) => {
+                rupu_agent::continuation::apply_continuation(&mut opts, messages, seed_source);
+            }
         }
 
         // Spawn the agent in a background task and tail the transcript with
@@ -1173,6 +1249,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        rupu_transcript::Event::Outcome { .. }
+                        | rupu_transcript::Event::Recovery { .. }
+                        | rupu_transcript::Event::AssistantBlock { .. }
+                        | rupu_transcript::Event::Unknown { .. } => {
+                            crate::output::outcome_row::print_outcome_event(&mut printer, &ev);
+                        }
                         _ => {}
                     }
                 }
@@ -1200,6 +1282,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let run_result = agent_task
             .await
             .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))?;
+        // A run that ends badly can still return `Ok` (a max-turns bust, an
+        // outcome the recovery ladder could not fix): fold it into the
+        // failure path so it is recorded `Failed` and the command exits
+        // non-zero. `rupu run` sets no pause token, and `terminal_error`
+        // treats a cooperative pause as no failure anyway.
+        let run_result = standalone_run_outcome(run_result);
         let success = run_result.is_ok();
 
         // Write run.json so the run is observable via RunStore and the mirror
@@ -1223,7 +1311,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             } else {
                 rupu_orchestrator::RunStatus::Failed
             };
-            let error_message = run_result.as_ref().err().map(|e| e.to_string());
+            let error_message = run_result.as_ref().err().map(|f| f.message.clone());
+            let cause = run_result
+                .as_ref()
+                .err()
+                .and_then(|f| f.cause.as_deref().cloned());
             let rec = rupu_orchestrator::RunRecord {
                 id: run_id.clone(),
                 workflow_name: format!("agent:{}", spec.name),
@@ -1237,6 +1329,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 finished_at: Some(finished_at),
                 final_output: final_output.clone(),
                 error_message: error_message.clone(),
+                cause: cause.clone(),
                 awaiting: Vec::new(),
                 awaiting_step_id: None,
                 approval_prompt: None,
@@ -1283,6 +1376,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                             loaded.finished_at = Some(finished_at);
                             loaded.final_output = final_output;
                             loaded.error_message = error_message;
+                            loaded.cause = cause;
                             // Under the run lock, on the blocking pool: a cancel
                             // that landed since the load is kept.
                             match store
@@ -1306,7 +1400,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // Print a brief footer.
         println!("transcript: {}", transcript_path.display());
         // Propagate agent failure so the CLI exits non-zero on a failed run.
-        run_result?;
+        if let Err(failure) = run_result {
+            anyhow::bail!(failure.message);
+        }
         Ok(())
     }
     .await;
@@ -1324,6 +1420,90 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     }
 
     body_result
+}
+
+/// The agent's model- and provider-specific settings, as they apply to this
+/// run: a `--model` onto another model drops the agent's limit pins and its
+/// model-specific Anthropic settings — `contextWindow`, `anthropicSpeed`,
+/// `anthropicTaskBudget`, `anthropicContextManagement` (each exists only on
+/// some models — the rule a fallback hop follows; `effort` is
+/// provider-generic and stays); a `--provider` onto another provider drops
+/// its `auth:`.
+#[derive(Debug)]
+struct AgentPins {
+    limits: rupu_runtime::model_limits::LimitOverrides,
+    context_window: Option<rupu_providers::model_tier::ContextWindow>,
+    anthropic_speed: Option<rupu_providers::types::Speed>,
+    anthropic_task_budget: Option<u32>,
+    anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
+    auth: Option<rupu_providers::AuthMode>,
+}
+
+impl AgentPins {
+    fn for_run(spec: &rupu_agent::AgentSpec, other_provider: bool, other_model: bool) -> Self {
+        Self {
+            limits: if other_model {
+                rupu_runtime::model_limits::LimitOverrides::default()
+            } else {
+                rupu_runtime::model_limits::LimitOverrides::from_spec(spec)
+            },
+            context_window: if other_model {
+                None
+            } else {
+                spec.context_window
+            },
+            anthropic_speed: spec.anthropic_speed.filter(|_| !other_model),
+            anthropic_task_budget: spec.anthropic_task_budget.filter(|_| !other_model),
+            anthropic_context_management: spec
+                .anthropic_context_management
+                .filter(|_| !other_model),
+            auth: if other_provider { None } else { spec.auth },
+        }
+    }
+}
+
+/// What `rupu run --continue` picks up: the rebuilt conversation, the
+/// transcript it is seeded from, and — for a failed run continued on another
+/// model — the outcome it failed on.
+type ResumeFrom = (
+    Vec<rupu_providers::types::Message>,
+    std::path::PathBuf,
+    Option<rupu_transcript::OutcomeRecord>,
+);
+
+/// A standalone run that did not do its job: the text recorded as the run's
+/// `error_message` and printed by the command, and the outcome it failed on.
+#[derive(Debug)]
+struct RunFailure {
+    message: String,
+    cause: Option<Box<rupu_transcript::OutcomeRecord>>,
+}
+
+/// Fold a run's result into success or [`RunFailure`]. An `Ok` whose own
+/// status failed ([`rupu_agent::RunResult::terminal_error`]) is a failure,
+/// reported in the run's own words (`RunResult.error`, which carries the
+/// rung-3 `--continue` hint); an `Err` gets its hint appended.
+fn standalone_run_outcome(
+    result: Result<rupu_agent::RunResult, rupu_agent::RunError>,
+) -> Result<rupu_agent::RunResult, RunFailure> {
+    match result {
+        Ok(result) => match result.terminal_error() {
+            None => Ok(result),
+            Some(err) => Err(RunFailure {
+                message: result.error.clone().unwrap_or_else(|| err.to_string()),
+                cause: err.outcome().cloned().map(Box::new),
+            }),
+        },
+        // An outcome the ladder ran out on carries its rung-3 hint apart from
+        // the error text; the operator reads both.
+        Err(err) => Err(RunFailure {
+            message: match err.hint() {
+                Some(hint) => format!("{err}; {hint}"),
+                None => err.to_string(),
+            },
+            cause: err.outcome().cloned().map(Box::new),
+        }),
+    }
 }
 
 fn render_assistant_output(
@@ -1639,6 +1819,62 @@ mod tests {
         parse_launch_args(argv.iter().map(|s| s.to_string()).collect())
     }
 
+    fn pinned_spec() -> rupu_agent::AgentSpec {
+        rupu_agent::AgentSpec::parse(
+            "---\nname: pinned\nprovider: anthropic\nmodel: claude-sonnet-4-6\nauth: api-key\n\
+             contextWindow: 1m\nanthropicSpeed: fast\nanthropicTaskBudget: 40000\n\
+             anthropicContextManagement: tool_clearing\neffort: high\nmaxTokens: 777\ncontextWindowTokens: 9000\n\
+             ---\nhi\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_pins_follow_the_agents_own_model_and_provider() {
+        let spec = pinned_spec();
+        let own = AgentPins::for_run(&spec, false, false);
+        assert_eq!(own.limits.max_tokens, Some(777));
+        assert_eq!(own.limits.context_window_tokens, Some(9000));
+        assert!(own.context_window.is_some());
+        assert_eq!(
+            own.anthropic_speed,
+            Some(rupu_providers::types::Speed::Fast)
+        );
+        assert_eq!(own.anthropic_task_budget, Some(40_000));
+        assert_eq!(
+            own.anthropic_context_management,
+            Some(rupu_providers::types::ContextManagement::ToolClearing)
+        );
+        assert_eq!(own.auth, Some(rupu_providers::AuthMode::ApiKey));
+
+        let other_model = AgentPins::for_run(&spec, false, true);
+        assert_eq!(other_model.limits.max_tokens, None);
+        assert_eq!(other_model.limits.context_window_tokens, None);
+        assert_eq!(other_model.context_window, None);
+        assert_eq!(
+            other_model.anthropic_speed, None,
+            "fast mode exists only on some models"
+        );
+        assert_eq!(other_model.anthropic_task_budget, None);
+        assert_eq!(other_model.anthropic_context_management, None);
+        assert!(
+            spec.effort.is_some(),
+            "effort is provider-generic; AgentPins never carries it"
+        );
+        assert_eq!(other_model.auth, Some(rupu_providers::AuthMode::ApiKey));
+
+        let other_provider = AgentPins::for_run(&spec, true, false);
+        assert_eq!(other_provider.auth, None);
+        assert_eq!(other_provider.limits.max_tokens, Some(777));
+        assert_eq!(
+            other_provider.anthropic_speed,
+            Some(rupu_providers::types::Speed::Fast),
+            "the same model on another provider keeps its pins"
+        );
+        assert_eq!(other_provider.anthropic_task_budget, Some(40_000));
+        assert!(other_provider.anthropic_context_management.is_some());
+    }
+
     #[test]
     fn findings_profile_flag_parses_in_either_position() {
         use rupu_coverage::FindingProfile::{Full, Summary};
@@ -1890,6 +2126,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         rupu_cp::api::runs::RunListRow::from(&rec)
     }

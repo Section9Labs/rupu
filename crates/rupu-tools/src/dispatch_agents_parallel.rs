@@ -240,20 +240,22 @@ impl Tool for DispatchAgentsParallelTool {
                     if !o.success {
                         all_succeeded = false;
                     }
-                    results.insert(
-                        req.id,
-                        json!({
-                            "ok": o.success,
-                            "agent": o.agent,
-                            "output": o.output,
-                            "findings": [],
-                            "tokens_used": o.tokens_used,
-                            "duration_ms": o.duration_ms,
-                            "transcript_path": o.transcript_path.display().to_string(),
-                            "sub_run_id": o.sub_run_id,
-                            "codename": o.codename,
-                        }),
-                    );
+                    let mut entry = json!({
+                        "ok": o.success,
+                        "agent": o.agent,
+                        "output": o.output,
+                        "findings": [],
+                        "tokens_used": o.tokens_used,
+                        "duration_ms": o.duration_ms,
+                        "transcript_path": o.transcript_path.display().to_string(),
+                        "sub_run_id": o.sub_run_id,
+                        "codename": o.codename,
+                    });
+                    // A failed child's `output` is empty; this is the reason.
+                    if let Some(error) = o.error {
+                        entry["error"] = json!(error);
+                    }
+                    results.insert(req.id, entry);
                 }
                 Err(e) => {
                     all_succeeded = false;
@@ -343,6 +345,7 @@ mod tests {
                 transcript_path: PathBuf::from(format!("/tmp/{agent}.jsonl")),
                 output: output.to_string(),
                 success: true,
+                error: None,
                 tokens_used: tokens,
                 duration_ms: 1,
             }
@@ -563,5 +566,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("provider exploded"));
+    }
+
+    /// A child that ran but failed: empty `output`, `ok: false`, and the
+    /// reason its run recorded under `error` (spec 2026-10-01 §5.3).
+    #[tokio::test]
+    async fn a_failed_child_carries_its_error_and_no_output() {
+        let tool = DispatchAgentsParallelTool;
+        let mut refused = StubDispatcher::ok("sec", "", 5);
+        refused.success = false;
+        refused.error = Some("refused · no fallback left".into());
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::new([
+            ("sec", Ok(refused)),
+            ("perf", Ok(StubDispatcher::ok("perf", "perf output", 5))),
+        ]));
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["sec".into(), "perf".into()]),
+            Some("run_X".into()),
+            0,
+        );
+        let out = tool
+            .invoke(
+                json!({ "agents": [
+                    { "id": "s", "agent": "sec", "prompt": "p" },
+                    { "id": "p", "agent": "perf", "prompt": "p" },
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(parsed["all_succeeded"], json!(false));
+        assert_eq!(parsed["results"]["s"]["ok"], json!(false));
+        assert_eq!(parsed["results"]["s"]["output"], "");
+        assert_eq!(
+            parsed["results"]["s"]["error"],
+            "refused · no fallback left"
+        );
+        assert!(
+            parsed["results"]["p"].get("error").is_none(),
+            "a succeeding child has no error key"
+        );
     }
 }

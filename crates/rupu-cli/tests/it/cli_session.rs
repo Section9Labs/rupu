@@ -198,6 +198,7 @@ fn write_transcript_file(path: &std::path::Path, run_id: &str, assistant_content
             total_tokens: 123,
             duration_ms: 1234,
             error: None,
+            outcome: None,
         })
         .unwrap();
     writer.flush().unwrap();

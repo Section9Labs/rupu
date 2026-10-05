@@ -159,7 +159,7 @@ impl Tool for DispatchAgentTool {
             .await
         {
             Ok(outcome) => {
-                let body = json!({
+                let mut body = json!({
                     "ok": outcome.success,
                     "agent": outcome.agent,
                     "output": outcome.output,
@@ -173,6 +173,10 @@ impl Tool for DispatchAgentTool {
                     "sub_run_id": outcome.sub_run_id,
                     "codename": outcome.codename,
                 });
+                // A failed child's `output` is empty; this is the reason.
+                if let Some(error) = outcome.error {
+                    body["error"] = json!(error);
+                }
                 Ok(ToolOutput {
                     stdout: serde_json::to_string_pretty(&body)
                         .unwrap_or_else(|_| body.to_string()),
@@ -207,6 +211,8 @@ mod tests {
     #[derive(Debug)]
     struct StubDispatcher {
         return_output: String,
+        /// `Some(reason)`: the child ran and failed with this error.
+        failure: Option<String>,
         /// The `parent_codename` the tool handed the dispatcher.
         seen_parent_codename: Arc<std::sync::Mutex<Option<String>>>,
     }
@@ -215,6 +221,7 @@ mod tests {
         fn stub(return_output: &str) -> Self {
             Self {
                 return_output: return_output.into(),
+                failure: None,
                 seen_parent_codename: Arc::new(std::sync::Mutex::new(None)),
             }
         }
@@ -237,7 +244,8 @@ mod tests {
                 codename: Some("p>lynx#1".into()),
                 transcript_path: PathBuf::from("/tmp/sub_TEST/transcript.jsonl"),
                 output: self.return_output.clone(),
-                success: true,
+                success: self.failure.is_none(),
+                error: self.failure.clone(),
                 tokens_used: 42,
                 duration_ms: 10,
             })
@@ -317,6 +325,30 @@ mod tests {
             .contains("max_dispatch_depth_exceeded"));
     }
 
+    /// A child that ran but failed: `ok: false`, empty `output`, and the
+    /// reason its run recorded under `error` (spec 2026-10-01 §5.3).
+    #[tokio::test]
+    async fn a_failed_child_returns_its_error_and_no_output() {
+        let tool = DispatchAgentTool;
+        let mut stub = StubDispatcher::stub("");
+        stub.failure = Some("refused · no fallback left".into());
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(stub);
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["reviewer".into()]),
+            Some("run_X".into()),
+            0,
+        );
+        let out = tool
+            .invoke(json!({ "agent": "reviewer", "prompt": "hi" }), &ctx)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(parsed["ok"], json!(false));
+        assert_eq!(parsed["output"], "");
+        assert_eq!(parsed["error"], "refused · no fallback left");
+    }
+
     #[tokio::test]
     async fn returns_spec_shape_on_success() {
         let tool = DispatchAgentTool;
@@ -336,6 +368,7 @@ mod tests {
         assert_eq!(parsed["ok"], json!(true));
         assert_eq!(parsed["agent"], "reviewer");
         assert_eq!(parsed["output"], "child output");
+        assert!(parsed.get("error").is_none(), "no error key on success");
         assert_eq!(parsed["sub_run_id"], "sub_TEST");
         assert_eq!(parsed["tokens_used"], 42);
         assert!(parsed["transcript_path"]

@@ -115,6 +115,7 @@ impl AgentDispatcher for FakeDispatcher {
                 total_tokens: 7,
                 duration_ms: 9,
                 error: None,
+                outcome: None,
             })
             .unwrap();
         writer.flush().unwrap();
@@ -126,6 +127,7 @@ impl AgentDispatcher for FakeDispatcher {
             transcript_path: path,
             output: format!("{agent_name}: review complete"),
             success: true,
+            error: None,
             tokens_used: 7,
             duration_ms: 9,
         })
@@ -230,6 +232,7 @@ impl StepFactory for ParallelFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }

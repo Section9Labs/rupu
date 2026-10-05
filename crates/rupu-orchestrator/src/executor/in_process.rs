@@ -266,6 +266,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             started_at: chrono::Utc::now(),
                             finished_at: None,
                             error_message: None,
+                            cause: None,
                             awaiting: Vec::new(),
                             awaiting_step_id: None,
                             approval_prompt: None,
@@ -492,6 +493,7 @@ mod tests {
                 surface_tag: None,
                 pause: None,
                 codename: None,
+                recovery: Default::default(),
             }
         }
     }

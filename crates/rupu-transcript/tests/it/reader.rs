@@ -37,6 +37,8 @@ fn reads_complete_run_summary() {
                 tokens_out: Some(20),
                 stop_reason: None,
                 response_id: None,
+                discarded: false,
+                stop: None,
             },
             Event::RunComplete {
                 run_id: "run_a".into(),
@@ -44,6 +46,7 @@ fn reads_complete_run_summary() {
                 total_tokens: 30,
                 duration_ms: 1000,
                 error: None,
+                outcome: None,
             },
         ],
     );
@@ -125,6 +128,8 @@ fn iter_yields_all_events_in_order() {
                 tokens_out: Some(2),
                 stop_reason: None,
                 response_id: None,
+                discarded: false,
+                stop: None,
             },
             Event::TurnStart { turn_idx: 1 },
         ],

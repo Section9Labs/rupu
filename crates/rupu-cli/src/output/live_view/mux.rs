@@ -114,6 +114,48 @@ pub fn project_event(ev: &Event, codename: Option<&str>) -> Option<FeedLine> {
             ..
         } => Some(Line::new().danger(format!("✕ {tool} blocked"))),
         Event::Notice { message, .. } => Some(Line::new().dim(format!("! {}", squash(message)))),
+        // A classified non-normal reply (refusal, cut-off, malformed call, …)
+        // and what the run did about it. Errors are the rows operators must
+        // not miss; warnings share the finding-meter tone; recovery is dim.
+        Event::Outcome { outcome, .. } => {
+            let text = squash(&rupu_transcript::outcome::outcome_line(outcome));
+            Some(match outcome.severity {
+                rupu_transcript::Severity::Error => Line::new().danger(text),
+                rupu_transcript::Severity::Warning => Line::new().meter(text),
+                rupu_transcript::Severity::Info => Line::new().dim(text),
+            })
+        }
+        // The feed draws no status glyph of its own, so it takes the
+        // glyph-bearing one-line forms.
+        Event::Recovery {
+            rung,
+            action,
+            attempt,
+            budget,
+            provider,
+            model,
+            reason,
+            ..
+        } => Some(
+            Line::new().dim(squash(&rupu_transcript::outcome::recovery_line(
+                *action,
+                *rung,
+                provider.as_deref(),
+                model.as_deref(),
+                *attempt,
+                *budget,
+                reason.as_deref(),
+            ))),
+        ),
+        // A reply block with no event of its own: a server-side fallback
+        // boundary, an unrecognized block, or one abandoned at a mid-output
+        // fallback.
+        Event::AssistantBlock { block, abandoned } => Some(Line::new().dim(format!(
+            "· {}",
+            squash(&rupu_transcript::outcome::assistant_block_line(
+                block, *abandoned
+            ))
+        ))),
         _ => None,
     }?;
 
@@ -759,6 +801,8 @@ mod tests {
                 tokens_out: None,
                 stop_reason: None,
                 response_id: None,
+                discarded: false,
+                stop: None,
             },
             Some("otter#3")
         )
@@ -784,7 +828,14 @@ mod tests {
             None
         )
         .is_none());
-        assert!(project_event(&Event::Unknown, None).is_none());
+        assert!(project_event(
+            &Event::Unknown {
+                tag: "future_event".into(),
+                data: serde_json::Value::Null
+            },
+            None
+        )
+        .is_none());
         assert!(project_event(
             &Event::ToolResult {
                 call_id: "c1".into(),
@@ -796,6 +847,47 @@ mod tests {
             None
         )
         .is_none());
+    }
+
+    #[test]
+    fn project_event_surfaces_outcome_and_recovery() {
+        let outcome = Event::Outcome {
+            turn_idx: 1,
+            outcome: rupu_transcript::OutcomeRecord {
+                id: "oc_1".into(),
+                class: "refusal".into(),
+                severity: rupu_transcript::Severity::Error,
+                title: "refused · cyber".into(),
+                detail: None,
+                error_class: None,
+                wire: serde_json::Value::Null,
+            },
+        };
+        let row = project_event(&outcome, Some("otter#3")).expect("outcome row");
+        assert!(render_plain(std::slice::from_ref(&row.line)).contains("refused · cyber"));
+        let recovery = Event::Recovery {
+            outcome_id: "oc_1".into(),
+            rung: 1,
+            action: rupu_transcript::RecoveryAction::Retried,
+            attempt: None,
+            budget: None,
+            provider: None,
+            model: None,
+            reason: None,
+            merge_into_previous: false,
+            continues_output: false,
+        };
+        let row = project_event(&recovery, None).expect("recovery row");
+        assert!(render_plain(std::slice::from_ref(&row.line)).contains("↺ rung 1 · retried"));
+        let block = Event::AssistantBlock {
+            block: serde_json::json!({
+                "type": "fallback", "from_model": "model-a", "to_model": "model-b"
+            }),
+            abandoned: false,
+        };
+        let row = project_event(&block, None).expect("assistant_block row");
+        assert!(render_plain(std::slice::from_ref(&row.line))
+            .contains("served by fallback · model-a → model-b"));
     }
 
     // ---- TranscriptMux -------------------------------------------------

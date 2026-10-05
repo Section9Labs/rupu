@@ -31,7 +31,43 @@ export type TranscriptEvent =
   | { type: 'notice'; data: { kind: string; message: string } }
   | { type: 'compaction'; data: { seq: number; summarized_messages: number; backup_path?: string; messages?: unknown } }
   | { type: 'net_flow'; data: { flow: unknown } }
-  | { type: string; data: Record<string, unknown> }; // catch-all for forward-compat
+  | { type: 'outcome'; data: { turn_idx: number; outcome: OutcomeRecord } }
+  | { type: 'recovery'; data: RecoveryData }
+  // A reply content block with no event of its own (`fallback`, `unknown`,
+  // or a block abandoned at a mid-output server-side fallback): `block` is the
+  // provider-neutral ContentBlock JSON.
+  | { type: 'assistant_block'; data: { block: Record<string, unknown>; abandoned?: boolean } }
+  // Catch-all for forward-compat: the server passes an unrecognized event's
+  // `data` through verbatim; the view model keeps it on the `unknown` block.
+  | { type: string; data: Record<string, unknown> };
+
+export type OutcomeSeverity = 'info' | 'warning' | 'error';
+
+/** `rupu_transcript::OutcomeRecord`. */
+export interface OutcomeRecord {
+  id: string;
+  class: string;
+  severity: OutcomeSeverity;
+  title: string;
+  detail?: string | null;
+  error_class?: string | null;
+  wire?: unknown;
+}
+
+/** `Event::Recovery`'s payload. `action` is a snake_case name; an action this
+ *  build does not know still renders (as its own name). */
+export interface RecoveryData {
+  outcome_id: string;
+  rung: number;
+  action: string;
+  attempt?: number | null;
+  budget?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  reason?: string | null;
+  merge_into_previous?: boolean;
+  continues_output?: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Transcript summary / response shapes

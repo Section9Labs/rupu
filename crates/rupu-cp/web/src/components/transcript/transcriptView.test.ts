@@ -721,12 +721,106 @@ describe('v2 blocks model', () => {
       { type: 'gate_requested', data: { gate_id: 'g1', prompt: 'ship it?', decision: 'approve', decided_by: 'matt' } },
       { type: 'notice', data: { kind: 'context_trim', message: 'trimmed' } },
       { type: 'compaction', data: { seq: 1, summarized_messages: 9 } },
+      { type: 'outcome', data: { turn_idx: 0, outcome: { id: 'oc_1', class: 'refusal', severity: 'error', title: 'refused · cyber' } } },
+      { type: 'recovery', data: { outcome_id: 'oc_1', rung: 1, action: 'retried' } },
       { type: 'hologram_projection', data: { x: 1 } },
     ]);
     const kinds = view.turns.flatMap((t) => t.blocks.map((b) => b.kind));
-    expect(kinds).toEqual(['seed', 'user', 'gate', 'notice', 'compaction', 'unknown']);
+    expect(kinds).toEqual(['seed', 'user', 'gate', 'notice', 'compaction', 'outcome', 'recovery', 'unknown']);
     const gate = view.turns.flatMap((t) => t.blocks).find((b) => b.kind === 'gate');
     expect(gate).toMatchObject({ gateId: 'g1', decision: 'approve', decidedBy: 'matt' });
+  });
+
+  it('an outcome event becomes an outcome block carrying severity, title and detail', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      {
+        type: 'outcome',
+        data: {
+          turn_idx: 0,
+          outcome: {
+            id: 'oc_1',
+            class: 'refusal',
+            severity: 'error',
+            title: 'refused · cyber',
+            detail: 'Declined for this example.',
+            wire: {},
+          },
+        },
+      },
+      {
+        type: 'outcome',
+        data: { turn_idx: 0, outcome: { id: 'oc_2', class: 'max_tokens', severity: 'warning', title: 'cut off' } },
+      },
+    ]);
+    const blocks = view.turns.flatMap((t) => t.blocks);
+    expect(blocks[0]).toEqual({
+      kind: 'outcome',
+      severity: 'error',
+      title: 'refused · cyber',
+      detail: 'Declined for this example.',
+    });
+    expect(blocks[1]).toMatchObject({ kind: 'outcome', severity: 'warning', title: 'cut off' });
+  });
+
+  it('a recovery event becomes a recovery block with the phrased text', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      {
+        type: 'recovery',
+        data: {
+          outcome_id: 'oc_1',
+          rung: 1,
+          action: 'fell_back',
+          provider: 'anthropic',
+          model: 'claude-opus-4-8',
+        },
+      },
+    ]);
+    expect(view.turns.flatMap((t) => t.blocks)[0]).toEqual({
+      kind: 'recovery',
+      text: '↺ rung 1 · fell back to anthropic/claude-opus-4-8',
+    });
+  });
+
+  it('an assistant_block event becomes a one-line block with its raw JSON', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      {
+        type: 'assistant_block',
+        data: { block: { type: 'fallback', from_model: 'model-a', to_model: 'model-b' } },
+      },
+      {
+        type: 'assistant_block',
+        data: { block: { type: 'tool_use', id: 'c1', name: 'bash', input: {} }, abandoned: true },
+      },
+    ]);
+    expect(view.turns.flatMap((t) => t.blocks)).toEqual([
+      {
+        kind: 'assistant_block',
+        text: 'served by fallback · model-a → model-b',
+        abandoned: false,
+        raw: { type: 'fallback', from_model: 'model-a', to_model: 'model-b' },
+      },
+      {
+        kind: 'assistant_block',
+        text: 'abandoned · tool call · bash',
+        abandoned: true,
+        raw: { type: 'tool_use', id: 'c1', name: 'bash', input: {} },
+      },
+    ]);
+  });
+
+  it('an unknown event keeps its raw data', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'brand_new_event', data: { x: 1 } },
+    ]);
+    expect(view.turns.flatMap((t) => t.blocks)[0]).toEqual({
+      kind: 'unknown',
+      type: 'brand_new_event',
+      data: { x: 1 },
+    });
   });
 
   it('legacy v1: assistant_message.thinking becomes a thinking block before the assistant block, and assistant_message still opens a turn when no turn_start groups it', () => {

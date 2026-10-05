@@ -5,6 +5,7 @@
 //! enforces this.
 
 mod final_turn_text;
+mod outcome_events;
 mod reader;
 mod roundtrip;
 mod usage_event;

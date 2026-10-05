@@ -209,6 +209,27 @@ steps:
 }
 
 #[tokio::test]
+async fn a_tolerated_spawn_failure_records_why_the_step_failed() {
+    let yaml = r#"
+name: bench-smoke
+steps:
+  - id: boom
+    continue_on_error: true
+    run: { cmd: "rupu-test-no-such-binary-7f3a" }
+  - id: after
+    run: { cmd: echo, args: ["still ran"] }
+"#;
+    let res = run_with(yaml, "ws_run_coe_spawn", bypass())
+        .await
+        .expect("run completes");
+    let boom = &res.step_results[0];
+    assert!(!boom.success);
+    assert!(boom.error.is_some(), "{boom:?}");
+    assert!(boom.cause.is_none());
+    assert!(res.step_results[1].success, "later steps still run");
+}
+
+#[tokio::test]
 async fn readonly_mode_refuses_a_run_step() {
     let yaml = r#"
 name: bench-smoke

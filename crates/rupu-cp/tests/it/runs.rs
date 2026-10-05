@@ -53,6 +53,7 @@ fn seed_run(id: &str) -> RunRecord {
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
         codename: None,
+        cause: None,
     }
 }
 
@@ -76,6 +77,8 @@ fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
         loop_iteration: None,
         host: None,
         codename: None,
+        cause: None,
+        error: None,
     }
 }
 

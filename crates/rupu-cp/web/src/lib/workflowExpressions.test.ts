@@ -60,9 +60,9 @@ describe('completionsFor', () => {
     expect(par).toContain('steps.par.sub_results');
   });
 
-  it('a plain step prior contributes only output/success/skipped', () => {
+  it('a plain step prior contributes only output/success/skipped/error', () => {
     const xs = inserts(ctx({ priorSteps: [{ id: 'a', kind: 'step' }] })).filter((x) => x.startsWith('steps.a.'));
-    expect(xs.sort()).toEqual(['steps.a.output', 'steps.a.skipped', 'steps.a.success']);
+    expect(xs.sort()).toEqual(['steps.a.error', 'steps.a.output', 'steps.a.skipped', 'steps.a.success']);
   });
 
   it('offers inputs.subject only inside a panel field', () => {

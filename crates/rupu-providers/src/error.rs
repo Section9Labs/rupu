@@ -65,6 +65,15 @@ pub enum ProviderError {
     /// input limit and retries once.
     #[error("long context unavailable (1M beta disabled): {message}")]
     LongContextUnavailable { message: String },
+
+    /// A request carrying Anthropic's server-side fallback opt-in
+    /// (`"fallbacks": "default"` + the `server-side-fallback-2026-07-01`
+    /// beta) was refused with a 400 naming `fallbacks`: this account or
+    /// gateway does not accept it. The client has stopped sending the opt-in,
+    /// so a retry goes out without it. Never retryable as-is — the agent
+    /// runner notes it and retries the turn once.
+    #[error("server-side fallback unavailable: {message}")]
+    FallbackUnavailable { message: String },
 }
 
 impl From<reqwest::Error> for ProviderError {
@@ -129,6 +138,7 @@ impl ProviderError {
             | ProviderError::MissingAuth { .. }
             | ProviderError::AuthConfig(_) => C::Auth,
             ProviderError::LongContextUnavailable { .. } => C::ContextOverflow,
+            ProviderError::FallbackUnavailable { .. } => C::InvalidRequest,
             ProviderError::Json(_)
             | ProviderError::Preflight(_)
             | ProviderError::NotImplemented { .. }
@@ -380,6 +390,19 @@ mod structured_variants_tests {
         assert_eq!(
             ProviderError::Other(anyhow::anyhow!("x")).class(),
             ErrorClass::Unrecognized
+        );
+    }
+
+    #[test]
+    fn fallback_unavailable_is_an_invalid_request_and_never_retryable() {
+        let e = ProviderError::FallbackUnavailable {
+            message: "fallbacks: not enabled".into(),
+        };
+        assert_eq!(e.class(), ErrorClass::InvalidRequest);
+        assert!(!crate::tuned::is_retryable(&e));
+        assert_eq!(
+            e.to_string(),
+            "server-side fallback unavailable: fallbacks: not enabled"
         );
     }
 }

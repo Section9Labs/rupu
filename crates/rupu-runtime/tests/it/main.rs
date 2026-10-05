@@ -7,9 +7,14 @@
 //! Every test that sets process env vars (`RUPU_MOCK_PROVIDER_SCRIPT`,
 //! `RUPU_AUTH_FILE`, the base-URL seams) is `#[serial]`: all of these tests
 //! share one process, so an unserialized one would leak into its neighbours.
+//! So is every test that reaches the provider factory (a hop build,
+//! `model_limits::refresh`), even one that sets nothing: the factory reads
+//! `RUPU_MOCK_PROVIDER_SCRIPT`, and would build a mock for it while a
+//! neighbour has the script set.
 
 mod anthropic_prompt_cache;
 mod gemini_code_assist_project;
+mod hop_builder;
 mod model_limits;
 mod netflow_capture;
 mod oauth_refresh_persists;

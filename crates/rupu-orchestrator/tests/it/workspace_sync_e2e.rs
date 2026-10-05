@@ -204,6 +204,7 @@ impl StepFactory for ReadingFactory {
             surface_tag: None,
             pause: None,
             codename: None,
+            recovery: Default::default(),
         }
     }
 }

@@ -709,6 +709,7 @@ mod tests {
                 total_tokens: (input_tokens + output_tokens) as u64,
                 duration_ms: 100,
                 error: None,
+                outcome: None,
             })
             .unwrap();
         writer.flush().unwrap();
@@ -758,6 +759,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         }
     }
 
@@ -821,6 +823,8 @@ mod tests {
             loop_iteration: None,
             host: None,
             codename: None,
+            cause: None,
+            error: None,
         }
     }
 

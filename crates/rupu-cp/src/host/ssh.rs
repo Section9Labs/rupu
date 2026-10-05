@@ -5955,6 +5955,8 @@ mod tests {
                     run_outcome: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

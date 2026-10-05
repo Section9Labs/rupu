@@ -209,6 +209,7 @@ fn linear_agent_opts(
         surface_tag: None,
         pause: None,
         codename: None,
+        recovery: Default::default(),
     }
 }
 
@@ -981,6 +982,8 @@ async fn fanout_pause_resumes_only_incomplete_units() {
                     success: true,
                     is_fixer: false,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             );
     }
@@ -1446,6 +1449,8 @@ impl Killed {
                         success: true,
                         is_fixer: false,
                         codename: cp.codename.clone(),
+                        error: None,
+                        cause: None,
                     },
                 );
             } else {
@@ -1915,6 +1920,8 @@ async fn resume_ignores_plans_when_the_fanout_list_changed() {
                 finished_at: chrono::Utc::now(),
                 host: None,
                 codename: None,
+                error: None,
+                cause: None,
             },
         )
         .unwrap();

@@ -59,6 +59,7 @@ async fn happy_path_one_turn_no_tools() {
         surface_tag: None,
         pause: None,
         codename: None,
+        recovery: Default::default(),
     };
 
     let res = run_agent(opts).await.unwrap();

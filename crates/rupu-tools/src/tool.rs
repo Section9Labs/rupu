@@ -189,10 +189,16 @@ pub struct DispatchOutcome {
     /// printer uses this to render the child's run inline as a
     /// child callout frame.
     pub transcript_path: PathBuf,
-    /// Final assistant text from the child agent.
+    /// Final assistant text from the child agent. Empty when the child
+    /// failed (spec 2026-10-01 §5.3): its last text is interim or cut off,
+    /// not an answer; `error` says why.
     pub output: String,
     /// True iff the child finished without an agent error.
     pub success: bool,
+    /// Why the child failed — the error its run recorded (the outcome's
+    /// title plus the recovery hint). `None` on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Total tokens consumed by the child run (in + out).
     pub tokens_used: u64,
     /// Wall-clock duration of the child run in milliseconds.

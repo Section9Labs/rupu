@@ -53,6 +53,7 @@ fn opts(
         surface_tag: None,
         pause: None,
         codename: None,
+        recovery: Default::default(),
     }
 }
 
@@ -62,7 +63,13 @@ async fn provider_error_propagates_and_writes_run_complete() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let path = tmp.path().join("run.jsonl");
     let res = run_agent(opts(provider, 5, path.clone(), tmp.path().to_path_buf())).await;
-    assert!(matches!(res, Err(RunError::Provider(_))));
+    // A provider error is an outcome (spec 2026-10-01 §5.2): it fails the
+    // run with the same text as before, now carrying the typed cause.
+    assert!(
+        matches!(&res, Err(e @ RunError::Outcome { .. }) if e.to_string() == "provider: provider error: boom"),
+        "{:?}",
+        res.as_ref().err()
+    );
     let summary = rupu_transcript::JsonlReader::summary(&path).unwrap();
     assert_eq!(summary.status, rupu_transcript::RunStatus::Error);
 }

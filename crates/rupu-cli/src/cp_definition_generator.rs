@@ -66,6 +66,7 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: None,
             anthropic_prompt_cache: None,
+            anthropic_server_side_fallback: Some(gen_cfg.recovery.server_side_fallback),
             openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
                 &gen_req.provider,
                 &gen_cfg.providers,

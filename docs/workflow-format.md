@@ -1245,9 +1245,10 @@ Because `for_each:` JSON-parses a value that starts with `[`, have the upstream 
 | Variable | Meaning |
 | --- | --- |
 | `inputs.<key>` | Runtime input values |
-| `steps.<step_id>.output` | Final output string from an earlier step |
+| `steps.<step_id>.output` | Final output string from an earlier step. Empty when an agent step failed (tolerated by `continue_on_error:`) |
 | `steps.<step_id>.success` | Whether that step completed successfully |
 | `steps.<step_id>.skipped` | Whether that step was skipped by `when:` |
+| `steps.<step_id>.error` | Why a tolerated step failed, as the step recorded it (for an agent step, the outcome's title and hint). Empty on success |
 
 ### Fan-out outputs
 

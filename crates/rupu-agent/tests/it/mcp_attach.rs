@@ -66,6 +66,7 @@ async fn mcp_registry_attaches_tools_to_run() {
         surface_tag: None,
         pause: None,
         codename: None,
+        recovery: Default::default(),
     };
 
     run_agent(opts).await.unwrap();

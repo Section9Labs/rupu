@@ -2224,6 +2224,7 @@ mod tests {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            cause: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();
 
@@ -2267,6 +2268,7 @@ mod tests {
                 total_tokens: 180,
                 duration_ms: 4200,
                 error: None,
+                outcome: None,
             },
         ];
         let mut buf = Vec::new();
@@ -2297,6 +2299,8 @@ mod tests {
                     loop_iteration: None,
                     host: None,
                     codename: None,
+                    cause: None,
+                    error: None,
                 },
             )
             .unwrap();

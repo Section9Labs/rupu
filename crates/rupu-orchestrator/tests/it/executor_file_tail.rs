@@ -87,3 +87,25 @@ async fn waits_for_file_to_be_created() {
         .expect("event");
     assert!(matches!(ev, Event::RunStarted { .. }));
 }
+
+#[tokio::test]
+async fn skips_event_types_this_build_does_not_know() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("events.jsonl");
+    let known = serde_json::to_string(&Event::RunPaused {
+        run_id: "r1".into(),
+    })
+    .unwrap();
+    std::fs::write(
+        &path,
+        format!("{{\"type\":\"step_warped\",\"run_id\":\"r1\"}}\n{known}\n"),
+    )
+    .unwrap();
+
+    let mut source = FileTailRunSource::open(&path).await.expect("open");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), source.next())
+        .await
+        .expect("timeout")
+        .expect("first event");
+    assert!(matches!(first, Event::RunPaused { .. }), "got {first:?}");
+}

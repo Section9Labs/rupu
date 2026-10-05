@@ -206,6 +206,29 @@ schema — passing reasoning tokens again here would double-bill them.
 
 ---
 
+## `[recovery]`
+
+What to do when a model's reply cannot be used or the provider fails the request. See
+[response-outcomes.md](response-outcomes.md) for the recovery ladder.
+
+| Key                    | Type  | Default | Notes |
+|------------------------|-------|---------|-------|
+| `fallbacks`            | array of `{ model, provider? }` | `[]` | Ordered fallback chain used by every agent that declares no `fallbacks:` of its own (an agent's list replaces this one, not merged). An entry without `provider` means the provider the run started on; entries on that provider are tried first, then other providers. Unknown keys are an error |
+| `server_side_fallback` | bool  | `true`  | Ask Anthropic to fall back server-side when the requested model refuses. Applies only to API-key auth on `claude-fable-5`, `claude-fable-5-1`, `claude-opus-5`, `claude-opus-5-5` and `claude-sonnet-5-5`; never OAuth. Set `false` to stop sending it |
+
+```toml
+[recovery]
+fallbacks = [
+  { model = "claude-sonnet-5-5" },
+  { provider = "openai-codex", model = "gpt-5.6-cyber" },
+]
+server_side_fallback = true
+```
+
+A cross-provider entry sends the conversation to that provider's API.
+
+---
+
 ## `[cp]`
 
 Runtime settings for `rupu cp serve` (the control-plane HTTP server). Absent fields
