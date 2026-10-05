@@ -87,6 +87,15 @@ impl FlowSink for NetflowWriter {
     async fn complete_socket(&self, c: crate::record::SocketCompletion) {
         self.offer(LedgerLine::SocketComplete(c));
     }
+
+    async fn capture_state(&self, line: crate::sink::CaptureStateLine) {
+        self.offer(LedgerLine::Capture {
+            ts: chrono::Utc::now(),
+            state: line.state,
+            tool_call_id: line.tool_call_id,
+            note: line.note,
+        });
+    }
 }
 
 pub struct NetflowWriterHandle {

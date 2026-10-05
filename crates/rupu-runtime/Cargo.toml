@@ -31,6 +31,7 @@ rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-config = { path = "../rupu-config" }
 rupu-netflow = { workspace = true, features = ["http"] }
+rupu-netwatch = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true
