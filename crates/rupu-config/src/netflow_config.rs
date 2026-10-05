@@ -22,6 +22,19 @@ pub struct NetflowConfig {
     /// iptoasn.com's combined TSV.
     #[serde(default = "NetflowConfig::default_asn_source_url")]
     pub asn_source_url: String,
+    /// Observe the sockets that agent-run shell commands open (`bash` tool
+    /// subprocesses). Defaults to `true`; `RUPU_NETFLOW_SUBPROCESS=0`
+    /// forces it off regardless.
+    #[serde(default = "NetflowConfig::default_subprocess_capture")]
+    pub subprocess_capture: bool,
+    /// Socket-table poll cadence for the subprocess capture backend, in
+    /// milliseconds. Defaults to 50.
+    #[serde(default = "NetflowConfig::default_subprocess_poll_ms")]
+    pub subprocess_poll_ms: u64,
+    /// How long a closed socket is remembered before its flow is flushed,
+    /// in milliseconds. Defaults to 3000.
+    #[serde(default = "NetflowConfig::default_subprocess_linger_ms")]
+    pub subprocess_linger_ms: u64,
 }
 
 impl NetflowConfig {
@@ -36,6 +49,18 @@ impl NetflowConfig {
     fn default_asn_source_url() -> String {
         "https://iptoasn.com/data/ip2asn-combined.tsv.gz".to_string()
     }
+
+    fn default_subprocess_capture() -> bool {
+        true
+    }
+
+    fn default_subprocess_poll_ms() -> u64 {
+        50
+    }
+
+    fn default_subprocess_linger_ms() -> u64 {
+        3000
+    }
 }
 
 impl Default for NetflowConfig {
@@ -44,6 +69,9 @@ impl Default for NetflowConfig {
             asn_auto_refresh: Self::default_asn_auto_refresh(),
             asn_refresh_interval_days: Self::default_asn_refresh_interval_days(),
             asn_source_url: Self::default_asn_source_url(),
+            subprocess_capture: Self::default_subprocess_capture(),
+            subprocess_poll_ms: Self::default_subprocess_poll_ms(),
+            subprocess_linger_ms: Self::default_subprocess_linger_ms(),
         }
     }
 }
@@ -78,5 +106,36 @@ asn_refresh_interval_days = 30
         assert_eq!(cfg.asn_refresh_interval_days, 30);
         // Unspecified keys still take their default.
         assert!(cfg.asn_source_url.contains("iptoasn.com"));
+    }
+
+    #[test]
+    fn subprocess_fields_default_and_override() {
+        let empty: NetflowConfig = toml::from_str::<toml::Value>("[netflow]\n")
+            .unwrap()
+            .get("netflow")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(empty.subprocess_capture);
+        assert_eq!(empty.subprocess_poll_ms, 50);
+        assert_eq!(empty.subprocess_linger_ms, 3000);
+
+        let toml = r#"
+[netflow]
+subprocess_capture = false
+subprocess_poll_ms = 10
+subprocess_linger_ms = 500
+"#;
+        let cfg: NetflowConfig = toml::from_str::<toml::Value>(toml)
+            .unwrap()
+            .get("netflow")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(!cfg.subprocess_capture);
+        assert_eq!(cfg.subprocess_poll_ms, 10);
+        assert_eq!(cfg.subprocess_linger_ms, 500);
     }
 }
