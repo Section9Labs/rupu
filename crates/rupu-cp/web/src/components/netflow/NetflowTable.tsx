@@ -23,6 +23,7 @@
 //     the agent's `bash` subprocess) so an empty table doesn't imply "no
 //     network activity happened".
 
+import { Link } from 'react-router-dom';
 import { formatBytes, type FlowView, type IncompleteSource } from '../../lib/netflow';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { EmptyState } from '../ui/EmptyState';
@@ -100,11 +101,17 @@ export function isSocketFlow(f: FlowView): boolean {
 }
 
 /** Where the transcript anchor for a socket flow's spawning tool call
- *  lives — null when the run or the tool call is unknown. */
+ *  lives — null when the run or the tool call is unknown. The run id is
+ *  the API-resolved TOP-LEVEL run (`f.run_id`, what `/runs/:id` resolves),
+ *  falling back to `ctx.run_id` (the agent's own run) when unresolved.
+ *  Both ids are URL-encoded; the transcript's `#call-` anchor target must
+ *  encode the tool call id the same way. */
 export function transcriptHref(f: FlowView): string | null {
-  const run = f.ctx.run_id;
+  const run = f.run_id ?? f.ctx.run_id;
   const call = f.ctx.tool_call_id;
-  return run && call ? `/runs/${run}#call-${call}` : null;
+  return run && call
+    ? `/runs/${encodeURIComponent(run)}#call-${encodeURIComponent(call)}`
+    : null;
 }
 
 /** The one authored copy of the dropped-loss sentence — the empty-state
@@ -282,13 +289,14 @@ export function NetflowTable({
             {href && (
               <>
                 {' '}
-                <a
-                  href={href}
+                <Link
+                  to={href}
                   onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => e.stopPropagation()}
                   className="text-brand-500 hover:underline"
                 >
                   transcript
-                </a>
+                </Link>
               </>
             )}
           </span>
@@ -319,35 +327,45 @@ export function NetflowTable({
       key: 'network',
       header: 'Network',
       fit: true,
-      render: (f) => (
-        <>
-          {/* A socket flow has no URL, so the transport → endpoint is its
-              identity; an ASN (when enrichment found one) follows. */}
-          {isSocketFlow(f) && (
+      render: (f) => {
+        if (!isSocketFlow(f)) {
+          return f.asn ? (
+            <span className="font-mono text-note text-ink-mute">
+              AS{f.asn.asn} {f.asn.org}
+            </span>
+          ) : (
+            <span className="text-ink-mute">—</span>
+          );
+        }
+        // A socket flow has no URL, so the transport → endpoint is its
+        // identity; an ASN (when enrichment found one) follows.
+        return (
+          <>
             <span className="font-mono text-note text-ink-dim">
               {f.scheme} → {f.host}:{f.port}
             </span>
-          )}
-          {f.asn ? (
-            <span className="font-mono text-note text-ink-mute">
-              {isSocketFlow(f) ? ' · ' : ''}AS{f.asn.asn} {f.asn.org}
-            </span>
-          ) : (
-            !isSocketFlow(f) && <span className="text-ink-mute">—</span>
-          )}
-        </>
-      ),
+            {f.asn && (
+              <span className="font-mono text-note text-ink-mute">
+                {' · '}AS{f.asn.asn} {f.asn.org}
+              </span>
+            )}
+          </>
+        );
+      },
     },
     {
       key: 'status',
       header: 'Status',
       fit: true,
       align: 'right',
-      render: (f) => (
-        <span className={f.outcome === 'ok' ? 'text-ink-dim' : 'text-err'}>
-          {isSocketFlow(f) ? '—' : (f.status ?? '—')}
-        </span>
-      ),
+      render: (f) =>
+        isSocketFlow(f) ? (
+          <span className="text-ink-mute">—</span>
+        ) : (
+          <span className={f.outcome === 'ok' ? 'text-ink-dim' : 'text-err'}>
+            {f.status ?? '—'}
+          </span>
+        ),
     },
     {
       key: 'bytes_in',
