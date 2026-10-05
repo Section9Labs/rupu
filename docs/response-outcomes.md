@@ -329,15 +329,16 @@ info instead of `●`.
 
 Outcome and recovery rows are cut at 96 columns. An event type this version of
 rupu does not know, written by a newer rupu, prints as an `event` row reading
-`unrecognized event · <type>` followed by its data, cut at 240 columns. Its `type`
-and `data` are preserved when a transcript is copied or re-written; other
-top-level keys on that line are not.
+`unrecognized event · <type>` followed by its data (cut at 200 characters, in a
+row capped at 240 columns). Its `type` and `data` are preserved when a
+transcript is copied or re-written; other top-level keys on that line are not.
 
 A reply block that has no event of its own prints as a `block` row:
 `served by fallback · <from> → <to>` for a server-side fallback boundary,
-`unrecognized block · <type>` followed by the provider's raw JSON (cut at 240
-columns) for a block rupu does not model, and `abandoned · …` for a tool call or
-reasoning block abandoned at a mid-output fallback. A refused or retried turn's
+`unrecognized block · <type>` followed by the provider's raw JSON (cut at 200
+characters, in a row capped at 240 columns) for a block rupu does not model,
+and `abandoned · …` for a tool call or reasoning block abandoned at a
+mid-output fallback. A refused or retried turn's
 tool calls and reasoning print as `block` rows too (`tool call · <name>`,
 `reasoning`): they were never run or kept, and the rows show the reply whole.
 
