@@ -48,6 +48,7 @@ async fn poll_bucket_run_mirrors_and_finishes() {
     };
     mirror
         .create_run(run_id, host_id, &spec)
+        .await
         .expect("create_run");
 
     // Build an in-memory bucket (no cloud required).
@@ -175,6 +176,7 @@ async fn poll_bucket_run_remirrors_run_json_each_tick() {
     };
     mirror
         .create_run(run_id, host_id, &spec)
+        .await
         .expect("create_run");
 
     let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/host_REMIRROR01");

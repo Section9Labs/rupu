@@ -1976,10 +1976,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn terminal_partial_mirrored_run_unseals_when_the_cache_fills() {
+    #[tokio::test]
+    async fn terminal_partial_mirrored_run_unseals_when_the_cache_fills() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, _recorded) = crate::usage::tests::seed_remote_run(tmp.path());
+        let (store, _recorded) = crate::usage::tests::seed_remote_run(tmp.path()).await;
         let mut rec = store.load("run_01USAGE").unwrap();
         rec.status = RunStatus::Completed;
         store.update(&rec).unwrap();
@@ -2576,10 +2576,10 @@ mod tests {
         assert!(!u.partial);
     }
 
-    #[test]
-    fn remote_worker_run_resolves_mirror_cache() {
+    #[tokio::test]
+    async fn remote_worker_run_resolves_mirror_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, recorded) = crate::usage::tests::seed_remote_run(tmp.path());
+        let (store, recorded) = crate::usage::tests::seed_remote_run(tmp.path()).await;
         assert!(!recorded.exists());
         let cache = tmp
             .path()
