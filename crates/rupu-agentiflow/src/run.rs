@@ -10,7 +10,13 @@
 //!   events.jsonl               append-only event log (shape below)
 //!   lead/transcript.r<N>.jsonl the lead's transcript for round N
 //!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
+//!   board/board/               the lead's coordination board (posts, claims, directives)
+//!   mailboxes/                 per-participant inboxes (`rupu_fleet::Mailbox` root)
 //! ```
+//!
+//! `board/` and `mailboxes/` are created lazily by the stores on first write.
+//! The lead reaches them through always-on `board.*` / `msg.send` tools and
+//! reads them back each turn through the inbox / standing-directive collectors.
 //!
 //! The lead's configured base transcript path is `lead/transcript.jsonl`; the
 //! driver writes one file per round beside it (`transcript.r0.jsonl`, ...)
@@ -508,6 +514,19 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             if !agent_tools.iter().any(|t| t == "report_finding") {
                 agent_tools.push("report_finding".to_string());
             }
+            // The lead's coordination substrate: a file-backed board and mailboxes
+            // under the run dir, the tools that act on them, and the collectors that
+            // fold its inbox and standing directives into each turn. "lead" is the
+            // lead's participant id (the `to: "lead"` inbox other participants address).
+            let board = Arc::new(rupu_fleet::Board::new(run_dir.join("board")));
+            let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir.join("mailboxes")));
+            let fleet_ctx = Arc::new(crate::tools::FleetToolCtx::new(
+                board.clone(),
+                mailbox.clone(),
+                "lead",
+            ));
+            let extra_tools = crate::tools::fleet_tools(fleet_ctx);
+            let collectors = crate::collectors::lead_collectors(mailbox, board, "lead");
             let lead_cfg = LeadConfig {
                 agent_name: lead.agent_name,
                 system_prompt: lead.system_prompt,
@@ -527,6 +546,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 // `target_id(workspace, id)` the envelope's goal evaluator reads.
                 scope_name: Some(id.clone()),
                 findings_engagement: Some(findings_engagement),
+                extra_tools,
+                collectors,
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,
@@ -600,6 +621,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
 mod tests {
     use super::*;
     use crate::operator::OperatorMessage;
+    use rupu_agent::runner::CapturingMockProvider;
     use rupu_agent::{MockProvider, ScriptedTurn};
     use rupu_coverage::{
         append_record, Attribution, FindingEvidence, FindingProfile, FindingRecord, FindingScope,
@@ -1125,6 +1147,191 @@ mod tests {
         );
         // The evaluator saw it: the finding goal is met from the pooled ledger.
         assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+    }
+
+    /// Every request a [`CapturingMockProvider`] saw, shared across the
+    /// providers the factory mints (one per round).
+    type Captured = Arc<std::sync::Mutex<Vec<rupu_providers::LlmRequest>>>;
+
+    /// A factory handing out one `CapturingMockProvider` per round -- `rounds[i]`
+    /// is round i's script -- all recording into the returned [`Captured`].
+    fn capturing_factory(rounds: Vec<Vec<ScriptedTurn>>) -> (ProviderFactory, Captured) {
+        let captured: Captured = Arc::default();
+        let shared = captured.clone();
+        let mut rounds = rounds.into_iter();
+        let factory: ProviderFactory = Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
+            let mut p = CapturingMockProvider::new(rounds.next().unwrap_or_default());
+            p.captured = shared.clone();
+            Box::new(p)
+        });
+        (factory, captured)
+    }
+
+    /// The model-visible text of a request: every text block and tool result.
+    /// (`ToolUse` inputs are deliberately left out so a body the lead merely
+    /// SENT is not mistaken for one that was delivered back to it.)
+    fn request_texts(req: &rupu_providers::LlmRequest) -> Vec<String> {
+        use rupu_providers::types::ContentBlock;
+        req.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn any_contains(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|t| t.contains(needle))
+    }
+
+    fn tool_turn(id: &str, name: &str, input: Value) -> ScriptedTurn {
+        ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: id.into(),
+            tool_name: name.into(),
+            tool_input: input,
+            stop: rupu_agent::StopReason::ToolUse,
+        }
+    }
+
+    fn done_turn() -> ScriptedTurn {
+        ScriptedTurn::AssistantText {
+            text: "Round done.".into(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }
+    }
+
+    #[test]
+    fn the_lead_posts_to_the_board_and_sees_a_standing_directive() {
+        // The lead lists NO tools of its own (`agent_tools` is empty), so
+        // `board.post` can only reach it as an always-on injected tool.
+        let fx = fixture();
+        let id = "af_board";
+        // An operator directive queued on the run's board BEFORE the run starts.
+        // This creates `board/` but not `agentiflow.json`, so the run is not
+        // refused as already existing, and the run never wipes the directory.
+        let seeded = rupu_fleet::Board::new(run_dir(&fx, id).join("board"));
+        seeded
+            .put_directive(&rupu_fleet::Directive {
+                author: "operator".into(),
+                ts: "2026-10-05T11:59:00Z".into(),
+                body: "never scan outside 10.0.0.0/24".into(),
+                addressed_to: None,
+            })
+            .unwrap();
+
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t1",
+                "board.post",
+                json!({ "kind": "note", "body": "starting on the web tier" }),
+            ),
+            done_turn(),
+        ]]);
+        let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = factory;
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+
+        // (a) The post is in the run's board, read back through a FRESH handle.
+        let fresh = rupu_fleet::Board::new(run_dir(&fx, id).join("board"));
+        let posts = fresh.read_posts().unwrap();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(posts[0].author, "lead");
+        assert_eq!(posts[0].body, "starting on the web tier");
+        // The directive survived the run untouched.
+        assert_eq!(fresh.read_directives().unwrap().len(), 1);
+
+        // (b) The DirectiveCollector put the standing directive in front of the
+        // model on its very first call. Injections are not transcript events, so
+        // the request the provider received is where delivery is observable.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one model call per scripted turn");
+        let first = request_texts(&reqs[0]);
+        assert!(
+            any_contains(&first, "never scan outside 10.0.0.0/24")
+                && any_contains(&first, "source: directive:board"),
+            "the directive reaches the lead's first turn: {first:?}"
+        );
+        // ...and stands: it is re-asserted on the next turn too.
+        assert!(any_contains(
+            &request_texts(&reqs[1]),
+            "never scan outside 10.0.0.0/24"
+        ));
+        // (c) The tool ran for real: its success result came back to the model.
+        assert!(
+            any_contains(&request_texts(&reqs[1]), "posted [note]"),
+            "{:?}",
+            request_texts(&reqs[1])
+        );
+    }
+
+    #[test]
+    fn the_lead_receives_mailbox_messages_and_can_send() {
+        let fx = fixture();
+        let id = "af_mail";
+        // A worker's message already waiting in the lead's inbox.
+        let seeded = rupu_fleet::Mailbox::new(run_dir(&fx, id).join("mailboxes"));
+        seeded
+            .send(
+                "lead",
+                &rupu_fleet::FleetMessage {
+                    from: "worker-1".into(),
+                    ts: "2026-10-05T11:59:00Z".into(),
+                    body: "port 22 open on 10.0.0.5".into(),
+                },
+                64,
+            )
+            .unwrap();
+
+        // The lead then messages its own inbox via the injected `msg.send`.
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t1",
+                "msg.send",
+                json!({ "to": "lead", "body": "note-to-self: check ssh next" }),
+            ),
+            done_turn(),
+        ]]);
+        let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = factory;
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one model call per scripted turn");
+        let first = request_texts(&reqs[0]);
+        let second = request_texts(&reqs[1]);
+        // The worker's message was drained into the first turn...
+        assert!(
+            any_contains(&first, "port 22 open on 10.0.0.5")
+                && any_contains(&first, "source: mailbox:lead"),
+            "{first:?}"
+        );
+        assert!(
+            !any_contains(&first, "note-to-self"),
+            "not sent yet on turn 0"
+        );
+        // ...and the lead's own message came back on the turn after it sent it.
+        assert!(
+            any_contains(&second, "note-to-self: check ssh next"),
+            "{second:?}"
+        );
+        // `Once` delivery: the worker's message persisted in history (not
+        // re-drained), so it is still there exactly once.
+        let delivered = second
+            .iter()
+            .filter(|t| t.contains("port 22 open on 10.0.0.5"))
+            .count();
+        assert_eq!(delivered, 1, "{second:?}");
+        // Both inboxes are now empty.
+        let fresh = rupu_fleet::Mailbox::new(run_dir(&fx, id).join("mailboxes"));
+        assert!(fresh.drain("lead").unwrap().is_empty());
     }
 
     #[test]

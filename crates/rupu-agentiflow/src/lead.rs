@@ -264,6 +264,15 @@ pub struct LeadConfig {
     /// and makes the lead's findings profile-typed; `None` records bare
     /// findings with no engagement routing.
     pub findings_engagement: Option<Arc<rupu_coverage::ActiveSet>>,
+    /// Always-on tools injected into every round's registry AFTER the
+    /// `agent_tools` filter (so they need not be listed there): the lead's
+    /// board / mailbox coordination tools. Shared `Arc`s -- the same instances
+    /// serve every round, so their per-run state (held claims) persists.
+    pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
+    /// Ambient-context collectors run before each of the lead's model calls
+    /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
+    /// into every round's `AgentRunOpts`.
+    pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
 }
 
 /// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
@@ -277,12 +286,14 @@ pub struct LeadConfig {
 /// must create, drive AND drop the driver from a BLOCKING context -- a
 /// dedicated thread or `spawn_blocking` -- never directly on a runtime worker.
 ///
-/// What a round does NOT wire up yet (Plan 3b): fleet-backed turn collectors,
-/// the MCP/SCM registry, dispatchable agents, and a codename. It runs with
-/// `BypassDecider`, so [`LeadConfig::agent_tools`] is the only tool gate: the
-/// runner's registry is filtered to exactly that list (empty = no tools). No
-/// collectors, no parent run, depth 0 -- the same shape as a session turn's
-/// `AgentRunOpts` minus the CLI-only plumbing.
+/// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
+/// dispatchable agents, and a codename. It runs with `BypassDecider`, so the
+/// tool gate is [`LeadConfig::agent_tools`] (the runner's registry is filtered
+/// to exactly that list; empty = no tools) plus [`LeadConfig::extra_tools`],
+/// the caller's explicit always-on injections (the board / mailbox tools).
+/// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
+/// into each turn. No parent run, depth 0 -- the same shape as a session
+/// turn's `AgentRunOpts` minus the CLI-only plumbing.
 pub struct RunAgentLeadDriver {
     cfg: LeadConfig,
     make_provider: ProviderFactory,
@@ -380,8 +391,8 @@ impl LeadDriver for RunAgentLeadDriver {
             surface_tag: None,
             pause: None,
             seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+            collectors: self.cfg.collectors.clone(),
+            extra_tools: self.cfg.extra_tools.clone(),
             recovery: Default::default(),
         };
 
@@ -640,6 +651,8 @@ mod tests {
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
             scope_name: None,
             findings_engagement: None,
+            extra_tools: Vec::new(),
+            collectors: Vec::new(),
         }
     }
 
