@@ -845,26 +845,36 @@ fn emit_turn_content(
     Ok(tool_uses)
 }
 
-/// A discarded turn's (refused, blocked or retried) non-text blocks — tool
-/// calls, reasoning, `fallback`, `unknown` — as `AssistantBlock`s, so the
-/// reply is still shown whole; its text arrives as `AssistantDelta`s when
-/// streamed. Nothing here is dispatched, and replay drops it all with the
-/// rest of the discarded turn. A block before the reply's last `fallback` is
-/// marked abandoned, as [`emit_turn_content`] marks it.
+/// A discarded turn's (refused, blocked or retried) content, so the reply
+/// is still shown whole: its non-text blocks — tool calls, reasoning,
+/// `fallback`, `unknown` — as `AssistantBlock`s, and, when `text_unstreamed`
+/// (a `no_stream` run, which wrote no `AssistantDelta`s while the reply
+/// arrived), its text as `AssistantDelta`s — the event the streaming path
+/// writes, so every viewer shows it the same way. Nothing here is
+/// dispatched, and replay drops it all with the rest of the discarded turn.
+/// A block before the reply's last `fallback` is marked abandoned, as
+/// [`emit_turn_content`] marks it.
 fn emit_discarded_blocks(
     writer: &mut JsonlWriter,
     content: &[ContentBlock],
+    text_unstreamed: bool,
 ) -> Result<(), RunError> {
     let boundary = crate::outcome::fallback_boundary(content);
     for (i, block) in content.iter().enumerate() {
-        if matches!(
-            block,
-            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. }
-        ) {
-            continue;
+        match block {
+            ContentBlock::Text { text } => {
+                if text_unstreamed && !text.is_empty() {
+                    writer.write(&Event::AssistantDelta {
+                        content: text.clone(),
+                    })?;
+                }
+            }
+            ContentBlock::ToolResult { .. } => {}
+            _ => {
+                let abandoned = crate::outcome::is_abandoned(boundary, i, block);
+                writer.write(&assistant_block_event(block, abandoned))?;
+            }
         }
-        let abandoned = crate::outcome::is_abandoned(boundary, i, block);
-        writer.write(&assistant_block_event(block, abandoned))?;
     }
     Ok(())
 }
@@ -1369,8 +1379,10 @@ pub struct AgentRunOpts {
     pub turn_index_offset: u32,
     pub mode_str: String,
     /// If true, don't render tokens as they arrive and don't write
-    /// `AssistantDelta`/`ThinkingDelta` transcript events (the transcript keeps
-    /// its final-message-only shape). Display only: the request still streams
+    /// `AssistantDelta`/`ThinkingDelta` transcript events while a reply
+    /// streams (the transcript keeps its final-message-only shape). A
+    /// discarded turn has no final message, so its text is written as
+    /// `AssistantDelta`s once the reply is in. Display only: the request still streams
     /// on the wire, so a long response cannot hit the HTTP request timeout and
     /// the full output cap applies. Default is false. Used by --no-stream.
     pub no_stream: bool,
@@ -2102,7 +2114,9 @@ async fn run_agent_inner(
                     // no clamping. The sink is quiet — it forwards each event
                     // to `on_stream_event` (if set) but prints nothing and
                     // writes no `AssistantDelta`/`ThinkingDelta`, so the
-                    // transcript keeps its final-message-only shape.
+                    // transcript keeps its final-message-only shape (a
+                    // discarded turn's text is written afterwards, by
+                    // `emit_discarded_blocks`).
                     let mut quiet = |ev: StreamEvent| {
                         if let Some(cb) = opts.on_stream_event.as_ref() {
                             cb(ev);
@@ -2653,7 +2667,7 @@ async fn run_agent_inner(
             // and not kept. Rung 0 can retry it (with the output cap raised,
             // or once for an incomplete reply); otherwise it climbs the ladder.
             if let (true, Some(o), Some(p)) = (discard, outcome.as_ref(), policy) {
-                emit_discarded_blocks(&mut writer, &resp.content)?;
+                emit_discarded_blocks(&mut writer, &resp.content, opts.no_stream)?;
                 writer.write(&turn_end_event(
                     turn_idx,
                     &resp,

@@ -441,6 +441,86 @@ async fn a_discarded_turn_writes_its_tool_calls_and_reasoning_as_blocks() {
     assert_replay_lockstep(&ran);
 }
 
+/// `AssistantDelta` contents, in order.
+fn deltas(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AssistantDelta { content } => Some(content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `--no-stream` run writes no deltas while a reply arrives, so a refused
+/// (discarded) turn's text is written afterwards as `AssistantDelta`s — the
+/// event a streamed run writes — before its discarded `TurnEnd`. Replay
+/// still drops the turn.
+#[tokio::test]
+async fn a_no_stream_refused_turn_writes_its_text_as_deltas() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(
+        Box::new(MockProvider::new(vec![ScriptedTurn::Reply {
+            content: vec![text("first part"), text("second part")],
+            stop: Stop::synthetic(StopReason::Refusal, "mock"),
+            usage: Usage::default(),
+        }])),
+        &tmp,
+        transcript.clone(),
+    );
+    opts.no_stream = true;
+    let result = run_agent(opts).await.expect("the loop completes");
+    assert_eq!(result.status, RunStatus::Error);
+    let events = read_events(&transcript);
+    assert_eq!(deltas(&events), vec!["first part", "second part"]);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::AssistantMessage { .. })));
+    let last_delta = events
+        .iter()
+        .rposition(|e| matches!(e, Event::AssistantDelta { .. }))
+        .unwrap();
+    let discarded_end = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::TurnEnd {
+                    discarded: true,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(last_delta < discarded_end);
+    let rebuilt = rupu_agent::replay::reconstruct_messages(&events).expect("replay");
+    assert_eq!(
+        serde_json::to_value(&rebuilt).unwrap(),
+        serde_json::to_value(&result.final_messages).unwrap()
+    );
+}
+
+/// A kept turn on a `--no-stream` run is unchanged: its text is an
+/// `AssistantMessage` and no deltas are written.
+#[tokio::test]
+async fn a_no_stream_kept_turn_writes_no_deltas() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("run.jsonl");
+    let mut opts = build_opts(
+        Box::new(MockProvider::new(vec![reply(
+            StopReason::EndTurn,
+            vec![text("answer")],
+        )])),
+        &tmp,
+        transcript.clone(),
+    );
+    opts.no_stream = true;
+    let result = run_agent(opts).await.expect("the loop completes");
+    assert_eq!(result.status, RunStatus::Ok);
+    assert!(deltas(&read_events(&transcript)).is_empty());
+}
+
 #[tokio::test]
 async fn empty_reply_is_nudged_once() {
     let ran = run_script(empty_script(), "s1").await;
