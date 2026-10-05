@@ -142,10 +142,10 @@ describe('NetflowTable', () => {
     expect(screen.getByText(/ASN data not loaded/i)).toBeInTheDocument();
   });
 
-  it('states the phase-1 scope limit on the empty state', () => {
+  it('states the covered scope (incl. bash subprocess connections) on the empty state', () => {
     render(<NetflowTable flows={[]} droppedTotal={0} asnLoaded />);
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
-    expect(screen.getByText(/does not cover.*subprocess/i)).toBeInTheDocument();
+    expect(screen.getByText(/own egress.*bash subprocess connections/i)).toBeInTheDocument();
   });
 
   it('surfaces a non-zero dropped count even when every flow was dropped', () => {

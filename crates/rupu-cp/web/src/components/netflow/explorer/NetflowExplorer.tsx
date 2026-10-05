@@ -215,7 +215,11 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
             Updating…
           </p>
         )}
-        <CoveragePopover scope={scope} droppedTotal={explorer.dropped_total} />
+        <CoveragePopover
+          scope={scope}
+          droppedTotal={explorer.dropped_total}
+          capture={flows.capture}
+        />
       </div>
       <ActivityStrip
         histogram={explorer.histogram}

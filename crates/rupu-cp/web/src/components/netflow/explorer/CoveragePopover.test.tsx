@@ -31,6 +31,20 @@ describe('CoveragePopover', () => {
     expect(screen.queryByText(/sub-agents this run dispatched/i)).not.toBeInTheDocument();
   });
 
+  it('states capture-unavailable on the pill and its reason in the popover at run scope', () => {
+    render(
+      <CoveragePopover
+        scope="run"
+        droppedTotal={0}
+        capture={{ state: 'unavailable', reason: 'lsof not permitted', notes: [] }}
+      />,
+    );
+    const pill = screen.getByRole('button', { name: /coverage & gaps/i });
+    expect(pill).toHaveTextContent(/subprocess capture unavailable/i);
+    fireEvent.click(pill);
+    expect(screen.getByText(/capture unavailable on this run: lsof not permitted/i)).toBeInTheDocument();
+  });
+
   it('carries the fidelity legend from FIDELITY_TITLE for all four levels', () => {
     render(<CoveragePopover scope="global" droppedTotal={0} />);
     fireEvent.click(screen.getByRole('button', { name: /coverage & gaps/i }));

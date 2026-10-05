@@ -14,7 +14,11 @@ import { useEffect, useRef, useState } from 'react';
 import type { Fidelity } from '../../../lib/netflow';
 import { FidelityBadge, FIDELITY_TITLE } from '../FidelityBadge';
 import { droppedTotalSentence } from '../NetflowTable';
-import { disclosureText, type NetflowScope } from '../ScopeDisclosure';
+import {
+  disclosureText,
+  type NetflowCaptureStatus,
+  type NetflowScope,
+} from '../ScopeDisclosure';
 
 // Rank order: least to most observed.
 const LEGEND_ORDER: Fidelity[] = ['coarse', 'socket', 'http', 'full'];
@@ -22,9 +26,12 @@ const LEGEND_ORDER: Fidelity[] = ['coarse', 'socket', 'http', 'full'];
 export function CoveragePopover({
   scope,
   droppedTotal,
+  capture,
 }: {
   scope: NetflowScope;
   droppedTotal: number;
+  /** Run scope only: `NetflowResponse.capture`. */
+  capture?: NetflowCaptureStatus | null;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -65,6 +72,9 @@ export function CoveragePopover({
         {droppedTotal > 0 && (
           <span className="font-semibold">· {droppedTotal} dropped</span>
         )}
+        {scope === 'run' && capture?.state === 'unavailable' && (
+          <span className="font-semibold">· subprocess capture unavailable</span>
+        )}
       </button>
       {open && (
         <div
@@ -75,7 +85,7 @@ export function CoveragePopover({
           <p className="mb-2 text-meta font-semibold uppercase tracking-wider text-ink-mute">
             What this view covers
           </p>
-          <p className="mb-3 text-note leading-relaxed text-ink-dim">{disclosureText(scope)}</p>
+          <p className="mb-3 text-note leading-relaxed text-ink-dim">{disclosureText(scope, capture)}</p>
           <div className="flex flex-col gap-2 border-t border-border pt-2.5">
             {LEGEND_ORDER.map((f) => (
               <div key={f} className="flex items-baseline gap-2">

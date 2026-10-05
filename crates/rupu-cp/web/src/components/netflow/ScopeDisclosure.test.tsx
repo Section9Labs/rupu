@@ -103,6 +103,61 @@ describe('disclosureText sub-agent note', () => {
   );
 });
 
+describe('bash subprocess coverage', () => {
+  it.each(SCOPES)('lists bash subprocess connections as covered at %s scope', (scope) => {
+    expect(netflowCoverageList(scope)).toMatch(
+      /bash subprocess connections \(TCP\/UDP, by process, attributed to the tool call\)/,
+    );
+    expect(disclosureText(scope)).toMatch(/bash subprocess connections/);
+  });
+
+  it.each(SCOPES)('states the subprocess capture gaps at %s scope', (scope) => {
+    const text = disclosureText(scope);
+    expect(text).toMatch(/no hostnames \(IP \+ ASN only\)/);
+    expect(text).toMatch(/unconnected UDP has no destination/);
+    expect(text).toMatch(/detached children and very short connections may be missed/);
+    expect(text).toMatch(/remote host's bash flows stay on that host/);
+  });
+
+  it('keeps the existing provider/SCM coverage and non-HTTP limits', () => {
+    const text = disclosureText('run');
+    expect(text).toMatch(/provider APIs, SCM connectors/);
+    expect(text).toMatch(/git2 clones/);
+  });
+
+  it('surfaces an unavailable capture state with its reason at run scope', () => {
+    const text = disclosureText('run', {
+      state: 'unavailable',
+      reason: 'lsof not permitted',
+      notes: [],
+    });
+    expect(text).toMatch(/Subprocess capture unavailable on this run: lsof not permitted/);
+  });
+
+  it('surfaces loss notes, and says nothing extra for a clean active capture', () => {
+    const noted = disclosureText('run', {
+      state: 'active',
+      reason: null,
+      notes: ['2 short connections missed', 'poll lagged'],
+    });
+    expect(noted).toMatch(/Capture notes: 2 short connections missed; poll lagged/);
+    expect(noted).not.toMatch(/capture unavailable/i);
+
+    const clean = disclosureText('run', { state: 'active', notes: [] });
+    expect(clean).not.toMatch(/Capture notes|capture unavailable/i);
+    expect(clean).toBe(disclosureText('run'));
+  });
+
+  it.each(['project', 'global'] as NetflowScope[])(
+    'ignores a capture status outside run scope (%s)',
+    (scope) => {
+      expect(disclosureText(scope, { state: 'unavailable', reason: 'x', notes: ['n'] })).toBe(
+        disclosureText(scope),
+      );
+    },
+  );
+});
+
 describe('disclosureText coverage claims', () => {
   it.each(SCOPES)('never claims MCP or webhook coverage at %s scope', (scope) => {
     expect(disclosureText(scope)).not.toMatch(/MCP/i);

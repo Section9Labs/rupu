@@ -194,6 +194,18 @@ export interface NetflowResponse {
    *  Absent (not `[]`) when nothing is missing — the server omits the field
    *  entirely, so treat `undefined` as complete. */
   incomplete?: IncompleteSource[];
+  /** Subprocess-capture availability — run scope only. Flattened by the
+   *  server from the run's `capture` ledger lines: `state` is the LATEST
+   *  line's, `reason` is set when unavailable, `notes` are every
+   *  visible-loss note. Absent when the run recorded no capture line. */
+  capture?: RunCaptureStatus;
+}
+
+/** `rupu_cp::api::netflow::CaptureSummary`. */
+export interface RunCaptureStatus {
+  state: 'active' | 'unavailable';
+  reason?: string | null;
+  notes: string[];
 }
 
 // ---------------------------------------------------------------------------
