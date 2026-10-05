@@ -2006,6 +2006,64 @@ async fn a_tool_call_before_a_mid_output_fallback_is_abandoned() {
     );
 }
 
+/// A mid-output fallback with nothing after the boundary: the abandoned tool
+/// call is not content, so the reply is an empty reply — nudged once at rung
+/// 0, never dispatched, never sent back.
+#[tokio::test]
+async fn a_reply_with_only_an_abandoned_tool_call_is_an_empty_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::Reply {
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "abandoned_1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "out.txt", "content": "x" }),
+                },
+                fallback_block(),
+            ],
+            stop: served_by_stop(StopReason::ToolUse),
+            usage: Usage::default(),
+        },
+        reply(StopReason::EndTurn, vec![text("done")]),
+    ]);
+    let captured = provider.captured.clone();
+    let transcript = tmp.path().join("run.jsonl");
+    let opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    let result = run_agent(opts).await.expect("the loop completes");
+    assert_eq!(result.status, RunStatus::Ok);
+    let events = read_events(&transcript);
+
+    assert!(!tmp.path().join("out.txt").exists());
+    assert!(!events.iter().any(|e| matches!(e, Event::ToolCall { .. })));
+    let classes: Vec<String> = outcomes(&events).into_iter().map(|o| o.class).collect();
+    assert!(classes.contains(&"empty_reply".to_string()), "{classes:?}");
+    assert!(
+        recoveries(&events)
+            .iter()
+            .any(|(rung, action, ..)| *rung == 0 && *action == RecoveryAction::Continued),
+        "the empty-reply nudge"
+    );
+
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let last = requests[1].messages.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    assert_eq!(last_text(last), Some(EMPTY_REPLY_NOTE));
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Assistant),
+        "the empty reply is never sent back"
+    );
+    let rebuilt = rupu_agent::replay::reconstruct_messages(&events).expect("replay");
+    assert_eq!(
+        serde_json::to_value(&rebuilt).unwrap(),
+        serde_json::to_value(&result.final_messages).unwrap()
+    );
+}
+
 /// A turn a server-side fallback served from the start carries a leading
 /// `fallback` block; an unrecognized block is kept verbatim. Both reach the
 /// transcript in position, and replay rebuilds the conversation byte for

@@ -102,10 +102,36 @@ fn detail_str<'a>(stop: &'a Stop, path: &[&str]) -> Option<&'a str> {
     cur.as_str()
 }
 
+/// The index of the reply's last server-side `Fallback` block. Every
+/// `ToolUse` and `Reasoning` block before it belongs to the model the API
+/// swapped out mid-output: the API passes only the partial's text on to the
+/// fallback model, so those blocks are abandoned (spec 2026-10-01 §4.5).
+pub(crate) fn fallback_boundary(content: &[ContentBlock]) -> Option<usize> {
+    content
+        .iter()
+        .rposition(|b| matches!(b, ContentBlock::Fallback { .. }))
+}
+
+/// Whether `content[i]` is abandoned at the reply's mid-output fallback
+/// ([`fallback_boundary`]): never dispatched, never in the conversation.
+/// Text stays — it is the fallback model's continuation context.
+pub(crate) fn is_abandoned(boundary: Option<usize>, i: usize, block: &ContentBlock) -> bool {
+    boundary.is_some_and(|b| i < b)
+        && matches!(
+            block,
+            ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. }
+        )
+}
+
+/// Whether the reply has content the conversation keeps: non-blank text or
+/// a tool call. A tool call abandoned at a mid-output server-side fallback
+/// ([`is_abandoned`]) does not count — it is never dispatched or kept, so a
+/// reply with nothing after the boundary is an empty reply.
 fn has_usable_content(resp: &LlmResponse) -> bool {
-    resp.content.iter().any(|b| match b {
+    let boundary = fallback_boundary(&resp.content);
+    resp.content.iter().enumerate().any(|(i, b)| match b {
         ContentBlock::Text { text } => !text.trim().is_empty(),
-        ContentBlock::ToolUse { .. } => true,
+        ContentBlock::ToolUse { .. } => !is_abandoned(boundary, i, b),
         _ => false,
     })
 }
@@ -308,6 +334,32 @@ mod tests {
             let o = classify_response(&resp(synth(reason), vec![])).unwrap();
             assert_eq!(o.class, OutcomeClass::EmptyReply);
         }
+    }
+
+    /// A tool call abandoned at a mid-output fallback is not content: with
+    /// nothing after the boundary the reply is empty. One after it counts.
+    #[test]
+    fn a_tool_call_abandoned_at_a_fallback_is_not_content() {
+        let call = |id: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        };
+        let fallback = ContentBlock::Fallback {
+            from_model: "model-a".into(),
+            to_model: "model-b".into(),
+        };
+        let o = classify_response(&resp(
+            synth(StopReason::ToolUse),
+            vec![call("a"), fallback.clone()],
+        ))
+        .unwrap();
+        assert_eq!(o.class, OutcomeClass::EmptyReply);
+        assert!(classify_response(&resp(
+            synth(StopReason::ToolUse),
+            vec![call("a"), fallback, call("b")],
+        ))
+        .is_none());
     }
 
     #[test]

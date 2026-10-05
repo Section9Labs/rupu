@@ -762,36 +762,15 @@ fn terminated(
     }
 }
 
-/// The index of the reply's last server-side `Fallback` block. Every
-/// `ToolUse` and `Reasoning` block before it belongs to the model the API
-/// swapped out mid-output: the API passes only the partial's text on to the
-/// fallback model, so those blocks are abandoned (spec 2026-10-01 §4.5).
-fn fallback_boundary(content: &[ContentBlock]) -> Option<usize> {
-    content
-        .iter()
-        .rposition(|b| matches!(b, ContentBlock::Fallback { .. }))
-}
-
-/// Whether `content[i]` is abandoned at the reply's mid-output fallback
-/// ([`fallback_boundary`]): never dispatched, never in the conversation.
-/// Text stays — it is the fallback model's continuation context.
-fn is_abandoned(boundary: Option<usize>, i: usize, block: &ContentBlock) -> bool {
-    boundary.is_some_and(|b| i < b)
-        && matches!(
-            block,
-            ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. }
-        )
-}
-
 /// The reply's content as it joins the conversation: every block but the
 /// abandoned ones, in order. Replay rebuilds exactly this from the events
 /// [`emit_turn_content`] writes.
 fn conversation_content(content: &[ContentBlock]) -> Vec<ContentBlock> {
-    let boundary = fallback_boundary(content);
+    let boundary = crate::outcome::fallback_boundary(content);
     content
         .iter()
         .enumerate()
-        .filter(|(i, b)| !is_abandoned(boundary, *i, b))
+        .filter(|(i, b)| !crate::outcome::is_abandoned(boundary, *i, b))
         .map(|(_, b)| b.clone())
         .collect()
 }
@@ -815,7 +794,7 @@ fn assistant_block_event(block: &ContentBlock, abandoned: bool) -> Event {
 /// dispatch, as `(call_id, tool, input)`.
 ///
 /// A `tool_use` or reasoning block before the reply's last `fallback` is
-/// abandoned ([`is_abandoned`]): it is written as `AssistantBlock {
+/// abandoned ([`crate::outcome::is_abandoned`]): it is written as `AssistantBlock {
 /// abandoned: true }` so the reply is shown whole, and is neither returned
 /// for dispatch nor (see [`conversation_content`]) kept in the conversation.
 fn emit_turn_content(
@@ -823,9 +802,9 @@ fn emit_turn_content(
     content: &[ContentBlock],
 ) -> Result<Vec<(String, String, serde_json::Value)>, RunError> {
     let mut tool_uses = Vec::new();
-    let boundary = fallback_boundary(content);
+    let boundary = crate::outcome::fallback_boundary(content);
     for (i, block) in content.iter().enumerate() {
-        if is_abandoned(boundary, i, block) {
+        if crate::outcome::is_abandoned(boundary, i, block) {
             writer.write(&assistant_block_event(block, true))?;
             continue;
         }
