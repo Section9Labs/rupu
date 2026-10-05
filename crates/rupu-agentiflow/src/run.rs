@@ -1,0 +1,1085 @@
+//! The agentiflow entry point: [`run_agentiflow`] validates a definition,
+//! lays out a run directory, wires the envelope to a `run_agent`-backed lead,
+//! runs it to a stop, and persists the result.
+//!
+//! # Run-directory layout
+//!
+//! ```text
+//! <global>/agentiflows/<id>/
+//!   agentiflow.json            AgentiflowRecord, rewritten atomically (tmp + rename)
+//!   events.jsonl               append-only event log (shape below)
+//!   lead/transcript.r<N>.jsonl the lead's transcript for round N
+//!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
+//! ```
+//!
+//! The lead's configured base transcript path is `lead/transcript.jsonl`; the
+//! driver writes one file per round beside it (`transcript.r0.jsonl`, ...)
+//! because the runner truncates a transcript when a run starts.
+//!
+//! # Pooled evidence scope
+//!
+//! All evidence this run produces (findings, assets, coverage) pools under ONE
+//! coverage target inside the workspace:
+//! `CoveragePaths::new(&workspace, &target_id(&workspace, &id))`, i.e.
+//! `<workspace>/.rupu/coverage/<target_id>/`. The agentiflow id is the scope
+//! name, so two runs never share a target, and the envelope's goal / coverage
+//! evaluation reads exactly the evidence this run's lead and units write.
+//!
+//! # `events.jsonl`
+//!
+//! One JSON object per line, appended as things happen. Every line has `ts`
+//! (RFC 3339, from the run's injected clock) and `kind`; the rest depends on
+//! the kind:
+//!
+//! - `run_started`: `id`, `name`, `goals` (count), `engagement_profiles`
+//! - `round`: written when a lead round FINISHES. `round` (zero-based index),
+//!   `budget` (`ok` / `soft` / `hard:<dimension>`), `converge` (bool),
+//!   `goals_met` / `goals_total` (as the round began), `steering` (messages
+//!   delivered), `outcome` (`yielded` / `turn_budget_hit` / `error`), and
+//!   `error` when the outcome is `error`
+//! - `run_stopped`: `stop_reason` (a stable code, see [`AgentiflowRecord`]),
+//!   `detail` (human text), `rounds`, `goals` (`id` / `met` / `current` /
+//!   `target`), `summary`
+//!
+//! The log is deliberately local and minimal: a best-effort append. A failed
+//! append is logged (`tracing::warn!`) and never stops the run; the durable
+//! state of record is `agentiflow.json`.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use rupu_coverage::{target_id, ActiveSet, CoveragePaths};
+use rupu_providers::model_limits::ModelLimits;
+use rupu_runtime::RunTriggerSource;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::budget::{parse_duration, BudgetStage, UsageSource};
+use crate::def::AgentiflowDef;
+use crate::envelope::{
+    Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome, StopReason,
+};
+use crate::error::AgentiflowError;
+use crate::lead::{LeadConfig, ProviderFactory, RunAgentLeadDriver};
+use crate::operator::OperatorQueue;
+
+/// `agentiflow.json`, the durable record of one run.
+const RECORD_FILE: &str = "agentiflow.json";
+const EVENTS_FILE: &str = "events.jsonl";
+/// Turns the lead may take per round when the definition does not say.
+const DEFAULT_LEAD_MAX_TURNS: u32 = 50;
+
+/// One goal's status as of the last evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalStatus {
+    pub id: String,
+    pub met: bool,
+    pub current: u64,
+    pub target: u64,
+}
+
+/// The persisted record of an agentiflow run (`<run dir>/agentiflow.json`).
+///
+/// `status` is `running` from the moment the run directory is laid out,
+/// `completed` once the envelope reached a stop (whatever the reason: the
+/// reason is `stop_reason`), or `failed` if the run could not start.
+///
+/// `stop_reason` is a stable snake_case code: `goals_met`,
+/// `coverage_reached`, `budget_exhausted:<dimension>`, `operator_stop`,
+/// `ceiling`; for a `failed` run it is `error: <message>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentiflowRecord {
+    pub id: String,
+    pub name: String,
+    pub engagement_profiles: Vec<String>,
+    pub trigger: RunTriggerSource,
+    pub status: String,
+    pub stop_reason: Option<String>,
+    pub rounds: u32,
+    pub goals: Vec<GoalStatus>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Human codename; minted by the daemon (Plan 4), `None` before then.
+    pub codename: Option<String>,
+}
+
+impl AgentiflowRecord {
+    /// Atomically write this record to `<run_dir>/agentiflow.json`: the JSON
+    /// goes to a sibling temp file which is then renamed over the target, so
+    /// a reader sees the old record or the new one, never a torn write.
+    pub fn write(&self, run_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(run_dir)?;
+        let tmp = run_dir.join(format!(".{RECORD_FILE}.tmp"));
+        let mut bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, run_dir.join(RECORD_FILE)).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+
+    /// Read `<run_dir>/agentiflow.json` back.
+    pub fn read(run_dir: &Path) -> std::io::Result<Self> {
+        let raw = std::fs::read(run_dir.join(RECORD_FILE))?;
+        serde_json::from_slice(&raw).map_err(std::io::Error::other)
+    }
+}
+
+/// `<global>/agentiflows`: the directory holding every run's directory.
+pub fn agentiflow_dir(global: &Path) -> PathBuf {
+    global.join("agentiflows")
+}
+
+/// A fresh agentiflow id (`af_<ULID>`). The caller mints it so it can show
+/// the operator the id (and enqueue steering) before the run starts.
+pub fn new_run_id() -> String {
+    format!("af_{}", ulid::Ulid::new())
+}
+
+/// The caller-resolved lead: which agent, with which prompt / provider /
+/// model / tools. (Plan 4 wires the real resolver; tests hand in a mock.)
+pub struct LeadInputs {
+    pub agent_name: String,
+    pub system_prompt: String,
+    pub provider_name: String,
+    pub model: String,
+    /// Exactly the tools the lead may use; empty grants none (fail closed).
+    pub agent_tools: Vec<String>,
+}
+
+/// Everything [`run_agentiflow`] needs.
+pub struct RunAgentiflowOpts {
+    pub def: AgentiflowDef,
+    /// The workspace the evidence is pooled in and the lead's tools run in.
+    pub workspace: PathBuf,
+    /// The rupu global dir; the run directory lives under it.
+    pub global: PathBuf,
+    /// The resolved engagement profiles (`def.resolve_profiles`).
+    pub active: ActiveSet,
+    /// When the run began: the zero of the budget's and ceiling's wall clock.
+    pub started: DateTime<Utc>,
+    /// The injected clock.
+    pub now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    pub make_provider: ProviderFactory,
+    pub lead: LeadInputs,
+    /// This run's id (see [`new_run_id`]). Must be a safe path component.
+    pub run_id: String,
+}
+
+/// A run id becomes a directory name and an evidence scope name, so it must
+/// not be able to name anything but a direct child of `agentiflows/`.
+fn validate_run_id(id: &str) -> Result<(), AgentiflowError> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(AgentiflowError::Invalid(format!(
+            "run id `{id}` must be 1-128 characters of [A-Za-z0-9_-]"
+        )))
+    }
+}
+
+/// Whether anything but an operator `stop` can end this flow: a required
+/// goal, a coverage target, a wall-clock / round cap on the budget, or a
+/// round / wall-clock ceiling.
+///
+/// `budget.usd` / `budget.tokens` do NOT count: the usage-ledger-backed
+/// [`UsageSource`] is not wired yet (see [`UnmeteredUsage`]), so those caps
+/// cannot fire in this build and a flow bounded only by them is, honestly,
+/// unbounded.
+fn has_automatic_terminator(def: &AgentiflowDef) -> bool {
+    def.goals.iter().any(|g| g.required)
+        || def.coverage.is_some()
+        || def
+            .budget
+            .as_ref()
+            .is_some_and(|b| b.wall_clock.is_some() || b.rounds.is_some())
+        || def
+            .round
+            .as_ref()
+            .and_then(|r| r.ceiling.as_ref())
+            .is_some_and(|c| c.rounds.is_some() || c.wall_clock.is_some())
+}
+
+/// The usage source for this build: reports nothing spent.
+///
+/// The ledger-backed source (summing the lead's and the dispatched units'
+/// token / cost usage) lands with real dispatch in Plan 3b. Until then
+/// `budget.usd` / `budget.tokens` are NOT enforced and only the wall-clock and
+/// round dimensions can stop a run; `run_agentiflow` warns when a definition
+/// sets the unenforced ones.
+struct UnmeteredUsage;
+
+impl UsageSource for UnmeteredUsage {
+    fn spent_usd(&self) -> f64 {
+        0.0
+    }
+    fn spent_tokens(&self) -> u64 {
+        0
+    }
+}
+
+/// The lead's round-0 mission text: each goal's objective, the coverage
+/// target if there is one, falling back to the definition's description.
+fn mission_objective(def: &AgentiflowDef) -> String {
+    let mut lines: Vec<String> = def
+        .goals
+        .iter()
+        .map(|g| format!("- {}: {}", g.id, g.objective.trim()))
+        .collect();
+    if let Some(c) = &def.coverage {
+        lines.push(format!(
+            "- coverage: reach {:.0}% of the discovered assets{}",
+            c.reach * 100.0,
+            c.depth
+                .as_deref()
+                .map(|d| format!(" at depth `{d}` or deeper"))
+                .unwrap_or_default()
+        ));
+    }
+    if lines.is_empty() {
+        return def.description.clone().unwrap_or_else(|| def.name.clone());
+    }
+    lines.join("\n")
+}
+
+/// A stable machine code for a stop reason (what `stop_reason` persists).
+fn stop_code(stop: &StopReason) -> String {
+    match stop {
+        StopReason::GoalsMet => "goals_met".into(),
+        StopReason::CoverageReached => "coverage_reached".into(),
+        StopReason::BudgetExhausted { dimension } => format!("budget_exhausted:{dimension}"),
+        StopReason::OperatorStop => "operator_stop".into(),
+        StopReason::Ceiling => "ceiling".into(),
+    }
+}
+
+fn goal_statuses(outcome: &EnvelopeOutcome) -> Vec<GoalStatus> {
+    outcome
+        .goals
+        .iter()
+        .map(|g| GoalStatus {
+            id: g.id.clone(),
+            met: g.met,
+            current: g.current,
+            target: g.target,
+        })
+        .collect()
+}
+
+/// The best-effort `events.jsonl` appender (shape in the module docs).
+struct EventLog {
+    path: PathBuf,
+}
+
+impl EventLog {
+    fn emit(&self, ts: DateTime<Utc>, kind: &str, fields: Value) {
+        let mut line = serde_json::Map::new();
+        line.insert(
+            "ts".into(),
+            Value::String(ts.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        );
+        line.insert("kind".into(), Value::String(kind.into()));
+        if let Value::Object(extra) = fields {
+            line.extend(extra);
+        }
+        if let Err(e) = self.append(&Value::Object(line)) {
+            tracing::warn!(path = %self.path.display(), error = %e, kind, "could not append agentiflow event");
+        }
+    }
+
+    fn append(&self, line: &Value) -> std::io::Result<()> {
+        let mut buf = serde_json::to_vec(line).map_err(std::io::Error::other)?;
+        buf.push(b'\n');
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        // One `write_all` of the whole line: an appended write this small is
+        // not interleaved with another writer's.
+        f.write_all(&buf)
+    }
+}
+
+fn budget_label(b: &BudgetStage) -> String {
+    match b {
+        BudgetStage::Ok => "ok".into(),
+        BudgetStage::Soft => "soft".into(),
+        BudgetStage::Hard { dimension } => format!("hard:{dimension}"),
+    }
+}
+
+/// Wraps the real lead driver to write a `round` event as each round ends.
+/// The envelope owns the round loop and has no hook of its own, so the event
+/// is recorded at the one seam every round passes through.
+struct RecordingLead<'a> {
+    inner: RunAgentLeadDriver,
+    events: &'a EventLog,
+    now: &'a (dyn Fn() -> DateTime<Utc> + Send + Sync),
+}
+
+impl LeadDriver for RecordingLead<'_> {
+    fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+        let out = self.inner.run_round(ctx);
+        let d = &ctx.digest;
+        let (outcome, error) = match &out {
+            RoundOutcome::Yielded => ("yielded", None),
+            RoundOutcome::TurnBudgetHit => ("turn_budget_hit", None),
+            RoundOutcome::Error(e) => ("error", Some(e.as_str())),
+        };
+        let mut fields = json!({
+            "round": ctx.round,
+            "budget": budget_label(&d.budget),
+            "converge": d.converge,
+            "goals_met": d.goals.iter().filter(|g| g.met).count(),
+            "goals_total": d.goals.len(),
+            "steering": d.steering.len(),
+            "outcome": outcome,
+        });
+        if let (Some(e), Some(obj)) = (error, fields.as_object_mut()) {
+            obj.insert("error".into(), Value::String(e.to_string()));
+        }
+        self.events.emit((self.now)(), "round", fields);
+        out
+    }
+}
+
+/// Run an agentiflow to a stop and persist the result.
+///
+/// 1. Validates `def` against `active` (fail closed) and the run id, and
+///    rejects an unparseable `round.ceiling.wall_clock` or a zero
+///    `round.lead_max_turns`, all before touching the filesystem.
+/// 2. Warns (`tracing::warn!`, never rejects) when nothing but an operator
+///    `stop` can end the flow, and when `budget.usd` / `budget.tokens` are set
+///    but not yet enforced. Operator-only is a valid, explicit mode.
+/// 3. Lays out `<global>/agentiflows/<run_id>/` (see the module docs), writes
+///    a `running` [`AgentiflowRecord`], and runs the envelope over the pooled
+///    evidence scope with a [`RunAgentLeadDriver`] lead.
+/// 4. On a stop, writes the final record (`completed`, with the stop reason,
+///    round count and goal statuses) and returns the [`EnvelopeOutcome`].
+///
+/// # Blocking context only
+///
+/// The lead driver owns a tokio runtime and `block_on`s it each round, which
+/// panics inside an async context (so does dropping that runtime there). Call
+/// this from a blocking context: a plain thread or `spawn_blocking`. Called
+/// from within a tokio runtime it returns an error instead.
+///
+/// # Budget in this build
+///
+/// Usage is not metered yet ([`UnmeteredUsage`]): `budget.usd` and
+/// `budget.tokens` never trip. Wall-clock and round caps work.
+pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, AgentiflowError> {
+    let RunAgentiflowOpts {
+        def,
+        workspace,
+        global,
+        active,
+        started,
+        now,
+        make_provider,
+        lead,
+        run_id: id,
+    } = opts;
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(AgentiflowError::Invalid(
+            "run_agentiflow must be called from a blocking context (a plain thread or \
+             spawn_blocking), not from inside an async runtime"
+                .into(),
+        ));
+    }
+
+    // ---- everything that can be rejected without touching the disk ----------
+    def.validate(&active)?;
+    validate_run_id(&id)?;
+
+    let ceiling = def.round.as_ref().and_then(|r| r.ceiling.as_ref());
+    let ceiling_wall_clock = match ceiling.and_then(|c| c.wall_clock.as_deref()) {
+        Some(w) => Some(
+            parse_duration(w)
+                .map_err(|e| AgentiflowError::Invalid(format!("round.ceiling.wall_clock: {e}")))?,
+        ),
+        None => None,
+    };
+    let ceiling_rounds = ceiling.and_then(|c| c.rounds);
+    let per_round_max_turns = def
+        .round
+        .as_ref()
+        .and_then(|r| r.lead_max_turns)
+        .unwrap_or(DEFAULT_LEAD_MAX_TURNS);
+    if per_round_max_turns == 0 {
+        return Err(AgentiflowError::Invalid(
+            "round.lead_max_turns must be at least 1".into(),
+        ));
+    }
+
+    if !has_automatic_terminator(&def) {
+        tracing::warn!(
+            name = %def.name,
+            run_id = %id,
+            "agentiflow has no automatic terminator; it will run until an operator stop"
+        );
+    }
+    if def
+        .budget
+        .as_ref()
+        .is_some_and(|b| b.usd.is_some() || b.tokens.is_some())
+    {
+        tracing::warn!(
+            name = %def.name,
+            run_id = %id,
+            "budget.usd / budget.tokens are not enforced yet (usage is not metered); \
+             only budget.wall_clock / budget.rounds can stop this run"
+        );
+    }
+
+    // ---- run directory ------------------------------------------------------
+    let run_dir = agentiflow_dir(&global).join(&id);
+    if run_dir.join(RECORD_FILE).exists() {
+        return Err(AgentiflowError::Invalid(format!(
+            "agentiflow run `{id}` already exists at {}",
+            run_dir.display()
+        )));
+    }
+    // `steering/` may already exist: an operator can queue a message for a run
+    // they were told the id of before it started.
+    std::fs::create_dir_all(run_dir.join("lead"))?;
+
+    let mut record = AgentiflowRecord {
+        id: id.clone(),
+        name: def.name.clone(),
+        engagement_profiles: def.engagement_profiles.clone(),
+        trigger: RunTriggerSource::Agentiflow,
+        status: "running".into(),
+        stop_reason: None,
+        rounds: 0,
+        goals: Vec::new(),
+        started_at: started,
+        ended_at: None,
+        codename: None,
+    };
+    record.write(&run_dir)?;
+
+    // From here a failure must not leave the record claiming `running`.
+    let fail = |record: &mut AgentiflowRecord, e: std::io::Error| -> AgentiflowError {
+        record.status = "failed".into();
+        record.stop_reason = Some(format!("error: {e}"));
+        record.ended_at = Some(now());
+        if let Err(werr) = record.write(&run_dir) {
+            tracing::error!(error = %werr, "could not record the failed agentiflow run");
+        }
+        AgentiflowError::Io(e)
+    };
+
+    // ---- envelope and lead ----------------------------------------------------
+    let paths = CoveragePaths::new(&workspace, &target_id(&workspace, &id));
+    let cfg = EnvelopeConfig {
+        goals: def.goals.clone(),
+        coverage: def.coverage.clone(),
+        ceiling_rounds,
+        ceiling_wall_clock,
+    };
+    let mut envelope = Envelope::new(
+        paths,
+        active,
+        cfg,
+        def.budget.clone().unwrap_or_default(),
+        OperatorQueue::new(&run_dir),
+        started,
+    );
+
+    let lead_cfg = LeadConfig {
+        agent_name: lead.agent_name,
+        system_prompt: lead.system_prompt,
+        provider_name: lead.provider_name,
+        model: lead.model,
+        per_round_max_turns,
+        run_id: id.clone(),
+        transcript_path: run_dir.join("lead").join("transcript.jsonl"),
+        objective: mission_objective(&def),
+        goals: def.goals.clone(),
+        workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
+        workspace_path: workspace.clone(),
+        agent_tools: lead.agent_tools,
+        // Real limit resolution is Plan 4's; unknown limits are the safe start.
+        limits: ModelLimits::unknown(),
+    };
+    let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
+        Ok(d) => d,
+        Err(e) => return Err(fail(&mut record, e)),
+    };
+
+    let events = EventLog {
+        path: run_dir.join(EVENTS_FILE),
+    };
+    let mut lead = RecordingLead {
+        inner: driver,
+        events: &events,
+        now: &*now,
+    };
+
+    events.emit(
+        now(),
+        "run_started",
+        json!({
+            "id": id,
+            "name": def.name,
+            "goals": def.goals.len(),
+            "engagement_profiles": def.engagement_profiles,
+        }),
+    );
+    let outcome = envelope.run(&mut lead, &UnmeteredUsage, &*now);
+    // Drop the driver here, in the blocking context its runtime ran in, before
+    // anything else can return early.
+    drop(lead);
+    let ended = now();
+    let goals = goal_statuses(&outcome);
+    events.emit(
+        ended,
+        "run_stopped",
+        json!({
+            "stop_reason": stop_code(&outcome.stop),
+            "detail": outcome.stop.to_string(),
+            "rounds": outcome.rounds,
+            "goals": goals,
+            "summary": outcome.summary,
+        }),
+    );
+
+    record.status = "completed".into();
+    record.stop_reason = Some(stop_code(&outcome.stop));
+    record.rounds = outcome.rounds;
+    record.goals = goals;
+    record.ended_at = Some(ended);
+    if let Err(e) = record.write(&run_dir) {
+        tracing::error!(
+            id = %id,
+            stop = %outcome.stop,
+            error = %e,
+            "agentiflow reached a stop but its final record could not be written"
+        );
+        return Err(AgentiflowError::Io(e));
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::OperatorMessage;
+    use rupu_agent::{MockProvider, ScriptedTurn};
+    use rupu_coverage::{
+        append_record, Attribution, FindingEvidence, FindingProfile, FindingRecord, FindingScope,
+        Ledger, Severity, Surface,
+    };
+
+    fn started() -> DateTime<Utc> {
+        "2026-10-05T12:00:00Z".parse().unwrap()
+    }
+
+    /// A one-goal definition: "record at least one finding" (any
+    /// classification, unverified). Extra top-level YAML is appended.
+    fn def_with(extra: &str) -> AgentiflowDef {
+        let yaml = format!(
+            "name: itest\n\
+             lead: lead\n\
+             engagement_profiles: [network]\n\
+             goals:\n  \
+               - id: any-finding\n    \
+                 objective: \"Record at least one finding.\"\n    \
+                 target: {{ findings: {{}}, count_gte: 1 }}\n\
+             scope: {{ authorized: true }}\n\
+             pool: {{ agents: [lead] }}\n\
+             {extra}"
+        );
+        AgentiflowDef::parse_str(&yaml).unwrap()
+    }
+
+    fn active() -> ActiveSet {
+        rupu_coverage::builtin_registry()
+            .unwrap()
+            .active_set(&["network".to_string()])
+            .unwrap()
+    }
+
+    /// A factory handing out a fresh one-turn `MockProvider` per round.
+    fn one_turn_factory() -> ProviderFactory {
+        Box::new(|| -> Box<dyn rupu_providers::LlmProvider> {
+            Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: "Round done.".into(),
+                stop: rupu_agent::StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]))
+        })
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        global: PathBuf,
+        workspace: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        Fixture {
+            _tmp: tmp,
+            global,
+            workspace,
+        }
+    }
+
+    fn opts(fx: &Fixture, def: AgentiflowDef, id: &str) -> RunAgentiflowOpts {
+        RunAgentiflowOpts {
+            def,
+            workspace: fx.workspace.clone(),
+            global: fx.global.clone(),
+            active: active(),
+            started: started(),
+            // A frozen clock: wall-clock caps never trip in these tests.
+            now: Box::new(started),
+            make_provider: one_turn_factory(),
+            lead: LeadInputs {
+                agent_name: "lead".into(),
+                system_prompt: "You are the lead.".into(),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                agent_tools: vec![],
+            },
+            run_id: id.into(),
+        }
+    }
+
+    fn run_dir(fx: &Fixture, id: &str) -> PathBuf {
+        agentiflow_dir(&fx.global).join(id)
+    }
+
+    fn pooled_paths(fx: &Fixture, id: &str) -> CoveragePaths {
+        CoveragePaths::new(&fx.workspace, &target_id(&fx.workspace, id))
+    }
+
+    fn events(fx: &Fixture, id: &str) -> Vec<Value> {
+        std::fs::read_to_string(run_dir(fx, id).join(EVENTS_FILE))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn kinds(evs: &[Value]) -> Vec<&str> {
+        evs.iter().map(|e| e["kind"].as_str().unwrap()).collect()
+    }
+
+    /// Seed one (Summary-profile) finding into the run's pooled ledger.
+    fn seed_finding(fx: &Fixture, id: &str) {
+        let rec = FindingRecord {
+            id: "fnd_seed".into(),
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: FindingScope::Repo,
+            summary: "seeded".into(),
+            severity: Severity::High,
+            concern_id: None,
+            evidence: FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".into(),
+                references: vec![],
+            },
+            declared_by: Attribution {
+                run_id: "run_seed".into(),
+                model: "m".into(),
+                surface: Surface::Workflow,
+                codename: None,
+                agent: None,
+                provider: None,
+            },
+            declared_at: Utc::now(),
+            profile: FindingProfile::Summary,
+            report: None,
+        };
+        append_record(&pooled_paths(fx, id), Ledger::Findings, &rec).unwrap();
+    }
+
+    // ---- AgentiflowRecord ---------------------------------------------------
+
+    fn sample_record() -> AgentiflowRecord {
+        AgentiflowRecord {
+            id: "af_x".into(),
+            name: "itest".into(),
+            engagement_profiles: vec!["network".into(), "web".into()],
+            trigger: RunTriggerSource::Agentiflow,
+            status: "completed".into(),
+            stop_reason: Some("goals_met".into()),
+            rounds: 3,
+            goals: vec![GoalStatus {
+                id: "g".into(),
+                met: true,
+                current: 10,
+                target: 10,
+            }],
+            started_at: started(),
+            ended_at: Some(started() + chrono::Duration::minutes(5)),
+            codename: None,
+        }
+    }
+
+    #[test]
+    fn record_round_trips_through_agentiflow_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let rec = sample_record();
+        rec.write(&run).unwrap();
+        assert!(run.join(RECORD_FILE).is_file());
+        assert_eq!(AgentiflowRecord::read(&run).unwrap(), rec);
+        // The trigger is persisted in its snake_case wire form.
+        let raw = std::fs::read_to_string(run.join(RECORD_FILE)).unwrap();
+        assert!(raw.contains("\"agentiflow\""), "{raw}");
+    }
+
+    #[test]
+    fn record_write_is_atomic_and_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let mut rec = sample_record();
+        rec.write(&run).unwrap();
+        rec.status = "running".into();
+        rec.rounds = 9;
+        rec.write(&run).unwrap();
+        assert_eq!(AgentiflowRecord::read(&run).unwrap().rounds, 9);
+        // The temp file was renamed away, not left behind.
+        let names: Vec<_> = std::fs::read_dir(&run)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [RECORD_FILE], "{names:?}");
+    }
+
+    #[test]
+    fn new_run_id_is_a_safe_unique_path_component() {
+        let a = new_run_id();
+        let b = new_run_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("af_"), "{a}");
+        assert!(validate_run_id(&a).is_ok());
+    }
+
+    #[test]
+    fn run_ids_that_could_escape_the_run_dir_are_rejected() {
+        for bad in ["", "../x", "a/b", "a\\b", ".", "..", "a b", "x\0y"] {
+            assert!(validate_run_id(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(validate_run_id(&"a".repeat(129)).is_err());
+        assert!(validate_run_id("af_01J-test_1").is_ok());
+    }
+
+    // ---- terminator predicate ----------------------------------------------
+
+    #[test]
+    fn terminator_predicate_counts_only_effective_stops() {
+        // A required goal terminates.
+        assert!(has_automatic_terminator(&def_with("")));
+        // No required goal, nothing else: operator-only.
+        let with = operator_only;
+        assert!(!has_automatic_terminator(&with("")));
+        assert!(has_automatic_terminator(&with(
+            "round: { ceiling: { rounds: 3 } }"
+        )));
+        assert!(has_automatic_terminator(&with(
+            "round: { ceiling: { wall_clock: 1h } }"
+        )));
+        assert!(has_automatic_terminator(&with("budget: { rounds: 5 }")));
+        assert!(has_automatic_terminator(&with(
+            "budget: { wall_clock: 2h }"
+        )));
+        assert!(has_automatic_terminator(&with("coverage: { reach: 0.5 }")));
+        // An empty ceiling / budget block caps nothing.
+        assert!(!has_automatic_terminator(&with("round: { ceiling: {} }")));
+        assert!(!has_automatic_terminator(&with("budget: {}")));
+        // usd / tokens caps are not enforced yet (no usage ledger in 3a), so
+        // they are not a terminator either.
+        assert!(!has_automatic_terminator(&with(
+            "budget: { usd: 5.0, tokens: 1000 }"
+        )));
+    }
+
+    // ---- run_agentiflow, end to end ----------------------------------------
+
+    #[test]
+    fn goals_met_before_round_zero_stops_without_running_the_lead() {
+        let fx = fixture();
+        let id = "af_goalsmet";
+        seed_finding(&fx, id);
+
+        let out = run_agentiflow(opts(&fx, def_with(""), id)).unwrap();
+        assert_eq!(out.stop, StopReason::GoalsMet);
+        assert_eq!(out.rounds, 0);
+
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.id, id);
+        assert_eq!(rec.name, "itest");
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("goals_met"));
+        assert_eq!(rec.rounds, 0);
+        assert_eq!(rec.trigger, RunTriggerSource::Agentiflow);
+        assert_eq!(rec.engagement_profiles, ["network"]);
+        assert_eq!(rec.started_at, started());
+        assert_eq!(rec.ended_at, Some(started()));
+        assert_eq!(
+            rec.goals,
+            [GoalStatus {
+                id: "any-finding".into(),
+                met: true,
+                current: 1,
+                target: 1
+            }]
+        );
+
+        let evs = events(&fx, id);
+        assert_eq!(kinds(&evs), ["run_started", "run_stopped"], "{evs:?}");
+        assert_eq!(evs[0]["id"], id);
+        assert_eq!(evs[1]["stop_reason"], "goals_met");
+        assert_eq!(evs[1]["rounds"], 0);
+        assert!(evs[0]["ts"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-10-05T12:00:00"));
+
+        // The lead's directory exists, but it never ran a round.
+        let lead = run_dir(&fx, id).join("lead");
+        assert!(lead.is_dir());
+        assert_eq!(std::fs::read_dir(&lead).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ceiling_runs_the_lead_for_the_capped_rounds() {
+        let fx = fixture();
+        let id = "af_ceiling";
+        let def = def_with("round: { lead_max_turns: 3, ceiling: { rounds: 2 } }");
+
+        let out = run_agentiflow(opts(&fx, def, id)).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling);
+        assert_eq!(out.rounds, 2);
+
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("ceiling"));
+        assert_eq!(rec.rounds, 2);
+        assert!(!rec.goals[0].met);
+
+        let evs = events(&fx, id);
+        assert_eq!(
+            kinds(&evs),
+            ["run_started", "round", "round", "run_stopped"],
+            "{evs:?}"
+        );
+        assert_eq!(evs[1]["round"], 0);
+        assert_eq!(evs[2]["round"], 1);
+        assert_eq!(evs[1]["outcome"], "yielded");
+        assert_eq!(evs[1]["budget"], "ok");
+        assert_eq!(evs[1]["goals_met"], 0);
+        assert_eq!(evs[1]["goals_total"], 1);
+        assert_eq!(evs[3]["stop_reason"], "ceiling");
+        assert_eq!(evs[3]["rounds"], 2);
+
+        // Each round wrote its own transcript beside the configured base path.
+        let lead = run_dir(&fx, id).join("lead");
+        assert!(lead.join("transcript.r0.jsonl").is_file());
+        assert!(lead.join("transcript.r1.jsonl").is_file());
+        assert!(!lead.join("transcript.r2.jsonl").exists());
+    }
+
+    #[test]
+    fn an_operator_stop_enqueued_before_the_run_ends_it_at_round_zero() {
+        let fx = fixture();
+        let id = "af_opstop";
+        // The operator queue is rooted at the run dir and exists before the
+        // run starts (that is why the caller mints the id).
+        OperatorQueue::new(run_dir(&fx, id))
+            .enqueue(&OperatorMessage {
+                ts: "2026-10-05T12:00:00Z".into(),
+                body: "wrap up".into(),
+                stop: true,
+            })
+            .unwrap();
+
+        let out = run_agentiflow(opts(&fx, def_with(""), id)).unwrap();
+        assert_eq!(out.stop, StopReason::OperatorStop);
+        assert_eq!(out.rounds, 0);
+
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop"));
+        let evs = events(&fx, id);
+        assert_eq!(kinds(&evs), ["run_started", "run_stopped"], "{evs:?}");
+        // The drained message was consumed from the steering queue.
+        assert!(OperatorQueue::new(run_dir(&fx, id))
+            .drain()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Run `f` with a thread-local tracing subscriber and return what it
+    /// logged. `run_agentiflow` logs its warnings on the calling thread.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sub = tracing_subscriber::fmt()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(sub, f);
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// One optional goal, no coverage / budget / ceiling: only an operator
+    /// stop can end it. `extra` is appended (e.g. a `budget:` block).
+    fn operator_only(extra: &str) -> AgentiflowDef {
+        AgentiflowDef::parse_str(&format!(
+            "name: opsonly\nlead: lead\nengagement_profiles: [network]\n\
+             goals:\n  - id: g\n    objective: o\n    required: false\n    \
+             target: {{ findings: {{}}, count_gte: 1 }}\n\
+             scope: {{ authorized: true }}\npool: {{ agents: [lead] }}\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    fn enqueue_stop(fx: &Fixture, id: &str) {
+        OperatorQueue::new(run_dir(fx, id))
+            .enqueue(&OperatorMessage {
+                ts: "2026-10-05T12:00:00Z".into(),
+                body: "stop".into(),
+                stop: true,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_flow_with_no_automatic_terminator_warns_but_still_runs() {
+        let fx = fixture();
+        enqueue_stop(&fx, "af_noterm");
+        let (out, logs) =
+            capture_logs(|| run_agentiflow(opts(&fx, operator_only(""), "af_noterm")));
+        // Operator-only is a valid explicit mode: warned about, never rejected.
+        assert_eq!(out.unwrap().stop, StopReason::OperatorStop);
+        assert!(
+            logs.contains("no automatic terminator; it will run until an operator stop"),
+            "{logs}"
+        );
+
+        // A flow that HAS a terminator does not warn.
+        let id = "af_hasterm";
+        enqueue_stop(&fx, id);
+        let (out, logs) = capture_logs(|| run_agentiflow(opts(&fx, def_with(""), id)));
+        out.unwrap();
+        assert!(!logs.contains("no automatic terminator"), "{logs}");
+    }
+
+    #[test]
+    fn unenforced_usd_and_token_caps_are_warned_about() {
+        let fx = fixture();
+        let id = "af_usd";
+        enqueue_stop(&fx, id);
+        let (out, logs) =
+            capture_logs(|| run_agentiflow(opts(&fx, operator_only("budget: { usd: 5.0 }"), id)));
+        out.unwrap();
+        assert!(logs.contains("not enforced yet"), "{logs}");
+        // ...and a usd-only budget is not mistaken for a terminator.
+        assert!(logs.contains("no automatic terminator"), "{logs}");
+    }
+
+    #[test]
+    fn evidence_pools_under_the_run_ids_scope() {
+        // A finding seeded under ANOTHER run's scope must not satisfy this
+        // run's goal: the pooled target is keyed by the agentiflow id.
+        let fx = fixture();
+        seed_finding(&fx, "af_other");
+        let def = def_with("round: { ceiling: { rounds: 1 } }");
+        let out = run_agentiflow(opts(&fx, def, "af_mine")).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling);
+        assert_ne!(
+            pooled_paths(&fx, "af_mine").root,
+            pooled_paths(&fx, "af_other").root
+        );
+    }
+
+    #[test]
+    fn a_failed_validation_creates_nothing() {
+        let fx = fixture();
+        let mut def = def_with("");
+        def.scope.authorized = false;
+        let err = run_agentiflow(opts(&fx, def, "af_bad")).expect_err("rejected");
+        assert!(matches!(err, AgentiflowError::Invalid(_)), "{err:?}");
+        assert!(!run_dir(&fx, "af_bad").exists());
+    }
+
+    #[test]
+    fn a_bad_ceiling_wall_clock_or_zero_turns_is_rejected_before_any_dir() {
+        let fx = fixture();
+        let bad = def_with("round: { ceiling: { wall_clock: \"soon\" } }");
+        let err = run_agentiflow(opts(&fx, bad, "af_wc")).expect_err("rejected");
+        assert!(err.to_string().contains("wall_clock"), "{err}");
+        assert!(!run_dir(&fx, "af_wc").exists());
+
+        let zero = def_with("round: { lead_max_turns: 0 }");
+        let err = run_agentiflow(opts(&fx, zero, "af_zero")).expect_err("rejected");
+        assert!(err.to_string().contains("lead_max_turns"), "{err}");
+        assert!(!run_dir(&fx, "af_zero").exists());
+    }
+
+    #[test]
+    fn an_existing_run_is_never_overwritten() {
+        let fx = fixture();
+        let id = "af_dup";
+        seed_finding(&fx, id);
+        run_agentiflow(opts(&fx, def_with(""), id)).unwrap();
+        let before = std::fs::read(run_dir(&fx, id).join(RECORD_FILE)).unwrap();
+
+        let err = run_agentiflow(opts(&fx, def_with(""), id)).expect_err("rejected");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            std::fs::read(run_dir(&fx, id).join(RECORD_FILE)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn calling_from_an_async_context_is_an_error_not_a_panic() {
+        let fx = fixture();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let o = opts(&fx, def_with(""), "af_async");
+        let err = rt
+            .block_on(async move { run_agentiflow(o) })
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("blocking"), "{err}");
+        assert!(!run_dir(&fx, "af_async").exists());
+    }
+}

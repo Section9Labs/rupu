@@ -4506,6 +4506,7 @@ dependencies = [
  "rupu-agent",
  "rupu-coverage",
  "rupu-providers",
+ "rupu-runtime",
  "rupu-tools",
  "serde",
  "serde_json",
@@ -4514,6 +4515,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]
