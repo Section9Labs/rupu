@@ -4,6 +4,7 @@
 //! port. Spec: docs/superpowers/specs/2026-09-30-rupu-agentiflows-design.md.
 
 mod budget;
+mod collectors;
 mod coverage;
 mod def;
 mod envelope;
@@ -15,6 +16,7 @@ mod run;
 mod tools;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
+pub use collectors::{lead_collectors, DirectiveCollector, MailboxCollector};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
