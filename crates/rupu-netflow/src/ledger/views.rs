@@ -78,6 +78,8 @@ pub fn read_flows_and_dropped(path: &Path) -> std::io::Result<(Vec<FlowRecord>, 
             LedgerLine::Dropped { count, .. } => {
                 dropped += count;
             }
+            // Capture-availability lines carry no flow data.
+            LedgerLine::Capture { .. } => {}
         }
     }
 

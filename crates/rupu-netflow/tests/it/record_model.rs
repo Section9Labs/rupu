@@ -4,10 +4,10 @@
 
 use chrono::{TimeZone, Utc};
 use rupu_netflow::ledger::explorer::{origin_key, timeline_view, ExplorerFilters, ExplorerFlow};
-use rupu_netflow::ledger::views::read_flows;
+use rupu_netflow::ledger::views::{read_flows, read_flows_and_dropped};
 use rupu_netflow::{
-    Direction, Fidelity, FlowCtx, FlowId, FlowProcess, FlowRecord, LedgerLine, Origin, Outcome,
-    SocketCompletion,
+    CaptureState, Direction, Fidelity, FlowCtx, FlowId, FlowProcess, FlowRecord, LedgerLine,
+    Origin, Outcome, SocketCompletion,
 };
 use std::io::Write;
 
@@ -255,4 +255,47 @@ async fn memory_and_fanout_sinks_carry_socket_completions() {
     assert_eq!(b.socket_completions(), vec![c]);
     // The HTTP completion path is separate and untouched.
     assert!(a.completions().is_empty());
+}
+
+// ---- Task 6: Capture ----
+
+#[test]
+fn capture_line_round_trips_and_is_ignored_by_read_flows() {
+    let line = LedgerLine::Capture {
+        ts: Utc::now(),
+        state: CaptureState::Unavailable {
+            reason: "cgroup v2 not mounted".into(),
+        },
+        tool_call_id: Some("toolu_01Ab".into()),
+        note: None,
+    };
+    let json = serde_json::to_string(&line).unwrap();
+    assert!(json.contains(r#""type":"capture""#));
+    assert_eq!(serde_json::from_str::<LedgerLine>(&json).unwrap(), line);
+
+    let active = LedgerLine::Capture {
+        ts: Utc::now(),
+        state: CaptureState::Active {
+            backend: "cgroup-ebpf".into(),
+        },
+        tool_call_id: None,
+        note: Some("note".into()),
+    };
+    let json = serde_json::to_string(&active).unwrap();
+    assert!(json.contains(r#""state":"active""#));
+    assert!(!json.contains("tool_call_id"));
+    assert_eq!(serde_json::from_str::<LedgerLine>(&json).unwrap(), active);
+
+    // The fold: a Capture line neither adds a flow nor touches the count.
+    let ledger = write_ledger(&[
+        LedgerLine::Flow(Box::new(socket_flow(FlowId::from_parts(1, 1)))),
+        line,
+        LedgerLine::Dropped {
+            count: 2,
+            ts: Utc::now(),
+        },
+    ]);
+    let (flows, dropped) = read_flows_and_dropped(ledger.path()).unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(dropped, 2);
 }

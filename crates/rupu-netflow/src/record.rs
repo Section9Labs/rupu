@@ -130,6 +130,16 @@ pub struct SocketCompletion {
     pub error: Option<String>,
 }
 
+/// What the subprocess-capture backend could do for a run. Written as a
+/// `LedgerLine::Capture` so the CP can surface "capture unavailable:
+/// <reason>" honestly (spec 2026-10-04 13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CaptureState {
+    Active { backend: String },
+    Unavailable { reason: String },
+}
+
 /// One line of the append-only ledger.
 ///
 /// `Flow` is boxed because it dwarfs the other variants — clippy's
@@ -153,6 +163,15 @@ pub enum LedgerLine {
     /// HTTP streamed-body finalizer) so the HTTP path is untouched. Any
     /// `Some` field overwrites the flow; `None` leaves it as written.
     SocketComplete(SocketCompletion),
+    /// Capture availability for a run, plus any visible-loss note.
+    Capture {
+        ts: DateTime<Utc>,
+        state: CaptureState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 #[cfg(test)]

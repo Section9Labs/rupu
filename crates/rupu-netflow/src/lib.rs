@@ -51,6 +51,7 @@ pub use ledger::{
     LEGACY_LEDGER_FILENAME,
 };
 pub use record::{
-    Direction, Fidelity, FlowId, FlowProcess, FlowRecord, LedgerLine, Outcome, SocketCompletion,
+    CaptureState, Direction, Fidelity, FlowId, FlowProcess, FlowRecord, LedgerLine, Outcome,
+    SocketCompletion,
 };
 pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};
