@@ -4807,6 +4807,7 @@ version = "0.82.0"
 dependencies = [
  "chrono",
  "rupu-netflow",
+ "rustix 1.1.4",
  "tokio",
  "tracing",
 ]

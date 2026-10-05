@@ -11,6 +11,9 @@ chrono.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 

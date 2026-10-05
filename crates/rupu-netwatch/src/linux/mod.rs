@@ -5,5 +5,7 @@
 //! modules.
 
 pub mod cgroup;
+#[cfg(target_os = "linux")]
+pub mod netlink;
 pub mod parse;
 pub mod req;
