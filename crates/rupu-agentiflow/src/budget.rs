@@ -85,10 +85,13 @@ impl BudgetEnforcer {
         // (fraction, dimension-name) for each SET dimension.
         let mut fracs: Vec<(f64, &str)> = Vec::new();
         if let Some(cap) = self.budget.usd {
-            let frac = if cap.is_nan() || cap <= 0.0 {
+            // Fail closed: a NaN cap, a non-positive cap, or a non-finite
+            // spend (NaN would compare `< 1.0` and read as "Ok") is exhausted.
+            let spent = usage.spent_usd();
+            let frac = if cap.is_nan() || cap <= 0.0 || !spent.is_finite() {
                 f64::INFINITY
             } else {
-                usage.spent_usd() / cap
+                spent / cap
             };
             fracs.push((frac, "usd"));
         }
@@ -336,6 +339,26 @@ mod tests {
         assert_eq!(e.stage(&at(79.0), 0, start), BudgetStage::Ok);
         assert_eq!(e.stage(&at(80.0), 0, start), BudgetStage::Soft);
         assert_eq!(e.stage(&at(100.0), 0, start), hard("usd"));
+    }
+
+    #[test]
+    fn nan_spend_is_hard_not_ok() {
+        struct NanUsage;
+        impl UsageSource for NanUsage {
+            fn spent_usd(&self) -> f64 {
+                f64::NAN
+            }
+            fn spent_tokens(&self) -> u64 {
+                0
+            }
+        }
+        let e = BudgetEnforcer::new(budget(), chrono::Utc::now());
+        // a NaN spend must trip Hard on the usd dimension, never Ok (NaN >= 1.0 is false).
+        assert!(matches!(
+            e.stage(&NanUsage, 0, chrono::Utc::now()),
+            BudgetStage::Hard { .. }
+        ));
+        assert_eq!(e.stage(&NanUsage, 0, chrono::Utc::now()), hard("usd"));
     }
 
     #[test]
