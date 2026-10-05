@@ -9,7 +9,7 @@ mod def;
 mod error;
 mod goal;
 
-pub use budget::Budget;
+pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use coverage::{CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
