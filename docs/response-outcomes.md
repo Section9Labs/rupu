@@ -292,7 +292,7 @@ which model it is continuing on.
   for any `rupu run`, not only a continuation.
 - They also drop the agent's settings that were chosen for its own model. A
   different `--model` drops the agent's `maxTokens`, `contextWindowTokens`,
-  `compactAtPercent` and `contextWindow`. A different
+  `compactAtPercent`, `contextWindow` and `anthropicSpeed`. A different
   `--provider` drops the agent's `auth:` mode. The new model's limits are
   discovered instead.
 - Run it from the same project as the original run, and give it a fresh run id.

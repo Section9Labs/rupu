@@ -1126,7 +1126,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             output_schema: spec.output_schema.clone(),
             anthropic_task_budget: spec.anthropic_task_budget,
             anthropic_context_management: spec.anthropic_context_management,
-            anthropic_speed: spec.anthropic_speed,
+            anthropic_speed: pins.anthropic_speed,
             // Top-level `rupu run` invocation — no parent, depth 0,
             // dispatch surface taken from the agent's frontmatter.
             parent_run_id: None,
@@ -1423,12 +1423,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 }
 
 /// The agent's model- and provider-specific settings, as they apply to this
-/// run: a `--model` onto another model drops the agent's limit pins and
-/// `contextWindow`; a `--provider` onto another provider drops its `auth:`.
+/// run: a `--model` onto another model drops the agent's limit pins,
+/// `contextWindow` and `anthropicSpeed` (the 1M window and fast mode exist
+/// only on some models — the rule a fallback hop follows); a `--provider`
+/// onto another provider drops its `auth:`.
 #[derive(Debug)]
 struct AgentPins {
     limits: rupu_runtime::model_limits::LimitOverrides,
     context_window: Option<rupu_providers::model_tier::ContextWindow>,
+    anthropic_speed: Option<rupu_providers::types::Speed>,
     auth: Option<rupu_providers::AuthMode>,
 }
 
@@ -1444,6 +1447,11 @@ impl AgentPins {
                 None
             } else {
                 spec.context_window
+            },
+            anthropic_speed: if other_model {
+                None
+            } else {
+                spec.anthropic_speed
             },
             auth: if other_provider { None } else { spec.auth },
         }
@@ -1810,7 +1818,8 @@ mod tests {
     fn pinned_spec() -> rupu_agent::AgentSpec {
         rupu_agent::AgentSpec::parse(
             "---\nname: pinned\nprovider: anthropic\nmodel: claude-sonnet-4-6\nauth: api-key\n\
-             contextWindow: 1m\nmaxTokens: 777\ncontextWindowTokens: 9000\n---\nhi\n",
+             contextWindow: 1m\nanthropicSpeed: fast\nmaxTokens: 777\ncontextWindowTokens: 9000\n\
+             ---\nhi\n",
         )
         .unwrap()
     }
@@ -1822,17 +1831,30 @@ mod tests {
         assert_eq!(own.limits.max_tokens, Some(777));
         assert_eq!(own.limits.context_window_tokens, Some(9000));
         assert!(own.context_window.is_some());
+        assert_eq!(
+            own.anthropic_speed,
+            Some(rupu_providers::types::Speed::Fast)
+        );
         assert_eq!(own.auth, Some(rupu_providers::AuthMode::ApiKey));
 
         let other_model = AgentPins::for_run(&spec, false, true);
         assert_eq!(other_model.limits.max_tokens, None);
         assert_eq!(other_model.limits.context_window_tokens, None);
         assert_eq!(other_model.context_window, None);
+        assert_eq!(
+            other_model.anthropic_speed, None,
+            "fast mode exists only on some models"
+        );
         assert_eq!(other_model.auth, Some(rupu_providers::AuthMode::ApiKey));
 
         let other_provider = AgentPins::for_run(&spec, true, false);
         assert_eq!(other_provider.auth, None);
         assert_eq!(other_provider.limits.max_tokens, Some(777));
+        assert_eq!(
+            other_provider.anthropic_speed,
+            Some(rupu_providers::types::Speed::Fast),
+            "the same model on another provider keeps its pins"
+        );
     }
 
     #[test]
