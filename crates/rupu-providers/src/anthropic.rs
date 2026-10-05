@@ -216,10 +216,16 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str, ec
         }
         // Echo rule (spec section 4.5): reasoning and tool calls from before
         // the last fallback belong to the model that was swapped out; only the
-        // blocks from the fallback on are valid to echo. Text stays. The agent
-        // runner already leaves those blocks out of the conversation (and
-        // never dispatches the abandoned calls), so this is a defensive no-op
-        // for any caller that kept them.
+        // blocks from the fallback on are valid to echo. Text stays.
+        //
+        // The agent runner applies the same rule per RESPONSE (it never
+        // dispatches or keeps those blocks); this applies it per stored
+        // MESSAGE. They agree except when one assistant message holds several
+        // responses — a `pause_turn` merge chain — and a later response
+        // carries a fallback: then this also drops the earlier response's
+        // reasoning, which the runner kept. Runtime and replay messages still
+        // agree; only the wire differs. Unreachable today: a pause needs
+        // server tools, which rupu does not send.
         let last_fallback = restored
             .iter()
             .rposition(|b| b.get("type").and_then(|v| v.as_str()) == Some("fallback"));
