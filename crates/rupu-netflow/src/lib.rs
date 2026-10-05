@@ -56,4 +56,4 @@ pub use record::{
     CaptureState, Direction, Fidelity, FlowId, FlowProcess, FlowRecord, LedgerLine, Outcome,
     SocketCompletion,
 };
-pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};
+pub use sink::{CaptureStateLine, FanoutSink, FlowSink, MemorySink, NullSink};

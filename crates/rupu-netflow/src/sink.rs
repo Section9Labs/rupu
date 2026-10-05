@@ -1,8 +1,17 @@
 //! The `FlowSink` port and its in-process adapters.
 
-use crate::record::{FlowId, FlowRecord, SocketCompletion};
+use crate::record::{CaptureState, FlowId, FlowRecord, SocketCompletion};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
+
+/// A subprocess-capture availability note, written through a sink as a
+/// `LedgerLine::Capture`. The writer stamps the timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStateLine {
+    pub state: CaptureState,
+    pub tool_call_id: Option<String>,
+    pub note: Option<String>,
+}
 
 /// Where flow records go.
 ///
@@ -20,6 +29,10 @@ pub trait FlowSink: Send + Sync {
     /// Finalize a socket flow. Default no-op: sinks that don't persist
     /// completions (e.g. the transcript bridge) ignore it.
     async fn complete_socket(&self, _c: SocketCompletion) {}
+
+    /// Record what subprocess capture could do. Default no-op: sinks that
+    /// don't persist capture state ignore it.
+    async fn capture_state(&self, _line: CaptureStateLine) {}
 }
 
 /// Capture disabled.
@@ -87,6 +100,21 @@ impl FlowSink for FanoutSink {
             }
         }
     }
+
+    async fn capture_state(&self, line: CaptureStateLine) {
+        for child in &self.children {
+            let child = child.clone();
+            let line = line.clone();
+            if tokio::task::spawn(async move { child.capture_state(line).await })
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    "netflow sink child panicked during capture_state; continuing to remaining sinks"
+                );
+            }
+        }
+    }
 }
 
 /// Test double.
@@ -100,6 +128,7 @@ struct MemoryState {
     records: Vec<FlowRecord>,
     completions: Vec<(FlowId, u64, u64)>,
     socket_completions: Vec<SocketCompletion>,
+    capture_states: Vec<CaptureStateLine>,
 }
 
 impl MemorySink {
@@ -123,6 +152,13 @@ impl MemorySink {
             .map(|s| s.socket_completions.clone())
             .unwrap_or_default()
     }
+
+    pub fn capture_states(&self) -> Vec<CaptureStateLine> {
+        self.inner
+            .lock()
+            .map(|s| s.capture_states.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -142,6 +178,12 @@ impl FlowSink for MemorySink {
     async fn complete_socket(&self, c: SocketCompletion) {
         if let Ok(mut s) = self.inner.lock() {
             s.socket_completions.push(c);
+        }
+    }
+
+    async fn capture_state(&self, line: CaptureStateLine) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.capture_states.push(line);
         }
     }
 }

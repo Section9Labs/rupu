@@ -300,6 +300,62 @@ fn capture_line_round_trips_and_is_ignored_by_read_flows() {
     assert_eq!(dropped, 2);
 }
 
+#[tokio::test]
+async fn writer_capture_state_writes_a_capture_line_that_read_flows_ignores() {
+    use rupu_netflow::{CaptureStateLine, FlowSink, NetflowPaths, NetflowWriterHandle};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = NetflowPaths::for_run(tmp.path(), "run-1");
+    let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
+    let want = CaptureStateLine {
+        state: CaptureState::Unavailable {
+            reason: "cgroup v2 not mounted".into(),
+        },
+        tool_call_id: Some("toolu_01Ab".into()),
+        note: None,
+    };
+    handle.writer.capture_state(want.clone()).await;
+    handle
+        .writer
+        .record(socket_flow(FlowId::from_parts(1, 1)))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())
+        .await
+        .expect("writer shutdown deadlocked");
+
+    let text = std::fs::read_to_string(&paths.flows).unwrap();
+    let lines: Vec<LedgerLine> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert!(matches!(
+        &lines[0],
+        LedgerLine::Capture { state, tool_call_id, note, .. }
+            if *state == want.state && *tool_call_id == want.tool_call_id && note.is_none()
+    ));
+
+    let (flows, dropped) = read_flows_and_dropped(&paths.flows).unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(dropped, 0);
+}
+
+#[tokio::test]
+async fn memory_and_fanout_sinks_carry_capture_states() {
+    use rupu_netflow::{CaptureStateLine, FanoutSink, FlowSink, MemorySink, NullSink};
+    use std::sync::Arc;
+    let a = Arc::new(MemorySink::default());
+    let fan = FanoutSink::new(vec![Arc::new(NullSink), a.clone()]);
+    let line = CaptureStateLine {
+        state: CaptureState::Active {
+            backend: "x".into(),
+        },
+        tool_call_id: None,
+        note: Some("n".into()),
+    };
+    fan.capture_state(line.clone()).await;
+    assert_eq!(a.capture_states(), vec![line]);
+}
+
 // ---- Task 7: the capture port ----
 
 #[test]
