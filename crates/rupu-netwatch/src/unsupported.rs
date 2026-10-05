@@ -55,7 +55,10 @@ impl SubprocessCapture for UnsupportedCapture {
                 }
                 // No runtime (a sync caller): drive the write on a
                 // transient current-thread runtime. Sinks only enqueue.
-                Err(_) => match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Err(_) => match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt.block_on(sink.capture_state(line)),
                     Err(e) => tracing::debug!(
                         error = %e,
