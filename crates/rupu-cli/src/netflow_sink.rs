@@ -74,6 +74,27 @@ pub fn for_run(
     (Arc::new(rupu_netflow::FanoutSink::new(sinks)), handle)
 }
 
+/// The process's one subprocess network-capture backend, obtained OFF the
+/// async runtime.
+///
+/// `rupu_runtime::net_capture::shared` memoizes the backend in a
+/// `OnceLock`, but its first call blocks (capture-root setup, `ntstat`
+/// socket open), so it must never run inline on an async worker. This
+/// wrapper runs it on the blocking pool; later calls are cheap `OnceLock`
+/// reads (still routed through `spawn_blocking` for uniformity). Every
+/// run's `ToolContext.net_capture` comes from here (or from a
+/// `DefaultStepFactory` / dispatcher that was handed this value).
+/// A panicked blocking task degrades to [`rupu_netflow::NoopCapture`] —
+/// capture must never break a run.
+pub async fn net_capture(
+    cfg: &rupu_config::NetflowConfig,
+) -> Arc<dyn rupu_netflow::SubprocessCapture> {
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || rupu_runtime::net_capture::shared(&cfg))
+        .await
+        .unwrap_or_else(|_| Arc::new(rupu_netflow::NoopCapture))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
