@@ -60,6 +60,7 @@ pub enum BudgetStage {
 
 /// Evaluates a `Budget` over time. First-to-trip across the four dimensions
 /// (usd, tokens, rounds, wall_clock); unset dimensions are ignored.
+#[derive(Debug, Clone)]
 pub struct BudgetEnforcer {
     budget: Budget,
     started: DateTime<Utc>,
@@ -77,29 +78,46 @@ impl BudgetEnforcer {
         }
     }
 
+    /// First-to-trip stage. Fail closed: a zero cap is exhausted by
+    /// definition, so it is `Hard` on the first call (never "unlimited") —
+    /// the budget is the envelope's last-resort kill switch.
     pub fn stage(&self, usage: &dyn UsageSource, round: u32, now: DateTime<Utc>) -> BudgetStage {
         // (fraction, dimension-name) for each SET dimension.
         let mut fracs: Vec<(f64, &str)> = Vec::new();
         if let Some(cap) = self.budget.usd {
-            if cap > 0.0 {
-                fracs.push((usage.spent_usd() / cap, "usd"));
-            }
+            let frac = if cap.is_nan() || cap <= 0.0 {
+                f64::INFINITY
+            } else {
+                usage.spent_usd() / cap
+            };
+            fracs.push((frac, "usd"));
         }
         if let Some(cap) = self.budget.tokens {
-            if cap > 0 {
-                fracs.push((usage.spent_tokens() as f64 / cap as f64, "tokens"));
-            }
+            let frac = if cap == 0 {
+                f64::INFINITY
+            } else {
+                usage.spent_tokens() as f64 / cap as f64
+            };
+            fracs.push((frac, "tokens"));
         }
         if let Some(cap) = self.budget.rounds {
-            if cap > 0 {
-                fracs.push((round as f64 / cap as f64, "rounds"));
-            }
+            let frac = if cap == 0 {
+                f64::INFINITY
+            } else {
+                round as f64 / cap as f64
+            };
+            fracs.push((frac, "rounds"));
         }
         if let Some(w) = &self.budget.wall_clock {
             if let Ok(d) = parse_duration(w) {
-                let secs = d.num_seconds().max(1) as f64;
-                let elapsed = (now - self.started).num_seconds().max(0) as f64;
-                fracs.push((elapsed / secs, "wall_clock"));
+                let secs = d.num_seconds();
+                let frac = if secs <= 0 {
+                    f64::INFINITY
+                } else {
+                    let elapsed = (now - self.started).num_seconds().max(0);
+                    elapsed as f64 / secs as f64
+                };
+                fracs.push((frac, "wall_clock"));
             }
         }
         if let Some((_, dim)) = fracs.iter().find(|(f, _)| *f >= 1.0) {
@@ -235,5 +253,110 @@ mod tests {
         assert_eq!(parse_duration("6h").unwrap(), Duration::hours(6));
         assert_eq!(parse_duration("30m").unwrap(), Duration::minutes(30));
         assert!(parse_duration("banana").is_err());
+    }
+
+    fn only(f: impl FnOnce(&mut Budget)) -> Budget {
+        let mut b = Budget {
+            usd: None,
+            tokens: None,
+            wall_clock: None,
+            rounds: None,
+            soft_at: None,
+        };
+        f(&mut b);
+        b
+    }
+
+    fn hard(dimension: &str) -> BudgetStage {
+        BudgetStage::Hard {
+            dimension: dimension.into(),
+        }
+    }
+
+    #[test]
+    fn zero_cap_is_immediately_hard_for_every_dimension() {
+        // A 0 cap is exhausted by definition: fail closed, never "unlimited".
+        let start = Utc::now();
+        let idle = FixedUsage {
+            usd: 0.0,
+            tokens: 0,
+        };
+        let cases: [(&str, Budget); 4] = [
+            ("usd", only(|b| b.usd = Some(0.0))),
+            ("tokens", only(|b| b.tokens = Some(0))),
+            ("rounds", only(|b| b.rounds = Some(0))),
+            ("wall_clock", only(|b| b.wall_clock = Some("0s".into()))),
+        ];
+        for (dim, b) in cases {
+            b.validate().expect("a zero cap is a valid budget");
+            let e = BudgetEnforcer::new(b, start);
+            assert_eq!(e.stage(&idle, 0, start), hard(dim), "dimension {dim}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_budgets_and_accepts_a_normal_one() {
+        assert!(budget().validate().is_ok());
+        assert!(only(|b| b.usd = Some(-1.0)).validate().is_err());
+        assert!(only(|b| b.usd = Some(f64::NAN)).validate().is_err());
+        assert!(only(|b| b.soft_at = Some(1.5)).validate().is_err());
+        assert!(only(|b| b.soft_at = Some(-0.1)).validate().is_err());
+        assert!(only(|b| b.wall_clock = Some("banana".into()))
+            .validate()
+            .is_err());
+        // Boundaries and zero are accepted.
+        assert!(only(|b| b.soft_at = Some(1.0)).validate().is_ok());
+        assert!(only(|b| b.usd = Some(0.0)).validate().is_ok());
+    }
+
+    #[test]
+    fn hard_preempts_soft_and_names_the_first_tripped_dimension() {
+        let start = Utc::now();
+        let e = BudgetEnforcer::new(budget(), start);
+        // usd at cap (hard) AND tokens at 90% (soft): Hard wins, usd named.
+        let usage = FixedUsage {
+            usd: 50.0,
+            tokens: 18_000_000,
+        };
+        assert_eq!(e.stage(&usage, 0, start), hard("usd"));
+        // Two dimensions hard at once: the first in usd, tokens, rounds,
+        // wall_clock order is named.
+        let both = FixedUsage {
+            usd: 0.0,
+            tokens: 20_000_000,
+        };
+        assert_eq!(e.stage(&both, 40, start), hard("tokens"));
+    }
+
+    #[test]
+    fn soft_at_defaults_to_eighty_percent_when_unset() {
+        let start = Utc::now();
+        let e = BudgetEnforcer::new(only(|b| b.usd = Some(100.0)), start);
+        let at = |usd: f64| FixedUsage { usd, tokens: 0 };
+        assert_eq!(e.stage(&at(79.0), 0, start), BudgetStage::Ok);
+        assert_eq!(e.stage(&at(80.0), 0, start), BudgetStage::Soft);
+        assert_eq!(e.stage(&at(100.0), 0, start), hard("usd"));
+    }
+
+    #[test]
+    fn soft_can_be_triggered_by_wall_clock_alone() {
+        let start = Utc::now();
+        let e = BudgetEnforcer::new(budget(), start); // 6h, soft_at 0.8 => 4.8h
+        let idle = FixedUsage {
+            usd: 0.0,
+            tokens: 0,
+        };
+        assert_eq!(
+            e.stage(&idle, 0, start + Duration::hours(4)),
+            BudgetStage::Ok
+        );
+        assert_eq!(
+            e.stage(&idle, 0, start + Duration::hours(5)),
+            BudgetStage::Soft
+        );
+        assert_eq!(
+            e.stage(&idle, 0, start + Duration::hours(6)),
+            hard("wall_clock")
+        );
     }
 }
