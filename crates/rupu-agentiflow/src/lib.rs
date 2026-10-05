@@ -8,6 +8,7 @@ mod coverage;
 mod def;
 mod error;
 mod goal;
+mod operator;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use coverage::{CoverageEvaluator, CoverageOutcome, CoverageTarget};
@@ -17,3 +18,4 @@ pub use def::{
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
+pub use operator::{OperatorMessage, OperatorQueue};
