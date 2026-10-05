@@ -9,6 +9,7 @@ mod def;
 mod envelope;
 mod error;
 mod goal;
+mod lead;
 mod operator;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
@@ -23,4 +24,5 @@ pub use envelope::{
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
+pub use lead::render_round_prompt;
 pub use operator::{OperatorMessage, OperatorQueue};
