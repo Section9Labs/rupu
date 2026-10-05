@@ -216,6 +216,15 @@ impl AgentiflowDef {
                             g.id, a.kind
                         ))
                     })?;
+                    // `profile_for_kind` only matches the profile prefix; the kind
+                    // itself must also be one the profile defines (ids are
+                    // namespaced `"<profile>:<kind>"`).
+                    if !profile.asset_kinds.iter().any(|k| k.id == a.kind) {
+                        return Err(Invalid(format!(
+                            "goal `{}`: asset kind `{}` is not defined by profile `{}`",
+                            g.id, a.kind, profile.id
+                        )));
+                    }
                     if !profile.coverage.depth_ladder.iter().any(|d| d == depth) {
                         return Err(Invalid(format!(
                             "goal `{}`: depth `{}` is not a rung of `{}`'s ladder",
@@ -429,6 +438,27 @@ trigger: manual
 
         // ...but it is valid against a web kind.
         let d = with_target("{ asset: { kind: \"web:site\" }, depth_at_least: mapped }");
+        d.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn validate_asset_goal_kind_must_be_defined_by_its_profile() {
+        // `network:` resolves to the `network` profile and `exploited` is on
+        // its ladder, but `bogus` is not one of its asset kinds.
+        let d = with_target("{ asset: { kind: \"network:bogus\" }, depth_at_least: exploited }");
+        assert!(reason(&d).contains("is not defined by profile `network`"));
+
+        // A real kind of the same profile still passes (host AND the child
+        // kind service).
+        let d = with_target("{ asset: { kind: \"network:host\" }, depth_at_least: exploited }");
+        d.validate(&active()).unwrap();
+        let d = with_target("{ asset: { kind: \"network:service\" }, depth_at_least: tested }");
+        d.validate(&active()).unwrap();
+
+        // `count_gte` on an asset target is valid (the required asset count).
+        let d = with_target(
+            "{ asset: { kind: \"network:host\" }, depth_at_least: tested, count_gte: 5 }",
+        );
         d.validate(&active()).unwrap();
     }
 
