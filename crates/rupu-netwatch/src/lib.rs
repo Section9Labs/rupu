@@ -8,6 +8,7 @@
 //! [`OwnerId`]; the tracker returns [`Emission`]s for the caller to deliver.
 
 pub mod linux;
+pub mod macos;
 pub mod tracker;
 pub mod types;
 pub mod unsupported;
