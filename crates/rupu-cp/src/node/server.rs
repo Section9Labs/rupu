@@ -272,18 +272,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
 
                     match frame {
+                        // Awaited in frame order, one at a time: a run's
+                        // lines land in the order the node sent them.
                         Frame::Artifact { run_id, file, line } => {
-                            if let Err(e) =
-                                mirror.append(&run_id, &node_id_r, file, &line)
-                            {
+                            if let Err(e) = mirror.append(&run_id, &node_id_r, file, &line).await {
                                 warn!(error = %e, run_id,
                                       "node_tunnel: mirror.append failed");
                             }
                         }
                         Frame::RunFinished { run_id, status } => {
-                            if let Err(e) =
-                                mirror.finish(&run_id, &node_id_r, &status)
-                            {
+                            if let Err(e) = mirror.finish(&run_id, &node_id_r, &status).await {
                                 warn!(error = %e, run_id,
                                       "node_tunnel: mirror.finish failed");
                             }

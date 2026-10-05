@@ -9,10 +9,15 @@
 //! from the node, or overwrite `run.json` from the node's own
 //! [`RunRecord`] while preserving our `id` and `worker_id`.
 //! [`NodeMirror::finish`] transitions the run to its terminal status.
+//!
+//! Every operation that touches disk is `async` and runs its `std::fs` body
+//! on tokio's blocking pool, never on an executor thread: the callers are the
+//! tunnel read pump, the bucket poller and the SSH tail pump, all on the
+//! runtime.
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -43,6 +48,10 @@ pub enum MirrorError {
     /// The calling node does not own the run it is trying to update.
     #[error("run `{0}` does not belong to the calling node")]
     WrongNode(String),
+    /// The blocking-pool task running the operation panicked, or the runtime
+    /// shut down before it started.
+    #[error("mirror task failed: {0}")]
+    Task(String),
 }
 
 /// Validates a `run_id` before allowing any store operation, by the one rule
@@ -54,10 +63,28 @@ fn validate_run_id(id: &str) -> Result<(), MirrorError> {
     Ok(())
 }
 
+/// Append `line` plus its newline to `path` (created if absent) in ONE
+/// `write_all` of one buffer on an `O_APPEND` descriptor, so a concurrent
+/// appender to the same file can never land between a line and its newline
+/// (`writeln!` would issue two writes: the line, then the `\n`).
+fn append_line(path: &Path, mut line: String) -> std::io::Result<()> {
+    line.push('\n');
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())
+}
+
 /// Mirrors artifact files streamed from a remote tunnel node into the
 /// central [`RunStore`].
 ///
 /// The mirror is thread-safe: all state is behind `Arc`.
+///
+/// Each disk-touching method makes one hop to the blocking pool
+/// ([`Self::off_runtime`]). A caller dropped mid-await does not cancel the
+/// operation: it still runs to completion, so a line still lands whole and a
+/// replace still renames whole.
 pub struct NodeMirror {
     run_store: Arc<RunStore>,
 }
@@ -68,6 +95,18 @@ impl NodeMirror {
         Self { run_store }
     }
 
+    /// Run `op` against this mirror's store on tokio's blocking pool. Only a
+    /// panicked (or never-started) task maps to [`MirrorError::Task`].
+    async fn off_runtime<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&NodeMirror) -> Result<T, MirrorError> + Send + 'static,
+    ) -> Result<T, MirrorError> {
+        let mirror = NodeMirror::new(Arc::clone(&self.run_store));
+        tokio::task::spawn_blocking(move || op(&mirror))
+            .await
+            .map_err(|e| MirrorError::Task(e.to_string()))?
+    }
+
     /// Allocate a run directory in the store and record the initial
     /// [`RunRecord`] with `status = Running` and `worker_id = node_id`.
     ///
@@ -75,7 +114,18 @@ impl NodeMirror {
     /// Returns [`MirrorError::InvalidRunId`] when `run_id` fails format
     /// validation.  Returns [`MirrorError::Store`] if the store already
     /// contains `run_id` or if directory creation fails.
-    pub fn create_run(
+    pub async fn create_run(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        spec: &RunSpec,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, spec) = (run_id.to_owned(), node_id.to_owned(), spec.clone());
+        self.off_runtime(move |m| m.create_run_blocking(&run_id, &node_id, &spec))
+            .await
+    }
+
+    fn create_run_blocking(
         &self,
         run_id: &str,
         node_id: &str,
@@ -159,12 +209,24 @@ impl NodeMirror {
     /// [`MirrorError::WrongNode`] when `node_id` does not match the run's
     /// recorded `worker_id`.  [`MirrorError::Io`] on file-open/write failures.
     /// [`MirrorError::Json`] when a `RunJson` line cannot be parsed.
-    pub fn append(
+    pub async fn append(
         &self,
         run_id: &str,
         node_id: &str,
         file: ArtifactFile,
         line: &str,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, line) = (run_id.to_owned(), node_id.to_owned(), line.to_owned());
+        self.off_runtime(move |m| m.append_blocking(&run_id, &node_id, file, line))
+            .await
+    }
+
+    fn append_blocking(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        file: ArtifactFile,
+        line: String,
     ) -> Result<(), MirrorError> {
         validate_run_id(run_id)?;
 
@@ -178,14 +240,11 @@ impl NodeMirror {
 
         match file {
             ArtifactFile::Events => {
-                let path = self.run_store.events_path(run_id);
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(f, "{line}")?;
+                append_line(&self.run_store.events_path(run_id), line)?;
             }
             ArtifactFile::StepResults => {
                 let path = self.run_store.root.join(run_id).join("step_results.jsonl");
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(f, "{line}")?;
+                append_line(&path, line)?;
             }
             ArtifactFile::UnitCheckpoints => {
                 let path = self
@@ -193,26 +252,20 @@ impl NodeMirror {
                     .root
                     .join(run_id)
                     .join("unit_checkpoints.jsonl");
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(f, "{line}")?;
+                append_line(&path, line)?;
             }
             ArtifactFile::Usage => {
-                let path = self.run_store.usage_ledger_path(run_id);
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(f, "{line}")?;
+                append_line(&self.run_store.usage_ledger_path(run_id), line)?;
             }
             ArtifactFile::Transcript => {
                 let path = self.transcript_mirror_path(run_id);
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(f, "{line}")?;
+                append_line(&path, line)?;
             }
             ArtifactFile::Coverage => {
-                let path = self.coverage_path(run_id);
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(f, "{line}")?;
+                append_line(&self.coverage_path(run_id), line)?;
             }
             ArtifactFile::RunJson => {
                 // Parse the node's run.json.  Re-pin the CP-local identity /
@@ -223,7 +276,7 @@ impl NodeMirror {
                 // from `incoming` — that is the point of the RunJson update.
                 // Ownership was already verified above; `existing` carries the
                 // CP-local fields to re-apply.
-                let mut incoming: RunRecord = serde_json::from_str(line)?;
+                let mut incoming: RunRecord = serde_json::from_str(&line)?;
                 incoming.id = existing.id;
                 incoming.worker_id = existing.worker_id;
                 incoming.workspace_id = existing.workspace_id;
@@ -262,7 +315,13 @@ impl NodeMirror {
     /// transcript: `tail -n +1 -F` always replays the file from byte zero,
     /// so a respawned pump would otherwise append a second copy of every
     /// already-mirrored line. Ownership rules match [`NodeMirror::append`].
-    pub fn reset_transcript(&self, run_id: &str, node_id: &str) -> Result<(), MirrorError> {
+    pub async fn reset_transcript(&self, run_id: &str, node_id: &str) -> Result<(), MirrorError> {
+        let (run_id, node_id) = (run_id.to_owned(), node_id.to_owned());
+        self.off_runtime(move |m| m.reset_transcript_blocking(&run_id, &node_id))
+            .await
+    }
+
+    fn reset_transcript_blocking(&self, run_id: &str, node_id: &str) -> Result<(), MirrorError> {
         validate_run_id(run_id)?;
         let existing = self.run_store.load(run_id)?;
         if existing.worker_id.as_deref() != Some(node_id) {
@@ -285,7 +344,19 @@ impl NodeMirror {
     /// tail stream — the final copy is authoritative and complete, and the
     /// overwrite also makes replays idempotent. Ownership rules match
     /// [`NodeMirror::append`].
-    pub fn replace_transcript(
+    pub async fn replace_transcript(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        content: &str,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, content) =
+            (run_id.to_owned(), node_id.to_owned(), content.to_owned());
+        self.off_runtime(move |m| m.replace_transcript_blocking(&run_id, &node_id, &content))
+            .await
+    }
+
+    fn replace_transcript_blocking(
         &self,
         run_id: &str,
         node_id: &str,
@@ -321,7 +392,19 @@ impl NodeMirror {
     /// the temp file cannot be written or renamed. Either way the (possibly
     /// partly written) temp file is removed and the existing ledger is left
     /// untouched.
-    pub fn replace_usage_ledger(
+    pub async fn replace_usage_ledger(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        content: &str,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, content) =
+            (run_id.to_owned(), node_id.to_owned(), content.to_owned());
+        self.off_runtime(move |m| m.replace_usage_ledger_blocking(&run_id, &node_id, &content))
+            .await
+    }
+
+    fn replace_usage_ledger_blocking(
         &self,
         run_id: &str,
         node_id: &str,
@@ -355,10 +438,22 @@ impl NodeMirror {
     /// mark FIRST, so a reader never pairs "complete" with a snapshot. Same
     /// ownership check as [`Self::append`].
     ///
-    /// Async because the stream can be large and the caller is the SSH tail
-    /// pump on the async runtime: the whole-file write and the rename go
-    /// through `tokio::fs`, not a blocking `std::fs` call.
+    /// The stream can be large and the caller is the SSH tail pump on the
+    /// async runtime: like every mirror write, the ownership check, the
+    /// whole-file write and the rename run on the blocking pool.
     pub async fn replace_coverage(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        body: &str,
+        complete: bool,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, body) = (run_id.to_owned(), node_id.to_owned(), body.to_owned());
+        self.off_runtime(move |m| m.replace_coverage_blocking(&run_id, &node_id, &body, complete))
+            .await
+    }
+
+    fn replace_coverage_blocking(
         &self,
         run_id: &str,
         node_id: &str,
@@ -373,7 +468,7 @@ impl NodeMirror {
         let path = self.coverage_path(run_id);
         let mark = crate::host::transcript_paths::complete_marker(&path);
         if !complete {
-            match tokio::fs::remove_file(&mark).await {
+            match std::fs::remove_file(&mark) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -382,27 +477,28 @@ impl NodeMirror {
         // A per-call temp name (two replaces for one run can overlap) removed
         // on any failure, like `replace_usage_ledger`.
         let tmp = path.with_file_name(format!("coverage.jsonl.{}.tmp", ulid::Ulid::new()));
-        let written = async {
-            tokio::fs::write(&tmp, body).await?;
-            tokio::fs::rename(&tmp, &path).await
-        }
-        .await;
-        if let Err(e) = written {
-            let _ = tokio::fs::remove_file(&tmp).await;
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
         if complete {
-            tokio::fs::write(&mark, b"").await?;
+            std::fs::write(&mark, b"")?;
         }
         Ok(())
     }
 
     /// Whether the mirrored stream is the host's whole file — a
     /// [`Self::replace_coverage`] with `complete` landed. `false` for an
-    /// invalid run id.
-    pub fn coverage_complete(&self, run_id: &str) -> bool {
-        validate_run_id(run_id).is_ok()
-            && crate::host::transcript_paths::is_complete(&self.coverage_path(run_id))
+    /// invalid run id, and for a check whose task failed (the conservative
+    /// answer: the coordinator then warns rather than trusts a short stream).
+    pub async fn coverage_complete(&self, run_id: &str) -> bool {
+        if validate_run_id(run_id).is_err() {
+            return false;
+        }
+        let path = self.coverage_path(run_id);
+        self.off_runtime(move |_| Ok(crate::host::transcript_paths::is_complete(&path)))
+            .await
+            .unwrap_or(false)
     }
 
     /// Transition `run_id` to `status` and set `finished_at = now()`.
@@ -419,7 +515,23 @@ impl NodeMirror {
     /// [`MirrorError::Store`] when the run cannot be loaded or written.
     /// [`MirrorError::WrongNode`] when `node_id` does not match the run's
     /// recorded `worker_id`.
-    pub fn finish(&self, run_id: &str, node_id: &str, status: &str) -> Result<(), MirrorError> {
+    pub async fn finish(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        status: &str,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, status) = (run_id.to_owned(), node_id.to_owned(), status.to_owned());
+        self.off_runtime(move |m| m.finish_blocking(&run_id, &node_id, &status))
+            .await
+    }
+
+    fn finish_blocking(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        status: &str,
+    ) -> Result<(), MirrorError> {
         validate_run_id(run_id)?;
         let mut record = self.run_store.load(run_id)?;
         if record.worker_id.as_deref() != Some(node_id) {
@@ -448,7 +560,21 @@ impl NodeMirror {
     /// Spec §8: the pump saw the agent transcript's first line. Point the
     /// local record's active step at the mirrored copy so the frontends'
     /// existing active-step fallback opens it live. No-op once terminal.
-    pub fn note_transcript_started(&self, run_id: &str, node_id: &str) -> Result<(), MirrorError> {
+    pub async fn note_transcript_started(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id) = (run_id.to_owned(), node_id.to_owned());
+        self.off_runtime(move |m| m.note_transcript_started_blocking(&run_id, &node_id))
+            .await
+    }
+
+    fn note_transcript_started_blocking(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<(), MirrorError> {
         validate_run_id(run_id)?;
         let mut record = self.run_store.load(run_id)?;
         if record.worker_id.as_deref() != Some(node_id) {
@@ -563,9 +689,10 @@ mod tests {
             target: None,
             findings_profile: None,
         };
-        mirror.create_run("run_C1", "node-1", &spec).unwrap();
+        mirror.create_run("run_C1", "node-1", &spec).await.unwrap();
         mirror
             .append("run_C1", "node-1", ArtifactFile::Coverage, "line-1")
+            .await
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(mirror.coverage_path("run_C1")).unwrap(),
@@ -607,15 +734,18 @@ mod tests {
             target: None,
             findings_profile: None,
         };
-        mirror.create_run("run_C3", "node-1", &spec).unwrap();
-        assert!(!mirror.coverage_complete("run_C3"), "nothing pulled yet");
+        mirror.create_run("run_C3", "node-1", &spec).await.unwrap();
+        assert!(
+            !mirror.coverage_complete("run_C3").await,
+            "nothing pulled yet"
+        );
 
         mirror
             .replace_coverage("run_C3", "node-1", "snap\n", false)
             .await
             .unwrap();
         assert!(
-            !mirror.coverage_complete("run_C3"),
+            !mirror.coverage_complete("run_C3").await,
             "a snapshot is not complete"
         );
 
@@ -623,7 +753,7 @@ mod tests {
             .replace_coverage("run_C3", "node-1", "whole\n", true)
             .await
             .unwrap();
-        assert!(mirror.coverage_complete("run_C3"));
+        assert!(mirror.coverage_complete("run_C3").await);
         assert_eq!(
             std::fs::read_to_string(mirror.coverage_path("run_C3")).unwrap(),
             "whole\n"
@@ -634,10 +764,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !mirror.coverage_complete("run_C3"),
+            !mirror.coverage_complete("run_C3").await,
             "a later snapshot must clear the mark"
         );
-        assert!(!mirror.coverage_complete("../escape"));
+        assert!(!mirror.coverage_complete("../escape").await);
     }
 
     #[tokio::test]
@@ -656,7 +786,7 @@ mod tests {
             target: None,
             findings_profile: None,
         };
-        mirror.create_run("run_C2", "node-1", &spec).unwrap();
+        mirror.create_run("run_C2", "node-1", &spec).await.unwrap();
         mirror
             .replace_coverage("run_C2", "node-1", "a\n", false)
             .await
@@ -711,7 +841,7 @@ mod tests {
             target: None,
             findings_profile: None,
         };
-        mirror.create_run("run_C3", "node-1", &spec).unwrap();
+        mirror.create_run("run_C3", "node-1", &spec).await.unwrap();
         // A directory where the stream file belongs: the write of the temp
         // file succeeds, the rename over a non-empty directory fails.
         let dest = mirror.coverage_path("run_C3");
@@ -721,7 +851,7 @@ mod tests {
             .await
             .is_err());
         assert!(
-            !mirror.coverage_complete("run_C3"),
+            !mirror.coverage_complete("run_C3").await,
             "a replace that did not land must not be marked complete"
         );
         let run_dir = dest.parent().unwrap().to_path_buf();
@@ -734,5 +864,60 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// Appenders racing on one file (frames from a reconnected node beside an
+    /// old connection's, two pumps for one run) each land whole lines: a line
+    /// and its newline go out in one write, so no other line lands between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_never_tear_a_line() {
+        const TASKS: u8 = 8;
+        const LINES: usize = 50;
+        const WIDTH: usize = 4096;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = std::sync::Arc::new(NodeMirror::new(std::sync::Arc::clone(&store)));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "a".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        mirror.create_run("run_A1", "node-1", &spec).await.unwrap();
+
+        let tasks: Vec<_> = (0..TASKS)
+            .map(|t| {
+                let mirror = std::sync::Arc::clone(&mirror);
+                tokio::spawn(async move {
+                    let line = char::from(b'a' + t).to_string().repeat(WIDTH);
+                    for _ in 0..LINES {
+                        mirror
+                            .append("run_A1", "node-1", ArtifactFile::Events, &line)
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let body = std::fs::read_to_string(store.events_path("run_A1")).unwrap();
+        let lines: Vec<&str> = body.split_terminator('\n').collect();
+        assert_eq!(lines.len(), usize::from(TASKS) * LINES, "a line was torn");
+        for line in lines {
+            assert!(
+                line.len() == WIDTH && line.bytes().all(|b| b == line.as_bytes()[0]),
+                "a line was torn: {} bytes, starting {:?}",
+                line.len(),
+                &line[..line.len().min(16)]
+            );
+        }
     }
 }

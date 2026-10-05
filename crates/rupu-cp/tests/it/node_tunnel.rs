@@ -214,8 +214,8 @@ async fn send_errors_offline_when_receiver_dropped() {
 
 // ── NodeMirror ────────────────────────────────────────────────────────────────
 
-#[test]
-fn mirror_create_append_finish_round_trip() {
+#[tokio::test]
+async fn mirror_create_append_finish_round_trip() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::{RunStatus, RunStore};
@@ -241,6 +241,7 @@ fn mirror_create_append_finish_round_trip() {
 
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     mirror
@@ -250,6 +251,7 @@ fn mirror_create_append_finish_round_trip() {
             ArtifactFile::Events,
             r#"{"type":"step_started","step_id":"s1"}"#,
         )
+        .await
         .expect("append event 1");
 
     mirror
@@ -259,9 +261,13 @@ fn mirror_create_append_finish_round_trip() {
             ArtifactFile::Events,
             r#"{"type":"step_completed","step_id":"s1"}"#,
         )
+        .await
         .expect("append event 2");
 
-    mirror.finish(run_id, node_id, "completed").expect("finish");
+    mirror
+        .finish(run_id, node_id, "completed")
+        .await
+        .expect("finish");
 
     // Status must be Completed and worker_id must carry the node attribution.
     let record = store.load(run_id).expect("load");
@@ -290,8 +296,8 @@ fn mirror_create_append_finish_round_trip() {
 
 /// A node's usage ledger lines land verbatim in the run's `usage.jsonl`
 /// (`RunStore::usage_ledger_path`) — the file the CP's live usage fold reads.
-#[test]
-fn mirror_usage_lines_land_in_the_run_usage_ledger() {
+#[tokio::test]
+async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -315,15 +321,18 @@ fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     let node_id = "node-42";
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     let row1 = r#"{"id":"01J0000000000000000000USG1","step_id":"s1","input_tokens":10}"#;
     let row2 = r#"{"id":"01J0000000000000000000USG2","step_id":"s2","input_tokens":20}"#;
     mirror
         .append(run_id, node_id, ArtifactFile::Usage, row1)
+        .await
         .expect("append usage 1");
     mirror
         .append(run_id, node_id, ArtifactFile::Usage, row2)
+        .await
         .expect("append usage 2");
 
     let path = store.usage_ledger_path(run_id);
@@ -334,6 +343,7 @@ fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     // Ownership is still enforced for the new artifact kind.
     let err = mirror
         .append(run_id, "intruder", ArtifactFile::Usage, row1)
+        .await
         .expect_err("a different node must not append to this run's ledger");
     assert!(
         matches!(err, rupu_cp::node::mirror::MirrorError::WrongNode(_)),
@@ -350,8 +360,8 @@ fn mirror_usage_lines_land_in_the_run_usage_ledger() {
 /// content is exactly the given body, the inode changes, no temp file is left,
 /// and node ownership / run-id validation still apply.
 #[cfg(unix)]
-#[test]
-fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
+#[tokio::test]
+async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     use rupu_cp::node::mirror::{MirrorError, NodeMirror};
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -375,6 +385,7 @@ fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let node_id = "node-42";
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     // Replacing works even when no ledger exists yet.
@@ -382,6 +393,7 @@ fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let row_b = r#"{"id":"01J0000000000000000000USGB"}"#;
     mirror
         .replace_usage_ledger(run_id, node_id, &format!("{row_a}\n"))
+        .await
         .expect("replace into a missing ledger");
     let path = store.usage_ledger_path(run_id);
     assert_eq!(
@@ -392,6 +404,7 @@ fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let inode_before = std::fs::metadata(&path).unwrap().ino();
     mirror
         .replace_usage_ledger(run_id, node_id, &format!("{row_a}\n{row_b}\n"))
+        .await
         .expect("replace");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -418,16 +431,17 @@ fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
             ArtifactFile::Usage,
             r#"{"id":"01J0000000000000000000USGC"}"#,
         )
+        .await
         .expect("append after replace");
     assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
 
     // Ownership and run-id validation are enforced before any I/O.
     assert!(matches!(
-        mirror.replace_usage_ledger(run_id, "intruder", "x\n"),
+        mirror.replace_usage_ledger(run_id, "intruder", "x\n").await,
         Err(MirrorError::WrongNode(_))
     ));
     assert!(matches!(
-        mirror.replace_usage_ledger("../evil", node_id, "x\n"),
+        mirror.replace_usage_ledger("../evil", node_id, "x\n").await,
         Err(MirrorError::InvalidRunId(_))
     ));
     assert_eq!(
@@ -441,8 +455,8 @@ fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
 /// untouched. The rename is made to fail by occupying the ledger path with a
 /// non-empty directory; the write-failure path shares the same cleanup branch.
 #[cfg(unix)]
-#[test]
-fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
+#[tokio::test]
+async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     use rupu_cp::node::mirror::{MirrorError, NodeMirror};
     use rupu_cp::node::protocol::{RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -465,12 +479,14 @@ fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let node_id = "node-43";
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
     let path = store.usage_ledger_path(run_id);
     std::fs::create_dir_all(path.join("occupied")).unwrap();
 
     let err = mirror
         .replace_usage_ledger(run_id, node_id, "{\"id\":\"01J0000000000000000000USGD\"}\n")
+        .await
         .expect_err("a file cannot be renamed over a non-empty directory");
     assert!(
         matches!(err, MirrorError::Io(_)),
@@ -493,8 +509,8 @@ fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
 /// the loaded record must carry the CP-side `transcript_dir` and
 /// `workspace_path` (not the node's paths), while run-state fields
 /// (e.g. `status`) are taken from the node's `RunRecord`.
-#[test]
-fn mirror_run_json_repins_cp_local_paths() {
+#[tokio::test]
+async fn mirror_run_json_repins_cp_local_paths() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::{RunStatus, RunStore};
@@ -521,6 +537,7 @@ fn mirror_run_json_repins_cp_local_paths() {
 
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     // Record what create_run stored as the CP-side transcript_dir and
@@ -545,6 +562,7 @@ fn mirror_run_json_repins_cp_local_paths() {
 
     mirror
         .append(run_id, node_id, ArtifactFile::RunJson, &line)
+        .await
         .expect("append RunJson");
 
     let record = store.load(run_id).expect("load after RunJson append");
@@ -595,8 +613,8 @@ fn mirror_run_json_repins_cp_local_paths() {
 /// the node sent.  This prevents a mirrored run from ever being picked up by
 /// the central resume worker (which scans for `resume_requested_at` being
 /// `Some`).
-#[test]
-fn mirror_run_json_nulls_resume_fields() {
+#[tokio::test]
+async fn mirror_run_json_nulls_resume_fields() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -622,6 +640,7 @@ fn mirror_run_json_nulls_resume_fields() {
 
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     // Build a node-side RunRecord JSON that has all four resume_* fields set.
@@ -643,6 +662,7 @@ fn mirror_run_json_nulls_resume_fields() {
 
     mirror
         .append(run_id, node_id, ArtifactFile::RunJson, &line)
+        .await
         .expect("append RunJson");
 
     let record = store.load(run_id).expect("load after RunJson append");
@@ -669,8 +689,8 @@ fn mirror_run_json_nulls_resume_fields() {
 /// field preserved after the mirror re-pins CP-local identity fields.
 /// `final_output` is a run-state field (not a location / identity field), so
 /// the mirror must pass it through from the node's record unchanged.
-#[test]
-fn mirror_run_json_preserves_final_output() {
+#[tokio::test]
+async fn mirror_run_json_preserves_final_output() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::{RunStatus, RunStore};
@@ -696,6 +716,7 @@ fn mirror_run_json_preserves_final_output() {
 
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     // Build a node-side RunRecord JSON with final_output set and status=completed.
@@ -715,6 +736,7 @@ fn mirror_run_json_preserves_final_output() {
 
     mirror
         .append(run_id, node_id, ArtifactFile::RunJson, &line)
+        .await
         .expect("append RunJson");
 
     let record = store.load(run_id).expect("load after RunJson append");
@@ -738,8 +760,8 @@ fn mirror_run_json_preserves_final_output() {
 
 /// A run_id containing a path-traversal sequence (`/`) must be rejected by
 /// both `append` and `finish` before any I/O is attempted.
-#[test]
-fn mirror_traversal_run_id_rejected_before_io() {
+#[tokio::test]
+async fn mirror_traversal_run_id_rejected_before_io() {
     use rupu_cp::node::mirror::{MirrorError, NodeMirror};
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -756,6 +778,7 @@ fn mirror_traversal_run_id_rejected_before_io() {
     // append must return InvalidRunId.
     let err = mirror
         .append(evil_id, node_id, ArtifactFile::Events, "line")
+        .await
         .expect_err("append with traversal id must fail");
     assert!(
         matches!(err, MirrorError::InvalidRunId(_)),
@@ -765,6 +788,7 @@ fn mirror_traversal_run_id_rejected_before_io() {
     // finish must return InvalidRunId.
     let err = mirror
         .finish(evil_id, node_id, "completed")
+        .await
         .expect_err("finish with traversal id must fail");
     assert!(
         matches!(err, MirrorError::InvalidRunId(_)),
@@ -797,6 +821,7 @@ fn mirror_traversal_run_id_rejected_before_io() {
     ] {
         let err = mirror
             .append(bad, node_id, ArtifactFile::Events, "line")
+            .await
             .expect_err(&format!("append({bad}) must fail"));
         assert!(
             matches!(err, MirrorError::InvalidRunId(_)),
@@ -806,8 +831,8 @@ fn mirror_traversal_run_id_rejected_before_io() {
 }
 
 /// A node must not be able to write into a run that belongs to a different node.
-#[test]
-fn mirror_wrong_node_id_rejected() {
+#[tokio::test]
+async fn mirror_wrong_node_id_rejected() {
     use rupu_cp::node::mirror::{MirrorError, NodeMirror};
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -835,11 +860,13 @@ fn mirror_wrong_node_id_rejected() {
     // Run created by owner_node.
     mirror
         .create_run(run_id, owner_node, &spec)
+        .await
         .expect("create_run by owner");
 
     // intruder_node tries to append — must be rejected with WrongNode.
     let err = mirror
         .append(run_id, intruder_node, ArtifactFile::Events, "injected line")
+        .await
         .expect_err("append by wrong node must fail");
     assert!(
         matches!(err, MirrorError::WrongNode(_)),
@@ -849,6 +876,7 @@ fn mirror_wrong_node_id_rejected() {
     // intruder_node tries to finish — must be rejected with WrongNode.
     let err = mirror
         .finish(run_id, intruder_node, "completed")
+        .await
         .expect_err("finish by wrong node must fail");
     assert!(
         matches!(err, MirrorError::WrongNode(_)),
@@ -871,8 +899,8 @@ fn mirror_wrong_node_id_rejected() {
 }
 
 /// Legitimate path: the owning node can append and finish its own run.
-#[test]
-fn mirror_legitimate_owner_can_append_and_finish() {
+#[tokio::test]
+async fn mirror_legitimate_owner_can_append_and_finish() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::{RunStatus, RunStore};
@@ -898,6 +926,7 @@ fn mirror_legitimate_owner_can_append_and_finish() {
 
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
     mirror
         .append(
@@ -906,9 +935,11 @@ fn mirror_legitimate_owner_can_append_and_finish() {
             ArtifactFile::Events,
             r#"{"type":"started"}"#,
         )
+        .await
         .expect("append by owner must succeed");
     mirror
         .finish(run_id, node_id, "completed")
+        .await
         .expect("finish by owner must succeed");
 
     let record = store.load(run_id).expect("load");
@@ -1555,11 +1586,18 @@ mod tunnel_connector {
 
         // Seed two runs for my_node and one for other_node.
         let my_spec = make_spec("mine-wf");
-        mirror.create_run("run_MINE001", my_node, &my_spec).unwrap();
-        mirror.create_run("run_MINE002", my_node, &my_spec).unwrap();
+        mirror
+            .create_run("run_MINE001", my_node, &my_spec)
+            .await
+            .unwrap();
+        mirror
+            .create_run("run_MINE002", my_node, &my_spec)
+            .await
+            .unwrap();
         let other_spec = make_spec("other-wf");
         mirror
             .create_run("run_OTHER001", other_node, &other_spec)
+            .await
             .unwrap();
 
         // Register my_node (online) so the connector can be built; list_runs
@@ -3290,8 +3328,8 @@ async fn e2e_reject_over_tunnel() {
 /// and `finish` must synthesize a single `"agent"` step-result row pointing
 /// at that file, because every CP read path (`/api/runs/:id` steps, the run
 /// graph, the usage rollup) locates transcripts through `step_results.jsonl`.
-#[test]
-fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
+#[tokio::test]
+async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -3317,17 +3355,23 @@ fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
     let node_id = "node-42";
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     let t1 = r#"{"type":"run_start","agent":"reviewer"}"#;
     let t2 = r#"{"type":"run_complete","status":"ok"}"#;
     mirror
         .append(run_id, node_id, ArtifactFile::Transcript, t1)
+        .await
         .expect("append transcript 1");
     mirror
         .append(run_id, node_id, ArtifactFile::Transcript, t2)
+        .await
         .expect("append transcript 2");
-    mirror.finish(run_id, node_id, "completed").expect("finish");
+    mirror
+        .finish(run_id, node_id, "completed")
+        .await
+        .expect("finish");
 
     // Bytes land at <global>/transcripts/<run_id>.jsonl — outside runs/.
     let transcript_path = dir
@@ -3354,6 +3398,7 @@ fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
     // Repeated finish (pump fallback path) must not duplicate the row.
     mirror
         .finish(run_id, node_id, "completed")
+        .await
         .expect("finish again");
     let steps = store.read_step_results(run_id).expect("read step results");
     assert_eq!(steps.len(), 1, "finish must be idempotent for synthesis");
@@ -3363,8 +3408,8 @@ fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
 /// respawned pump re-sends every already-mirrored line. The pump calls
 /// `reset_transcript` when the replay starts; the mirror must truncate so
 /// the replay overwrites instead of appending a duplicate copy.
-#[test]
-fn mirror_reset_transcript_makes_replay_idempotent() {
+#[tokio::test]
+async fn mirror_reset_transcript_makes_replay_idempotent() {
     use rupu_cp::node::mirror::NodeMirror;
     use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
     use rupu_orchestrator::RunStore;
@@ -3388,20 +3433,29 @@ fn mirror_reset_transcript_makes_replay_idempotent() {
     let node_id = "node-42";
     mirror
         .create_run(run_id, node_id, &spec)
+        .await
         .expect("create_run");
 
     let line = r#"{"type":"run_start","agent":"reviewer"}"#;
 
     // First pump lifetime: replay starts → reset → line mirrored.
-    mirror.reset_transcript(run_id, node_id).expect("reset 1");
+    mirror
+        .reset_transcript(run_id, node_id)
+        .await
+        .expect("reset 1");
     mirror
         .append(run_id, node_id, ArtifactFile::Transcript, line)
+        .await
         .expect("append 1");
 
     // Respawned pump: same full replay again.
-    mirror.reset_transcript(run_id, node_id).expect("reset 2");
+    mirror
+        .reset_transcript(run_id, node_id)
+        .await
+        .expect("reset 2");
     mirror
         .append(run_id, node_id, ArtifactFile::Transcript, line)
+        .await
         .expect("append 2");
 
     let transcript_path = dir
@@ -3417,12 +3471,13 @@ fn mirror_reset_transcript_makes_replay_idempotent() {
 
     // Ownership is enforced like every other mirror write.
     assert!(
-        mirror.reset_transcript(run_id, "other-node").is_err(),
+        mirror.reset_transcript(run_id, "other-node").await.is_err(),
         "reset from a non-owning node must be refused"
     );
     assert!(
         mirror
             .replace_transcript(run_id, "other-node", "stolen")
+            .await
             .is_err(),
         "replace from a non-owning node must be refused"
     );

@@ -50,6 +50,7 @@ pub async fn poll_bucket_run(
         mirror_new_results(bucket, mirror, host_id, run_id, consumed).await?;
         mirror
             .finish(run_id, host_id, &status)
+            .await
             .with_context(|| format!("mirror.finish for run {run_id}"))?;
         return Ok(true);
     }
@@ -95,6 +96,7 @@ async fn mirror_new_results(
                 // Do NOT add "run.json" to `consumed` so each poll picks it up.
                 mirror
                     .append(run_id, host_id, ArtifactFile::RunJson, &body_str)
+                    .await
                     .with_context(|| format!("mirror.append RunJson for run {run_id}"))?;
                 continue; // skip the `consumed.insert` below
             }
@@ -107,6 +109,7 @@ async fn mirror_new_results(
                     }
                     mirror
                         .append(run_id, host_id, file.clone(), line)
+                        .await
                         .with_context(|| {
                             format!("mirror.append {file:?} line for run {run_id}")
                         })?;
@@ -276,6 +279,7 @@ mod tests {
                     findings_profile: None,
                 },
             )
+            .await
             .unwrap();
 
         let inner = ObjectStoreBucket::new(
@@ -327,6 +331,7 @@ mod tests {
                     findings_profile: None,
                 },
             )
+            .await
             .unwrap();
         let bucket = ObjectStoreBucket::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),

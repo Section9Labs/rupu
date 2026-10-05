@@ -142,6 +142,7 @@ impl HostConnector for TunnelHostConnector {
 
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)
+            .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
         if conn
@@ -155,7 +156,10 @@ impl HostConnector for TunnelHostConnector {
             // Node disconnected in the narrow window between live_conn() and
             // send().  Best-effort: mark the orphaned mirror run cancelled so
             // it doesn't remain stuck in Running.
-            let _ = self.mirror.finish(&run_id, &self.node_id, "cancelled");
+            let _ = self
+                .mirror
+                .finish(&run_id, &self.node_id, "cancelled")
+                .await;
             return Err(HostConnectorError::Unreachable(format!(
                 "node {} disconnected before Run frame could be sent",
                 self.node_id
@@ -200,6 +204,7 @@ impl HostConnector for TunnelHostConnector {
 
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)
+            .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
         if conn
@@ -213,7 +218,10 @@ impl HostConnector for TunnelHostConnector {
             // Node disconnected in the narrow window between live_conn() and
             // send().  Best-effort: mark the orphaned mirror run cancelled so
             // it doesn't remain stuck in Running.
-            let _ = self.mirror.finish(&run_id, &self.node_id, "cancelled");
+            let _ = self
+                .mirror
+                .finish(&run_id, &self.node_id, "cancelled")
+                .await;
             return Err(HostConnectorError::Unreachable(format!(
                 "node {} disconnected before Run frame could be sent",
                 self.node_id

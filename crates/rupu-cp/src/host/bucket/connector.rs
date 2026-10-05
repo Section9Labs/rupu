@@ -178,19 +178,20 @@ impl HostConnector for BucketHostConnector {
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
+            .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
-        let bytes = serde_json::to_vec(&spec).map_err(|e| {
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
-            HostConnectorError::Invalid(e.to_string())
-        })?;
-        self.bucket
-            .put_job(&run_id, &bytes)
-            .await
-            .map_err(|e| {
-                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
-                bucket_err_to_unreachable(e)
-            })?;
+        let bytes = match serde_json::to_vec(&spec) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
+                return Err(HostConnectorError::Invalid(e.to_string()));
+            }
+        };
+        if let Err(e) = self.bucket.put_job(&run_id, &bytes).await {
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
+            return Err(bucket_err_to_unreachable(e));
+        }
 
         Ok(run_id)
     }
@@ -219,19 +220,20 @@ impl HostConnector for BucketHostConnector {
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
+            .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
-        let bytes = serde_json::to_vec(&spec).map_err(|e| {
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
-            HostConnectorError::Invalid(e.to_string())
-        })?;
-        self.bucket
-            .put_job(&run_id, &bytes)
-            .await
-            .map_err(|e| {
-                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
-                bucket_err_to_unreachable(e)
-            })?;
+        let bytes = match serde_json::to_vec(&spec) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
+                return Err(HostConnectorError::Invalid(e.to_string()));
+            }
+        };
+        if let Err(e) = self.bucket.put_job(&run_id, &bytes).await {
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
+            return Err(bucket_err_to_unreachable(e));
+        }
 
         Ok(run_id)
     }

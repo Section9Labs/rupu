@@ -1056,7 +1056,7 @@ async fn pump_catch_up_transcript(
 ) {
     if let Ok(t) = exec.run(cat_transcript_cmd).await {
         if t.success && !t.stdout.is_empty() {
-            let _ = mirror.replace_transcript(run_id, host_id, &t.stdout);
+            let _ = mirror.replace_transcript(run_id, host_id, &t.stdout).await;
         }
     }
 }
@@ -1186,7 +1186,7 @@ async fn pump_catch_up_ledgers(
     // status 0, whatever the ssh exit status says about the rest.
     let sections = split_ledger_pull(&out.stdout);
     if let Some(usage) = sections.get(LEDGER_USAGE).filter(|b| !b.is_empty()) {
-        let _ = mirror.replace_usage_ledger(run_id, host_id, usage);
+        let _ = mirror.replace_usage_ledger(run_id, host_id, usage).await;
     }
     // No coverage section (or an empty one) is ordinary for a workflow run,
     // which writes no stream; for a unit, the read reports it not complete.
@@ -1369,7 +1369,9 @@ async fn pump_finalize_if_terminal(
         // The host HAS a record for this run — it is simply not done. Mirror
         // it (spec §5.2) so the local record carries the live active step,
         // then clear the startup deadline.
-        let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
+        let _ = mirror
+            .append(run_id, host_id, ArtifactFile::RunJson, &trimmed)
+            .await;
         return PumpProbe::Alive;
     }
     let status = status.to_string();
@@ -1380,12 +1382,14 @@ async fn pump_finalize_if_terminal(
     // which `create_run` already guaranteed. The same round trip brings the
     // complete coverage stream, ahead of the (possibly slow) transcript work.
     pump_catch_up_ledgers(exec, mirror, run_id, host_id, true).await;
-    let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
+    let _ = mirror
+        .append(run_id, host_id, ArtifactFile::RunJson, &trimmed)
+        .await;
     // Before `finish`, so the synthesized step-result row sees the complete
     // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
     pump_pull_step_transcripts(exec, mirror, lazy, run_id, host_id).await;
-    let _ = mirror.finish(run_id, host_id, &status);
+    let _ = mirror.finish(run_id, host_id, &status).await;
     PumpProbe::Finalized
 }
 
@@ -1839,7 +1843,7 @@ impl SshHostConnector {
     ///
     /// `tail -F` **never exits on its own** — when the remote run finishes, the
     /// artifact files stop growing but `tail` keeps watching.  The pump therefore
-    /// uses `tokio::select!` over two arms:
+    /// uses a `biased` `tokio::select!` over two arms (lines first):
     ///
     /// 1. **Line arm** — routes artifact lines as before; on stream-end/error
     ///    (e.g. SSH connection dropped) breaks and falls through to a best-effort
@@ -1868,7 +1872,12 @@ impl SshHostConnector {
                 host_id = %self.host_id,
                 "refusing to spawn a tail pump for an unsafe run id"
             );
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            // This fn is sync, so the finish runs on a task of its own (the
+            // runtime is guaranteed: the pump below is spawned on it too).
+            let (mirror, host_id) = (Arc::clone(&self.mirror), self.host_id.clone());
+            tokio::spawn(async move {
+                let _ = mirror.finish(&run_id, &host_id, "failed").await;
+            });
             return;
         }
         let exec = Arc::clone(&self.exec);
@@ -1961,7 +1970,16 @@ impl SshHostConnector {
                     // First tick fires immediately per tokio docs; subsequent ticks
                     // fire every PUMP_POLL_INTERVAL.
                     loop {
+                        // `biased`: a line already buffered always runs before
+                        // the interval/nudge probe. Mirroring a line awaits the
+                        // blocking pool, so with a random pick a terminal probe
+                        // could win between two ready lines and drop the rest
+                        // with the stream — and events, step results and unit
+                        // checkpoints have no terminal catch-up to restore them.
+                        // The probes still run whenever the stream is waiting
+                        // on the host.
                         tokio::select! {
+                            biased;
                             maybe_line = stream.next() => {
                                 match maybe_line {
                                     Some(Ok(line)) => {
@@ -2018,9 +2036,11 @@ impl SshHostConnector {
                                                     // mirrored copy (see the flag's
                                                     // declaration).
                                                     let _ = mirror
-                                                        .reset_transcript(&run_id, &host_id);
+                                                        .reset_transcript(&run_id, &host_id)
+                                                        .await;
                                                     let _ = mirror
-                                                        .note_transcript_started(&run_id, &host_id);
+                                                        .note_transcript_started(&run_id, &host_id)
+                                                        .await;
                                                 }
                                                 Some(ArtifactFile::Transcript)
                                             } else {
@@ -2032,9 +2052,9 @@ impl SshHostConnector {
                                             continue;
                                         }
                                         if let Some(file) = &current {
-                                            let _ = mirror.append(
-                                                &run_id, &host_id, file.clone(), &line,
-                                            );
+                                            let _ = mirror
+                                                .append(&run_id, &host_id, file.clone(), &line)
+                                                .await;
                                         }
                                     }
                                     // Stream ended or errored (SSH connection dropped,
@@ -2192,7 +2212,9 @@ impl SshHostConnector {
                     )
                     .await;
                     if let Some(trimmed) = &record {
-                        let _ = mirror.append(&run_id, &host_id, ArtifactFile::RunJson, trimmed);
+                        let _ = mirror
+                            .append(&run_id, &host_id, ArtifactFile::RunJson, trimmed)
+                            .await;
                     }
                     let finish_status = terminal_status.unwrap_or_else(|| "failed".to_string());
                     // Same terminal transcript catch-up as the interval arm above:
@@ -2212,7 +2234,7 @@ impl SshHostConnector {
                     // recorded step transcript before finishing the run.
                     pump_pull_step_transcripts(exec.as_ref(), &mirror, &lazy, &run_id, &host_id)
                         .await;
-                    let _ = mirror.finish(&run_id, &host_id, &finish_status);
+                    let _ = mirror.finish(&run_id, &host_id, &finish_status).await;
                 }
             };
             pump.await;
@@ -2464,6 +2486,7 @@ impl HostConnector for SshHostConnector {
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
+            .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
         let out = match self.exec.run(&detached).await {
@@ -2471,7 +2494,7 @@ impl HostConnector for SshHostConnector {
             Err(e) => {
                 // Spawn error (e.g. ssh binary not found): mirror run would
                 // be stuck Running with no executor — clean it up now.
-                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
                 return Err(HostConnectorError::Unreachable(e.to_string()));
             }
         };
@@ -2479,7 +2502,7 @@ impl HostConnector for SshHostConnector {
         if !out.success {
             // Best-effort cleanup: mark the mirror run failed so it doesn't
             // stay stuck in Running with no executor attached.
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
             return Err(HostConnectorError::Unreachable(out.stderr));
         }
 
@@ -2525,19 +2548,20 @@ impl HostConnector for SshHostConnector {
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
+            .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
         let out = match self.exec.run(&detached).await {
             Ok(o) => o,
             Err(e) => {
                 // Spawn error: mirror run would be stuck Running — clean up.
-                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
                 return Err(HostConnectorError::Unreachable(e.to_string()));
             }
         };
 
         if !out.success {
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
             return Err(HostConnectorError::Unreachable(out.stderr));
         }
 
@@ -2922,7 +2946,7 @@ impl HostConnector for SshHostConnector {
         // authoritative replace landed, so bytes read after seeing it are that
         // copy. Read the other way round, a replace landing in between would
         // pair the tailed bytes with "complete".
-        let complete = self.mirror.coverage_complete(run_id);
+        let complete = self.mirror.coverage_complete(run_id).await;
         let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
         Ok(CoverageRead { bytes, complete })
     }
@@ -5890,7 +5914,7 @@ mod tests {
 
     /// Seed a mirrored run owned by `host_abc` whose step_results claim
     /// `remote` — the shape every allowlist test starts from.
-    fn seed_claimed_run(
+    async fn seed_claimed_run(
         conn: &SshHostConnector,
         run_store: &rupu_orchestrator::RunStore,
         run_id: &str,
@@ -5908,6 +5932,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
         run_store
             .append_step_result(
@@ -5936,6 +5961,7 @@ mod tests {
         if terminal {
             conn.mirror
                 .finish(run_id, &conn.host_id, "completed")
+                .await
                 .unwrap();
         }
     }
@@ -5962,7 +5988,7 @@ mod tests {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01OWNED", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01OWNED", claimed, false).await;
 
         let other = std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01OTHER.jsonl");
         let err = conn
@@ -5994,7 +6020,7 @@ mod tests {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01FOREIGN", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01FOREIGN", claimed, false).await;
         let mut rec = run_store.load("run_01FOREIGN").unwrap();
         rec.worker_id = Some("host_other".into());
         run_store.update(&rec).unwrap();
@@ -6017,7 +6043,7 @@ mod tests {
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01PULL", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01PULL", claimed, false).await;
         let cache = tmp
             .path()
             .join("mirror/host_abc/transcripts/run_01STEP.jsonl");
@@ -6070,7 +6096,7 @@ mod tests {
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01NONE.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01ABSENT", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01ABSENT", claimed, false).await;
         let cache = tmp
             .path()
             .join("mirror/host_abc/transcripts/run_01NONE.jsonl");
@@ -6089,7 +6115,7 @@ mod tests {
         ));
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01OFF.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01OFFLINE", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01OFFLINE", claimed, false).await;
 
         let err = conn
             .pull_transcript("run_01OFFLINE", std::path::Path::new(claimed), true)
@@ -6121,7 +6147,7 @@ mod tests {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![r#"{"type":"run_start"}"#.into()]));
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01FEED.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01FEEDRUN", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01FEEDRUN", claimed, false).await;
         let cache = tmp
             .path()
             .join("mirror/host_abc/transcripts/run_01FEED.jsonl");
@@ -6171,7 +6197,7 @@ mod tests {
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         let claimed = "/home/ci/proj/.rupu/transcripts/run_01LIVE.jsonl";
-        seed_claimed_run(&conn, &run_store, "run_01LIVERUN", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01LIVERUN", claimed, false).await;
         let cache = tmp
             .path()
             .join("mirror/host_abc/transcripts/run_01LIVE.jsonl");
@@ -6234,7 +6260,7 @@ mod tests {
         ));
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
-        seed_claimed_run(&conn, &run_store, "run_01RETIRERUN", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01RETIRERUN", claimed, false).await;
         let cache = tmp
             .path()
             .join("mirror/host_abc/transcripts/run_01RETIRE.jsonl");
@@ -6739,6 +6765,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -6878,18 +6905,22 @@ mod tests {
         fake.ledger_cat_status = (1, 1);
         let fake = std::sync::Arc::new(fake);
         let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
-        conn.mirror
-            .create_run(run_id, &conn.host_id, &workflow_spec())
-            .unwrap();
-        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
-        conn.mirror
-            .append(run_id, &conn.host_id, ArtifactFile::Usage, USAGE_ROW_LATE)
-            .unwrap();
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        rt.block_on(
+            conn.mirror
+                .create_run(run_id, &conn.host_id, &workflow_spec()),
+        )
+        .unwrap();
+        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+        rt.block_on(
+            conn.mirror
+                .append(run_id, &conn.host_id, ArtifactFile::Usage, USAGE_ROW_LATE),
+        )
+        .unwrap();
+
         rt.block_on(async {
             conn.spawn_tail_pump(run_id.to_string());
             conn.await_run_mirror(run_id).await;
@@ -6911,7 +6942,7 @@ mod tests {
     ///
     /// The "tailed copy" is seeded before the pump is spawned (as in
     /// `coverage_catch_up_never_truncates_the_tailed_copy_with_an_empty_cat`),
-    /// so the result does not depend on the pump's unbiased `select!`.
+    /// so the result does not depend on when the pump's probe runs.
     #[test]
     fn a_failed_terminal_ledger_pull_leaves_the_coverage_read_partial() {
         let run_id = "run_01COVPULLFAIL";
@@ -6922,15 +6953,17 @@ mod tests {
         fake.ledger_pull_fails = true;
         let fake = std::sync::Arc::new(fake);
         let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
-        conn.mirror
-            .create_run(run_id, &conn.host_id, &workflow_spec())
-            .unwrap();
-        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        rt.block_on(
+            conn.mirror
+                .create_run(run_id, &conn.host_id, &workflow_spec()),
+        )
+        .unwrap();
+        std::fs::write(rupu_coverage::stream_path(&store.root, run_id), tailed).unwrap();
+
         rt.block_on(async {
             conn.spawn_tail_pump(run_id.to_string());
             conn.await_run_mirror(run_id).await;
@@ -6984,6 +7017,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(exec);
         conn.mirror
             .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
             .unwrap();
         conn.spawn_tail_pump(run_id.to_string());
         wait_until_finished(&run_store, run_id).await;
@@ -7019,8 +7053,11 @@ mod tests {
             target: None,
             findings_profile: None,
         };
-        conn.mirror
-            .create_run(run_id, &conn.host_id, &spec)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(conn.mirror.create_run(run_id, &conn.host_id, &spec))
             .unwrap();
         let stream = rupu_coverage::stream_path(&store.root, run_id);
         std::fs::write(&stream, tailed).unwrap();
@@ -7030,10 +7067,6 @@ mod tests {
             "precondition: the tailed copy is on disk before the pump exists"
         );
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         rt.block_on(async {
             conn.spawn_tail_pump(run_id.to_string());
             conn.await_run_mirror(run_id).await;
@@ -7147,6 +7180,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7216,6 +7250,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7282,6 +7317,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7333,6 +7369,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7384,6 +7421,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7495,6 +7533,41 @@ mod tests {
         );
     }
 
+    /// Mirroring a tailed line awaits the blocking pool, so the pump yields
+    /// between lines. Every line already buffered must still land before a
+    /// terminal probe (here the dispatcher's nudge, and the interval's first
+    /// tick) tears the stream down: events have no terminal catch-up, so a
+    /// line dropped with the stream is lost for good.
+    #[tokio::test]
+    async fn tail_pump_mirrors_every_buffered_line_before_finalizing() {
+        const EVENTS: usize = 200;
+        let run_id = "run_01PUMPBURST";
+        let mut tail_lines = vec![format!("==> /home/ci/.rupu/runs/{run_id}/events.jsonl <==")];
+        tail_lines
+            .extend((0..EVENTS).map(|i| format!(r#"{{"type":"step_started","step":"s{i}"}}"#)));
+        let run_json = format!(r#"{{"run_id":"{run_id}","status":"completed"}}"#);
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(tail_lines.clone(), run_json));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+        conn.await_run_mirror(run_id).await;
+
+        assert_eq!(
+            run_store.load(run_id).unwrap().status,
+            rupu_orchestrator::RunStatus::Completed
+        );
+        let events = std::fs::read_to_string(run_store.events_path(run_id)).unwrap_or_default();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            tail_lines[1..],
+            "every buffered event line is mirrored, in order, before the run finishes"
+        );
+    }
+
     /// A placed agent run's only content is its transcript, which lives
     /// OUTSIDE the run directory (`$HOME/.rupu/transcripts/<run_id>.jsonl`).
     /// The pump must (1) tail it, (2) route its lines to the mirrored
@@ -7536,6 +7609,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7618,6 +7692,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7706,6 +7781,7 @@ mod tests {
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
+            .await
             .unwrap();
 
         conn.spawn_tail_pump(run_id.to_string());
@@ -7759,8 +7835,7 @@ mod tests {
     /// still "buffered" / never arrived). On terminal detection the remote
     /// `usage.jsonl` is `cat`ed and REPLACES the tailed copy — exactly the two
     /// rows, the first NOT duplicated. Whichever of the tail arm and the
-    /// terminal probe the pump's unbiased `select!` runs first, the end state
-    /// is the same.
+    /// terminal probe runs first, the end state is the same.
     #[tokio::test]
     async fn tail_pump_terminal_ledger_pull_recovers_a_late_row_without_duplicates() {
         let run_id = "run_01USAGEPULL1";
@@ -7775,6 +7850,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.mirror
             .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
             .unwrap();
         conn.spawn_tail_pump(run_id.to_string());
         wait_until_finished(&run_store, run_id).await;
@@ -7807,11 +7883,13 @@ mod tests {
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::new(fake));
         conn.mirror
             .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
             .unwrap();
         // What an earlier tail delivered: row 1 plus a row the remote lacks.
         for row in [USAGE_ROW_1, stale] {
             conn.mirror
                 .append(run_id, &conn.host_id, ArtifactFile::Usage, row)
+                .await
                 .unwrap();
         }
         let ledger = run_store.usage_ledger_path(run_id);
@@ -7856,9 +7934,11 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::new(fake));
         conn.mirror
             .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
             .unwrap();
         conn.mirror
             .append(run_id, &conn.host_id, ArtifactFile::Usage, USAGE_ROW_1)
+            .await
             .unwrap();
         let ledger = run_store.usage_ledger_path(run_id);
         let inode_before = std::fs::metadata(&ledger).unwrap().ino();
@@ -7916,6 +7996,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(exec);
         conn.mirror
             .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
             .unwrap();
         conn.spawn_tail_pump(run_id.to_string());
         wait_until_finished(&run_store, run_id).await;
@@ -7942,8 +8023,7 @@ mod tests {
     /// (the body is derived from it — see [`remote_run_json`]). In `fallback`
     /// mode the tail stream ENDS after its lines, and `cat run.json` answers
     /// `run_json_after_end` once it has — so only the stream-end fallback can
-    /// ever see the run terminal, whatever order the pump's unbiased
-    /// `select!` takes.
+    /// ever see the run terminal, whatever order the pump's `select!` takes.
     struct LedgerOrderExec {
         inner: FakeExec,
         store: std::sync::OnceLock<std::sync::Arc<rupu_orchestrator::RunStore>>,
@@ -8035,6 +8115,7 @@ mod tests {
             let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
             conn.mirror
                 .create_run(run_id, &conn.host_id, &workflow_spec())
+                .await
                 .unwrap();
             let _ = exec.store.set(std::sync::Arc::clone(&run_store));
             let terminal = remote_run_json(&run_store, run_id, RunStatus::Completed, None);
@@ -8834,16 +8915,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn note_transcript_started_sets_the_live_active_step_and_finish_clears_it() {
+    #[tokio::test]
+    async fn note_transcript_started_sets_the_live_active_step_and_finish_clears_it() {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.mirror
             .create_run("run_01LIVE", "host_abc", &agent_spec())
+            .await
             .unwrap();
 
         conn.mirror
             .note_transcript_started("run_01LIVE", "host_abc")
+            .await
             .unwrap();
         let rec = run_store.load("run_01LIVE").unwrap();
         assert_eq!(rec.active_step_id.as_deref(), Some("agent"));
@@ -8853,12 +8936,14 @@ mod tests {
         );
         assert!(matches!(
             conn.mirror
-                .note_transcript_started("run_01LIVE", "host_other"),
+                .note_transcript_started("run_01LIVE", "host_other")
+                .await,
             Err(crate::node::MirrorError::WrongNode(_))
         ));
 
         conn.mirror
             .finish("run_01LIVE", "host_abc", "completed")
+            .await
             .unwrap();
         let rec = run_store.load("run_01LIVE").unwrap();
         assert_eq!(rec.active_step_id, None);
@@ -8951,6 +9036,7 @@ mod tests {
         conn0
             .mirror
             .create_run(run_id, &conn0.host_id, &workflow_spec())
+            .await
             .unwrap();
         let alive_json = remote_run_json(
             &run_store,
@@ -9003,6 +9089,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.mirror
             .create_run(run_id, &conn.host_id, &agent_spec())
+            .await
             .unwrap();
         conn.spawn_tail_pump(run_id.to_string());
 
@@ -9028,8 +9115,8 @@ mod tests {
         let run_id = "run_01PULLALL";
         let step_a = "/home/ci/proj/.rupu/transcripts/run_01STEPA.jsonl";
         let step_b = "/home/ci/proj/.rupu/transcripts/run_01STEPB.jsonl";
-        // The pump's `select!` is unbiased, so the terminal probe can win
-        // before any tailed line is consumed. Pre-seed the LOCAL mirror with
+        // The terminal probe can run before a tailed line arrives (one still
+        // in flight from the host is not ready). Pre-seed the LOCAL mirror with
         // the artifacts the tail would have delivered (that is what
         // `recorded_transcript_paths` reads), and feed no tail lines.
         let fake_probe = std::sync::Arc::new(FakeExec::ok(vec![]));
@@ -9037,6 +9124,7 @@ mod tests {
         conn0
             .mirror
             .create_run(run_id, &conn0.host_id, &workflow_spec())
+            .await
             .unwrap();
         conn0
             .mirror
@@ -9046,7 +9134,7 @@ mod tests {
                 ArtifactFile::StepResults,
                 &format!(r#"{{"step_id":"a","run_id":"run_01STEPA","transcript_path":"{step_a}","output":"","success":true,"skipped":false,"rendered_prompt":"","finished_at":"2026-09-04T00:00:00Z"}}"#),
             )
-            .unwrap();
+            .await.unwrap();
         conn0
             .mirror
             .append(
@@ -9055,7 +9143,7 @@ mod tests {
                 ArtifactFile::Events,
                 &format!(r#"{{"type":"step_working","run_id":"{run_id}","step_id":"b","transcript_path":"{step_b}"}}"#),
             )
-            .unwrap();
+            .await.unwrap();
         let run_json = remote_run_json(
             &run_store,
             run_id,

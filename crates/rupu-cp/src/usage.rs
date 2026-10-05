@@ -921,7 +921,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn run_usage_blocking_matches_the_sync_fold() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, _) = seed_remote_run(tmp.path());
+        let (store, _) = seed_remote_run(tmp.path()).await;
         let cache = tmp.path().join("mirror/host_abc/transcripts/run_01A.jsonl");
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         std::fs::write(
@@ -954,7 +954,9 @@ pub(crate) mod tests {
 
     // ── `run_transcript_paths`' host-mirror fallback (spec §6.3) ──────────
 
-    pub(crate) fn seed_remote_run(tmp: &std::path::Path) -> (std::sync::Arc<RunStore>, PathBuf) {
+    pub(crate) async fn seed_remote_run(
+        tmp: &std::path::Path,
+    ) -> (std::sync::Arc<RunStore>, PathBuf) {
         let store = std::sync::Arc::new(RunStore::new(tmp.join("runs")));
         let mirror = crate::node::NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
@@ -966,7 +968,10 @@ pub(crate) mod tests {
             target: None,
             findings_profile: None,
         };
-        mirror.create_run("run_01USAGE", "host_abc", &spec).unwrap();
+        mirror
+            .create_run("run_01USAGE", "host_abc", &spec)
+            .await
+            .unwrap();
         let recorded = PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl");
         store
             .append_step_result(
@@ -995,10 +1000,10 @@ pub(crate) mod tests {
         (store, recorded)
     }
 
-    #[test]
-    fn paths_of_a_remote_run_resolve_to_the_cache_when_it_exists() {
+    #[tokio::test]
+    async fn paths_of_a_remote_run_resolve_to_the_cache_when_it_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, _recorded) = seed_remote_run(tmp.path());
+        let (store, _recorded) = seed_remote_run(tmp.path()).await;
         let cache = tmp
             .path()
             .join("mirror")
@@ -1012,10 +1017,10 @@ pub(crate) mod tests {
         assert_eq!(got, vec![cache]);
     }
 
-    #[test]
-    fn paths_of_a_remote_run_stay_recorded_when_no_cache_exists() {
+    #[tokio::test]
+    async fn paths_of_a_remote_run_stay_recorded_when_no_cache_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, recorded) = seed_remote_run(tmp.path());
+        let (store, recorded) = seed_remote_run(tmp.path()).await;
 
         let got = run_transcript_paths(&store, "run_01USAGE");
         assert_eq!(got, vec![recorded]);
