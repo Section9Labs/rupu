@@ -141,35 +141,109 @@ impl Tracker {
         };
         state.ever_established |= snap.established;
         state.last = snap;
-        let sink = call.attribution.sink.clone();
+        vec![finalize(call, &state, now, false)]
+    }
 
-        if state.flow_emitted {
-            let (outcome, error) = settle_outcome(
-                state.last.transport,
-                state.ever_established,
-                state.last.bytes_in,
-            );
-            return vec![Emission {
-                sink,
-                emit: Emit::Complete(completion(&state, now, outcome, error)),
-            }];
+    /// Mark call `id` finished. It stays attributable until `tick` finds
+    /// the linger elapsed, so sockets that close just after the bash call
+    /// returns are still reported.
+    pub fn finish_call(&mut self, id: CallId, now: DateTime<Utc>) {
+        if let Some(call) = self.calls.get_mut(&id) {
+            call.closing_at.get_or_insert(now);
         }
+    }
 
-        // Attributed but never reportable: the never-established case.
-        let mut record = flow_record_from(&call.attribution, &state);
-        record.outcome = Outcome::TransportError;
-        record.error = Some(NEVER_ESTABLISHED.to_string());
-        record.body_complete = true;
-        record.bytes_in = state.last.bytes_in;
-        record.bytes_out = state.last.bytes_out;
-        record.duration_ms = Some(elapsed_ms(state.first_seen, now));
-        vec![Emission {
-            sink,
-            emit: Emit::Flow(Box::new(record)),
-        }]
+    /// Expire finished calls whose linger has elapsed, flushing their
+    /// still-open sockets.
+    pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Emission> {
+        let linger = self.linger;
+        let expired: Vec<CallId> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.closing_at.is_some_and(|at| now - at >= linger))
+            .map(|(id, _)| *id)
+            .collect();
+        expired
+            .into_iter()
+            .flat_map(|id| self.flush_call(id, now))
+            .collect()
+    }
+
+    /// Immediately flush and drop every call of `run_id`, regardless of
+    /// linger.
+    pub fn finish_run(&mut self, run_id: &str, now: DateTime<Utc>) -> Vec<Emission> {
+        let ids: Vec<CallId> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.run_id == run_id)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .flat_map(|id| self.flush_call(id, now))
+            .collect()
+    }
+
+    /// Drop a call, its owner mapping and its sockets, reporting each socket
+    /// that was still open.
+    fn flush_call(&mut self, id: CallId, now: DateTime<Utc>) -> Vec<Emission> {
+        let Some(call) = self.calls.remove(&id) else {
+            return Vec::new();
+        };
+        if self.owner_to_call.get(&call.owner) == Some(&id) {
+            self.owner_to_call.remove(&call.owner);
+        }
+        let open: Vec<SocketId> = self
+            .sockets
+            .iter()
+            .filter(|(_, s)| s.call_id == id)
+            .map(|(sock, _)| *sock)
+            .collect();
+        let mut out = Vec::new();
+        for sock in open {
+            if let Some(state) = self.sockets.remove(&sock) {
+                out.push(finalize(&call, &state, now, true));
+            }
+        }
+        out
     }
 }
 
+/// Finalize one socket. A socket that emitted a `Flow` gets a `Complete`
+/// (noting `still_open` when observation, not the socket, ended); one that
+/// never became reportable gets its single never-established `Flow` — a
+/// `Complete` with no `Flow` to finalize would be dropped on fold.
+fn finalize(call: &CallState, state: &SockState, now: DateTime<Utc>, still_open: bool) -> Emission {
+    let sink = call.attribution.sink.clone();
+    if state.flow_emitted {
+        let (outcome, error) = settle_outcome(
+            state.last.transport,
+            state.ever_established,
+            state.last.bytes_in,
+        );
+        let error = if still_open {
+            Some(STILL_OPEN.to_string())
+        } else {
+            error
+        };
+        return Emission {
+            sink,
+            emit: Emit::Complete(completion(state, now, outcome, error)),
+        };
+    }
+    let mut record = flow_record_from(&call.attribution, state);
+    record.outcome = Outcome::TransportError;
+    record.error = Some(NEVER_ESTABLISHED.to_string());
+    record.body_complete = true;
+    record.bytes_in = state.last.bytes_in;
+    record.bytes_out = state.last.bytes_out;
+    record.duration_ms = Some(elapsed_ms(state.first_seen, now));
+    Emission {
+        sink,
+        emit: Emit::Flow(Box::new(record)),
+    }
+}
+
+const STILL_OPEN: &str = "observation ended with the run; socket still open";
 const NEVER_ESTABLISHED: &str = "connection never established";
 
 fn elapsed_ms(from: DateTime<Utc>, to: DateTime<Utc>) -> u64 {
@@ -413,5 +487,73 @@ mod tests {
         assert_eq!(c.id, flow.id);
         assert_eq!(c.outcome, Some(Outcome::Ok));
         assert_eq!(c.error, None);
+    }
+
+    #[test]
+    fn socket_closing_within_linger_is_still_attributed() {
+        let (mut t, _sink) = tracker_with_call(100);
+        let flow = only_flow(t.observe(7, 100, tcp(true), t0()));
+        t.finish_call(1, t0() + ms(500));
+        let c = only_complete(t.close(7, tcp(true), t0() + ms(1_500)));
+        assert_eq!(c.id, flow.id);
+        assert_eq!(c.outcome, Some(Outcome::Ok));
+    }
+
+    #[test]
+    fn tick_after_linger_flushes_still_open_sockets_and_drops_call() {
+        let (mut t, _sink) = tracker_with_call(100);
+        only_flow(t.observe(7, 100, tcp(true), t0()));
+        t.finish_call(1, t0());
+
+        assert!(t.tick(t0() + ms(2_000)).is_empty());
+
+        let c = only_complete(t.tick(t0() + ms(4_000)));
+        assert!(c.error.as_deref().unwrap().contains("still open"));
+        assert_eq!(c.outcome, Some(Outcome::Ok));
+
+        // The call is gone: its owner no longer attributes anything.
+        assert!(t.observe(8, 100, tcp(true), t0() + ms(4_100)).is_empty());
+        assert!(t.tick(t0() + ms(9_000)).is_empty());
+    }
+
+    #[test]
+    fn tick_leaves_unfinished_calls_alone() {
+        let (mut t, _sink) = tracker_with_call(100);
+        only_flow(t.observe(7, 100, tcp(true), t0()));
+        assert!(t.tick(t0() + ms(60_000)).is_empty());
+        let c = only_complete(t.close(7, tcp(true), t0() + ms(60_001)));
+        assert_eq!(c.outcome, Some(Outcome::Ok));
+    }
+
+    #[test]
+    fn finish_run_flushes_all_calls_for_that_run_immediately() {
+        let sink = Arc::new(MemorySink::default());
+        let mut t = Tracker::new(chrono::Duration::seconds(3));
+        for (call, owner, run) in [(1, 100, "run-1"), (2, 101, "run-1"), (3, 200, "run-2")] {
+            let mut a = attribution(sink.clone());
+            a.run_id = run.into();
+            t.register_call(
+                call,
+                CallInfo {
+                    owner,
+                    attribution: a,
+                },
+                t0(),
+            );
+            only_flow(t.observe(call + 10, owner, tcp(true), t0()));
+        }
+
+        let out = t.finish_run("run-1", t0() + ms(100));
+        assert_eq!(out.len(), 2);
+        for e in out {
+            match e.emit {
+                Emit::Complete(c) => assert!(c.error.as_deref().unwrap().contains("still open")),
+                Emit::Flow(_) => panic!("expected only Completes"),
+            }
+        }
+
+        // run-2's call is still live and attributing.
+        let c = only_complete(t.close(13, tcp(true), t0() + ms(200)));
+        assert_eq!(c.outcome, Some(Outcome::Ok));
     }
 }
