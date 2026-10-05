@@ -106,8 +106,10 @@ describe('disclosureText sub-agent note', () => {
 describe('bash subprocess coverage', () => {
   it.each(SCOPES)('lists bash subprocess connections as covered at %s scope', (scope) => {
     expect(netflowCoverageList(scope)).toMatch(
-      /bash subprocess connections \(TCP\/UDP, by process, attributed to the tool call\)/,
+      /bash subprocess connections \(TCP\/UDP, by process, attributed to the tool call\) where subprocess capture is enabled/,
     );
+    // Not an unconditional claim: capture can be disabled or absent.
+    expect(disclosureText(scope)).not.toMatch(/its agents' bash subprocesses/);
     expect(disclosureText(scope)).toMatch(/bash subprocess connections/);
   });
 

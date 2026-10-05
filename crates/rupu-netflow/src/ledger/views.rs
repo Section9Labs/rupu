@@ -130,7 +130,9 @@ pub fn read_capture_states(path: &Path) -> std::io::Result<Vec<CaptureEntry>> {
     let mut out = Vec::new();
     for line in BufReader::new(file).lines() {
         let line = line?;
-        if line.trim().is_empty() {
+        // Cheap pre-filter: only `capture` lines carry this exact quoted
+        // token as the `type` tag, so skip deserializing every Flow line.
+        if !line.contains("\"capture\"") {
             continue;
         }
         if let Ok(LedgerLine::Capture {

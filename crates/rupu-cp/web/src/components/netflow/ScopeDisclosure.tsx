@@ -74,7 +74,8 @@ export type NetflowScope = 'run' | 'project' | 'global';
  *  [`netflowCoverageList`], which now just returns this same string for
  *  every scope. */
 export const NETFLOW_COVERAGE_LIST =
-  'provider APIs, SCM connectors, bash subprocess connections (TCP/UDP, by process, attributed to the tool call)';
+  'provider APIs, SCM connectors, and bash subprocess connections (TCP/UDP, by process, ' +
+  "attributed to the tool call) where subprocess capture is enabled — see the run's capture status";
 
 /** Honest limits of the subprocess (bash) capture — the gaps that make a
  *  quiet subprocess list "not seen" rather than "did nothing". Authored
@@ -141,7 +142,7 @@ export function disclosureText(scope: NetflowScope, capture?: NetflowCaptureStat
   const coverage = netflowCoverageList(scope);
   const captureText = scope === 'run' ? captureStatusText(capture) : '';
   return (
-    `This covers rupu's own egress and its agents' bash subprocesses — ${coverage}. ` +
+    `This covers rupu's own egress — ${coverage}. ` +
     `${SUBPROCESS_CAPTURE_LIMITS} ` +
     `It also can't see non-HTTP egress from rupu itself: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
