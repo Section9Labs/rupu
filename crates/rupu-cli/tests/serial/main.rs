@@ -92,6 +92,7 @@ mod cli_workflow;
 mod coverage_audit_cli;
 mod multi_gate_approve;
 mod netflow_run;
+mod netflow_subprocess_live;
 mod netflow_workflow;
 mod policy_lock;
 mod reject_mode_inheritance;

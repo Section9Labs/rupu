@@ -410,6 +410,11 @@ async fn rebuild_opts_from_disk(
         Some(&store_arc.root.join(run_id)),
     ));
     dispatcher.set_namer(naming.namer());
+    // Process-wide subprocess-capture backend, warmed off the async runtime
+    // (its first call blocks). Shared by the dispatcher (children) and the
+    // step factory (this workflow's steps).
+    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+    dispatcher.set_net_capture(Arc::clone(&net_capture));
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(
         &mcp_registry,
@@ -451,6 +456,7 @@ async fn rebuild_opts_from_disk(
         limits_ctx,
         providers: cfg.providers.clone(),
         recovery: cfg.recovery.clone(),
+        net_capture: Some(net_capture),
     });
 
     // Rebuild the `run:` step policy from the resolved mode + layered config

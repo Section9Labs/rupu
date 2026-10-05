@@ -189,6 +189,13 @@ pub struct DefaultStepFactory {
     /// its agent declares no `fallbacks:`, and the server-side-fallback
     /// toggle for the step's provider and its hops.
     pub recovery: rupu_config::RecoveryConfig,
+    /// The process-wide subprocess network-capture backend, handed to every
+    /// step's `ToolContext` so its `bash` calls are captured. The factory
+    /// never builds it: `rupu_runtime::net_capture::shared` blocks on first
+    /// call, so the (async) caller warms it off-runtime and threads the
+    /// `Arc` in (`rupu-cli`'s `netflow_sink::net_capture`). `None` (tests)
+    /// means no capture.
+    pub net_capture: Option<Arc<dyn rupu_netflow::SubprocessCapture>>,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -418,6 +425,10 @@ impl StepFactory for DefaultStepFactory {
         // resolver, provider table, limits and sink. An error-stub step (the
         // agent did not load, or its provider did not build) gets none: there
         // is no reply to recover, only a configuration error to report.
+        // The same sink also goes on the step's `ToolContext`, so bash's
+        // subprocess flows land in this step's ledger/transcript. `None`
+        // only when the agent failed to load (an error-stub step runs no tools).
+        let tool_netflow_sink = step_sink.clone();
         let recovery = match (provider_is_real, step_sink) {
             (true, Some(sink)) => rupu_runtime::hop_builder::recovery_opts(
                 &self.recovery,
@@ -524,6 +535,9 @@ impl StepFactory for DefaultStepFactory {
                 agent: None,
                 provider: None,
                 coverage_stream: None,
+                netflow_sink: tool_netflow_sink,
+                net_capture: self.net_capture.clone(),
+                tool_call_id: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -1328,6 +1342,7 @@ steps:
             limits_ctx,
             providers: Default::default(),
             recovery: Default::default(),
+            net_capture: None,
         }
     }
 
@@ -2001,6 +2016,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            net_capture: None,
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -2063,6 +2079,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            net_capture: None,
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -2149,6 +2166,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            net_capture: None,
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
@@ -2354,6 +2372,7 @@ steps:
             ),
             providers: Default::default(),
             recovery: Default::default(),
+            net_capture: None,
         };
         // The account `acct-x` is declared as kind `openai` — a builtin
         // vendor, but a name the factory's dispatch `match` would never
@@ -2428,6 +2447,7 @@ steps:
             ),
             providers: Default::default(),
             recovery: Default::default(),
+            net_capture: None,
         }
     }
 

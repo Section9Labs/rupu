@@ -7777,6 +7777,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let codename = session.codename.clone().unwrap_or_else(|| {
             rupu_codename::derive_legacy(&session.session_id, Some(&session.agent_name))
         });
+        // Process-wide subprocess-capture backend, warmed off the async
+        // runtime (its first call blocks).
+        let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
         let tool_context = ToolContext {
             findings: Some(
                 crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
@@ -7799,6 +7802,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             agent: None,
             provider: None,
             coverage_stream: None,
+            netflow_sink: Some(netflow_sink.clone()),
+            net_capture: Some(net_capture),
+            tool_call_id: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
