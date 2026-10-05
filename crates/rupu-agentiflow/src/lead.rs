@@ -217,8 +217,10 @@ pub struct LeadConfig {
     pub system_prompt: String,
     pub provider_name: String,
     pub model: String,
-    /// Turns the lead may take in ONE round. The runner's own `max_turns` is a
-    /// ceiling on an absolute turn index, so the driver passes
+    /// Turns the lead may take in ONE round; must be at least 1
+    /// ([`RunAgentLeadDriver::new`] rejects 0, which would bust every round
+    /// before its first turn). The runner's own `max_turns` is a ceiling on an
+    /// absolute turn index, so the driver passes
     /// `total_turns_so_far + per_round_max_turns` -- every round gets a full
     /// budget, however many turns earlier rounds used.
     pub per_round_max_turns: u32,
@@ -235,9 +237,12 @@ pub struct LeadConfig {
     pub workspace_id: String,
     /// The lead's workspace root (the file/bash tools' scope).
     pub workspace_path: PathBuf,
-    /// The lead's tool allowlist, straight from its agent spec. `None` means
-    /// every builtin tool; pass the spec's list explicitly.
-    pub agent_tools: Option<Vec<String>>,
+    /// Exactly the tools the lead may use; the runner's registry is filtered
+    /// to this list. Empty (the fail-closed default) grants NO tools. The
+    /// caller lists what the lead needs -- there is deliberately no way to
+    /// say "all builtins" by omission, because the lead runs unattended under
+    /// `BypassDecider` on digest text an attacker can influence.
+    pub agent_tools: Vec<String>,
     /// Starting model limits; the driver carries the limits each round ends
     /// with (including any learned from a context-overflow error) into the
     /// next, as a session does. `ModelLimits::unknown()` when not resolved.
@@ -250,15 +255,17 @@ pub struct LeadConfig {
 ///
 /// It drives the async runner from a synchronous trait method by owning a
 /// current-thread tokio runtime and `block_on`-ing it. `Runtime::block_on`
-/// panics when called from inside an async context, so whatever runs the
-/// envelope (the Plan-4 daemon) must drive it from a BLOCKING context -- a
+/// panics when called from inside an async context, and so does DROPPING the
+/// owned `Runtime` there, so whatever runs the envelope (the Plan-4 daemon)
+/// must create, drive AND drop the driver from a BLOCKING context -- a
 /// dedicated thread or `spawn_blocking` -- never directly on a runtime worker.
 ///
 /// What a round does NOT wire up yet (Plan 3b): fleet-backed turn collectors,
 /// the MCP/SCM registry, dispatchable agents, and a codename. It runs with
-/// `BypassDecider` (the lead's tool allowlist is the gate), no collectors, no
-/// parent run, depth 0 -- the same shape as a session turn's `AgentRunOpts`
-/// minus the CLI-only plumbing.
+/// `BypassDecider`, so [`LeadConfig::agent_tools`] is the only tool gate: the
+/// runner's registry is filtered to exactly that list (empty = no tools). No
+/// collectors, no parent run, depth 0 -- the same shape as a session turn's
+/// `AgentRunOpts` minus the CLI-only plumbing.
 pub struct RunAgentLeadDriver {
     cfg: LeadConfig,
     make_provider: ProviderFactory,
@@ -269,7 +276,16 @@ pub struct RunAgentLeadDriver {
 }
 
 impl RunAgentLeadDriver {
+    /// Fails with `InvalidInput` when `cfg.per_round_max_turns` is 0 (every
+    /// round would bust before its first turn, so the lead could never run),
+    /// or with the OS error when the tokio runtime cannot be built.
     pub fn new(cfg: LeadConfig, make_provider: ProviderFactory) -> std::io::Result<Self> {
+        if cfg.per_round_max_turns == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "LeadConfig::per_round_max_turns must be at least 1",
+            ));
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -298,7 +314,9 @@ impl LeadDriver for RunAgentLeadDriver {
             codename: None,
             agent_name: self.cfg.agent_name.clone(),
             agent_system_prompt: self.cfg.system_prompt.clone(),
-            agent_tools: self.cfg.agent_tools.clone(),
+            // `Some(..)` always: the runner filters its registry to exactly this
+            // list, so an empty list is "no tools" (never "all builtins").
+            agent_tools: Some(self.cfg.agent_tools.clone()),
             provider: (self.make_provider)(),
             provider_name: self.cfg.provider_name.clone(),
             model: self.cfg.model.clone(),
@@ -584,7 +602,7 @@ mod tests {
             goals: vec![],
             workspace_id: "ws_lead_test".into(),
             workspace_path: dir.to_path_buf(),
-            agent_tools: Some(vec![]),
+            agent_tools: vec![],
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
         }
     }
@@ -708,6 +726,38 @@ mod tests {
                 .is_some_and(|m| text_of(m).contains("lead orchestrator")),
             "{:?}",
             d.history
+        );
+    }
+
+    #[test]
+    fn zero_per_round_max_turns_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = scripted_factory(vec![]);
+        let err = RunAgentLeadDriver::new(lead_cfg(dir.path(), 0), make)
+            .err()
+            .expect("0 must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn an_empty_tool_list_grants_the_lead_no_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // The lead tries `bash`; with an empty allowlist it must be an unknown
+        // tool, NOT run (an unfiltered registry would execute it).
+        let call = ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "t1".into(),
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({ "command": "true" }),
+            stop: rupu_agent::StopReason::ToolUse,
+        };
+        let make = scripted_factory(vec![vec![call, text_turn("done")]]);
+        let mut d = RunAgentLeadDriver::new(lead_cfg(dir.path(), 4), make).unwrap();
+        assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
+        let transcript = std::fs::read_to_string(dir.path().join("lead.r0.jsonl")).unwrap();
+        assert!(
+            transcript.contains("unknown tool: bash"),
+            "bash must be refused when agent_tools is empty: {transcript}"
         );
     }
 
