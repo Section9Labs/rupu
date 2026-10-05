@@ -1686,13 +1686,23 @@ async fn unnamed_entries_stay_on_the_origin_provider_after_a_hop() {
     );
 }
 
-/// The origin model's `contextWindow: 1m` + `anthropicSpeed: fast`.
+/// The origin model's `contextWindow: 1m`, `anthropicSpeed: fast`,
+/// `anthropicTaskBudget` and `anthropicContextManagement`, plus a
+/// provider-generic `effort`.
 fn pin_origin_model(opts: &mut AgentRunOpts) {
     opts.context_window = Some(rupu_providers::model_tier::ContextWindow::OneMillion);
     opts.anthropic_speed = Some(rupu_providers::types::Speed::Fast);
+    opts.anthropic_task_budget = Some(40_000);
+    opts.anthropic_context_management = Some(ORIGIN_CONTEXT_MANAGEMENT);
+    opts.effort = Some(rupu_providers::model_tier::ThinkingLevel::High);
 }
 
-/// `(context_window, anthropic_speed)` per request.
+const ORIGIN_CONTEXT_MANAGEMENT: rupu_providers::types::ContextManagement =
+    rupu_providers::types::ContextManagement::ToolClearing;
+
+/// `(context_window, anthropic_speed)` per request, after asserting the
+/// task budget and context management follow the same rule (both set or
+/// both cleared with them) and `effort` is always kept.
 fn pins(
     requests: &Arc<Mutex<Vec<LlmRequest>>>,
 ) -> Vec<(
@@ -1703,7 +1713,20 @@ fn pins(
         .lock()
         .unwrap()
         .iter()
-        .map(|r| (r.context_window, r.anthropic_speed))
+        .map(|r| {
+            let pinned = r.anthropic_speed.is_some();
+            assert_eq!(r.anthropic_task_budget, pinned.then_some(40_000));
+            assert_eq!(
+                r.anthropic_context_management,
+                pinned.then_some(ORIGIN_CONTEXT_MANAGEMENT)
+            );
+            assert_eq!(
+                r.thinking,
+                Some(rupu_providers::model_tier::ThinkingLevel::High),
+                "effort is provider-generic: every hop keeps it"
+            );
+            (r.context_window, r.anthropic_speed)
+        })
         .collect()
 }
 

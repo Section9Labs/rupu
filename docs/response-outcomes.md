@@ -177,10 +177,11 @@ only in model. Three details:
 - A hop does not inherit the agent's `maxTokens` or `contextWindowTokens`.
   Those were chosen for the original model. The hop's limits come from
   `[[providers.X.models]]` and the provider's model list.
-- A hop to a different model does not send the agent's `contextWindow` or
-  `anthropicSpeed` either: the 1M beta and fast mode exist only on some
-  models. A hop that keeps the original model's name, on another provider,
-  keeps both.
+- A hop to a different model does not send the agent's `contextWindow`,
+  `anthropicSpeed`, `anthropicTaskBudget` or `anthropicContextManagement`
+  either: each exists only on some models. A hop that keeps the original
+  model's name, on another provider, keeps them. `effort` is not tied to a
+  model and carries over to every hop.
 
 ### Cross-provider fallback sends the conversation to another vendor
 
@@ -294,7 +295,8 @@ which model it is continuing on.
   for any `rupu run`, not only a continuation.
 - They also drop the agent's settings that were chosen for its own model. A
   different `--model` drops the agent's `maxTokens`, `contextWindowTokens`,
-  `compactAtPercent`, `contextWindow` and `anthropicSpeed`. A different
+  `compactAtPercent`, `contextWindow`, `anthropicSpeed`,
+  `anthropicTaskBudget` and `anthropicContextManagement`. A different
   `--provider` drops the agent's `auth:` mode. The new model's limits are
   discovered instead.
 - Run it from the same project as the original run, and give it a fresh run id.

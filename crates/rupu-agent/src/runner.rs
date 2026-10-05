@@ -1058,15 +1058,20 @@ fn provider_exhausted(
     }
 }
 
-/// The origin model's model-specific request pins (`contextWindow`,
-/// `anthropicSpeed`). They describe that model: a hop to a different model
-/// sends neither (a 1M beta or `speed: fast` the hop's model may not
-/// support), and a hop that keeps the origin's model string keeps both —
-/// the rule `rupu run --model` applies to an agent's pins.
+/// The origin model's model-specific Anthropic request pins
+/// (`contextWindow`, `anthropicSpeed`, `anthropicTaskBudget`,
+/// `anthropicContextManagement`). They describe that model: a hop to a
+/// different model sends none of them (a 1M beta, `speed: fast`, a task
+/// budget or a context-management strategy the hop's model may not
+/// support), and a hop that keeps the origin's model string keeps them all —
+/// the rule `rupu run --model` applies to an agent's pins. `effort` is
+/// provider-generic and is not a pin.
 struct OriginPins {
     model: String,
     context_window: Option<rupu_providers::model_tier::ContextWindow>,
     anthropic_speed: Option<rupu_providers::types::Speed>,
+    anthropic_task_budget: Option<u32>,
+    anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
 }
 
 impl OriginPins {
@@ -1075,18 +1080,18 @@ impl OriginPins {
             model: opts.model.clone(),
             context_window: opts.context_window,
             anthropic_speed: opts.anthropic_speed,
+            anthropic_task_budget: opts.anthropic_task_budget,
+            anthropic_context_management: opts.anthropic_context_management,
         }
     }
 
     /// Set the pins for the model `opts` now runs on.
     fn apply_to(&self, opts: &mut AgentRunOpts) {
-        if opts.model == self.model {
-            opts.context_window = self.context_window;
-            opts.anthropic_speed = self.anthropic_speed;
-        } else {
-            opts.context_window = None;
-            opts.anthropic_speed = None;
-        }
+        let same = opts.model == self.model;
+        opts.context_window = self.context_window.filter(|_| same);
+        opts.anthropic_speed = self.anthropic_speed.filter(|_| same);
+        opts.anthropic_task_budget = self.anthropic_task_budget.filter(|_| same);
+        opts.anthropic_context_management = self.anthropic_context_management.filter(|_| same);
     }
 }
 
@@ -1116,8 +1121,8 @@ enum FallBack {
 /// - A candidate with no hop builder, or one that fails to build, writes
 ///   `Recovery { Skipped, reason }` and the next is tried.
 /// - A built hop replaces `opts.provider`, `provider_name`, `model` and
-///   `limits`, and drops the origin's `context_window` / `anthropic_speed`
-///   pins when its model differs from the origin's ([`OriginPins`]). The
+///   `limits`, and drops the origin's model-specific Anthropic pins when its
+///   model differs from the origin's ([`OriginPins`]). The
 ///   swap is sticky: every later turn uses `opts`. It writes
 ///   the hop's `model_limits` notice, then `Recovery { FellBack }`.
 /// - When the last measured input is over the hop's compaction threshold,
@@ -2448,6 +2453,9 @@ async fn run_agent_inner(
                             req.max_tokens = opts.limits.output.tokens;
                             req.context_window = opts.context_window;
                             req.anthropic_speed = opts.anthropic_speed;
+                            req.anthropic_task_budget = opts.anthropic_task_budget;
+                            req.anthropic_context_management =
+                                opts.anthropic_context_management;
                             if messages_changed {
                                 req.messages = messages.clone();
                             }
