@@ -7799,6 +7799,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             agent: None,
             provider: None,
             coverage_stream: None,
+            netflow_sink: None,
+            net_capture: None,
+            tool_call_id: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {

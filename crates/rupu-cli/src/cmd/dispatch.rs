@@ -424,6 +424,9 @@ impl AgentDispatcher for CliAgentDispatcher {
             agent: None,
             provider: None,
             coverage_stream: self.coverage_stream.clone(),
+            netflow_sink: None,
+            net_capture: None,
+            tool_call_id: None,
         };
 
         // What a fallback hop keeps from this child's agent: exactly what its

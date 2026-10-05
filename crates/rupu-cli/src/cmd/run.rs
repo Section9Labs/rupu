@@ -1030,6 +1030,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             agent: None,
             provider: None,
             coverage_stream: Some(coverage_stream.clone()),
+            netflow_sink: None,
+            net_capture: None,
+            tool_call_id: None,
         };
 
         let backend_id = "local_checkout".to_string();

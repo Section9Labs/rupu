@@ -34,7 +34,7 @@ pub enum ToolError {
 }
 
 /// Per-invocation context the runtime passes to every tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ToolContext {
     /// Workspace root. Read/write tools restrict their scope to this
     /// directory; `bash` runs with this as its cwd.
@@ -121,6 +121,53 @@ pub struct ToolContext {
     /// sessions, which already write the coordinator's ledgers directly.
     #[serde(skip)]
     pub coverage_stream: Option<std::path::PathBuf>,
+    /// Where this run's network flows go. Set (with `net_capture`) by the
+    /// run assembly so the `bash` tool can attribute a child's connections
+    /// to the run; `None` disables subprocess capture.
+    #[serde(skip)]
+    pub netflow_sink: Option<std::sync::Arc<dyn rupu_netflow::FlowSink>>,
+    /// The process-wide subprocess-capture backend the `bash` tool drives
+    /// around each spawn. `None` = no capture (the exact pre-capture path).
+    #[serde(skip)]
+    pub net_capture: Option<std::sync::Arc<dyn rupu_netflow::SubprocessCapture>>,
+    /// The model's tool-call id for the tool invocation in flight —
+    /// attributes a bash call's captured connections to that call.
+    #[serde(skip)]
+    pub tool_call_id: Option<String>,
+}
+
+// Hand-written because the netflow trait objects are not `Debug`.
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("workspace_path", &self.workspace_path)
+            .field("bash_env_allowlist", &self.bash_env_allowlist)
+            .field("bash_timeout_secs", &self.bash_timeout_secs)
+            .field("dispatcher", &self.dispatcher)
+            .field("dispatchable_agents", &self.dispatchable_agents)
+            .field("parent_run_id", &self.parent_run_id)
+            .field("depth", &self.depth)
+            .field("coverage_writer", &self.coverage_writer)
+            .field("surface_tag", &self.surface_tag)
+            .field("run_id", &self.run_id)
+            .field("model", &self.model)
+            .field("tool_mappings", &self.tool_mappings)
+            .field("findings", &self.findings)
+            .field("codename", &self.codename)
+            .field("agent", &self.agent)
+            .field("provider", &self.provider)
+            .field("coverage_stream", &self.coverage_stream)
+            .field(
+                "netflow_sink",
+                &self.netflow_sink.as_ref().map(|_| "<sink>"),
+            )
+            .field(
+                "net_capture",
+                &self.net_capture.as_ref().map(|_| "<capture>"),
+            )
+            .field("tool_call_id", &self.tool_call_id)
+            .finish()
+    }
 }
 
 impl Default for ToolContext {
@@ -143,6 +190,9 @@ impl Default for ToolContext {
             agent: None,
             provider: None,
             coverage_stream: None,
+            netflow_sink: None,
+            net_capture: None,
+            tool_call_id: None,
         }
     }
 }
