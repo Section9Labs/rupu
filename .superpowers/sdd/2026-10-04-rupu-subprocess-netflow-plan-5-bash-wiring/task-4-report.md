@@ -31,3 +31,10 @@ across a poll (hence --limit-rate). Short connections are not reliably captured
 (known backend limitation, not a wiring bug). Clippy: my file is clean;
 `cargo clippy -p rupu-cli --tests` fails only on a pre-existing
 `question_mark` lint in src/cmd/completers.rs:127 (local toolchain drift, untouched).
+
+## Fix round 1
+
+- Added `assert_eq!(flow.outcome, Outcome::Ok, ...)` after the run_id assert, so the test exercises the established+completed (Complete fold) path rather than the tracker's never-established branch. The `error` note text is deliberately not asserted.
+- The "no Socket flow captured" panic now says it requires network access to example.com:80 and curl, and that the ledger dump shows what was captured.
+- Run/capture logic, `--limit-rate` hold and env handling unchanged.
+- Re-ran the ignored test 3x on this Mac: 3/3 passed (~6s each).

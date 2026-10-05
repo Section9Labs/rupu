@@ -116,7 +116,8 @@ async fn a_bash_curl_flow_is_captured_and_attributed() {
         .collect();
     assert!(
         !socket.is_empty(),
-        "no Socket flow captured; flows: {flows:#?}\nledger:\n{raw}"
+        "no Socket flow captured (requires network access to example.com:80 and curl; \
+         the ledger dump below shows what was captured); flows: {flows:#?}\nledger:\n{raw}"
     );
 
     let flow = socket
@@ -129,6 +130,14 @@ async fn a_bash_curl_flow_is_captured_and_attributed() {
         "origin should be Subprocess(curl): {flow:#?}"
     );
     assert_eq!(flow.ctx.run_id.as_deref(), Some(RUN_ID), "{flow:#?}");
+    // `Ok` means the established+completed path (the Complete fold), not the
+    // tracker's never-established branch that also emits `body_complete`.
+    assert_eq!(
+        flow.outcome,
+        rupu_netflow::Outcome::Ok,
+        "captured flow should be Ok, got {:?}",
+        flow.outcome
+    );
     assert!(
         flow.body_complete,
         "the SocketComplete must be folded in: {flow:#?}\n{raw}"
