@@ -2884,7 +2884,13 @@ async fn run_agent_inner(
                     ));
                 }
                 let started_tool = Instant::now();
-                let invoke_result = tool.invoke(input.clone(), &opts.tool_context).await;
+                // Per-invocation context: stamp THIS call's id so the bash
+                // tool can attribute captured connections to it. Cloned
+                // (cheap: Arcs + small fields) so a sibling call in the
+                // same turn never inherits a stale id.
+                let mut call_ctx = opts.tool_context.clone();
+                call_ctx.tool_call_id = Some(call_id.clone());
+                let invoke_result = tool.invoke(input.clone(), &call_ctx).await;
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
                 match invoke_result {
                     Ok(out) => {
@@ -3262,6 +3268,10 @@ async fn run_agent_inner(
     // never sees EOF and the await hangs indefinitely.
     // -----------------------------------------------------------------------
     opts.tool_context.coverage_writer = None;
+    // Release the run's subprocess-capture state once, at run end.
+    if let Some(cap) = &opts.tool_context.net_capture {
+        cap.run_finished(&opts.run_id);
+    }
     if let Some(h) = coverage_handle {
         h.shutdown().await;
     }
@@ -3434,6 +3444,135 @@ mod on_tool_call_tests {
             "expected step_id 's1' prefix, got {}",
             log[0]
         );
+    }
+
+    #[derive(Default)]
+    struct CaptureLog {
+        begun: Vec<(String, String)>,
+        finished_runs: Vec<String>,
+    }
+
+    struct RecordingCapture(Arc<Mutex<CaptureLog>>);
+    struct RecordedCall;
+
+    impl rupu_netflow::SubprocessCapture for RecordingCapture {
+        fn begin(&self, call: rupu_netflow::CallAttribution) -> Box<dyn rupu_netflow::CaptureCall> {
+            self.0
+                .lock()
+                .unwrap()
+                .begun
+                .push((call.run_id, call.tool_call_id));
+            Box::new(RecordedCall)
+        }
+        fn run_finished(&self, run_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .finished_runs
+                .push(run_id.to_string());
+        }
+    }
+
+    impl rupu_netflow::CaptureCall for RecordedCall {
+        fn shell_prefix(&self) -> Option<String> {
+            None
+        }
+        fn spawned(&mut self, _pid: u32) {}
+        fn finished(self: Box<Self>) {}
+    }
+
+    #[tokio::test]
+    async fn runner_stamps_tool_call_id_and_calls_run_finished() {
+        let log = Arc::new(Mutex::new(CaptureLog::default()));
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_netcap.jsonl");
+
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_bash_net_1".into(),
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "echo hi" }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_bash_net_2".into(),
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "echo there" }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            seed_source: None,
+            collectors: Vec::new(),
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_netcap".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 6,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                net_capture: Some(Arc::new(RecordingCapture(log.clone()))),
+                netflow_sink: Some(Arc::new(rupu_netflow::MemorySink::default())),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            on_usage: None,
+            concerns: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            scope_name: None,
+            surface_tag: None,
+            pause: None,
+            codename: None,
+            recovery: Default::default(),
+        };
+
+        run_agent(opts).await.expect("agent run succeeds");
+
+        let l = log.lock().unwrap();
+        assert_eq!(
+            l.begun,
+            vec![
+                ("run_netcap".to_string(), "call_bash_net_1".to_string()),
+                ("run_netcap".to_string(), "call_bash_net_2".to_string()),
+            ],
+            "each bash call is attributed to its own tool-call id"
+        );
+        assert_eq!(l.finished_runs, vec!["run_netcap".to_string()]);
     }
 
     #[tokio::test]
