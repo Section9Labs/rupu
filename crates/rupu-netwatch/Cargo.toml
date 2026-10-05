@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 rupu-netflow.workspace = true
 chrono.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [lints]
 workspace = true
