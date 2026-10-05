@@ -394,6 +394,9 @@ mod tests {
             bytes_out: Some(100),
             bytes_in: Some(200),
             body_complete: true,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: Some(10),
             duration_ms: Some(ms),
         }

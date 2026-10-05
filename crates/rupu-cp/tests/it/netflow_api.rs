@@ -66,6 +66,9 @@ fn flow(run: Option<&str>, host: &str, fidelity: Fidelity, peer: Option<&str>) -
             Some(20)
         },
         body_complete: true,
+        process: None,
+        local_addr: None,
+        direction: None,
         ttfb_ms: None,
         duration_ms: Some(30),
     }
@@ -325,6 +328,9 @@ fn e2e_flow(id: FlowId, run: Option<&str>, host: &str, origin: Origin) -> FlowRe
         bytes_out: Some(1),
         bytes_in: Some(2),
         body_complete: true,
+        process: None,
+        local_addr: None,
+        direction: None,
         ttfb_ms: None,
         duration_ms: Some(5),
     }

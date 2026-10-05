@@ -140,6 +140,9 @@ mod tests {
             bytes_out: None,
             bytes_in: None,
             body_complete: true,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: None,
             duration_ms: None,
         }

@@ -542,3 +542,22 @@ fn flow_ctx_tool_call_id_is_optional_and_omitted_when_none() {
     assert!(json.contains(r#""tool_call_id":"toolu_01Ab""#));
     assert_eq!(serde_json::from_str::<FlowCtx>(&json).unwrap(), c);
 }
+
+#[test]
+fn flow_process_and_direction_round_trip() {
+    use rupu_netflow::{Direction, FlowProcess};
+    let p = FlowProcess {
+        pid: 4412,
+        name: "curl".into(),
+    };
+    assert_eq!(
+        serde_json::from_str::<FlowProcess>(&serde_json::to_string(&p).unwrap()).unwrap(),
+        p
+    );
+    let d = Direction::Outbound;
+    assert_eq!(serde_json::to_string(&d).unwrap(), r#""outbound""#);
+    assert_eq!(
+        serde_json::from_str::<Direction>(r#""inbound""#).unwrap(),
+        Direction::Inbound
+    );
+}

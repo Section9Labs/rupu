@@ -56,6 +56,9 @@ fn flow_at(ts_secs: i64, host: &str) -> FlowRecord {
         bytes_out: Some(10),
         bytes_in: Some(20),
         body_complete: true,
+        process: None,
+        local_addr: None,
+        direction: None,
         ttfb_ms: None,
         duration_ms: Some(30),
     }

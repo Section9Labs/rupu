@@ -37,6 +37,22 @@ pub enum Outcome {
     Timeout,
 }
 
+/// The process that owned a captured socket (socket flows only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowProcess {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// Connection direction for socket flows. `None` on a record means
+/// unknown — e.g. Linux v1 does not populate it (spec 2026-10-04 18 V1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Outbound,
+    Inbound,
+}
+
 /// One outbound request.
 ///
 /// Deliberate omissions (spec §5.1): no query string, no headers, no TLS
@@ -60,6 +76,14 @@ pub struct FlowRecord {
     pub peer_ip: Option<IpAddr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolved_ips: Vec<IpAddr>,
+    /// The process that owned the socket (socket flows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<FlowProcess>,
+    /// `"ip:port"` of the local end, for correlating with other logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_version: Option<String>,
@@ -143,6 +167,9 @@ mod tests {
             bytes_out: Some(1234),
             bytes_in: None,
             body_complete: false,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: Some(42),
             duration_ms: None,
         }

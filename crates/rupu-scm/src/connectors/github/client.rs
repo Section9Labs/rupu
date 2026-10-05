@@ -431,6 +431,9 @@ pub fn coarse_flow(
         // count behind it (a `Content-Length` or a `LedgerLine::Complete`
         // fold), neither of which applies to a Coarse record.
         body_complete: false,
+        process: None,
+        local_addr: None,
+        direction: None,
         ttfb_ms: None,
         duration_ms: Some(duration_ms),
     }
