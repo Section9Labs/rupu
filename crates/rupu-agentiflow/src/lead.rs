@@ -366,6 +366,7 @@ impl LeadDriver for RunAgentLeadDriver {
             pause: None,
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             recovery: Default::default(),
         };
 

@@ -174,6 +174,7 @@ impl StepFactory for ParallelFactory {
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "writer".into(),
             agent_system_prompt: "you are the writer".into(),
             agent_tools: Some(vec!["dispatch_agents_parallel".into()]),

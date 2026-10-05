@@ -7939,6 +7939,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             pause: None,
             seed_source,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             codename: Some(codename.clone()),
             recovery,
         };

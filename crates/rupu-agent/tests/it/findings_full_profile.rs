@@ -36,6 +36,7 @@ fn opts(
         on_usage: None,
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: "assessor".into(),
         agent_system_prompt: "You assess code.".into(),
         agent_tools: Some(vec!["report_finding".into()]),

@@ -105,6 +105,7 @@ async fn a_terminating_process_starts_no_overflow_compaction_call() {
     let res = run_agent(AgentRunOpts {
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: "test".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

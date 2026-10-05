@@ -51,6 +51,7 @@ impl Fx {
             seed_source: None,
             recovery: Default::default(),
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "worker".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,

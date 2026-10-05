@@ -1501,6 +1501,11 @@ pub struct AgentRunOpts {
     /// Pre-turn collectors (spec §8). Empty = no injection; the loop behaves
     /// exactly as before. Run off the async runtime via spawn_blocking.
     pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
+    /// Pre-built, run-scoped tools injected into this run's registry regardless
+    /// of `agent_tools` (always-on platform tools; the `PermissionDecider` still
+    /// gates each call). Empty for ordinary runs; the agentiflow envelope uses it
+    /// for the lead's board/mailbox tools.
+    pub extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
     /// Recovery ladder inputs (spec 2026-10-01 §5–§6). Default: no fallback chain and no hop builder — rungs 1 and 2 are unavailable, rung 0 still applies.
     pub recovery: crate::recovery::RecoveryOpts,
 }
@@ -1946,6 +1951,14 @@ async fn run_agent_inner(
         } else {
             None
         };
+
+    // Always-on injected tools (agentiflow Tier-1): registered after the
+    // agent_tools filter and the coverage/MCP blocks, so a restrictive agent
+    // tools:/actions: list cannot strip them. A name collision favors the
+    // injected tool. The per-call PermissionDecider still runs.
+    for tool in &opts.extra_tools {
+        registry.insert(tool.name().to_string(), tool.clone());
+    }
 
     let tool_defs = registry.to_tool_definitions();
 
@@ -3375,6 +3388,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3437,6 +3451,126 @@ mod on_tool_call_tests {
     }
 
     #[tokio::test]
+    async fn extra_tools_are_registered_and_bypass_the_agent_tools_filter() {
+        // A trivial always-on tool.
+        struct Ping;
+        #[async_trait::async_trait]
+        impl rupu_tools::Tool for Ping {
+            fn name(&self) -> &'static str {
+                "ping"
+            }
+            fn description(&self) -> &'static str {
+                "returns pong"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            async fn invoke(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &rupu_tools::ToolContext,
+            ) -> Result<rupu_tools::ToolOutput, rupu_tools::ToolError> {
+                Ok(rupu_tools::ToolOutput {
+                    stdout: "pong".into(),
+                    error: None,
+                    duration_ms: 0,
+                    derived: None,
+                    structured: None,
+                })
+            }
+        }
+
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test_extra_tools.jsonl");
+
+        // turn 1: call ping; turn 2: stop.
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_ping_1".into(),
+                tool_name: "ping".into(),
+                tool_input: serde_json::json!({}),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            seed_source: None,
+            collectors: Vec::new(),
+            // Empty allowlist: NO builtins, NO MCP. The injected tool must
+            // still be callable.
+            extra_tools: vec![Arc::new(Ping)],
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: Some(vec![]),
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_test_extra_tools".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            on_usage: None,
+            concerns: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            scope_name: None,
+            surface_tag: None,
+            pause: None,
+            codename: None,
+            recovery: Default::default(),
+        };
+
+        let exit = run_agent_full(opts).await;
+        let run = exit.result.expect("run ok");
+        let saw_pong = run.final_messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    rupu_providers::types::ContentBlock::ToolResult { content, is_error: false, .. }
+                        if content.contains("pong")
+                )
+            })
+        });
+        assert!(
+            saw_pong,
+            "the injected tool ran despite an empty agent_tools: {:?}",
+            run.final_messages
+        );
+    }
+
+    #[tokio::test]
     async fn denied_tool_call_fires_on_tool_call_with_blocked_true_and_does_not_fail_the_run() {
         // `agent_tools` narrows the roster to `read_file` only, so `bash`
         // is never inserted into the registry (see the `filter_to` call
@@ -3479,6 +3613,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: Some(vec!["read_file".to_string()]),
@@ -3604,6 +3739,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3682,6 +3818,7 @@ mod on_tool_call_tests {
             codename: Some("jade-reef/heron#3".into()),
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3785,6 +3922,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3863,6 +4001,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3963,6 +4102,7 @@ mod on_tool_call_tests {
             let opts = AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: "test-agent".into(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -4794,6 +4934,7 @@ mod compaction_tests {
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -5339,6 +5480,7 @@ mod pause_tests {
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -5680,6 +5822,7 @@ mod reasoning_tests {
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,

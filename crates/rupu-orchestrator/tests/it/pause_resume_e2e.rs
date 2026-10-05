@@ -169,6 +169,7 @@ fn linear_agent_opts(
     AgentRunOpts {
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: agent_name.to_string(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

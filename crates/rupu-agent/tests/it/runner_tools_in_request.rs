@@ -18,6 +18,7 @@ async fn run_passes_all_default_tools_to_provider() {
     let opts = AgentRunOpts {
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: "all-tools".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None, // None = every default tool
@@ -117,6 +118,7 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
     let opts = AgentRunOpts {
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: "subset".into(),
         agent_system_prompt: "test".into(),
         agent_tools: Some(vec!["bash".into(), "read_file".into()]),
