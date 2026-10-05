@@ -299,3 +299,27 @@ fn capture_line_round_trips_and_is_ignored_by_read_flows() {
     assert_eq!(flows.len(), 1);
     assert_eq!(dropped, 2);
 }
+
+// ---- Task 7: the capture port ----
+
+#[test]
+fn noop_capture_is_inert() {
+    use rupu_netflow::capture::{CallAttribution, NoopCapture, SubprocessCapture};
+    use rupu_netflow::NullSink;
+    use std::sync::Arc;
+
+    let cap = NoopCapture;
+    let call = CallAttribution {
+        run_id: "run-1".into(),
+        step_id: None,
+        agent: Some("recon".into()),
+        codename: None,
+        tool_call_id: "toolu_01Ab".into(),
+        sink: Arc::new(NullSink),
+    };
+    let mut c = cap.begin(call);
+    assert_eq!(c.shell_prefix(), None);
+    c.spawned(4412);
+    c.finished();
+    cap.run_finished("run-1");
+}
