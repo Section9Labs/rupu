@@ -122,7 +122,7 @@ mod fsops {
     use rustix::fs::{access, statfs, Access};
     use rustix::process::geteuid;
 
-    use super::{choose_mode, CgroupEnv, Mode};
+    use super::{choose_mode, owned_root, CgroupEnv, Mode};
 
     /// Where the cgroup2 hierarchy is mounted.
     const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
