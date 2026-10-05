@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup } from '@testing-library/react';
 import NetflowTable from './NetflowTable';
 import type { FlowView } from '../../lib/netflow';
+import { socketFlowView } from './explorer/explorerFixtures';
 
 afterEach(() => {
   cleanup();
@@ -219,5 +220,37 @@ describe('NetflowTable', () => {
       />,
     );
     expect(screen.queryByText(/no network flows/i)).not.toBeInTheDocument();
+  });
+
+  describe('socket flows', () => {
+    it('renders the process, a tcp endpoint, em dashes for path/status, and a transcript link', () => {
+      render(<NetflowTable flows={[socketFlowView()]} droppedTotal={0} asnLoaded />);
+      const row = screen.getByText('tcp → 140.82.116.3:443').closest('tr') as HTMLElement;
+      expect(row).not.toBeNull();
+      // Origin cell: the process name and its pid.
+      expect(within(row).getByText(/curl/)).toBeInTheDocument();
+      expect(within(row).getByText(/4412/)).toBeInTheDocument();
+      // Path + status cells are honest dashes, not a blank or a bogus method.
+      expect(within(row).getAllByText('—').length).toBeGreaterThanOrEqual(2);
+      expect(within(row).queryByText('GET')).not.toBeInTheDocument();
+      const link = within(row).getByRole('link', { name: /transcript/i });
+      expect(link).toHaveAttribute('href', '/runs/run1#call-toolu_1');
+    });
+
+    it('omits the transcript link when the tool call is unknown', () => {
+      const f = socketFlowView({
+        ctx: { origin: { kind: 'subprocess', name: 'curl' }, run_id: 'run1' },
+      });
+      render(<NetflowTable flows={[f]} droppedTotal={0} asnLoaded />);
+      expect(screen.queryByRole('link', { name: /transcript/i })).not.toBeInTheDocument();
+    });
+
+    it('leaves http rows unchanged: path text, status, no transcript link, no tcp endpoint', () => {
+      render(<NetflowTable flows={[flow({ status: 201 })]} droppedTotal={0} asnLoaded />);
+      expect(screen.getByText('/v1/messages')).toBeInTheDocument();
+      expect(screen.getByText('201')).toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: /transcript/i })).not.toBeInTheDocument();
+      expect(screen.queryByText(/tcp →/)).not.toBeInTheDocument();
+    });
   });
 });

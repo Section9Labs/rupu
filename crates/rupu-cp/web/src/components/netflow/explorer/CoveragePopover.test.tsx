@@ -3,6 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import CoveragePopover from './CoveragePopover';
+import { FIDELITY_TITLE } from '../FidelityBadge';
 
 afterEach(() => {
   cleanup();
@@ -30,12 +31,13 @@ describe('CoveragePopover', () => {
     expect(screen.queryByText(/sub-agents this run dispatched/i)).not.toBeInTheDocument();
   });
 
-  it('carries the fidelity legend from FIDELITY_TITLE for all three levels', () => {
+  it('carries the fidelity legend from FIDELITY_TITLE for all four levels', () => {
     render(<CoveragePopover scope="global" droppedTotal={0} />);
     fireEvent.click(screen.getByRole('button', { name: /coverage & gaps/i }));
     expect(screen.getByText(/exact request and response metadata/i)).toBeInTheDocument();
     expect(screen.getByText(/not observable for this connector/i)).toBeInTheDocument();
     expect(screen.getByText(/frame-level capture/i)).toBeInTheDocument();
+    expect(screen.getByText(FIDELITY_TITLE.socket)).toBeInTheDocument();
   });
 
   it('states the dropped accounting (same wording as the banner) only when loss occurred', () => {

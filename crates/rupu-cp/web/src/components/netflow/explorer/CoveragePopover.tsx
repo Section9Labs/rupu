@@ -16,7 +16,8 @@ import { FidelityBadge, FIDELITY_TITLE } from '../FidelityBadge';
 import { droppedTotalSentence } from '../NetflowTable';
 import { disclosureText, type NetflowScope } from '../ScopeDisclosure';
 
-const LEGEND_ORDER: Fidelity[] = ['http', 'coarse', 'full'];
+// Rank order: least to most observed.
+const LEGEND_ORDER: Fidelity[] = ['coarse', 'socket', 'http', 'full'];
 
 export function CoveragePopover({
   scope,

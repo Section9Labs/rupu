@@ -92,6 +92,21 @@ export function originLabel(f: FlowView): string {
   return f.ctx.origin.name ?? f.ctx.origin.kind;
 }
 
+/** A `socket`-fidelity flow: a subprocess's TCP connection seen in the OS
+ *  socket table. It has no method, path or status — those cells render an
+ *  em dash rather than a blank. */
+export function isSocketFlow(f: FlowView): boolean {
+  return f.fidelity === 'socket';
+}
+
+/** Where the transcript anchor for a socket flow's spawning tool call
+ *  lives — null when the run or the tool call is unknown. */
+export function transcriptHref(f: FlowView): string | null {
+  const run = f.ctx.run_id;
+  const call = f.ctx.tool_call_id;
+  return run && call ? `/runs/${run}#call-${call}` : null;
+}
+
 /** The one authored copy of the dropped-loss sentence — the empty-state
  *  banner below and the explorer's CoveragePopover both render exactly
  *  this string, so the "whole history, every ledger this view reads"
@@ -257,7 +272,28 @@ export function NetflowTable({
       key: 'origin',
       header: 'Origin',
       fit: true,
-      render: (f) => <span className="text-ink-dim">{originLabel(f)}</span>,
+      render: (f) => {
+        if (!isSocketFlow(f)) return <span className="text-ink-dim">{originLabel(f)}</span>;
+        const href = transcriptHref(f);
+        return (
+          <span className="text-ink-dim">
+            {f.process?.name ?? originLabel(f)}
+            {f.process && <span className="text-ink-mute"> · pid {f.process.pid}</span>}
+            {href && (
+              <>
+                {' '}
+                <a
+                  href={href}
+                  onClick={(e) => e.stopPropagation()}
+                  className="text-brand-500 hover:underline"
+                >
+                  transcript
+                </a>
+              </>
+            )}
+          </span>
+        );
+      },
     },
     {
       key: 'host',
@@ -271,21 +307,36 @@ export function NetflowTable({
       key: 'path',
       header: 'Path',
       subject: true,
-      titleValue: (f) => `${f.method} ${f.path}`,
-      render: (f) => <span className="font-mono text-note text-ink-dim">{f.path}</span>,
+      titleValue: (f) => (isSocketFlow(f) ? '—' : `${f.method} ${f.path}`),
+      render: (f) =>
+        isSocketFlow(f) ? (
+          <span className="text-ink-mute">—</span>
+        ) : (
+          <span className="font-mono text-note text-ink-dim">{f.path}</span>
+        ),
     },
     {
       key: 'network',
       header: 'Network',
       fit: true,
-      render: (f) =>
-        f.asn ? (
-          <span className="font-mono text-note text-ink-mute">
-            AS{f.asn.asn} {f.asn.org}
-          </span>
-        ) : (
-          <span className="text-ink-mute">—</span>
-        ),
+      render: (f) => (
+        <>
+          {/* A socket flow has no URL, so the transport → endpoint is its
+              identity; an ASN (when enrichment found one) follows. */}
+          {isSocketFlow(f) && (
+            <span className="font-mono text-note text-ink-dim">
+              {f.scheme} → {f.host}:{f.port}
+            </span>
+          )}
+          {f.asn ? (
+            <span className="font-mono text-note text-ink-mute">
+              {isSocketFlow(f) ? ' · ' : ''}AS{f.asn.asn} {f.asn.org}
+            </span>
+          ) : (
+            !isSocketFlow(f) && <span className="text-ink-mute">—</span>
+          )}
+        </>
+      ),
     },
     {
       key: 'status',
@@ -294,7 +345,7 @@ export function NetflowTable({
       align: 'right',
       render: (f) => (
         <span className={f.outcome === 'ok' ? 'text-ink-dim' : 'text-err'}>
-          {f.status ?? '—'}
+          {isSocketFlow(f) ? '—' : (f.status ?? '—')}
         </span>
       ),
     },
