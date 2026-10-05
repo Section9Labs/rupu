@@ -1,9 +1,10 @@
 ---
 source: crates/rupu-cli/src/output/live_view/structure.rs
+assertion_line: 3194
 expression: render_plain(&rows)
 ---
   ◐  sweep  run · scan · for_each ···· ◐ running
       ▓▓▓▓▓▓▓░░░░░░░░░░░░░ 1/3 ✓1 ◐1 ✗1
-    ◐├─ svc-1  otter#2 · anthropic/claude-opus-5-5 ···· ◐ running
+    ◐├─ svc-1  anthropic/claude-opus-5-5 ···· ◐ running · otter#2
     ✓├─ svc-0  anthropic/claude-opus-5-5 ···· ✓ done
-    ✗├─ svc-2  otter#3 · anthropic/claude-opus-5-5 ···· ✗ failed
+    ✗├─ svc-2  anthropic/claude-opus-5-5 ···· ✗ failed · otter#3

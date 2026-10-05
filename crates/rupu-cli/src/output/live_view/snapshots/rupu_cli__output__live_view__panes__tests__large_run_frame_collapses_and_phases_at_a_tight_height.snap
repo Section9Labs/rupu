@@ -1,10 +1,11 @@
 ---
 source: crates/rupu-cli/src/output/live_view/panes.rs
+assertion_line: 1593
 expression: s
 ---
 sweep-fleet  ● mint-tundra  ◐ running · 38m 05s
 step 18/21  █████████████████████░░░  ◐ hunt
-⇡41000000 ⇣2300000 $112.60 · ⚑4
+⇡41.0M ⇣2.3M $112.60 · ⚑4
 ─ structure ────────────────────────────────────┬─ stream · run ────────────────────────────────────────────────────────
   ✓ s01 … s11 (+11 done)                        │ waiting for activity…
   │                                             │
@@ -18,10 +19,10 @@ step 18/21  █████████████████████░�
   │                                             │
   ├─╭─ ⊞ hunt  for_each · runti… ···· ◐ running │
   │ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26  │
-  │ ◐├─ svc-56  heron#57 … ···· ◐ running @mini │
-  │ ◐├─ svc-57  wren#58 ·… ···· ◐ running @kuki │
-  │ ◐├─ svc-58  egret#59 … ···· ◐ running @mini ├─ live · 6 active · 2 hosts ───────────────────────────────────────────
-  │ ◐├─ svc-59  lynx#60 ·… ···· ◐ running @kuki │ lynx#55 ▸ read_file svc/auth/handler.rs
+  │ ◐├─ svc-56… ···· ◐ running @mini · heron#57 │
+  │ ◐├─ svc-57 … ···· ◐ running @kuki · wren#58 │
+  │ ◐├─ svc-58… ···· ◐ running @mini · egret#59 ├─ live · 6 active · 2 hosts ───────────────────────────────────────────
+  │ ◐├─ svc-59 … ···· ◐ running @kuki · lynx#60 │ lynx#55 ▸ read_file svc/auth/handler.rs
   │ │ … +82 more · [enter] expand               │ otter#56 ▸ grep unwrap()
   │ ◄─╰─                                        │ heron#57 ▸ read_file svc/billing/ledger.rs
   │                                             │ lynx#55 ⚑ HIGH token accepted after revoke

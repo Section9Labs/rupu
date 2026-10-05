@@ -1,11 +1,11 @@
 ---
 source: crates/rupu-cli/src/output/live_view/panes.rs
-assertion_line: 633
+assertion_line: 1108
 expression: s
 ---
 assess-services  ● mint-tundra  ◐ running · 4m 12s
 step 1/3  ████████░░░░░░░░░░░░░░░░  ◐ sweep
-⇡6100000 ⇣420000 $18.40 · ⚑2
+⇡6.1M ⇣420k $18.40 · ⚑2
 ─ structure ────────────────────────────┬─ stream · run ────────────────────────────────────────────
   ✓  preflight  scanner · h… ···· ✓ 18s │ 11:42:31 ▸ read_file src/lib.rs
   │                                     │ 11:42:33 ◇ thinking "check the auth path"

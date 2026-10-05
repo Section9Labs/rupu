@@ -1,15 +1,16 @@
 ---
 source: crates/rupu-cli/src/output/live_view/structure.rs
+assertion_line: 2761
 expression: s
 ---
   ✓ s01 … recon (+21 done)
   │
   ├─╭─ ⊞ hunt  for_each · runtime fan-out ···· ◐ running
   │ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26
-  │ ◐├─ svc-56  otter#57 · anthropic/claude-opus-5-5 ···· ◐ running
+  │ ◐├─ svc-56  anthropic/claude-opus-5-5 ···· ◐ running · otter#57
   │ ◐├─ svc-57  anthropic/claude-opus-5-5 ···· ◐ running
-  │ ◐├─ svc-58  otter#59 · anthropic/claude-opus-5-5 ···· ◐ running
-  │ ◐├─ svc-59  otter#60 · anthropic/claude-opus-5-5 ···· ◐ running
+  │ ◐├─ svc-58  anthropic/claude-opus-5-5 ···· ◐ running · otter#59
+  │ ◐├─ svc-59  anthropic/claude-opus-5-5 ···· ◐ running · otter#60
   │ │ … +82 more · [enter] expand
   │ ◄─╰─
   │

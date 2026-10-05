@@ -214,6 +214,12 @@ struct Facts<'a> {
     /// The row's attempt picks up an interrupted one (`↩ continued` /
     /// `↩ recovered`); shown beside the identity.
     resumed: Option<ResumedMark>,
+    /// Identity that rides in the *protected tail* (after the state), so
+    /// [`clip_row`] keeps it even when a long label (a unit's file path) would
+    /// otherwise push it off: a unit's codename (ties the row to the
+    /// firehose), a fan-out header's agent. Pre-rendered so the caller controls
+    /// its styling (role-tinted codename vs plain agent).
+    tail_note: Option<Line>,
     /// The right-hand state: status plus its text (a duration, `running`, …).
     state: Option<(NodeStatus, String)>,
     /// How many `StepWarning`s the step has. Rides beside `state` as `⚠` /
@@ -469,21 +475,16 @@ fn codename_line(codename: &str) -> Option<Line> {
 }
 
 /// The identity parts that follow a row's label, each its own [`Line`]:
-/// `detail`, the `↩ continued` / `↩ recovered` mark, `codename`, `agent`,
-/// `provider/model`. `shown` holds the row's
+/// `detail`, `codename`, `agent`, `provider/model`. `shown` holds the row's
 /// meta texts so an agent app-canvas already printed there is not repeated.
+/// The resumption mark and any pinned codename/agent live in the *protected
+/// tail* instead ([`right_hand_state`]), so a clipped label can't drop them.
 fn identity_parts(facts: &Facts<'_>, shown: &[&str]) -> Vec<Line> {
     // An empty string is "not produced" (it would print as a bare ` · `).
     let clean = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(printable);
     let mut parts = Vec::new();
     if let Some(detail) = &facts.detail {
         parts.push(Line::new().dim(printable(detail)));
-    }
-    if let Some(mark) = facts.resumed {
-        parts.push(Line::new().status(
-            Status::Retrying,
-            format!("{RESUMED_GLYPH} {}", mark.label()),
-        ));
     }
     if let Some(c) = facts.codename.and_then(codename_line) {
         parts.push(c);
@@ -576,29 +577,53 @@ fn paint(row: &GraphRow, facts: &Facts<'_>, gutter: Option<NodeStatus>) -> Line 
 /// state is untouched.
 fn right_hand_state(mut line: Line, facts: &Facts<'_>) -> Line {
     let host = facts.host.filter(|h| !h.is_empty());
-    if facts.state.is_none() && host.is_none() && facts.warnings == 0 {
+    if facts.state.is_none()
+        && host.is_none()
+        && facts.warnings == 0
+        && facts.tail_note.is_none()
+        && facts.resumed.is_none()
+    {
         return line;
     }
     line = line.dim(LEADER);
+    // `wrote` tracks whether anything already sits after the leader, so each
+    // element adds its own leading space only when it needs one.
+    let mut wrote = false;
+    let space = |wrote: &mut bool| {
+        let gap = if *wrote { " " } else { "" };
+        *wrote = true;
+        gap
+    };
+    // The resumption mark leads the tail: it qualifies the attempt whose state
+    // follows (`↩ continued ◉ running`). In the protected tail so a narrow
+    // pane can't clip it — the #5 gap: resumed marks never showed in a real
+    // terminal because they rode in the truncatable identity.
+    if let Some(mark) = facts.resumed {
+        line = line.status(Status::Retrying, format!("{RESUMED_GLYPH} {}", mark.label()));
+        wrote = true;
+    }
     if let Some((ns, text)) = &facts.state {
         let st = palette_status(*ns);
-        line = line.status(st, format!("{} {}", st.glyph(), printable(text)));
+        line = line.status(st, format!("{}{} {}", space(&mut wrote), st.glyph(), printable(text)));
     }
     if facts.warnings > 0 {
-        let gap = if facts.state.is_some() { " " } else { "" };
         let marker = match facts.warnings {
             1 => "⚠".to_string(),
             n => format!("⚠{n}"),
         };
-        line = line.status(Status::SoftFailed, format!("{gap}{marker}"));
+        line = line.status(Status::SoftFailed, format!("{}{marker}", space(&mut wrote)));
     }
     if let Some(host) = host {
-        let gap = if facts.state.is_some() || facts.warnings > 0 {
-            " "
-        } else {
-            ""
-        };
-        line = line.dim(format!("{gap}@{}", printable(host)));
+        line = line.dim(format!("{}@{}", space(&mut wrote), printable(host)));
+    }
+    // The protected-tail identity (a unit's codename, a fan-out header's
+    // agent): separated by ` · ` from anything already in the tail, else it
+    // sits directly after the leader dots.
+    if let Some(note) = &facts.tail_note {
+        if wrote {
+            line = line.dim(" · ");
+        }
+        line.segments.extend(note.segments.iter().cloned());
     }
     line
 }
@@ -681,6 +706,23 @@ fn paint_rows<'a>(
                     });
                     if expand && facts.selected && nav.depth() != Depth::Run && lists_units {
                         facts.detail = filter_label(nav.filter()).map(|f| format!("filter: {f}"));
+                    }
+                    // A fan-out header's agent is the one identity its unit
+                    // rows don't each repeat, so surface it on the header (the
+                    // #4 gap: the row showed only `<name> for_each … running`),
+                    // pinned in the protected tail so a long label can't clip
+                    // it. A *running* fan's `running` text is redundant with the
+                    // density line's live counts spliced right below, so drop
+                    // it; a terminal state (failed / done) is kept — it rides
+                    // beside the agent in the tail (`… × failed · <agent>`).
+                    if lists_units {
+                        if let Some(agent) = facts.agent.filter(|a| !a.is_empty()) {
+                            facts.tail_note = Some(Line::new().plain(printable(agent)));
+                            facts.agent = None;
+                            if live.map(|s| s.state) == Some(StepState::Running) {
+                                facts.state = None;
+                            }
+                        }
                     }
                     (facts, Role::Head(id))
                 }
@@ -886,7 +928,10 @@ impl Scaffold {
         let facts = Facts {
             selected: marked,
             status: Some(ns),
-            codename: unit.codename.as_deref(),
+            // The codename ties the unit to its firehose line, so pin it in
+            // the protected tail — a long file-path `unit_key` must never clip
+            // it away (the #4 gap: units showed only `<path> ···· done`).
+            tail_note: unit.codename.as_deref().and_then(codename_line),
             provider: unit.provider.as_deref(),
             model: unit.model.as_deref(),
             host: unit.host.as_deref(),
@@ -2887,8 +2932,14 @@ steps:
         assert_eq!(*style_of(mover, "│"), Style::Status(Status::Working));
         assert_eq!(*style_of(mover, "◐"), Style::Status(Status::Working));
         assert_eq!(*style_of(mover, "├─"), Style::Status(Status::Working));
-        assert!(plain(mover).ends_with("···· ◐ running"), "{}", plain(mover));
-        // Identity from the unit; no unit codename → none shown.
+        // The codename is pinned in the protected tail (after the state) so a
+        // clipped label can't drop it; the provider/model stays in the
+        // clippable identity before the leader.
+        assert!(
+            plain(mover).ends_with("···· ◐ running · otter#60"),
+            "{}",
+            plain(mover)
+        );
         assert!(plain(mover).contains("anthropic/claude-opus-5-5"));
         // No per-unit spend exists, so none is invented.
         let s = render_plain(&rows);
@@ -2983,11 +3034,17 @@ steps:
             *style_of(step, "↩ continued"),
             Style::Status(Status::Retrying)
         );
+        // The mark rides in the protected tail now (before the state), so a
+        // clipped label can never drop it — the #5 gap.
         let unit = row(&rows, "svc-0");
         assert!(
-            plain(unit).contains("svc-0  ↩ recovered · "),
+            plain(unit).contains("···· ↩ recovered ✓ done"),
             "{}",
             plain(unit)
+        );
+        assert_eq!(
+            *style_of(unit, "↩ recovered"),
+            Style::Status(Status::Retrying)
         );
         let plain_unit = plain(row(&rows, "svc-1"));
         assert!(!plain_unit.contains('↩'), "{plain_unit}");
@@ -2997,6 +3054,63 @@ steps:
             2,
             "only the two resumed rows:\n{}",
             render_plain(&rows)
+        );
+    }
+
+    /// A fan-out header surfaces the agent its units run (the #4 gap — the row
+    /// used to show only `<name> for_each … running`), pinned in the protected
+    /// tail, and drops the redundant `running` state text: the density line
+    /// spliced right below already carries the live counts + status.
+    #[test]
+    fn a_fan_out_header_shows_its_agent_in_place_of_a_redundant_state() {
+        let wf = scale_wf(0);
+        let mut v = RunView::default();
+        start(
+            &mut v,
+            "hunt",
+            StepKind::ForEach,
+            Some("oracle-assessor-cyber"),
+            None,
+            None,
+        );
+        give_units(&mut v, "hunt", &[UnitStatus::Running, UnitStatus::Done]);
+        let rows = structure_pane(&v, &wf, &NavState::default(), W, 40);
+        let header = plain(row(&rows, "for_each"));
+        assert!(
+            header.contains("oracle-assessor-cyber"),
+            "agent on header: {header}"
+        );
+        // The header's own `running` text is gone (the density line carries it).
+        assert!(
+            !header.contains("running"),
+            "redundant state dropped: {header}"
+        );
+        // The density line still reports the live counts.
+        assert!(
+            render_plain(&rows).contains("1/2"),
+            "{}",
+            render_plain(&rows)
+        );
+
+        // A terminal (failed) fan keeps its outcome AND shows the agent — both
+        // ride in the protected tail (`… × failed · <agent>`).
+        let mut v = RunView::default();
+        start(
+            &mut v,
+            "hunt",
+            StepKind::ForEach,
+            Some("oracle-assessor-cyber"),
+            None,
+            None,
+        );
+        give_units(&mut v, "hunt", &[UnitStatus::Failed, UnitStatus::Done]);
+        v.step_mut("hunt").state = StepState::Failed;
+        let rows = structure_pane(&v, &wf, &NavState::default(), W, 40);
+        let header = plain(row(&rows, "for_each"));
+        assert!(header.contains("✗ failed"), "keeps terminal state: {header}");
+        assert!(
+            header.contains("oracle-assessor-cyber"),
+            "and the agent: {header}"
         );
     }
 

@@ -29,6 +29,43 @@ pub fn format_token_compact(n: u64) -> String {
     }
 }
 
+/// Humanize a token count for the live dashboard header, matching the CP
+/// web's `formatTokens` (crates/rupu-cp/web/src/lib/usage.ts) byte-for-byte
+/// so the terminal and the web read the same: `12.9B` / `55.7M` (one
+/// decimal), `45k` (rounded to whole thousands, lowercase, from 10 000 up),
+/// and comma-grouped verbatim below that (`9,999`, `1,200`, `999`, `0`).
+///
+/// Distinct from [`format_token_compact`] on purpose: that one is the terser
+/// status-line form (`1.2K`, `12M`, no billions); this one is web parity for
+/// the dashboard, where totals reach the billions.
+pub fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}k", (n as f64 / 1_000.0).round() as u64)
+    } else {
+        group_thousands(n)
+    }
+}
+
+/// `1200` → `1,200`; `999` → `999`. Thousands separators for the small-count
+/// tail of [`format_tokens`], matching JS `toLocaleString('en-US')`.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    // Group the decimal digits into threes from the right.
+    for (i, chunk) in digits.as_bytes().rchunks(3).rev().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // `digits` is ASCII decimal, so every chunk is valid UTF-8.
+        out.push_str(std::str::from_utf8(chunk).expect("ascii digits"));
+    }
+    out
+}
+
 /// Format a USD cost as `$3.40` (always two decimals). Used by the
 /// live workflow dashboard's cost meter.
 pub fn format_cost_compact(usd: f64) -> String {
@@ -96,6 +133,24 @@ mod tests {
         assert_eq!(format_token_compact(1_000_000), "1.0M");
         assert_eq!(format_token_compact(1_200_000), "1.2M");
         assert_eq!(format_token_compact(12_000_000), "12M");
+    }
+
+    #[test]
+    fn format_tokens_matches_the_web_formattokens() {
+        // Billions / millions: one decimal, exactly like the web.
+        assert_eq!(format_tokens(12_862_240_481), "12.9B");
+        assert_eq!(format_tokens(55_673_532), "55.7M");
+        assert_eq!(format_tokens(1_000_000_000), "1.0B");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        // 10k and up: rounded to whole thousands, lowercase k.
+        assert_eq!(format_tokens(45_000), "45k");
+        assert_eq!(format_tokens(12_500), "13k");
+        assert_eq!(format_tokens(10_000), "10k");
+        // Below 10k: comma-grouped verbatim.
+        assert_eq!(format_tokens(9_999), "9,999");
+        assert_eq!(format_tokens(1_200), "1,200");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(0), "0");
     }
 
     #[test]

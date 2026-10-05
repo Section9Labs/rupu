@@ -1,5 +1,6 @@
 ---
 source: crates/rupu-cli/src/output/live_view/structure.rs
+assertion_line: 3076
 expression: s
 ---
   ✓  s01  scanner ···· ✓ 1s
@@ -12,8 +13,8 @@ expression: s
   │
 ▸ ├─╭─ ⊞ hunt  for_each · runtime fan-out · filter: failed ···· ◐ running
   │ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26
-▸ │ ✗├─ svc-7  otter#8 · anthropic/claude-opus-5-5 ···· ✗ failed
-  │ ✗├─ svc-31  otter#32 · anthropic/claude-opus-5-5 ···· ✗ failed
+▸ │ ✗├─ svc-7  anthropic/claude-opus-5-5 ···· ✗ failed · otter#8
+  │ ✗├─ svc-31  anthropic/claude-opus-5-5 ···· ✗ failed · otter#32
   │ ◄─╰─
   │
   ✓  probe  prober ···· ✓ 5s

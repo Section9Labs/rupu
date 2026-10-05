@@ -20,6 +20,7 @@
 use chrono::{DateTime, Utc};
 use rupu_orchestrator::runs::RunStatus;
 
+use crate::output::fmt::format_tokens;
 use crate::output::live_view::nav::{NavState, Pane};
 use crate::output::live_view::row::{truncate_to, Line};
 use crate::output::palette::Status;
@@ -122,9 +123,9 @@ fn meter_row(view: &RunView) -> Option<Line> {
 
     if let Some(u) = &view.usage {
         let mut g = Line::new()
-            .meter(format!("⇡{}", u.input_tokens))
+            .meter(format!("⇡{}", format_tokens(u.input_tokens)))
             .plain(" ")
-            .meter(format!("⇣{}", u.output_tokens));
+            .meter(format!("⇣{}", format_tokens(u.output_tokens)));
         // A partial cost total can exist while `priced` is false; never show
         // it as if it were the real spend.
         if let Some(cost) = u.cost_usd.filter(|_| u.priced) {

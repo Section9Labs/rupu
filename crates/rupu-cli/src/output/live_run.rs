@@ -71,6 +71,11 @@ enum KeyAction {
     Approve,
     Reject,
     ToggleDetails,
+    /// Ctrl-L: force a full repaint. A no-op when the screen is intact, but
+    /// the universal recovery key if anything ever leaves the terminal in an
+    /// unknown state (a caught panic's message, a stray write) — lazygit binds
+    /// the same.
+    Redraw,
 }
 
 /// Decode one key press. `gate_focused` is `NavState::focused_gate(..)
@@ -84,10 +89,15 @@ enum KeyAction {
 /// Ctrl-C quit (raw mode turns the tty's SIGINT off, so Ctrl-C arrives as a
 /// key and must be handled here); only `Esc` pauses. A control- or
 /// alt-modified letter is never a plain command — Ctrl-A must not approve a
-/// gate.
+/// gate. The two exceptions are Ctrl-C (quit) and Ctrl-L (force a full
+/// repaint, the universal screen-recovery key).
 fn decode_key(code: KeyCode, mods: KeyModifiers, gate_focused: bool) -> Option<KeyAction> {
     if mods.contains(KeyModifiers::CONTROL) {
-        return (code == KeyCode::Char('c')).then_some(KeyAction::Nav(NavKey::Quit));
+        return match code {
+            KeyCode::Char('c') => Some(KeyAction::Nav(NavKey::Quit)),
+            KeyCode::Char('l') => Some(KeyAction::Redraw),
+            _ => None,
+        };
     }
     if mods.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char(_)) {
         return None;
@@ -243,10 +253,16 @@ impl TranscriptIndex {
 ///   the breadcrumb leaf the title shows.
 /// * `Run` / `Step` depth: the *chosen* step's own transcript — a manual
 ///   selection, or (while following a parked run) its gate. A fan-out step has
-///   no transcript of its own, so the pin is `None` there and the stream waits
-///   until the operator drills into a unit.
+///   no transcript of its own, so the stream auto-follows the step's live
+///   frontier unit ([`StepView::frontier_unit`] — the newest-active unit,
+///   re-resolved every frame as the frontier moves). The stream title names
+///   that same unit ([`panes::selection_label`] resolves the frontier the same
+///   way), so the two stay in lockstep.
 /// * Following at `Run` depth with nothing chosen: `None` — the stream is idle
 ///   and its title is the neutral `run`.
+///
+/// [`StepView::frontier_unit`]: crate::output::run_model::StepView::frontier_unit
+/// [`panes::selection_label`]: crate::output::live_view::panes
 fn pinned_path(view: &RunView, nav: &NavState, index: &TranscriptIndex) -> Option<PathBuf> {
     match nav.depth() {
         Depth::SubAgent => {
@@ -263,7 +279,17 @@ fn pinned_path(view: &RunView, nav: &NavState, index: &TranscriptIndex) -> Optio
         }
         Depth::Run | Depth::Step => {
             let step = nav.chosen_step(view)?;
-            index.steps.get(&step.step_id).cloned()
+            // A leaf step's own transcript, when it has one.
+            if let Some(path) = index.steps.get(&step.step_id) {
+                return Some(path.clone());
+            }
+            // A fan-out step has none of its own — follow its live frontier
+            // unit so the stream shows real activity instead of sitting idle.
+            let unit = step.frontier_unit()?;
+            index
+                .units
+                .get(&(step.step_id.clone(), unit.index))
+                .cloned()
         }
     }
 }
@@ -808,6 +834,9 @@ impl Live {
             KeyAction::Approve => self.decide(GateVerb::Approve),
             KeyAction::Reject => self.decide(GateVerb::Reject),
             KeyAction::ToggleDetails => self.show_details = !self.show_details,
+            // Discard what we believe is on screen and repaint in full next
+            // frame — recovery if anything ever corrupted the terminal.
+            KeyAction::Redraw => self.renderer.invalidate(),
         }
         None
     }
@@ -1125,6 +1154,12 @@ mod tests {
                 decode_key(KeyCode::Char('A'), KeyModifiers::SHIFT, gate),
                 None
             );
+            // Ctrl-L forces a repaint from any focus, gate included.
+            assert_eq!(
+                decode_key(KeyCode::Char('l'), KeyModifiers::CONTROL, gate),
+                Some(KeyAction::Redraw),
+                "ctrl-l gate={gate}"
+            );
         }
     }
 
@@ -1334,11 +1369,16 @@ mod tests {
             dispatch_started("sub1", "/t/sub1.jsonl", "wren#1"),
         ]);
         let mut nav = NavState::default();
-        // Run and Step depth pin nothing: the feed is the firehose.
+        // Run depth while following pins nothing: the firehose carries activity.
         assert_eq!(pinned_path(&view, &nav, &index), None);
         nav.apply(NavKey::In, &view);
         assert_eq!(nav.depth(), Depth::Step);
-        assert_eq!(pinned_path(&view, &nav, &index), None);
+        // Step depth with a fan-out chosen auto-follows its live frontier unit
+        // (newest-active = highest-index running), rather than sitting idle (B).
+        assert_eq!(
+            pinned_path(&view, &nav, &index),
+            Some(PathBuf::from("/t/u1.jsonl"))
+        );
         // Unit depth pins the selected unit...
         nav.apply(NavKey::In, &view);
         assert_eq!(nav.depth(), Depth::Unit);
@@ -1367,9 +1407,19 @@ mod tests {
             pinned_path(&view, &nav, &index),
             Some(PathBuf::from("/t/sub1.jsonl"))
         );
-        // Popping back out unpins.
-        nav.apply(NavKey::Out, &view);
-        nav.apply(NavKey::Out, &view);
+        // Popping back out to Step depth re-follows the fan-out's live frontier
+        // (the newest-active unit), not nothing.
+        nav.apply(NavKey::Out, &view); // SubAgent -> Unit
+        nav.apply(NavKey::Out, &view); // Unit -> Step
+        assert_eq!(nav.depth(), Depth::Step);
+        assert_eq!(
+            pinned_path(&view, &nav, &index),
+            Some(PathBuf::from("/t/u1.jsonl"))
+        );
+        // Returning to following (Run depth, nothing chosen) unpins — the
+        // firehose carries the run.
+        nav.apply(NavKey::Follow, &view);
+        assert_eq!(nav.depth(), Depth::Run);
         assert_eq!(pinned_path(&view, &nav, &index), None);
     }
 

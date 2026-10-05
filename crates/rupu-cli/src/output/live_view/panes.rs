@@ -40,7 +40,7 @@ use rupu_orchestrator::runs::StepKind;
 use rupu_orchestrator::Workflow;
 
 use crate::output::live_view::layout::{dashboard, footer_line, printable};
-use crate::output::live_view::nav::{NavState, Pane};
+use crate::output::live_view::nav::{Depth, NavState, Pane};
 use crate::output::live_view::row::{truncate_to, Line};
 use crate::output::live_view::structure::structure_pane;
 use crate::output::run_model::{RunView, StepState, StepView, UnitStatus};
@@ -205,6 +205,15 @@ pub fn dashboard_frame(
     if plan.footer_h > 0 {
         out.push(footer_line(view, nav, w));
     }
+    // The renderer addresses rows absolutely (`MoveTo(0, i)`); a frame taller
+    // than the terminal would write past the last line and scroll the screen,
+    // desyncing the diff cache. The `Plan` math keeps the total within `h` —
+    // guard it so a future change can never silently reintroduce scroll.
+    debug_assert!(
+        out.len() <= h,
+        "frame of {} rows exceeds terminal height {h}",
+        out.len()
+    );
     out
 }
 
@@ -405,11 +414,34 @@ fn selection_label(view: &RunView, nav: &NavState) -> String {
         .skip(skip)
         .map(|c| printable(&c))
         .collect();
-    if !path.is_empty() {
-        return path.join(" › ");
+    // Drilled into a specific unit / sub-agent: the breadcrumb already names
+    // the leaf.
+    if matches!(nav.depth(), Depth::Unit | Depth::SubAgent) {
+        return if path.is_empty() {
+            "run".to_string()
+        } else {
+            path.join(" › ")
+        };
     }
-    nav.chosen_step(view)
-        .map_or_else(|| "run".to_string(), |s| printable(&s.step_id))
+    // Step / Run depth: name the chosen step, plus — for a fan-out whose live
+    // frontier the stream auto-follows — that unit, so the title matches what
+    // `pinned_path` pins (lockstep).
+    match nav.chosen_step(view) {
+        Some(step) => {
+            let mut label = printable(&step.step_id);
+            if let Some(unit) = step.frontier_unit() {
+                let crumb = unit
+                    .codename
+                    .clone()
+                    .unwrap_or_else(|| unit.unit_key.clone());
+                label.push_str(" › ");
+                label.push_str(&printable(&crumb));
+            }
+            label
+        }
+        None if path.is_empty() => "run".to_string(),
+        None => path.join(" › "),
+    }
 }
 
 /// The running steps that are themselves work. A `loop:` step stays `Running`
@@ -1437,6 +1469,45 @@ steps:
         let mut nav = NavState::default();
         nav.apply(NavKey::Down, &view);
         assert!(title(&nav).contains("─ stream · sweep"), "{}", title(&nav));
+    }
+
+    #[test]
+    fn stream_title_follows_a_fan_out_frontier_unit() {
+        // A for_each with three running units; the newest (highest index) is
+        // the live frontier the stream auto-follows (B).
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            kind: StepKind::ForEach,
+            agent: Some("worker".into()),
+            host: None,
+            codename: None,
+        });
+        for i in 0..3usize {
+            v.apply(&Event::UnitStarted {
+                run_id: "r".into(),
+                step_id: "hunt".into(),
+                index: i,
+                unit_key: format!("svc-{i}"),
+                agent: Some("worker".into()),
+                transcript_path: format!("/t/u{i}.jsonl").into(),
+                host: None,
+                codename: Some(format!("otter#{}", i + 1)),
+            });
+        }
+        let fan = Workflow::parse(FANOUT_WF).expect("parses");
+        // Choose the fan-out step (drill Run → Step; cursor on hunt).
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+        let title = plain(row_with(
+            &dashboard_frame(&v, &fan, &nav, &[], &[], now(), 100, 28),
+            "─ stream",
+        ));
+        // The title names the step AND its live frontier unit, in lockstep with
+        // the stream pin.
+        assert!(title.contains("hunt › otter#3"), "{title}");
     }
 
     #[test]
