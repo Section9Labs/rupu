@@ -1,6 +1,6 @@
 #![cfg(feature = "http")]
 
-use rupu_netflow::{FlowCtx, FlowRecord, FlowSink, MemorySink, Origin};
+use rupu_netflow::{Fidelity, FlowCtx, FlowRecord, FlowSink, MemorySink, Origin};
 use std::sync::Arc;
 
 /// A sink that panics on every call. Drives invariant 1 directly through
@@ -506,4 +506,14 @@ async fn private_clients_each_open_their_own_connection() {
     a.get(&url).send().await.unwrap().text().await.unwrap();
     b.get(&url).send().await.unwrap().text().await.unwrap();
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn socket_fidelity_serializes_snake_case_and_round_trips() {
+    let json = serde_json::to_string(&Fidelity::Socket).unwrap();
+    assert_eq!(json, r#""socket""#);
+    assert_eq!(
+        serde_json::from_str::<Fidelity>(&json).unwrap(),
+        Fidelity::Socket
+    );
 }

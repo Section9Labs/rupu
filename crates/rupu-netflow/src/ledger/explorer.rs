@@ -580,8 +580,9 @@ pub fn timeline_view(
                 .map(|f| f.flow.fidelity)
                 .min_by_key(|f| match f {
                     Fidelity::Coarse => 0u8,
-                    Fidelity::Http => 1,
-                    Fidelity::Full => 2,
+                    Fidelity::Socket => 1,
+                    Fidelity::Http => 2,
+                    Fidelity::Full => 3,
                 })
                 .unwrap_or(Fidelity::Coarse);
             let org_id = org_key_of(acc.attribution.asn.as_ref());

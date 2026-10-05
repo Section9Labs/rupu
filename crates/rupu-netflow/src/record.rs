@@ -17,6 +17,11 @@ pub enum Fidelity {
     /// Host, outcome and timing only — recorded at a connector boundary
     /// whose HTTP stack we do not own (`octocrab`).
     Coarse,
+    /// Connection-level: process, remote IP:port, bytes and timing
+    /// observed from the OS socket table (spec 2026-10-04). No URL,
+    /// method or HTTP status. More observable than `Coarse`, less than
+    /// `Http`.
+    Socket,
     /// Exact request/response metadata from the instrumented client.
     Http,
     /// Frame-level capture from the microVM backend. Not emitted yet.
