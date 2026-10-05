@@ -190,6 +190,27 @@ impl Shared {
         lock(&self.calls).retain(|_, e| e.finished.is_none_or(|at| now - at < linger));
     }
 
+    /// The watcher is stopping for good: tell every live call (spec §13).
+    fn note_unavailable(&self, reason: &str) {
+        let notes: Vec<_> = lock(&self.calls)
+            .values()
+            .filter(|e| e.finished.is_none())
+            .map(|e| (e.sink.clone(), e.tool_call_id.clone()))
+            .collect();
+        for (sink, tool_call_id) in notes {
+            self.queue_state(
+                sink,
+                CaptureStateLine {
+                    state: CaptureState::Unavailable {
+                        reason: reason.to_string(),
+                    },
+                    tool_call_id: Some(tool_call_id),
+                    note: None,
+                },
+            );
+        }
+    }
+
     /// Write one visible-loss note per live call (spec §13).
     fn note_loss(&self) {
         let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -263,6 +284,8 @@ struct Tracked {
 struct Local {
     socks: HashMap<u64, Tracked>,
     ticks: u32,
+    /// Consecutive non-timeout receive errors.
+    recv_errors: u32,
 }
 
 fn run(shared: Arc<Shared>, sock: NstatSocket, rt: tokio::runtime::Runtime) {
@@ -274,12 +297,17 @@ fn run(shared: Arc<Shared>, sock: NstatSocket, rt: tokio::runtime::Runtime) {
         // One bad iteration (a parse or tracker panic) must not kill the
         // watcher: log it and run the next cycle.
         let cycle = catch_unwind(AssertUnwindSafe(|| {
-            drain(&shared, &sock, &mut buf, &mut local);
+            let alive = drain(&shared, &sock, &mut buf, &mut local);
             housekeeping(&shared, &sock, &mut local);
             shared.flush(&rt);
+            alive
         }));
-        if cycle.is_err() {
-            tracing::error!("netwatch: the watcher cycle panicked; continuing");
+        match cycle {
+            Ok(true) => {}
+            // The socket is persistently broken: exit, so `begin` sees a
+            // finished thread and degrades to inert.
+            Ok(false) => break,
+            Err(_) => tracing::error!("netwatch: the watcher cycle panicked; continuing"),
         }
         // Pacing normally comes from the receive timeout; a persistent
         // immediate error must not turn this into a hot loop.
@@ -309,31 +337,87 @@ fn messages(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
-/// Receive datagrams for up to one tick and act on every message.
-fn drain(shared: &Shared, sock: &NstatSocket, buf: &mut [u8], local: &mut Local) {
+/// Consecutive non-timeout receive errors after which the watcher gives up.
+const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 10;
+/// A persistent receive error is logged on its first occurrence and then
+/// once per this many.
+const RECV_ERROR_LOG_EVERY: u32 = 10;
+
+/// What a failed receive means for the watcher.
+#[derive(Debug, PartialEq, Eq)]
+enum RecvFailure {
+    /// The tick timeout: no data this tick.
+    Quiet,
+    /// A signal interrupted the call: try again.
+    Retry,
+    /// The kernel dropped events (`ENOBUFS`).
+    Overflow,
+    /// Anything else (`ENOTCONN`, `EBADF`, `ECONNRESET`, ...).
+    Broken,
+}
+
+fn classify_recv_error(e: &io::Error) -> RecvFailure {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => RecvFailure::Quiet,
+        io::ErrorKind::Interrupted => RecvFailure::Retry,
+        _ if e.raw_os_error() == Some(nix::errno::Errno::ENOBUFS as i32) => RecvFailure::Overflow,
+        _ => RecvFailure::Broken,
+    }
+}
+
+/// Receive datagrams for up to one tick and act on every message. Returns
+/// `false` when the socket is persistently broken and the watcher must stop
+/// (every live call has then been told capture is unavailable).
+fn drain(shared: &Shared, sock: &NstatSocket, buf: &mut [u8], local: &mut Local) -> bool {
     let deadline = Instant::now() + TICK;
     loop {
         match sock.recv_into(buf) {
             Ok(0) => break,
             Ok(n) => {
+                local.recv_errors = 0;
                 for msg in messages(&buf[..n]) {
                     handle(shared, sock, local, parse_message(msg));
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ENOBUFS as i32) => {
-                // The kernel overflowed our receive buffer: events were
-                // lost. Say so, and keep going.
-                shared.note_loss();
-            }
-            // WouldBlock (the tick timeout) or a real error: nothing more
-            // this cycle.
-            Err(_) => break,
+            Err(e) => match classify_recv_error(&e) {
+                RecvFailure::Retry => {}
+                RecvFailure::Quiet => {
+                    // A full tick passed without data.
+                    local.recv_errors = 0;
+                    break;
+                }
+                RecvFailure::Overflow => {
+                    // The kernel overflowed our receive buffer: events were
+                    // lost. Say so, and keep going.
+                    local.recv_errors = 0;
+                    shared.note_loss();
+                }
+                RecvFailure::Broken => {
+                    local.recv_errors += 1;
+                    if local.recv_errors % RECV_ERROR_LOG_EVERY == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            consecutive = local.recv_errors,
+                            "netwatch: ntstat receive failed"
+                        );
+                    }
+                    if local.recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        tracing::error!(error = %e, "netwatch: ntstat socket is broken; stopping");
+                        shared.note_unavailable(&format!(
+                            "the network-statistics socket failed ({e})"
+                        ));
+                        return false;
+                    }
+                    // Back to the cycle's pacing; do not spin on the error.
+                    break;
+                }
+            },
         }
         if Instant::now() >= deadline {
             break;
         }
     }
+    true
 }
 
 fn handle(shared: &Shared, sock: &NstatSocket, local: &mut Local, msg: NstatMsg) {
@@ -398,12 +482,11 @@ fn on_desc(shared: &Shared, local: &mut Local, obs: NstatObservation) {
     if obs.transport == Transport::Tcp && obs.state == TCPS_LISTEN {
         return;
     }
-    let (bytes_in, bytes_out) = local
-        .socks
-        .get(&obs.srcref)
-        .map_or((obs.bytes_in, obs.bytes_out), |t| {
-            (t.snap.bytes_in, t.snap.bytes_out)
-        });
+    // Counters from a `SRC_COUNTS` are kept; a descriptor's own (none today)
+    // only fills a gap.
+    let cached = local.socks.get(&obs.srcref);
+    let bytes_in = cached.and_then(|t| t.snap.bytes_in).or(obs.bytes_in);
+    let bytes_out = cached.and_then(|t| t.snap.bytes_out).or(obs.bytes_out);
     let snap = SocketSnapshot {
         transport: obs.transport,
         local: obs.local,
@@ -439,8 +522,14 @@ fn housekeeping(shared: &Shared, sock: &NstatSocket, local: &mut Local) {
     for (srcref, t) in &local.socks {
         // State changes are not pushed to us: poll a TCP socket every tick
         // until ESTABLISHED (a short connection may be gone within a few
-        // ticks), and a not-yet-connected UDP socket at the slower pace.
-        if !t.snap.established && (t.snap.transport == Transport::Tcp || slow) {
+        // ticks), and a not-yet-connected UDP socket at the slower pace. A
+        // connected UDP socket (a remote, though never "established") has
+        // already been reported: no more polling.
+        let poll = match t.snap.transport {
+            Transport::Tcp => !t.snap.established,
+            Transport::Udp => slow && t.snap.remote.is_none(),
+        };
+        if poll {
             request(sock.request_description(*srcref), "description");
         }
         if slow {
@@ -491,5 +580,269 @@ mod tests {
         // Too short for a header.
         assert_eq!(messages(&[0u8; 8]).count(), 0);
         assert_eq!(messages(&[]).count(), 0);
+    }
+
+    // ---- attribution and reaping ------------------------------------
+
+    use crate::tracker::CallInfo;
+    use rupu_netflow::{CallAttribution, MemorySink};
+
+    fn register(shared: &Shared, seq: CallId, shell: u32, run: &str) -> Arc<MemorySink> {
+        let sink = Arc::new(MemorySink::default());
+        lock(&shared.calls).insert(
+            seq,
+            CallEntry {
+                shell,
+                run_id: run.to_string(),
+                tool_call_id: format!("call-{seq}"),
+                sink: sink.clone(),
+                finished: None,
+                loss_noted: false,
+            },
+        );
+        lock(&shared.tracker).register_call(
+            seq,
+            CallInfo {
+                owner: shell as u64,
+                attribution: CallAttribution {
+                    run_id: run.to_string(),
+                    step_id: None,
+                    agent: None,
+                    codename: None,
+                    tool_call_id: format!("call-{seq}"),
+                    sink: sink.clone(),
+                },
+            },
+            Utc::now(),
+        );
+        sink
+    }
+
+    fn obs(
+        srcref: u64,
+        transport: Transport,
+        pid: u32,
+        state: u32,
+        remote: bool,
+    ) -> NstatObservation {
+        NstatObservation {
+            srcref,
+            transport,
+            pid,
+            pname: "tester".to_string(),
+            local: Some("10.0.0.2:50000".parse().unwrap()),
+            remote: remote.then(|| "93.184.216.34:80".parse().unwrap()),
+            state,
+            established: transport == Transport::Tcp && state == 4,
+            bytes_in: None,
+            bytes_out: None,
+        }
+    }
+
+    fn queued(shared: &Shared) -> usize {
+        lock(&shared.pending).len()
+    }
+
+    #[test]
+    fn on_desc_observes_a_socket_owned_by_the_shell_itself() {
+        let shared = Shared::new(chrono::Duration::seconds(3));
+        register(&shared, 1, std::process::id(), "run");
+        let mut local = Local::default();
+        on_desc(
+            &shared,
+            &mut local,
+            obs(10, Transport::Tcp, std::process::id(), 4, true),
+        );
+        assert_eq!(queued(&shared), 1, "a Flow is emitted");
+        assert!(local.socks.contains_key(&10));
+    }
+
+    #[test]
+    fn on_desc_resolves_a_descendant_through_real_ancestry() {
+        // This process descends from its parent, registered as the shell.
+        let shared = Shared::new(chrono::Duration::seconds(3));
+        let parent = std::os::unix::process::parent_id();
+        register(&shared, 1, parent, "run");
+        let mut local = Local::default();
+        on_desc(
+            &shared,
+            &mut local,
+            obs(11, Transport::Tcp, std::process::id(), 4, true),
+        );
+        assert_eq!(queued(&shared), 1);
+        assert_eq!(local.socks[&11].shell, parent);
+    }
+
+    #[test]
+    fn on_desc_ignores_listeners_and_unattributed_pids() {
+        let shared = Shared::new(chrono::Duration::seconds(3));
+        register(&shared, 1, std::process::id(), "run");
+        let mut local = Local::default();
+        // A listener (LISTEN, no remote) is not a connection.
+        on_desc(
+            &shared,
+            &mut local,
+            obs(20, Transport::Tcp, std::process::id(), 1, false),
+        );
+        assert_eq!(queued(&shared), 0);
+        assert!(local.socks.is_empty());
+        // A pid that descends from no registered shell.
+        let other = Shared::new(chrono::Duration::seconds(3));
+        register(&other, 1, u32::MAX >> 1, "run");
+        on_desc(
+            &other,
+            &mut local,
+            obs(21, Transport::Tcp, std::process::id(), 4, true),
+        );
+        assert_eq!(queued(&other), 0);
+        assert!(local.socks.is_empty());
+        // No registered shell at all.
+        let none = Shared::new(chrono::Duration::seconds(3));
+        on_desc(
+            &none,
+            &mut local,
+            obs(22, Transport::Tcp, std::process::id(), 4, true),
+        );
+        assert_eq!(queued(&none), 0);
+        assert!(local.socks.is_empty());
+    }
+
+    #[test]
+    fn on_desc_tracks_an_unconnected_socket_but_reports_it_only_once_connected() {
+        let shared = Shared::new(chrono::Duration::seconds(3));
+        register(&shared, 1, std::process::id(), "run");
+        let mut local = Local::default();
+        on_desc(
+            &shared,
+            &mut local,
+            obs(30, Transport::Tcp, std::process::id(), 0, false),
+        );
+        assert_eq!(queued(&shared), 0, "no remote yet: nothing to report");
+        assert!(local.socks.contains_key(&30), "kept for polling");
+        on_desc(
+            &shared,
+            &mut local,
+            obs(30, Transport::Tcp, std::process::id(), 4, true),
+        );
+        assert_eq!(queued(&shared), 1);
+    }
+
+    #[test]
+    fn on_desc_keeps_cached_counters() {
+        let shared = Shared::new(chrono::Duration::seconds(3));
+        register(&shared, 1, std::process::id(), "run");
+        let mut local = Local::default();
+        on_desc(
+            &shared,
+            &mut local,
+            obs(40, Transport::Tcp, std::process::id(), 4, true),
+        );
+        let t = local.socks.get_mut(&40).unwrap();
+        t.snap.bytes_in = Some(7);
+        t.snap.bytes_out = Some(9);
+        on_desc(
+            &shared,
+            &mut local,
+            obs(40, Transport::Tcp, std::process::id(), 4, true),
+        );
+        assert_eq!(local.socks[&40].snap.bytes_in, Some(7));
+        assert_eq!(local.socks[&40].snap.bytes_out, Some(9));
+        // A descriptor's own counters fill a gap.
+        let mut o = obs(41, Transport::Tcp, std::process::id(), 4, true);
+        o.bytes_in = Some(3);
+        on_desc(&shared, &mut local, o);
+        assert_eq!(local.socks[&41].snap.bytes_in, Some(3));
+    }
+
+    #[test]
+    fn a_finished_call_is_reaped_after_the_linger_and_its_pid_stops_attributing() {
+        let linger = chrono::Duration::seconds(3);
+        let shared = Shared::new(linger);
+        let me = std::process::id();
+        register(&shared, 1, me, "run");
+        let t0 = Utc::now();
+        lock(&shared.tracker).finish_call(1, t0);
+        lock(&shared.calls).get_mut(&1).unwrap().finished = Some(t0);
+
+        shared.reap_calls(t0 + chrono::Duration::seconds(2));
+        assert!(shared.shells().contains(&me), "still lingering");
+        shared.reap_calls(t0 + linger);
+        assert!(lock(&shared.calls).is_empty(), "entry reaped");
+        assert!(shared.shells().is_empty(), "shell unregistered");
+
+        // A recycled pid no longer attributes to the finished call.
+        let mut local = Local::default();
+        on_desc(&shared, &mut local, obs(50, Transport::Tcp, me, 4, true));
+        assert_eq!(queued(&shared), 0);
+        assert!(local.socks.is_empty());
+    }
+
+    #[test]
+    fn release_run_makes_only_that_runs_calls_due() {
+        let linger = chrono::Duration::seconds(3);
+        let shared = Shared::new(linger);
+        register(&shared, 1, 4001, "run-a");
+        register(&shared, 2, 4002, "run-b");
+        lock(&shared.announced).insert("run-a".to_string());
+        let now = Utc::now();
+        shared.release_run("run-a", now);
+        assert!(!lock(&shared.announced).contains("run-a"));
+        shared.reap_calls(now);
+        assert_eq!(shared.shells(), HashSet::from([4002]));
+    }
+
+    #[test]
+    fn recv_errors_are_classified() {
+        use io::ErrorKind::*;
+        assert_eq!(
+            classify_recv_error(&io::Error::from(WouldBlock)),
+            RecvFailure::Quiet
+        );
+        assert_eq!(
+            classify_recv_error(&io::Error::from(TimedOut)),
+            RecvFailure::Quiet
+        );
+        assert_eq!(
+            classify_recv_error(&io::Error::from(Interrupted)),
+            RecvFailure::Retry
+        );
+        assert_eq!(
+            classify_recv_error(&io::Error::from_raw_os_error(
+                nix::errno::Errno::ENOBUFS as i32
+            )),
+            RecvFailure::Overflow
+        );
+        for errno in [
+            nix::errno::Errno::ENOTCONN,
+            nix::errno::Errno::EBADF,
+            nix::errno::Errno::ECONNRESET,
+        ] {
+            assert_eq!(
+                classify_recv_error(&io::Error::from_raw_os_error(errno as i32)),
+                RecvFailure::Broken,
+                "{errno}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_unavailable_reaches_only_live_calls() {
+        let shared = Shared::new(chrono::Duration::seconds(3));
+        register(&shared, 1, 5001, "run");
+        register(&shared, 2, 5002, "run");
+        lock(&shared.calls).get_mut(&2).unwrap().finished = Some(Utc::now());
+        shared.note_unavailable("boom");
+        let pending = lock(&shared.pending);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            Pending::State(
+                _,
+                CaptureStateLine {
+                    state: CaptureState::Unavailable { .. },
+                    ..
+                }
+            )
+        ));
     }
 }

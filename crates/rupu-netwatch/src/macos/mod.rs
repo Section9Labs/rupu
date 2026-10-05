@@ -154,6 +154,10 @@ mod capture {
                 return;
             };
             let now = Utc::now();
+            // Acceptable by design: a `SRC_DESC` that arrives before this
+            // call (a sub-millisecond window after the fork) finds no
+            // registered shell and is dropped as unattributed. Not a leak;
+            // nothing is retained for it.
             // Entry first, so the watcher never sees the call in the
             // tracker without its shell in the registered set.
             lock(&self.shared.calls).insert(
