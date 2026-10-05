@@ -4502,9 +4502,11 @@ dependencies = [
 name = "rupu-agentiflow"
 version = "0.82.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "rupu-agent",
  "rupu-coverage",
+ "rupu-fleet",
  "rupu-providers",
  "rupu-runtime",
  "rupu-tools",

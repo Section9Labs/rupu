@@ -12,6 +12,7 @@ mod goal;
 mod lead;
 mod operator;
 mod run;
+mod tools;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
@@ -31,3 +32,4 @@ pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
+pub use tools::{fleet_tools, FleetToolCtx};
