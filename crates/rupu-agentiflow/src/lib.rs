@@ -7,6 +7,7 @@ mod budget;
 mod coverage;
 mod def;
 mod error;
+mod goal;
 
 pub use budget::Budget;
 pub use coverage::CoverageTarget;
@@ -15,3 +16,4 @@ pub use def::{
     ScopeRoot,
 };
 pub use error::AgentiflowError;
+pub use goal::{GoalEvaluator, GoalOutcome};
