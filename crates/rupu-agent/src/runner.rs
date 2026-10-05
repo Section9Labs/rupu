@@ -762,6 +762,40 @@ fn terminated(
     }
 }
 
+/// The index of the reply's last server-side `Fallback` block. Every
+/// `ToolUse` and `Reasoning` block before it belongs to the model the API
+/// swapped out mid-output: the API passes only the partial's text on to the
+/// fallback model, so those blocks are abandoned (spec 2026-10-01 §4.5).
+fn fallback_boundary(content: &[ContentBlock]) -> Option<usize> {
+    content
+        .iter()
+        .rposition(|b| matches!(b, ContentBlock::Fallback { .. }))
+}
+
+/// Whether `content[i]` is abandoned at the reply's mid-output fallback
+/// ([`fallback_boundary`]): never dispatched, never in the conversation.
+/// Text stays — it is the fallback model's continuation context.
+fn is_abandoned(boundary: Option<usize>, i: usize, block: &ContentBlock) -> bool {
+    boundary.is_some_and(|b| i < b)
+        && matches!(
+            block,
+            ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. }
+        )
+}
+
+/// The reply's content as it joins the conversation: every block but the
+/// abandoned ones, in order. Replay rebuilds exactly this from the events
+/// [`emit_turn_content`] writes.
+fn conversation_content(content: &[ContentBlock]) -> Vec<ContentBlock> {
+    let boundary = fallback_boundary(content);
+    content
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| !is_abandoned(boundary, *i, b))
+        .map(|(_, b)| b.clone())
+        .collect()
+}
+
 /// An `AssistantBlock` transcript event carrying `block`'s own
 /// `ContentBlock` JSON (spec 2026-10-01 §7.1).
 fn assistant_block_event(block: &ContentBlock, abandoned: bool) -> Event {
@@ -779,12 +813,22 @@ fn assistant_block_event(block: &ContentBlock, abandoned: bool) -> Event {
 /// produced them (spec §3 emission-order contract; Anthropic requires a
 /// `fallback` echoed where it appeared), and return the tool calls to
 /// dispatch, as `(call_id, tool, input)`.
+///
+/// A `tool_use` or reasoning block before the reply's last `fallback` is
+/// abandoned ([`is_abandoned`]): it is written as `AssistantBlock {
+/// abandoned: true }` so the reply is shown whole, and is neither returned
+/// for dispatch nor (see [`conversation_content`]) kept in the conversation.
 fn emit_turn_content(
     writer: &mut JsonlWriter,
     content: &[ContentBlock],
 ) -> Result<Vec<(String, String, serde_json::Value)>, RunError> {
     let mut tool_uses = Vec::new();
-    for block in content {
+    let boundary = fallback_boundary(content);
+    for (i, block) in content.iter().enumerate() {
+        if is_abandoned(boundary, i, block) {
+            writer.write(&assistant_block_event(block, true))?;
+            continue;
+        }
         match block {
             ContentBlock::Text { text } => {
                 writer.write(&Event::AssistantMessage {
@@ -2892,15 +2936,18 @@ async fn run_agent_inner(
             // construct a multi-block assistant message manually. A reply
             // with no content is not appended (replay folds none either);
             // after a `pause_turn` the content joins the paused message.
+            // Blocks abandoned at a mid-output server-side fallback are left
+            // out ([`conversation_content`]), as replay leaves them out.
             if !empty_reply {
-                if !resp.content.is_empty() {
+                let kept = conversation_content(&resp.content);
+                if !kept.is_empty() {
                     match messages.last_mut() {
                         Some(last) if merge_next_assistant && last.role == Role::Assistant => {
-                            last.content.extend(resp.content.iter().cloned());
+                            last.content.extend(kept);
                         }
                         _ => messages.push(Message {
                             role: Role::Assistant,
-                            content: resp.content.clone(),
+                            content: kept,
                         }),
                     }
                 }

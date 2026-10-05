@@ -210,6 +210,11 @@ reply in one request.
   reply's `fallback` boundary is written in place as an `assistant_block`
   event, and replay puts it back where it was: Anthropic requires it echoed in
   that position on the next request.
+- **Declined mid-output:** when the requested model stops part way through its
+  reply, the API passes only the partial's text on to the fallback model. Tool
+  calls and reasoning from before the boundary are abandoned: rupu never runs
+  those tool calls and leaves them out of the conversation. They are still
+  written to the transcript, as `assistant_block` events marked `abandoned`.
 
 ### Turning it off
 
@@ -323,9 +328,10 @@ and `data` are preserved when a transcript is copied or re-written; other
 top-level keys on that line are not.
 
 A reply block that has no event of its own prints as a `block` row:
-`served by fallback · <from> → <to>` for a server-side fallback boundary and
+`served by fallback · <from> → <to>` for a server-side fallback boundary,
 `unrecognized block · <type>` followed by the provider's raw JSON (cut at 240
-columns) for a block rupu does not model. A block marked `abandoned` says so.
+columns) for a block rupu does not model, and `abandoned · …` for a tool call or
+reasoning block abandoned at a mid-output fallback.
 
 **Control plane.** The transcript view shows an outcome as a block with a
 severity-colored edge, its title and its detail, and a recovery as a one-line

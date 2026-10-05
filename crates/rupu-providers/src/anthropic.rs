@@ -211,7 +211,10 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
         }
         // Echo rule (spec section 4.5): reasoning and tool calls from before
         // the last fallback belong to the model that was swapped out; only the
-        // blocks from the fallback on are valid to echo. Text stays.
+        // blocks from the fallback on are valid to echo. Text stays. The agent
+        // runner already leaves those blocks out of the conversation (and
+        // never dispatches the abandoned calls), so this is a defensive no-op
+        // for any caller that kept them.
         let last_fallback = restored
             .iter()
             .rposition(|b| b.get("type").and_then(|v| v.as_str()) == Some("fallback"));

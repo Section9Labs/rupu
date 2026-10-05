@@ -1870,7 +1870,8 @@ async fn a_terminating_provider_error_aborts_without_the_ladder() {
 }
 
 // ---------------------------------------------------------------------------
-// Blocks with no event of their own (spec 2026-10-01 §4.5, §5.4, §7.1).
+// Blocks with no event of their own, and the mid-output fallback boundary
+// (spec 2026-10-01 §4.5, §5.4, §7.1).
 // ---------------------------------------------------------------------------
 
 fn fallback_block() -> ContentBlock {
@@ -1901,6 +1902,108 @@ fn assistant_blocks(events: &[Event]) -> Vec<(serde_json::Value, bool)> {
             _ => None,
         })
         .collect()
+}
+
+/// A mid-output server-side fallback: the tool call before the boundary
+/// belongs to the swapped-out model. It is not dispatched, the next request
+/// carries no `tool_result` for it, and the transcript keeps it as an
+/// abandoned `assistant_block`. The call after the boundary runs.
+#[tokio::test]
+async fn a_tool_call_before_a_mid_output_fallback_is_abandoned() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "the notes").unwrap();
+    let provider = CapturingMockProvider::new(vec![
+        ScriptedTurn::Reply {
+            content: vec![
+                text("Let me check the notes."),
+                ContentBlock::ToolUse {
+                    id: "abandoned_1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "out.txt", "content": "x" }),
+                },
+                fallback_block(),
+                text("Reading them now."),
+                ContentBlock::ToolUse {
+                    id: "kept_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "notes.txt" }),
+                },
+            ],
+            stop: served_by_stop(StopReason::ToolUse),
+            usage: Usage::default(),
+        },
+        reply(StopReason::EndTurn, vec![text("done")]),
+    ]);
+    let captured = provider.captured.clone();
+    let transcript = tmp.path().join("run.jsonl");
+    let opts = build_opts(Box::new(provider), &tmp, transcript.clone());
+    let result = run_agent(opts).await.expect("the loop completes");
+    assert_eq!(result.status, RunStatus::Ok);
+    let events = read_events(&transcript);
+
+    assert!(
+        !tmp.path().join("out.txt").exists(),
+        "the abandoned write_file never ran"
+    );
+    let called: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ToolCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(called, vec!["kept_1"]);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ToolResult { call_id, .. } if call_id == "abandoned_1")));
+
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let mentions_abandoned = requests[1].messages.iter().any(|m| {
+        m.content.iter().any(|b| match b {
+            ContentBlock::ToolUse { id, .. } => id == "abandoned_1",
+            ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id == "abandoned_1",
+            _ => false,
+        })
+    });
+    assert!(
+        !mentions_abandoned,
+        "no tool_use or tool_result for the abandoned call"
+    );
+    let assistant = requests[1]
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("the reply is in the next request");
+    assert_eq!(
+        assistant.content,
+        vec![
+            text("Let me check the notes."),
+            fallback_block(),
+            text("Reading them now."),
+            ContentBlock::ToolUse {
+                id: "kept_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": "notes.txt" }),
+            },
+        ],
+        "text before the boundary stays; the fallback is echoed in place"
+    );
+
+    let blocks = assistant_blocks(&events);
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert_eq!(blocks[0].0["type"], "tool_use");
+    assert_eq!(blocks[0].0["id"], "abandoned_1");
+    assert!(blocks[0].1, "the pre-boundary call is abandoned");
+    assert_eq!(blocks[1].0["type"], "fallback");
+    assert!(!blocks[1].1);
+
+    let rebuilt = rupu_agent::replay::reconstruct_messages(&events).expect("replay");
+    assert_eq!(
+        serde_json::to_value(&rebuilt).unwrap(),
+        serde_json::to_value(&result.final_messages).unwrap(),
+        "replay must rebuild exactly what the runner sent"
+    );
 }
 
 /// A turn a server-side fallback served from the start carries a leading
