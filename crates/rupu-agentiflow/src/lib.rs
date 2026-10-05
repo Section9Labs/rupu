@@ -6,15 +6,20 @@
 mod budget;
 mod coverage;
 mod def;
+mod envelope;
 mod error;
 mod goal;
 mod operator;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
-pub use coverage::{CoverageEvaluator, CoverageOutcome, CoverageTarget};
+pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
     ScopeRoot,
+};
+pub use envelope::{
+    Digest, Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome,
+    StopReason,
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
