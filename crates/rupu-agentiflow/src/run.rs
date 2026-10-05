@@ -561,13 +561,18 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             record.goals = goals;
             record.ended_at = Some(ended);
             if let Err(e) = record.write(&run_dir) {
+                // The run genuinely finished: its outcome is returned below and
+                // the `run_stopped` event is already on disk. Only this summary
+                // record could not be rewritten, so it may still read `running`
+                // until the orphan sweep reconciles it — don't turn a completed
+                // run into an error.
                 tracing::error!(
                     id = %id,
                     stop = %outcome.stop,
                     error = %e,
-                    "agentiflow reached a stop but its final record could not be written"
+                    "agentiflow reached a stop but its final record could not be rewritten; \
+                     returning the outcome anyway (record may remain `running` on disk)"
                 );
-                return Err(AgentiflowError::Io(e));
             }
             Ok(outcome)
         })
