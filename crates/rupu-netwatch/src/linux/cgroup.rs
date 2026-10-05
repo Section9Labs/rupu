@@ -142,6 +142,10 @@ mod fsops {
         /// [`shutdown`](CaptureRoot::shutdown); `None` (Scope mode) leaves
         /// teardown to systemd, which reaps the transient scope.
         parent: Option<PathBuf>,
+        /// This `setup_root` call created the root. A root adopted through
+        /// [`owned_root`](super::owned_root) belongs to whoever created it
+        /// and is never torn down by [`shutdown`](CaptureRoot::shutdown).
+        created: bool,
     }
 
     /// The cgroup of one tool call.
@@ -183,7 +187,7 @@ mod fsops {
         /// is a no-op (systemd reaps the scope). Best-effort: every error is
         /// ignored, and a cgroup that still holds a process stays behind.
         pub fn shutdown(&self) {
-            let Some(parent) = &self.parent else {
+            let Some(parent) = self.parent.as_ref().filter(|_| self.created) else {
                 return;
             };
             if fs::write(parent.join("cgroup.procs"), b"0").is_err() {
@@ -394,6 +398,7 @@ mod fsops {
                     root.parent().map(Path::to_path_buf)
                 },
                 root,
+                created: false,
             });
         }
         let dir = cgroup_dir(&own);
@@ -428,6 +433,7 @@ mod fsops {
         Ok(CaptureRoot {
             root,
             parent: created_here.then_some(dir),
+            created: created_here,
         })
     }
 

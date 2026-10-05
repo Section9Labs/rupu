@@ -34,12 +34,18 @@ mod capture {
     use crate::tracker::CallInfo;
     use crate::types::CallId;
 
+    /// Call-cgroup numbering, process-global: several instances (tests) can
+    /// then share one reused root without colliding on `call-<seq>`.
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+
     /// The Linux backend: one cgroup per bash call, attributed to sockets by
-    /// a `sock_diag` watcher thread feeding the pure tracker.
+    /// a `sock_diag` watcher thread feeding the pure tracker. It is meant to
+    /// be a process singleton (`net_capture::shared` memoizes it); root
+    /// reuse and the `created` guard only make several instances, as in
+    /// tests, safe.
     pub struct LinuxCapture {
         shared: Arc<Shared>,
         root: Arc<CaptureRoot>,
-        seq: AtomicU64,
         thread: Option<JoinHandle<()>>,
     }
 
@@ -92,7 +98,6 @@ mod capture {
             Ok(Self {
                 shared,
                 root: Arc::new(root),
-                seq: AtomicU64::new(1),
                 thread: Some(thread),
             })
         }
@@ -100,7 +105,26 @@ mod capture {
 
     impl SubprocessCapture for LinuxCapture {
         fn begin(&self, call: CallAttribution) -> Box<dyn CaptureCall> {
-            let seq: CallId = self.seq.fetch_add(1, Ordering::SeqCst);
+            if self.thread.as_ref().is_some_and(|t| t.is_finished()) {
+                // The watcher died: nothing would tick or reap new calls.
+                // Degrade visibly (once per run) and stay inert.
+                tracing::error!("netwatch: the watcher thread is not running");
+                if lock(&self.shared.announced).insert(format!("dead:{}", call.run_id)) {
+                    self.shared.queue_state(
+                        call.sink.clone(),
+                        CaptureStateLine {
+                            state: CaptureState::Unavailable {
+                                reason: "the subprocess capture watcher stopped".to_string(),
+                            },
+                            tool_call_id: Some(call.tool_call_id.clone()),
+                            note: None,
+                        },
+                    );
+                    self.shared.flush_blocking();
+                }
+                return NoopCapture.begin(call);
+            }
+            let seq: CallId = SEQ.fetch_add(1, Ordering::SeqCst);
             let cg = match self.root.create_call(seq) {
                 Ok(cg) => cg,
                 Err(e) => {
@@ -150,9 +174,9 @@ mod capture {
         }
 
         fn run_finished(&self, run_id: &str) {
-            let emissions = lock(&self.shared.tracker).finish_run(run_id, Utc::now());
+            self.shared.track(|t| t.finish_run(run_id, Utc::now()));
             self.shared.release_run(run_id, Utc::now());
-            self.shared.flush_blocking(emissions);
+            self.shared.flush_blocking();
         }
     }
 

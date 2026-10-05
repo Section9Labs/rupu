@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -120,6 +121,15 @@ impl Shared {
         }
     }
 
+    /// Run `f` on the tracker and queue what it returns WHILE the tracker
+    /// guard is still held, so queue order is tracker order: a `Complete`
+    /// can never be queued ahead of its `Flow`.
+    pub fn track(&self, f: impl FnOnce(&mut Tracker) -> Vec<Emission>) {
+        let mut tracker = lock(&self.tracker);
+        let emissions = f(&mut tracker);
+        self.queue_emissions(emissions);
+    }
+
     pub fn queue_emissions(&self, emissions: Vec<Emission>) {
         if emissions.is_empty() {
             return;
@@ -141,15 +151,13 @@ impl Shared {
         deliver(rt, self.take_pending());
     }
 
-    /// Queue `emissions` behind whatever is already queued and deliver the
-    /// lot now, on the CALLING thread. Used by `run_finished`, which must not
+    /// Deliver everything already queued (see [`track`](Self::track)), on the CALLING thread. Used by `run_finished`, which must not
     /// return before a run's last flows are written (the process may exit
     /// right after). The write runs on a scoped helper thread with its own
     /// transient runtime, so it is safe from inside or outside an async
     /// context.
-    pub fn flush_blocking(&self, emissions: Vec<Emission>) {
+    pub fn flush_blocking(&self) {
         let _g = lock(&self.deliver_lock);
-        self.queue_emissions(emissions);
         let items = self.take_pending();
         if items.is_empty() {
             return;
@@ -179,7 +187,11 @@ impl Shared {
                 e.finished = Some(due);
             }
         }
-        lock(&self.announced).remove(run_id);
+        {
+            let mut announced = lock(&self.announced);
+            announced.remove(run_id);
+            announced.remove(&format!("dead:{run_id}"));
+        }
     }
 
     /// Remove the cgroups of calls finished at least `linger` ago. A cgroup
@@ -252,15 +264,22 @@ impl Shared {
 /// Write queued items to their sinks.
 fn deliver(rt: &tokio::runtime::Runtime, items: Vec<Pending>) {
     for item in items {
-        rt.block_on(async move {
-            match item {
-                Pending::Emission(Emission { sink, emit }) => match emit {
-                    Emit::Flow(f) => sink.record(*f).await,
-                    Emit::Complete(c) => sink.complete_socket(c).await,
-                },
-                Pending::State(sink, line) => sink.capture_state(line).await,
-            }
-        });
+        // A panicking sink must not take the delivery loop (or the watcher
+        // thread) down with it: log it and carry on with the next item.
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            rt.block_on(async move {
+                match item {
+                    Pending::Emission(Emission { sink, emit }) => match emit {
+                        Emit::Flow(f) => sink.record(*f).await,
+                        Emit::Complete(c) => sink.complete_socket(c).await,
+                    },
+                    Pending::State(sink, line) => sink.capture_state(line).await,
+                }
+            });
+        }));
+        if outcome.is_err() {
+            tracing::error!("netwatch: a flow sink panicked; dropped one item");
+        }
     }
 }
 
@@ -293,20 +312,34 @@ fn run(
     let mut stale_dump = false;
 
     while shared.running.load(Ordering::Acquire) {
-        dump_cycle(
-            &shared,
-            &dump,
-            &mut buf,
-            &mut known,
-            &mut seq,
-            &mut stale_dump,
-        );
-        shared.flush(&rt);
-        drain_destroy(&shared, &destroy, &mut buf, &mut known, poll);
-        let tick = lock(&shared.tracker).tick(Utc::now());
-        shared.queue_emissions(tick);
-        shared.reap_cgroups(Utc::now());
-        shared.flush(&rt);
+        let started = Instant::now();
+        // One bad iteration (a parse or tracker panic) must not kill the
+        // watcher: log it and run the next cycle.
+        let cycle = catch_unwind(AssertUnwindSafe(|| {
+            dump_cycle(
+                &shared,
+                &dump,
+                &mut buf,
+                &mut known,
+                &mut seq,
+                &mut stale_dump,
+            );
+            shared.flush(&rt);
+            drain_destroy(&shared, &destroy, &mut buf, &mut known, poll);
+            shared.track(|t| t.tick(Utc::now()));
+            shared.reap_cgroups(Utc::now());
+            shared.flush(&rt);
+        }));
+        if cycle.is_err() {
+            tracing::error!("netwatch: the watcher cycle panicked; continuing");
+            // The panic may have left a dump half-read.
+            stale_dump = true;
+        }
+        // Pacing normally comes from the destroy socket's receive timeout;
+        // a persistent immediate error must not turn this into a hot loop.
+        if let Some(rest) = poll.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
     }
     shared.flush(&rt);
 }
@@ -340,20 +373,13 @@ fn dump_cycle(
         return;
     }
 
-    if *stale {
-        // A previous dump was abandoned mid-reply; discard its leftovers.
-        loop {
-            match sock.recv_into(buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
-                Err(_) => break,
-            }
-        }
-        *stale = false;
-    }
-
     for (family, proto, transport) in DUMPS {
+        if *stale {
+            // A previous dump was abandoned mid-reply; discard its leftovers
+            // so they are never read as this dump's, under this transport.
+            discard_pending(sock, buf);
+            *stale = false;
+        }
         *seq = seq.wrapping_add(1);
         if let Err(e) = sock.send(&dump_request(family, proto, *seq)) {
             tracing::debug!(error = %e, family, proto, "netwatch: dump request failed");
@@ -372,6 +398,11 @@ fn dump_cycle(
                 // WouldBlock / TimedOut (the poll timeout) or a real error.
                 Err(_) => break,
             };
+            // The kernel echoes the request's seq in every reply: drop
+            // anything that answers an earlier request.
+            if n >= 12 && buf[8..12] != seq.to_le_bytes() {
+                continue;
+            }
             for (ty, body) in nlmsgs(&buf[..n]) {
                 match ty {
                     NLMSG_DONE | NLMSG_ERROR => {
@@ -390,19 +421,27 @@ fn dump_cycle(
                             continue;
                         }
                         known.insert(obs.socket_id, obs.transport);
-                        let emissions = lock(&shared.tracker).observe(
-                            obs.socket_id,
-                            cgroup,
-                            snapshot_of(&obs),
-                            Utc::now(),
-                        );
-                        shared.queue_emissions(emissions);
+                        shared.track(|t| {
+                            t.observe(obs.socket_id, cgroup, snapshot_of(&obs), Utc::now())
+                        });
                     }
                 }
             }
         }
         if !finished {
             *stale = true;
+        }
+    }
+}
+
+/// Discard whatever is queued on the dump socket (until it would block).
+fn discard_pending(sock: &DiagSocket, buf: &mut [u8]) {
+    loop {
+        match sock.recv_into(buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Err(_) => break,
         }
     }
 }
@@ -462,6 +501,5 @@ fn handle_close(shared: &Shared, body: &[u8], known: &mut HashMap<u64, Transport
             None => return,
         }
     };
-    let emissions = lock(&shared.tracker).close(obs.socket_id, snapshot_of(&obs), Utc::now());
-    shared.queue_emissions(emissions);
+    shared.track(|t| t.close(obs.socket_id, snapshot_of(&obs), Utc::now()));
 }
