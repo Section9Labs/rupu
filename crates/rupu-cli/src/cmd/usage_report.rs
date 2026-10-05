@@ -559,6 +559,7 @@ fn trigger_name(envelope: &RunEnvelope) -> String {
         rupu_runtime::RunTriggerSource::EventDispatch => "event_dispatch",
         rupu_runtime::RunTriggerSource::CronEvent => "cron_event",
         rupu_runtime::RunTriggerSource::Autoflow => "autoflow",
+        rupu_runtime::RunTriggerSource::Agentiflow => "agentiflow",
     }
     .to_string()
 }
