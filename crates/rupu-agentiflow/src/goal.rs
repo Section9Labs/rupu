@@ -68,15 +68,25 @@ pub fn count_matching_findings(
         .count() as u64
 }
 
+/// The locator-key tags a v1 asset goal can match on: the string-valued
+/// coordinates. This is the single source of truth for both the matcher
+/// ([`coord_value_matches`]) and `AgentiflowDef::validate`, so a goal that
+/// validates can always be matched.
+pub(crate) const V1_STRING_COORD_TAGS: [&str; 7] =
+    ["host", "url", "path", "symbol", "sha256", "commit", "param"];
+
 /// Whether `loc` carries a coordinate of the given string `tag` equal to
 /// `want`.
 ///
-/// v1 supports only the string-valued coordinates (`host` / `url` / `path` /
-/// `symbol` / `sha256` / `commit` / `param`). Any other tag (the structured
-/// coordinates `port` / `line_range` / `offset` / `address` / `http_route` /
-/// `resource_id`, or an unknown tag) never matches — a selector naming one is
-/// a miss, not an error.
+/// v1 supports only the tags in [`V1_STRING_COORD_TAGS`]. Any other tag (the
+/// structured coordinates `port` / `line_range` / `offset` / `address` /
+/// `http_route` / `resource_id`, or an unknown tag) never matches here;
+/// `AgentiflowDef::validate` rejects such a selector key up front so the goal
+/// can't silently become unmeetable.
 fn coord_value_matches(loc: &Locator, tag: &str, want: &str) -> bool {
+    if !V1_STRING_COORD_TAGS.contains(&tag) {
+        return false;
+    }
     loc.0.iter().any(|c| match (tag, c) {
         ("host", Coordinate::Host(v)) => v == want,
         ("url", Coordinate::Url(v)) => v == want,
@@ -347,5 +357,123 @@ mod tests {
             min,
             &ladder
         )); // no depth yet
+    }
+
+    #[test]
+    fn asset_matches_depth_is_at_least_not_equal() {
+        let ladder = ["discovered", "enumerated", "tested", "exploited"].map(String::from);
+        let sel = crate::def::AssetSelector {
+            kind: "network:host".into(),
+            locator: std::collections::BTreeMap::from([("host".into(), "1.1.2.2".into())]),
+        };
+        // min rung is "enumerated"
+        let min = 1;
+        // deeper than the minimum still matches (>=, not ==)
+        assert!(asset_matches(
+            &host_asset("1.1.2.2", Some("exploited")),
+            &sel,
+            min,
+            &ladder
+        ));
+        // exactly the minimum matches
+        assert!(asset_matches(
+            &host_asset("1.1.2.2", Some("enumerated")),
+            &sel,
+            min,
+            &ladder
+        ));
+        // shallower than the minimum does not
+        assert!(!asset_matches(
+            &host_asset("1.1.2.2", Some("discovered")),
+            &sel,
+            min,
+            &ladder
+        ));
+        // a depth that is not a rung of the ladder is never at/above
+        assert!(!asset_matches(
+            &host_asset("1.1.2.2", Some("bogus")),
+            &sel,
+            min,
+            &ladder
+        ));
+    }
+
+    #[test]
+    fn asset_matches_requires_all_locator_entries() {
+        let ladder = ["discovered", "enumerated"].map(String::from);
+        let mut a = Asset::new(
+            "web:endpoint",
+            Locator(vec![
+                Coordinate::Host("example.test".into()),
+                Coordinate::Path("/login".into()),
+            ]),
+            "login",
+            None,
+        );
+        a.depth = Some("enumerated".into());
+        let sel = |entries: &[(&str, &str)]| crate::def::AssetSelector {
+            kind: "web:endpoint".into(),
+            locator: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        // both entries match
+        assert!(asset_matches(
+            &a,
+            &sel(&[("host", "example.test"), ("path", "/login")]),
+            0,
+            &ladder
+        ));
+        // one entry wrong -> no match (all, not any)
+        assert!(!asset_matches(
+            &a,
+            &sel(&[("host", "example.test"), ("path", "/admin")]),
+            0,
+            &ladder
+        ));
+        // an entry whose tag the asset does not carry -> no match
+        assert!(!asset_matches(
+            &a,
+            &sel(&[
+                ("host", "example.test"),
+                ("url", "https://example.test/login")
+            ]),
+            0,
+            &ladder
+        ));
+        // an empty locator matches on kind + depth alone
+        assert!(asset_matches(&a, &sel(&[]), 0, &ladder));
+        // a different kind never matches
+        let mut other = sel(&[("host", "example.test")]);
+        other.kind = "network:host".into();
+        assert!(!asset_matches(&a, &other, 0, &ladder));
+    }
+
+    #[test]
+    fn structured_coordinate_tags_never_match_in_v1() {
+        let loc = Locator(vec![
+            Coordinate::Host("1.1.2.2".into()),
+            Coordinate::Port {
+                number: 443,
+                proto: rupu_coverage::Proto::Tcp,
+            },
+        ]);
+        // supported string tag matches
+        assert!(coord_value_matches(&loc, "host", "1.1.2.2"));
+        // the asset genuinely carries a port, but `port` is not matchable in v1
+        assert!(!coord_value_matches(&loc, "port", "443"));
+        // nor are other structured tags / unknown tags
+        assert!(!coord_value_matches(&loc, "line_range", "1-2"));
+        assert!(!coord_value_matches(&loc, "hostname", "1.1.2.2"));
+
+        let ladder = ["discovered".to_string()];
+        let mut a = Asset::new("network:host", loc, "h", None);
+        a.depth = Some("discovered".into());
+        let sel = crate::def::AssetSelector {
+            kind: "network:host".into(),
+            locator: std::collections::BTreeMap::from([("port".into(), "443".into())]),
+        };
+        assert!(!asset_matches(&a, &sel, 0, &ladder));
     }
 }

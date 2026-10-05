@@ -231,6 +231,18 @@ impl AgentiflowDef {
                             g.id, depth, profile.id
                         )));
                     }
+                    // Every locator key must be one the evaluator can match, or the
+                    // goal could never be met (structured coords / typos).
+                    if let Some(key) = a
+                        .locator
+                        .keys()
+                        .find(|k| !crate::goal::V1_STRING_COORD_TAGS.contains(&k.as_str()))
+                    {
+                        return Err(Invalid(format!(
+                            "goal `{}`: locator key `{}` is not a v1-matchable string coordinate",
+                            g.id, key
+                        )));
+                    }
                 }
             }
         }
@@ -458,6 +470,44 @@ trigger: manual
         // `count_gte` on an asset target is valid (the required asset count).
         let d = with_target(
             "{ asset: { kind: \"network:host\" }, depth_at_least: tested, count_gte: 5 }",
+        );
+        d.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn validate_asset_goal_locator_keys_must_be_v1_matchable() {
+        // A structured coordinate tag can never match in v1 (the goal would be
+        // unmeetable and burn budget), so it is rejected up front with the
+        // offending key named.
+        let d = with_target(
+            "{ asset: { kind: \"network:host\", locator: { port: \"443\" } }, depth_at_least: exploited }",
+        );
+        let r = reason(&d);
+        assert!(
+            r.contains("locator key `port` is not a v1-matchable string coordinate"),
+            "{r}"
+        );
+        assert!(r.contains("goal `"), "{r}");
+
+        // A typo for a real tag is the same class of mistake.
+        let d = with_target(
+            "{ asset: { kind: \"network:host\", locator: { hostname: \"a\" } }, depth_at_least: exploited }",
+        );
+        let r = reason(&d);
+        assert!(
+            r.contains("locator key `hostname` is not a v1-matchable string coordinate"),
+            "{r}"
+        );
+
+        // One bad key among good ones is still rejected.
+        let d = with_target(
+            "{ asset: { kind: \"network:host\", locator: { host: \"1.1.2.2\", ip: \"x\" } }, depth_at_least: exploited }",
+        );
+        assert!(reason(&d).contains("locator key `ip`"));
+
+        // A v1 string tag still validates.
+        let d = with_target(
+            "{ asset: { kind: \"network:host\", locator: { host: \"1.1.2.2\" } }, depth_at_least: exploited }",
         );
         d.validate(&active()).unwrap();
     }
