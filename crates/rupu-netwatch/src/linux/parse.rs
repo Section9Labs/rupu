@@ -187,14 +187,45 @@ mod tests {
 
     #[test]
     fn parses_listener_fixture_without_remote() {
-        // NOTE: this capture is one byte short of its own nlmsg_len (399 vs
-        // 400), so only the leading fields are asserted.
         let msg = load("sock_diag_tcp_listener.hex");
         let obs = parse_inet_diag(&msg[16..], Transport::Tcp).unwrap();
         assert_eq!(obs.state, 10);
         assert!(obs.family_v4);
         assert!(!obs.established);
+        assert_eq!(obs.local, Some("0.0.0.0:22".parse().unwrap()));
         assert_eq!(obs.remote, None);
+        assert_eq!(obs.socket_id, 1);
+        assert_eq!(obs.cgroup_id, Some(0xaa7));
+    }
+
+    #[test]
+    fn bad_rtattr_lengths_are_tolerated() {
+        let msg = load("sock_diag_tcp_established.hex");
+        let fixed = &msg[16..16 + INET_DIAG_MSG_LEN];
+
+        // rta_len < 4 ends attribute parsing.
+        let mut body = fixed.to_vec();
+        body.extend_from_slice(&[2, 0, 21, 0, 0, 0, 0, 0]);
+        let obs = parse_inet_diag(&body, Transport::Tcp).unwrap();
+        assert_eq!(
+            (obs.cgroup_id, obs.bytes_in, obs.bytes_out),
+            (None, None, None)
+        );
+
+        // rta_len overrunning the buffer ends attribute parsing.
+        let mut body = fixed.to_vec();
+        body.extend_from_slice(&[0xff, 0x00, 21, 0, 1, 2, 3, 4]);
+        let obs = parse_inet_diag(&body, Transport::Tcp).unwrap();
+        assert_eq!(
+            (obs.cgroup_id, obs.bytes_in, obs.bytes_out),
+            (None, None, None)
+        );
+        assert_eq!(obs.state, 1);
+
+        // A trailing 1-3 byte fragment is ignored.
+        let mut body = fixed.to_vec();
+        body.extend_from_slice(&[9, 0]);
+        assert!(parse_inet_diag(&body, Transport::Tcp).is_some());
     }
 
     #[test]

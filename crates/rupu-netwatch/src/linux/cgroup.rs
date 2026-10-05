@@ -151,4 +151,60 @@ mod tests {
             Mode::Unavailable("cgroup v2 not mounted".to_string())
         );
     }
+
+    #[test]
+    fn scope_beats_direct_when_both_apply() {
+        let e = CgroupEnv {
+            writable: true,
+            delegated: true,
+            systemd_available: true,
+            ..env("/user.slice/user-1000.slice/session-3.scope")
+        };
+        assert_eq!(choose_mode(&e), Mode::Scope);
+    }
+
+    #[test]
+    fn namespace_root_with_systemd_uses_scope() {
+        let e = CgroupEnv {
+            systemd_available: true,
+            ..env("/")
+        };
+        assert_eq!(choose_mode(&e), Mode::Scope);
+    }
+
+    #[test]
+    fn writable_but_not_delegated_is_unavailable() {
+        let e = CgroupEnv {
+            writable: true,
+            ..env("/user.slice/foo.scope")
+        };
+        match choose_mode(&e) {
+            Mode::Unavailable(r) => assert!(r.contains("not delegated"), "{r}"),
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn delegated_but_not_writable_is_unavailable() {
+        let e = CgroupEnv {
+            delegated: true,
+            ..env("/user.slice/foo.scope")
+        };
+        match choose_mode(&e) {
+            Mode::Unavailable(r) => assert!(r.contains("not writable"), "{r}"),
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn cgroup2_not_mounted_is_unavailable() {
+        let e = CgroupEnv {
+            cgroup2_mounted: false,
+            ..env("/user.slice/foo.scope")
+        };
+        match choose_mode(&e) {
+            Mode::Unavailable(r) => assert!(r.contains("cgroup v2 not mounted"), "{r}"),
+            m => panic!("{m:?}"),
+        }
+    }
 }
