@@ -73,6 +73,37 @@ pub fn choose_mode(env: &CgroupEnv) -> Mode {
     ))
 }
 
+/// A capture root this very process already created and entered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedRoot {
+    /// The root's cgroup path (e.g. `/user.slice/rupu-netwatch-42-ab.scope`).
+    pub path: String,
+    /// A transient systemd scope (Scope mode); otherwise a directly created
+    /// child (Direct mode).
+    pub scope: bool,
+}
+
+/// Whether `self_cgroup` is inside a capture root created by process `pid`
+/// (`rupu-netwatch-<pid>-<nonce>[.scope]`, with the process in the root or
+/// its `supervisor`). A second `setup_root` in one process must reuse it: a
+/// pid can belong to only one systemd scope. Other processes' roots never
+/// match, so a child never adopts its parent's.
+pub fn owned_root(self_cgroup: &str, pid: u32) -> Option<OwnedRoot> {
+    let prefix = format!("rupu-netwatch-{pid}-");
+    let mut path = String::new();
+    for seg in self_cgroup.split('/').filter(|s| !s.is_empty()) {
+        path.push('/');
+        path.push_str(seg);
+        if seg.starts_with(&prefix) {
+            return Some(OwnedRoot {
+                path,
+                scope: seg.ends_with(".scope"),
+            });
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "linux")]
 pub use fsops::{setup_root, CallCgroup, CaptureRoot};
 
@@ -323,11 +354,20 @@ mod fsops {
 
     /// Create `<root>/supervisor` and move this process into it, so the root
     /// holds no process itself. Never touches `cgroup.subtree_control`.
+    ///
+    /// An existing `supervisor` (a reused root) is entered as it is, and is
+    /// never removed on failure since this call did not create it.
     fn enter_supervisor(root: &Path) -> Result<(), String> {
         let leaf = root.join("supervisor");
-        fs::create_dir(&leaf).map_err(|e| format!("cannot create {}: {e}", leaf.display()))?;
+        let created = match fs::create_dir(&leaf) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(format!("cannot create {}: {e}", leaf.display())),
+        };
         if let Err(e) = fs::write(leaf.join("cgroup.procs"), b"0") {
-            let _ = fs::remove_dir(&leaf);
+            if created {
+                let _ = fs::remove_dir(&leaf);
+            }
             return Err(format!("cannot move into {}: {e}", leaf.display()));
         }
         Ok(())
@@ -342,6 +382,20 @@ mod fsops {
     pub fn setup_root() -> Result<CaptureRoot, String> {
         let uid = geteuid().as_raw();
         let own = self_cgroup()?;
+        // Already inside a root this process made: reuse it instead of
+        // asking systemd for a second scope (one pid, one scope).
+        if let Some(owned) = owned_root(&own, std::process::id()) {
+            let root = cgroup_dir(&owned.path);
+            enter_supervisor(&root)?;
+            return Ok(CaptureRoot {
+                parent: if owned.scope {
+                    None
+                } else {
+                    root.parent().map(Path::to_path_buf)
+                },
+                root,
+            });
+        }
         let dir = cgroup_dir(&own);
         let env = CgroupEnv {
             self_cgroup: &own,
@@ -406,6 +460,7 @@ mod fsops {
         }
 
         #[test]
+        #[serial_test::serial]
         #[ignore = "needs a delegated cgroup v2 environment"]
         fn setup_root_then_create_and_remove_a_call_cgroup() {
             let root = setup_root().expect("setup_root");
@@ -434,6 +489,37 @@ mod tests {
             systemd_available: false,
             uid: 1000,
         }
+    }
+
+    #[test]
+    fn owned_root_matches_this_pids_scope_and_supervisor() {
+        let r = owned_root(
+            "/user.slice/user-1000.slice/rupu-netwatch-42-0a1b2c3d.scope/supervisor",
+            42,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            OwnedRoot {
+                path: "/user.slice/user-1000.slice/rupu-netwatch-42-0a1b2c3d.scope".into(),
+                scope: true,
+            }
+        );
+    }
+
+    #[test]
+    fn owned_root_matches_a_direct_child_root() {
+        let r = owned_root("/a/b/rupu-netwatch-42-0a1b2c3d", 42).unwrap();
+        assert_eq!(r.path, "/a/b/rupu-netwatch-42-0a1b2c3d");
+        assert!(!r.scope);
+    }
+
+    #[test]
+    fn owned_root_ignores_other_pids_and_plain_cgroups() {
+        assert_eq!(owned_root("/a/rupu-netwatch-43-0a1b2c3d.scope", 42), None);
+        assert_eq!(owned_root("/a/rupu-netwatch-420-ab.scope", 42), None);
+        assert_eq!(owned_root("/user.slice/session-3.scope", 42), None);
+        assert_eq!(owned_root("/", 42), None);
     }
 
     #[test]

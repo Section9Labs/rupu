@@ -16,6 +16,7 @@ rustix.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+serial_test.workspace = true
 
 [lints]
 workspace = true

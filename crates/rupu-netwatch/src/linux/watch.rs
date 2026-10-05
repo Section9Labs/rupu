@@ -211,6 +211,16 @@ impl Shared {
         }
     }
 
+    /// Remove every call cgroup that is empty now, finished or not. Called
+    /// once the watcher has stopped.
+    pub fn reap_all(&self) {
+        let all: Vec<CallCgroup> = lock(&self.cgroups).values().map(|e| e.cg.clone()).collect();
+        for cg in all {
+            cg.remove_if_empty();
+        }
+        lock(&self.cgroups).clear();
+    }
+
     /// Write one visible-loss note per live call (spec §13).
     fn note_loss(&self) {
         let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;

@@ -4808,6 +4808,7 @@ dependencies = [
  "chrono",
  "rupu-netflow",
  "rustix 1.1.4",
+ "serial_test",
  "tokio",
  "tracing",
 ]

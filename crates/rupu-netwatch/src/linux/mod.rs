@@ -162,6 +162,9 @@ mod capture {
             if let Some(t) = self.thread.take() {
                 let _ = t.join();
             }
+            // Scope mode never tears the root down, so leave no call
+            // cgroup behind for a later root reuse to trip over.
+            self.shared.reap_all();
             self.root.shutdown();
         }
     }
@@ -201,6 +204,7 @@ mod capture {
         use std::thread::sleep;
 
         #[test]
+        #[serial_test::serial]
         #[ignore = "needs a delegated cgroup v2 environment, curl and network access"]
         fn live_capture_attributes_subprocess_sockets() {
             let cap = LinuxCapture::start(chrono::Duration::seconds(3), Duration::from_millis(50))
