@@ -16,4 +16,4 @@ pub use def::{
     ScopeRoot,
 };
 pub use error::AgentiflowError;
-pub use goal::{GoalEvaluator, GoalOutcome};
+pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};

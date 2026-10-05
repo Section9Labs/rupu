@@ -1,9 +1,13 @@
 //! Goal evaluation: is an objective's measurable target met by the evidence
 //! on disk? Finding goals are a pure predicate over the findings ledger;
-//! asset goals are added alongside.
+//! asset goals match assets by kind + locator and a minimum rung on the
+//! owning profile's depth ladder.
 
-use crate::def::{FindingSelector, Goal};
-use rupu_coverage::{read_findings, ActiveSet, CoveragePaths, FindingRecord, VerificationStatus};
+use crate::def::{AssetSelector, FindingSelector, Goal};
+use rupu_coverage::{
+    read_assets, read_findings, ActiveSet, Asset, Coordinate, CoveragePaths, FindingRecord,
+    Locator, VerificationStatus,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -64,6 +68,52 @@ pub fn count_matching_findings(
         .count() as u64
 }
 
+/// Whether `loc` carries a coordinate of the given string `tag` equal to
+/// `want`.
+///
+/// v1 supports only the string-valued coordinates (`host` / `url` / `path` /
+/// `symbol` / `sha256` / `commit` / `param`). Any other tag (the structured
+/// coordinates `port` / `line_range` / `offset` / `address` / `http_route` /
+/// `resource_id`, or an unknown tag) never matches — a selector naming one is
+/// a miss, not an error.
+fn coord_value_matches(loc: &Locator, tag: &str, want: &str) -> bool {
+    loc.0.iter().any(|c| match (tag, c) {
+        ("host", Coordinate::Host(v)) => v == want,
+        ("url", Coordinate::Url(v)) => v == want,
+        ("path", Coordinate::Path(v)) => v == want,
+        ("symbol", Coordinate::Symbol(v)) => v == want,
+        ("sha256", Coordinate::Sha256(v)) => v == want,
+        ("commit", Coordinate::Commit(v)) => v == want,
+        ("param", Coordinate::Param(v)) => v == want,
+        _ => false,
+    })
+}
+
+/// Whether `a` satisfies `sel` at or above rung `min_depth_idx` of `ladder`:
+/// the kind is equal, every locator entry of the selector matches, and the
+/// asset's recorded depth sits at or above the minimum rung. An asset with no
+/// recorded depth (or one that is not a rung of `ladder`) is not at/above.
+fn asset_matches(a: &Asset, sel: &AssetSelector, min_depth_idx: usize, ladder: &[String]) -> bool {
+    if a.kind != sel.kind {
+        return false;
+    }
+    if !sel
+        .locator
+        .iter()
+        .all(|(tag, want)| coord_value_matches(&a.locator, tag, want))
+    {
+        return false;
+    }
+    match a
+        .depth
+        .as_ref()
+        .and_then(|d| ladder.iter().position(|r| r == d))
+    {
+        Some(idx) => idx >= min_depth_idx,
+        None => false,
+    }
+}
+
 pub struct GoalEvaluator;
 
 impl GoalEvaluator {
@@ -99,20 +149,50 @@ impl GoalEvaluator {
                 ),
             });
         }
-        // asset arm: Task 4
         Self::evaluate_asset(goal, paths, active)
     }
 
-    /// TEMPORARY placeholder; Task 4 replaces this with the asset predicate.
+    /// Count the assets matching the goal's asset selector at or above its
+    /// `depth_at_least` rung (resolved on the ladder of the profile that owns
+    /// the selector's kind). Defaults to "at least one exists".
     fn evaluate_asset(
         goal: &Goal,
-        _paths: &CoveragePaths,
-        _active: &ActiveSet,
+        paths: &CoveragePaths,
+        active: &ActiveSet,
     ) -> Result<GoalOutcome, GoalEvalError> {
-        Err(GoalEvalError::Bad(
-            goal.id.clone(),
-            "asset goals land in Task 4".into(),
-        ))
+        let sel = goal
+            .target
+            .asset
+            .as_ref()
+            .ok_or_else(|| GoalEvalError::Bad(goal.id.clone(), "no asset selector".into()))?;
+        let depth = goal
+            .target
+            .depth_at_least
+            .as_deref()
+            .ok_or_else(|| GoalEvalError::Bad(goal.id.clone(), "no depth_at_least".into()))?;
+        let profile = active.profile_for_kind(&sel.kind).ok_or_else(|| {
+            GoalEvalError::Bad(goal.id.clone(), format!("kind `{}` unowned", sel.kind))
+        })?;
+        let ladder = &profile.coverage.depth_ladder;
+        let min = ladder.iter().position(|r| r == depth).ok_or_else(|| {
+            GoalEvalError::Bad(goal.id.clone(), format!("depth `{depth}` not in ladder"))
+        })?;
+        let assets = read_assets(&paths.assets).map_err(|e| GoalEvalError::Io(e.to_string()))?;
+        let current = assets
+            .iter()
+            .filter(|a| asset_matches(a, sel, min, ladder))
+            .count() as u64;
+        let target = goal.target.count_gte.unwrap_or(1);
+        Ok(GoalOutcome {
+            id: goal.id.clone(),
+            met: current >= target,
+            current,
+            target,
+            detail: format!(
+                "{}/{} assets {} @ depth>={}",
+                current, target, sel.kind, depth
+            ),
+        })
     }
 }
 
@@ -222,5 +302,50 @@ mod tests {
         assert_eq!(count_matching_findings(&recs, &sel, true), 1);
         // all CWE-94 regardless of verification (the report-less record has no classification)
         assert_eq!(count_matching_findings(&recs, &sel, false), 3);
+    }
+
+    fn host_asset(host: &str, depth: Option<&str>) -> Asset {
+        let mut a = Asset::new(
+            "network:host",
+            Locator(vec![Coordinate::Host(host.into())]),
+            host,
+            None,
+        );
+        a.depth = depth.map(|d| d.to_string());
+        a
+    }
+
+    #[test]
+    fn asset_matches_kind_locator_and_min_depth() {
+        let ladder = ["discovered", "enumerated", "tested", "exploited"].map(String::from);
+        let sel = crate::def::AssetSelector {
+            kind: "network:host".into(),
+            locator: std::collections::BTreeMap::from([("host".into(), "1.1.2.2".into())]),
+        };
+        let min = 3; // "exploited"
+        assert!(asset_matches(
+            &host_asset("1.1.2.2", Some("exploited")),
+            &sel,
+            min,
+            &ladder
+        ));
+        assert!(!asset_matches(
+            &host_asset("1.1.2.2", Some("tested")),
+            &sel,
+            min,
+            &ladder
+        )); // below
+        assert!(!asset_matches(
+            &host_asset("9.9.9.9", Some("exploited")),
+            &sel,
+            min,
+            &ladder
+        )); // wrong host
+        assert!(!asset_matches(
+            &host_asset("1.1.2.2", None),
+            &sel,
+            min,
+            &ladder
+        )); // no depth yet
     }
 }
