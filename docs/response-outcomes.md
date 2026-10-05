@@ -250,7 +250,8 @@ is the outcome's title followed by a hint. For a provider error it is instead th
 provider's own error text (`provider: <error>`, as before the ladder existed)
 followed by the hint. The hint depends on where the run was started:
 
-- **`rupu run <agent>`** (a dispatched sub-agent gets the same hint):
+- **`rupu run <agent>`** (a dispatched sub-agent's own transcript and run
+  record get the same hint):
 
   ```
   refused · cyber; no recovery left — continue with another model: rupu run dependency-auditor --continue <run id> --model <model> [--provider <provider>]
@@ -274,7 +275,8 @@ A failed run's final output is empty: its last text is an interim message or a
 cut-off reply, not an answer. A workflow step tolerated by `continue_on_error:`
 publishes `steps.<id>.output` as `""` and the reason as `steps.<id>.error`; a
 failed dispatched sub-agent returns `"ok": false`, `"output": ""` and the reason
-as `"error"` to the agent that dispatched it.
+as `"error"` to the agent that dispatched it. That reason leaves out the
+`rupu run … --continue` hint, which the dispatching agent cannot act on.
 
 ### Continuing a failed run on another model
 

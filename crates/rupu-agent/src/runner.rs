@@ -1553,6 +1553,23 @@ impl RunResult {
             }),
         }
     }
+
+    /// Why the run failed, without the rung-3 hint: the outcome's title and
+    /// detail when it failed on an outcome, otherwise the error it recorded
+    /// (e.g. `max turns (N) reached`). `None` when [`Self::terminal_error`]
+    /// is `None`. For a reader that cannot act on the hint — a dispatching
+    /// parent agent cannot `rupu run --continue` its child; the child's own
+    /// transcript and run record keep the hint (`RunResult.error`).
+    pub fn failure_reason(&self) -> Option<String> {
+        self.terminal_error()?;
+        Some(match &self.outcome {
+            Some(o) => rupu_transcript::outcome::outcome_body(o),
+            None => self
+                .error
+                .clone()
+                .unwrap_or_else(|| "no reason recorded".to_string()),
+        })
+    }
 }
 
 /// Await a cooperative pause signal. Resolves when the token is cancelled;

@@ -545,10 +545,11 @@ impl AgentDispatcher for CliAgentDispatcher {
         // `DispatchError::ChildRun`, so the parent gets the child's sub-run
         // id and transcript with an honest `ok: false`. Its `output` is
         // empty (spec 2026-10-01 §5.3): the child's last text is an interim
-        // message or a cut-off chain, not an answer. `error` carries the
-        // reason its run recorded (`RunResult.error`: the outcome's title
-        // plus the recovery hint), which the dispatch tools put in the body
-        // the parent reads.
+        // message or a cut-off chain, not an answer. `error` carries why it
+        // failed, which the dispatch tools put in the body the parent reads —
+        // without the rung-3 hint (`RunResult::failure_reason`): the parent
+        // model cannot `rupu run --continue` its child. The child's own
+        // transcript and run record keep the hint.
         let terminal = run_result.terminal_error();
         if let Some(err) = &terminal {
             tracing::warn!(
@@ -564,9 +565,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         } else {
             String::new()
         };
-        let error = terminal
-            .as_ref()
-            .map(|err| run_result.error.clone().unwrap_or_else(|| err.to_string()));
+        let error = run_result.failure_reason();
 
         self.emit_dispatch_completed(
             parent_run_id,
@@ -1420,6 +1419,23 @@ mod tests {
         assert_eq!(outcome.output, "", "no stale interim text as the answer");
         let error = outcome.error.expect("the child's error reaches the parent");
         assert!(error.contains("refused"), "{error}");
+        assert!(
+            !error.contains("no recovery left") && !error.contains("--continue"),
+            "the parent gets no rung-3 hint it cannot act on: {error}"
+        );
+        // The child's own transcript keeps the hint.
+        let child_complete = rupu_transcript::JsonlReader::iter(&outcome.transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                rupu_transcript::Event::RunComplete { error, .. } => error,
+                _ => None,
+            })
+            .expect("the child's RunComplete records its error");
+        assert!(
+            child_complete.contains("no recovery left"),
+            "{child_complete}"
+        );
     }
 
     /// Regression for ISSUES.md I-8: `dispatch()` was the FOURTH I-1/I-2

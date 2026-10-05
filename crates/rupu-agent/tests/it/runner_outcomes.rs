@@ -321,6 +321,21 @@ async fn a_standalone_run_hints_at_continue() {
 }
 
 #[tokio::test]
+async fn failure_reason_is_the_outcome_without_the_hint() {
+    let ran = run_script(vec![refusal_reply()], "").await;
+    assert_eq!(ran.result.status, RunStatus::Error);
+    let recorded = ran.result.error.clone().unwrap();
+    assert!(recorded.contains("no recovery left"), "{recorded}");
+    let reason = ran.result.failure_reason().unwrap();
+    assert!(reason.starts_with("refused"), "{reason}");
+    assert!(!reason.contains("no recovery left"), "{reason}");
+    assert!(!reason.contains("--continue"), "{reason}");
+
+    let ok = run_script(vec![reply(StopReason::EndTurn, vec![text("done")])], "").await;
+    assert_eq!(ok.result.failure_reason(), None);
+}
+
+#[tokio::test]
 async fn refusal_with_no_chain_fails_and_discards_the_partial() {
     let mut stop = Stop::synthetic(StopReason::Refusal, "mock");
     stop.refusal = None;
