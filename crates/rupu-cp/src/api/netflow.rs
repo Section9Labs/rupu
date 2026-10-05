@@ -215,6 +215,50 @@ pub struct NetflowResponse {
     /// answer for one is not "no traffic", it is "we could not look".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete: Vec<IncompleteSource>,
+    /// Subprocess-capture availability for this run (run scope only), so
+    /// the UI can say "capture unavailable: <reason>" instead of letting
+    /// an empty bash-flow list read as "no connections". Absent when the
+    /// run's ledger(s) carry no `Capture` line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureSummary>,
+}
+
+/// Flattened view of a run's `LedgerLine::Capture` lines.
+///
+/// `state` is the LATEST line's state (by `ts`; file order breaks ties);
+/// `reason` is that line's reason when it is `unavailable`; `notes` is
+/// every non-empty visible-loss note across the run's capture lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureSummary {
+    /// `"active"` or `"unavailable"`.
+    pub state: String,
+    pub reason: Option<String>,
+    pub notes: Vec<String>,
+}
+
+/// Fold capture lines into the web-facing summary. `None` for no lines.
+pub fn summarize_capture(entries: &[rupu_netflow::ledger::CaptureEntry]) -> Option<CaptureSummary> {
+    use rupu_netflow::CaptureState;
+    // `max_by_key` returns the LAST maximal element, so ties go to the
+    // later line in file order.
+    let latest = entries.iter().max_by_key(|e| e.ts)?;
+    let (state, reason) = match &latest.state {
+        CaptureState::Active { .. } => ("active", None),
+        CaptureState::Unavailable { reason } => ("unavailable", Some(reason.clone())),
+    };
+    let mut notes: Vec<String> = Vec::new();
+    for e in entries {
+        if let Some(n) = e.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            if !notes.iter().any(|x| x == n) {
+                notes.push(n.to_string());
+            }
+        }
+    }
+    Some(CaptureSummary {
+        state: state.to_string(),
+        reason,
+        notes,
+    })
 }
 
 /// One source of this run's flows that could not be read, and why.
@@ -1055,6 +1099,7 @@ pub(crate) fn build_filtered_response(
         // Builders serve local data; a caller that also read a remote
         // source records any gap on the returned value.
         incomplete: Vec::new(),
+        capture: None,
     }
 }
 
@@ -1177,6 +1222,15 @@ fn collect_run_netflow(
     let mut resp =
         build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters);
     resp.incomplete = incomplete;
+    let mut entries = Vec::new();
+    for id in run_and_unit_ids(store, run_id) {
+        for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
+            entries.extend(
+                rupu_netflow::ledger::read_capture_states(&ledger_path).unwrap_or_default(),
+            );
+        }
+    }
+    resp.capture = summarize_capture(&entries);
     resp
 }
 

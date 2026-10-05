@@ -80,6 +80,7 @@ fn unfiltered_remote_response(flows: Vec<FlowRecord>, dropped_total: u64) -> Net
         dropped_total,
         asn_loaded: false,
         incomplete: Vec::new(),
+        capture: None,
     }
 }
 

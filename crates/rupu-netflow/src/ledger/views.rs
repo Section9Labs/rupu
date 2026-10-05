@@ -4,7 +4,7 @@
 //! render time (spec §6.2), so a dataset that arrives late improves
 //! every historical record with no backfill.
 
-use crate::record::{FlowId, FlowRecord, LedgerLine, Outcome};
+use crate::record::{CaptureState, FlowId, FlowRecord, LedgerLine, Outcome};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -103,6 +103,52 @@ pub fn read_flows(path: &Path) -> std::io::Result<Vec<FlowRecord>> {
 /// that reads the file once instead of twice.
 pub fn read_dropped_total(path: &Path) -> std::io::Result<u64> {
     Ok(read_flows_and_dropped(path)?.1)
+}
+
+/// One `LedgerLine::Capture` line as read back from a ledger: what the
+/// subprocess-capture backend could do for the run, when it said so, and
+/// any visible-loss note. [`read_flows`] ignores these lines; this is
+/// their read side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureEntry {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub state: CaptureState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Read every `Capture` line, in file order. A missing file is an empty
+/// list; malformed lines are skipped (same tolerance as [`read_flows`]).
+pub fn read_capture_states(path: &Path) -> std::io::Result<Vec<CaptureEntry>> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(LedgerLine::Capture {
+            ts,
+            state,
+            tool_call_id,
+            note,
+        }) = serde_json::from_str::<LedgerLine>(&line)
+        {
+            out.push(CaptureEntry {
+                ts,
+                state,
+                tool_call_id,
+                note,
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -811,5 +857,56 @@ mod tests {
             read_flows_in_range(&tmp.path().join("absent.jsonl"), &TimeRange::unbounded()).unwrap();
         assert!(flows.is_empty());
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn read_capture_states_returns_capture_lines_in_order_and_flows_still_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("run-a.jsonl");
+        write_lines(
+            &path,
+            &[
+                LedgerLine::Capture {
+                    ts: at(10),
+                    state: CaptureState::Active {
+                        backend: "lsof".into(),
+                    },
+                    tool_call_id: None,
+                    note: None,
+                },
+                LedgerLine::Flow(Box::new(flow_at(1, at(20)))),
+                LedgerLine::Capture {
+                    ts: at(30),
+                    state: CaptureState::Unavailable {
+                        reason: "no permission".into(),
+                    },
+                    tool_call_id: Some("tc1".into()),
+                    note: Some("lost 2 short connections".into()),
+                },
+            ],
+        );
+        // A torn tail line is skipped, not fatal.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":\"capt")
+            .unwrap();
+
+        let caps = read_capture_states(&path).unwrap();
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0].ts, at(10));
+        assert!(matches!(caps[0].state, CaptureState::Active { .. }));
+        assert!(matches!(caps[1].state, CaptureState::Unavailable { .. }));
+        assert_eq!(caps[1].note.as_deref(), Some("lost 2 short connections"));
+        assert_eq!(caps[1].tool_call_id.as_deref(), Some("tc1"));
+
+        let flows = read_flows(&path).unwrap();
+        assert_eq!(flows.len(), 1, "capture lines do not perturb flow reads");
+
+        assert!(read_capture_states(&tmp.path().join("absent.jsonl"))
+            .unwrap()
+            .is_empty());
     }
 }
