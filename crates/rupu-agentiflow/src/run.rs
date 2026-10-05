@@ -10,8 +10,8 @@
 //!   events.jsonl               append-only event log (shape below)
 //!   lead/transcript.r<N>.jsonl the lead's transcript for round N
 //!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
-//!   board/board/               the lead's coordination board (posts, claims, directives)
-//!   mailboxes/                 per-participant inboxes (`rupu_fleet::Mailbox` root)
+//!   board/                     the coordination board (posts, claims, directives)
+//!   mailboxes/<participant>/   per-participant inboxes
 //! ```
 //!
 //! `board/` and `mailboxes/` are created lazily by the stores on first write.
@@ -518,8 +518,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             // under the run dir, the tools that act on them, and the collectors that
             // fold its inbox and standing directives into each turn. "lead" is the
             // lead's participant id (the `to: "lead"` inbox other participants address).
-            let board = Arc::new(rupu_fleet::Board::new(run_dir.join("board")));
-            let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir.join("mailboxes")));
+            let board = Arc::new(rupu_fleet::Board::new(run_dir.clone()));
+            let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir.clone()));
             let fleet_ctx = Arc::new(crate::tools::FleetToolCtx::new(
                 board.clone(),
                 mailbox.clone(),
@@ -1215,7 +1215,7 @@ mod tests {
         // An operator directive queued on the run's board BEFORE the run starts.
         // This creates `board/` but not `agentiflow.json`, so the run is not
         // refused as already existing, and the run never wipes the directory.
-        let seeded = rupu_fleet::Board::new(run_dir(&fx, id).join("board"));
+        let seeded = rupu_fleet::Board::new(run_dir(&fx, id));
         seeded
             .put_directive(&rupu_fleet::Directive {
                 author: "operator".into(),
@@ -1239,13 +1239,17 @@ mod tests {
         assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
 
         // (a) The post is in the run's board, read back through a FRESH handle.
-        let fresh = rupu_fleet::Board::new(run_dir(&fx, id).join("board"));
+        let fresh = rupu_fleet::Board::new(run_dir(&fx, id));
         let posts = fresh.read_posts().unwrap();
         assert_eq!(posts.len(), 1, "{posts:?}");
         assert_eq!(posts[0].author, "lead");
         assert_eq!(posts[0].body, "starting on the web tier");
         // The directive survived the run untouched.
         assert_eq!(fresh.read_directives().unwrap().len(), 1);
+        // The spec layout: files live at `<run dir>/board/…`, not a doubled subdir.
+        assert!(run_dir(&fx, id).join("board/posts.jsonl").is_file());
+        assert!(run_dir(&fx, id).join("board/directives.jsonl").is_file());
+        assert!(!run_dir(&fx, id).join("board/board").exists());
 
         // (b) The DirectiveCollector put the standing directive in front of the
         // model on its very first call. Injections are not transcript events, so
@@ -1276,7 +1280,7 @@ mod tests {
         let fx = fixture();
         let id = "af_mail";
         // A worker's message already waiting in the lead's inbox.
-        let seeded = rupu_fleet::Mailbox::new(run_dir(&fx, id).join("mailboxes"));
+        let seeded = rupu_fleet::Mailbox::new(run_dir(&fx, id));
         seeded
             .send(
                 "lead",
@@ -1329,8 +1333,11 @@ mod tests {
             .filter(|t| t.contains("port 22 open on 10.0.0.5"))
             .count();
         assert_eq!(delivered, 1, "{second:?}");
+        // The spec layout: inboxes live at `<run dir>/mailboxes/<participant>/`.
+        assert!(run_dir(&fx, id).join("mailboxes").is_dir());
+        assert!(!run_dir(&fx, id).join("mailboxes/mailboxes").exists());
         // Both inboxes are now empty.
-        let fresh = rupu_fleet::Mailbox::new(run_dir(&fx, id).join("mailboxes"));
+        let fresh = rupu_fleet::Mailbox::new(run_dir(&fx, id));
         assert!(fresh.drain("lead").unwrap().is_empty());
     }
 
