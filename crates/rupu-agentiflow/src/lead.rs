@@ -245,9 +245,11 @@ pub struct LeadConfig {
     pub workspace_id: String,
     /// The lead's workspace root (the file/bash tools' scope).
     pub workspace_path: PathBuf,
-    /// Exactly the tools the lead may use; the runner's registry is filtered
-    /// to this list. Empty (the fail-closed default) grants NO tools. The
-    /// caller lists what the lead needs -- there is deliberately no way to
+    /// The builtins/MCP allowlist: the runner filters its registry to this
+    /// list, so empty (the fail-closed default) grants NO builtins/MCP tools.
+    /// (`report_finding` is appended by `run_agentiflow`, and the board/mailbox
+    /// `extra_tools` are always-on, so an empty list is not "no tools at all".)
+    /// The caller lists what the lead needs -- there is deliberately no way to
     /// say "all builtins" by omission, because the lead runs unattended under
     /// `BypassDecider` on digest text an attacker can influence.
     pub agent_tools: Vec<String>,
@@ -289,7 +291,7 @@ pub struct LeadConfig {
 /// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
 /// dispatchable agents, and a codename. It runs with `BypassDecider`, so the
 /// tool gate is [`LeadConfig::agent_tools`] (the runner's registry is filtered
-/// to exactly that list; empty = no tools) plus [`LeadConfig::extra_tools`],
+/// to exactly that list; empty = no builtins/MCP) plus [`LeadConfig::extra_tools`],
 /// the caller's explicit always-on injections (the board / mailbox tools).
 /// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
 /// into each turn. No parent run, depth 0 -- the same shape as a session

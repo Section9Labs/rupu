@@ -2,10 +2,12 @@
 //! post / read and mailbox send, as [`rupu_tools::Tool`] impls over run-scoped
 //! `rupu-fleet` handles.
 //!
-//! Error discipline: a store failure is `Ok(ToolOutput { error: Some(..) })` so
-//! the model sees it and can react; `Err` aborts the run, so it is reserved for
-//! arguments that cannot be parsed (`ToolError::InvalidInput`), including an
-//! unrecognized `board.post` `kind` (fail closed, never a silent `note`).
+//! Error discipline: a failed operation on a well-formed call is
+//! `Ok(ToolOutput { error: Some(..) })` so the model sees it and can react.
+//! `Err(ToolError::InvalidInput)` is reserved for arguments that cannot be
+//! parsed -- including an unrecognized `board.post` `kind` (fail closed, never
+//! a silent `note`). The runner surfaces such an `Err` to the model as an error
+//! `ToolResult` and continues the turn; it does not abort the run.
 
 use async_trait::async_trait;
 use rupu_fleet::{Board, BoardPost, ClaimGuard, ClaimOutcome, FleetMessage, Mailbox, PostKind};

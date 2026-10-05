@@ -151,7 +151,10 @@ pub struct LeadInputs {
     pub system_prompt: String,
     pub provider_name: String,
     pub model: String,
-    /// Exactly the tools the lead may use; empty grants none (fail closed).
+    /// The builtins/MCP allowlist (the runner filters its registry to this
+    /// list); empty grants none of those. `report_finding` is appended by
+    /// `run_agentiflow` and the board/mailbox tools are always-on `extra_tools`,
+    /// so an empty list does not mean the lead is toolless.
     pub agent_tools: Vec<String>,
 }
 

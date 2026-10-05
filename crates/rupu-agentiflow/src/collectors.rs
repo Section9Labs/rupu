@@ -29,8 +29,10 @@ const DIRECTIVE_PRIORITY: u8 = 230;
 /// `Once` message injections.
 ///
 /// `Once` because `Mailbox::drain` consumes what it returns: each message must
-/// be delivered exactly once, and the pipeline persists `Once` injections into
-/// the transcript so the lead keeps them across turns.
+/// be delivered exactly once. The pipeline keeps `Once` injections in the
+/// lead's in-memory conversation (they return via `RunExit.messages` / history),
+/// so the lead carries them across rounds; they are not written as transcript
+/// events.
 pub struct MailboxCollector {
     pub(crate) mailbox: Arc<Mailbox>,
     pub(crate) participant: String,
