@@ -24,6 +24,7 @@ members = [
     "crates/rupu-netflow",
     "crates/rupu-netwatch",
     "crates/rupu-fleet",
+    "crates/rupu-agentiflow",
 ]
 
 [workspace.package]
@@ -197,6 +198,14 @@ rupu-netwatch = { path = "crates/rupu-netwatch" }
 
 # File-backed fleet comms store (agentiflows)
 rupu-fleet = { path = "crates/rupu-fleet" }
+
+# Coverage harness (findings/ledgers/profiles) — consumed by the agentiflow
+# envelope for goal/coverage evaluation.
+rupu-coverage = { path = "crates/rupu-coverage" }
+
+# The agentiflow envelope: deterministic goal/coverage/budget supervisor
+# driving a LeadDriver round loop.
+rupu-agentiflow = { path = "crates/rupu-agentiflow" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

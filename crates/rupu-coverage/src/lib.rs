@@ -60,6 +60,7 @@ pub use ledger::{
 };
 pub use report::{
     Classification, DisasmLine, EvidenceBlock, FindingProfile, FindingReport, FindingWriteOptions,
+    Verification, VerificationStatus,
 };
 pub use rerun::{plan_rerun, RerunError, RerunInvocation};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
