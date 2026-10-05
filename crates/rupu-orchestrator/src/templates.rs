@@ -203,6 +203,14 @@ pub struct StepOutput {
     pub success: bool,
     #[serde(default)]
     pub skipped: bool,
+    /// Why a tolerated (`continue_on_error`) step failed — the error the
+    /// step recorded, e.g. `refused · no fallback left`. Bound as
+    /// `steps.<id>.error`. A failed agent step's `output` is empty (spec
+    /// 2026-10-01 §5.3), so this is where a downstream step reads what
+    /// went wrong. Empty on success.
+    /// Always serialized — see `results` for rationale.
+    #[serde(default)]
+    pub error: String,
     /// Per-unit outputs (strings) for fan-out steps. Empty for
     /// non-fan-out steps. Bound as `steps.<id>.results[*]`.
     ///
@@ -285,6 +293,7 @@ impl Default for StepOutput {
             duration_ms: 0,
             success: false,
             skipped: false,
+            error: String::new(),
             results: Vec::new(),
             sub_results: BTreeMap::new(),
             findings: Vec::new(),

@@ -58,15 +58,28 @@ impl StepFactory for RefusingFactory {
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
-        let turn = if rendered_prompt.contains("REFUSE") {
-            refusal_turn()
+        let turns = if rendered_prompt.contains("INTERIM") {
+            // An interim message plus a tool call, then a refusal on the
+            // final turn: the interim text is not the step's answer.
+            vec![
+                ScriptedTurn::AssistantToolUse {
+                    text: Some("Let me look at the settings first".into()),
+                    tool_id: "c1".into(),
+                    tool_name: "read_file".into(),
+                    tool_input: serde_json::json!({ "path": "absent-settings.toml" }),
+                    stop: StopReason::ToolUse,
+                },
+                refusal_turn(),
+            ]
+        } else if rendered_prompt.contains("REFUSE") {
+            vec![refusal_turn()]
         } else {
-            ScriptedTurn::AssistantText {
+            vec![ScriptedTurn::AssistantText {
                 text: format!("done: {rendered_prompt}"),
                 stop: StopReason::EndTurn,
                 input_tokens: 1,
                 output_tokens: 1,
-            }
+            }]
         };
         AgentRunOpts {
             seed_source: None,
@@ -74,7 +87,7 @@ impl StepFactory for RefusingFactory {
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
-            provider: Box::new(MockProvider::new(vec![turn])),
+            provider: Box::new(MockProvider::new(turns)),
             provider_name: "mock".into(),
             model: "mock-1".into(),
             run_id,
@@ -235,6 +248,77 @@ async fn a_tolerated_refusal_persists_the_step_error_and_cause_and_the_run_compl
     assert!(after.success);
     assert_eq!(after.error, None);
     assert_eq!(after.cause, None);
+}
+
+const WF_INTERIM_THEN_REFUSED: &str = r#"
+name: interim-then-refused
+steps:
+  - id: review
+    agent: ag
+    actions: []
+    continue_on_error: true
+    prompt: "INTERIM REFUSE this"
+  - id: after
+    agent: ag
+    actions: []
+    prompt: "output=[{{ steps.review.output }}] error=[{{ steps.review.error }}]"
+"#;
+
+/// Spec 2026-10-01 §5.3: a failed step's output is empty, not the interim
+/// text of an earlier turn; the reason reaches a downstream template as
+/// `steps.<id>.error`.
+#[tokio::test]
+async fn a_tolerated_refusal_after_an_interim_turn_publishes_empty_output_and_its_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let sink = Arc::new(CollectSink::default());
+
+    let res = run_workflow(opts(
+        &tmp,
+        &store,
+        &sink,
+        WF_INTERIM_THEN_REFUSED,
+        "run_cause_interim",
+    ))
+    .await
+    .expect("continue_on_error tolerates the refusal");
+    let review = &res.step_results[0];
+    assert!(!review.success);
+    assert_eq!(review.output, "", "no stale interim text as the answer");
+    let error = review.error.clone().expect("the step records its error");
+    assert!(!error.is_empty());
+
+    let after = &res.step_results[1];
+    assert_eq!(
+        after.rendered_prompt,
+        format!("output=[] error=[{error}]"),
+        "the downstream render sees an empty output and the error"
+    );
+    assert!(!after.rendered_prompt.contains("settings first"));
+}
+
+/// A succeeding step binds `steps.<id>.error` as an empty string.
+#[tokio::test]
+async fn a_succeeding_step_binds_an_empty_error() {
+    const WF: &str = r#"
+name: fine
+steps:
+  - id: review
+    agent: ag
+    actions: []
+    prompt: "look"
+  - id: after
+    agent: ag
+    actions: []
+    prompt: "error=[{{ steps.review.error }}]"
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let sink = Arc::new(CollectSink::default());
+    let res = run_workflow(opts(&tmp, &store, &sink, WF, "run_cause_fine"))
+        .await
+        .expect("both steps answer");
+    assert_eq!(res.step_results[1].rendered_prompt, "error=[]");
 }
 
 const WF_FANOUT: &str = r#"

@@ -259,6 +259,12 @@ followed by the hint. The hint depends on where the run was started:
 
   A failed session turn keeps its conversation, so the next message continues it.
 
+A failed run's final output is empty: its last text is an interim message or a
+cut-off reply, not an answer. A workflow step tolerated by `continue_on_error:`
+publishes `steps.<id>.output` as `""` and the reason as `steps.<id>.error`; a
+failed dispatched sub-agent returns `"ok": false`, `"output": ""` and the reason
+as `"error"` to the agent that dispatched it.
+
 ### Continuing a failed run on another model
 
 ```

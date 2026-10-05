@@ -531,8 +531,6 @@ impl AgentDispatcher for CliAgentDispatcher {
 
         write_delegation_narrowing_notice(&transcript_path, agent_name, parent_run_id);
 
-        let output = read_final_assistant_text(&transcript_path).unwrap_or_default();
-
         // `run_agent` returning `Ok` does NOT mean the child did its job: an
         // `Err` is reserved for failures that stopped the loop from
         // proceeding at all, so a child that burned its whole `max_turns`
@@ -543,12 +541,14 @@ impl AgentDispatcher for CliAgentDispatcher {
         // sibling of the workflow-step bug fixed in `rupu-orchestrator`'s
         // `dispatch_one`.
         //
-        // The child's partial `output` is deliberately still returned rather
-        // than collapsed into `DispatchError::ChildRun`: the parent gets both
-        // whatever the child managed to produce AND an honest `ok: false`.
-        // The reason itself lives in the child's own transcript
-        // (`RunComplete.error`) and in the warning below — `DispatchOutcome`
-        // has no error channel to carry it.
+        // A failed child is still an `Ok(DispatchOutcome)` rather than a
+        // `DispatchError::ChildRun`, so the parent gets the child's sub-run
+        // id and transcript with an honest `ok: false`. Its `output` is
+        // empty (spec 2026-10-01 §5.3): the child's last text is an interim
+        // message or a cut-off chain, not an answer. `error` carries the
+        // reason its run recorded (`RunResult.error`: the outcome's title
+        // plus the recovery hint), which the dispatch tools put in the body
+        // the parent reads.
         let terminal = run_result.terminal_error();
         if let Some(err) = &terminal {
             tracing::warn!(
@@ -559,6 +559,14 @@ impl AgentDispatcher for CliAgentDispatcher {
             );
         }
         let success = terminal.is_none();
+        let output = if success {
+            read_final_assistant_text(&transcript_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let error = terminal
+            .as_ref()
+            .map(|err| run_result.error.clone().unwrap_or_else(|| err.to_string()));
 
         self.emit_dispatch_completed(
             parent_run_id,
@@ -576,6 +584,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             transcript_path,
             output,
             success,
+            error,
             tokens_used: run_result.total_tokens_in + run_result.total_tokens_out,
             duration_ms,
         })
@@ -1343,6 +1352,74 @@ mod tests {
             result.is_ok(),
             "dispatch with no event sink should behave exactly as before"
         );
+    }
+
+    /// Spec 2026-10-01 §5.3: a child that ran and failed reports `ok:
+    /// false`, an EMPTY `output` (not its interim text from an earlier
+    /// turn), and the reason its run recorded as `error`.
+    #[tokio::test]
+    async fn a_failed_child_returns_no_output_and_its_error() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+            None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
+            None,
+            Default::default(),
+            Default::default(),
+        );
+
+        // An interim message with a tool call, then a refusal on the final
+        // turn with no fallback chain.
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[
+              { "AssistantToolUse": { "text": "Let me read the settings first", "tool_id": "call_1", "tool_name": "read_file", "tool_input": { "path": "absent.toml" }, "stop": "tool_use" } },
+              { "Reply": {
+                  "content": [{ "type": "text", "text": "I won't do that." }],
+                  "stop": { "reason": "refusal", "wire": { "provider": "anthropic", "value": "refusal" } }
+              } }
+            ]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("a failed child is an outcome, not a dispatch error");
+        assert!(!outcome.success);
+        assert_eq!(outcome.output, "", "no stale interim text as the answer");
+        let error = outcome.error.expect("the child's error reaches the parent");
+        assert!(error.contains("refused"), "{error}");
     }
 
     /// Regression for ISSUES.md I-8: `dispatch()` was the FOURTH I-1/I-2

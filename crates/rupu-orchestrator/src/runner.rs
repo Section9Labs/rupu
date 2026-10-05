@@ -5955,6 +5955,7 @@ fn base_context_for_step(
                 output: sr.output.clone(),
                 success: sr.success,
                 skipped: sr.skipped,
+                error: sr.error.clone().unwrap_or_default(),
                 results,
                 sub_results,
                 findings: sr
@@ -9958,8 +9959,12 @@ fn mirrored_unit_tokens(transcript_path: &Path) -> (u64, u64) {
 /// text ([`rupu_transcript::final_turn_text`]: every text fragment of the
 /// final turn, the same rule the dispatch tool uses). The JSONL reader
 /// silently skips truncated lines, so this is robust against half-written
-/// transcripts. We do this even on failure so partial output is observable
-/// to downstream `when:` gates.
+/// transcripts.
+///
+/// A failed run's output is empty (spec 2026-10-01 §5.3): its final turn
+/// was refused, cut off or never answered, so the text on hand is an
+/// interim message or a truncated chain, not the step's answer. Callers
+/// carry the reason as the step's `error` (`steps.<id>.error`) and `cause`.
 pub fn read_final_assistant_text(
     transcript_path: &Path,
     success: bool,
@@ -9967,9 +9972,12 @@ pub fn read_final_assistant_text(
     step_id: &str,
 ) -> String {
     let mut output = String::new();
+    if !success {
+        return output;
+    }
     if let Ok(iter) = JsonlReader::iter(transcript_path) {
         output = rupu_transcript::final_turn_text(iter.flatten()).unwrap_or_default();
-    } else if success {
+    } else {
         warn!(
             run_id = %run_id,
             "transcript missing after step {}; using empty output",

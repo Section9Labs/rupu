@@ -109,6 +109,7 @@ impl AgentDispatcher for FakeDispatcher {
             transcript_path: path,
             output: "child says: code looks fine".into(),
             success: true,
+            error: None,
             tokens_used: 5,
             duration_ms: 7,
         })

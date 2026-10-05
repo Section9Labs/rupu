@@ -127,6 +127,7 @@ impl AgentDispatcher for FakeDispatcher {
             transcript_path: path,
             output: format!("{agent_name}: review complete"),
             success: true,
+            error: None,
             tokens_used: 7,
             duration_ms: 9,
         })
