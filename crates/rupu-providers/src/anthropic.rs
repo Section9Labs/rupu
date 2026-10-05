@@ -155,8 +155,13 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
 /// `Unknown` blocks are dropped too: they serialize as `{"type":"unknown"}`,
 /// which no provider accepts. A `Fallback` block is rewritten into Anthropic's
 /// own `{"type":"fallback","from":{"model":…},"to":{"model":…}}` shape and
-/// echoed in place.
-fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
+/// echoed in place — only when `echo_fallback`, i.e. this request itself
+/// carries the server-side fallback opt-in (beta + `"fallbacks"`). A request
+/// without it (an OAuth client, an API-key model outside the supported set,
+/// the opt-in switched off or refused) drops the block on the wire: the API
+/// does not accept it there. The echo rule's pre-boundary drops apply either
+/// way.
+fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str, echo_fallback: bool) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
     };
@@ -229,6 +234,9 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
                 index += 1;
                 keep
             });
+        }
+        if !echo_fallback {
+            restored.retain(|b| b.get("type").and_then(|v| v.as_str()) != Some("fallback"));
         }
         *blocks = restored;
     }
@@ -2210,7 +2218,11 @@ impl AnthropicClient {
         // Must run after `sanitize_messages_tool_names`: restoring reasoning
         // blocks last guarantees `raw` is echoed byte-exact and is never
         // touched by the tool-name sanitizer's block-rewriting pass.
-        restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
+        restore_reasoning_blocks(
+            &mut messages_value,
+            PROVIDER_TAG,
+            self.sends_server_side_fallback(&request.model),
+        );
         drop_emptied_messages(&mut messages_value);
 
         let max_tokens = request
@@ -4122,8 +4134,9 @@ mod tests {
     #[test]
     fn fallback_block_is_echoed_in_wire_shape() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
-            .with_prompt_cache(false);
-        let request = request_with_assistant_blocks(vec![
+            .with_prompt_cache(false)
+            .with_server_side_fallback(true);
+        let mut request = request_with_assistant_blocks(vec![
             ContentBlock::Fallback {
                 from_model: "a".into(),
                 to_model: "b".into(),
@@ -4132,12 +4145,59 @@ mod tests {
                 text: "the answer".into(),
             },
         ]);
+        // A request that itself carries the server-side fallback opt-in.
+        request.model = "claude-opus-5-5".into();
         let body = client.build_request_body(&request, false);
+        assert_eq!(body["fallbacks"], "default");
         assert_eq!(
             body["messages"][1]["content"][0],
             serde_json::json!({"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}})
         );
         assert_eq!(body["messages"][1]["content"][1]["type"], "text");
+    }
+
+    /// A request without the server-side fallback opt-in drops a stored
+    /// `fallback` block on the wire (the API accepts it only alongside the
+    /// beta), and still applies the echo rule's pre-boundary drops. OAuth
+    /// never opts in — e.g. a rupu-level hop onto an OAuth Anthropic provider,
+    /// or a `--continue` onto one.
+    #[test]
+    fn fallback_block_is_dropped_without_the_server_side_fallback_opt_in() {
+        let blocks = vec![
+            ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::Text { text: "a".into() },
+            ContentBlock::Fallback {
+                from_model: "x".into(),
+                to_model: "y".into(),
+            },
+            ContentBlock::Text { text: "b".into() },
+        ];
+        let expected = serde_json::json!([
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"},
+        ]);
+        let mut request = request_with_assistant_blocks(blocks);
+        request.model = "claude-opus-5-5".into();
+
+        let oauth = oauth_client()
+            .with_prompt_cache(false)
+            .with_server_side_fallback(true);
+        let body = oauth.build_request_body(&request, false);
+        assert!(body.get("fallbacks").is_none());
+        assert!(!build_oauth_beta_csv(&request.model, false).contains(SERVER_SIDE_FALLBACK_BETA));
+        assert_eq!(body["messages"][1]["content"], expected);
+
+        // API key with the switch off: no opt-in, so no echo either.
+        let api_key = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false)
+            .with_server_side_fallback(false);
+        let body = api_key.build_request_body(&request, false);
+        assert!(body.get("fallbacks").is_none());
+        assert_eq!(body["messages"][1]["content"], expected);
     }
 
     #[test]
@@ -6655,14 +6715,15 @@ mod tests {
     #[test]
     fn echo_rule_drops_thinking_and_tool_use_before_the_last_fallback() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
-            .with_prompt_cache(false);
+            .with_prompt_cache(false)
+            .with_server_side_fallback(true);
         let reasoning = |text: &str, sig: &str| ContentBlock::Reasoning {
             text: Some(text.into()),
             provider: PROVIDER_TAG.into(),
             model: "claude-opus-5-5".into(),
             raw: serde_json::json!({"type": "thinking", "thinking": text, "signature": sig}),
         };
-        let request = request_with_assistant_blocks(vec![
+        let mut request = request_with_assistant_blocks(vec![
             reasoning("before", "sig-1"),
             ContentBlock::ToolUse {
                 id: "toolu_1".into(),
@@ -6677,6 +6738,7 @@ mod tests {
             reasoning("after", "sig-2"),
             ContentBlock::Text { text: "b".into() },
         ]);
+        request.model = "claude-opus-5-5".into();
         let body = client.build_request_body(&request, false);
         assert_eq!(
             body["messages"][1]["content"],
@@ -8381,7 +8443,7 @@ mod tests {
             Message::user("c"),
         ];
         let mut expected = sanitize_messages_tool_names(serde_json::to_value(&messages).unwrap());
-        restore_reasoning_blocks(&mut expected, PROVIDER_TAG);
+        restore_reasoning_blocks(&mut expected, PROVIDER_TAG, false);
         let got = body_messages(messages);
         assert_eq!(serde_json::Value::Array(got), expected);
     }

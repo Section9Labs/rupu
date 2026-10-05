@@ -209,7 +209,9 @@ reply in one request.
   followed by a `recovery` with action `served_by_fallback` on rung 1. The
   reply's `fallback` boundary is written in place as an `assistant_block`
   event, and replay puts it back where it was: Anthropic requires it echoed in
-  that position on the next request.
+  that position on the next request. Only a request that itself carries the
+  opt-in echoes it; any other request, on OAuth or after the opt-in was turned
+  off or refused, leaves it out.
 - **Declined mid-output:** when the requested model stops part way through its
   reply, the API passes only the partial's text on to the fallback model. Tool
   calls and reasoning from before the boundary are abandoned: rupu never runs
