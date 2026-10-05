@@ -1,6 +1,6 @@
 //! The `FlowSink` port and its in-process adapters.
 
-use crate::record::{FlowId, FlowRecord};
+use crate::record::{FlowId, FlowRecord, SocketCompletion};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +16,10 @@ pub trait FlowSink: Send + Sync {
     /// Finalize a streamed body recorded earlier. Sinks that cannot
     /// express completion may ignore this.
     async fn complete(&self, id: FlowId, bytes_in: u64, duration_ms: u64);
+
+    /// Finalize a socket flow. Default no-op: sinks that don't persist
+    /// completions (e.g. the transcript bridge) ignore it.
+    async fn complete_socket(&self, _c: SocketCompletion) {}
 }
 
 /// Capture disabled.
@@ -68,6 +72,21 @@ impl FlowSink for FanoutSink {
             }
         }
     }
+
+    async fn complete_socket(&self, c: SocketCompletion) {
+        for child in &self.children {
+            let child = child.clone();
+            let c = c.clone();
+            if tokio::task::spawn(async move { child.complete_socket(c).await })
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    "netflow sink child panicked during complete_socket; continuing to remaining sinks"
+                );
+            }
+        }
+    }
 }
 
 /// Test double.
@@ -80,6 +99,7 @@ pub struct MemorySink {
 struct MemoryState {
     records: Vec<FlowRecord>,
     completions: Vec<(FlowId, u64, u64)>,
+    socket_completions: Vec<SocketCompletion>,
 }
 
 impl MemorySink {
@@ -96,6 +116,13 @@ impl MemorySink {
             .map(|s| s.completions.clone())
             .unwrap_or_default()
     }
+
+    pub fn socket_completions(&self) -> Vec<SocketCompletion> {
+        self.inner
+            .lock()
+            .map(|s| s.socket_completions.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -109,6 +136,12 @@ impl FlowSink for MemorySink {
     async fn complete(&self, id: FlowId, bytes_in: u64, duration_ms: u64) {
         if let Ok(mut s) = self.inner.lock() {
             s.completions.push((id, bytes_in, duration_ms));
+        }
+    }
+
+    async fn complete_socket(&self, c: SocketCompletion) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.socket_completions.push(c);
         }
     }
 }
@@ -140,6 +173,9 @@ mod tests {
             bytes_out: None,
             bytes_in: None,
             body_complete: true,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: None,
             duration_ms: None,
         }

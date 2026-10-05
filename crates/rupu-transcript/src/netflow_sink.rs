@@ -75,6 +75,9 @@ mod tests {
             bytes_out: None,
             bytes_in: Some(64),
             body_complete: true,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: Some(3),
             duration_ms: Some(9),
         }

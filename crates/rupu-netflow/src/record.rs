@@ -17,6 +17,11 @@ pub enum Fidelity {
     /// Host, outcome and timing only — recorded at a connector boundary
     /// whose HTTP stack we do not own (`octocrab`).
     Coarse,
+    /// Connection-level: process, remote IP:port, bytes and timing
+    /// observed from the OS socket table (spec 2026-10-04). No URL,
+    /// method or HTTP status. More observable than `Coarse`, less than
+    /// `Http`.
+    Socket,
     /// Exact request/response metadata from the instrumented client.
     Http,
     /// Frame-level capture from the microVM backend. Not emitted yet.
@@ -30,6 +35,22 @@ pub enum Outcome {
     HttpError,
     TransportError,
     Timeout,
+}
+
+/// The process that owned a captured socket (socket flows only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowProcess {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// Connection direction for socket flows. `None` on a record means
+/// unknown — e.g. Linux v1 does not populate it (spec 2026-10-04 18 V1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Outbound,
+    Inbound,
 }
 
 /// One outbound request.
@@ -55,6 +76,14 @@ pub struct FlowRecord {
     pub peer_ip: Option<IpAddr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolved_ips: Vec<IpAddr>,
+    /// The process that owned the socket (socket flows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<FlowProcess>,
+    /// `"ip:port"` of the local end, for correlating with other logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_version: Option<String>,
@@ -84,6 +113,33 @@ pub struct FlowRecord {
     pub duration_ms: Option<u64>,
 }
 
+/// Finalizes a socket flow at close: byte counts, final outcome and an
+/// optional note. Any `Some` field overwrites the flow when folded;
+/// `None` leaves it as written. `duration_ms` always applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketCompletion {
+    pub id: FlowId,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_out: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What the subprocess-capture backend could do for a run. Written as a
+/// `LedgerLine::Capture` so the CP can surface "capture unavailable:
+/// <reason>" honestly (spec 2026-10-04 13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CaptureState {
+    Active { backend: String },
+    Unavailable { reason: String },
+}
+
 /// One line of the append-only ledger.
 ///
 /// `Flow` is boxed because it dwarfs the other variants — clippy's
@@ -103,6 +159,19 @@ pub enum LedgerLine {
         count: u64,
         ts: DateTime<Utc>,
     },
+    /// Finalizes a socket flow at close. Separate from `Complete` (the
+    /// HTTP streamed-body finalizer) so the HTTP path is untouched. Any
+    /// `Some` field overwrites the flow; `None` leaves it as written.
+    SocketComplete(SocketCompletion),
+    /// Capture availability for a run, plus any visible-loss note.
+    Capture {
+        ts: DateTime<Utc>,
+        state: CaptureState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -120,6 +189,7 @@ mod tests {
                 step_id: Some("step-1".into()),
                 agent: Some("reviewer".into()),
                 workspace_id: Some("ws-1".into()),
+                tool_call_id: None,
                 origin: Origin::Provider("anthropic".into()),
             },
             fidelity: Fidelity::Http,
@@ -137,6 +207,9 @@ mod tests {
             bytes_out: Some(1234),
             bytes_in: None,
             body_complete: false,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: Some(42),
             duration_ms: None,
         }

@@ -116,6 +116,7 @@ pub fn origin_key(origin: &Origin) -> String {
     match origin {
         Origin::Provider(name) => format!("provider:{name}"),
         Origin::Scm(name) => format!("scm:{name}"),
+        Origin::Subprocess(name) => format!("subprocess:{name}"),
         Origin::Update => "update".to_string(),
         Origin::Cp => "cp".to_string(),
         Origin::System => "system".to_string(),
@@ -580,8 +581,9 @@ pub fn timeline_view(
                 .map(|f| f.flow.fidelity)
                 .min_by_key(|f| match f {
                     Fidelity::Coarse => 0u8,
-                    Fidelity::Http => 1,
-                    Fidelity::Full => 2,
+                    Fidelity::Socket => 1,
+                    Fidelity::Http => 2,
+                    Fidelity::Full => 3,
                 })
                 .unwrap_or(Fidelity::Coarse);
             let org_id = org_key_of(acc.attribution.asn.as_ref());
@@ -756,6 +758,7 @@ mod tests {
                     step_id: None,
                     agent: None,
                     workspace_id: None,
+                    tool_call_id: None,
                     origin,
                 },
                 fidelity: Fidelity::Http,
@@ -773,6 +776,9 @@ mod tests {
                 bytes_out: Some(10),
                 bytes_in: Some(20),
                 body_complete: true,
+                process: None,
+                local_addr: None,
+                direction: None,
                 ttfb_ms: Some(5),
                 duration_ms: Some(30),
             },

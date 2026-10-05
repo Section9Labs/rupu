@@ -28,6 +28,7 @@ async fn provider_client_records_flows_with_provider_origin() {
             step_id: None,
             agent: None,
             workspace_id: None,
+            tool_call_id: None,
             origin: Origin::Provider("anthropic".into()),
         },
         rupu_providers::tuning::ProviderTuning::default().http_client_builder(),

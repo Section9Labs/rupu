@@ -74,6 +74,7 @@ async fn records_a_successful_request() {
             step_id: Some("step-2".into()),
             agent: Some("reviewer".into()),
             workspace_id: Some("ws".into()),
+            tool_call_id: None,
             origin: Origin::Provider("anthropic".into()),
         },
         reqwest::Client::builder(),
@@ -448,6 +449,7 @@ fn run_ctx(run: &str) -> FlowCtx {
         step_id: None,
         agent: None,
         workspace_id: None,
+        tool_call_id: None,
         origin: Origin::Provider("anthropic".into()),
     }
 }

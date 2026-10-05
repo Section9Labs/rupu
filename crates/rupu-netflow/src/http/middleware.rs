@@ -81,6 +81,9 @@ impl Middleware for NetflowMiddleware {
             bytes_out,
             bytes_in: None,
             body_complete: false,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: Some(elapsed_ms),
             duration_ms: None,
         };

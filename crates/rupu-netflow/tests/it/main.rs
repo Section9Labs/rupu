@@ -7,3 +7,4 @@
 mod capture;
 mod choke_point;
 mod feature_split;
+mod record_model;

@@ -57,9 +57,29 @@ pub fn read_flows_and_dropped(path: &Path) -> std::io::Result<(Vec<FlowRecord>, 
                     flows[i].body_complete = true;
                 }
             }
+            LedgerLine::SocketComplete(c) => {
+                if let Some(&i) = index.get(&c.id) {
+                    if let Some(b) = c.bytes_in {
+                        flows[i].bytes_in = Some(b);
+                    }
+                    if let Some(b) = c.bytes_out {
+                        flows[i].bytes_out = Some(b);
+                    }
+                    if let Some(o) = c.outcome {
+                        flows[i].outcome = o;
+                    }
+                    if c.error.is_some() {
+                        flows[i].error = c.error;
+                    }
+                    flows[i].duration_ms = Some(c.duration_ms);
+                    flows[i].body_complete = true;
+                }
+            }
             LedgerLine::Dropped { count, .. } => {
                 dropped += count;
             }
+            // Capture-availability lines carry no flow data.
+            LedgerLine::Capture { .. } => {}
         }
     }
 
@@ -376,6 +396,7 @@ mod tests {
                 step_id: Some("s1".into()),
                 agent: Some("reviewer".into()),
                 workspace_id: Some("ws".into()),
+                tool_call_id: None,
                 origin: Origin::Provider("anthropic".into()),
             },
             fidelity: Fidelity::Http,
@@ -393,6 +414,9 @@ mod tests {
             bytes_out: Some(100),
             bytes_in: Some(200),
             body_complete: true,
+            process: None,
+            local_addr: None,
+            direction: None,
             ttfb_ms: Some(10),
             duration_ms: Some(ms),
         }

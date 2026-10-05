@@ -36,6 +36,7 @@
 //! sink — callers supply their run's `Arc<dyn FlowSink>` explicitly.
 
 pub mod asn;
+pub mod capture;
 pub mod ctx;
 #[cfg(feature = "http")]
 pub mod http;
@@ -44,11 +45,15 @@ pub mod record;
 pub mod sink;
 
 pub use asn::{AsnInfo, AsnTable};
+pub use capture::{CallAttribution, CaptureCall, NoopCapture, SubprocessCapture};
 pub use ctx::{FlowCtx, Origin};
 pub use ledger::{
     ensure_netflow_dir, global_netflow_dir, is_per_run_ledger_path, netflow_dir,
     project_local_netflow_dir, NetflowPaths, NetflowWriter, NetflowWriterHandle,
     LEGACY_LEDGER_FILENAME,
 };
-pub use record::{Fidelity, FlowId, FlowRecord, LedgerLine, Outcome};
+pub use record::{
+    CaptureState, Direction, Fidelity, FlowId, FlowProcess, FlowRecord, LedgerLine, Outcome,
+    SocketCompletion,
+};
 pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};
