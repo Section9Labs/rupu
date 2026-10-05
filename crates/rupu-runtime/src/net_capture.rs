@@ -30,12 +30,31 @@ pub fn shared(cfg: &NetflowConfig) -> Arc<dyn SubprocessCapture> {
 /// The backend decision, with the env override passed in. Not memoized; use
 /// [`shared`] outside tests.
 ///
-/// The real OS backends arrive with the Linux/macOS plans; until then every
-/// enabled platform gets the backend that announces capture as unavailable.
+/// Enabled on Linux gets the real backend; other platforms get the backend
+/// that announces capture as unavailable until their backend lands.
 pub(crate) fn choose(cfg: &NetflowConfig, env_disabled: bool) -> Arc<dyn SubprocessCapture> {
     if !cfg.subprocess_capture || env_disabled {
         return Arc::new(NoopCapture);
     }
+    enabled_backend(cfg)
+}
+
+/// Linux: start the real cgroup/conntrack backend; if it cannot start here
+/// (no cgroup delegation, no conntrack...) announce why instead of going
+/// silent.
+#[cfg(target_os = "linux")]
+fn enabled_backend(cfg: &NetflowConfig) -> Arc<dyn SubprocessCapture> {
+    let linger = chrono::Duration::milliseconds(cfg.subprocess_linger_ms as i64);
+    let poll = std::time::Duration::from_millis(cfg.subprocess_poll_ms);
+    match rupu_netwatch::linux::LinuxCapture::start(linger, poll) {
+        Ok(cap) => Arc::new(cap),
+        Err(reason) => Arc::new(UnsupportedCapture::new(reason)),
+    }
+}
+
+/// Platforms without a capture backend yet announce capture as unavailable.
+#[cfg(not(target_os = "linux"))]
+fn enabled_backend(_cfg: &NetflowConfig) -> Arc<dyn SubprocessCapture> {
     Arc::new(UnsupportedCapture::new(
         "subprocess capture backend not built for this platform yet",
     ))
@@ -80,6 +99,7 @@ mod tests {
         assert!(sink.capture_states().is_empty());
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn enabled_config_returns_backend_that_announces_unavailable() {
         let cap = choose(&cfg(true), false);
@@ -90,6 +110,24 @@ mod tests {
         let lines = sink.capture_states();
         assert_eq!(lines.len(), 1);
         assert!(matches!(lines[0].state, CaptureState::Unavailable { .. }));
+    }
+
+    /// Proves the linux arm wires `LinuxCapture` (a real cgroup-backed
+    /// prefix), not `UnsupportedCapture`. Needs cgroup delegation.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    #[ignore = "creates a cgroup root; needs cgroup v2 delegation (run on kali6)"]
+    async fn enabled_on_linux_returns_a_working_backend() {
+        let cap = choose(&cfg(true), false);
+        let sink = Arc::new(MemorySink::default());
+        let call = cap.begin(attribution(&sink));
+        settle().await;
+        assert!(
+            call.shell_prefix().is_some(),
+            "linux backend should hand back a cgroup shell prefix; states: {:?}",
+            sink.capture_states()
+        );
     }
 
     #[tokio::test]
