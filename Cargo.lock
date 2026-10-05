@@ -4887,6 +4887,7 @@ dependencies = [
  "rupu-auth",
  "rupu-config",
  "rupu-netflow",
+ "rupu-netwatch",
  "rupu-providers",
  "serde",
  "serde_json",
