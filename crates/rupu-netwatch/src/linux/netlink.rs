@@ -3,12 +3,14 @@
 //! [`super::parse`].
 
 use std::io;
+use std::time::Duration;
 
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::net::netlink::{SocketAddrNetlink, SOCK_DIAG};
 use rustix::net::{
-    bind, recv, send, socket_with, sockopt, AddressFamily, RecvFlags, SendFlags, SocketFlags,
-    SocketType,
+    bind, recv, send, socket_with,
+    sockopt::{self, Timeout},
+    AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType,
 };
 
 use super::req::DESTROY_GROUPS;
@@ -45,14 +47,47 @@ impl DiagSocket {
     }
 
     /// Receive one datagram into `buf`, returning the bytes written.
+    ///
+    /// This BLOCKS until a datagram arrives or the receive timeout set by
+    /// [`set_recv_timeout`](Self::set_recv_timeout) expires (then it fails
+    /// with `WouldBlock`/`TimedOut`).
+    ///
+    /// Errors worth handling:
+    /// - `ENOBUFS` surfaces as a plain `io::Error`: the kernel dropped
+    ///   multicast events because the receive buffer overflowed. The caller
+    ///   should keep receiving and record the visible loss.
+    /// - `ErrorKind::Interrupted` (`EINTR`) means retry.
+    /// - `ErrorKind::InvalidData` means the datagram was larger than `buf`
+    ///   and was truncated; it is never returned as if it were complete.
     pub fn recv_into(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let (written, _) = recv(&self.fd, buf, RecvFlags::empty())?;
+        let cap = buf.len();
+        // With `MSG_TRUNC` the second value is the datagram's real length,
+        // which may exceed `cap`.
+        let (written, real_len) = recv(&self.fd, buf, RecvFlags::TRUNC)?;
+        if real_len > cap {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
         Ok(written)
     }
 
-    /// Best-effort `SO_RCVBUF` bump; errors are ignored.
+    /// Set (or clear, with `None`) the receive timeout so a poller never
+    /// blocks forever in [`recv_into`](Self::recv_into). A zero duration is
+    /// rejected by the kernel/rustix; pass `None` to block indefinitely.
+    pub fn set_recv_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        sockopt::set_socket_timeout(&self.fd, Timeout::Recv, d)?;
+        Ok(())
+    }
+
+    /// Best-effort `SO_RCVBUF` bump. The kernel clamps the value to
+    /// `net.core.rmem_max` and errors are ignored.
     pub fn set_rcvbuf(&self, bytes: usize) {
         let _ = sockopt::set_socket_recv_buffer_size(&self.fd, bytes);
+    }
+}
+
+impl AsFd for DiagSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

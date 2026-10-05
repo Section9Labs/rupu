@@ -128,7 +128,13 @@ mod fsops {
         pub fn create_call(&self, seq: u64) -> io::Result<CallCgroup> {
             let dir = self.root.join(format!("call-{seq}"));
             fs::create_dir(&dir)?;
-            let id = fs::metadata(&dir)?.ino();
+            let id = match fs::metadata(&dir) {
+                Ok(m) => m.ino(),
+                Err(e) => {
+                    let _ = fs::remove_dir(&dir);
+                    return Err(e);
+                }
+            };
             Ok(CallCgroup {
                 id,
                 procs_path: dir.join("cgroup.procs"),
@@ -140,11 +146,12 @@ mod fsops {
         /// Shell text that moves the shell that runs it into this cgroup.
         /// Prefix it to the command line; failures are silenced so a command
         /// still runs (uncaptured) if the move is refused.
+        ///
+        /// The path is single-quoted with embedded `'` escaped as `'\''`, so
+        /// a cgroup directory name can never break out of the quoting.
         pub fn shell_prefix(&self) -> String {
-            format!(
-                "{{ printf '%d\\n' \"$$\" > '{}'; }} 2>/dev/null",
-                self.procs_path.display()
-            )
+            let p = self.procs_path.to_string_lossy().replace('\'', "'\\''");
+            format!("{{ printf '%d\\n' \"$$\" > '{p}'; }} 2>/dev/null")
         }
 
         /// Remove the cgroup directory if no process is left in it. Errors
@@ -300,6 +307,10 @@ mod fsops {
 
     /// Obtain a delegated capture root (spec §9.1). `Err` carries the reason
     /// capture is unavailable; partially created directories are removed.
+    ///
+    /// This BLOCKS: it runs `systemctl`/`busctl` subprocesses and polls for
+    /// up to 2s. Call it from a plain thread or `spawn_blocking`, never on an
+    /// async runtime worker.
     pub fn setup_root() -> Result<CaptureRoot, String> {
         let uid = geteuid().as_raw();
         let own = self_cgroup()?;
@@ -349,6 +360,18 @@ mod fsops {
                 c.shell_prefix(),
                 "{ printf '%d\\n' \"$$\" > '/sys/fs/cgroup/x/call-1/cgroup.procs'; } 2>/dev/null"
             );
+        }
+
+        #[test]
+        fn shell_prefix_escapes_single_quotes_in_the_path() {
+            let c = CallCgroup {
+                id: 7,
+                procs_path: PathBuf::from("/x/a'b/call-1/cgroup.procs"),
+            };
+            let p = c.shell_prefix();
+            assert!(p.contains("'/x/a'\\''b/call-1/cgroup.procs'"), "{p}");
+            // Removing the escape sequences leaves balanced quotes only.
+            assert_eq!(p.replace("'\\''", "").matches('\'').count() % 2, 0, "{p}");
         }
 
         #[test]
