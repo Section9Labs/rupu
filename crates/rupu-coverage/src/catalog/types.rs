@@ -12,6 +12,19 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// The wire name (`critical`, `high`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Low => "low",
+            Severity::Medium => "medium",
+            Severity::High => "high",
+            Severity::Critical => "critical",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Concern {
     pub id: String,

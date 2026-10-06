@@ -3,6 +3,7 @@ pub mod events;
 pub mod ingest;
 pub mod manifest;
 pub mod paths;
+pub mod query;
 pub mod stream;
 pub mod tags;
 pub mod target_id;
@@ -16,6 +17,10 @@ pub use events::{
 pub use ingest::{ingest_unit_stream, IngestError, IngestReport, IngestSource};
 pub use manifest::{append_manifest, find_manifest, read_manifests, RunManifest};
 pub use paths::CoveragePaths;
+pub use query::{
+    query, query_input_schema, query_response, select, severity_rank, tags_in_use, FindingQuery,
+    FindingRow, Page, QueryError, TagCount, TagMode, DEFAULT_LIMIT, MAX_LIMIT,
+};
 pub use stream::{
     append_record, stream_catalog, stream_path, write_stream_begin, Ledger, RunStream, StreamLine,
     STREAM_FILE, STREAM_VERSION,

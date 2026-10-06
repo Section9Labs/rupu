@@ -61,6 +61,10 @@ pub use ledger::{
     TagActor, TagChange, TagError, TagEvent, TagLog, TagOp, TagOutcome, TagParseError,
     MAX_TAGS_PER_FINDING, STREAM_FILE, STREAM_VERSION, TAG_LOG_FILE,
 };
+pub use ledger::{
+    query, query_input_schema, query_response, select, severity_rank, tags_in_use, FindingQuery,
+    FindingRow, Page, QueryError, TagCount, TagMode, DEFAULT_LIMIT, MAX_LIMIT,
+};
 pub use report::{
     Classification, DisasmLine, EvidenceBlock, FindingProfile, FindingReport, FindingWriteOptions,
     Verification, VerificationStatus,
