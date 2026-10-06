@@ -134,3 +134,17 @@ pub fn config_paths_for_customer(
         ..ConfigPaths::without_customer(home, project_root)
     })
 }
+
+/// The workflow file `name` resolves to from a project: the project's
+/// `.rupu/workflows/<name>.yaml` first, then `<global>/workflows/<name>.yaml`
+/// — `rupu workflow run`'s lookup, shared by the CLI and the CP's launch
+/// preview so the two can never find different files. `None` when neither
+/// exists.
+pub fn locate_workflow(global: &Path, project_root: Option<&Path>, name: &str) -> Option<PathBuf> {
+    let file = format!("{name}.yaml");
+    project_root
+        .map(|r| r.join(".rupu").join("workflows").join(&file))
+        .into_iter()
+        .chain(std::iter::once(global.join("workflows").join(&file)))
+        .find(|p| p.is_file())
+}

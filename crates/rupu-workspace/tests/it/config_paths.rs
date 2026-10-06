@@ -176,3 +176,29 @@ fn config_paths_for_customer_uses_the_slug_and_refuses_an_unknown_one() {
         Err(rupu_workspace::CustomerError::NotFound(_))
     ));
 }
+
+#[test]
+fn locate_workflow_prefers_the_project_then_the_global_layer() {
+    let (_tmp, home, project) = setup();
+    let wf = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("w.yaml"), "name: w\n").unwrap();
+        dir.join("w.yaml")
+    };
+    let global = wf(&home.join("workflows"));
+    assert_eq!(
+        rupu_workspace::locate_workflow(&home, Some(&project), "w"),
+        Some(global.clone())
+    );
+    let local = wf(&project.join(".rupu/workflows"));
+    assert_eq!(
+        rupu_workspace::locate_workflow(&home, Some(&project), "w"),
+        Some(local)
+    );
+    // No project: global only; unknown name: none.
+    assert_eq!(
+        rupu_workspace::locate_workflow(&home, None, "w"),
+        Some(global)
+    );
+    assert_eq!(rupu_workspace::locate_workflow(&home, None, "x"), None);
+}

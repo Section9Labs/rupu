@@ -104,6 +104,11 @@ fn push(
         if !existing.agents.iter().any(|a| a == agent) {
             existing.agents.push(agent.to_string());
         }
+        // Agents can reach one account from different places (one names it,
+        // another inherits it); keep every distinct origin.
+        if !existing.source.split("; ").any(|s| s == source) {
+            existing.source = format!("{}; {source}", existing.source);
+        }
         return;
     }
     out.push(ManifestEntry {
@@ -116,7 +121,7 @@ fn push(
 }
 
 /// Accounts a run will use. Deduplicates by (role, account), merging
-/// `agents`; the first agent's `source` is kept. `scm` is appended as given.
+/// `agents` and joining each distinct `source` with "; ". `scm` is appended as given.
 pub fn credential_manifest(
     cfg: &Config,
     provenance: &BTreeMap<String, KeyProvenance>,
@@ -308,11 +313,14 @@ mod tests {
                 agent("a", None),
                 agent("b", Some("anthropic")),
                 agent("a", None),
+                agent("c", Some("anthropic")),
             ],
             None,
         );
         assert_eq!(m.len(), 1);
-        assert_eq!(m[0].agents, vec!["a", "b"]);
+        assert_eq!(m[0].agents, vec!["a", "b", "c"]);
+        // Inherited by `a`, named by `b` and `c`: both origins, once each.
+        assert_eq!(m[0].source, "built-in default; agent frontmatter");
     }
 
     #[test]

@@ -121,6 +121,29 @@ fn fixture() -> Fixture {
     }
 }
 
+/// An api-key credential for `account` in the test home's auth file, so the
+/// account counts as registered (a connector builds only with credentials).
+async fn store_credential(global: &Path, account: &str) {
+    rupu_auth::KeychainResolver::at(global.join("auth.json"))
+        .store_named(
+            account,
+            rupu_providers::AuthMode::ApiKey,
+            &rupu_auth::StoredCredential::api_key("test-key"),
+        )
+        .await
+        .unwrap();
+}
+
+async fn preview_w(base: &str, f: &Fixture) -> Value {
+    let resp = post(
+        base,
+        json!({ "workflow": "w", "working_dir": f.project.display().to_string() }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.json().await.unwrap()
+}
+
 async fn post(base: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("{base}/api/launch/preview"))
@@ -142,6 +165,7 @@ fn account<'a>(body: &'a Value, role: &str, account: &str) -> &'a Value {
 #[tokio::test]
 async fn previews_the_customer_provider_fallback_and_scm_accounts() {
     let f = fixture();
+    store_credential(&f.global, "github-acme").await;
     let base = spawn(&f.global).await;
     let resp = post(
         &base,
@@ -195,6 +219,7 @@ async fn previews_a_single_agent_and_attributes_a_pinned_provider() {
 #[tokio::test]
 async fn an_unknown_agent_in_a_workflow_is_a_warning_not_an_error() {
     let f = fixture();
+    store_credential(&f.global, "github-acme").await;
     std::fs::write(
         f.project.join(".rupu/workflows/ghosty.yaml"),
         "name: ghosty\nsteps:\n  - id: one\n    agent: ghost\n    prompt: hi\n",
@@ -274,21 +299,17 @@ async fn the_body_must_name_exactly_one_target() {
 }
 
 #[tokio::test]
-async fn several_accounts_and_no_matching_rule_is_a_warning() {
+async fn several_credentialed_accounts_and_no_matching_rule_is_a_warning() {
     let f = fixture();
+    store_credential(&f.global, "github-acme").await;
+    store_credential(&f.global, "github-other").await;
     std::fs::write(
         f.global.join("config.toml"),
-        "[scm.github-acme]\nkind = \"github\"\n",
+        "[scm.github-acme]\nkind = \"github\"\n\n[scm.github-other]\nkind = \"github\"\n",
     )
     .unwrap();
     let base = spawn(&f.global).await;
-    let resp = post(
-        &base,
-        json!({ "workflow": "w", "working_dir": f.project.display().to_string() }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.unwrap();
+    let body = preview_w(&base, &f).await;
     assert!(
         body["accounts"]
             .as_array()
@@ -307,9 +328,132 @@ async fn several_accounts_and_no_matching_rule_is_a_warning() {
     );
 }
 
+/// An account declared without a credential is not registered at run time,
+/// so it neither makes the choice ambiguous nor gets picked.
+#[tokio::test]
+async fn an_uncredentialed_declared_account_is_not_a_candidate() {
+    let f = fixture();
+    store_credential(&f.global, "github-acme").await;
+    std::fs::write(
+        f.global.join("config.toml"),
+        "[scm.github-acme]\nkind = \"github\"\n\n[scm.github-other]\nkind = \"github\"\n",
+    )
+    .unwrap();
+    let base = spawn(&f.global).await;
+    let body = preview_w(&base, &f).await;
+    assert_eq!(
+        account(&body, "scm", "github-acme")["source"],
+        "only github account"
+    );
+    assert_eq!(body["warnings"], json!([]));
+}
+
+#[tokio::test]
+async fn a_rule_naming_an_uncredentialed_account_is_a_warning() {
+    let f = fixture(); // rule owner = acme-corp -> github-acme, no credential
+    let base = spawn(&f.global).await;
+    let body = preview_w(&base, &f).await;
+    // No credentialed github account at all.
+    assert!(
+        body["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["role"] != "scm"),
+        "{body}"
+    );
+    assert!(
+        body["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("no github account has stored credentials")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_credential_store_keeps_the_account_and_says_so() {
+    let f = fixture();
+    std::fs::write(f.global.join("auth.json"), "{ not json").unwrap();
+    let base = spawn(&f.global).await;
+    let body = preview_w(&base, &f).await;
+    assert_eq!(
+        account(&body, "scm", "github-acme")["source"],
+        "rule owner = acme-corp · credentials not checked"
+    );
+    assert!(
+        body["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("credential store could not be read")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_origin_off_github_and_gitlab_com_is_a_warning() {
+    let f = fixture();
+    git(
+        &f.project,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://git.example.com/acme/web.git",
+        ],
+    );
+    let base = spawn(&f.global).await;
+    let body = preview_w(&base, &f).await;
+    assert!(
+        body["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["role"] != "scm"),
+        "{body}"
+    );
+    let warnings = body["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| {
+            let w = w.as_str().unwrap();
+            w.contains("https://git.example.com/acme/web.git") && w.contains("can't be previewed")
+        }),
+        "{body}"
+    );
+}
+
+/// One malformed agent file fails the loader for every agent; that is ONE
+/// warning, not one per agent.
+#[tokio::test]
+async fn a_malformed_agent_file_warns_once() {
+    let f = fixture();
+    std::fs::write(f.project.join(".rupu/agents/broken.md"), "no frontmatter\n").unwrap();
+    std::fs::write(
+        f.project.join(".rupu/workflows/two.yaml"),
+        "name: two\nsteps:\n  - id: a\n    agent: echo\n    prompt: x\n  - id: b\n    agent: pinned\n    prompt: y\n",
+    )
+    .unwrap();
+    let base = spawn(&f.global).await;
+    let resp = post(
+        &base,
+        json!({ "workflow": "two", "working_dir": f.project.display().to_string() }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    let loads = body["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w.as_str().unwrap().contains("could not be loaded"))
+        .count();
+    assert_eq!(loads, 1, "{body}");
+}
+
 #[tokio::test]
 async fn a_project_scope_selects_the_launch_directory() {
     let f = fixture();
+    store_credential(&f.global, "github-acme").await;
     let base = spawn(&f.global).await;
     let resp = post(
         &base,

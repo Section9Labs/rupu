@@ -4456,19 +4456,8 @@ pub(crate) fn locate_workflow_in(
     project_root: Option<&Path>,
     name: &str,
 ) -> anyhow::Result<PathBuf> {
-    if let Some(project_root) = project_root {
-        let candidate = project_root
-            .join(".rupu/workflows")
-            .join(format!("{name}.yaml"));
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    let candidate = global.join("workflows").join(format!("{name}.yaml"));
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
-    Err(anyhow::anyhow!("workflow not found: {name}"))
+    rupu_workspace::locate_workflow(global, project_root, name)
+        .ok_or_else(|| anyhow::anyhow!("workflow not found: {name}"))
 }
 
 fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {

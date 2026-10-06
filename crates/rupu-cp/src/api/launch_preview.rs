@@ -161,7 +161,7 @@ fn build(global: &FsPath, dir: &FsPath, target: Target, name: &str) -> ApiResult
     let agent_names: Vec<String> = match target {
         Target::Agent => vec![name.to_string()],
         Target::Workflow => {
-            let path = locate_workflow(global, project_root.as_deref(), name)
+            let path = rupu_workspace::locate_workflow(global, project_root.as_deref(), name)
                 .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
             let wf = rupu_orchestrator::Workflow::parse_file(&path)
                 .map_err(|e| ApiError::conflict(format!("workflow {name} does not parse: {e}")))?;
@@ -181,7 +181,15 @@ fn build(global: &FsPath, dir: &FsPath, target: Target, name: &str) -> ApiResult
                     "agent `{agent}` was not found; its accounts are not listed"
                 ));
             }
-            Err(e) => warnings.push(format!("agent `{agent}` could not be loaded: {e}")),
+            Err(e) => {
+                // The loader reads the whole agents directory, so one
+                // malformed file fails the lookup of every agent: say so once.
+                warnings.push(format!(
+                    "agent definitions could not be loaded: {e}; \
+                     the accounts of this launch's agents are not listed"
+                ));
+                break;
+            }
         }
     }
     let facts: Vec<AgentFacts<'_>> = specs
@@ -193,7 +201,7 @@ fn build(global: &FsPath, dir: &FsPath, target: Target, name: &str) -> ApiResult
         })
         .collect();
 
-    let scm = scm_entry(cfg, dir, &mut warnings);
+    let scm = scm_entry(global, cfg, dir, &mut warnings);
     let accounts = credential_manifest(cfg, &resolved.provenance, &facts, scm);
     Ok(PreviewResponse {
         customer,
@@ -203,27 +211,31 @@ fn build(global: &FsPath, dir: &FsPath, target: Target, name: &str) -> ApiResult
     })
 }
 
-/// Project `.rupu/workflows/<name>.yaml`, then global — where a launch finds
-/// it (`rupu workflow run`'s own lookup).
-fn locate_workflow(global: &FsPath, project_root: Option<&FsPath>, name: &str) -> Option<PathBuf> {
-    let file = format!("{name}.yaml");
-    project_root
-        .map(|r| r.join(".rupu").join("workflows").join(&file))
-        .into_iter()
-        .chain(std::iter::once(global.join("workflows").join(&file)))
-        .find(|p| p.is_file())
-}
-
 /// The SCM account the launch directory's `origin` repo resolves to, as the
 /// registry would pick it. `None` (with a warning when the config is
-/// ambiguous or broken) when there is nothing to report.
+/// ambiguous, broken, or the remote is not one rupu can resolve) when there
+/// is nothing to report.
+///
+/// Candidates are the config-declared accounts of the repo's platform THAT
+/// HAVE A CREDENTIAL — `Registry::discover` registers an account only when
+/// its connector builds, so an uncredentialed `[scm.<name>]` table is not a
+/// candidate at run time and must not make the choice look ambiguous here.
+/// When the credential store cannot be read the account is kept (presence is
+/// unknown) and the result says it was not checked.
 fn scm_entry(
+    global: &FsPath,
     cfg: &rupu_config::Config,
     dir: &FsPath,
     warnings: &mut Vec<String>,
 ) -> Option<ManifestEntry> {
     let remote = rupu_workspace::store::detect_repo_remote(dir)?;
-    let web = rupu_scm::weburl::parse_repo_remote(&remote)?;
+    let Some(web) = rupu_scm::weburl::parse_repo_remote(&remote) else {
+        warnings.push(format!(
+            "origin `{remote}` is not a github.com/gitlab.com remote — \
+             its SCM account can't be previewed"
+        ));
+        return None;
+    };
     let repo = rupu_scm::RepoRef {
         platform: web.platform,
         owner: web.owner.clone(),
@@ -239,20 +251,41 @@ fn scm_entry(
             names.push(name.clone());
         }
     }
-    let candidates: Vec<AccountId> = names
-        .into_iter()
-        .filter(|name| {
-            let kind = cfg
-                .scm
-                .platforms
-                .get(name)
-                .and_then(|p| p.kind.as_deref())
-                .and_then(|k| k.parse::<Platform>().ok())
-                .or_else(|| name.parse::<Platform>().ok());
-            kind == Some(repo.platform)
-        })
-        .map(AccountId::new)
-        .collect();
+    let declared = names.into_iter().filter(|name| {
+        let kind = cfg
+            .scm
+            .platforms
+            .get(name)
+            .and_then(|p| p.kind.as_deref())
+            .and_then(|k| k.parse::<Platform>().ok())
+            .or_else(|| name.parse::<Platform>().ok());
+        kind == Some(repo.platform)
+    });
+
+    let resolver = rupu_auth::KeychainResolver::for_home(global);
+    let mut unchecked = false;
+    let mut candidates: Vec<AccountId> = Vec::new();
+    for name in declared {
+        match resolver.has_credential_named(&name) {
+            Ok(true) => candidates.push(AccountId::new(name)),
+            Ok(false) => {}
+            Err(e) => {
+                if !unchecked {
+                    warnings.push(format!(
+                        "the credential store could not be read ({e}); SCM accounts are \
+                         listed as if their credentials exist"
+                    ));
+                }
+                unchecked = true;
+                candidates.push(AccountId::new(name));
+            }
+        }
+    }
+    let if_creds = if unchecked {
+        " if its credentials exist"
+    } else {
+        ""
+    };
 
     let rules: Vec<Rule> = cfg.scm.rules.iter().map(Rule::from_config).collect();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -280,7 +313,11 @@ fn scm_entry(
         account: account.0.clone(),
         kind: Some(repo.platform.as_str().to_string()),
         agents: Vec::new(),
-        source,
+        source: if unchecked {
+            format!("{source} · credentials not checked")
+        } else {
+            source
+        },
     };
     match resolve_account(
         &rules,
@@ -297,8 +334,8 @@ fn scm_entry(
         Resolution::Explicit(_) => None,
         Resolution::RuleTargetUnavailable { account, pattern } => {
             warnings.push(format!(
-                "SCM rule `{pattern}` selects account `{}`, which is not configured; \
-                 SCM calls for {}/{} will fail",
+                "SCM rule `{pattern}` selects account `{}`, which is not configured \
+                 or has no stored credentials; SCM calls for {}/{} will fail",
                 account.0, repo.owner, repo.repo
             ));
             None
@@ -307,7 +344,7 @@ fn scm_entry(
             let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
             warnings.push(format!(
                 "{} {} accounts are configured ({}) and no [[scm.rules]] entry matches {}/{}; \
-                 SCM calls will fail until a rule selects one",
+                 SCM calls will fail until a rule selects one{if_creds}",
                 names.len(),
                 repo.platform,
                 names.join(", "),
@@ -318,7 +355,7 @@ fn scm_entry(
         }
         Resolution::NoAccounts => {
             warnings.push(format!(
-                "no {} account is configured for {}/{}",
+                "no {} account has stored credentials, so SCM calls for {}/{} would fail",
                 repo.platform, repo.owner, repo.repo
             ));
             None

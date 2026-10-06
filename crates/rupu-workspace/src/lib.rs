@@ -34,7 +34,9 @@ pub use autoflow_claim_store::{
 pub use autoflow_worktree::{
     ensure_issue_worktree, remove_issue_worktree, AutoflowWorktree, AutoflowWorktreeError,
 };
-pub use config_paths::{config_paths, config_paths_for_customer, project_root_for, ConfigPaths};
+pub use config_paths::{
+    config_paths, config_paths_for_customer, locate_workflow, project_root_for, ConfigPaths,
+};
 pub use customers::{
     validate_slug, validate_ws_id, Customer, CustomerError, CustomerMeta, CustomerStore, MetaPatch,
     NewCustomer, ProjectRef,
