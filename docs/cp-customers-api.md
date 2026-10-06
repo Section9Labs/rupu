@@ -43,21 +43,32 @@ rollups use the same per-customer pricing.
 A run records the customer it ran under at launch: `RunRecord.customer`
 (workflow and standalone runs), `RunStart.customer` in every agent transcript
 (standalone runs, session turns, workflow steps) and `SessionRecord.customer`
-(the session's directory as of its latest turn). A resumed run keeps its
-recorded customer even if the project has been reassigned since (a recorded
-customer that no longer exists is an error); only a run recorded before this
-feature falls back to the launch's `customer_dir` sidecar.
+(the session's directory as of its latest turn). The field is **tri-state** on
+disk:
 
-A run with no recorded customer **derives** it from its project's CURRENT
-assignment and the row says so: `customer_derived: true`. A session turn whose
-transcript predates customers inherits its session's customer (also reported
-derived). Findings and projects record no customer — they follow the project's
-current assignment.
+| On disk | Means | Attributed as |
+|---|---|---|
+| `"customer": "acme"` | recorded slug | `acme`, `customer_derived: false` |
+| `"customer": null` | recorded **no customer** | none, `customer_derived: false` — even if the project has been assigned since |
+| no `customer` key | **legacy** — written before customers existed | the project's CURRENT assignment, `customer_derived: true` (none when unassigned) |
 
-Run, session, agent-run, project and finding rows always serialize `customer`
-(`null` = no customer; `customer_derived` on run-like rows). A row that omits
-the `customer` key cannot say whose it is (see Remote hosts below) — a
-coordinator never reads absence as "no customer".
+Reassigning a project never rewrites history: only a legacy record derives
+from the current assignment. A resumed run keeps what it recorded — its slug
+(even if the project has been reassigned since; a recorded customer that no
+longer exists is an error), or no customer for a recorded `null` (even if the
+project has been assigned since). Only a legacy run falls back to the launch's
+`customer_dir` sidecar, else its workspace path.
+
+A session turn whose own transcript is legacy inherits its session record's
+customer, and the row reports it as derived (`customer_derived: true`); a turn
+that recorded `null` stays none whatever the session says now. Findings and
+projects record no customer — they follow the project's current assignment.
+
+Run, session, agent-run, project and finding rows serialize `customer`
+whenever it is known (`null` = no customer; `customer_derived` on run-like
+rows). A row that omits the `customer` key cannot say whose it is (see Remote
+hosts and "An unreadable assignment" below) — a coordinator never reads
+absence as "no customer".
 
 ## `?customer=<slug>|none`
 
@@ -78,8 +89,9 @@ is not an error — it matches nothing.
 
 - **Run and session lists** (runs, workflows, agents, sessions): a remote host's
   rows are filtered on the coordinator by their `customer` key. If any row
-  **lacks the key** — a peer older than customers, a mirror holding a worker's
-  runs recorded before attribution, or rows the peer could not attribute — the
+  **lacks the key** — a peer older than customers, a mirror (tunnel / bucket)
+  holding a worker's legacy runs (a mirrored run that recorded `null` carries
+  `customer: null` and is filterable), or rows the peer could not attribute — the
   host "can't report a customer for every run": a single-host request
   (`?host=<id>`) answers **501** (the web shows it "unavailable"), and the
   fan-out skips the host and names it in the **`X-Rupu-Hosts-Without-Customer`**
@@ -89,22 +101,35 @@ is not an error — it matches nothing.
   page until the requested window is full or the host runs out, so a peer that
   clamps its page size (an HTTP peer caps `limit` at 200) never makes a filtered
   page come back short while more matches exist.
+- **Peers have their own customer namespace (until Plan 3).** A remote run —
+  including a placed unit of a coordinator's run — records the customer the
+  WORKER resolved from its own customers and assignments; the coordinator's
+  layer is not shipped to remote hosts yet. A peer's `acme` is that peer's
+  customer, which the filter matches by slug.
 - **Aggregates (`/api/usage`, `/api/dashboard`) are local-only under a filter.**
   A remote host's totals arrive already summed and cannot be filtered:
   `?host=<remote>&customer=…` is **501**, and the fan-out reports each remote
   host `unavailable` rather than counting it. An unknown `?host=` is 404 first.
 
-### An unreadable assignment fails closed
+### An unreadable assignment fails closed — except on an unfiltered list
 
 The assignment of a project is `workspaces/<id>.customer`. If the CP cannot read
-it (an unreadable sidecar), its local handlers answer **500** naming the workspace
-and the file to repair — work is never counted under "no customer". Two
-documented exceptions: `/api/usage` marks the local host `offline` with that
-reason (its per-host contract), and the CLI's display listings (`rupu run list`,
-`transcript list`, `session list`, which an SSH coordinator reads) instead
-**omit the `customer` keys** on the affected rows and print one warning per
-workspace to stderr — the coordinator then reads that host as unable to report.
-A malformed legacy workspace id reads as unassigned.
+it (an unreadable sidecar), every **filtered** request (`?customer=`) and every
+**count, rollup or price** (the customers API, project rollups,
+`/api/usage/runs`, `/api/usage/timeline`, the dashboard) answers **500** naming
+the workspace and the file to repair — work is never counted under "no
+customer". On the fan-out, a filtered run list whose LOCAL rows can't all be
+attributed is that same 500, never a header entry.
+
+An **unfiltered** run / workflow-run / agent-run / session list (and a
+project's session list) does not fail: the affected rows **omit the `customer`
+/ `customer_derived` keys** and one warning per workspace goes to the server
+log; every other row keeps its keys. The CLI's display listings (`rupu run
+list`, `transcript list`, `session list`, which an SSH coordinator reads)
+degrade the same way, warning on stderr — the coordinator then reads that host
+as unable to report. `/api/usage` marks the local host `offline` with the reason
+(its per-host contract). A recorded slug or `null` needs no assignment read and
+is always reported. A malformed legacy workspace id reads as unassigned.
 
 ## Launch preview
 

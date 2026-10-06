@@ -403,9 +403,15 @@ struct SessionRecord {
     /// The customer the session's directory is assigned to (`rupu
     /// customer`), as of its latest turn: each turn re-resolves it, so
     /// a reassignment mid-session shows here while every transcript keeps
-    /// the customer it ran under. `None` ⇒ no customer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    customer: Option<String>,
+    /// the customer it ran under. Tri-state (`rupu_transcript::recorded`):
+    /// `None` = the key is absent (a session that predates customers),
+    /// `Some(None)` = recorded "no customer" (written as `null`).
+    #[serde(
+        default,
+        deserialize_with = "rupu_transcript::recorded::deserialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    customer: rupu_transcript::RecordedField,
     transcripts_dir: PathBuf,
     #[serde(default)]
     repo_ref: Option<String>,
@@ -1281,8 +1287,9 @@ async fn list(
     } else {
         &[SessionScope::Active]
     };
-    // Each row's customer: the session record's, else its workspace's
-    // current assignment (derived). A workspace whose assignment cannot be
+    // Each row's customer: the session record's (a slug or `null`), else —
+    // a session that predates customers — its workspace's current
+    // assignment (derived). A workspace whose assignment cannot be
     // read does not fail the listing: its rows omit the customer keys (one
     // warning per workspace on stderr), never claiming "no customer".
     let mut customers =
@@ -1292,8 +1299,10 @@ async fn list(
             if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
                 write_session(&global, scope, &session)?;
             }
-            let customer =
-                customers.attribute_for_listing(session.customer.as_deref(), &session.workspace_id);
+            let customer = customers.attribute_for_listing(
+                rupu_transcript::Recorded::of(&session.customer),
+                &session.workspace_id,
+            );
             rows.push(SessionListRow {
                 customer: customer.map(Into::into),
                 session_id: session.session_id.clone(),
@@ -1707,7 +1716,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root,
         launch_dir: Some(pwd.clone()),
-        customer: cfg_paths.customer_slug.clone(),
+        customer: Some(cfg_paths.customer_slug.clone()),
         transcripts_dir,
         repo_ref,
         issue_ref,
@@ -7328,7 +7337,7 @@ async fn run_compact_request(
     let resolver = crate::accounts::resolver_for(&cfg);
     // This request's customer: the directory's assignment now, which is
     // what the pseudo-turn transcript records and the session record shows.
-    session.customer = cfg_paths.customer_slug.clone();
+    session.customer = Some(cfg_paths.customer_slug.clone());
 
     paths::ensure_dir(&session.transcripts_dir)?;
 
@@ -7725,6 +7734,18 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // lookup above already failed a dangling one): recorded on the turn's
     // transcript and shown on the session record.
     let turn_customer = cfg_paths.customer_slug.clone();
+    // Persist it now, before the turn runs: a turn that fails before its
+    // finalize below must not leave the record showing the previous turn's
+    // customer. Re-read first so a concurrent write is not clobbered (the
+    // finalize below follows the same rule).
+    {
+        let mut current = read_session(&global, &args.session_id)?.0;
+        if current.customer != Some(turn_customer.clone()) {
+            current.customer = Some(turn_customer.clone());
+            write_session(&global, scope, &current)?;
+        }
+        session.customer = Some(turn_customer.clone());
+    }
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -8012,7 +8033,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         clear_session_live_usage(&global, scope, &args.session_id)?;
 
         session = read_session(&global, &args.session_id)?.0;
-        session.customer = turn_customer.clone();
+        session.customer = Some(turn_customer.clone());
         session.updated_at = Utc::now();
         session.active_run_id = None;
         session.active_transcript_path = None;
@@ -8276,6 +8297,30 @@ fn session_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf 
 
 fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
     session_dir(global, scope, session_id).join("session.json")
+}
+
+/// The customer `session_id`'s record holds (tri-state,
+/// `rupu_transcript::recorded`), active or archived — what a session turn
+/// whose transcript predates customers inherits in a listing. `None` when
+/// the session can't be found or read (the turn then derives from its
+/// workspace like any legacy run).
+pub(crate) fn recorded_session_customer(
+    global: &Path,
+    session_id: &str,
+) -> Option<rupu_transcript::RecordedField> {
+    #[derive(serde::Deserialize)]
+    struct CustomerOnly {
+        #[serde(default, deserialize_with = "rupu_transcript::recorded::deserialize")]
+        customer: rupu_transcript::RecordedField,
+    }
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.contains("..") {
+        return None;
+    }
+    [SessionScope::Active, SessionScope::Archived]
+        .into_iter()
+        .find_map(|scope| fs::read(session_record_path(global, scope, session_id)).ok())
+        .and_then(|bytes| serde_json::from_slice::<CustomerOnly>(&bytes).ok())
+        .map(|c| c.customer)
 }
 
 fn session_live_usage_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
@@ -10605,9 +10650,11 @@ mod tests {
     }
 
     /// Every turn records the customer its directory is assigned to NOW —
-    /// on its own transcript's `run_start` and on the session record — so a
-    /// reassignment mid-session shows on the record while each earlier
-    /// transcript keeps the customer it ran under.
+    /// on its own transcript's `run_start` (an explicit `null` when none)
+    /// and on the session record — so a turn that ran with no customer
+    /// stays "none" after the project is assigned, while the next turn runs
+    /// under the new customer (spec: reassigning a project never rewrites
+    /// history).
     #[tokio::test]
     async fn turns_record_their_customer_and_follow_a_reassignment() {
         let _guard = crate::test_support::ENV_LOCK.lock().await;
@@ -10626,12 +10673,17 @@ mod tests {
                 },
             )
             .expect("create customer");
-        store
+        // Register the project (and learn its workspace id), unassigned.
+        let ws = store
             .assign("acme", rupu_workspace::ProjectRef::Path(&project))
-            .expect("assign project");
+            .expect("register project");
+        store
+            .unassign(rupu_workspace::ProjectRef::Path(&project))
+            .expect("unassign project");
 
         let mut record = test_session_record();
         record.session_id = "ses_customer_turns01".into();
+        record.workspace_id = ws.id.clone();
         record.workspace_path = project.clone();
         record.launch_dir = Some(project.clone());
         record.project_root = Some(project.clone());
@@ -10655,11 +10707,12 @@ mod tests {
             run_id: run_id.into(),
             prompt: "hi".into(),
         };
+        // Turn 1 with the project unassigned; then assign it; turn 2.
         let first = run_turn(turn("run_customer_1")).await;
         let after_first = read_session(&global, &record.session_id).expect("read").0;
         store
-            .unassign(rupu_workspace::ProjectRef::Path(&project))
-            .expect("unassign project");
+            .assign("acme", rupu_workspace::ProjectRef::Path(&project))
+            .expect("assign project");
         let second = run_turn(turn("run_customer_2")).await;
         let after_second = read_session(&global, &record.session_id).expect("read").0;
 
@@ -10671,14 +10724,93 @@ mod tests {
         first.expect("turn 1 completes");
         second.expect("turn 2 completes");
 
-        assert_eq!(after_first.customer.as_deref(), Some("acme"));
-        assert_eq!(after_second.customer, None, "unassigned by turn 2");
+        assert_eq!(after_first.customer, Some(None), "recorded none");
+        assert_eq!(after_second.customer, Some(Some("acme".to_string())));
         let head = |run_id: &str| {
             JsonlReader::head(record.transcripts_dir.join(format!("{run_id}.jsonl")))
                 .expect("transcript head")
         };
-        assert_eq!(head("run_customer_1").customer.as_deref(), Some("acme"));
-        assert_eq!(head("run_customer_2").customer, None);
+        let (h1, h2) = (head("run_customer_1"), head("run_customer_2"));
+        assert_eq!(h1.customer, Some(None), "turn 1 recorded an explicit null");
+        assert_eq!(h2.customer, Some(Some("acme".to_string())));
+
+        // Attributed now (project assigned to acme, session record acme):
+        // turn 1 stays none — neither the session's latest customer nor the
+        // current assignment re-attributes it — and turn 2 is acme.
+        let mut lookup = rupu_cp::customers::CustomerLookup::new(store.clone());
+        let attribute = |lookup: &mut rupu_cp::customers::CustomerLookup,
+                         h: &rupu_transcript::RunHead| {
+            let (field, inherited) =
+                rupu_cp::customers::session_turn_customer(&h.customer, &after_second.customer);
+            lookup
+                .attribute(rupu_transcript::Recorded::of(&field), &h.workspace_id)
+                .unwrap()
+                .inherited(inherited)
+        };
+        let a1 = attribute(&mut lookup, &h1);
+        assert_eq!((a1.slug, a1.derived), (None, false));
+        let a2 = attribute(&mut lookup, &h2);
+        assert_eq!((a2.slug.as_deref(), a2.derived), (Some("acme"), false));
+    }
+
+    /// A turn persists its customer on the session record BEFORE it runs, so
+    /// a turn that fails before its finalize still leaves the record showing
+    /// the customer that turn resolved, not the previous turn's.
+    #[tokio::test]
+    async fn a_turn_that_fails_early_still_records_its_customer() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".rupu")).expect("create project");
+        let store = rupu_workspace::CustomerStore::new(&global);
+        store
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("create customer");
+        store
+            .assign("acme", rupu_workspace::ProjectRef::Path(&project))
+            .expect("assign project");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_customer_early01".into();
+        record.workspace_path = project.clone();
+        record.launch_dir = Some(project.clone());
+        record.project_root = Some(project.clone());
+        // The previous turn ran with no customer.
+        record.customer = Some(None);
+        // A provider that can't be built fails the turn before it runs.
+        record.provider_name = "no-such-provider".into();
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.runs = Vec::new();
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let result = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_customer_early".into(),
+            prompt: "hi".into(),
+        })
+        .await;
+        let after = read_session(&global, &record.session_id).expect("read").0;
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        assert!(result.is_err(), "the turn fails before running");
+        assert_eq!(after.customer, Some(Some("acme".to_string())));
     }
 
     /// 3j (transcript fidelity plan 1): the session worker's send path

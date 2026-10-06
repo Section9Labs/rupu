@@ -3703,13 +3703,14 @@ pub(crate) async fn resume_run(
     let project_root = paths::project_root_for(&workspace_path)?;
 
     // Standard wiring (mirrors `approve` above). The customer is the one the
-    // run recorded; a run that predates that uses the launch's persisted
-    // lookup dir, else its workspace path (`resume_config_paths`).
+    // run recorded (or recorded none); a run that predates customers uses
+    // the launch's persisted lookup dir, else its workspace path
+    // (`resume_config_paths`).
     let cfg_paths = crate::resume::resume_config_paths(
         &store,
         &global,
         run_id,
-        record.customer.as_deref(),
+        rupu_transcript::Recorded::of(&record.customer),
         &workspace_path,
         project_root.as_deref(),
     )?;

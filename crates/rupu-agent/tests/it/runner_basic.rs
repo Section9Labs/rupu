@@ -134,5 +134,5 @@ async fn run_start_records_the_tool_contexts_customer() {
     let res = run_agent(opts).await.unwrap();
     assert_eq!(res.turns, 1);
     let head = JsonlReader::head(&transcript_path).unwrap();
-    assert_eq!(head.customer.as_deref(), Some("acme"));
+    assert_eq!(head.customer, Some(Some("acme".to_string())));
 }

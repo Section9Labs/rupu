@@ -1,7 +1,8 @@
 //! A workflow run records the customer it ran under (customers Plan 2A,
 //! Task 2): `run_workflow` copies `StepFactory::customer()` onto the fresh
-//! `RunRecord`, and a `run.json` written before the field existed reads back
-//! with no customer.
+//! `RunRecord` — tri-state on disk (`rupu_transcript::recorded`): a slug, an
+//! explicit `null` for a run recorded with no customer, and no key at all
+//! only on a `run.json` written before the field existed (legacy).
 
 use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
@@ -169,23 +170,27 @@ async fn run_records_the_factory_customer() {
     }))
     .await;
     let record = store.load(&run_id).unwrap();
-    assert_eq!(record.customer.as_deref(), Some("acme"));
+    assert_eq!(record.customer, Some(Some("acme".to_string())));
 }
 
 #[tokio::test]
-async fn run_with_a_factory_that_names_no_customer_records_none() {
+async fn run_with_a_factory_that_names_no_customer_records_null() {
     let (_tmp, store, run_id) =
         run_with(Arc::new(DefaultFactory(Factory { customer: None }))).await;
     let record = store.load(&run_id).unwrap();
-    assert_eq!(record.customer, None);
-    // `None` is not serialized: run.json stays byte-compatible with
-    // readers that predate the field.
+    assert_eq!(record.customer, Some(None));
+    assert_eq!(
+        rupu_transcript::Recorded::of(&record.customer),
+        rupu_transcript::Recorded::None
+    );
+    // "No customer" is RECORDED as an explicit `null`, so a later
+    // assignment of the project never re-attributes the run.
     let raw = std::fs::read_to_string(store.run_json_path(&run_id)).unwrap();
-    assert!(!raw.contains("\"customer\""), "run.json: {raw}");
+    assert!(raw.contains("\"customer\": null"), "run.json: {raw}");
 }
 
 #[tokio::test]
-async fn a_run_json_without_the_customer_key_reads_as_none() {
+async fn a_run_json_without_the_customer_key_reads_as_legacy_and_stays_legacy() {
     let (_tmp, store, run_id) = run_with(Arc::new(Factory {
         customer: Some("acme"),
     }))
@@ -197,4 +202,8 @@ async fn a_run_json_without_the_customer_key_reads_as_none() {
     value.as_object_mut().unwrap().remove("customer");
     let legacy: RunRecord = serde_json::from_value(value).unwrap();
     assert_eq!(legacy.customer, None);
+    assert!(rupu_transcript::Recorded::of(&legacy.customer).is_legacy());
+    // Re-saving a legacy record writes no key back: it stays legacy.
+    let back = serde_json::to_value(&legacy).unwrap();
+    assert!(back.get("customer").is_none(), "{back}");
 }

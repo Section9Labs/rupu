@@ -840,12 +840,21 @@ pub(crate) async fn blocking_host<T: Send + 'static>(
 /// read from the same mirror; only the `worker_id` they scope to differs.
 ///
 /// Customers: a mirrored run's workspace lives on the worker, not in this
-/// coordinator's store, so its customer cannot be derived here. A row whose
-/// run RECORDED a customer carries it (`customer_derived: false`); a row whose
-/// run recorded none OMITS the `customer`/`customer_derived` keys — the
-/// coordinator cannot tell a legacy run from one with no customer, so under a
-/// customer filter such a host answers 501 / is named in
-/// `X-Rupu-Hosts-Without-Customer` rather than being counted as "none".
+/// coordinator's store, so its customer cannot be derived here — only what
+/// the run RECORDED is reported. A run that recorded a customer carries it
+/// (`customer_derived: false`); one that recorded "no customer" (an explicit
+/// `null` in its `run.json`) carries `customer: null` and is filterable
+/// (`?customer=none`); a LEGACY worker run (no key: it predates customers)
+/// OMITS the `customer`/`customer_derived` keys, so under a customer filter
+/// such a host answers 501 / is named in `X-Rupu-Hosts-Without-Customer`
+/// rather than being counted as "none".
+///
+/// What a mirrored run records is the WORKER's own resolution: a placed unit
+/// of a coordinator's `acme` run resolves its customer on the worker, from
+/// the worker's own customers and assignments, until customers Plan 3 ships
+/// the coordinator's layer to placed units. Until then each peer has its own
+/// customer namespace — a peer's `acme` is that peer's customer, which may or
+/// may not be the coordinator's `acme`.
 pub(crate) fn mirror_list_runs(
     run_store: &RunStore,
     worker_id: &str,
@@ -1209,13 +1218,16 @@ mod off_runtime_tests {
     }
 
     /// A mirrored run that recorded a customer carries it; one that recorded
-    /// none omits the key, so a customer filter reads the host as unable to
-    /// say (501) instead of counting the run as "no customer".
+    /// "no customer" (`null`) carries `customer: null` and is filterable; a
+    /// legacy run (no key) omits the key, so a customer filter reads the
+    /// host as unable to say (501) instead of counting the run as "no
+    /// customer".
     #[test]
     fn mirror_rows_omit_the_customer_a_worker_run_never_recorded() {
         let tmp = tempfile::tempdir().unwrap();
         let store = RunStore::new(tmp.path().join("runs"));
-        let seed = |id: &str, customer: Option<&str>| {
+        // `None` = legacy (no key); `Some(None)` = recorded `null`.
+        let seed = |id: &str, customer: Option<Option<&str>>| {
             let mut v = serde_json::json!({
                 "id": id,
                 "workflow_name": "wf",
@@ -1234,7 +1246,8 @@ mod off_runtime_tests {
                 .create(serde_json::from_value(v).unwrap(), "name: wf\n")
                 .unwrap();
         };
-        seed("run_acme", Some("acme"));
+        seed("run_acme", Some(Some("acme")));
+        seed("run_none", Some(None));
         let params = RunListQuery {
             kind: RunKind::All,
             offset: 0,
@@ -1245,17 +1258,27 @@ mod off_runtime_tests {
         let none = crate::customers::CustomerFilter::Unassigned;
         let acme = crate::customers::CustomerFilter::Slug("acme".into());
 
-        // Only recorded runs: filtered normally.
+        // Only recorded runs (a slug and an explicit null): filtered normally.
         let rows = mirror_list_runs(&store, "node_1", &params, &pricing).unwrap();
-        assert_eq!(rows[0]["customer"], "acme");
-        assert_eq!(rows[0]["customer_derived"], false);
+        let row = |rows: &[serde_json::Value], id: &str| {
+            rows.iter().find(|r| r["id"] == id).unwrap().clone()
+        };
+        assert_eq!(row(&rows, "run_acme")["customer"], "acme");
+        assert_eq!(row(&rows, "run_acme")["customer_derived"], false);
+        let recorded_none = row(&rows, "run_none");
+        assert!(recorded_none.as_object().unwrap().contains_key("customer"));
+        assert!(recorded_none["customer"].is_null());
+        assert_eq!(recorded_none["customer_derived"], false);
+        let ids = |rows: Option<Vec<serde_json::Value>>| {
+            rows.map(|r| r.iter().map(|v| v["id"].clone()).collect::<Vec<_>>())
+        };
         assert_eq!(
-            crate::customers::filter_remote_rows(rows.clone(), &acme).map(|r| r.len()),
-            Some(1)
+            ids(crate::customers::filter_remote_rows(rows.clone(), &acme)),
+            Some(vec![serde_json::json!("run_acme")])
         );
         assert_eq!(
-            crate::customers::filter_remote_rows(rows, &none).map(|r| r.len()),
-            Some(0)
+            ids(crate::customers::filter_remote_rows(rows, &none)),
+            Some(vec![serde_json::json!("run_none")])
         );
 
         // A legacy run: no key, so the host can't be filtered (501).

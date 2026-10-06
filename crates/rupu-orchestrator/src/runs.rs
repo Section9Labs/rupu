@@ -130,10 +130,16 @@ pub struct RunRecord {
     /// Crew codename (`adjective-noun`) minted for this run. Absent on legacy runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codename: Option<String>,
-    /// The customer this run ran under, recorded at launch (`None` = no
-    /// customer, or a run recorded before customers existed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub customer: Option<String>,
+    /// The customer this run ran under, recorded at launch — tri-state
+    /// (`rupu_transcript::recorded`): `None` = the key is absent (a run
+    /// recorded before customers existed), `Some(None)` = recorded "no
+    /// customer" (written as `null`), `Some(Some(slug))` = that customer.
+    #[serde(
+        default,
+        deserialize_with = "rupu_transcript::recorded::deserialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub customer: rupu_transcript::RecordedField,
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,

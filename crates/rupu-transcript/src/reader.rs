@@ -166,9 +166,10 @@ pub struct RunHead {
     pub model: String,
     pub started_at: DateTime<Utc>,
     pub mode: RunMode,
-    /// Customer recorded on `run_start`; `None` on older transcripts and
-    /// for runs with no customer.
-    pub customer: Option<String>,
+    /// Customer recorded on `run_start`, tri-state (see
+    /// [`crate::recorded`]): `None` on transcripts that predate customers,
+    /// `Some(None)` for a run recorded with no customer.
+    pub customer: crate::recorded::RecordedField,
 }
 
 pub struct JsonlReader;

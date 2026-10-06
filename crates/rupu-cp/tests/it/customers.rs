@@ -296,7 +296,8 @@ fn write_transcript_at(
         schema: None,
         system_prompt: None,
         codename: None,
-        customer: customer.map(String::from),
+        // `None` = a legacy record (no key); see the tri-state tests.
+        customer: customer.map(|c| Some(c.to_string())),
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "anthropic".into(),
@@ -323,7 +324,8 @@ fn record(
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> RunRecord {
     RunRecord {
-        customer: customer.map(String::from),
+        // `None` = a legacy record (no key); see the tri-state tests.
+        customer: customer.map(|c| Some(c.to_string())),
         id: id.into(),
         workflow_name: "wf".into(),
         status: RunStatus::Completed,

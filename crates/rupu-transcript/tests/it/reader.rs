@@ -202,7 +202,7 @@ fn head_reads_run_start_without_needing_the_rest_of_the_file() {
                 schema: None,
                 system_prompt: None,
                 codename: None,
-                customer: Some("acme".into()),
+                customer: Some(Some("acme".into())),
             },
             Event::TurnStart { turn_idx: 0 },
         ],
@@ -218,7 +218,7 @@ fn head_reads_run_start_without_needing_the_rest_of_the_file() {
     assert_eq!(head.run_id, "run_head");
     assert_eq!(head.agent, "agent-a");
     assert_eq!(head.started_at, started);
-    assert_eq!(head.customer.as_deref(), Some("acme"));
+    assert_eq!(head.customer, Some(Some("acme".to_string())));
 }
 
 /// A file sharing the transcripts directory but written by another

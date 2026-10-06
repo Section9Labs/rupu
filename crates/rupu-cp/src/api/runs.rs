@@ -511,8 +511,9 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
 }
 
 /// Concurrently call `list_runs` on every registered host, tag each row with
-/// its `host_id`, merge, and sort newest-first. A per-host failure produces an
-/// empty contribution plus a warning — it never fails the whole merge.
+/// its `host_id`, merge, and sort newest-first. A REMOTE host's failure
+/// produces an empty contribution plus a warning — it never fails the whole
+/// merge (the local host's own failures do; see below).
 ///
 /// With a customer `filter`, each host's rows are filtered on the coordinator
 /// by their `customer` key BEFORE the caller pages the merge (every host's
@@ -523,9 +524,13 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
 /// returned in the second element, for the
 /// [`crate::customers::HOSTS_WITHOUT_CUSTOMER_HEADER`].
 ///
-/// The one failure that is not skipped: the LOCAL host failing on this
-/// side (`Internal` — e.g. a customer assignment it cannot read) fails the
-/// request, rather than silently dropping every local run.
+/// The failures that are not skipped are the LOCAL host's own, which fail
+/// the request rather than silently dropping every local run: an `Internal`
+/// error on this side (a run store it cannot read), and — under a customer
+/// filter — a local row whose customer can't be known (its workspace's
+/// assignment is unreadable: the unfiltered local listing omits that row's
+/// customer keys), which is answered with the fail-closed 500 naming the
+/// workspace, never by naming the local host in the header.
 async fn fan_out_list_runs(
     s: &AppState,
     kind: RunKind,
@@ -555,6 +560,7 @@ async fn fan_out_list_runs(
                 // Filtered: the host's WHOLE list, page by page, so a peer
                 // that clamps its page size (an HTTP peer: 200) never caps
                 // the merged answer.
+                let local_lifecycle = lifecycle.clone();
                 let listed = match filter {
                     None => conn
                         .list_runs(RunListQuery {
@@ -578,6 +584,29 @@ async fn fan_out_list_runs(
                     }
                 };
                 match listed {
+                    Ok(FilteredRuns::CannotReport) if host_id == "local" => {
+                        // Re-ask the local store fail-closed: its error names
+                        // the workspace whose assignment can't be read.
+                        let err = local_run_rows(
+                            s,
+                            crate::pagination::PageQuery {
+                                offset: Some(0),
+                                limit: Some(1),
+                            },
+                            local_lifecycle,
+                            kind == RunKind::Workflow,
+                            crate::pagination::DateRangeQuery::default(),
+                            filter.cloned(),
+                        )
+                        .await
+                        .err()
+                        .unwrap_or_else(|| {
+                            ApiError::internal(
+                                "the local host can't report a customer for every run",
+                            )
+                        });
+                        Err(err)
+                    }
                     Ok(FilteredRuns::CannotReport) => Ok((Vec::new(), Some(host_id))),
                     Ok(FilteredRuns::Rows(rows)) => {
                         let rows = rows
@@ -646,19 +675,21 @@ pub struct RunListRow {
     pub codename: String,
     pub codename_derived: bool,
     /// The customer the run is attributed to — `customer` (the one it
-    /// recorded, else a legacy run's workspace's CURRENT assignment) and
-    /// `customer_derived` — see [`Self::set_customer`]. Serialized whenever
-    /// known (`customer: null` = no customer); `None` = the run's customer
-    /// cannot be known here (a mirrored worker's legacy run, an assignment
-    /// `rupu run list` could not read) and the row carries NEITHER key, so a
-    /// coordinator reads that host as unable to report a customer for every
-    /// run rather than counting the run as "no customer".
+    /// recorded, a slug or `null`; for a LEGACY run only, its workspace's
+    /// CURRENT assignment) and `customer_derived` — see
+    /// [`Self::set_customer`]. Serialized whenever known (`customer: null` =
+    /// no customer); `None` = the run's customer cannot be known here (a
+    /// mirrored worker's legacy run, an assignment an unfiltered listing
+    /// could not read) and the row carries NEITHER key, so a coordinator
+    /// reads that host as unable to report a customer for every run rather
+    /// than counting the run as "no customer".
     #[serde(flatten)]
     pub customer: Option<crate::customers::RowCustomer>,
 }
 
 impl From<&RunRecord> for RunListRow {
-    /// Pure: `customer` is the RECORDED one; callers with a
+    /// Pure: `customer` is the RECORDED one (none for a legacy run, which
+    /// recorded nothing); callers with a
     /// [`crate::customers::CustomerLookup`] apply the derived attribution
     /// through [`Self::set_customer`].
     fn from(r: &RunRecord) -> Self {
@@ -667,10 +698,10 @@ impl From<&RunRecord> for RunListRow {
         Self {
             codename,
             codename_derived,
-            customer: Some(crate::customers::RowCustomer {
-                customer: r.customer.clone(),
-                customer_derived: false,
-            }),
+            customer: crate::customers::Attribution::recorded_only(crate::customers::Recorded::of(
+                &r.customer,
+            ))
+            .map(Into::into),
             id: r.id.clone(),
             workflow_name: r.workflow_name.clone(),
             status: r.status,
@@ -703,7 +734,7 @@ impl RunListRow {
     ) -> Self {
         let slug = match &who {
             Some(w) => w.slug.as_deref(),
-            None => r.customer.as_deref(),
+            None => crate::customers::Recorded::of(&r.customer).slug(),
         };
         let mut row = Self::with_usage(r, store, prices.pricing_for(slug));
         row.customer = who.map(Into::into);
@@ -721,7 +752,7 @@ impl RunListRow {
         lookup: &mut crate::customers::CustomerLookup,
         prices: &mut dyn crate::customers::PriceBook,
     ) -> Result<Self, ApiError> {
-        let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
+        let who = lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)?;
         Ok(Self::priced(r, Some(who), store, prices))
     }
 
@@ -735,7 +766,8 @@ impl RunListRow {
         lookup: &mut crate::customers::CustomerLookup,
         prices: &mut dyn crate::customers::PriceBook,
     ) -> Self {
-        let who = lookup.attribute_for_listing(r.customer.as_deref(), &r.workspace_id);
+        let who = lookup
+            .attribute_for_listing(crate::customers::Recorded::of(&r.customer), &r.workspace_id);
         Self::priced(r, who, store, prices)
     }
 
@@ -776,14 +808,17 @@ impl RunListRow {
 /// paginates — every filter, the customer one included, applies BEFORE the
 /// page is cut, so a page is never short while matches exist.
 ///
-/// Each row's customer is attributed through `customers.lookup` (recorded,
-/// else the workspace's current assignment — `customer_derived`); with no
-/// lookup (a mirrored remote run, whose workspace this store does not know)
-/// only a recorded customer is reported, and a run that recorded none carries
-/// no customer keys (its customer cannot be known here; such rows never match
-/// a customer filter). Each row is priced with
-/// `prices.pricing_for(its customer)`. An assignment that cannot be read
-/// fails the call ([`RunRowsError::Customer`]).
+/// Each row's customer is attributed through `customers.lookup` (recorded —
+/// a slug, or `null` = none — else, for a legacy run only, the workspace's
+/// current assignment — `customer_derived`); with no lookup (a mirrored
+/// remote run, whose workspace this store does not know) only what the run
+/// recorded is reported — a slug, or `customer: null` — and a LEGACY run
+/// carries no customer keys (its customer cannot be known here; such rows
+/// never match a customer filter). Each row is priced with
+/// `prices.pricing_for(its customer)`. Under a customer filter an assignment
+/// that cannot be read fails the call ([`RunRowsError::Customer`]); an
+/// unfiltered listing degrades instead — that row carries no customer keys
+/// (one warning per workspace).
 ///
 /// `pub` (not `pub(crate)`) so a consumer outside this crate CAN reuse it —
 /// but note `lifecycle` is a 3-value GROUP vocabulary (`"active"` |
@@ -835,18 +870,14 @@ pub fn query_run_rows(
     let mut attributed: Vec<(RunRecord, Option<crate::customers::Attribution>)> =
         Vec::with_capacity(runs.len());
     for r in runs {
+        let recorded = crate::customers::Recorded::of(&r.customer);
         let who = match lookup.as_deref_mut() {
-            Some(l) => Some(
-                l.attribute(r.customer.as_deref(), &r.workspace_id)
+            Some(l) if filter.is_some() => Some(
+                l.attribute(recorded, &r.workspace_id)
                     .map_err(RunRowsError::Customer)?,
             ),
-            None => r
-                .customer
-                .clone()
-                .map(|slug| crate::customers::Attribution {
-                    slug: Some(slug),
-                    derived: false,
-                }),
+            Some(l) => l.attribute_for_listing(recorded, &r.workspace_id),
+            None => crate::customers::Attribution::recorded_only(recorded),
         };
         let keep = match (filter, &who) {
             (None, _) => true,
@@ -872,8 +903,8 @@ pub fn query_run_rows(
 #[derive(Default)]
 pub struct RowCustomers<'a> {
     /// `Some` → derive a legacy run's customer from its workspace's current
-    /// assignment; `None` → report only a recorded customer (a run that
-    /// recorded none carries no customer keys).
+    /// assignment; `None` → report only what a run recorded (a slug or
+    /// `null`; a legacy run carries no customer keys).
     pub lookup: Option<&'a mut crate::customers::CustomerLookup>,
     /// Keep only the rows this matches (before paging).
     pub filter: Option<&'a crate::customers::CustomerFilter>,

@@ -282,30 +282,44 @@ pub(crate) fn customer_lookup_dir(
     Ok(dir)
 }
 
-/// The config layers a resumed run loads, and the customer it runs under.
-/// In order:
+/// The config layers a resumed run loads, and the customer it runs under —
+/// by what the run RECORDED at launch (`RunRecord.customer`, tri-state):
 ///
-/// 1. the customer the run RECORDED at launch (`RunRecord.customer`), even if
-///    the project has been reassigned since — a run keeps the customer it
-///    started under; a recorded customer that no longer exists is an error,
-///    never a fall back to the global config;
-/// 2. for a run recorded before customers: the launch's persisted
-///    `customer_dir` sidecar ([`customer_lookup_dir`]);
-/// 3. else the run's `workspace_path`.
+/// 1. a recorded customer: that one, even if the project has been
+///    reassigned since — a run keeps the customer it started under; a
+///    recorded customer that no longer exists is an error, never a fall back
+///    to the global config;
+/// 2. a recorded "no customer" (`null`): no customer, even if the project
+///    has been assigned since — reassigning a project never rewrites the
+///    history of a run already under way;
+/// 3. a run recorded before customers (legacy, no key): the launch's
+///    persisted `customer_dir` sidecar ([`customer_lookup_dir`]), else the
+///    run's `workspace_path`.
 pub(crate) fn resume_config_paths(
     store: &RunStore,
     global: &Path,
     run_id: &str,
-    recorded_customer: Option<&str>,
+    recorded_customer: rupu_transcript::Recorded<'_>,
     workspace_path: &Path,
     project_root: Option<&Path>,
 ) -> anyhow::Result<paths::ConfigPaths> {
-    if let Some(slug) = recorded_customer {
-        return rupu_workspace::config_paths_for_customer(global, Some(slug), project_root)
-            .with_context(|| format!("resume run {run_id} under its recorded customer `{slug}`"));
+    match recorded_customer {
+        rupu_transcript::Recorded::Slug(slug) => {
+            rupu_workspace::config_paths_for_customer(global, Some(slug), project_root)
+                .with_context(|| {
+                    format!("resume run {run_id} under its recorded customer `{slug}`")
+                })
+        }
+        rupu_transcript::Recorded::None => Ok(rupu_workspace::config_paths_for_customer(
+            global,
+            None,
+            project_root,
+        )?),
+        rupu_transcript::Recorded::Legacy => {
+            let lookup_dir = customer_lookup_dir(store, run_id, workspace_path)?;
+            paths::config_paths(global, project_root, &lookup_dir)
+        }
     }
-    let lookup_dir = customer_lookup_dir(store, run_id, workspace_path)?;
-    paths::config_paths(global, project_root, &lookup_dir)
 }
 
 /// Shared disk-rebuild step for [`resume_run`] (approve-resume) and
@@ -366,13 +380,13 @@ async fn rebuild_opts_from_disk(
     // Standard wiring (mirrors `run` above; refactor candidate but
     // keeping inline for now to avoid spreading the resume path
     // across the CLI surface).
-    // The run's recorded customer, else the launch's lookup dir, else the
-    // workspace path (`resume_config_paths`).
+    // The run's recorded customer (or recorded none); for a legacy run, the
+    // launch's lookup dir, else the workspace path (`resume_config_paths`).
     let cfg_paths = resume_config_paths(
         store,
         &global,
         run_id,
-        record.customer.as_deref(),
+        rupu_transcript::Recorded::of(&record.customer),
         &workspace_path,
         project_root.as_deref(),
     )?;
@@ -652,7 +666,15 @@ mod tests {
         let store = store_with_run(tmp.path());
         // The project is assigned to nobody and the run has no sidecar:
         // only the recorded slug names the customer.
-        let paths = resume_config_paths(&store, &home, "run_1", Some("acme"), &proj, None).unwrap();
+        let paths = resume_config_paths(
+            &store,
+            &home,
+            "run_1",
+            rupu_transcript::Recorded::Slug("acme"),
+            &proj,
+            None,
+        )
+        .unwrap();
         assert_eq!(paths.customer_slug.as_deref(), Some("acme"));
         assert_eq!(
             paths.customer,
@@ -669,7 +691,15 @@ mod tests {
             .unwrap();
         let store = store_with_run(tmp.path());
         store.write_customer_dir("run_1", &proj).unwrap();
-        let paths = resume_config_paths(&store, &home, "run_1", Some("acme"), &proj, None).unwrap();
+        let paths = resume_config_paths(
+            &store,
+            &home,
+            "run_1",
+            rupu_transcript::Recorded::Slug("acme"),
+            &proj,
+            None,
+        )
+        .unwrap();
         assert_eq!(paths.customer_slug.as_deref(), Some("acme"));
     }
 
@@ -678,8 +708,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (home, proj) = customers_home(tmp.path());
         let store = store_with_run(tmp.path());
-        let err =
-            resume_config_paths(&store, &home, "run_1", Some("initech"), &proj, None).unwrap_err();
+        let err = resume_config_paths(
+            &store,
+            &home,
+            "run_1",
+            rupu_transcript::Recorded::Slug("initech"),
+            &proj,
+            None,
+        )
+        .unwrap_err();
         let shown = format!("{err:#}");
         assert!(shown.contains("run_1"), "{shown}");
         assert!(shown.contains("initech"), "{shown}");
@@ -702,7 +739,40 @@ mod tests {
             .unwrap();
         let store = store_with_run(tmp.path());
         // A run recorded before customers: the workspace path's assignment.
-        let paths = resume_config_paths(&store, &home, "run_1", None, &proj, None).unwrap();
+        let paths = resume_config_paths(
+            &store,
+            &home,
+            "run_1",
+            rupu_transcript::Recorded::Legacy,
+            &proj,
+            None,
+        )
+        .unwrap();
         assert_eq!(paths.customer_slug.as_deref(), Some("globex"));
+    }
+
+    /// A run that RECORDED no customer resumes with none, even though its
+    /// project has been assigned since (and its launch dir sidecar points at
+    /// the assigned project): reassigning never rewrites a run's history.
+    #[test]
+    fn resume_config_paths_keep_a_recorded_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, proj) = customers_home(tmp.path());
+        rupu_workspace::CustomerStore::new(&home)
+            .assign("globex", rupu_workspace::ProjectRef::Path(&proj))
+            .unwrap();
+        let store = store_with_run(tmp.path());
+        store.write_customer_dir("run_1", &proj).unwrap();
+        let paths = resume_config_paths(
+            &store,
+            &home,
+            "run_1",
+            rupu_transcript::Recorded::None,
+            &proj,
+            None,
+        )
+        .unwrap();
+        assert_eq!(paths.customer_slug, None);
+        assert_eq!(paths.customer, None);
     }
 }

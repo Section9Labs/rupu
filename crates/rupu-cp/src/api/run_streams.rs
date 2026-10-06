@@ -148,9 +148,10 @@ pub(crate) struct SessionForRunsDto {
     #[serde(default)]
     model: Option<String>,
     /// The customer the session's directory was assigned to as of its latest
-    /// turn; the fallback for a turn whose transcript predates customers.
-    #[serde(default)]
-    pub(crate) customer: Option<String>,
+    /// turn, tri-state ([`crate::customers::RecordedField`]); the fallback
+    /// for a turn whose transcript predates customers.
+    #[serde(default, deserialize_with = "rupu_transcript::recorded::deserialize")]
+    pub(crate) customer: crate::customers::RecordedField,
     /// The workspace the session runs in — derives a legacy session turn's
     /// customer from the workspace's current assignment.
     #[serde(default)]
@@ -185,21 +186,41 @@ struct AgentRunRow {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    /// The customer the run is attributed to: the one its transcript's
-    /// `RunStart` recorded (a session turn falls back to its session's),
-    /// else (`customer_derived`) its workspace's CURRENT assignment — see
-    /// [`attribute_agent_runs`]. ALWAYS serialized (`null` = no customer)
-    /// so a coordinator can tell "no customer" from a peer too old to say.
-    customer: Option<String>,
-    customer_derived: bool,
+    /// The customer the run is attributed to — `customer` + `customer_derived`
+    /// — see [`attribute_agent_runs`]: the one its transcript's `RunStart`
+    /// recorded (a slug, or `null` = none); for a legacy transcript, a
+    /// session turn's session customer (derived), else its workspace's
+    /// CURRENT assignment (derived). Serialized whenever known (`null` = no
+    /// customer) so a coordinator can tell "no customer" from a peer too old
+    /// to say; `None` (an unfiltered list whose workspace assignment could
+    /// not be read) carries neither key.
+    #[serde(flatten)]
+    customer: Option<crate::customers::RowCustomer>,
     /// The run's workspace (`RunStart`, else the session's) — what a legacy
     /// run's customer is derived from. Not on the wire.
     #[serde(skip)]
     workspace_id: Option<String>,
-    /// `customer` came from the session (its latest turn's), not the turn's
-    /// own `RunStart` — reported as `customer_derived`. Not on the wire.
+    /// The customer the turn's own `RunStart` recorded (tri-state). Not on
+    /// the wire.
     #[serde(skip)]
-    customer_inherited: bool,
+    recorded_customer: crate::customers::RecordedField,
+    /// The session record's customer (tri-state), for a session row — what a
+    /// legacy turn inherits. Not on the wire.
+    #[serde(skip)]
+    session_customer: crate::customers::RecordedField,
+}
+
+impl AgentRunRow {
+    /// The customer this row is priced under: its attribution, else (a row
+    /// whose attribution could not be read) the one it recorded.
+    fn pricing_customer(&self) -> Option<String> {
+        match &self.customer {
+            Some(c) => c.customer.clone(),
+            None => crate::customers::Recorded::of(&self.recorded_customer)
+                .slug()
+                .map(str::to_string),
+        }
+    }
 }
 
 /// One actionable autoflow *event* — a single launched run or awaiting/failed
@@ -307,7 +328,7 @@ struct TranscriptRunStart {
     provider: Option<String>,
     model: Option<String>,
     workspace_id: Option<String>,
-    customer: Option<String>,
+    customer: crate::customers::RecordedField,
 }
 
 /// Resolve `session_id`'s `agent_name` by loading its `session.json` from
@@ -450,10 +471,10 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
                 host_id: None,
                 provider,
                 model,
-                customer,
-                customer_derived: false,
+                customer: None,
                 workspace_id,
-                customer_inherited: false,
+                recorded_customer: customer,
+                session_customer: None,
             },
             dto.pid,
         ));
@@ -559,6 +580,14 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                 dto.agent_name.as_deref(),
             );
             for run in dto.runs {
+                // The turn's own `RunStart` (cached process-wide): what it
+                // recorded decides its customer before the session's does.
+                let head = run
+                    .transcript_path
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| crate::usage_sources::head_of(std::path::Path::new(t)))
+                    .unwrap_or_default();
                 out.push(AgentRunRow {
                     codename: codename.clone(),
                     codename_derived,
@@ -576,11 +605,12 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     host_id: None,
                     provider: dto.provider_name.clone().filter(|p| !p.is_empty()),
                     model: dto.model.clone().filter(|m| !m.is_empty()),
-                    customer: dto.customer.clone(),
-                    customer_derived: false,
-                    workspace_id: dto.workspace_id.clone().filter(|w| !w.is_empty()),
-                    // The session's customer, not this turn's own record.
-                    customer_inherited: dto.customer.is_some(),
+                    customer: None,
+                    workspace_id: Some(head.workspace_id)
+                        .filter(|w| !w.is_empty())
+                        .or_else(|| dto.workspace_id.clone().filter(|w| !w.is_empty())),
+                    recorded_customer: head.customer,
+                    session_customer: dto.customer.clone(),
                 });
             }
         }
@@ -702,35 +732,47 @@ fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
         provider: standalone.provider.or(session.provider),
         model: standalone.model.or(session.model),
         // The turn's own `RunStart` records the customer it ran under; the
-        // session's is only its latest turn's (inherited ⇒ derived).
-        customer_inherited: standalone.customer.is_none() && session.customer_inherited,
-        customer: standalone.customer.or(session.customer),
-        customer_derived: false,
+        // session's is only its latest turn's, inherited by a legacy turn.
+        customer: None,
+        recorded_customer: standalone.recorded_customer.or(session.recorded_customer),
+        session_customer: session.session_customer.or(standalone.session_customer),
         workspace_id: standalone.workspace_id.or(session.workspace_id),
     }
 }
 
 /// Attribute each local agent run to its customer: the one its own
-/// `RunStart` recorded; else (`customer_derived`) the one inherited from its
-/// session, or its workspace's CURRENT assignment; a run with none of these
-/// has none. An assignment that cannot be read fails the request.
+/// `RunStart` recorded (a slug, or `null` = none — a recorded none stays none
+/// whatever its project is assigned to now); for a LEGACY transcript only,
+/// the customer inherited from its session (`customer_derived`), else its
+/// workspace's CURRENT assignment (`customer_derived`); a legacy run with no
+/// workspace has none. `fail_closed` (a customer filter): an assignment that
+/// cannot be read fails the request; otherwise (an unfiltered list) that
+/// row carries no customer keys and its workspace is warned about once.
 fn attribute_agent_runs(
     lookup: &mut crate::customers::CustomerLookup,
     rows: &mut [AgentRunRow],
+    fail_closed: bool,
 ) -> Result<(), crate::error::ApiError> {
+    use crate::customers::{Attribution, Recorded};
     for row in rows {
-        let who = match (&row.customer, row.workspace_id.as_deref()) {
-            (Some(_), _) | (None, Some(_)) => lookup.attribute(
-                row.customer.as_deref(),
-                row.workspace_id.as_deref().unwrap_or_default(),
-            )?,
-            (None, None) => crate::customers::Attribution {
+        let (field, inherited) =
+            crate::customers::session_turn_customer(&row.recorded_customer, &row.session_customer);
+        let recorded = Recorded::of(&field);
+        let who = match (recorded, row.workspace_id.as_deref()) {
+            (Recorded::Legacy, None) => Some(Attribution {
                 slug: None,
                 derived: false,
-            },
+            }),
+            (_, ws) => {
+                let ws = ws.unwrap_or_default();
+                if fail_closed {
+                    Some(lookup.attribute(recorded, ws)?)
+                } else {
+                    lookup.attribute_for_listing(recorded, ws)
+                }
+            }
         };
-        row.customer_derived = who.derived || (who.slug.is_some() && row.customer_inherited);
-        row.customer = who.slug;
+        row.customer = who.map(|w| w.inherited(inherited).into());
     }
     Ok(())
 }
@@ -976,9 +1018,14 @@ async fn list_agent_runs(
     // the customer's — before anything is paged.
     let mut lookup =
         crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir));
-    attribute_agent_runs(&mut lookup, &mut local_rows)?;
+    attribute_agent_runs(&mut lookup, &mut local_rows, filter.is_some())?;
     if let Some(f) = &filter {
-        local_rows.retain(|r| f.matches(r.customer.as_deref()));
+        // Fail-closed above: every row is attributed here.
+        local_rows.retain(|r| {
+            r.customer
+                .as_ref()
+                .is_some_and(|c| f.matches(c.customer.as_deref()))
+        });
     }
 
     // ── Local-only path ───────────────────────────────────────────────────────
@@ -994,7 +1041,7 @@ async fn list_agent_runs(
                 Some((
                     r.run_id.clone(),
                     r.transcript_path.clone()?,
-                    r.customer.clone(),
+                    r.pricing_customer(),
                 ))
             })
             .collect();
@@ -2182,9 +2229,9 @@ mod tests {
                 provider: None,
                 model: None,
                 customer: None,
-                customer_derived: false,
                 workspace_id: None,
-                customer_inherited: false,
+                recorded_customer: None,
+                session_customer: None,
             }
         }
 

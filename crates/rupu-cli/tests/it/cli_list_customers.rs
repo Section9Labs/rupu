@@ -38,6 +38,16 @@ fn rupu_json(home: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> (V
 }
 
 fn write_transcript(dir: &std::path::Path, run_id: &str, ws: &str, customer: Option<&str>) {
+    // `None` = a transcript that predates customers (no key).
+    write_transcript_rec(dir, run_id, ws, customer.map(|c| Some(c.to_string())));
+}
+
+fn write_transcript_rec(
+    dir: &std::path::Path,
+    run_id: &str,
+    ws: &str,
+    customer: rupu_transcript::RecordedField,
+) {
     std::fs::create_dir_all(dir).unwrap();
     let mut w = JsonlWriter::create(dir.join(format!("{run_id}.jsonl"))).unwrap();
     w.write(&Event::RunStart {
@@ -51,7 +61,7 @@ fn write_transcript(dir: &std::path::Path, run_id: &str, ws: &str, customer: Opt
         schema: None,
         system_prompt: None,
         codename: None,
-        customer: customer.map(String::from),
+        customer,
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -161,4 +171,79 @@ fn run_list_degrades_on_an_unreadable_assignment() {
         stderr.contains("ws_broken"),
         "names the workspace: {stderr}"
     );
+}
+
+/// `transcript list` attributes by what each transcript recorded: an explicit
+/// `null` stays none even in a workspace assigned since; a session turn whose
+/// transcript predates customers inherits its session's customer (derived);
+/// any other legacy transcript derives from its workspace's assignment.
+#[test]
+fn transcript_list_keeps_a_recorded_none_and_inherits_a_legacy_turns_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let tx = home.join("transcripts");
+    rupu_workspace::CustomerStore::new(&home)
+        .create(
+            "acme",
+            &rupu_workspace::NewCustomer {
+                name: "Acme".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    rupu_workspace::CustomerStore::new(&home)
+        .create(
+            "globex",
+            &rupu_workspace::NewCustomer {
+                name: "Globex".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    std::fs::create_dir_all(home.join("workspaces")).unwrap();
+    std::fs::write(home.join("workspaces/ws_acme.customer"), "acme\n").unwrap();
+
+    write_transcript_rec(&tx, "run_none", "ws_acme", Some(None));
+    write_transcript(&tx, "run_legacy", "ws_acme", None);
+    // Session turns of `ses_globex` (whose record says globex): one legacy,
+    // one that recorded none.
+    for (id, field) in [("turn_legacy", None), ("turn_none", Some(None))] {
+        write_transcript_rec(&tx, id, "ws_acme", field);
+        std::fs::write(
+            tx.join(format!("{id}.meta.json")),
+            serde_json::json!({
+                "version": 1,
+                "run_id": id,
+                "session_id": "ses_globex",
+                "workspace_path": "/tmp/proj",
+                "backend_id": "local",
+                "trigger_source": "session_turn",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let sdir = home.join("sessions/ses_globex");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(
+        sdir.join("session.json"),
+        serde_json::json!({"session_id": "ses_globex", "customer": "globex"}).to_string(),
+    )
+    .unwrap();
+
+    let (report, _) = rupu_json(
+        &home,
+        tmp.path(),
+        &["--format", "json", "transcript", "list"],
+    );
+    let rows = &report["rows"];
+    let keys = |id: &str| {
+        let r = row(rows, "run_id", id);
+        (r["customer"].clone(), r["customer_derived"].clone())
+    };
+    use serde_json::json;
+    assert_eq!(keys("run_none"), (json!(null), json!(false)));
+    assert_eq!(keys("run_legacy"), (json!("acme"), json!(true)));
+    assert_eq!(keys("turn_legacy"), (json!("globex"), json!(true)));
+    assert_eq!(keys("turn_none"), (json!(null), json!(false)));
 }

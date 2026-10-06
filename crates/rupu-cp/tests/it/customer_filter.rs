@@ -109,12 +109,29 @@ fn assign(global: &Path, slug: &str, ws: &str) {
         .unwrap();
 }
 
+/// `Some(slug)` → a recorded slug; `None` → a LEGACY record (no key). A
+/// recorded "no customer" (`null`) goes through the `*_rec` helpers with
+/// `Some(None)`.
+fn legacy_or_slug(customer: Option<&str>) -> rupu_transcript::RecordedField {
+    customer.map(|c| Some(c.to_string()))
+}
+
 /// A transcript with one `Usage` event: 1M input tokens of `anthropic/MODEL`.
 fn write_transcript(
     path: &Path,
     run_id: &str,
     ws: &str,
     customer: Option<&str>,
+    started_at: DateTime<Utc>,
+) {
+    write_transcript_rec(path, run_id, ws, legacy_or_slug(customer), started_at);
+}
+
+fn write_transcript_rec(
+    path: &Path,
+    run_id: &str,
+    ws: &str,
+    customer: rupu_transcript::RecordedField,
     started_at: DateTime<Utc>,
 ) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -129,7 +146,7 @@ fn write_transcript(
         schema: None,
         system_prompt: None,
         codename: None,
-        customer: customer.map(String::from),
+        customer,
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "anthropic".into(),
@@ -149,9 +166,14 @@ fn write_transcript(
     std::fs::write(path, &buf).unwrap();
 }
 
-fn record(id: &str, ws: &str, customer: Option<&str>, started_at: DateTime<Utc>) -> RunRecord {
+fn record(
+    id: &str,
+    ws: &str,
+    customer: rupu_transcript::RecordedField,
+    started_at: DateTime<Utc>,
+) -> RunRecord {
     RunRecord {
-        customer: customer.map(String::from),
+        customer,
         id: id.into(),
         workflow_name: "wf".into(),
         status: RunStatus::Completed,
@@ -199,12 +221,22 @@ fn record(id: &str, ws: &str, customer: Option<&str>, started_at: DateTime<Utc>)
 
 /// A completed workflow run with one step whose transcript carries usage.
 fn seed_run(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateTime<Utc>) {
+    seed_run_rec(global, id, ws, legacy_or_slug(customer), at);
+}
+
+fn seed_run_rec(
+    global: &Path,
+    id: &str,
+    ws: &str,
+    customer: rupu_transcript::RecordedField,
+    at: DateTime<Utc>,
+) {
     let store = RunStore::new(global.join("runs"));
     store
-        .create(record(id, ws, customer, at), "name: wf\n")
+        .create(record(id, ws, customer.clone(), at), "name: wf\n")
         .unwrap();
     let transcript_path = global.join("tx").join(format!("{id}.jsonl"));
-    write_transcript(&transcript_path, id, ws, customer, at);
+    write_transcript_rec(&transcript_path, id, ws, customer, at);
     store
         .append_step_result(
             id,
@@ -235,6 +267,16 @@ fn seed_run(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateT
 
 /// A standalone `rupu run`: `<global>/transcripts/<id>.{meta.json,jsonl}`.
 fn seed_agent_run(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateTime<Utc>) {
+    seed_agent_run_rec(global, id, ws, legacy_or_slug(customer), at);
+}
+
+fn seed_agent_run_rec(
+    global: &Path,
+    id: &str,
+    ws: &str,
+    customer: rupu_transcript::RecordedField,
+    at: DateTime<Utc>,
+) {
     let dir = global.join("transcripts");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -242,7 +284,7 @@ fn seed_agent_run(global: &Path, id: &str, ws: &str, customer: Option<&str>, at:
         json!({ "run_id": id, "trigger_source": "run_cli" }).to_string(),
     )
     .unwrap();
-    write_transcript(&dir.join(format!("{id}.jsonl")), id, ws, customer, at);
+    write_transcript_rec(&dir.join(format!("{id}.jsonl")), id, ws, customer, at);
 }
 
 fn seed_session(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateTime<Utc>) {
@@ -775,7 +817,8 @@ async fn a_new_peers_rows_are_filtered_on_the_coordinator() {
 
 // ── fail closed ─────────────────────────────────────────────────────────
 
-/// An assignment that cannot be read fails the request (500 naming the
+/// Under a customer filter, and for every count / rollup / price, an
+/// assignment that cannot be read fails the request (500 naming the
 /// workspace) — it never reads as "no customer".
 #[tokio::test]
 async fn an_unreadable_assignment_fails_the_request() {
@@ -787,16 +830,19 @@ async fn an_unreadable_assignment_fails_the_request() {
     let base = spawn(&f.global).await;
     for path in [
         "/api/runs?host=local&customer=none",
-        // Unfiltered too: the row cannot claim a customer it can't read, and
-        // the fan-out must not drop the local host's runs silently.
-        "/api/runs?host=local",
-        "/api/runs",
-        "/api/runs/workflows",
+        "/api/runs?customer=acme",
+        "/api/runs/workflows?customer=none",
         "/api/runs/agents?host=local&customer=none",
         "/api/sessions?host=local&customer=none",
         "/api/findings?customer=none",
         "/api/usage/runs?customer=none",
         "/api/dashboard?host=local&customer=none",
+        // Counts, rollups and prices fail closed unfiltered too. (`/api/usage`
+        // marks the local host offline with the reason instead — its
+        // per-host contract.)
+        "/api/customers",
+        "/api/usage/runs",
+        "/api/projects",
     ] {
         let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
@@ -806,6 +852,184 @@ async fn an_unreadable_assignment_fails_the_request() {
             "{path}: {body}"
         );
     }
+}
+
+/// An UNFILTERED run / agent-run / session list does not fail on one
+/// unreadable assignment: the rows whose customer can't be known are listed
+/// WITHOUT the `customer` / `customer_derived` keys (never as "no
+/// customer"); every other row keeps them.
+#[tokio::test]
+async fn an_unreadable_assignment_degrades_an_unfiltered_list() {
+    let f = seed_fleet();
+    let sidecar = f.global.join("workspaces").join("ws_acme.customer");
+    std::fs::remove_file(&sidecar).unwrap();
+    std::fs::create_dir_all(&sidecar).unwrap();
+    let base = spawn(&f.global).await;
+    let has_keys = |row: &Value| {
+        let o = row.as_object().unwrap();
+        o.contains_key("customer") || o.contains_key("customer_derived")
+    };
+    for (path, key, broken, ok) in [
+        ("/api/runs?host=local", "id", "r_acme_legacy", "r_acme"),
+        ("/api/runs", "id", "r_acme_legacy", "r_acme"),
+        ("/api/runs/workflows", "id", "r_acme_legacy", "r_acme"),
+        (
+            "/api/runs/agents?host=local",
+            "run_id",
+            "a_acme_legacy",
+            "a_acme",
+        ),
+        ("/api/runs/agents", "run_id", "a_acme_legacy", "a_acme"),
+        (
+            "/api/sessions?host=local",
+            "session_id",
+            "s_acme_legacy",
+            "s_acme",
+        ),
+        ("/api/sessions", "session_id", "s_acme_legacy", "s_acme"),
+    ] {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let rows: Value = resp.json().await.unwrap();
+        assert!(!has_keys(by_id(&rows, key, broken)), "{path}: {rows}");
+        assert_eq!(by_id(&rows, key, ok)["customer"], "acme", "{path}");
+    }
+}
+
+// ── tri-state attribution ───────────────────────────────────────────────
+
+/// A run that RECORDED no customer (`"customer": null`) stays "none" after
+/// its project is assigned: not derived, not in the new customer's filter or
+/// rollup, and included in `?customer=none`. A legacy run (no key) in the
+/// same project still derives the assignment.
+#[tokio::test]
+async fn a_recorded_none_stays_none_after_the_project_is_assigned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    seed_workspace(global, "ws_p", &proj.path().join("ws_p"));
+    create_customer(global, "acme");
+    let at = Utc::now() - Duration::hours(1);
+    // Launched while the project was unassigned: recorded none.
+    seed_run_rec(global, "r_none", "ws_p", Some(None), at);
+    seed_agent_run_rec(global, "a_none", "ws_p", Some(None), at);
+    // A run that predates customers (no key).
+    seed_run(global, "r_legacy", "ws_p", None, at - Duration::hours(1));
+    seed_agent_run(global, "a_legacy", "ws_p", None, at - Duration::hours(1));
+    // Now the project is assigned.
+    assign(global, "acme", "ws_p");
+    let base = spawn(global).await;
+
+    for (list, key, none, legacy) in [
+        ("/api/runs?host=local&", "id", "r_none", "r_legacy"),
+        ("/api/runs?", "id", "r_none", "r_legacy"),
+        (
+            "/api/runs/agents?host=local&",
+            "run_id",
+            "a_none",
+            "a_legacy",
+        ),
+    ] {
+        let rows = get_json(format!("{base}{list}")).await;
+        let row = by_id(&rows, key, none);
+        assert!(row["customer"].is_null(), "{list}: {row}");
+        assert_eq!(row["customer_derived"], false, "{list}");
+        let row = by_id(&rows, key, legacy);
+        assert_eq!(row["customer"], "acme", "{list}");
+        assert_eq!(row["customer_derived"], true, "{list}");
+
+        let rows = get_json(format!("{base}{list}customer=acme")).await;
+        assert_eq!(ids(&rows, key), [legacy], "{list}");
+        let rows = get_json(format!("{base}{list}customer=none")).await;
+        assert_eq!(ids(&rows, key), [none], "{list}");
+    }
+
+    // Acme's rollup counts only the legacy (derived) work.
+    let rows = get_json(format!("{base}/api/customers")).await;
+    let acme = by_id(&rows, "slug", "acme");
+    assert_eq!(acme["rollup"]["run_count"], 1, "{acme}");
+    // Usage: acme's spend is the legacy run + the legacy agent run only.
+    let usage = get_json(format!("{base}/api/usage?customer=acme")).await;
+    assert_eq!(usage["summary"]["input_tokens"], 2_000_000, "{usage}");
+    let usage = get_json(format!("{base}/api/usage?customer=none")).await;
+    assert_eq!(usage["summary"]["input_tokens"], 2_000_000, "{usage}");
+}
+
+/// Session turns are attributed per turn: turn 1 ran while the project was
+/// unassigned (its transcript recorded `null`), turn 2 after it was assigned
+/// to Acme (recorded `acme`; the session record now says acme). Turn 1 stays
+/// none — the session's latest customer never re-attributes it — and turn 2
+/// is Acme.
+#[tokio::test]
+async fn a_session_turn_that_recorded_none_is_not_reattributed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    seed_workspace(global, "ws_p", &proj.path().join("ws_p"));
+    create_customer(global, "acme");
+    assign(global, "acme", "ws_p");
+    let at = Utc::now() - Duration::hours(2);
+    let tdir = global.join("transcripts");
+    let turns = [
+        ("turn_1", Some(None), at),
+        (
+            "turn_2",
+            Some(Some("acme".to_string())),
+            at + Duration::hours(1),
+        ),
+    ];
+    let mut runs = Vec::new();
+    for (id, field, t) in &turns {
+        let path = tdir.join(format!("{id}.jsonl"));
+        write_transcript_rec(&path, id, "ws_p", field.clone(), *t);
+        std::fs::write(
+            tdir.join(format!("{id}.meta.json")),
+            json!({"run_id": id, "session_id": "s_1", "trigger_source": "session_turn"})
+                .to_string(),
+        )
+        .unwrap();
+        runs.push(json!({
+            "run_id": id,
+            "transcript_path": path.to_string_lossy(),
+            "started_at": t.to_rfc3339(),
+            "status": "ok",
+        }));
+    }
+    let sdir = global.join("sessions").join("s_1");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(
+        sdir.join("session.json"),
+        json!({
+            "session_id": "s_1",
+            "agent_name": "reviewer",
+            "workspace_id": "ws_p",
+            "customer": "acme",
+            "created_at": at.to_rfc3339(),
+            "updated_at": at.to_rfc3339(),
+            "status": "idle",
+            "runs": runs,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let base = spawn(global).await;
+
+    let rows = get_json(format!("{base}/api/runs/agents?host=local")).await;
+    let t1 = by_id(&rows, "run_id", "turn_1");
+    assert!(t1["customer"].is_null(), "{t1}");
+    assert_eq!(t1["customer_derived"], false);
+    let t2 = by_id(&rows, "run_id", "turn_2");
+    assert_eq!(t2["customer"], "acme");
+    assert_eq!(t2["customer_derived"], false);
+    let rows = get_json(format!("{base}/api/runs/agents?host=local&customer=none")).await;
+    assert_eq!(ids(&rows, "run_id"), ["turn_1"]);
+    let rows = get_json(format!("{base}/api/runs/agents?host=local&customer=acme")).await;
+    assert_eq!(ids(&rows, "run_id"), ["turn_2"]);
+    // The usage aggregates attribute the same way.
+    let usage = get_json(format!("{base}/api/usage?customer=none")).await;
+    assert_eq!(usage["summary"]["input_tokens"], 1_000_000, "{usage}");
+    let usage = get_json(format!("{base}/api/usage?customer=acme")).await;
+    assert_eq!(usage["summary"]["input_tokens"], 1_000_000, "{usage}");
 }
 
 // ── session turns ───────────────────────────────────────────────────────

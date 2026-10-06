@@ -1461,8 +1461,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 loop_progress: Default::default(),
                 gate_decisions: Vec::new(),
                 codename: Some(codename.crew.clone()),
-                // The customer this run's config was layered with.
-                customer: cfg_paths.customer_slug.clone(),
+                // The customer this run's config was layered with — recorded
+                // even when none (`null`), so a later assignment of the
+                // project never re-attributes it.
+                customer: Some(cfg_paths.customer_slug.clone()),
             };
             match store.create(rec, "") {
                 Ok(_) => {}
@@ -1478,7 +1480,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                             loaded.cause = cause;
                             // A stub (a tunnel mirror's, or a reused id)
                             // knows no customer; this run does.
-                            loaded.customer = cfg_paths.customer_slug.clone();
+                            loaded.customer = Some(cfg_paths.customer_slug.clone());
                             // Under the run lock, on the blocking pool: a cancel
                             // that landed since the load is kept.
                             match store

@@ -129,9 +129,13 @@ pub fn routes() -> Router<AppState> {
 /// once), which add spend and activity, not to `run_count` (the project's
 /// workflow-run count, as its runs tab lists). Each run and transcript is
 /// priced with the pricing of the customer it is attributed to (recorded,
-/// else the workspace's current assignment), so a customer's projects sum
-/// to its rollup. `keep` selects the projects. An assignment that cannot be
-/// read fails the call. Blocking IO.
+/// else — a legacy record — the workspace's current assignment). A project
+/// rollup counts ALL of the project's work, whoever it is attributed to: a
+/// run that recorded another customer (or none) before the project was
+/// (re)assigned stays in the project's rollup but counts towards the
+/// customer it recorded, so a customer's projects need not sum to that
+/// customer's rollup. `keep` selects the projects. An assignment that
+/// cannot be read fails the call. Blocking IO.
 pub(crate) fn project_rollups(
     run_store: &rupu_orchestrator::runs::RunStore,
     runs: &[RunRecord],
@@ -145,7 +149,7 @@ pub(crate) fn project_rollups(
         if !keep(&r.workspace_id) {
             continue;
         }
-        let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
+        let who = lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)?;
         let usage = crate::usage::summarize_run(run_store, &r.id, prices.get(who.slug.as_deref()));
         out.entry(r.workspace_id.clone())
             .or_default()
@@ -155,7 +159,7 @@ pub(crate) fn project_rollups(
         if src.workspace_id.is_empty() || !keep(&src.workspace_id) {
             continue;
         }
-        let who = lookup.attribute(src.customer.as_deref(), &src.workspace_id)?;
+        let who = src.attribute(lookup)?;
         let usage = crate::usage::summarize_run_usage(
             &crate::usage::transcripts_usage(&src.paths),
             prices.get(who.slug.as_deref()),
@@ -300,17 +304,20 @@ async fn get_project(
                 crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
             let mut prices = crate::customers::PricingMemo::new(&pricing);
             let customers = project_customers(&mut lookup, std::slice::from_ref(&ws))?;
-            // The recent runs' customers: recorded, else derived.
+            // The recent runs' customers: recorded, else (legacy) derived.
             let recent_who = scoped
                 .iter()
                 .take(10)
-                .map(|r| lookup.attribute(r.customer.as_deref(), &r.workspace_id))
+                .map(|r| {
+                    lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)
+                })
                 .collect::<Result<Vec<_>, ApiError>>()?;
             let sessions = crate::api::sessions::collect_sessions_with(
                 &global,
                 crate::api::sessions::SessionScan {
                     pricing: None,
                     workspace: Some(&ws),
+                    fail_closed: true,
                 },
             )?;
             let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
@@ -438,9 +445,12 @@ async fn project_sessions(
         tokio::task::spawn_blocking(move || {
             crate::api::sessions::collect_sessions_with(
                 &global,
+                // An unfiltered list: a session whose assignment can't be
+                // read is listed without customer keys.
                 crate::api::sessions::SessionScan {
                     pricing: Some(&pricing),
                     workspace: Some(&ws_id),
+                    fail_closed: false,
                 },
             )
         })

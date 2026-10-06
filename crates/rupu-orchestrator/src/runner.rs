@@ -1225,7 +1225,9 @@ pub async fn run_workflow(
                 loop_progress: std::collections::BTreeMap::new(),
                 gate_decisions: Vec::new(),
                 codename: Some(naming.crew().to_string()),
-                customer: opts.factory.customer().map(str::to_string),
+                // Recorded even when none (`null`): a later assignment of the
+                // project must not re-attribute this run.
+                customer: Some(opts.factory.customer().map(str::to_string)),
             };
             let created = store.create(record, yaml).map_err(map_run_store_err)?;
             _runner_guard = Some(store.register_runner(&run_id));

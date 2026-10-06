@@ -1086,7 +1086,7 @@ mod tests {
         let outcome = result.expect("dispatch should succeed against the mock provider");
 
         let head = rupu_transcript::JsonlReader::head(&outcome.transcript_path).unwrap();
-        assert_eq!(head.customer.as_deref(), Some("acme"));
+        assert_eq!(head.customer, Some(Some("acme".to_string())));
     }
 
     /// Spec 2026-09-30-rupu-remote-findings-transport-design.md deviation 4:

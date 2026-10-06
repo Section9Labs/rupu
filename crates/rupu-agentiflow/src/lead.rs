@@ -771,7 +771,7 @@ mod tests {
         d.run_round(&round(1));
         for name in ["lead.r0.jsonl", "lead.r1.jsonl"] {
             let head = rupu_transcript::JsonlReader::head(dir.path().join(name)).unwrap();
-            assert_eq!(head.customer.as_deref(), Some("acme"), "{name}");
+            assert_eq!(head.customer, Some(Some("acme".to_string())), "{name}");
         }
     }
 

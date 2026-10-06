@@ -266,6 +266,7 @@ async fn rupu_run_over_an_existing_stub_records_the_customer() {
     let stub = rupu_orchestrator::RunRecord {
         workflow_name: "agent:writer".into(),
         status: rupu_orchestrator::RunStatus::Running,
+        // A stub records nothing (legacy shape).
         customer: None,
         ..stub_record(&run_id, home.path())
     };
@@ -286,7 +287,7 @@ async fn rupu_run_over_an_existing_stub_records_the_customer() {
     assert!(ok(code), "rupu run failed");
     let record = store.load(&run_id).unwrap();
     assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
-    assert_eq!(record.customer.as_deref(), Some("acme"));
+    assert_eq!(record.customer, Some(Some("acme".to_string())));
 }
 
 /// A minimal pre-existing `run.json` for `run_id`, round-tripped through
@@ -336,8 +337,8 @@ async fn workflow_run_takes_the_customer_default_provider() {
         .list()
         .unwrap();
     assert_eq!(
-        runs[0].customer.as_deref(),
-        Some("acme"),
+        runs[0].customer,
+        Some(Some("acme".to_string())),
         "the run records its customer"
     );
 }
@@ -357,7 +358,7 @@ async fn rupu_run_records_the_customer() {
         .filter(|r| r.workflow_name.starts_with("agent:"))
         .collect();
     assert_eq!(agent_runs.len(), 1, "expected one standalone run: {runs:?}");
-    assert_eq!(agent_runs[0].customer.as_deref(), Some("acme"));
+    assert_eq!(agent_runs[0].customer, Some(Some("acme".to_string())));
     // The agent's own transcript names the customer on its first line too —
     // what the CP's usage sources read.
     let transcript = tmp
@@ -435,7 +436,7 @@ async fn approve_after_moving_workspace(keep_sidecar: bool) -> String {
     if !keep_sidecar {
         std::fs::remove_file(store.customer_dir_path(&run_id)).unwrap();
     }
-    assert_eq!(record.customer.as_deref(), Some("acme"));
+    assert_eq!(record.customer, Some(Some("acme".to_string())));
     record.customer = None;
     record.workspace_path = elsewhere.path().to_path_buf();
     store.update(&record).unwrap();
@@ -527,7 +528,7 @@ async fn resume_uses_the_recorded_customer_after_a_reassignment() {
         record.status,
         rupu_orchestrator::RunStatus::AwaitingApproval
     );
-    assert_eq!(record.customer.as_deref(), Some("acme"));
+    assert_eq!(record.customer, Some(Some("acme".to_string())));
 
     customers.unassign(ProjectRef::Path(&project)).unwrap();
     customers
@@ -544,7 +545,7 @@ async fn resume_uses_the_recorded_customer_after_a_reassignment() {
     assert!(ok(code), "approve failed");
     let record = store.load(&run_id).unwrap();
     assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
-    assert_eq!(record.customer.as_deref(), Some("acme"));
+    assert_eq!(record.customer, Some(Some("acme".to_string())));
     let steps = store.read_step_results(&run_id).unwrap();
     let step = steps.iter().find(|s| s.step_id == "a").unwrap();
     let transcript = std::fs::read_to_string(&step.transcript_path).unwrap();
@@ -552,5 +553,77 @@ async fn resume_uses_the_recorded_customer_after_a_reassignment() {
     assert!(
         run_start.contains("\"provider\":\"anthropic-acme\""),
         "the resumed step should run under the RECORDED customer, not the new assignment: {run_start}"
+    );
+}
+
+/// A run launched with NO customer records `"customer": null`; assigning its
+/// project while it is parked at a gate does not move the resumed steps onto
+/// the new customer's config — it resumes with no customer, on the global
+/// default provider (spec: reassigning a project never rewrites history).
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_keeps_a_recorded_none_after_the_project_is_assigned() {
+    let _guard = ENV_LOCK.lock().await;
+    let (tmp, project) = workflow_fixture(
+        "default_provider = \"anthropic-acme\"\n[providers.anthropic-acme]\nkind = \"anthropic\"\n",
+    );
+    let home = tmp.child(".rupu");
+    home.child("workflows/gate-wf.yaml")
+        .write_str(GATE_WF)
+        .unwrap();
+    let customers = CustomerStore::new(home.path());
+    // Launch from an unassigned project.
+    customers.unassign(ProjectRef::Path(&project)).unwrap();
+    let run_id = "run_customer_none_then_assigned".to_string();
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", ECHO_SCRIPT);
+    std::env::set_current_dir(&project).unwrap();
+    Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "gate-wf".into(),
+        "--run-id".into(),
+        run_id.clone(),
+        "--plain".into(),
+    ]))
+    .await;
+
+    let store = rupu_orchestrator::RunStore::new(home.path().join("runs"));
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(
+        record.status,
+        rupu_orchestrator::RunStatus::AwaitingApproval
+    );
+    assert_eq!(record.customer, Some(None), "a recorded none");
+    let raw = std::fs::read_to_string(store.run_json_path(&run_id)).unwrap();
+    assert!(raw.contains("\"customer\": null"), "run.json: {raw}");
+
+    customers
+        .assign("acme", ProjectRef::Path(&project))
+        .unwrap();
+
+    let code = Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "approve".into(),
+        run_id.clone(),
+    ]))
+    .await;
+    assert!(ok(code), "approve failed");
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
+    assert_eq!(record.customer, Some(None), "still none after the resume");
+    let steps = store.read_step_results(&run_id).unwrap();
+    let step = steps.iter().find(|s| s.step_id == "a").unwrap();
+    let transcript = std::fs::read_to_string(&step.transcript_path).unwrap();
+    let run_start = transcript.lines().next().unwrap();
+    assert!(
+        run_start.contains("\"provider\":\"anthropic\""),
+        "the resumed step should run with NO customer, on the global default: {run_start}"
+    );
+    assert!(
+        run_start.contains("\"customer\":null"),
+        "the resumed step records no customer: {run_start}"
     );
 }

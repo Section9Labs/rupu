@@ -440,8 +440,9 @@ pub(crate) struct LocalSource {
     /// Stamped with `workflow`, `workspace_id` and `host_id = "local"`.
     pub(crate) rows: Vec<rupu_transcript::UsageRow>,
     pub(crate) partial: bool,
-    /// The customer the source is attributed to — recorded, else its
-    /// workspace's current assignment — and whose pricing prices it.
+    /// The customer the source is attributed to — recorded (a slug or none),
+    /// else, for a legacy source, its session's or its workspace's current
+    /// assignment — and whose pricing prices it.
     pub(crate) customer: Option<String>,
 }
 
@@ -453,8 +454,8 @@ pub(crate) struct LocalSource {
 /// [`crate::usage::transcripts_usage`]). Also returns the earliest start
 /// across ALL sources, for the timeline's gap-fill.
 ///
-/// Each kept source is attributed to its customer (recorded, else its
-/// workspace's current assignment); with a `customer` filter only that
+/// Each kept source is attributed to its customer (recorded, else — a legacy
+/// source — its session's or its workspace's current assignment); with a `customer` filter only that
 /// customer's sources are kept. An assignment that cannot be read fails the
 /// call.
 ///
@@ -481,7 +482,7 @@ fn collect_local_sources(
         .iter()
         .filter(|r| in_scope(r.started_at, &r.workspace_id))
     {
-        let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
+        let who = lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)?;
         if customer.is_some_and(|f| !f.matches(who.slug.as_deref())) {
             continue;
         }
@@ -521,14 +522,7 @@ fn collect_local_sources(
         if !in_scope(at, &src.workspace_id) {
             continue;
         }
-        let who = if src.customer.is_none() && src.workspace_id.is_empty() {
-            crate::customers::Attribution {
-                slug: None,
-                derived: false,
-            }
-        } else {
-            lookup.attribute(src.customer.as_deref(), &src.workspace_id)?
-        };
+        let who = src.attribute(&mut lookup)?;
         if customer.is_some_and(|f| !f.matches(who.slug.as_deref())) {
             continue;
         }

@@ -1812,7 +1812,9 @@ async fn run_agent_inner(
         schema: Some(2),
         system_prompt: Some(opts.agent_system_prompt.clone()),
         codename: opts.codename.clone(),
-        customer: opts.tool_context.customer.clone(),
+        // Always recorded: `null` when the run has no customer, so a
+        // later assignment of the project never re-attributes it.
+        customer: Some(opts.tool_context.customer.clone()),
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).

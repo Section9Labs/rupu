@@ -66,11 +66,17 @@ struct SessionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codename: Option<String>,
     /// The customer the session's directory was assigned to as of its latest
-    /// turn (`session.json`'s `customer`). Always serialized (`null` when
-    /// none) so a coordinator can tell "no customer" from a peer too old to
-    /// report one.
-    #[serde(default)]
-    customer: Option<String>,
+    /// turn (`session.json`'s `customer`), tri-state
+    /// ([`crate::customers::RecordedField`]). Not serialized from here: the
+    /// scan writes the attributed `customer` + `customer_derived` (`null` =
+    /// no customer, so a coordinator can tell "no customer" from a peer too
+    /// old to report one), or neither when the attribution can't be read.
+    #[serde(
+        default,
+        deserialize_with = "rupu_transcript::recorded::deserialize",
+        skip_serializing
+    )]
+    customer: crate::customers::RecordedField,
     /// The recorded turns — read for [`session_usage`], never serialized
     /// (the list/detail wire shape is unchanged; `/api/sessions/:id/runs`
     /// serves the turns). Parsed leniently: an unexpected shape reads as no
@@ -276,22 +282,33 @@ pub(crate) struct SessionScan<'a> {
     /// `Some(w)` → only sessions whose `workspace_id == w`, filtered BEFORE
     /// any usage is folded.
     pub(crate) workspace: Option<&'a str>,
+    /// `true` (a customer filter, a count or a rollup) → an assignment that
+    /// cannot be read fails the scan; `false` (an unfiltered list) → that
+    /// session carries no customer keys (one warning per workspace).
+    pub(crate) fail_closed: bool,
 }
 
-/// A session's customer: the one `session.json` recorded (`customer`), else
-/// — a session that predates customers — its workspace's CURRENT assignment
-/// (`derived`). An assignment that cannot be read is an error.
+/// A session's customer: the one `session.json` recorded (a slug, or `null`
+/// = none), else — a session that predates customers — its workspace's
+/// CURRENT assignment (`derived`). An assignment that cannot be read is an
+/// error when `fail_closed`, else `None` (the customer can't be known).
 fn session_customer(
     lookup: &mut crate::customers::CustomerLookup,
     dto: &SessionDto,
-) -> Result<crate::customers::Attribution, ApiError> {
-    if dto.customer.is_none() && dto.workspace_id.is_empty() {
-        return Ok(crate::customers::Attribution {
+    fail_closed: bool,
+) -> Result<Option<crate::customers::Attribution>, ApiError> {
+    let recorded = crate::customers::Recorded::of(&dto.customer);
+    if recorded.is_legacy() && dto.workspace_id.is_empty() {
+        return Ok(Some(crate::customers::Attribution {
             slug: None,
             derived: false,
-        });
+        }));
     }
-    lookup.attribute(dto.customer.as_deref(), &dto.workspace_id)
+    if fail_closed {
+        lookup.attribute(recorded, &dto.workspace_id).map(Some)
+    } else {
+        Ok(lookup.attribute_for_listing(recorded, &dto.workspace_id))
+    }
 }
 
 /// What a scan attributes and prices with — one per request.
@@ -302,7 +319,8 @@ struct ScanCtx<'a> {
 
 /// Scan `<root>` for `<id>/session.json` entries. Assigns `scope` to
 /// each successfully parsed session, attributes it to its customer
-/// (`customer` + `customer_derived`, always present) and pushes it onto `out`.
+/// (`customer` + `customer_derived`; neither when the attribution can't be
+/// read and the scan is not `fail_closed`) and pushes it onto `out`.
 fn scan_session_dir(
     root: &std::path::Path,
     scope: &str,
@@ -332,11 +350,19 @@ fn scan_session_dir(
         if scan.workspace.is_some_and(|w| dto.workspace_id != w) {
             continue;
         }
-        let who = session_customer(&mut ctx.lookup, &dto)?;
+        let who = session_customer(&mut ctx.lookup, &dto, scan.fail_closed)?;
+        // Priced at its attribution's customer; a session whose attribution
+        // can't be read, at the customer it recorded (else global).
+        let pricing_slug = match &who {
+            Some(w) => w.slug.clone(),
+            None => crate::customers::Recorded::of(&dto.customer)
+                .slug()
+                .map(str::to_string),
+        };
         let usage = ctx
             .prices
             .as_mut()
-            .map(|prices| session_usage(&dto, run_store, prices.get(who.slug.as_deref())));
+            .map(|prices| session_usage(&dto, run_store, prices.get(pricing_slug.as_deref())));
         match serde_json::to_value(&dto) {
             Ok(mut val) => {
                 if let serde_json::Value::Object(ref mut map) = val {
@@ -347,11 +373,13 @@ fn scan_session_dir(
                     if let Some(Ok(u)) = usage.map(|u| serde_json::to_value(&u)) {
                         map.insert("usage".to_string(), u);
                     }
-                    map.insert("customer".to_string(), serde_json::json!(who.slug));
-                    map.insert(
-                        "customer_derived".to_string(),
-                        serde_json::json!(who.derived),
-                    );
+                    if let Some(who) = &who {
+                        map.insert("customer".to_string(), serde_json::json!(who.slug));
+                        map.insert(
+                            "customer_derived".to_string(),
+                            serde_json::json!(who.derived),
+                        );
+                    }
                 }
                 crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
                 out.push(val);
@@ -370,18 +398,21 @@ fn scan_session_dir(
 
 /// Collect all sessions from both active and archive dirs, each attributed
 /// to its customer and priced with that customer's pricing. Each entry has
-/// an injected `"scope"` key (`"active"` or `"archived"`). An assignment that
-/// cannot be read fails the call. Blocking IO (every session's turn
-/// transcripts are folded) — call from `spawn_blocking`.
+/// an injected `"scope"` key (`"active"` or `"archived"`). `fail_closed`: an
+/// assignment that cannot be read fails the call; else that session carries
+/// no customer keys. Blocking IO (every session's turn transcripts are
+/// folded) — call from `spawn_blocking`.
 pub(crate) fn collect_sessions(
     global_dir: &std::path::Path,
     pricing: &crate::customers::CustomerPricing,
+    fail_closed: bool,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     collect_sessions_with(
         global_dir,
         SessionScan {
             pricing: Some(pricing),
             workspace: None,
+            fail_closed,
         },
     )
 }
@@ -465,8 +496,11 @@ struct SessionHostQuery {
 /// `GET /api/sessions[?host=<id>][&customer=<slug>|none]`
 ///
 /// `?customer=` keeps the sessions attributed to that customer (recorded on
-/// `session.json`, else the workspace's current assignment —
-/// `customer_derived`; `none` = no customer). Each session is priced with its
+/// `session.json` — a slug or `null` — else, for a session that predates
+/// customers, the workspace's current assignment — `customer_derived`;
+/// `none` = no customer). Unfiltered, a session whose workspace assignment
+/// can't be read is listed without customer keys; under a filter that fails
+/// the request (500). Each session is priced with its
 /// customer's pricing. Local sessions are filtered
 /// before they are paged. A remote host's sessions are filtered on the
 /// coordinator by their `customer` key; a remote whose rows carry none is too
@@ -528,7 +562,9 @@ async fn list_sessions(
         let pricing = std::sync::Arc::clone(&s.customer_pricing);
         let filter = filter.clone();
         tokio::task::spawn_blocking(move || {
-            let mut sessions = collect_sessions(&global, &pricing)?;
+            // Unfiltered: an unreadable assignment omits that session's
+            // customer keys; under a filter it fails the request.
+            let mut sessions = collect_sessions(&global, &pricing, filter.is_some())?;
             if let Some(f) = &filter {
                 sessions.retain(|v| f.matches(v["customer"].as_str()));
             }
@@ -1149,7 +1185,7 @@ mod tests {
             tmp.path().to_path_buf(),
             rupu_config::PricingConfig::default(),
         );
-        let rows = collect_sessions(tmp.path(), &pricing).unwrap();
+        let rows = collect_sessions(tmp.path(), &pricing, true).unwrap();
         let by = |id: &str| {
             rows.iter()
                 .find(|r| r["session_id"] == id)
@@ -1195,18 +1231,89 @@ mod tests {
         assert!((u.cost_usd.unwrap() - 3.0).abs() < 1e-9);
     }
 
-    /// `session.json`'s `customer` rides on the row; a row with none says
-    /// `null` (never omits the key), so a coordinator can tell "no customer"
-    /// from a peer too old to report one.
+    /// A session row's `customer` is the one `session.json` recorded — a
+    /// slug, or `null` (kept none even when its project is assigned now) —
+    /// else, for a session that predates customers, its workspace's current
+    /// assignment (derived). A row with none says `null` (never omits the
+    /// key), so a coordinator can tell "no customer" from a peer too old to
+    /// report one. Unfiltered, a session whose assignment can't be read is
+    /// listed WITHOUT the keys; fail-closed (a filter), the scan errors.
     #[test]
-    fn session_row_carries_the_customer_or_null() {
-        let with: SessionDto =
-            serde_json::from_str(r#"{"session_id":"s1","customer":"acme"}"#).unwrap();
-        assert_eq!(serde_json::to_value(&with).unwrap()["customer"], "acme");
-        let without: SessionDto = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
-        let v = serde_json::to_value(&without).unwrap();
-        assert!(v.as_object().unwrap().contains_key("customer"));
-        assert!(v["customer"].is_null());
+    fn session_rows_carry_the_recorded_customer_or_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let store = rupu_workspace::CustomerStore::new(global);
+        store
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(global.join("workspaces")).unwrap();
+        std::fs::write(global.join("workspaces/ws_acme.customer"), "acme\n").unwrap();
+        let root = global.join("sessions");
+        for (id, extra) in [
+            (
+                "ses_slug",
+                serde_json::json!({"customer": "acme", "workspace_id": "ws_none"}),
+            ),
+            (
+                "ses_null",
+                serde_json::json!({"customer": null, "workspace_id": "ws_acme"}),
+            ),
+            ("ses_legacy", serde_json::json!({"workspace_id": "ws_acme"})),
+            (
+                "ses_legacy_none",
+                serde_json::json!({"workspace_id": "ws_none"}),
+            ),
+        ] {
+            let dir = root.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut j = serde_json::json!({"session_id": id, "agent_name": "a"});
+            for (k, v) in extra.as_object().unwrap() {
+                j[k] = v.clone();
+            }
+            std::fs::write(dir.join("session.json"), j.to_string()).unwrap();
+        }
+        let pricing = crate::customers::CustomerPricing::new(
+            global.to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let rows = collect_sessions(global, &pricing, true).unwrap();
+        let by = |rows: &[serde_json::Value], id: &str| {
+            rows.iter()
+                .find(|r| r["session_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let keys = |v: &serde_json::Value| (v["customer"].clone(), v["customer_derived"].clone());
+        use serde_json::json;
+        assert_eq!(keys(&by(&rows, "ses_slug")), (json!("acme"), json!(false)));
+        assert_eq!(keys(&by(&rows, "ses_null")), (json!(null), json!(false)));
+        assert_eq!(keys(&by(&rows, "ses_legacy")), (json!("acme"), json!(true)));
+        let none = by(&rows, "ses_legacy_none");
+        assert!(none.as_object().unwrap().contains_key("customer"));
+        assert_eq!(keys(&none), (json!(null), json!(false)));
+
+        // An unreadable assignment: listed without the keys when unfiltered…
+        std::fs::remove_file(global.join("workspaces/ws_acme.customer")).unwrap();
+        std::fs::create_dir(global.join("workspaces/ws_acme.customer")).unwrap();
+        let rows = collect_sessions(global, &pricing, false).unwrap();
+        let legacy = by(&rows, "ses_legacy");
+        assert!(
+            !legacy.as_object().unwrap().contains_key("customer"),
+            "{legacy}"
+        );
+        assert!(!legacy.as_object().unwrap().contains_key("customer_derived"));
+        // …a recorded none needs no sidecar…
+        assert_eq!(keys(&by(&rows, "ses_null")), (json!(null), json!(false)));
+        // …and fail-closed (a filter) is a 500 naming the workspace.
+        let err = collect_sessions(global, &pricing, true).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("ws_acme"), "{}", err.1);
     }
 
     /// A `runs` field of an unexpected shape never fails the session parse

@@ -72,11 +72,16 @@ pub enum Event {
         /// `None` on transcripts written before codenames existed.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         codename: Option<String>,
-        /// Customer this run ran under (`rupu customer`). `None` on
-        /// transcripts written before customers existed or for runs with
-        /// no customer.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        customer: Option<String>,
+        /// Customer this run ran under (`rupu customer`), tri-state (see
+        /// [`crate::recorded`]): `None` = the key is absent (a transcript
+        /// written before customers existed), `Some(None)` = recorded "no
+        /// customer" (written as `null`), `Some(Some(slug))` = the slug.
+        #[serde(
+            default,
+            deserialize_with = "crate::recorded::deserialize",
+            skip_serializing_if = "Option::is_none"
+        )]
+        customer: crate::recorded::RecordedField,
     },
     TurnStart {
         turn_idx: u32,
@@ -749,7 +754,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
-            customer: Some("acme".into()),
+            customer: Some(Some("acme".into())),
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""customer":"acme""#), "{s}");
@@ -784,8 +789,16 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
-            customer: None,
+            customer: Some(None),
         };
-        assert!(!serde_json::to_string(&none).unwrap().contains("customer"));
+        // A recorded "no customer" is written as an explicit `null`, so a
+        // reader can tell it from a transcript that predates customers.
+        let s = serde_json::to_string(&none).unwrap();
+        assert!(s.contains(r#""customer":null"#), "{s}");
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), none);
+        let legacy_rt = serde_json::from_str::<Event>(legacy).unwrap();
+        assert!(!serde_json::to_string(&legacy_rt)
+            .unwrap()
+            .contains("customer"));
     }
 }

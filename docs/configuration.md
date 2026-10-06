@@ -40,10 +40,12 @@ global lock › customer lock › project › customer › global › default
   so subdirectories inherit their project's customer, and a repo needs no `.rupu/` of its own.
   An autoflow run uses its repo's checkout (not its issue worktree).
 - A run **records** the customer it ran under (`run.json`, every transcript's `RunStart`,
-  and a session's `session.json`). `rupu workflow resume` / `approve` run on the recorded
-  customer even if the project has since been reassigned; only a run from before this
-  was recorded falls back to the directory it was launched from. A recorded customer that
-  no longer exists fails the resume. Runs recorded before customers show the project's
+  and a session's `session.json`) — `"customer": null` when it ran with none.
+  `rupu workflow resume` / `approve` run on what was recorded even if the project has
+  since been reassigned: the recorded customer, or no customer for a recorded `null`
+  (even if the project has been assigned since). A recorded customer that no longer
+  exists fails the resume. Only a run from before customers existed (no `customer` key
+  at all) falls back to the directory it was launched from, and shows the project's
   *current* customer, marked derived in the CP API
   ([`cp-customers-api.md`](cp-customers-api.md)).
 - A project assigned to a customer that no longer exists, or a customer layer that

@@ -37,7 +37,7 @@ use crate::api::config::require_writable_to;
 use crate::api::projects::{apply_rollup, project_rollups, project_row, ProjectRow};
 use crate::api::runs::blocking;
 pub use crate::customers::DefaultAccount;
-use crate::customers::{customer_dto, CustomerDto, CustomerLookup, PricingMemo};
+use crate::customers::{customer_dto, CustomerDto, CustomerLookup, PricingMemo, Recorded};
 use crate::error::{ApiError, ApiResult};
 use crate::host::dashboard_summary::DashboardRange;
 use crate::state::AppState;
@@ -206,7 +206,7 @@ impl Pass {
             }
             let who = self
                 .lookup
-                .attribute(run.customer.as_deref(), &run.workspace_id)?;
+                .attribute(Recorded::of(&run.customer), &run.workspace_id)?;
             let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
                 continue;
             };
@@ -222,9 +222,7 @@ impl Pass {
             if !in_range(src.started_at) {
                 continue;
             }
-            let who = self
-                .lookup
-                .attribute(src.customer.as_deref(), &src.workspace_id)?;
+            let who = src.attribute(&mut self.lookup)?;
             let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
                 continue;
             };

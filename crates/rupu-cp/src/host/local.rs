@@ -200,8 +200,10 @@ impl HostConnector for LocalHostConnector {
         let global = self.global_dir.clone();
         // Store reads + the usage fold run on the blocking pool.
         let rows = blocking_host(move || {
-            // Each row carries its customer (recorded, else derived from the
-            // workspace's current assignment) and is priced per customer.
+            // Each row carries its customer (recorded, else — a legacy run —
+            // derived from the workspace's current assignment) and is priced
+            // per customer. Unfiltered: an unreadable assignment omits that
+            // row's customer keys rather than failing the listing.
             let mut lookup =
                 crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
             let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
@@ -507,8 +509,8 @@ impl HostConnector for LocalHostConnector {
 
 impl LocalHostConnector {
     /// This host's dashboard summary, optionally narrowed to one customer's
-    /// work: runs by attribution (recorded, else the workspace's current
-    /// assignment), open findings by their project's current assignment,
+    /// work: runs by attribution (recorded, else — a legacy run — the
+    /// workspace's current assignment), open findings by their project's current assignment,
     /// and autoflow cycles by the customers of the projects whose repos they
     /// touched (a cycle no project resolves for is left out under a filter).
     /// The fleet counts are not run-scoped and stay unfiltered. An
@@ -530,7 +532,7 @@ impl LocalHostConnector {
             let mut kept = Vec::with_capacity(runs.len());
             for r in runs {
                 let who = lookup
-                    .attribute(r.customer.as_deref(), &r.workspace_id)
+                    .attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)
                     .map_err(internal)?;
                 if f.matches(who.slug.as_deref()) {
                     kept.push(r);

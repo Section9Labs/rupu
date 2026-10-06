@@ -31,7 +31,7 @@ use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
@@ -1842,18 +1842,36 @@ async fn list(
     heads.sort_by_key(|(_, _, head)| Reverse(head.started_at));
     heads.truncate(limit);
 
-    // Each row's customer: recorded on `run_start`, else its workspace's
-    // current assignment (derived). A workspace whose assignment cannot be
-    // read does not fail the listing: its rows omit the customer keys (one
-    // warning per workspace on stderr), never claiming "no customer".
+    // Each row's customer: recorded on `run_start` (a slug or `null`); for a
+    // transcript that predates customers, a session turn's session customer
+    // (derived), else its workspace's current assignment (derived). A
+    // workspace whose assignment cannot be read does not fail the listing:
+    // its rows omit the customer keys (one warning per workspace on
+    // stderr), never claiming "no customer".
     let mut customers =
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+    let mut session_customers: std::collections::HashMap<
+        String,
+        Option<rupu_transcript::RecordedField>,
+    > = std::collections::HashMap::new();
 
     // Pass 2 — full summaries, for the surviving rows only.
     let mut rows: Vec<Row> = Vec::new();
     for (scope, path, head) in &heads {
-        let customer =
-            customers.attribute_for_listing(head.customer.as_deref(), &head.workspace_id);
+        let (field, inherited) = match &head.customer {
+            Some(_) => (head.customer.clone(), false),
+            // Legacy: only now (and only for the rows shown) look up whether
+            // it is a session turn, via its meta sidecar.
+            None => match legacy_turn_session_customer(&global, path, &mut session_customers) {
+                Some(session) => {
+                    rupu_cp::customers::session_turn_customer(&head.customer, &session)
+                }
+                None => (None, false),
+            },
+        };
+        let customer = customers
+            .attribute_for_listing(rupu_transcript::Recorded::of(&field), &head.workspace_id)
+            .map(|who| who.inherited(inherited));
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
                 customer,
@@ -1958,6 +1976,28 @@ async fn list(
         );
     }
     Ok(())
+}
+
+/// The session customer a transcript inherits when it is a session turn
+/// whose `run_start` predates customers: its meta sidecar names the session,
+/// whose record holds the customer (memoized per session). `None` when the
+/// transcript is not a session turn or the session can't be read.
+fn legacy_turn_session_customer(
+    global: &Path,
+    transcript: &Path,
+    cache: &mut std::collections::HashMap<String, Option<rupu_transcript::RecordedField>>,
+) -> Option<rupu_transcript::RecordedField> {
+    let dir = transcript.parent()?;
+    let stem = transcript.file_stem()?.to_str()?;
+    let meta = crate::standalone_run_metadata::read_metadata(
+        &crate::standalone_run_metadata::metadata_path_for_run(dir, stem),
+    )
+    .ok()?;
+    let session_id = meta.session_id?;
+    cache
+        .entry(session_id.clone())
+        .or_insert_with(|| crate::cmd::session::recorded_session_customer(global, &session_id))
+        .clone()
 }
 
 async fn show(

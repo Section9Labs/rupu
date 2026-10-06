@@ -118,31 +118,79 @@ impl CustomerFilter {
     }
 }
 
+pub use rupu_transcript::{Recorded, RecordedField};
+
 /// A run's customer as rows report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribution {
     pub slug: Option<String>,
-    /// True when `slug` came from the workspace's CURRENT assignment because
-    /// the run recorded none (ruling 4).
+    /// True when `slug` did not come from the work's own record: the
+    /// workspace's CURRENT assignment (a legacy record, ruling 4) or a
+    /// session's customer inherited by a legacy session turn.
     pub derived: bool,
 }
 
-/// Recorded customer, else the workspace's current assignment (`derived`),
-/// else none. A workspace id the store rejects (a malformed legacy id) reads
-/// as unassigned: nothing can be assigned under it. Any other failure to
-/// read the assignment — an unreadable sidecar, say — is a 500 naming the
-/// workspace: callers fail the request rather than count the work as having
-/// no customer.
+impl Attribution {
+    /// Mark an attribution whose record was inherited from a session
+    /// ([`session_turn_customer`]) as derived: a session-inherited customer
+    /// is never the turn's own record.
+    pub fn inherited(mut self, inherited: bool) -> Self {
+        if inherited && self.slug.is_some() {
+            self.derived = true;
+        }
+        self
+    }
+
+    /// What a record says on its own, with no store to consult: a recorded
+    /// slug or a recorded none; `None` for a legacy record (whose customer
+    /// only the workspace's current assignment could tell).
+    pub fn recorded_only(recorded: Recorded<'_>) -> Option<Self> {
+        match recorded {
+            Recorded::Legacy => None,
+            Recorded::None => Some(Self {
+                slug: None,
+                derived: false,
+            }),
+            Recorded::Slug(s) => Some(Self {
+                slug: Some(s.to_string()),
+                derived: false,
+            }),
+        }
+    }
+}
+
+/// A session turn's customer field: its own transcript's when that recorded
+/// one (a slug or `null`); for a LEGACY turn transcript, the session
+/// record's (its latest turn's — `true` = inherited, which rows report as
+/// `customer_derived`); legacy when both are legacy (then the workspace's
+/// current assignment applies).
+pub fn session_turn_customer(
+    head: &RecordedField,
+    session: &RecordedField,
+) -> (RecordedField, bool) {
+    match (head, session) {
+        (Some(_), _) => (head.clone(), false),
+        (None, Some(_)) => (session.clone(), true),
+        (None, None) => (None, false),
+    }
+}
+
+/// The customer a record recorded (a slug, or `null` = none — neither
+/// derived); for a LEGACY record (no key: it predates customers) only, the
+/// workspace's current assignment (`derived`), else none. A recorded none
+/// stays none even if the project has been assigned since: reassigning a
+/// project never rewrites history. A workspace id the store rejects (a
+/// malformed legacy id) reads as unassigned: nothing can be assigned under
+/// it. Any other failure to read the assignment — an unreadable sidecar,
+/// say — is a 500 naming the workspace: callers fail the request rather than
+/// count the work as having no customer.
 pub fn attribute(
     store: &CustomerStore,
-    recorded: Option<&str>,
+    recorded: Recorded<'_>,
     workspace_id: &str,
 ) -> Result<Attribution, ApiError> {
-    if let Some(slug) = recorded {
-        return Ok(Attribution {
-            slug: Some(slug.to_string()),
-            derived: false,
-        });
+    if let Some(who) = Attribution::recorded_only(recorded) {
+        return Ok(who);
     }
     let slug = match store.customer_of(workspace_id) {
         Ok(slug) => slug,
@@ -216,7 +264,7 @@ impl CustomerLookup {
         if let Some(hit) = self.assignments.get(ws_id) {
             return Ok(hit.clone());
         }
-        let slug = attribute(&self.store, None, ws_id)?.slug;
+        let slug = attribute(&self.store, Recorded::Legacy, ws_id)?.slug;
         self.assignments.insert(ws_id.to_string(), slug.clone());
         Ok(slug)
     }
@@ -224,14 +272,11 @@ impl CustomerLookup {
     /// [`attribute`], memoized per workspace id.
     pub fn attribute(
         &mut self,
-        recorded: Option<&str>,
+        recorded: Recorded<'_>,
         workspace_id: &str,
     ) -> Result<Attribution, ApiError> {
-        if let Some(slug) = recorded {
-            return Ok(Attribution {
-                slug: Some(slug.to_string()),
-                derived: false,
-            });
+        if let Some(who) = Attribution::recorded_only(recorded) {
+            return Ok(who);
         }
         let slug = self.assigned(workspace_id)?;
         Ok(Attribution {
@@ -240,15 +285,17 @@ impl CustomerLookup {
         })
     }
 
-    /// [`Self::attribute`] for a CLI display listing (`rupu run list`,
-    /// `transcript list`, `session list`), which must not fail on one
-    /// workspace's unreadable assignment: `None` = the row's customer cannot
-    /// be known (the row then omits its customer keys), with ONE warning per
-    /// affected workspace naming it. The CP's own handlers use
-    /// [`Self::attribute`] and fail closed instead.
+    /// [`Self::attribute`] for a display listing — a CLI listing (`rupu run
+    /// list`, `transcript list`, `session list`) or one of the CP's
+    /// UNFILTERED run / agent-run / session lists — which must not fail on
+    /// one workspace's unreadable assignment: `None` = the row's customer
+    /// cannot be known (the row then omits its customer keys), with ONE
+    /// warning per affected workspace naming it. A customer filter, and every
+    /// count, rollup and price (customers API, project rollups, usage,
+    /// dashboard), uses [`Self::attribute`] and fails closed instead.
     pub fn attribute_for_listing(
         &mut self,
-        recorded: Option<&str>,
+        recorded: Recorded<'_>,
         workspace_id: &str,
     ) -> Option<Attribution> {
         match self.attribute(recorded, workspace_id) {
@@ -673,18 +720,57 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = assigned_store(tmp.path());
 
-        let a = attribute(&store, Some("zed"), "ws_assigned").unwrap();
+        let a = attribute(&store, Recorded::Slug("zed"), "ws_assigned").unwrap();
         assert_eq!((a.slug.as_deref(), a.derived), (Some("zed"), false));
 
-        let a = attribute(&store, None, "ws_assigned").unwrap();
+        // Only a LEGACY record (no key) derives from the current assignment.
+        let a = attribute(&store, Recorded::Legacy, "ws_assigned").unwrap();
         assert_eq!((a.slug.as_deref(), a.derived), (Some("acme"), true));
 
-        let a = attribute(&store, None, "ws_unassigned").unwrap();
+        // A recorded "no customer" stays none even though the project is
+        // assigned now: reassigning a project never rewrites history.
+        let a = attribute(&store, Recorded::None, "ws_assigned").unwrap();
+        assert_eq!((a.slug, a.derived), (None, false));
+
+        let a = attribute(&store, Recorded::Legacy, "ws_unassigned").unwrap();
         assert_eq!((a.slug, a.derived), (None, false));
 
         // A workspace id the store rejects never fails a listing.
-        let a = attribute(&store, None, "../weird id").unwrap();
+        let a = attribute(&store, Recorded::Legacy, "../weird id").unwrap();
         assert_eq!((a.slug, a.derived), (None, false));
+
+        // A session-inherited slug is derived; an inherited none is not.
+        assert!(
+            attribute(&store, Recorded::Slug("zed"), "ws_assigned")
+                .unwrap()
+                .inherited(true)
+                .derived
+        );
+        assert!(
+            !attribute(&store, Recorded::None, "ws_assigned")
+                .unwrap()
+                .inherited(true)
+                .derived
+        );
+    }
+
+    #[test]
+    fn session_turn_customer_takes_the_session_only_for_a_legacy_turn() {
+        let slug = |s: &str| Some(Some(s.to_string()));
+        assert_eq!(
+            session_turn_customer(&slug("a"), &slug("b")),
+            (slug("a"), false)
+        );
+        assert_eq!(
+            session_turn_customer(&Some(None), &slug("b")),
+            (Some(None), false)
+        );
+        assert_eq!(session_turn_customer(&None, &slug("b")), (slug("b"), true));
+        assert_eq!(
+            session_turn_customer(&None, &Some(None)),
+            (Some(None), true)
+        );
+        assert_eq!(session_turn_customer(&None, &None), (None, false));
     }
 
     #[test]
@@ -694,10 +780,11 @@ mod tests {
         let mut lookup = CustomerLookup::new(store.clone());
 
         for (recorded, ws) in [
-            (Some("zed"), "ws_assigned"),
-            (None, "ws_assigned"),
-            (None, "ws_unassigned"),
-            (None, "../weird id"),
+            (Recorded::Slug("zed"), "ws_assigned"),
+            (Recorded::None, "ws_assigned"),
+            (Recorded::Legacy, "ws_assigned"),
+            (Recorded::Legacy, "ws_unassigned"),
+            (Recorded::Legacy, "../weird id"),
         ] {
             assert_eq!(
                 lookup.attribute(recorded, ws).unwrap(),
@@ -733,19 +820,24 @@ mod tests {
         // error other than NotFound.
         std::fs::create_dir(tmp.path().join("workspaces/ws_broken.customer")).unwrap();
 
-        let err = attribute(&store, None, "ws_broken").unwrap_err();
+        let err = attribute(&store, Recorded::Legacy, "ws_broken").unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.1.contains("ws_broken"), "{}", err.1);
         // A recorded customer never needs the sidecar.
         assert_eq!(
-            attribute(&store, Some("acme"), "ws_broken")
+            attribute(&store, Recorded::Slug("acme"), "ws_broken")
                 .unwrap()
                 .slug
                 .as_deref(),
             Some("acme")
         );
+        // Nor does a recorded none.
+        assert_eq!(
+            attribute(&store, Recorded::None, "ws_broken").unwrap().slug,
+            None
+        );
         let err = CustomerLookup::new(store)
-            .attribute(None, "ws_broken")
+            .attribute(Recorded::Legacy, "ws_broken")
             .unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.1.contains("ws_broken"), "{}", err.1);

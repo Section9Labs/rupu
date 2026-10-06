@@ -60,21 +60,48 @@ pub struct ExtraSource {
     pub agent: String,
     /// The transcript's `RunStart` workspace; empty when unknown.
     pub workspace_id: String,
-    /// The customer the run recorded on its `RunStart` (a session turn that
-    /// predates customers falls back to its `session.json`'s); `None` ⇒ no
-    /// customer recorded.
-    pub customer: Option<String>,
+    /// The customer the run recorded on its `RunStart`, tri-state
+    /// ([`crate::customers::RecordedField`]: legacy / recorded none / slug).
+    /// A session turn whose transcript predates customers (legacy) takes its
+    /// `session.json`'s instead, and says so in `customer_inherited`.
+    pub customer: crate::customers::RecordedField,
+    /// `customer` is the session's, inherited by a legacy turn — reported as
+    /// derived ([`crate::customers::Attribution::inherited`]).
+    pub customer_inherited: bool,
     /// Own transcript + recursive dispatch sub-runs, each labelled with `id`.
     pub paths: Vec<(String, PathBuf)>,
 }
 
+impl ExtraSource {
+    /// The source's customer, failing closed (for counts, rollups and
+    /// pricing): what its transcript recorded; for a legacy one, its
+    /// session's (inherited ⇒ derived), else its workspace's current
+    /// assignment; a legacy source with no workspace has none. An
+    /// assignment that cannot be read is an error naming the workspace.
+    pub fn attribute(
+        &self,
+        lookup: &mut crate::customers::CustomerLookup,
+    ) -> Result<crate::customers::Attribution, crate::error::ApiError> {
+        let recorded = crate::customers::Recorded::of(&self.customer);
+        if recorded.is_legacy() && self.workspace_id.is_empty() {
+            return Ok(crate::customers::Attribution {
+                slug: None,
+                derived: false,
+            });
+        }
+        Ok(lookup
+            .attribute(recorded, &self.workspace_id)?
+            .inherited(self.customer_inherited))
+    }
+}
+
 /// The run-start facts a source is dated and attributed by.
 #[derive(Debug, Clone, Default)]
-struct Head {
-    agent: String,
-    workspace_id: String,
-    started_at: Option<DateTime<Utc>>,
-    customer: Option<String>,
+pub(crate) struct Head {
+    pub(crate) agent: String,
+    pub(crate) workspace_id: String,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) customer: crate::customers::RecordedField,
 }
 
 /// A path's canonical form, or the path itself when it can't be resolved.
@@ -93,7 +120,7 @@ fn safe_run_id(id: &str) -> bool {
 
 /// A transcript's `RunStart` head. Found heads never change, so they are
 /// cached process-wide; a file with no `RunStart` yet is re-read next time.
-fn head_of(path: &Path) -> Head {
+pub(crate) fn head_of(path: &Path) -> Head {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Head>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Mutex::default);
     if let Some(h) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(path) {
@@ -220,7 +247,8 @@ pub fn extra_sources(
                 } else {
                     head.agent
                 };
-                let customer = head.customer.or_else(|| session.customer.clone());
+                let (customer, customer_inherited) =
+                    crate::customers::session_turn_customer(&head.customer, &session.customer);
                 let paths = source_paths(run_store, &id, &own, &is_claimed);
                 out.push(ExtraSource {
                     kind: SourceKind::Session,
@@ -230,6 +258,7 @@ pub fn extra_sources(
                     agent,
                     workspace_id: head.workspace_id,
                     customer,
+                    customer_inherited,
                     paths,
                 });
             }
@@ -304,6 +333,7 @@ pub fn extra_sources(
             agent: head.agent,
             workspace_id: head.workspace_id,
             customer: head.customer,
+            customer_inherited: false,
             paths,
         });
     }
@@ -327,11 +357,16 @@ fn source_paths(
 mod tests {
     use super::*;
 
+    /// A transcript that predates customers (no `customer` key).
     fn transcript(path: &Path, agent: &str) {
-        transcript_for(path, agent, None);
+        transcript_with(path, agent, None);
     }
 
     fn transcript_for(path: &Path, agent: &str, customer: Option<&str>) {
+        transcript_with(path, agent, Some(customer.map(str::to_string)));
+    }
+
+    fn transcript_with(path: &Path, agent: &str, customer: crate::customers::RecordedField) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let ev = rupu_transcript::Event::RunStart {
             codename: None,
@@ -344,7 +379,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
-            customer: customer.map(str::to_string),
+            customer,
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');
@@ -456,9 +491,10 @@ mod tests {
         );
     }
 
-    /// A source's customer is the one its transcript's `run_start` recorded;
-    /// a session turn whose transcript names none (written before customers)
-    /// falls back to the session's `customer` from `session.json`.
+    /// A source's customer is the one its transcript's `run_start` recorded
+    /// (a slug or `null`); a session turn whose transcript predates customers
+    /// (no key) falls back to the session's `customer` from `session.json`,
+    /// marked inherited.
     #[test]
     fn a_source_carries_the_customer_its_transcript_recorded() {
         let tmp = tempfile::tempdir().unwrap();
@@ -467,11 +503,15 @@ mod tests {
         let tdir = global.join("transcripts");
         transcript_for(&tdir.join("run_A.jsonl"), "lead", Some("acme"));
         transcript(&tdir.join("run_B.jsonl"), "lead");
-        // Session turns: one recorded its customer, one predates customers.
+        transcript_for(&tdir.join("run_C.jsonl"), "lead", None);
+        // Session turns: one recorded its customer, one recorded none, one
+        // predates customers.
         let recorded = global.join("sess/run_S1.jsonl");
         let legacy = global.join("sess/run_S2.jsonl");
+        let none = global.join("sess/run_S3.jsonl");
         transcript_for(&recorded, "chatter", Some("globex"));
         transcript(&legacy, "chatter");
+        transcript_for(&none, "chatter", None);
         let sdir = global.join("sessions/ses_1");
         std::fs::create_dir_all(&sdir).unwrap();
         let session = serde_json::json!({
@@ -481,22 +521,31 @@ mod tests {
             "runs": [
                 { "run_id": "run_S1", "transcript_path": recorded },
                 { "run_id": "run_S2", "transcript_path": legacy },
+                { "run_id": "run_S3", "transcript_path": none },
             ],
         });
         std::fs::write(sdir.join("session.json"), session.to_string()).unwrap();
 
         let got = extra_sources(global, &store, &HashSet::new());
         let customer_of = |id: &str| {
-            got.iter()
+            let src = got
+                .iter()
                 .find(|s| s.id == id)
-                .unwrap_or_else(|| panic!("no source {id}: {got:?}"))
-                .customer
-                .as_deref()
+                .unwrap_or_else(|| panic!("no source {id}: {got:?}"));
+            (
+                crate::customers::Recorded::of(&src.customer),
+                src.customer_inherited,
+            )
         };
-        assert_eq!(customer_of("run_A"), Some("acme"));
-        assert_eq!(customer_of("run_B"), None);
-        assert_eq!(customer_of("run_S1"), Some("globex"));
-        assert_eq!(customer_of("run_S2"), Some("initech"));
+        use crate::customers::Recorded;
+        assert_eq!(customer_of("run_A"), (Recorded::Slug("acme"), false));
+        assert_eq!(customer_of("run_B"), (Recorded::Legacy, false));
+        assert_eq!(customer_of("run_C"), (Recorded::None, false));
+        assert_eq!(customer_of("run_S1"), (Recorded::Slug("globex"), false));
+        assert_eq!(customer_of("run_S2"), (Recorded::Slug("initech"), true));
+        // A turn that RECORDED none stays none: the session's latest
+        // customer never re-attributes it.
+        assert_eq!(customer_of("run_S3"), (Recorded::None, false));
     }
 
     #[test]
