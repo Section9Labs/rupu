@@ -1,11 +1,11 @@
 use rupu_coverage::{read_assets, ActiveSet, Asset, CoveragePaths};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Required engagement-wide coverage threshold: the fraction of discovered
 /// assets (of the enumerated kinds) that must have reached a minimum depth.
 /// Evaluated by [`CoverageEvaluator`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageTarget {
     pub reach: f64,

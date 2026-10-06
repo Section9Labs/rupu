@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentiflowDef {
     pub name: String,
@@ -24,7 +24,7 @@ pub struct AgentiflowDef {
     pub trigger: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
     pub id: String,
@@ -39,7 +39,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalTarget {
     #[serde(default)]
@@ -63,7 +63,7 @@ pub struct GoalTarget {
 /// Independence (the verifier is a different run than the filer) and
 /// `verify_with` (the verifier is the named agent) apply under either level;
 /// this only widens what the verdict itself must carry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyCheck {
     /// A `Confirmed` verification is enough.
@@ -74,7 +74,7 @@ pub enum VerifyCheck {
     WithPoc,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindingSelector {
     /// Matches a classification id, e.g. "CWE-94" (via FindingReport::all_classifications()).
@@ -82,7 +82,7 @@ pub struct FindingSelector {
     pub classification: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetSelector {
     /// Profile-namespaced kind, e.g. "network:host".
@@ -92,7 +92,7 @@ pub struct AssetSelector {
     pub locator: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
     pub authorized: bool,
@@ -102,7 +102,7 @@ pub struct Scope {
     pub roots: Vec<ScopeRoot>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeRoot {
     /// A ROOT asset kind of an active profile (`parent == None`), e.g.
     /// "network:host" / "web:site" / "code:repo". Profiles are the mode of
@@ -114,7 +114,7 @@ pub struct ScopeRoot {
     pub fields: BTreeMap<String, serde_yaml::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pool {
     #[serde(default)]
@@ -124,7 +124,7 @@ pub struct Pool {
 }
 
 /// `workflows: all` or `workflows: [a, b]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkflowsSpec {
     All(AllKeyword),
@@ -135,13 +135,13 @@ impl Default for WorkflowsSpec {
         WorkflowsSpec::List(Vec::new())
     }
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AllKeyword {
     #[serde(rename = "all")]
     All,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoundConfig {
     #[serde(default)]
@@ -150,7 +150,7 @@ pub struct RoundConfig {
     pub ceiling: Option<Ceiling>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ceiling {
     #[serde(default)]
