@@ -1751,6 +1751,16 @@ export interface ConfigView {
   provenance: Record<string, KeyProvenance>;
   raw_global: string;
   raw_project: string | null;
+  /** The customer layer's raw TOML (`?customer=`, or the project's customer);
+   *  `null` when there is no customer or its layer has no file yet. */
+  raw_customer?: string | null;
+  /** The customer in play: the `?customer=` one, or the project's. */
+  customer?: CustomerRef | null;
+  /** The customer layer's `[policy].lock`, as written. */
+  customer_lock?: string[];
+  /** Set when a layer is malformed: `effective` is then global only, and the
+   *  raw text is still served so the editor can fix it. */
+  layer_error?: string | null;
   cp: Record<string, unknown>;
   status: ConfigRuntimeStatus;
 }

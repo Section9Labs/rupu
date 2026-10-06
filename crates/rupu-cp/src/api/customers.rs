@@ -70,7 +70,8 @@ pub struct CustomerDetail {
     pub customer: CustomerDto,
     pub rollup: CustomerRollup,
     /// The customer's current projects, with the Projects page's own
-    /// (all-time, global-priced) rollups.
+    /// (all-time) rollups, each run priced with the pricing of the customer
+    /// it recorded.
     pub projects: Vec<ProjectRow>,
     pub default_account: Option<DefaultAccount>,
     /// Why the customer's config could not be resolved (a malformed layer);
@@ -97,7 +98,7 @@ pub fn routes() -> Router<AppState> {
 
 /// Map a store error to its HTTP status. `HasProjects` is answered by
 /// [`delete_customer`] itself, with the projects in the body.
-fn api_err(e: CustomerError) -> ApiError {
+pub(crate) fn api_err(e: CustomerError) -> ApiError {
     let status = match &e {
         CustomerError::InvalidSlug(_)
         | CustomerError::InvalidColor(_)

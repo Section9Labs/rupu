@@ -1,9 +1,11 @@
 //! `rupu-cp` config read/write API (CP Settings).
 //!
-//! - `GET /api/config` (+ `?project=<ws_id>`) returns the effective resolved
-//!   config, per-key provenance, and the raw global/project TOML text so the
-//!   settings UI can offer both a form view and a raw editor.
-//! - `PUT /api/config/global` / `PUT /api/config/project/:id` persist an edit
+//! - `GET /api/config` (+ `?project=<ws_id>` or `?customer=<slug>`, never
+//!   both) returns the effective resolved config, per-key provenance, and
+//!   the raw global/customer/project TOML text so the settings UI can offer
+//!   both a form view and a raw editor.
+//! - `PUT /api/config/global` / `PUT /api/config/customer/:slug` /
+//!   `PUT /api/config/project/:id` persist an edit
 //!   (raw text or a flat form patch) after validating it against the typed
 //!   schema, then (for global) reload `AppState.config` so already-running
 //!   handlers observe the change without a process restart.
@@ -29,8 +31,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use rupu_workspace::CustomerStore;
+
 use crate::{
     config_write::{apply_form_patch, validate_toml, write_atomic},
+    customers::{CustomerLookup, CustomerRef},
     error::{ApiError, ApiResult},
     state::AppState,
 };
@@ -39,13 +44,17 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/config", get(get_config))
         .route("/api/config/global", put(put_global))
+        .route("/api/config/customer/:slug", put(put_customer))
         .route("/api/config/project/:id", put(put_project))
         .route("/api/config/policy", put(put_policy))
 }
 
-#[derive(Deserialize)]
-struct ProjectQuery {
+/// `?project=<ws_id>` and `?customer=<slug>` select what is layered over
+/// global; they are mutually exclusive.
+#[derive(Deserialize, Default)]
+struct ConfigQuery {
     project: Option<String>,
+    customer: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -61,33 +70,71 @@ pub struct ConfigView {
     pub provenance: BTreeMap<String, rupu_config::KeyProvenance>,
     pub raw_global: String,
     pub raw_project: Option<String>,
+    /// The customer layer's raw text (`?customer=`, or the project's
+    /// customer); `None` when there is no customer or it has no file yet.
+    pub raw_customer: Option<String>,
+    /// The customer in play: the `?customer=` one, or the project's.
+    pub customer: Option<CustomerRef>,
+    /// The customer layer's `[policy].lock`, as written.
+    pub customer_lock: Vec<String>,
+    /// Why the layers could not be resolved (a malformed layer). The view is
+    /// still served — `effective` is then global only — so the editor opens
+    /// and the text can be fixed.
+    pub layer_error: Option<String>,
     pub cp: serde_json::Value,
     pub status: RuntimeStatus,
 }
 
-/// `GET /api/config` (+ `?project=<ws_id>`) — effective config + provenance +
-/// raw TOML text for both layers.
+/// `GET /api/config` (+ `?project=<ws_id>` | `?customer=<slug>`) — effective
+/// config + provenance + raw TOML text for each layer.
 async fn get_config(
     State(s): State<AppState>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<ConfigQuery>,
 ) -> ApiResult<Json<ConfigView>> {
     let global = s.global_dir.join("config.toml");
-    let layers = match &q.project {
-        Some(id) => project_layers(&s, &load_ws(&s, id)?)?,
-        None => rupu_workspace::ConfigPaths::without_customer(&s.global_dir, None),
+    let store = CustomerStore::new(s.global_dir.clone());
+    let layers = match (&q.project, &q.customer) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "`project` and `customer` are mutually exclusive",
+            ))
+        }
+        (Some(id), None) => project_layers(&s, &load_ws(&s, id)?)?,
+        (None, Some(slug)) => {
+            store.get(slug).map_err(customer_api_err)?;
+            rupu_workspace::ConfigPaths {
+                customer: Some(store.config_path(slug)),
+                customer_slug: Some(slug.clone()),
+                ..rupu_workspace::ConfigPaths::without_customer(&s.global_dir, None)
+            }
+        }
+        (None, None) => rupu_workspace::ConfigPaths::without_customer(&s.global_dir, None),
     };
-    let project_path = layers.project.clone();
-    let resolved =
-        rupu_config::resolve(layers.layers()).map_err(|e| ApiError::internal(e.to_string()))?;
-    let raw_global = std::fs::read_to_string(&global).unwrap_or_default();
-    let raw_project = project_path
+    let (resolved, layer_error) = match rupu_config::resolve(layers.layers()) {
+        Ok(r) => (r, None),
+        // A malformed layer must not lock the operator out of the editor
+        // that fixes it: serve global only, with the error beside it.
+        Err(e) if layers.customer.is_some() || layers.project.is_some() => {
+            let global_only = rupu_config::resolve(rupu_config::LayerPaths::global_only(&global))
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            (global_only, Some(e.to_string()))
+        }
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    };
+    let read = |p: Option<&Path>| p.and_then(|p| std::fs::read_to_string(p).ok());
+    let customer = layers
+        .customer_slug
         .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok());
+        .map(|slug| CustomerLookup::new(store.clone()).customer_ref(slug));
     Ok(Json(ConfigView {
         effective: serde_json::to_value(&resolved.config).unwrap_or(serde_json::Value::Null),
         provenance: resolved.provenance,
-        raw_global,
-        raw_project,
+        raw_global: std::fs::read_to_string(&global).unwrap_or_default(),
+        raw_project: read(layers.project.as_deref()),
+        raw_customer: read(layers.customer.as_deref()),
+        customer,
+        customer_lock: resolved.customer_lock,
+        layer_error,
         cp: serde_json::to_value(&resolved.config.cp).unwrap_or(serde_json::Value::Null),
         status: RuntimeStatus {
             bind: s.bind.clone(),
@@ -170,9 +217,61 @@ async fn put_global(
     ))
 }
 
+/// `PUT /api/config/customer/:slug` — persist a customer layer
+/// (`customers/<slug>/config.toml`). The candidate is validated as a layer
+/// ON TOP OF GLOBAL before anything is written: a layer that is valid alone
+/// but breaks the merged config is refused, so an invalid layer never
+/// reaches disk. Keys the GLOBAL `[policy].lock` enforces are refused, as
+/// for a project. The customer's own lock list is written through this
+/// endpoint too, with `patch: {"policy.lock": [...]}`.
+async fn put_customer(
+    State(s): State<AppState>,
+    AxPath(slug): AxPath<String>,
+    Json(body): Json<ConfigWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_writable(&s)?;
+    let store = CustomerStore::new(s.global_dir.clone());
+    store.get(&slug).map_err(customer_api_err)?;
+    let path = store.config_path(&slug);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let cand = candidate_toml(&body, &existing)?;
+    reject_globally_locked_keys(&s, &cand)?;
+    validate_customer_layer(&s.global_dir.join("config.toml"), &path, &cand)?;
+    write_atomic_blocking(path, cand).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Resolve `candidate` as the customer layer over the global config, via a
+/// temp file next to `target` (removed before returning). 400 on failure.
+fn validate_customer_layer(global: &Path, target: &Path, candidate: &str) -> ApiResult<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = target.with_file_name(format!(
+        "config.toml.candidate-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, candidate)
+        .map_err(|e| ApiError::internal(format!("stage customer config candidate: {e}")))?;
+    let result = rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+        Some(global),
+        Some(&tmp),
+        None,
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    result.map(|_| ()).map_err(|e| {
+        ApiError::bad_request(
+            e.to_string()
+                .replace(&tmp.display().to_string(), "the candidate customer config"),
+        )
+    })
+}
+
 /// `PUT /api/config/project/:id` — persist a project-layer config edit under
 /// `<workspace path>/.rupu/config.toml`. Rejects an edit that would set a key
-/// enforced by the GLOBAL `[policy].lock` list (a project layer can never
+/// enforced by the GLOBAL `[policy].lock` list or by the project's CUSTOMER
+/// layer's `[policy].lock` (a project layer can never
 /// override a locked key at resolution time anyway; rejecting the write up
 /// front gives the operator a clear error instead of a silently-ignored
 /// setting).
@@ -185,7 +284,8 @@ async fn put_project(
     let path = project_config_path(&s, &id)?;
     // The shared rule (`rupu_workspace::ConfigPaths`): a project whose
     // `.rupu/` is the global dir has no project layer of its own.
-    let root = ws_root(&load_ws(&s, &id)?)?;
+    let ws = load_ws(&s, &id)?;
+    let root = ws_root(&ws)?;
     if rupu_workspace::ConfigPaths::without_customer(&s.global_dir, Some(&root))
         .project
         .is_none()
@@ -197,7 +297,7 @@ async fn put_project(
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let cand = candidate_toml(&body, &existing)?;
-    reject_locked_project_keys(&s, &cand)?;
+    reject_locked_project_keys(&s, &ws, &cand)?;
     write_atomic_blocking(path, cand).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -291,6 +391,10 @@ fn load_ws(s: &AppState, id: &str) -> ApiResult<rupu_workspace::Workspace> {
     }
 }
 
+fn customer_api_err(e: rupu_workspace::CustomerError) -> ApiError {
+    super::customers::api_err(e)
+}
+
 /// The layers a run in project `ws` would load, through the one resolver
 /// the CLI uses (`rupu_workspace::config_paths`): global, the project's
 /// customer and its `.rupu/config.toml` (absent when that is the global
@@ -345,36 +449,97 @@ fn flatten_toml_keys(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Reject a project-layer candidate that sets a key enforced by the GLOBAL
-/// `[policy].lock` list. Reads the lock list from `AppState.config` — the
-/// global-only resolved snapshot (`resolve(global, None, ..)`), which is
-/// exactly where locks are sourced from.
-fn reject_locked_project_keys(s: &AppState, candidate_toml: &str) -> ApiResult<()> {
-    // `unwrap_or_default()` fails OPEN on a poisoned RwLock (empty lock list,
-    // so this pre-write check would let the candidate through). That's safe,
-    // not a bypass: `rupu_config::resolve` re-enforces the lock list at
-    // RESOLUTION time from the global layer regardless of what a project
-    // file contains, so a project key that slips past this check on a
-    // poisoned lock is merely an inert value on disk — resolution still
-    // ignores it in favor of the locked global value. This check exists only
-    // to give the operator an early, clear write-time error; it is not the
-    // enforcement boundary.
-    let lock = s
-        .config
+/// The GLOBAL `[policy].lock` list, from `AppState.config` — the
+/// global-only resolved snapshot, which is exactly where locks are sourced.
+///
+/// `unwrap_or_default()` fails OPEN on a poisoned RwLock (empty lock list,
+/// so the pre-write check would let the candidate through). That's safe,
+/// not a bypass: `rupu_config::resolve` re-enforces the lock list at
+/// RESOLUTION time from the global layer regardless of what a lower layer
+/// contains, so a key that slips past this check on a poisoned lock is
+/// merely an inert value on disk. This check exists only to give the
+/// operator an early, clear write-time error; it is not the enforcement
+/// boundary.
+fn global_lock(s: &AppState) -> Vec<String> {
+    s.config
         .read()
         .map(|c| c.policy.lock.clone())
-        .unwrap_or_default();
-    if lock.is_empty() {
-        return Ok(());
-    }
+        .unwrap_or_default()
+}
+
+/// The dotted leaf keys of a candidate layer.
+fn candidate_keys(candidate_toml: &str) -> ApiResult<Vec<String>> {
     let value: toml::Value =
         toml::from_str(candidate_toml).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let mut keys = Vec::new();
     flatten_toml_keys(&value, "", &mut keys);
-    for key in &keys {
+    Ok(keys)
+}
+
+/// Reject a candidate layer that sets a key enforced by the GLOBAL
+/// `[policy].lock` list.
+fn reject_globally_locked_keys(s: &AppState, candidate_toml: &str) -> ApiResult<()> {
+    let lock = global_lock(s);
+    if lock.is_empty() {
+        return Ok(());
+    }
+    for key in &candidate_keys(candidate_toml)? {
         if lock.iter().any(|l| l == key) {
             return Err(ApiError::bad_request(format!(
                 "key `{key}` is enforced by global policy"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The keys `slug`'s customer layer locks AND sets — a customer lock on a
+/// key its layer does not set locks nothing (`rupu_config::resolve`), so it
+/// must not block a project from setting it. Read through `resolve` over
+/// global + customer so the rule is the resolver's own. An unreadable layer
+/// is an error: fail closed, never "no locks".
+fn customer_locked_keys(s: &AppState, slug: &str) -> ApiResult<Vec<String>> {
+    let global = s.global_dir.join("config.toml");
+    let customer = CustomerStore::new(s.global_dir.clone()).config_path(slug);
+    let resolved = rupu_config::resolve(rupu_config::LayerPaths::new(
+        Some(&global),
+        Some(&customer),
+        None,
+    ))
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "cannot check customer `{slug}`'s policy locks: {e}; fix its config first"
+        ))
+    })?;
+    Ok(resolved
+        .provenance
+        .into_iter()
+        .filter(|(_, p)| p.locked_by == Some(rupu_config::LockOwner::Customer))
+        .map(|(k, _)| k)
+        .collect())
+}
+
+/// Reject a project-layer candidate that sets a key enforced by the GLOBAL
+/// `[policy].lock` list, or by the `[policy].lock` of the project's customer
+/// (the error names which layer).
+fn reject_locked_project_keys(
+    s: &AppState,
+    ws: &rupu_workspace::Workspace,
+    candidate_toml: &str,
+) -> ApiResult<()> {
+    reject_globally_locked_keys(s, candidate_toml)?;
+    let layers = project_layers(s, ws)?;
+    let Some(slug) = layers.customer_slug.as_deref() else {
+        return Ok(());
+    };
+    let locked = customer_locked_keys(s, slug)?;
+    if locked.is_empty() {
+        return Ok(());
+    }
+    for key in &candidate_keys(candidate_toml)? {
+        if locked.iter().any(|l| l == key) {
+            return Err(ApiError::bad_request(format!(
+                "key `{key}` is enforced by customer `{slug}` policy"
             )));
         }
     }
@@ -385,6 +550,21 @@ fn reject_locked_project_keys(s: &AppState, candidate_toml: &str) -> ApiResult<(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    impl ConfigQuery {
+        fn project(id: &str) -> Self {
+            Self {
+                project: Some(id.into()),
+                customer: None,
+            }
+        }
+        fn customer(slug: &str) -> Self {
+            Self {
+                project: None,
+                customer: Some(slug.into()),
+            }
+        }
+    }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
         AppState::new(
@@ -433,7 +613,7 @@ mod tests {
         std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
         let s = test_state(&tmp);
 
-        let view = get_config(State(s), Query(ProjectQuery { project: None }))
+        let view = get_config(State(s), Query(ConfigQuery::default()))
             .await
             .expect("get_config ok")
             .0;
@@ -473,15 +653,10 @@ mod tests {
         )
         .unwrap();
 
-        let view = get_config(
-            State(s),
-            Query(ProjectQuery {
-                project: Some("ws_proj".into()),
-            }),
-        )
-        .await
-        .expect("get_config ok")
-        .0;
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_proj")))
+            .await
+            .expect("get_config ok")
+            .0;
 
         assert_eq!(view.effective["default_model"], "sonnet");
         assert_eq!(
@@ -529,15 +704,10 @@ mod tests {
             .assign("acme", rupu_workspace::ProjectRef::Id("ws_home"))
             .unwrap();
 
-        let view = get_config(
-            State(s),
-            Query(ProjectQuery {
-                project: Some("ws_home".into()),
-            }),
-        )
-        .await
-        .expect("get_config ok")
-        .0;
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_home")))
+            .await
+            .expect("get_config ok")
+            .0;
 
         assert_eq!(view.effective["default_model"], "acme-model");
         assert_eq!(view.raw_project, None);
@@ -606,15 +776,10 @@ mod tests {
             .assign("acme", rupu_workspace::ProjectRef::Id("ws_cust"))
             .unwrap();
 
-        let view = get_config(
-            State(s),
-            Query(ProjectQuery {
-                project: Some("ws_cust".into()),
-            }),
-        )
-        .await
-        .expect("get_config ok")
-        .0;
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_cust")))
+            .await
+            .expect("get_config ok")
+            .0;
 
         assert_eq!(view.effective["default_model"], "acme-model");
         let prov = view.provenance.get("default_model").unwrap();
@@ -646,14 +811,7 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(tmp.path().join("customers/acme")).unwrap();
 
-        let err = match get_config(
-            State(s),
-            Query(ProjectQuery {
-                project: Some("ws_dangling".into()),
-            }),
-        )
-        .await
-        {
+        let err = match get_config(State(s), Query(ConfigQuery::project("ws_dangling"))).await {
             Ok(_) => panic!("a dangling customer must not serve a global-only view"),
             Err(e) => e,
         };
@@ -840,9 +998,7 @@ input_per_mtok = 5.0
             // GET ?project=<traversal id>
             let err = match get_config(
                 State(test_state(&tmp)),
-                Query(ProjectQuery {
-                    project: Some(traversal_id.into()),
-                }),
+                Query(ConfigQuery::project(traversal_id)),
             )
             .await
             {
@@ -922,6 +1078,346 @@ input_per_mtok = 5.0
         );
     }
 
+    // ── Customer config layer ──────────────────────────────────────────────
+
+    fn make_customer(tmp: &tempfile::TempDir, slug: &str, layer: Option<&str>) {
+        let customers = rupu_workspace::CustomerStore::new(tmp.path());
+        customers
+            .create(
+                slug,
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if let Some(layer) = layer {
+            std::fs::write(customers.config_path(slug), layer).unwrap();
+        }
+    }
+
+    fn customer_put(raw: &str) -> ConfigWriteBody {
+        ConfigWriteBody {
+            raw: Some(raw.into()),
+            patch: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_config_for_a_customer_layers_it_over_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        make_customer(&tmp, "acme", Some("default_model = \"acme-model\"\n"));
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ConfigQuery::customer("acme")))
+            .await
+            .expect("get_config ok")
+            .0;
+        assert_eq!(view.effective["default_model"], "acme-model");
+        assert_eq!(
+            view.raw_customer.as_deref(),
+            Some("default_model = \"acme-model\"\n")
+        );
+        assert_eq!(view.customer.as_ref().unwrap().slug, "acme");
+        assert_eq!(view.raw_project, None);
+        assert_eq!(view.layer_error, None);
+        let prov = serde_json::to_value(view.provenance.get("default_model").unwrap()).unwrap();
+        assert_eq!(prov["source"], "customer");
+    }
+
+    #[tokio::test]
+    async fn get_config_project_and_customer_together_is_a_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        make_customer(&tmp, "acme", None);
+        let s = test_state(&tmp);
+        let err = match get_config(
+            State(s),
+            Query(ConfigQuery {
+                project: Some("ws_x".into()),
+                customer: Some("acme".into()),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("both selectors must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_config_unknown_customer_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = match get_config(State(s), Query(ConfigQuery::customer("nope"))).await {
+            Ok(_) => panic!("unknown customer"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_config_malformed_customer_layer_is_200_with_layer_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        make_customer(&tmp, "acme", Some("default_model = = broken\n"));
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ConfigQuery::customer("acme")))
+            .await
+            .expect("the editor must still open")
+            .0;
+        assert!(view.layer_error.is_some());
+        // Effective is global only; the broken text is still served to fix.
+        assert_eq!(view.effective["default_model"], "opus");
+        assert_eq!(
+            view.raw_customer.as_deref(),
+            Some("default_model = = broken\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_config_with_project_fills_the_projects_customer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        make_customer(
+            &tmp,
+            "acme",
+            Some("default_model = \"acme-model\"\n[policy]\nlock = [\"default_model\"]\n"),
+        );
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_cust2", proj.path());
+        rupu_workspace::CustomerStore::new(tmp.path())
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_cust2"))
+            .unwrap();
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_cust2")))
+            .await
+            .expect("get_config ok")
+            .0;
+        assert_eq!(view.customer.as_ref().unwrap().slug, "acme");
+        assert_eq!(view.customer_lock, vec!["default_model".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn put_customer_writes_and_the_next_get_reflects_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        make_customer(&tmp, "acme", None);
+        let s = writable_state(&tmp);
+
+        let resp = put_customer(
+            State(s.clone()),
+            AxPath("acme".into()),
+            Json(customer_put("default_model = \"acme-model\"\n")),
+        )
+        .await
+        .expect("put ok");
+        assert_eq!(resp.0["ok"], true);
+
+        let view = get_config(State(s), Query(ConfigQuery::customer("acme")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(view.effective["default_model"], "acme-model");
+    }
+
+    #[tokio::test]
+    async fn put_customer_invalid_toml_is_400_and_the_file_is_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        make_customer(&tmp, "acme", Some("default_model = \"keep\"\n"));
+        let s = writable_state(&tmp);
+        let path = rupu_workspace::CustomerStore::new(tmp.path()).config_path("acme");
+
+        for bad in ["bogus_key = 1\n", "default_model = = x\n"] {
+            let err = put_customer(
+                State(s.clone()),
+                AxPath("acme".into()),
+                Json(customer_put(bad)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "default_model = \"keep\"\n"
+            );
+        }
+        // No candidate temp file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("candidate"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn put_customer_rejects_a_layer_that_is_invalid_on_top_of_global() {
+        // Each file is valid alone; layered, the provider loses its
+        // required default_model, so the layer must be refused.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[providers.corp]\nkind = \"openai-compatible\"\nbase_url = \"http://corp.example\"\ndefault_model = \"m\"\n",
+        )
+        .unwrap();
+        make_customer(&tmp, "acme", Some("default_model = \"keep\"\n"));
+        let s = writable_state(&tmp);
+        let path = rupu_workspace::CustomerStore::new(tmp.path()).config_path("acme");
+
+        let err = put_customer(
+            State(s),
+            AxPath("acme".into()),
+            Json(customer_put("[providers.corp]\ndefault_model = \"\"\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default_model = \"keep\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_customer_unknown_slug_is_404_and_unwritable_is_501() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        make_customer(&tmp, "acme", None);
+        let err = put_customer(
+            State(writable_state(&tmp)),
+            AxPath("nope".into()),
+            Json(customer_put("default_model = \"x\"\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+
+        let err = put_customer(
+            State(test_state(&tmp)),
+            AxPath("acme".into()),
+            Json(customer_put("default_model = \"x\"\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn put_customer_patch_sets_the_customer_lock_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        make_customer(&tmp, "acme", Some("default_provider = \"anthropic\"\n"));
+        let s = writable_state(&tmp);
+
+        let _ = put_customer(
+            State(s.clone()),
+            AxPath("acme".into()),
+            Json(ConfigWriteBody {
+                raw: None,
+                patch: Some(serde_json::json!({ "policy.lock": ["default_provider"] })),
+            }),
+        )
+        .await
+        .expect("put ok");
+
+        let view = get_config(State(s), Query(ConfigQuery::customer("acme")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(view.customer_lock, vec!["default_provider".to_string()]);
+        let prov = serde_json::to_value(view.provenance.get("default_provider").unwrap()).unwrap();
+        assert_eq!(prov["locked_by"], "customer");
+    }
+
+    #[tokio::test]
+    async fn put_customer_rejects_a_globally_locked_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
+        )
+        .unwrap();
+        make_customer(&tmp, "acme", None);
+        let err = put_customer(
+            State(writable_state(&tmp)),
+            AxPath("acme".into()),
+            Json(customer_put("permission_mode = \"bypass\"\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("enforced by global policy"), "{}", err.1);
+    }
+
+    fn customer_with_project(tmp: &tempfile::TempDir, layer: &str) -> tempfile::TempDir {
+        make_customer(tmp, "acme", Some(layer));
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(tmp, "ws_acme", proj.path());
+        rupu_workspace::CustomerStore::new(tmp.path())
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_acme"))
+            .unwrap();
+        proj
+    }
+
+    #[tokio::test]
+    async fn put_project_rejects_a_key_its_customer_locks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = customer_with_project(
+            &tmp,
+            "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
+        );
+        let s = writable_state(&tmp);
+
+        let err = put_project(
+            State(s),
+            AxPath("ws_acme".into()),
+            Json(customer_put("permission_mode = \"bypass\"\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("customer"), "{}", err.1);
+        assert!(err.1.contains("acme"), "{}", err.1);
+        assert!(!proj.path().join(".rupu/config.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn put_project_allows_a_key_its_customer_lists_but_does_not_set() {
+        // A lock on a key the customer layer does not set locks nothing
+        // (`resolve` says so too), so the project may set it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = customer_with_project(&tmp, "[policy]\nlock = [\"permission_mode\"]\n");
+        let s = writable_state(&tmp);
+
+        let _ = put_project(
+            State(s),
+            AxPath("ws_acme".into()),
+            Json(customer_put("permission_mode = \"bypass\"\n")),
+        )
+        .await
+        .expect("an inert lock must not block the write");
+        assert!(proj.path().join(".rupu/config.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn put_project_with_an_unreadable_customer_layer_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = customer_with_project(&tmp, "default_model = = broken\n");
+        let s = writable_state(&tmp);
+
+        let err = put_project(
+            State(s),
+            AxPath("ws_acme".into()),
+            Json(customer_put("permission_mode = \"bypass\"\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!proj.path().join(".rupu/config.toml").exists());
+    }
+
     // ── Task 7: end-to-end — round-trip + lock enforcement ─────────────────
     //
     // These two tests exercise the FULL write→reload→resolve chain (not just
@@ -963,7 +1459,7 @@ input_per_mtok = 5.0
         assert_eq!(resp.0["ok"], true);
 
         // ── 2. GET reflects the reload without a restart ────────────────────
-        let view = get_config(State(s.clone()), Query(ProjectQuery { project: None }))
+        let view = get_config(State(s.clone()), Query(ConfigQuery::default()))
             .await
             .expect("get_config ok")
             .0;
@@ -1003,7 +1499,7 @@ input_per_mtok = 5.0
         assert!(on_disk.contains("sonnet"), "{on_disk}");
         assert!(on_disk.contains("log_level"), "{on_disk}");
 
-        let view2 = get_config(State(s), Query(ProjectQuery { project: None }))
+        let view2 = get_config(State(s), Query(ConfigQuery::default()))
             .await
             .expect("get_config ok")
             .0;
@@ -1050,15 +1546,10 @@ input_per_mtok = 5.0
         assert!(prov.locked);
 
         // ── 2. Same enforcement visible through the read API ────────────────
-        let view = get_config(
-            State(s.clone()),
-            Query(ProjectQuery {
-                project: Some("ws_e2e_lock".into()),
-            }),
-        )
-        .await
-        .expect("get_config ok")
-        .0;
+        let view = get_config(State(s.clone()), Query(ConfigQuery::project("ws_e2e_lock")))
+            .await
+            .expect("get_config ok")
+            .0;
         assert_eq!(view.effective["permission_mode"], "ask");
         let view_prov = view.provenance.get("permission_mode").unwrap();
         assert!(matches!(view_prov.source, rupu_config::KeySource::Global));
