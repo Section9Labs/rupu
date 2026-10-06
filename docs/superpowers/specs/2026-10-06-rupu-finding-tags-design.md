@@ -189,6 +189,77 @@ There are two new built-ins: `query_findings` and `tag_findings`. Like `report_f
 - **Report page (`/findings/:id`):** a tag editor (removable chips plus an add input with autocomplete) and a collapsible tag history showing who, when and add/remove.
 - **Visual check first:** a mock of the table chips, the bulk bar and the editor goes to matt *before* the UI is built.
 
+## Query language (Plans 2–3, decided 2026-10-06)
+
+Findings are filtered everywhere with ONE single-line query language, modeled on Ghost's spotlight query bar (`/Users/matt/Security/Ghost`, `origin/main`: `crates/ghost-cp/web/src/graph3d/{SpotlightBar.tsx,query.ts,fuzzy.ts,spotlightResults.ts}` for the UI, `coordination/QueueFilter.tsx` for the tokenizer with explicit errors). It replaces the Plan 1 structured filters (`tags`/`tag_mode`/`untagged`/`min_severity`/`concern_id`/`file_prefix` and the CLI's `--tag`/`--any-tag`/`--untagged`/`--severity`/`--project`/`--run`). Those shipped in no beta, so nothing external depends on them.
+
+**Grammar.**
+- A query is whitespace-separated tokens, and every token must match (AND).
+- `key:value` filters on a field.
+  - `key:a,b` matches any of the values (OR within one token).
+  - `-key:value` negates the token.
+  - Values may be `"quoted"` or `'quoted'`, with `\` escapes.
+- `severity` alone also takes `>=`, `>`, `<=` and `<`.
+- A bare word, or a quoted phrase, is free text. It matches title, summary, id and file path, case-insensitively, and `-word` negates it.
+- A token that looks like `word:`/`word>=`… names a key, so an unknown key is an error, never text. Quote a free-text value that contains `:`.
+- These are errors, and the query does not run:
+  - an unknown key
+  - an empty value
+  - an invalid value for an enum, tag or CWE
+  - a comparison operator on a non-severity key, or a comparison with several values
+  - an unclosed quote, or text glued to a closing quote
+
+**Fields.**
+
+| Key | Values and matching |
+|---|---|
+| `severity` (alias `sev`) | info/low/medium/high/critical; supports comparisons |
+| `tag` | normalized like `Tag`. Repeated tokens AND, comma OR. Tags may contain `:`; only the first `:` after the key splits |
+| `has` | tags / report / poc / cwe |
+| `project` | workspace name or id |
+| `cwe` | `79` or `CWE-79`, compared by number with `report.cwe` and the CWE a `concern_id` names. Same rules as export, now in `rupu_coverage::report::cwe` |
+| `owner`, `product` | report ownership, case-insensitive |
+| `verified` | unverified/confirmed/disputed/inconclusive. A finding with no verification counts as unverified |
+| `profile` | full/summary |
+| `scope` | line/file/repo/host/endpoint/resource |
+| `concern` | concern id |
+| `agent` | agent name or codename |
+| `workflow` | workflow name |
+| `file` | path prefix |
+| `run` | run id. The CLI and CP expand it to the run plus its sub-runs; elsewhere it is an exact match |
+| `id` | finding id |
+
+- `project`, `workflow` and `run` expansion exist only where provenance is known (CP, CLI). The agent tool and MCP answer a query that uses them with an "unavailable here" error.
+
+**One grammar, two parsers, one evaluator.**
+- **Rust is authoritative.** `rupu_coverage::ledger::query_lang` parses, and `ledger::query` evaluates, shared by the CP API (`GET /api/findings?q=`), the CLI (`rupu findings list|tags [QUERY…]`), the agent tool and MCP (`{"q": …}`).
+- **TypeScript only parses.** The web's copy (`web/src/lib/findingQuery/`) parses for chips, suggestions and inline errors. The page always asks the server to evaluate.
+- **Lockstep.** The two parsers are held together by shared fixtures in `crates/rupu-coverage/tests/fixtures/finding_query/`, run by both `cargo test` and vitest:
+  - `cases.json`: query → canonical AST, or `{token, code}` error
+  - `fields.json`: keys, aliases, kinds, enum values
+
+**API.**
+- `GET /api/findings` gains `q`. An invalid `q` gives a 400 with `{error, token, code, start, end}` (char offsets).
+- The response gains:
+  - `facets` (per key, `[{value, count}]` over the scope-filtered but not q-filtered set). These feed autocomplete and the severity tiles.
+  - `tags_unavailable: [ws_id]`, the workspaces whose tag log could not be read. This was decision A: findings are still served with their declared tags, flagged, and the page shows a banner.
+
+**Web.**
+- A generic `QueryBar` (chips, a fuzzy spotlight dropdown with lucide icons and per-value colors, keyboard handling, inline errors) driven by a per-view field registry. Plan 2 wires it into the global Findings page only.
+- The query lives in the URL (`?q=`).
+- Severity tiles toggle `severity:<x>`.
+- The profile/owner/CWE controls are removed.
+- A read-only Tags column shows each finding's tags.
+- `/` focuses the bar. ⌘K stays the global command palette.
+
+**Plans.**
+- **Plan 2:** the query language everywhere, plus the query bar on Findings, the Tags column and the `tags_unavailable` banner.
+- **Plan 3:** tag editing in the CP:
+  - `POST /api/findings/tags`, `GET /api/findings/tags` and `tag_history`
+  - row selection and the bulk tag/untag bar
+  - the finding-page tag editor and history
+  - editing disabled for `tags_unavailable` workspaces
+
 ## Testing
 
 Each crate keeps one integration-test binary, with modules under `tests/it/`. All fixtures are invented; none are derived from an assessment.
@@ -230,7 +301,7 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
    - `query_findings` / `tag_findings` and their MCP mirrors.
    - `rupu findings list|tag|tags`.
    - Docs.
-2. **Plan 2: CP API and web UI.** The three endpoint changes, plus the table, filter, bulk bar and report-page editor, with the mock shown first.
+2. **Plan 2 (superseded by the Query language section above — now Plans 2 and 3): CP API and web UI.** The three endpoint changes, plus the table, filter, bulk bar and report-page editor, with the mock shown first.
 
 ## Out of scope (follow-ups)
 
