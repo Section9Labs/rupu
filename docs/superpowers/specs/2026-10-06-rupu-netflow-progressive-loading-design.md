@@ -117,24 +117,40 @@ answers; ~16 B/flow + small per-file sets) but is counted and reported.
 
 ### 3.3 Refresh
 
-Every request calls `refresh()` (single-flight, mutex-held like
-`global_run_meta_cached`; all callers are already on the blocking pool via
-`run_blocking`):
+The index is a drop-in for the per-file read: callers keep listing ledger
+files exactly as today (same directories, same iteration order) and ask the
+index for each file instead of opening it. That keeps every caller's
+iteration order — and so every order-dependent detail of the responses —
+unchanged. Each per-file call refreshes that file's entry under the
+entry's own lock (concurrent requests for one file collapse into one read;
+all callers are already on the blocking pool via `run_blocking`):
 
-1. List the directory union; `stat` each ledger.
-2. Per file:
-   - **unchanged stamp** → nothing.
-   - **same inode, len grew, tier 2 resident** → read from the stored
-     offset; feed complete lines only (a trailing partial line is left for
-     the next refresh); advance offset; update tier 1 and tier 2.
-   - **same inode, len grew, tier 2 evicted** → full re-read (the fold
-     state needed to apply completions to earlier flows is gone).
-   - **len shrank, inode changed, or new file** → full re-read.
-   - **file gone** → drop the entry (covers `rupu netflow prune`).
-   - **not yet settled** (changed within `file_cache::SETTLE`) → treat as
-     changed on every refresh, the same racily-clean rule `FileCache`
-     uses.
-3. Enforce the budget (§3.4).
+- **stamp unchanged** → nothing (one `stat`).
+- **stamp changed** → open the file and check that its first bytes still
+  match the prefix recorded at the last read (ledgers are append-only; a
+  prefix mismatch means the file was rewritten in place):
+  - prefix matches, same inode, len ≥ offset, tier 2 resident → read from
+    the stored offset; feed complete lines only (a trailing partial line is
+    left for the next refresh); advance offset; update tier 1 and tier 2.
+  - anything else (tier 2 evicted, inode changed, shrank, prefix differs,
+    new file) → full re-read.
+- **file gone** → drop the entry (covers `rupu netflow prune`).
+- **non-UTF-8 content** → the entry reads as empty, exactly as today's
+  readers do (`lines()` fails, callers `unwrap_or_default`).
+
+The prefix check replaces `FileCache`'s settle window for this file type:
+ledgers are never rewritten by rupu, so the only in-place rewrite to catch
+is an external one, which the prefix check detects without the settle
+rule's cost of re-reading every live ledger on every request.
+
+Documented deviation: a final line with no trailing newline is not read
+until its newline arrives (today's `lines()` would parse it). rupu's writer
+always terminates lines, so this only matters for a writer killed mid-line,
+whose partial line is malformed and skipped today anyway.
+
+Entries for files that no longer appear in a global-scope listing are
+dropped at the end of that listing (`retain_only`), so pruned or
+unregistered ledgers do not linger in tier 1.
 
 `serve_on` prewarms the index on the blocking pool at startup, beside
 `usage::prewarm`, logging elapsed time.
@@ -181,8 +197,10 @@ builders are unchanged in contract.
   separately from the windowed flow set; the existing whole-slice
   functions remain and delegate, so both paths share one implementation.
 - **Status:** `GET /api/netflow/index` → `{ files, flows, tier1_bytes,
-  tier2_bytes, budget_bytes, resident_files, evictions_total, last_refresh_ms }`.
+  tier2_bytes, budget_bytes, resident_files, evictions_total }`.
   API only; no UI.
+- **Budget source:** read from config on every netflow request (cheap), so
+  editing `[netflow].cp_index_budget_mb` takes effect without a restart.
 
 ### 3.6 Equivalence guarantee
 
