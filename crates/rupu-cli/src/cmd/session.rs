@@ -394,6 +394,12 @@ struct SessionRecord {
     workspace_path: PathBuf,
     #[serde(default)]
     project_root: Option<PathBuf>,
+    /// The directory `session start` ran in — the customer lookup's
+    /// `run_dir` for every turn, so a session on a cloned target keeps the
+    /// customer of the directory it was started from. Absent on sessions
+    /// that predate it: those look the customer up from `workspace_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_dir: Option<PathBuf>,
     transcripts_dir: PathBuf,
     #[serde(default)]
     repo_ref: Option<String>,
@@ -1308,10 +1314,12 @@ async fn list(
         .as_deref()
         .and_then(|pwd| paths::project_root_for(pwd).ok().flatten());
     let cfg = match pwd.as_deref() {
-        Some(pwd) => {
-            let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), pwd);
-            rupu_config::layer_files(cfg_paths.layers())
-        }
+        Some(pwd) => Ok(paths::load_config_for_display(
+            &global,
+            project_root.as_deref(),
+            pwd,
+            false,
+        )),
         None => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
             &global.join("config.toml"),
         )),
@@ -1676,6 +1684,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         workspace_id: ws.id,
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root,
+        launch_dir: Some(pwd.clone()),
         transcripts_dir,
         repo_ref,
         issue_ref,
@@ -6894,7 +6903,10 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     let cfg_paths = paths::config_paths(
         &global,
         session.project_root.as_deref(),
-        &session.workspace_path,
+        session
+            .launch_dir
+            .as_deref()
+            .unwrap_or(&session.workspace_path),
     )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = crate::accounts::resolver_for(&cfg);
@@ -7285,7 +7297,10 @@ async fn run_compact_request(
     let cfg_paths = paths::config_paths(
         global,
         session.project_root.as_deref(),
-        &session.workspace_path,
+        session
+            .launch_dir
+            .as_deref()
+            .unwrap_or(&session.workspace_path),
     )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = crate::accounts::resolver_for(&cfg);
@@ -7672,7 +7687,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     let cfg_paths = paths::config_paths(
         &global,
         session.project_root.as_deref(),
-        &session.workspace_path,
+        session
+            .launch_dir
+            .as_deref()
+            .unwrap_or(&session.workspace_path),
     )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
@@ -10341,6 +10359,7 @@ mod tests {
             workspace_id: "ws_test".into(),
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/repo")),
+            launch_dir: None,
             transcripts_dir: PathBuf::from("/tmp/repo/.rupu/transcripts"),
             repo_ref: Some("github:Section9Labs/rupu".into()),
             issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),

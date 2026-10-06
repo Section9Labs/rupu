@@ -73,10 +73,13 @@ async fn get_config(
 ) -> ApiResult<Json<ConfigView>> {
     let global = s.global_dir.join("config.toml");
     let (project_path, customer_path) = match &q.project {
-        Some(id) => (
-            Some(project_config_path(&s, id)?),
-            project_customer_config_path(&s, id)?,
-        ),
+        Some(id) => {
+            let ws = load_ws(&s, id)?;
+            (
+                Some(project_config_path_of(&ws)?),
+                project_customer_config_path(&s, &ws)?,
+            )
+        }
         None => (None, None),
     };
     let resolved = rupu_config::resolve(rupu_config::LayerPaths::new(
@@ -246,21 +249,17 @@ fn validate_ws_id(id: &str) -> ApiResult<()> {
 /// depth against a workspace record steering a config write outside the
 /// project tree, mirroring `host::workspace_stage::confine`'s guard for
 /// staged workspace dirs. Note this `starts_with` check is ALSO
-/// defense-in-depth, not the primary guard: `validate_ws_id` below is what
-/// actually stops a traversal id, since `root_canon` here is always the
+/// defense-in-depth, not the primary guard: `validate_ws_id` (in
+/// [`load_ws`]) is what actually stops a traversal id, since `root_canon` here is always the
 /// canonicalized base that `candidate` was just joined onto (the
 /// `starts_with` alone would be vacuous against a hostile `id` — the real
 /// stop is refusing to load the record for a malformed id at all).
 fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
-    validate_ws_id(id)?;
-    let store = rupu_workspace::WorkspaceStore {
-        root: s.global_dir.join("workspaces"),
-    };
-    let ws = match store.load(id) {
-        Ok(Some(w)) => w,
-        Ok(None) => return Err(ApiError::not_found(format!("project {id} not found"))),
-        Err(e) => return Err(ApiError::internal(e.to_string())),
-    };
+    project_config_path_of(&load_ws(s, id)?)
+}
+
+/// [`project_config_path`] for an already-loaded workspace record.
+fn project_config_path_of(ws: &rupu_workspace::Workspace) -> ApiResult<PathBuf> {
     let root = Path::new(&ws.path);
     let root_canon = root
         .canonicalize()
@@ -272,19 +271,27 @@ fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
     Ok(candidate)
 }
 
-/// The customer layer of the project `id`, if it is assigned — the same
-/// lookup a run in that project makes. A dangling assignment is an error
-/// (500), matching the run, which would fail too.
-fn project_customer_config_path(s: &AppState, id: &str) -> ApiResult<Option<PathBuf>> {
+/// The workspace record of project `id`: the id is validated first (the
+/// traversal guard), then loaded; 404 when there is no such project.
+fn load_ws(s: &AppState, id: &str) -> ApiResult<rupu_workspace::Workspace> {
     validate_ws_id(id)?;
     let store = rupu_workspace::WorkspaceStore {
         root: s.global_dir.join("workspaces"),
     };
-    let ws = match store.load(id) {
-        Ok(Some(w)) => w,
-        Ok(None) => return Err(ApiError::not_found(format!("project {id} not found"))),
-        Err(e) => return Err(ApiError::internal(e.to_string())),
-    };
+    match store.load(id) {
+        Ok(Some(w)) => Ok(w),
+        Ok(None) => Err(ApiError::not_found(format!("project {id} not found"))),
+        Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
+/// The customer layer of project `ws`, if it is assigned — the same lookup
+/// a run in that project makes. A dangling assignment is an error (500),
+/// matching the run, which would fail too.
+fn project_customer_config_path(
+    s: &AppState,
+    ws: &rupu_workspace::Workspace,
+) -> ApiResult<Option<PathBuf>> {
     rupu_workspace::CustomerStore::new(&s.global_dir)
         .customer_config_for_dir(Path::new(&ws.path))
         .map_err(|e| ApiError::internal(e.to_string()))
@@ -522,6 +529,43 @@ mod tests {
         assert!(matches!(prov.source, rupu_config::KeySource::Customer));
         let rendered = serde_json::to_value(prov).unwrap();
         assert_eq!(rendered["source"], "customer");
+    }
+
+    #[tokio::test]
+    async fn get_config_with_a_dangling_customer_is_a_500_not_a_global_view() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = test_state(&tmp);
+
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_dangling", proj.path());
+        let customers = rupu_workspace::CustomerStore::new(tmp.path());
+        customers
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        customers
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_dangling"))
+            .unwrap();
+        std::fs::remove_dir_all(tmp.path().join("customers/acme")).unwrap();
+
+        let err = match get_config(
+            State(s),
+            Query(ProjectQuery {
+                project: Some("ws_dangling".into()),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("a dangling customer must not serve a global-only view"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

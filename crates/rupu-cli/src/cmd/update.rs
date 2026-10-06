@@ -63,8 +63,7 @@ pub(crate) fn load_cli_config() -> rupu_config::Config {
     };
     let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = paths::project_root_for(&pwd).ok().flatten();
-    let cfg_paths = paths::config_paths_for_display(&global_dir, project_root.as_deref(), &pwd);
-    rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default()
+    paths::load_config_for_display(&global_dir, project_root.as_deref(), &pwd, true)
 }
 
 /// Whether `rupu update` must refuse, and what to say.

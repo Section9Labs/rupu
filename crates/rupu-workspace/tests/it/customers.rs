@@ -273,3 +273,19 @@ fn a_dangling_assignment_is_an_error_not_a_fallback() {
         other => panic!("expected Dangling, got {other:?}"),
     }
 }
+
+#[test]
+fn lookup_from_a_dir_that_does_not_exist_uses_its_nearest_existing_ancestor() {
+    let h = home();
+    let project = assert_fs::TempDir::new().unwrap();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    store
+        .assign("acme", ProjectRef::Path(project.path()))
+        .unwrap();
+    let gone = project.path().join("does/not/exist");
+    assert_eq!(
+        store.customer_for_dir(&gone).unwrap().as_deref(),
+        Some("acme")
+    );
+}

@@ -181,22 +181,31 @@ impl ConfigPaths {
 }
 
 /// Layer paths for a load that serves a project. The customer is the one
-/// assigned to the nearest ancestor of `project_root` (else of `run_dir`,
-/// the directory the command works in).
+/// assigned to the nearest ancestor of `run_dir` (the directory the run or
+/// command works in); only when that walk finds no assignment is the
+/// nearest assigned ancestor of `project_root` used. `run_dir` goes first
+/// because `project_root_for` resolves to `$HOME` (which has `~/.rupu`) for
+/// any repo without its own `.rupu/`, and a project-root-first lookup would
+/// miss that repo's assignment.
 ///
 /// **Strict** — for launch paths and for anything whose result drives a
 /// provider, SCM-account or permission decision: a project assigned to a
 /// customer that no longer exists is an error, never a silent fall back to
-/// the global config.
+/// the global config. The error is the store's own (it names the project,
+/// the customer and the fix), uncontexted, so a launch failure printed with
+/// `{}` still shows it.
 pub fn config_paths(
     global: &Path,
     project_root: Option<&Path>,
     run_dir: &Path,
 ) -> Result<ConfigPaths> {
-    let dir = project_root.unwrap_or(run_dir);
-    let customer = rupu_workspace::CustomerStore::new(global)
-        .customer_config_for_dir(dir)
-        .with_context(|| format!("resolve the customer of {}", dir.display()))?;
+    let store = rupu_workspace::CustomerStore::new(global);
+    let mut customer = store.customer_config_for_dir(run_dir)?;
+    if customer.is_none() {
+        if let Some(root) = project_root {
+            customer = store.customer_config_for_dir(root)?;
+        }
+    }
     Ok(ConfigPaths {
         customer,
         ..ConfigPaths::without_customer(global, project_root)
@@ -216,6 +225,53 @@ pub fn config_paths_for_display(
         tracing::warn!(error = %format!("{e:#}"), "customer config layer skipped for this display");
         ConfigPaths::without_customer(global, project_root)
     })
+}
+
+/// The config for a display-only read (UI preferences, pricing, listings),
+/// never failing: [`config_paths_for_display`] layers, loaded with
+/// `layer_files_locked` when `locked` (a policy-bearing value such as
+/// `[ui].editor` or pricing) else `layer_files`. A layer that fails to load
+/// is logged and the load retried without the customer layer; if that fails
+/// too, it is logged and `Config::default()` returned. Never use this where
+/// the config picks a provider, account or permission — use
+/// [`config_paths`] there.
+pub fn load_config_for_display(
+    global: &Path,
+    project_root: Option<&Path>,
+    run_dir: &Path,
+    locked: bool,
+) -> rupu_config::Config {
+    let load = |p: &ConfigPaths| {
+        if locked {
+            rupu_config::layer_files_locked(p.layers())
+        } else {
+            rupu_config::layer_files(p.layers())
+        }
+    };
+    let paths = config_paths_for_display(global, project_root, run_dir);
+    let first = match load(&paths) {
+        Ok(cfg) => return cfg,
+        Err(e) => e,
+    };
+    if paths.customer.is_some() {
+        tracing::warn!(
+            error = %format!("{first:#}"),
+            "config failed to load for this display; retrying without the customer layer"
+        );
+        match load(&ConfigPaths::without_customer(global, project_root)) {
+            Ok(cfg) => return cfg,
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "config failed to load for this display; using defaults"
+            ),
+        }
+    } else {
+        tracing::warn!(
+            error = %format!("{first:#}"),
+            "config failed to load for this display; using defaults"
+        );
+    }
+    rupu_config::Config::default()
 }
 
 #[cfg(test)]
@@ -304,11 +360,94 @@ mod customer_layer_tests {
     }
 
     #[test]
+    fn config_paths_looks_up_from_the_run_dir_before_the_project_root() {
+        // `project_root_for` resolves to $HOME (which has `~/.rupu`) for any
+        // repo without its own `.rupu/`; the repo's own assignment must win.
+        let (_t, home, fake_home) = setup();
+        let repo = fake_home.join("code/repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assign(&home, &repo);
+        let p = config_paths(&home, Some(&fake_home), &repo).unwrap();
+        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
+        assert_eq!(p.project, Some(fake_home.join(".rupu/config.toml")));
+
+        // Even when the project root has a customer of its own.
+        let store = CustomerStore::new(&home);
+        store
+            .create(
+                "homeco",
+                &NewCustomer {
+                    name: "Home".into(),
+                    ..NewCustomer::default()
+                },
+            )
+            .unwrap();
+        store
+            .assign("homeco", ProjectRef::Path(&fake_home))
+            .unwrap();
+        let p = config_paths(&home, Some(&fake_home), &repo).unwrap();
+        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
+        // An unassigned run dir falls back to the project root's customer.
+        let elsewhere = fake_home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let p = config_paths(&home, Some(&fake_home), &elsewhere).unwrap();
+        assert_eq!(p.customer, Some(home.join("customers/homeco/config.toml")));
+    }
+
+    #[test]
+    fn display_loader_drops_a_malformed_customer_layer_and_keeps_the_rest() {
+        let (_t, home, project) = setup();
+        assign(&home, &project);
+        std::fs::write(
+            home.join("config.toml"),
+            "default_model = \"global-model\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".rupu/config.toml"),
+            "[ui]\ntheme = \"project-theme\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("customers/acme/config.toml"),
+            "this is = = not toml",
+        )
+        .unwrap();
+        for locked in [true, false] {
+            let cfg = load_config_for_display(&home, Some(&project), &project, locked);
+            assert_eq!(cfg.default_model.as_deref(), Some("global-model"));
+            assert_eq!(cfg.ui.theme.as_deref(), Some("project-theme"));
+        }
+    }
+
+    #[test]
+    fn display_loader_reads_the_customer_layer_when_it_is_fine() {
+        let (_t, home, project) = setup();
+        assign(&home, &project);
+        std::fs::write(
+            home.join("config.toml"),
+            "default_model = \"global-model\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("customers/acme/config.toml"),
+            "default_model = \"acme-model\"\n",
+        )
+        .unwrap();
+        let cfg = load_config_for_display(&home, Some(&project), &project, false);
+        assert_eq!(cfg.default_model.as_deref(), Some("acme-model"));
+    }
+
+    #[test]
     fn strict_errors_and_display_degrades_on_a_dangling_assignment() {
         let (_t, home, project) = setup();
         assign(&home, &project);
         std::fs::remove_dir_all(home.join("customers/acme")).unwrap();
-        assert!(config_paths(&home, Some(&project), &project).is_err());
+        let err = config_paths(&home, Some(&project), &project).unwrap_err();
+        // Launch failures print `{}` — the actionable cause must be in it.
+        let shown = err.to_string();
+        assert!(shown.contains("acme"), "{shown}");
+        assert!(shown.contains("does not exist"), "{shown}");
         let p = config_paths_for_display(&home, Some(&project), &project);
         assert_eq!(p.customer, None);
         assert_eq!(p.project, Some(project.join(".rupu/config.toml")));
