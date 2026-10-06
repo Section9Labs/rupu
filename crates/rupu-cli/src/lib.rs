@@ -125,6 +125,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Customers: group projects under a customer with its own config layer.
+    Customer {
+        #[command(subcommand)]
+        action: cmd::customer::Action,
+    },
     /// Manage UI themes and palette imports.
     Ui {
         #[command(subcommand)]
@@ -419,6 +424,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
             cmd::transcript::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
         Cmd::Config { action } => cmd::config::handle(action).await,
+        Cmd::Customer { action } => cmd::customer::handle(action, cli.format).await,
         Cmd::Ui { action } => cmd::ui::handle(action, cli.format).await,
         Cmd::Cleanup(args) => cmd::cleanup::handle(args, cli.format).await,
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
@@ -486,6 +492,7 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
+        Cmd::Customer { action } => cmd::customer::ensure_output_format(action, format),
         Cmd::Ui { action } => cmd::ui::ensure_output_format(action, format),
         Cmd::Cleanup(_) => cmd::cleanup::ensure_output_format(format),
         Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
