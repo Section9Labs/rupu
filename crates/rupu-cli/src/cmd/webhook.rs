@@ -154,12 +154,10 @@ fn load_cli_config() -> rupu_config::Config {
     let Ok(global_dir) = paths::global_dir() else {
         return rupu_config::Config::default();
     };
-    let global_cfg_path = global_dir.join("config.toml");
     let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = paths::project_root_for(&pwd).ok().flatten();
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
-        .unwrap_or_default()
+    let cfg_paths = paths::config_paths_for_display(&global_dir, project_root.as_deref(), &pwd);
+    rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default()
 }
 
 struct CliWebhookObserver {

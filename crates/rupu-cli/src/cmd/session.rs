@@ -1303,16 +1303,19 @@ async fn list(
     // `prefs` (C-1). `current_dir`/`project_root_for` failures degrade the
     // same way — fall back to the global-only (or default) config rather
     // than propagating.
-    let project_root = std::env::current_dir()
-        .ok()
-        .and_then(|pwd| paths::project_root_for(&pwd).ok().flatten());
-    let cfg = rupu_config::layer_files(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )
+    let pwd = std::env::current_dir().ok();
+    let project_root = pwd
+        .as_deref()
+        .and_then(|pwd| paths::project_root_for(pwd).ok().flatten());
+    let cfg = match pwd.as_deref() {
+        Some(pwd) => {
+            let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), pwd);
+            rupu_config::layer_files(cfg_paths.layers())
+        }
+        None => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
+            &global.join("config.toml"),
+        )),
+    }
     .unwrap_or_default();
     let prefs =
         UiPrefs::resolve(&cfg.ui, false, None, None, None).with_table_flags(absolute, all_columns);
@@ -1343,13 +1346,8 @@ async fn show(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )?;
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files(cfg_paths.layers())?;
     let prefs = UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let view_mode = prefs.live_view;
     let output = SessionShowOutput {
@@ -1532,9 +1530,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
 
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     let cli_mode = args.mode.as_deref().and_then(parse_mode);
     let agent_mode = spec.permission_mode.as_deref().and_then(parse_mode);
@@ -1985,13 +1982,8 @@ fn attach_blocking(
     }
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = rupu_config::layer_files_locked(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )?;
+    let cfg_paths = paths::config_paths_for_display(global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view);
     let view_mode = prefs.live_view;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -6899,12 +6891,12 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
 
     // Build the provider the same way the worker does.
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = session
-        .project_root
-        .as_ref()
-        .map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(
+        &global,
+        session.project_root.as_deref(),
+        &session.workspace_path,
+    )?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = crate::accounts::resolver_for(&cfg);
 
     let provider_config = provider_factory::ProviderConfig {
@@ -7286,16 +7278,16 @@ async fn run_compact_request(
 
     // Load config for the same reason the turn path does: a compaction call is
     // a real provider call and must honor `[providers.<name>]` tuning
-    // (ISSUES.md I-9…I-12).
-    let cfg = rupu_config::layer_files_locked(
-        Some(&global.join("config.toml")),
-        session
-            .project_root
-            .as_ref()
-            .map(|p| p.join(".rupu/config.toml"))
-            .as_deref(),
-    )
-    .unwrap_or_default();
+    // (ISSUES.md I-9…I-12). It also picks the compaction provider's
+    // accounts, so a failed load (a dangling customer assignment, a
+    // malformed layer) fails the request — the worker marks the session
+    // failed with the reason — rather than compacting on the global config.
+    let cfg_paths = paths::config_paths(
+        global,
+        session.project_root.as_deref(),
+        &session.workspace_path,
+    )?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = crate::accounts::resolver_for(&cfg);
 
     paths::ensure_dir(&session.transcripts_dir)?;
@@ -7677,12 +7669,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
     ensure_active_scope(scope, "session _run-turn")?;
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = session
-        .project_root
-        .as_ref()
-        .map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(
+        &global,
+        session.project_root.as_deref(),
+        &session.workspace_path,
+    )?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     paths::ensure_dir(&session.transcripts_dir)?;
@@ -8664,7 +8656,7 @@ fn session_prune_cutoff(
         value.to_string()
     } else {
         let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files_locked(Some(&path), None)?;
+        let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
         cfg.storage
             .archived_session_retention
             .unwrap_or_else(|| "30d".to_string())

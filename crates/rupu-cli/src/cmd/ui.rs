@@ -671,17 +671,21 @@ fn pager_command() -> (String, Vec<String>) {
 
 async fn themes(global_format: Option<crate::output::formats::OutputFormat>) -> anyhow::Result<()> {
     let global = crate::paths::global_dir()?;
-    let project_root = std::env::current_dir()
-        .ok()
-        .and_then(|pwd| crate::paths::project_root_for(&pwd).ok().flatten());
+    let pwd = std::env::current_dir().ok();
+    let project_root = pwd
+        .as_deref()
+        .and_then(|pwd| crate::paths::project_root_for(pwd).ok().flatten());
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )?;
+    let cfg = match pwd.as_deref() {
+        Some(pwd) => {
+            let cfg_paths =
+                crate::paths::config_paths_for_display(&global, project_root.as_deref(), pwd);
+            rupu_config::layer_files(cfg_paths.layers())?
+        }
+        None => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
+            &global.join("config.toml"),
+        ))?,
+    };
     let palette_requested = cfg
         .ui
         .palette

@@ -82,10 +82,24 @@ fn workspace() -> Result<PathBuf> {
 fn ui_prefs(workspace: &Path) -> UiPrefs {
     let global = crate::paths::global_dir().ok();
     let project_root = crate::paths::project_root_for(workspace).ok().flatten();
-    let global_cfg = global.as_deref().map(|g| g.join("config.toml"));
-    let project_cfg = project_root.as_deref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(global_cfg.as_deref(), project_cfg.as_deref())
-        .unwrap_or_default();
+    let cfg = match global.as_deref() {
+        Some(global) => {
+            let cfg_paths =
+                crate::paths::config_paths_for_display(global, project_root.as_deref(), workspace);
+            rupu_config::layer_files_locked(cfg_paths.layers())
+        }
+        // No global dir: no global layer and no customer store to look
+        // the customer up in — just the project layer, as before.
+        None => {
+            let project_cfg = project_root.as_deref().map(|p| p.join(".rupu/config.toml"));
+            rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+                None,
+                None,
+                project_cfg.as_deref(),
+            ))
+        }
+    }
+    .unwrap_or_default();
     UiPrefs::resolve(&cfg.ui, false, None, None, None)
 }
 

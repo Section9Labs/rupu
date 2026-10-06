@@ -19,7 +19,7 @@ struct Assets;
 /// as `GET /api/config`).
 fn resolve_shell(state: &AppState) -> &'static str {
     let global = state.global_dir.join("config.toml");
-    let shell = match rupu_config::resolve(Some(&global), None) {
+    let shell = match rupu_config::resolve(rupu_config::LayerPaths::global_only(&global)) {
         Ok(r) => r.config.ui.cp.shell,
         Err(e) => {
             tracing::warn!(path = %global.display(), error = %e, "failed to resolve global config for shell flag; using v1");

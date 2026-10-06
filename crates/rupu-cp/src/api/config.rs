@@ -72,12 +72,19 @@ async fn get_config(
     Query(q): Query<ProjectQuery>,
 ) -> ApiResult<Json<ConfigView>> {
     let global = s.global_dir.join("config.toml");
-    let project_path = match &q.project {
-        Some(id) => Some(project_config_path(&s, id)?),
-        None => None,
+    let (project_path, customer_path) = match &q.project {
+        Some(id) => (
+            Some(project_config_path(&s, id)?),
+            project_customer_config_path(&s, id)?,
+        ),
+        None => (None, None),
     };
-    let resolved = rupu_config::resolve(Some(&global), project_path.as_deref())
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let resolved = rupu_config::resolve(rupu_config::LayerPaths::new(
+        Some(&global),
+        customer_path.as_deref(),
+        project_path.as_deref(),
+    ))
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let raw_global = std::fs::read_to_string(&global).unwrap_or_default();
     let raw_project = project_path
         .as_deref()
@@ -265,6 +272,24 @@ fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
     Ok(candidate)
 }
 
+/// The customer layer of the project `id`, if it is assigned — the same
+/// lookup a run in that project makes. A dangling assignment is an error
+/// (500), matching the run, which would fail too.
+fn project_customer_config_path(s: &AppState, id: &str) -> ApiResult<Option<PathBuf>> {
+    validate_ws_id(id)?;
+    let store = rupu_workspace::WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    };
+    let ws = match store.load(id) {
+        Ok(Some(w)) => w,
+        Ok(None) => return Err(ApiError::not_found(format!("project {id} not found"))),
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    };
+    rupu_workspace::CustomerStore::new(&s.global_dir)
+        .customer_config_for_dir(Path::new(&ws.path))
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
 /// Quote a single key segment using the same canonical dotted-key encoding
 /// as `rupu_config::resolve`'s private `dotted()` (and the frontend's
 /// `quoteSegment` in `ConfigEditor.tsx`): a segment containing a `.` or a
@@ -450,6 +475,53 @@ mod tests {
         );
         let prov = view.provenance.get("default_model").unwrap();
         assert!(matches!(prov.source, rupu_config::KeySource::Project));
+    }
+
+    #[tokio::test]
+    async fn get_config_with_project_reports_customer_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = test_state(&tmp);
+
+        // A project with no project-layer config, assigned to customer
+        // `acme` whose layer sets the model.
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_cust", proj.path());
+        std::fs::create_dir_all(proj.path().join(".rupu")).unwrap();
+        let customers = rupu_workspace::CustomerStore::new(tmp.path());
+        customers
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            customers.config_path("acme"),
+            "default_model = \"acme-model\"\n",
+        )
+        .unwrap();
+        customers
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_cust"))
+            .unwrap();
+
+        let view = get_config(
+            State(s),
+            Query(ProjectQuery {
+                project: Some("ws_cust".into()),
+            }),
+        )
+        .await
+        .expect("get_config ok")
+        .0;
+
+        assert_eq!(view.effective["default_model"], "acme-model");
+        let prov = view.provenance.get("default_model").unwrap();
+        assert!(matches!(prov.source, rupu_config::KeySource::Customer));
+        let rendered = serde_json::to_value(prov).unwrap();
+        assert_eq!(rendered["source"], "customer");
     }
 
     #[tokio::test]
@@ -765,7 +837,8 @@ input_per_mtok = 5.0
         // This is the "took effect" assertion: it does not touch `s` at all,
         // it just re-reads the file the handler wrote, the same way any
         // other process (a `rupu` CLI invocation, a fresh `cp serve`) would.
-        let resolved = rupu_config::resolve(Some(&global_path), None).expect("on-disk resolve ok");
+        let resolved = rupu_config::resolve(rupu_config::LayerPaths::global_only(&global_path))
+            .expect("on-disk resolve ok");
         assert_eq!(resolved.config.default_model.as_deref(), Some("sonnet"));
 
         // ── 4. Hand-add a comment, then form-patch a DIFFERENT key ──────────
@@ -826,8 +899,12 @@ input_per_mtok = 5.0
         std::fs::write(&project_path, "permission_mode = \"bypass\"\n").unwrap();
 
         // ── 1. Direct resolve(): locked global wins, provenance says so ─────
-        let resolved =
-            rupu_config::resolve(Some(&global_path), Some(&project_path)).expect("resolve ok");
+        let resolved = rupu_config::resolve(rupu_config::LayerPaths::new(
+            Some(&global_path),
+            None,
+            Some(&project_path),
+        ))
+        .expect("resolve ok");
         assert_eq!(resolved.config.permission_mode.as_deref(), Some("ask"));
         let prov = resolved
             .provenance

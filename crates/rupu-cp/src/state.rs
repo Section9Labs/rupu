@@ -271,7 +271,7 @@ impl AppState {
     /// until fixed.
     fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
         let path = global_dir.join("config.toml");
-        match rupu_config::resolve(Some(&path), None) {
+        match rupu_config::resolve(rupu_config::LayerPaths::global_only(&path)) {
             Ok(r) => r.config,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to resolve global config; using defaults");

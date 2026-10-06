@@ -305,7 +305,10 @@ async fn list(
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let agents = load_agents(&global, project_agents_parent.as_deref())?;
-    let cfg = layered_config(&global, project_root.as_deref());
+    let cfg = layered_config(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "config");
+        rupu_config::Config::default()
+    });
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
         .with_table_flags(absolute, all_columns);
 
@@ -364,7 +367,10 @@ async fn show(
     let path = locate_agent_file(name, &global, project_agents_parent.as_deref())?;
     let body = std::fs::read_to_string(&path)?;
 
-    let cfg = layered_config(&global, project_root.as_deref());
+    let cfg = layered_config(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "config");
+        rupu_config::Config::default()
+    });
     let prefs = UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, None);
     let report = AgentShowReport {
         kind: "agent_show",
@@ -442,7 +448,7 @@ async fn create(
             // `gen_provider_config` below) so the SAME config also builds
             // the resolver: a declared account's SSO credential must be
             // reachable when generating an agent via `--gen-provider`.
-            let gen_cfg = layered_config(&global, project_root.as_deref());
+            let gen_cfg = layered_config(&global, project_root.as_deref(), &pwd)?;
             let resolver = crate::accounts::resolver_for(&gen_cfg);
             let (provider, model) = match (gen_provider, gen_model) {
                 (Some(p), Some(m)) => (p, m),
@@ -570,14 +576,17 @@ fn locate_agent_file(
     ))
 }
 
+/// Global + customer + project config, strictly: a dangling customer
+/// assignment or a malformed layer is an error. `create --gen-provider`
+/// propagates it (the config picks the provider); the display callers log
+/// it and fall back to defaults.
 fn layered_config(
     global: &std::path::Path,
     project_root: Option<&std::path::Path>,
-) -> rupu_config::Config {
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
-        .unwrap_or_default()
+    run_dir: &std::path::Path,
+) -> anyhow::Result<rupu_config::Config> {
+    let cfg_paths = paths::config_paths(global, project_root, run_dir)?;
+    Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
 }
 
 /// Pick the on-disk file to edit. With `--scope` set we honor it

@@ -122,7 +122,7 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
     if !config_path.exists() {
         return PricingConfig::default();
     }
-    match rupu_config::layer_files(Some(&config_path), None) {
+    match rupu_config::layer_files(rupu_config::LayerPaths::global_only(&config_path)) {
         Ok(cfg) => cfg.pricing,
         Err(e) => {
             tracing::warn!(path = %config_path.display(), error = %e, "failed to load [pricing]; using builtin prices only");

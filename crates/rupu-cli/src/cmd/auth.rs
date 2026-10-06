@@ -158,7 +158,9 @@ fn configured_named_providers() -> Vec<String> {
         return Vec::new();
     };
     let global_cfg = global.join("config.toml");
-    let Ok(cfg) = rupu_config::layer_files_locked(Some(&global_cfg), None) else {
+    let Ok(cfg) =
+        rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
+    else {
         return Vec::new();
     };
     cfg.providers
@@ -177,7 +179,8 @@ fn is_openai_compatible_name(name: &str) -> bool {
         return false;
     };
     let global_cfg = global.join("config.toml");
-    let cfg = match rupu_config::layer_files_locked(Some(&global_cfg), None) {
+    let layers = rupu_config::LayerPaths::global_only(&global_cfg);
+    let cfg = match rupu_config::layer_files_locked(layers) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -368,7 +371,8 @@ async fn login(
 
     let global = crate::paths::global_dir()?;
     let cfg_path = global.join("config.toml");
-    let cfg_loaded = rupu_config::layer_files_locked(Some(&cfg_path), None);
+    let cfg_loaded =
+        rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&cfg_path));
     // Kept for the logins that take settings from the config (a GitLab
     // account's instance and OAuth application): those refuse an
     // unreadable config rather than fall back to the defaults.
@@ -828,12 +832,9 @@ fn auth_ui_prefs(
     let global = crate::paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = crate::paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root
-        .as_ref()
-        .map(|path| path.join(".rupu/config.toml"));
+    let cfg_paths = crate::paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
+    let cfg = rupu_config::layer_files(cfg_paths.layers())?;
     Ok(UiPrefs::resolve(
         &cfg.ui,
         no_color,
@@ -1162,7 +1163,12 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = crate::paths::global_dir().ok();
     let cfg = global
         .as_ref()
-        .and_then(|g| rupu_config::layer_files_locked(Some(&g.join("config.toml")), None).ok())
+        .and_then(|g| {
+            rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
+                &g.join("config.toml"),
+            ))
+            .ok()
+        })
         .unwrap_or_default();
     let resolver = crate::accounts::resolver_for(&cfg);
 

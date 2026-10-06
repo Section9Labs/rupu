@@ -1719,13 +1719,15 @@ export interface RunDiff {
 // ---------------------------------------------------------------------------
 
 /** Provenance source for one resolved config key — mirrors `rupu_config::KeySource`. */
-export type KeySource = 'global' | 'project' | 'default';
+export type KeySource = 'global' | 'customer' | 'project' | 'default';
 
 /** Mirrors `rupu_config::KeyProvenance` — where a resolved key's value came
  *  from, and whether it is enforced by the global `[policy].lock` list. */
 export interface KeyProvenance {
   source: KeySource;
   locked: boolean;
+  /** Which layer's `[policy].lock` names this key (absent when unlocked). */
+  locked_by?: 'global' | 'customer';
 }
 
 /** Runtime status block on `GET /api/config` — no secret VALUE is ever

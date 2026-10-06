@@ -125,7 +125,7 @@ async fn run(args: UsageArgs, global_format: Option<OutputFormat>) -> anyhow::Re
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = layered_config(&global, project_root.as_deref());
+    let cfg = layered_config(&global, project_root.as_deref(), &pwd);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
 
     match args.command {
@@ -250,11 +250,10 @@ fn render_run_view(
 fn layered_config(
     global: &std::path::Path,
     project_root: Option<&std::path::Path>,
+    run_dir: &std::path::Path,
 ) -> rupu_config::Config {
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
-        .unwrap_or_default()
+    let cfg_paths = paths::config_paths_for_display(global, project_root, run_dir);
+    rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
