@@ -522,7 +522,8 @@ fn document_format(to: ExportFormat) -> anyhow::Result<Format> {
 /// plane does).
 fn export_prefix(global: &Path) -> String {
     let path = global.join("config.toml");
-    let configured = match rupu_config::layer_files_locked(Some(&path), None) {
+    let layers = rupu_config::LayerPaths::global_only(&path);
+    let configured = match rupu_config::layer_files_locked(layers) {
         Ok(cfg) => cfg.findings.export_id_prefix,
         Err(e) => {
             crate::output::diag::warn(
@@ -727,7 +728,8 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
     // Limits come from the global config, as for the export prefix; an
     // unreadable config falls back to the defaults with a warning.
     let cfg_path = global.join("config.toml");
-    let cfg = match rupu_config::layer_files_locked(Some(&cfg_path), None) {
+    let layers = rupu_config::LayerPaths::global_only(&cfg_path);
+    let cfg = match rupu_config::layer_files_locked(layers) {
         Ok(c) => c.findings,
         Err(e) => {
             crate::output::diag::warn(

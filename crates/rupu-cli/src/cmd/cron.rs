@@ -364,11 +364,9 @@ fn ui_prefs(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg =
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    let cfg = rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default();
     Ok(
         crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
             .with_table_flags(absolute, all_columns),
@@ -480,9 +478,8 @@ async fn tick_cron(global: &Path, dry_run: bool) -> anyhow::Result<()> {
 async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     let triggers_cfg = &cfg.triggers;
     if triggers_cfg.poll_sources.is_empty() {
@@ -706,10 +703,8 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())
-        .unwrap_or_default();
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default();
 
     let workflows = collect_event_workflows()?;
     let cursors_root = global.join("cron-state").join("event-cursors");

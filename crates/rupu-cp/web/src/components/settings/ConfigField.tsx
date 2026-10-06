@@ -19,6 +19,8 @@ import { Lock, Unlock } from 'lucide-react';
 
 export const SOURCE_CLASS: Record<KeyProvenance['source'], string> = {
   global: 'bg-info-bg text-info ring-info/30',
+  // A customer layer sits between global and project (customers spec §2).
+  customer: 'bg-violet-50 text-violet-700 ring-violet-200',
   project: 'bg-ok-bg text-ok ring-ok/30',
   default: 'bg-surface text-ink-mute ring-border',
 };

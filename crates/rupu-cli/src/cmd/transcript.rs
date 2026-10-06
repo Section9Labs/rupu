@@ -1872,10 +1872,9 @@ async fn list(
     // Resolve UI prefs the same way other list commands do — config +
     // env + flag — so the table honors NO_COLOR / `[ui].color = "never"`.
     let cfg = {
-        let global_cfg = global.join("config.toml");
-        let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+        let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
         // UI prefs only — lock does not apply (I-7)
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
+        rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default()
     };
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
         .with_table_flags(absolute, all_columns);
@@ -1958,13 +1957,8 @@ async fn show(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )?;
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files(cfg_paths.layers())?;
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let mut events = Vec::new();
     let mut raw_events = Vec::new();
@@ -2106,11 +2100,9 @@ fn prune_ui_prefs() -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg =
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    let cfg = rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default();
     Ok(crate::cmd::ui::UiPrefs::resolve(
         &cfg.ui, false, None, None, None,
     ))
@@ -2553,7 +2545,7 @@ fn prune_cutoff(
         value.to_string()
     } else {
         let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files_locked(Some(&path), None)?;
+        let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
         cfg.storage
             .archived_transcript_retention
             .unwrap_or_else(|| "30d".to_string())

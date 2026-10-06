@@ -122,10 +122,8 @@ fn warn_if_account_unknown(account: &str) {
     let Ok(global) = paths::global_dir() else {
         return;
     };
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())
-        .unwrap_or_default();
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default();
 
     let declared = cfg.scm.platforms.contains_key(account);
     let bare_vendor = account.parse::<rupu_scm::Platform>().is_ok();
@@ -290,10 +288,8 @@ async fn accounts_inner(global_format: Option<OutputFormat>) -> anyhow::Result<(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())
-        .unwrap_or_default();
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default();
 
     // Built-in bare vendor names always listed first (mirrors `auth
     // status`'s convention) so a single-account user — who wrote no

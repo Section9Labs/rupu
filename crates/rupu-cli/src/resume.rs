@@ -309,9 +309,8 @@ async fn rebuild_opts_from_disk(
     // Standard wiring (mirrors `run` above; refactor candidate but
     // keeping inline for now to avoid spreading the resume path
     // across the CLI surface).
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &workspace_path)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     // Rooted at `global` like everything else here: the resolver reads
     // `<global>/auth.json` and never resolves the home on its own.
     let resolver = Arc::new(crate::accounts::resolver_for_home(&cfg, &global));

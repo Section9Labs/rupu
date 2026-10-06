@@ -4112,17 +4112,18 @@ fn retained_serve_ui_prefs() -> UiPrefs {
     let project_root = pwd
         .as_ref()
         .and_then(|dir| paths::project_root_for(dir).ok().flatten());
-    let cfg = match global.as_ref() {
+    let cfg = match (global.as_ref(), pwd.as_deref()) {
         // UI prefs only — lock does not apply (I-7)
-        Some(global_dir) => rupu_config::layer_files(
-            Some(&global_dir.join("config.toml")),
-            project_root
-                .as_deref()
-                .map(|root| root.join(".rupu/config.toml"))
-                .as_deref(),
-        )
+        (Some(global_dir), Some(pwd)) => {
+            let cfg_paths =
+                paths::config_paths_for_display(global_dir, project_root.as_deref(), pwd);
+            rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default()
+        }
+        (Some(global_dir), None) => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
+            &global_dir.join("config.toml"),
+        ))
         .unwrap_or_default(),
-        None => rupu_config::Config::default(),
+        (None, _) => rupu_config::Config::default(),
     };
     UiPrefs::resolve(&cfg.ui, false, None, None, None)
 }
@@ -11971,13 +11972,19 @@ fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Valu
     Ok(value)
 }
 
+/// Global + customer + project config for `project_root`, strictly (a
+/// dangling customer assignment is an error). With no project this serves
+/// no project, so it reads the global file alone.
 fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<Config> {
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.map(|root| root.join(".rupu/config.toml"));
-    Ok(rupu_config::layer_files_locked(
-        Some(&global_cfg_path),
-        project_cfg_path.as_deref(),
-    )?)
+    match project_root {
+        Some(root) => {
+            let cfg_paths = paths::config_paths(global, Some(root), root)?;
+            Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
+        }
+        None => Ok(rupu_config::layer_files_locked(
+            rupu_config::LayerPaths::global_only(&global.join("config.toml")),
+        )?),
+    }
 }
 
 pub(crate) fn cleanup_terminal_claims(

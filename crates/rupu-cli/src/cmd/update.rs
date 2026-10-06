@@ -53,7 +53,7 @@ fn resolve_channel(flag: Option<&str>, cfg: Option<&str>) -> anyhow::Result<Chan
     Channel::from_str(raw).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Load the layered global + project config the same way every other
+/// Load the layered global + customer + project config the same way every other
 /// subcommand does (see `cmd::webhook::load_cli_config` for the
 /// original of this pattern). Exposed `pub(crate)` so the top-level
 /// dispatcher (`lib.rs`) can reuse it for the passive update-notice gate.
@@ -61,12 +61,10 @@ pub(crate) fn load_cli_config() -> rupu_config::Config {
     let Ok(global_dir) = paths::global_dir() else {
         return rupu_config::Config::default();
     };
-    let global_cfg_path = global_dir.join("config.toml");
     let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = paths::project_root_for(&pwd).ok().flatten();
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
-        .unwrap_or_default()
+    let cfg_paths = paths::config_paths_for_display(&global_dir, project_root.as_deref(), &pwd);
+    rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default()
 }
 
 /// Whether `rupu update` must refuse, and what to say.

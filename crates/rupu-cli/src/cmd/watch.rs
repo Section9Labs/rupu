@@ -325,31 +325,39 @@ fn resolve_watch_pricing() -> rupu_config::PricingConfig {
     let Ok(global) = paths::global_dir() else {
         return rupu_config::PricingConfig::default();
     };
-    let project_cfg = std::env::current_dir()
-        .ok()
-        .and_then(|pwd| paths::project_root_for(&pwd).ok().flatten())
-        .map(|root| root.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global.join("config.toml")), project_cfg.as_deref())
-        .map(|cfg| cfg.pricing)
-        .unwrap_or_default()
+    let loaded = match std::env::current_dir() {
+        Ok(pwd) => {
+            let project_root = paths::project_root_for(&pwd).ok().flatten();
+            let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+            rupu_config::layer_files_locked(cfg_paths.layers())
+        }
+        Err(_) => rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
+            &global.join("config.toml"),
+        )),
+    };
+    loaded.map(|cfg| cfg.pricing).unwrap_or_default()
 }
 
 fn resolve_watch_prefs(view: Option<LiveViewMode>) -> UiPrefs {
     let global = paths::global_dir().ok();
-    let project_root = std::env::current_dir()
-        .ok()
-        .and_then(|pwd| paths::project_root_for(&pwd).ok().flatten());
+    let pwd = std::env::current_dir().ok();
+    let project_root = pwd
+        .as_deref()
+        .and_then(|pwd| paths::project_root_for(pwd).ok().flatten());
     let cfg = global
         .as_deref()
         .map(|global| {
             // UI prefs only — lock does not apply (I-7)
-            rupu_config::layer_files(
-                Some(&global.join("config.toml")),
-                project_root
-                    .as_deref()
-                    .map(|root| root.join(".rupu/config.toml"))
-                    .as_deref(),
-            )
+            match pwd.as_deref() {
+                Some(pwd) => {
+                    let cfg_paths =
+                        paths::config_paths_for_display(global, project_root.as_deref(), pwd);
+                    rupu_config::layer_files(cfg_paths.layers())
+                }
+                None => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
+                    &global.join("config.toml"),
+                )),
+            }
             .unwrap_or_default()
         })
         .unwrap_or_default();

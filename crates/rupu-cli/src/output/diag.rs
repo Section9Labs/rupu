@@ -183,12 +183,17 @@ pub fn prefs_for_diag(no_color: bool) -> UiPrefs {
     let cfg = paths::global_dir()
         .ok()
         .and_then(|g| {
-            let global_cfg = g.join("config.toml");
-            let pwd = std::env::current_dir().ok()?;
+            // UI prefs only — lock does not apply (I-7). Diag must never
+            // fail: without a working directory, read the global file alone.
+            let Ok(pwd) = std::env::current_dir() else {
+                return rupu_config::layer_files(rupu_config::LayerPaths::global_only(
+                    &g.join("config.toml"),
+                ))
+                .ok();
+            };
             let project_root = paths::project_root_for(&pwd).ok().flatten();
-            let project_cfg = project_root.map(|p| p.join(".rupu/config.toml"));
-            // UI prefs only — lock does not apply (I-7)
-            rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).ok()
+            let cfg_paths = paths::config_paths_for_display(&g, project_root.as_deref(), &pwd);
+            rupu_config::layer_files(cfg_paths.layers()).ok()
         })
         .unwrap_or_default();
     UiPrefs::resolve(&cfg.ui, no_color, None, None, None)

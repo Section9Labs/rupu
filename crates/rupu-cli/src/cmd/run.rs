@@ -476,7 +476,8 @@ async fn list(
     // `cmd/workflow.rs` / `cmd/cron.rs`, which is fine to swallow — a
     // wrong pager/theme default has no correctness stakes.)
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
+    let layers = rupu_config::LayerPaths::global_only(&global_cfg_path);
+    let cfg = rupu_config::layer_files_locked(layers).map_err(|e| {
         tracing::warn!(
             path = %global_cfg_path.display(),
             error = %e,
@@ -561,7 +562,8 @@ async fn show(
     // right here, then the full id flows downstream.
     let run_id = crate::cmd::workflow::resolve_run_fragment(&store, &run_id)?;
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
+    let layers = rupu_config::LayerPaths::global_only(&global_cfg_path);
+    let cfg = rupu_config::layer_files_locked(layers).map_err(|e| {
         tracing::warn!(
             path = %global_cfg_path.display(),
             error = %e,
@@ -639,10 +641,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
 
-    // Resolve config (global + project).
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    // Resolve config (global + customer + project).
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, args.view);
 
     // Resolve permission mode.

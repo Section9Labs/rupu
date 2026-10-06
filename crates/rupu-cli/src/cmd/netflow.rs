@@ -368,10 +368,8 @@ fn prune_ui_prefs() -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg =
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
+    let cfg = rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default();
     Ok(crate::cmd::ui::UiPrefs::resolve(
         &cfg.ui, false, None, None, None,
     ))

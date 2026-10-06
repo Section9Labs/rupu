@@ -1410,7 +1410,10 @@ async fn list(
         // global scope chip for the same name.
         push_yaml_names(&p.join(".rupu/workflows"), "project", &mut by_name);
     }
-    let cfg = layered_config_workflow(&global, project_root.as_deref());
+    let cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "config");
+        rupu_config::Config::default()
+    });
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None)
         .with_table_flags(absolute, all_columns);
 
@@ -1504,11 +1507,9 @@ async fn show(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg =
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    let cfg = rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default();
 
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, view);
     let view_mode = prefs.live_view;
@@ -2268,7 +2269,7 @@ async fn create(
             // `gen_provider_config` below) so the SAME config also builds
             // the resolver: a declared account's SSO credential must be
             // reachable when generating a workflow via `--gen-provider`.
-            let gen_cfg = layered_config_workflow(&global, project_root.as_deref());
+            let gen_cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd)?;
             let resolver = crate::accounts::resolver_for(&gen_cfg);
             let (provider, model) = match (gen_provider, gen_model) {
                 (Some(p), Some(m)) => (p, m),
@@ -2653,7 +2654,10 @@ async fn runs(
 
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = layered_config_workflow(&global, project_root.as_deref());
+    let cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "config");
+        rupu_config::Config::default()
+    });
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
         .with_table_flags(absolute, all_columns);
 
@@ -2735,14 +2739,17 @@ fn run_cost_usd(
     any.then_some(total)
 }
 
+/// Global + customer + project config, strictly: a dangling customer
+/// assignment or a malformed layer is an error. `create --gen-provider`
+/// propagates it (the config picks the provider); the display callers log
+/// it and fall back to defaults.
 fn layered_config_workflow(
     global: &std::path::Path,
     project_root: Option<&std::path::Path>,
-) -> rupu_config::Config {
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
-        .unwrap_or_default()
+    run_dir: &std::path::Path,
+) -> anyhow::Result<rupu_config::Config> {
+    let cfg_paths = paths::config_paths(global, project_root, run_dir)?;
+    Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
 }
 
 /// Minimal per-run metadata needed to disambiguate a run-id fragment
@@ -2875,7 +2882,10 @@ async fn show_run(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = layered_config_workflow(&global, project_root.as_deref());
+    let cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "config");
+        rupu_config::Config::default()
+    });
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let runs_dir = global.join("runs");
     let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
@@ -3703,9 +3713,8 @@ pub(crate) async fn resume_run(
     let project_root = paths::project_root_for(&workspace_path)?;
 
     // Standard wiring (mirrors `approve` above).
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &workspace_path)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     // Netflow capture for this resumed run — same reasoning as
@@ -4732,12 +4741,11 @@ async fn run_with_outcome(
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
     }
 
-    // Resolve config (global + project) so Registry::discover can read
-    // [scm] platform settings, and so the credential resolver below knows
-    // this run's declared accounts.
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    // Resolve config (global + customer + project) so Registry::discover
+    // can read [scm] platform settings, and so the credential resolver
+    // below knows this run's declared accounts.
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     // Credential resolver (shared across all steps in this workflow run).
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
@@ -5508,12 +5516,8 @@ async fn execute_workflow_invocation(
             .and_then(|repo| repo.repo_ref.as_deref()),
     )?;
     let prepared_run = prepare_local_run(&run_envelope, &worker_record.worker_id)?;
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = ctx
-        .project_root
-        .as_ref()
-        .map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg_paths = paths::config_paths(&global, ctx.project_root.as_deref(), &ctx.workspace_path)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     let transcripts = paths::transcripts_dir(&global, ctx.project_root.as_deref());

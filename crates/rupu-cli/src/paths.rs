@@ -152,6 +152,72 @@ pub fn ensure_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The config files one load layers: global, the customer of the project
+/// (if assigned), and the project's `.rupu/config.toml`. Spec:
+/// `docs/superpowers/specs/2026-10-06-rupu-customers-design.md` §2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPaths {
+    pub global: PathBuf,
+    pub customer: Option<PathBuf>,
+    pub project: Option<PathBuf>,
+}
+
+impl ConfigPaths {
+    pub fn layers(&self) -> rupu_config::LayerPaths<'_> {
+        rupu_config::LayerPaths::new(
+            Some(&self.global),
+            self.customer.as_deref(),
+            self.project.as_deref(),
+        )
+    }
+
+    fn without_customer(global: &Path, project_root: Option<&Path>) -> Self {
+        Self {
+            global: global.join("config.toml"),
+            customer: None,
+            project: project_root.map(|p| p.join(".rupu/config.toml")),
+        }
+    }
+}
+
+/// Layer paths for a load that serves a project. The customer is the one
+/// assigned to the nearest ancestor of `project_root` (else of `run_dir`,
+/// the directory the command works in).
+///
+/// **Strict** — for launch paths and for anything whose result drives a
+/// provider, SCM-account or permission decision: a project assigned to a
+/// customer that no longer exists is an error, never a silent fall back to
+/// the global config.
+pub fn config_paths(
+    global: &Path,
+    project_root: Option<&Path>,
+    run_dir: &Path,
+) -> Result<ConfigPaths> {
+    let dir = project_root.unwrap_or(run_dir);
+    let customer = rupu_workspace::CustomerStore::new(global)
+        .customer_config_for_dir(dir)
+        .with_context(|| format!("resolve the customer of {}", dir.display()))?;
+    Ok(ConfigPaths {
+        customer,
+        ..ConfigPaths::without_customer(global, project_root)
+    })
+}
+
+/// [`config_paths`] for display-only reads (UI preferences, pricing tables,
+/// listings): a failed customer lookup is logged and the customer layer
+/// left out, so a broken assignment never stops `rupu transcript list`.
+/// Never use this where the config picks a provider, account or permission.
+pub fn config_paths_for_display(
+    global: &Path,
+    project_root: Option<&Path>,
+    run_dir: &Path,
+) -> ConfigPaths {
+    config_paths(global, project_root, run_dir).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "customer config layer skipped for this display");
+        ConfigPaths::without_customer(global, project_root)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +253,64 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let global = tmp.path().join("global");
         assert_eq!(netflow_dir(&global, None), global.join("netflow"));
+    }
+}
+
+#[cfg(test)]
+mod customer_layer_tests {
+    use super::*;
+    use rupu_workspace::{CustomerStore, NewCustomer, ProjectRef};
+
+    fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".rupu")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        (tmp, home, project)
+    }
+
+    fn assign(home: &Path, project: &Path) {
+        let store = CustomerStore::new(home);
+        store
+            .create(
+                "acme",
+                &NewCustomer {
+                    name: "Acme".into(),
+                    ..NewCustomer::default()
+                },
+            )
+            .unwrap();
+        store.assign("acme", ProjectRef::Path(project)).unwrap();
+    }
+
+    #[test]
+    fn config_paths_includes_the_customer_of_the_project_root() {
+        let (_t, home, project) = setup();
+        assign(&home, &project);
+        let p = config_paths(&home, Some(&project), Path::new("/")).unwrap();
+        assert_eq!(p.global, home.join("config.toml"));
+        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
+        assert_eq!(p.project, Some(project.join(".rupu/config.toml")));
+    }
+
+    #[test]
+    fn config_paths_falls_back_to_the_run_dir_without_a_project_root() {
+        let (_t, home, project) = setup();
+        assign(&home, &project);
+        let p = config_paths(&home, None, &project).unwrap();
+        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
+        assert_eq!(p.project, None);
+    }
+
+    #[test]
+    fn strict_errors_and_display_degrades_on_a_dangling_assignment() {
+        let (_t, home, project) = setup();
+        assign(&home, &project);
+        std::fs::remove_dir_all(home.join("customers/acme")).unwrap();
+        assert!(config_paths(&home, Some(&project), &project).is_err());
+        let p = config_paths_for_display(&home, Some(&project), &project);
+        assert_eq!(p.customer, None);
+        assert_eq!(p.project, Some(project.join(".rupu/config.toml")));
     }
 }
