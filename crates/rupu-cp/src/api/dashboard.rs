@@ -112,8 +112,10 @@ struct DashboardQuery {
 /// `fleet` counts are not run-scoped and stay unfiltered. A remote host's
 /// summary arrives already summed and cannot be filtered (plan ruling 5):
 /// `?host=<remote>` with `customer` is a 501, and the fan-out reports each
-/// remote host `unavailable` (never counted). An assignment that cannot be
-/// read fails the request (500). A bad slug is a 400.
+/// remote host `unavailable` (never counted). Under a filter, an assignment
+/// the local host cannot read fails the request (500) — unlike
+/// `/api/usage`, which keeps its per-host contract and marks the local host
+/// `offline` with that reason. A bad slug is a 400.
 async fn get_dashboard(
     State(s): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<DashboardQuery>,

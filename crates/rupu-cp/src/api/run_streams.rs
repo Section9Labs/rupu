@@ -196,6 +196,10 @@ struct AgentRunRow {
     /// run's customer is derived from. Not on the wire.
     #[serde(skip)]
     workspace_id: Option<String>,
+    /// `customer` came from the session (its latest turn's), not the turn's
+    /// own `RunStart` — reported as `customer_derived`. Not on the wire.
+    #[serde(skip)]
+    customer_inherited: bool,
 }
 
 /// One actionable autoflow *event* — a single launched run or awaiting/failed
@@ -449,6 +453,7 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
                 customer,
                 customer_derived: false,
                 workspace_id,
+                customer_inherited: false,
             },
             dto.pid,
         ));
@@ -574,6 +579,8 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     customer: dto.customer.clone(),
                     customer_derived: false,
                     workspace_id: dto.workspace_id.clone().filter(|w| !w.is_empty()),
+                    // The session's customer, not this turn's own record.
+                    customer_inherited: dto.customer.is_some(),
                 });
             }
         }
@@ -695,17 +702,18 @@ fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
         provider: standalone.provider.or(session.provider),
         model: standalone.model.or(session.model),
         // The turn's own `RunStart` records the customer it ran under; the
-        // session's is only its latest turn's.
+        // session's is only its latest turn's (inherited ⇒ derived).
+        customer_inherited: standalone.customer.is_none() && session.customer_inherited,
         customer: standalone.customer.or(session.customer),
         customer_derived: false,
         workspace_id: standalone.workspace_id.or(session.workspace_id),
     }
 }
 
-/// Attribute each local agent run to its customer: the recorded one, else
-/// (`customer_derived`) its workspace's CURRENT assignment; a run with
-/// neither a recorded customer nor a known workspace has none. An
-/// assignment that cannot be read fails the request.
+/// Attribute each local agent run to its customer: the one its own
+/// `RunStart` recorded; else (`customer_derived`) the one inherited from its
+/// session, or its workspace's CURRENT assignment; a run with none of these
+/// has none. An assignment that cannot be read fails the request.
 fn attribute_agent_runs(
     lookup: &mut crate::customers::CustomerLookup,
     rows: &mut [AgentRunRow],
@@ -721,8 +729,8 @@ fn attribute_agent_runs(
                 derived: false,
             },
         };
+        row.customer_derived = who.derived || (who.slug.is_some() && row.customer_inherited);
         row.customer = who.slug;
-        row.customer_derived = who.derived;
     }
     Ok(())
 }
@@ -2176,6 +2184,7 @@ mod tests {
                 customer: None,
                 customer_derived: false,
                 workspace_id: None,
+                customer_inherited: false,
             }
         }
 
@@ -2900,9 +2909,6 @@ mod tests {
         .expect("ok");
 
         assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
-        assert_eq!(
-            rows[0]["started_at"],
-            serde_json::json!(day(10).to_rfc3339())
-        );
+        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
     }
 }

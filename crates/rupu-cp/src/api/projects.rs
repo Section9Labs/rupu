@@ -312,7 +312,7 @@ async fn get_project(
                     pricing: None,
                     workspace: Some(&ws),
                 },
-            );
+            )?;
             let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
             let usage = project_rollups(
                 &run_store,
@@ -416,12 +416,7 @@ async fn project_runs(
         let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
         page_runs
             .iter()
-            .map(|r| {
-                let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
-                let mut row = RunListRow::with_usage(r, &store, prices.get(who.slug.as_deref()));
-                row.set_customer(who);
-                Ok(row)
-            })
+            .map(|r| RunListRow::attributed(r, &store, &mut lookup, &mut prices))
             .collect()
     })
     .await?;
@@ -435,10 +430,11 @@ async fn project_sessions(
     Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<Value>>> {
     load_workspace(&s, &ws_id)?;
-    // Scoped BEFORE usage is folded; blocking IO.
+    // Scoped BEFORE usage is folded; each session is attributed to its
+    // customer and priced with that customer's pricing. Blocking IO.
     let scoped: Vec<Value> = {
         let global = s.global_dir.clone();
-        let pricing = s.pricing.clone();
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
         tokio::task::spawn_blocking(move || {
             crate::api::sessions::collect_sessions_with(
                 &global,
@@ -449,7 +445,7 @@ async fn project_sessions(
             )
         })
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| ApiError::internal(e.to_string()))??
     };
     Ok(Json(crate::pagination::paginate(scoped, &page)))
 }

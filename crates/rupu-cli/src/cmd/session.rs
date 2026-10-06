@@ -559,6 +559,12 @@ struct SessionListRow {
     target: Option<String>,
     active_run_id: Option<String>,
     updated_at: String,
+    /// The customer the session is attributed to: the one its record holds,
+    /// else (`customer_derived`) its workspace's current assignment. Always
+    /// serialized (`null` = no customer) so a coordinator listing this host
+    /// over SSH can tell "no customer" from an older rupu.
+    customer: Option<String>,
+    customer_derived: bool,
 }
 
 #[derive(Serialize)]
@@ -1273,12 +1279,22 @@ async fn list(
     } else {
         &[SessionScope::Active]
     };
+    // Each row's customer: the session record's, else its workspace's
+    // current assignment (derived). An assignment that cannot be read fails
+    // the command rather than report "no customer".
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
     for &scope in scopes {
         for mut session in load_sessions_in_scope(&global, scope)? {
             if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
                 write_session(&global, scope, &session)?;
             }
+            let customer = customers
+                .attribute(session.customer.as_deref(), &session.workspace_id)
+                .map_err(|e| anyhow::anyhow!(e.1))?;
             rows.push(SessionListRow {
+                customer: customer.slug,
+                customer_derived: customer.derived,
                 session_id: session.session_id.clone(),
                 codename: crate::output::codename::display_codename(
                     session.codename.as_deref(),
@@ -12547,12 +12563,36 @@ mod tests {
             target: target.map(str::to_string),
             active_run_id: active_run_id.map(str::to_string),
             updated_at: updated_at.to_string(),
+            customer: None,
+            customer_derived: false,
         }
     }
 
     fn test_prefs() -> UiPrefs {
         let cfg = rupu_config::UiConfig::default();
         UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    /// `--format json` rows always carry `customer` (`null` = none) and
+    /// `customer_derived` — what an SSH coordinator filters by.
+    #[test]
+    fn session_list_json_rows_carry_the_customer_keys() {
+        let mut row = session_list_row_for_test(
+            "s1",
+            "reviewer",
+            "active",
+            "idle",
+            None,
+            None,
+            "2026-07-30T13:00:00Z",
+        );
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.as_object().unwrap().contains_key("customer"));
+        assert!(v["customer"].is_null());
+        assert_eq!(v["customer_derived"], false);
+        row.customer = Some("acme".into());
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["customer"], "acme");
     }
 
     fn test_now() -> DateTime<Utc> {

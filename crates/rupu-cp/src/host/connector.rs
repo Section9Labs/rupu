@@ -838,6 +838,14 @@ pub(crate) async fn blocking_host<T: Send + 'static>(
 ///
 /// Shared by [`TunnelHostConnector`] and the upcoming `SshHostConnector` — both
 /// read from the same mirror; only the `worker_id` they scope to differs.
+///
+/// Customers: a mirrored run's workspace lives on the worker, not in this
+/// coordinator's store, so its customer cannot be derived here. A row whose
+/// run RECORDED a customer carries it (`customer_derived: false`); a row whose
+/// run recorded none OMITS the `customer`/`customer_derived` keys — the
+/// coordinator cannot tell a legacy run from one with no customer, so under a
+/// customer filter such a host answers 501 / is named in
+/// `X-Rupu-Hosts-Without-Customer` rather than being counted as "none".
 pub(crate) fn mirror_list_runs(
     run_store: &RunStore,
     worker_id: &str,
@@ -863,7 +871,17 @@ pub(crate) fn mirror_list_runs(
     .map_err(crate::api::runs::RunRowsError::into_host)?;
 
     rows.iter()
-        .map(|r| serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string())))
+        .map(|r| {
+            let mut v =
+                serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+            if r.customer.is_none() {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("customer");
+                    obj.remove("customer_derived");
+                }
+            }
+            Ok(v)
+        })
         .collect()
 }
 
@@ -1198,6 +1216,65 @@ mod off_runtime_tests {
             .unwrap();
 
         assert_eq!(got, serde_json::json!({ "events": [], "summary": null }));
+    }
+
+    /// A mirrored run that recorded a customer carries it; one that recorded
+    /// none omits the key, so a customer filter reads the host as unable to
+    /// say (501) instead of counting the run as "no customer".
+    #[test]
+    fn mirror_rows_omit_the_customer_a_worker_run_never_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let seed = |id: &str, customer: Option<&str>| {
+            let mut v = serde_json::json!({
+                "id": id,
+                "workflow_name": "wf",
+                "status": "completed",
+                "inputs": {},
+                "workspace_id": "ws_remote",
+                "workspace_path": "/tmp/proj",
+                "transcript_dir": "/tmp/proj/.rupu/transcripts",
+                "started_at": "2026-10-06T00:00:00Z",
+                "worker_id": "node_1",
+            });
+            if let Some(c) = customer {
+                v["customer"] = serde_json::json!(c);
+            }
+            store
+                .create(serde_json::from_value(v).unwrap(), "name: wf\n")
+                .unwrap();
+        };
+        seed("run_acme", Some("acme"));
+        let params = RunListQuery {
+            kind: RunKind::All,
+            offset: 0,
+            limit: 50,
+            lifecycle: None,
+        };
+        let pricing = rupu_config::PricingConfig::default();
+        let none = crate::customers::CustomerFilter::Unassigned;
+        let acme = crate::customers::CustomerFilter::Slug("acme".into());
+
+        // Only recorded runs: filtered normally.
+        let rows = mirror_list_runs(&store, "node_1", &params, &pricing).unwrap();
+        assert_eq!(rows[0]["customer"], "acme");
+        assert_eq!(rows[0]["customer_derived"], false);
+        assert_eq!(
+            crate::customers::filter_remote_rows(rows.clone(), &acme).map(|r| r.len()),
+            Some(1)
+        );
+        assert_eq!(
+            crate::customers::filter_remote_rows(rows, &none).map(|r| r.len()),
+            Some(0)
+        );
+
+        // A legacy run: no key, so the host can't be filtered (501).
+        seed("run_legacy", None);
+        let rows = mirror_list_runs(&store, "node_1", &params, &pricing).unwrap();
+        let legacy = rows.iter().find(|r| r["id"] == "run_legacy").unwrap();
+        assert!(!legacy.as_object().unwrap().contains_key("customer"));
+        assert!(!legacy.as_object().unwrap().contains_key("customer_derived"));
+        assert!(crate::customers::filter_remote_rows(rows, &none).is_none());
     }
 
     /// `stream_run_events` on a mirror-backed connector (SSH, tunnel,

@@ -467,7 +467,7 @@ pub(crate) fn transcript_row_to_agent_run(row: &serde_json::Value) -> serde_json
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let null = serde_json::Value::Null;
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "run_id": row.get("run_id").cloned().unwrap_or(null.clone()),
         "source": "standalone",
         "agent": row.get("agent").cloned().unwrap_or(null.clone()),
@@ -479,7 +479,16 @@ pub(crate) fn transcript_row_to_agent_run(row: &serde_json::Value) -> serde_json
         "usage": usage_json(total, 1),
         "turns": 0,
         "duration_ms": null,
-    })
+    });
+    // A newer remote's `transcript list` rows carry the customer; copy the
+    // keys only when present, so an older remote's rows stay WITHOUT them
+    // (the coordinator then knows that host can't be filtered by customer).
+    for key in ["customer", "customer_derived"] {
+        if let Some(v) = row.get(key) {
+            out[key] = v.clone();
+        }
+    }
+    out
 }
 
 /// `rupu autoflow history` row → `AutoflowEventRow` wire shape
@@ -1560,6 +1569,41 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
     ];
     let lower = stderr.to_ascii_lowercase();
     MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Classify a failed remote `rupu run list`.
+///
+/// - an ssh transport failure (host down) passes through as `Unreachable`
+///   (offline);
+/// - an old remote rupu — one with no `run list`: it parses as "launch an
+///   agent named list", or its clap rejects the flags, or what it prints is
+///   not the JSON report — becomes `Unsupported` ("needs a newer rupu"), so
+///   the freshness strip never reads it as zero runs;
+/// - anything else (e.g. the remote's own customer assignment it cannot
+///   read) is the remote's error, reported as-is — never mislabelled as a
+///   missing command.
+fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError {
+    let predates = match &e {
+        HostConnectorError::Unreachable(msg) => {
+            if is_ssh_transport_failure(msg) {
+                return e;
+            }
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("unexpected argument")
+                || lower.contains("unrecognized subcommand")
+                || (lower.contains("list") && lower.contains("not found"))
+        }
+        HostConnectorError::Remote(0, msg) => msg.starts_with("parse `rupu"),
+        HostConnectorError::NotJson(_) => true,
+        _ => false,
+    };
+    if predates {
+        HostConnectorError::Unsupported(format!(
+            "remote host {host_id} does not support `rupu run list`: {e}"
+        ))
+    } else {
+        e
+    }
 }
 
 // ── SshHostConnector ──────────────────────────────────────────────────────────
@@ -2687,25 +2731,12 @@ impl HostConnector for SshHostConnector {
         {
             Ok(r) => r,
             Err(e) => {
-                // A host that is DOWN is not a host that predates `run list`.
-                if let HostConnectorError::Unreachable(msg) = &e {
-                    if is_ssh_transport_failure(msg) {
-                        return Err(e);
-                    }
-                }
-                // An old remote rupu has no `run list`; it parses as "launch an
-                // agent named list" and errors. Surface it as Unsupported so the
-                // freshness strip renders "needs a newer rupu" rather than
-                // silently reporting zero runs.
                 tracing::warn!(
                     host_id = %self.host_id,
                     error = %e,
-                    "list_runs: remote `rupu run list` failed; host may predate the command"
+                    "list_runs: remote `rupu run list` failed"
                 );
-                return Err(HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu run list`: {e}",
-                    self.host_id
-                )));
+                return Err(run_list_failure(&self.host_id, e));
             }
         };
 
@@ -3378,16 +3409,8 @@ impl HostConnector for SshHostConnector {
             .cached_rows(&["--format", "json", "run", "list", "--limit", "10000"])
             .await
             .map_err(|e| {
-                if let HostConnectorError::Unreachable(msg) = &e {
-                    if is_ssh_transport_failure(msg) {
-                        return e;
-                    }
-                }
                 tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: run list failed");
-                HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu run list`: {e}",
-                    self.host_id
-                ))
+                run_list_failure(&self.host_id, e)
             })?;
         let cycle_rows = self.list_autoflow_runs().await.unwrap_or_else(|e| {
             // Degrade to empty, but never silently: an IO/remote failure must
@@ -4777,6 +4800,21 @@ mod tests {
         assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
     }
 
+    /// A remote `run list` that fails for another reason (here: the remote's
+    /// own unreadable customer assignment) reports that error, not "does not
+    /// support `rupu run list`".
+    #[tokio::test]
+    async fn list_runs_reports_any_other_remote_failure_as_is() {
+        let msg = "error: the customer assignment of workspace ws_1 cannot be read: \
+                   Is a directory; repair or remove `workspaces/ws_1.customer`";
+        let fake = std::sync::Arc::new(FakeExec::offline(msg));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(!matches!(err, HostConnectorError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("ws_1.customer"), "{err}");
+        assert!(!err.to_string().contains("does not support"), "{err}");
+    }
+
     #[tokio::test]
     async fn dashboard_summary_still_reports_an_old_remote_rupu_as_unsupported() {
         let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
@@ -5783,6 +5821,32 @@ mod tests {
         assert_eq!(m["turns"], 0);
         assert!(m["session_id"].is_null());
         assert!(m["duration_ms"].is_null());
+        // An older remote's row has no customer: the mapped row has none
+        // either, so a customer filter reads the host as unable to say.
+        assert!(!m.as_object().unwrap().contains_key("customer"));
+        assert!(!m.as_object().unwrap().contains_key("customer_derived"));
+    }
+
+    /// A newer remote's row carries its customer through (`null` included).
+    #[test]
+    fn transcript_row_keeps_the_customer_keys_it_has() {
+        let base = serde_json::json!({
+            "run_id": "run_1", "agent": "a", "status": "completed",
+            "total_tokens": 1, "started_at": "2026-07-02 00:15:04",
+        });
+        let mut acme = base.clone();
+        acme["customer"] = serde_json::json!("acme");
+        acme["customer_derived"] = serde_json::json!(true);
+        let m = transcript_row_to_agent_run(&acme);
+        assert_eq!(m["customer"], "acme");
+        assert_eq!(m["customer_derived"], true);
+
+        let mut none = base;
+        none["customer"] = serde_json::Value::Null;
+        none["customer_derived"] = serde_json::json!(false);
+        let m = transcript_row_to_agent_run(&none);
+        assert!(m.as_object().unwrap().contains_key("customer"));
+        assert!(m["customer"].is_null());
     }
 
     #[test]

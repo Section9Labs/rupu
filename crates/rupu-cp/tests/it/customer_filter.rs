@@ -780,3 +780,76 @@ async fn an_unreadable_assignment_fails_the_request() {
         );
     }
 }
+
+// ── session turns ───────────────────────────────────────────────────────
+
+/// A session turn is priced with its customer's pricing on BOTH the session
+/// list and the agent-run list; a turn whose own transcript recorded no
+/// customer inherits the session's and says so (`customer_derived`).
+#[tokio::test]
+async fn a_session_turn_prices_and_attributes_alike_on_both_lists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    seed_workspace(global, "ws_none", &proj.path().join("ws_none"));
+    create_customer(global, "acme");
+    let toml = |p: f64| {
+        format!("[pricing.anthropic.\"{MODEL}\"]\ninput_per_mtok = {p}\noutput_per_mtok = 1.0\n")
+    };
+    std::fs::write(global.join("config.toml"), toml(1.0)).unwrap();
+    std::fs::write(CustomerStore::new(global).config_path("acme"), toml(5.0)).unwrap();
+
+    // The turn's transcript predates customers; the session records Acme.
+    let at = Utc::now() - Duration::hours(1);
+    let tdir = global.join("transcripts");
+    std::fs::create_dir_all(&tdir).unwrap();
+    let tpath = tdir.join("turn_1.jsonl");
+    write_transcript(&tpath, "turn_1", "ws_none", None, at);
+    std::fs::write(
+        tdir.join("turn_1.meta.json"),
+        json!({"run_id": "turn_1", "session_id": "s_1", "trigger_source": "session_turn"})
+            .to_string(),
+    )
+    .unwrap();
+    let sdir = global.join("sessions").join("s_1");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(
+        sdir.join("session.json"),
+        json!({
+            "session_id": "s_1",
+            "agent_name": "reviewer",
+            "provider_name": "anthropic",
+            "model": MODEL,
+            "workspace_id": "ws_none",
+            "customer": "acme",
+            "created_at": at.to_rfc3339(),
+            "updated_at": at.to_rfc3339(),
+            "status": "idle",
+            "runs": [{
+                "run_id": "turn_1",
+                "transcript_path": tpath.to_string_lossy(),
+                "started_at": at.to_rfc3339(),
+                "status": "ok",
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let base = spawn(global).await;
+
+    let sessions = get_json(format!("{base}/api/sessions?host=local&customer=acme")).await;
+    let session_cost = sessions[0]["usage"]["cost_usd"].as_f64().unwrap();
+    let agents = get_json(format!("{base}/api/runs/agents?host=local&customer=acme")).await;
+    let turn = by_id(&agents, "run_id", "turn_1");
+    assert_eq!(turn["customer"], "acme");
+    assert_eq!(turn["customer_derived"], true, "inherited from the session");
+    let turn_cost = turn["usage"]["cost_usd"].as_f64().unwrap();
+    assert!(
+        (session_cost - 5.0).abs() < 1e-9,
+        "session at Acme's $5: {session_cost}"
+    );
+    assert!(
+        (turn_cost - session_cost).abs() < 1e-9,
+        "{turn_cost} vs {session_cost}"
+    );
+}

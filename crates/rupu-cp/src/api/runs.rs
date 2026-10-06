@@ -670,6 +670,34 @@ impl RunListRow {
         self.customer_derived = who.derived;
     }
 
+    /// A row whose customer is already attributed (`who`), priced with that
+    /// customer's pricing.
+    pub fn priced(
+        r: &RunRecord,
+        who: crate::customers::Attribution,
+        store: &rupu_orchestrator::runs::RunStore,
+        prices: &mut dyn crate::customers::PriceBook,
+    ) -> Self {
+        let mut row = Self::with_usage(r, store, prices.pricing_for(who.slug.as_deref()));
+        row.set_customer(who);
+        row
+    }
+
+    /// The full list row: attributed through `lookup` (recorded customer,
+    /// else the workspace's current assignment — `customer_derived`) and
+    /// priced with that customer's pricing. An assignment that cannot be read
+    /// is an error naming the workspace (never "no customer"). Shared by the
+    /// CP's run lists and `rupu run list` (the SSH run-list surface).
+    pub fn attributed(
+        r: &RunRecord,
+        store: &rupu_orchestrator::runs::RunStore,
+        lookup: &mut crate::customers::CustomerLookup,
+        prices: &mut dyn crate::customers::PriceBook,
+    ) -> Result<Self, ApiError> {
+        let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
+        Ok(Self::priced(r, who, store, prices))
+    }
+
     /// Build a row with its usage summary, turn count, and duration filled from
     /// the run's transcripts (and the run record's wall-clock when available).
     ///
@@ -784,12 +812,7 @@ pub fn query_run_rows(
     let page_runs = crate::pagination::paginate(attributed, &page);
     Ok(page_runs
         .into_iter()
-        .map(|(r, who)| {
-            let mut row =
-                RunListRow::with_usage(&r, store, prices.pricing_for(who.slug.as_deref()));
-            row.set_customer(who);
-            row
-        })
+        .map(|(r, who)| RunListRow::priced(&r, who, store, prices))
         .collect())
 }
 
@@ -949,6 +972,56 @@ fn remote_run_rows(
         .collect())
 }
 
+/// One remote host's run-list window `[offset, offset + limit)`.
+///
+/// Without a customer filter: one connector call for exactly that window.
+/// With one: the host's list is read from the start in `page_size` pages,
+/// each filtered on the coordinator ([`remote_run_rows`]), until the matches
+/// cover the window or the host runs out (a short page) — so a window is
+/// never short while the host has more matching runs. A page from a peer too
+/// old to report customers is a 501 at once.
+#[allow(clippy::too_many_arguments)]
+async fn remote_run_window(
+    conn: &dyn crate::host::connector::HostConnector,
+    host_id: &str,
+    kind: RunKind,
+    lifecycle: Option<String>,
+    page: crate::pagination::PageQuery,
+    filter: Option<&crate::customers::CustomerFilter>,
+    page_size: usize,
+) -> ApiResult<Vec<serde_json::Value>> {
+    let Some(f) = filter else {
+        let params = RunListQuery {
+            kind,
+            offset: page.offset(),
+            limit: page.limit(),
+            lifecycle,
+        };
+        let rows = conn.list_runs(params).await.map_err(host_list_error)?;
+        return remote_run_rows(host_id, rows, None);
+    };
+    let want = page.offset().saturating_add(page.limit());
+    let page_size = page_size.max(1);
+    let mut matches: Vec<serde_json::Value> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let params = RunListQuery {
+            kind,
+            offset,
+            limit: page_size,
+            lifecycle: lifecycle.clone(),
+        };
+        let rows = conn.list_runs(params).await.map_err(host_list_error)?;
+        let n = rows.len();
+        matches.extend(remote_run_rows(host_id, rows, Some(f))?);
+        if matches.len() >= want || n < page_size {
+            break;
+        }
+        offset += n;
+    }
+    Ok(crate::pagination::paginate(matches, &page))
+}
+
 /// `GET /api/runs[?host=<id>][&customer=<slug>|none]`
 ///
 /// Without `?host=`: fan-out across every registered host concurrently, tag
@@ -960,9 +1033,11 @@ fn remote_run_rows(
 /// `?customer=` keeps the runs attributed to that customer (recorded, else
 /// the workspace's current assignment; `none` = no customer). Local runs are
 /// filtered before they are paged. A remote host's page is filtered on the
-/// coordinator; a remote whose rows carry no `customer` key is too old to
-/// say — 501 on `?host=<it>`, and skipped on the fan-out, named in the
-/// `X-Rupu-Hosts-Without-Customer` header. A bad slug is a 400.
+/// coordinator — page after page until the requested window is full or the
+/// host runs out ([`remote_run_window`]); a remote whose rows carry no
+/// `customer` key is too old to say — 501 on `?host=<it>`, and skipped on
+/// the fan-out, named in the `X-Rupu-Hosts-Without-Customer` header. A bad
+/// slug is a 400.
 async fn list_runs(
     State(s): State<AppState>,
     Query(q): Query<RunsListQuery>,
@@ -985,14 +1060,16 @@ async fn list_runs(
             return Ok((axum::http::HeaderMap::new(), Json(rows)));
         }
         let conn = resolve_host(&s, host_id)?;
-        let params = RunListQuery {
-            kind: RunKind::All,
-            offset: page.offset(),
-            limit: page.limit(),
-            lifecycle: None,
-        };
-        let rows = conn.list_runs(params).await.map_err(host_list_error)?;
-        let tagged = remote_run_rows(host_id, rows, filter.as_ref())?;
+        let tagged = remote_run_window(
+            conn.as_ref(),
+            host_id,
+            RunKind::All,
+            None,
+            page,
+            filter.as_ref(),
+            FAN_OUT_LIMIT,
+        )
+        .await?;
         return Ok((axum::http::HeaderMap::new(), Json(tagged)));
     }
     // Fan-out: collect all hosts → merge → paginate.
@@ -1085,8 +1162,8 @@ fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
 /// `WorkflowRunsQuery.since`'s doc comment.
 ///
 /// `?customer=` filters exactly as on `list_runs` (local: before paging;
-/// remote: on the coordinator, 501 / skipped + header for a peer too old to
-/// report customers).
+/// remote: on the coordinator, page after page until the window is full;
+/// 501 / skipped + header for a peer too old to report customers).
 async fn list_workflow_runs(
     State(s): State<AppState>,
     Query(q): Query<WorkflowRunsQuery>,
@@ -1107,14 +1184,16 @@ async fn list_workflow_runs(
             return Ok((axum::http::HeaderMap::new(), Json(rows)));
         }
         let conn = resolve_host(&s, host_id)?;
-        let params = RunListQuery {
-            kind: RunKind::Workflow,
-            offset: page.offset(),
-            limit: page.limit(),
-            lifecycle: q.lifecycle.clone(),
-        };
-        let rows = conn.list_runs(params).await.map_err(host_list_error)?;
-        let tagged = remote_run_rows(host_id, rows, filter.as_ref())?;
+        let tagged = remote_run_window(
+            conn.as_ref(),
+            host_id,
+            RunKind::Workflow,
+            q.lifecycle.clone(),
+            page,
+            filter.as_ref(),
+            FAN_OUT_LIMIT,
+        )
+        .await?;
         return Ok((axum::http::HeaderMap::new(), Json(tagged)));
     }
     let (rows, without_customer) =
@@ -1913,9 +1992,7 @@ async fn list_archived_runs(
         let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
         let mut rows = Vec::with_capacity(records.len());
         for r in &records {
-            let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
-            let mut row = RunListRow::with_usage(r, &store, prices.get(who.slug.as_deref()));
-            row.set_customer(who);
+            let row = RunListRow::attributed(r, &store, &mut lookup, &mut prices)?;
             let mut v = serde_json::to_value(row).map_err(|e| ApiError::internal(e.to_string()))?;
             v["host_id"] = serde_json::json!("local");
             rows.push(v);
@@ -3564,9 +3641,16 @@ pub(crate) mod tests {
         /// host answers as unreachable (exercises the 502 mapping).
         async fn list_runs(
             &self,
-            _params: RunListQuery,
+            params: RunListQuery,
         ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
             match self.run_json.get("runs").and_then(|v| v.as_array()) {
+                // `"paged": true` → honour offset/limit like a real peer.
+                Some(rows) if self.run_json["paged"] == true => Ok(rows
+                    .iter()
+                    .skip(params.offset)
+                    .take(params.limit)
+                    .cloned()
+                    .collect()),
                 Some(rows) => Ok(rows.clone()),
                 None => Err(HostConnectorError::Unreachable(
                     "fake host: no runs scripted".into(),
@@ -3739,6 +3823,67 @@ pub(crate) mod tests {
         test_state(tmp).with_hosts(Arc::new(crate::host::registry::HostRegistry::new(
             host_store, fake,
         )))
+    }
+
+    /// A filtered single-host window keeps paging the peer until it is full
+    /// or the peer runs out — a first page with no match never hides the
+    /// matches on the next one.
+    #[tokio::test]
+    async fn a_filtered_remote_window_pages_until_full_or_exhausted() {
+        let row = |id: &str, customer: Option<&str>| {
+            serde_json::json!({
+                "id": id, "started_at": "2026-10-01T00:00:00Z",
+                "codename": "c", "codename_derived": false,
+                "customer": customer, "customer_derived": false,
+            })
+        };
+        let fake = FakeHostConnector {
+            run_json: serde_json::json!({
+                "paged": true,
+                "runs": [
+                    row("r1", None), row("r2", Some("globex")), row("r3", None),
+                    row("r4", Some("acme")), row("r5", Some("acme")), row("r6", Some("acme")),
+                ],
+            }),
+        };
+        let acme = crate::customers::CustomerFilter::Slug("acme".into());
+        let window = |offset, limit| crate::pagination::PageQuery {
+            offset: Some(offset),
+            limit: Some(limit),
+        };
+        let ids = |rows: Vec<serde_json::Value>| -> Vec<String> {
+            rows.iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let rows = remote_run_window(
+            &fake,
+            "h",
+            RunKind::All,
+            None,
+            window(0, 10),
+            Some(&acme),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(rows), ["r4", "r5", "r6"]);
+        // The window applies to the matches.
+        let rows = remote_run_window(&fake, "h", RunKind::All, None, window(1, 1), Some(&acme), 3)
+            .await
+            .unwrap();
+        assert_eq!(ids(rows), ["r5"]);
+        // An old peer (no `customer` key) is a 501 whatever the page.
+        let old = FakeHostConnector {
+            run_json: serde_json::json!({
+                "paged": true,
+                "runs": [{"id": "o1", "started_at": "2026-10-01T00:00:00Z"}],
+            }),
+        };
+        let err = remote_run_window(&old, "h", RunKind::All, None, window(0, 10), Some(&acme), 3)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

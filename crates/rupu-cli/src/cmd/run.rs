@@ -502,20 +502,19 @@ async fn list(
     all.truncate(limit);
 
     // Each row carries its customer — recorded, else (a run that predates
-    // customers) its workspace's current assignment — so a coordinator
-    // shelling this command can filter by customer. An assignment that
-    // cannot be read fails the command rather than report "no customer".
+    // customers) its workspace's current assignment — and is priced with
+    // that customer's pricing (global + its layer), so a coordinator shelling
+    // this command can filter by customer and sees the CP's figures. An
+    // assignment that cannot be read fails the command.
     let mut customers =
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+    let customer_pricing = rupu_cp::customers::CustomerPricing::new(global.clone(), cfg.pricing);
+    let mut prices = rupu_cp::customers::PricingMemo::new(&customer_pricing);
     let rows: Vec<rupu_cp::api::runs::RunListRow> = all
         .iter()
         .map(|r| {
-            let mut row = rupu_cp::api::runs::RunListRow::with_usage(r, &store, &cfg.pricing);
-            let who = customers
-                .attribute(r.customer.as_deref(), &r.workspace_id)
-                .map_err(|e| anyhow::anyhow!(e.1))?;
-            row.set_customer(who);
-            Ok(row)
+            rupu_cp::api::runs::RunListRow::attributed(r, &store, &mut customers, &mut prices)
+                .map_err(|e| anyhow::anyhow!(e.1))
         })
         .collect::<anyhow::Result<_>>()?;
 

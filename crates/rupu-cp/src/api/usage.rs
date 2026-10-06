@@ -668,7 +668,9 @@ async fn local_usage(
 /// (`none` = no customer). A remote host's usage arrives already summed, so it
 /// cannot be filtered (plan ruling 5): with `customer` set, `?host=<remote>`
 /// is a 501 and the fan-out reports each remote host `unavailable` (never
-/// counted). A bad slug is a 400.
+/// counted). A bad slug is a 400. A customer assignment the local host
+/// cannot read marks it `offline` with that reason — this endpoint's per-host
+/// contract — where `/api/dashboard` under a filter fails the request.
 async fn get_usage(
     State(s): State<AppState>,
     Query(q): Query<UsageQuery>,

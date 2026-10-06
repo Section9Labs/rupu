@@ -212,6 +212,12 @@ struct TranscriptListRow {
     status: String,
     total_tokens: u64,
     started_at: String,
+    /// The customer the run is attributed to: the one its `run_start`
+    /// recorded, else (`customer_derived`) its workspace's current
+    /// assignment. Always serialized (`null` = no customer) so a coordinator
+    /// listing this host over SSH can tell "no customer" from an older rupu.
+    customer: Option<String>,
+    customer_derived: bool,
 }
 
 #[derive(Serialize)]
@@ -1788,6 +1794,7 @@ async fn list(
         status: RunStatus,
         total_tokens: u64,
         started_at: chrono::DateTime<chrono::Utc>,
+        customer: rupu_cp::customers::Attribution,
     }
 
     // Pass 1 — sort keys only.
@@ -1811,10 +1818,10 @@ async fn list(
     // transcripts and netflow ledgers under the same `run_<ulid>.jsonl`
     // naming; those are skipped quietly here, and only a genuine read
     // failure (permissions, a bad mount) is worth an operator's attention.
-    let mut heads: Vec<(TranscriptScope, &PathBuf, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    let mut heads: Vec<(TranscriptScope, &PathBuf, rupu_transcript::RunHead)> = Vec::new();
     for (scope, path) in &paths_to_scan {
         match JsonlReader::head(path) {
-            Ok(head) => heads.push((*scope, path, head.started_at)),
+            Ok(head) => heads.push((*scope, path, head)),
             Err(rupu_transcript::ReadError::NotAnAgentTranscript { first_tag }) => {
                 tracing::debug!(
                     path = %path.display(),
@@ -1830,14 +1837,24 @@ async fn list(
     let total_matched = heads.len();
 
     // Sort newest first, then keep only what will actually be rendered.
-    heads.sort_by_key(|(_, _, started_at)| Reverse(*started_at));
+    heads.sort_by_key(|(_, _, head)| Reverse(head.started_at));
     heads.truncate(limit);
+
+    // Each row's customer: recorded on `run_start`, else its workspace's
+    // current assignment (derived). An assignment that cannot be read fails
+    // the command rather than report "no customer".
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
 
     // Pass 2 — full summaries, for the surviving rows only.
     let mut rows: Vec<Row> = Vec::new();
-    for (scope, path, _) in &heads {
+    for (scope, path, head) in &heads {
+        let customer = customers
+            .attribute(head.customer.as_deref(), &head.workspace_id)
+            .map_err(|e| anyhow::anyhow!(e.1))?;
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
+                customer,
                 run_id: s.run_id,
                 codename: s.codename,
                 scope: *scope,
@@ -1894,6 +1911,8 @@ async fn list(
             },
             total_tokens: row.total_tokens,
             started_at: row.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            customer: row.customer.slug.clone(),
+            customer_derived: row.customer.derived,
         })
         .collect();
     let csv_rows: Vec<TranscriptListCsvRow> = report_rows
@@ -2943,7 +2962,32 @@ mod tests {
             status: status.to_string(),
             total_tokens: 1_200,
             started_at: started_at.to_string(),
+            customer: None,
+            customer_derived: false,
         }
+    }
+
+    /// `--format json` rows always carry `customer` (`null` = none) and
+    /// `customer_derived` — what an SSH coordinator filters by.
+    #[test]
+    fn transcript_list_json_rows_carry_the_customer_keys() {
+        let mut row = transcript_row_for_test(
+            "run_1",
+            "active",
+            None,
+            "reviewer",
+            "completed",
+            "2026-07-30 13:00:00",
+        );
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.as_object().unwrap().contains_key("customer"));
+        assert!(v["customer"].is_null());
+        assert_eq!(v["customer_derived"], false);
+        row.customer = Some("acme".into());
+        row.customer_derived = true;
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["customer"], "acme");
+        assert_eq!(v["customer_derived"], true);
     }
 
     #[test]
