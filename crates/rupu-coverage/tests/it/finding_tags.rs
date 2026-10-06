@@ -1,11 +1,11 @@
 //! `ledger::tags::apply`: the one writer of a workspace's finding-tag log.
 
 use chrono::Utc;
-use rupu_coverage::ledger::tags::{apply, TagChange, TagError, TagOutcome};
+use rupu_coverage::ledger::tags::{apply, ingest_tag_events, TagChange, TagError, TagOutcome};
 use rupu_coverage::{
     append_record, parse_tags, read_tag_events, read_workspace_findings, Attribution,
     CoveragePaths, FindingEvidence, FindingProfile, FindingRecord, FindingScope, Ledger,
-    OperatorSurface, RunStream, Severity, Surface, Tag, TagActor, TagLog,
+    OperatorSurface, RunStream, Severity, Surface, Tag, TagActor, TagEvent, TagLog, TagOp,
 };
 use std::path::Path;
 
@@ -267,4 +267,42 @@ fn concurrent_writers_lose_no_events() {
         .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()));
     assert_eq!(tags_of(&root, "fnd_a"), ["w0-19"]);
     assert_eq!(tags_of(&root, "fnd_b"), ["w1-19"]);
+}
+
+#[test]
+fn a_finding_already_over_the_cap_can_still_shrink_but_never_grow() {
+    let ws = tempfile::TempDir::new().unwrap();
+    seed(ws.path());
+    let log = TagLog::for_workspace(ws.path());
+    // Two remote units, each within the cap, push fnd_a to 34 on the coordinator.
+    let events: Vec<TagEvent> = (0..34)
+        .map(|i| TagEvent {
+            id: format!("tge_seed{i}"),
+            finding_id: "fnd_a".into(),
+            op: TagOp::Add,
+            tag: Tag::parse(&format!("t{i}")).unwrap(),
+            by: by(),
+            at: Utc::now(),
+        })
+        .collect();
+    assert_eq!(ingest_tag_events(&log, events).unwrap(), (34, 0));
+    assert_eq!(tags_of(ws.path(), "fnd_a").len(), 34);
+
+    // An add that grows it past the cap is refused.
+    let err = apply(&log, &change(&["fnd_a"], &["one-more"], &[]), &by()).unwrap_err();
+    assert!(
+        matches!(err, TagError::TooManyTags { count: 35, .. }),
+        "{err}"
+    );
+
+    // A change that keeps the count (remove 1, add 1) is allowed.
+    let out = apply(&log, &change(&["fnd_a"], &["swapped"], &["t0"]), &by()).unwrap();
+    assert_eq!(out[0].after.len(), 34);
+    assert_eq!(tags_of(ws.path(), "fnd_a").len(), 34);
+
+    // A remove-only change lowers it.
+    let out = apply(&log, &change(&["fnd_a"], &[], &["t1", "t2"]), &by()).unwrap();
+    assert_eq!(out[0].before.len(), 34);
+    assert_eq!(out[0].after.len(), 32);
+    assert_eq!(tags_of(ws.path(), "fnd_a").len(), 32);
 }

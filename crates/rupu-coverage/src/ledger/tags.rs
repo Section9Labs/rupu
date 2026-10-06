@@ -351,8 +351,10 @@ pub enum TagError {
 /// tag events (spec "Write path").
 ///
 /// Under the log's sidecar lock: read every target's declared findings and
-/// the log, fold, refuse the whole batch if any id is unknown or a finding
-/// would exceed [`MAX_TAGS_PER_FINDING`], then append only the events that
+/// the log, fold, refuse the whole batch if any id is unknown or the change
+/// would take a finding past [`MAX_TAGS_PER_FINDING`] (a finding already
+/// over it, say after two remote units' events were ingested, can still be
+/// changed so long as its tag count does not grow), then append only the events that
 /// change something (so a repeated request writes nothing) in one write,
 /// fsynced, and mirror them to the log's run stream. Findings are read
 /// without their own lock: their ledger is append-only and an import swaps
@@ -406,7 +408,7 @@ pub fn apply(log: &TagLog, change: &TagChange, by: &TagActor) -> Result<Vec<TagO
                     events.push(new_event(id, TagOp::Add, t, by, at));
                 }
             }
-            if after.len() > MAX_TAGS_PER_FINDING {
+            if after.len() > MAX_TAGS_PER_FINDING && after.len() > before.len() {
                 return Err(TagError::TooManyTags {
                     finding_id: id.clone(),
                     count: after.len(),
