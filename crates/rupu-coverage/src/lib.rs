@@ -51,12 +51,12 @@ pub use diff::generate::{list_runs, run_diff, DiffError, RunSelector};
 pub use diff::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
 pub use ledger::{
     append_manifest, append_record, discover_targets, file_views, find_manifest,
-    ingest_unit_stream, read_concern_assertions, read_file_events, read_findings, read_manifests,
-    stream_catalog, stream_path, target_id, write_stream_begin, AssertionStatus, Attribution,
-    ConcernAssertion, CoveragePaths, CoverageWriter, CoverageWriterHandle, DiscoveredTarget,
-    Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope, IngestError,
-    IngestReport, IngestSource, Ledger, RunManifest, RunStream, StreamLine, Surface, STREAM_FILE,
-    STREAM_VERSION,
+    ingest_unit_stream, parse_tags, read_concern_assertions, read_file_events, read_findings,
+    read_manifests, stream_catalog, stream_path, target_id, write_stream_begin, AssertionStatus,
+    Attribution, ConcernAssertion, CoveragePaths, CoverageWriter, CoverageWriterHandle,
+    DiscoveredTarget, Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord,
+    FindingScope, IngestError, IngestReport, IngestSource, Ledger, RunManifest, RunStream,
+    StreamLine, Surface, Tag, TagParseError, MAX_TAGS_PER_FINDING, STREAM_FILE, STREAM_VERSION,
 };
 pub use report::{
     Classification, DisasmLine, EvidenceBlock, FindingProfile, FindingReport, FindingWriteOptions,

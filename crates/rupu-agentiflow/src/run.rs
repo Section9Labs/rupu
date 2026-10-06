@@ -866,6 +866,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         };
         append_record(&pooled_paths(fx, id), Ledger::Findings, &rec).unwrap();
     }
@@ -1579,6 +1580,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         }
     }
 

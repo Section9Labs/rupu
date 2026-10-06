@@ -464,6 +464,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: crate::report::FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         }
     }
 

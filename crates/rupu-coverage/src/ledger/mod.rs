@@ -4,6 +4,7 @@ pub mod ingest;
 pub mod manifest;
 pub mod paths;
 pub mod stream;
+pub mod tags;
 pub mod target_id;
 pub mod views;
 pub mod writer;
@@ -19,6 +20,7 @@ pub use stream::{
     append_record, stream_catalog, stream_path, write_stream_begin, Ledger, RunStream, StreamLine,
     STREAM_FILE, STREAM_VERSION,
 };
+pub use tags::{parse_tags, Tag, TagParseError, MAX_TAGS_PER_FINDING};
 pub use target_id::target_id;
 pub use views::{file_views, read_concern_assertions, read_file_events, read_findings, FileView};
 pub use writer::{CoverageWriter, CoverageWriterHandle};

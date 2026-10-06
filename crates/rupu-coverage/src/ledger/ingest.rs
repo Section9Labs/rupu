@@ -293,6 +293,7 @@ mod tests {
                 crate::report::FindingProfile::Summary
             },
             report,
+            tags: Vec::new(),
         }
     }
 

@@ -268,6 +268,11 @@ pub struct FindingRecord {
     /// docs), which loads with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<crate::report::FindingReport>,
+    /// Tags the finding was declared with. Its effective tags also fold in
+    /// its workspace's tag log (`ledger::tags`); `read_findings` returns
+    /// them folded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<crate::ledger::tags::Tag>,
 }
 
 /// Deserialization shape of [`FindingRecord`]: identical except that
@@ -295,6 +300,8 @@ struct FindingRecordWire {
     profile: crate::report::FindingProfile,
     #[serde(default)]
     report: Option<serde_json::Value>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 impl From<FindingRecordWire> for FindingRecord {
@@ -314,6 +321,7 @@ impl From<FindingRecordWire> for FindingRecord {
                 }
             },
         };
+        let tags = lenient_tags(&w.id, w.tags);
         Self {
             id: w.id,
             file_path: w.file_path,
@@ -328,8 +336,29 @@ impl From<FindingRecordWire> for FindingRecord {
             declared_at: w.declared_at,
             profile: w.profile,
             report,
+            tags,
         }
     }
+}
+
+/// Declared tags as read from a ledger line: a tag this build cannot read
+/// (a newer writer's syntax, a hand edit) is dropped with a warning naming
+/// the finding, never the whole line. Deduped and sorted.
+fn lenient_tags(finding_id: &str, raw: Vec<String>) -> Vec<crate::ledger::tags::Tag> {
+    let mut set = std::collections::BTreeSet::new();
+    for r in raw {
+        match crate::ledger::tags::Tag::parse(&r) {
+            Ok(t) => {
+                set.insert(t);
+            }
+            Err(e) => tracing::warn!(
+                finding_id = %finding_id,
+                error = %e,
+                "dropping a finding tag this rupu version cannot read"
+            ),
+        }
+    }
+    set.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -448,6 +477,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: crate::report::FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         };
         let json = serde_json::to_string(&record).unwrap();
         let decoded: FindingRecord = serde_json::from_str(&json).unwrap();
@@ -528,9 +558,47 @@ mod tests {
             declared_at: Utc::now(),
             profile: crate::report::FindingProfile::Full,
             report: Some(report),
+            tags: Vec::new(),
         };
         let back: FindingRecord =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
         assert_eq!(back, rec);
+    }
+
+    /// A minimal finding line; `extra` is spliced in before the closing brace.
+    fn finding_line(extra: &str) -> String {
+        format!(
+            "{{\"id\":\"fnd_1\",\"scope\":\"repo\",\"summary\":\"s\",\"severity\":\"low\",\
+             \"evidence\":{{\"rationale\":\"r\"}},\
+             \"declared_by\":{{\"run_id\":\"r\",\"model\":\"m\",\"surface\":\"workflow\"}},\
+             \"declared_at\":\"2026-10-06T00:00:00Z\"{extra}}}"
+        )
+    }
+
+    #[test]
+    fn a_line_without_tags_reads_with_none_and_writes_none() {
+        let rec: FindingRecord = serde_json::from_str(&finding_line("")).unwrap();
+        assert!(rec.tags.is_empty());
+        let back = serde_json::to_string(&rec).unwrap();
+        assert!(!back.contains("\"tags\""), "{back}");
+    }
+
+    #[test]
+    fn declared_tags_round_trip_deduped_and_sorted() {
+        let rec: FindingRecord =
+            serde_json::from_str(&finding_line(",\"tags\":[\"b\",\"a\",\"b\"]")).unwrap();
+        let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
+        assert_eq!(tags, ["a", "b"]);
+        let again: FindingRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(again, rec);
+    }
+
+    #[test]
+    fn an_unreadable_tag_drops_the_tag_not_the_finding() {
+        let rec: FindingRecord =
+            serde_json::from_str(&finding_line(",\"tags\":[\"ok\",\"not ok\"]")).unwrap();
+        let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
+        assert_eq!(tags, ["ok"]);
     }
 }

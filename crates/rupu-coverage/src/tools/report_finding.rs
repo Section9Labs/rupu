@@ -218,6 +218,7 @@ pub fn report_finding(
         declared_at: Utc::now(),
         profile: opts.profile,
         report,
+        tags: Vec::new(),
     };
     paths.ensure_dir()?;
     // One write per line, under the ledger lock, then the run stream — see

@@ -438,6 +438,7 @@ mod tests {
                     declared_at: ts(),
                     profile: FindingProfile::Summary,
                     report: None,
+                    tags: Vec::new(),
                 },
             },
         }

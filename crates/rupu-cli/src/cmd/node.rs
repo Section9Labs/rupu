@@ -3192,6 +3192,7 @@ mod tests {
             declared_at: chrono::Utc::now(),
             profile: rupu_coverage::FindingProfile::Full,
             report: Some(report),
+            tags: Vec::new(),
         };
         serde_json::to_string(&rupu_coverage::StreamLine::Findings {
             scope_name: "sec".into(),

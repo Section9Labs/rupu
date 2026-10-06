@@ -47,6 +47,7 @@ pub fn full_record(id: &str, sev: Severity, report: FindingReport) -> FindingRec
         declared_at: ts("2026-03-01T10:00:00Z"),
         profile: FindingProfile::Full,
         report: Some(report),
+        tags: Vec::new(),
     }
 }
 
@@ -79,6 +80,7 @@ pub fn summary_record(id: &str, sev: Severity) -> FindingRecord {
         declared_at: ts("2026-03-02T10:00:00Z"),
         profile: FindingProfile::Summary,
         report: None,
+        tags: Vec::new(),
     }
 }
 

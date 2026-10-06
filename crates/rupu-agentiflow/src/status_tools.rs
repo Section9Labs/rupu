@@ -403,6 +403,7 @@ mod tests {
             declared_at: Utc::now(),
             profile: FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         };
         append_record(paths, Ledger::Findings, &rec).unwrap();
     }
