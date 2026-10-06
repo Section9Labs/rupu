@@ -171,7 +171,8 @@ pub fn new_run_id() -> String {
 }
 
 /// The caller-resolved lead: which agent, with which prompt / provider /
-/// model / tools. (Plan 4 wires the real resolver; tests hand in a mock.)
+/// model / tools. (`rupu agentiflow run` resolves it from the lead's agent file
+/// and the layered config -- Plan 4-1; tests hand in a mock.)
 pub struct LeadInputs {
     pub agent_name: String,
     pub system_prompt: String,
@@ -203,14 +204,16 @@ pub struct RunAgentiflowOpts {
     pub run_id: String,
     /// How the lead's `dispatch` tool starts units. `None` is production: a
     /// [`SubprocessUnitLauncher`] over the running `rupu` binary, so each unit
-    /// is a detached, process-isolated `rupu run`. A caller (a test, or the
-    /// Plan-4 daemon with its own launcher) injects an implementation here.
+    /// is a detached, process-isolated `rupu run`. A caller (a test, or a
+    /// daemon with its own launcher) injects an implementation here.
     pub unit_launcher: Option<Arc<dyn UnitLauncher>>,
     /// The lead's workflow-authoring capability: which provider/model writes a
     /// new workflow and a factory minting a provider for each generation call.
-    /// Built by the launch site exactly as `make_provider` is (wired for real in
-    /// Plan 4; tests inject a mock). `None` disables `generate_workflow`
-    /// entirely: the lead is not even offered the tool.
+    /// Built by the launch site exactly as `make_provider` is (`rupu agentiflow
+    /// run` builds both, Plan 4-1; tests inject a mock). `None` disables
+    /// `generate_workflow` entirely: the lead is not even offered the tool --
+    /// the CLI passes `None` when the generating provider has no credential or
+    /// cannot be built synchronously (Anthropic OAuth).
     pub generation: Option<crate::lead::GenerationCapability>,
 }
 
