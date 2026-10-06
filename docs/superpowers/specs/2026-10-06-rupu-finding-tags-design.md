@@ -222,7 +222,7 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
 
 ## Plans
 
-1. **Plan 1: core, CLI, agent and MCP tools.**
+1. **Plan 1 (complete): core, CLI, agent and MCP tools** — `docs/superpowers/plans/2026-10-06-rupu-finding-tags-plan-1-core-cli-agent.md`.
    - `Tag`, the record field, the tag log, `apply`, fold, query, tags-in-use, the stream line kind, ingest.
    - `rupu_cp::api::findings::tag_findings_across`, a library function the CLI uses; it gets no HTTP route until Plan 2.
    - The `report_finding` / `findings.record` `tags` input.
