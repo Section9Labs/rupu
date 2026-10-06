@@ -35,6 +35,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_BUDGET_MB: u64 = 256;
 
@@ -157,14 +158,26 @@ struct Entry {
     unreadable: bool,
     summary: Arc<LedgerSummary>,
     resident: Option<Resident>,
+    /// Taken out of the map (set under this entry's lock). A removed entry
+    /// never admits rows or records state: a reader that fetched it just
+    /// before removal answers directly from the file instead, so no bytes
+    /// are ever accounted to an entry `enforce_budget` can no longer reach.
+    removed: bool,
 }
+
+/// The entry a reader fetched was removed from the map in the meantime.
+struct Removed;
 
 pub struct NetflowIndex {
     entries: Mutex<HashMap<PathBuf, Arc<Mutex<Entry>>>>,
     resident_bytes: AtomicU64,
     budget_bytes: AtomicU64,
     evictions: AtomicU64,
+    last_sweep: Mutex<Option<Instant>>,
 }
+
+/// How often `sweep_missing` may actually stat every indexed path.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 fn inode(meta: &std::fs::Metadata) -> u64 {
@@ -184,14 +197,33 @@ impl NetflowIndex {
             resident_bytes: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(budget_bytes),
             evictions: AtomicU64::new(0),
+            last_sweep: Mutex::new(None),
         }
     }
 
     /// Tier 1 for one ledger, refreshed; `None` when the file is gone.
     pub fn summary(&self, path: &Path) -> Option<Arc<LedgerSummary>> {
-        let entry = self.entry(path);
+        // An entry removed between fetching it and locking it is replaced in
+        // the map by a fresh one: re-fetch once, then give up (None).
+        for _ in 0..2 {
+            let entry = self.entry(path);
+            if let Ok(out) = self.summary_in(&entry, path) {
+                return out;
+            }
+        }
+        None
+    }
+
+    fn summary_in(
+        &self,
+        entry: &Arc<Mutex<Entry>>,
+        path: &Path,
+    ) -> Result<Option<Arc<LedgerSummary>>, Removed> {
         let out = {
             let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+            if e.removed {
+                return Err(Removed);
+            }
             match self.refresh(&mut e, path) {
                 Refresh::Gone => None,
                 // Unreadable right now: serve the last consistent tier 1
@@ -204,7 +236,7 @@ impl NetflowIndex {
             self.remove(path);
         }
         self.enforce_budget();
-        out
+        Ok(out)
     }
 
     fn entry(&self, path: &Path) -> Arc<Mutex<Entry>> {
@@ -219,9 +251,16 @@ impl NetflowIndex {
             .unwrap_or_else(|p| p.into_inner())
             .remove(path);
         if let Some(entry) = removed {
-            let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
-            self.drop_resident(&mut e);
+            self.retire(&entry);
         }
+    }
+
+    /// Mark a map-removed entry and release its rows (blocking on its lock;
+    /// call without the map lock held).
+    fn retire(&self, entry: &Arc<Mutex<Entry>>) {
+        let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+        e.removed = true;
+        self.drop_resident(&mut e);
     }
 
     fn drop_resident(&self, e: &mut Entry) {
@@ -432,19 +471,40 @@ impl NetflowIndex {
         st
     }
 
-    /// Forget every entry whose path is not in `keep` (called with the full
-    /// global listing, so pruned or unregistered ledgers do not linger).
-    /// Entries that never loaded are dropped by the same rule.
-    pub fn retain_only(&self, keep: &std::collections::HashSet<PathBuf>) {
+    /// Forget entries whose ledger no longer exists, at most once per
+    /// [`SWEEP_EVERY`] (cheap to call on every request).
+    pub fn sweep_missing(&self) {
+        {
+            let mut last = self.last_sweep.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        self.sweep_missing_now();
+    }
+
+    /// [`sweep_missing`](Self::sweep_missing) without the throttle.
+    pub fn sweep_missing_now(&self) {
+        // Stat without the map lock: a slow filesystem must not stall readers.
+        let paths: Vec<PathBuf> = {
+            let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+            map.keys().cloned().collect()
+        };
+        let missing: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| std::fs::symlink_metadata(p).is_err())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
         let dropped: Vec<Arc<Mutex<Entry>>> = {
             let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-            let gone: Vec<PathBuf> = map.keys().filter(|p| !keep.contains(*p)).cloned().collect();
-            gone.into_iter().filter_map(|p| map.remove(&p)).collect()
+            missing.iter().filter_map(|p| map.remove(p)).collect()
         };
         // Outside the map lock: waiting on an in-flight read is fine here.
         for entry in dropped {
-            let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
-            self.drop_resident(&mut e);
+            self.retire(&entry);
         }
     }
 }
@@ -459,13 +519,19 @@ enum Refresh {
     Failed,
 }
 
-impl LedgerReader for NetflowIndex {
-    /// If the file cannot be read (or its rows re-loaded), this call answers
-    /// with the direct reader's result and caches nothing new.
-    fn flows_in_range(&self, path: &Path, range: &TimeRange) -> (Vec<FlowRecord>, u64) {
-        let entry = self.entry(path);
+impl NetflowIndex {
+    fn flows_in(
+        &self,
+        entry: &Arc<Mutex<Entry>>,
+        path: &Path,
+        range: &TimeRange,
+    ) -> (Vec<FlowRecord>, u64) {
         let out = {
             let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+            if e.removed {
+                // Not in the map any more: answer from the file, cache nothing.
+                return DirectReader.flows_in_range(path, range);
+            }
             match self.refresh(&mut e, path) {
                 Refresh::Gone => None,
                 Refresh::Failed => Some(DirectReader.flows_in_range(path, range)),
@@ -492,10 +558,12 @@ impl LedgerReader for NetflowIndex {
         out
     }
 
-    fn capture_states(&self, path: &Path) -> Vec<CaptureEntry> {
-        let entry = self.entry(path);
+    fn captures_in(&self, entry: &Arc<Mutex<Entry>>, path: &Path) -> Vec<CaptureEntry> {
         let out = {
             let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+            if e.removed {
+                return DirectReader.capture_states(path);
+            }
             match self.refresh(&mut e, path) {
                 Refresh::Gone => None,
                 Refresh::Failed => Some(DirectReader.capture_states(path)),
@@ -508,6 +576,18 @@ impl LedgerReader for NetflowIndex {
         };
         self.enforce_budget();
         out
+    }
+}
+
+impl LedgerReader for NetflowIndex {
+    /// If the file cannot be read (or its rows re-loaded), this call answers
+    /// with the direct reader's result and caches nothing new.
+    fn flows_in_range(&self, path: &Path, range: &TimeRange) -> (Vec<FlowRecord>, u64) {
+        self.flows_in(&self.entry(path), path, range)
+    }
+
+    fn capture_states(&self, path: &Path) -> Vec<CaptureEntry> {
+        self.captures_in(&self.entry(path), path)
     }
 }
 
@@ -768,6 +848,12 @@ mod tests {
         p
     }
 
+    fn is_resident(index: &NetflowIndex, path: &Path) -> bool {
+        let entry = Arc::clone(index.entries.lock().unwrap().get(path).unwrap());
+        let e = entry.lock().unwrap();
+        e.resident.is_some()
+    }
+
     #[test]
     fn over_budget_evicts_the_oldest_files_rows_and_rereads_them_correctly() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -784,8 +870,16 @@ mod tests {
         assert!(st.tier2_bytes <= st.budget_bytes, "{st:?}");
         assert_eq!(st.resident_files, 1);
         assert!(st.evictions_total >= 1);
-        // Evicted rows are re-read on demand and the answer is unchanged.
+        // Oldest first: the file with the older newest flow lost its rows.
+        assert!(is_resident(&index, &new));
+        assert!(!is_resident(&index, &old));
+        // Evicted rows are re-read on demand and the answer is unchanged...
         assert_same(&index, &old, &all());
+        // ...and re-admitting the old file evicts it again, not the newer one.
+        assert!(is_resident(&index, &new));
+        assert!(!is_resident(&index, &old));
+        let st = index.status();
+        assert!(st.tier2_bytes <= st.budget_bytes, "{st:?}");
     }
 
     #[test]
@@ -815,19 +909,86 @@ mod tests {
     }
 
     #[test]
-    fn retain_only_drops_entries_not_listed() {
+    fn sweep_missing_drops_entries_whose_file_is_gone() {
         let tmp = tempfile::TempDir::new().unwrap();
         let a = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 3);
         let b = ledger_with(tmp.path(), "run_b.jsonl", 10, 100, 4);
         let index = NetflowIndex::new(u64::MAX);
         index.summary(&a);
         index.summary(&b);
-        index.retain_only(&std::iter::once(a.clone()).collect());
+        std::fs::remove_file(&b).unwrap();
+        index.sweep_missing_now();
         let st = index.status();
         assert_eq!((st.files, st.flows), (1, 3));
         assert!(st.tier2_bytes > 0);
-        index.retain_only(&std::collections::HashSet::new());
+        std::fs::remove_file(&a).unwrap();
+        index.sweep_missing_now();
         let st = index.status();
         assert_eq!((st.files, st.flows, st.tier2_bytes), (0, 0, 0));
+    }
+
+    #[test]
+    fn sweep_missing_is_throttled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 3);
+        let b = ledger_with(tmp.path(), "run_b.jsonl", 10, 100, 4);
+        let index = NetflowIndex::new(u64::MAX);
+        index.summary(&a);
+        index.summary(&b);
+        index.sweep_missing(); // runs (first call), nothing missing
+        assert_eq!(index.status().files, 2);
+        std::fs::remove_file(&b).unwrap();
+        index.sweep_missing(); // within 60s of the last sweep: skipped
+        assert_eq!(index.status().files, 2);
+        index.sweep_missing_now();
+        assert_eq!(index.status().files, 1);
+    }
+
+    #[test]
+    fn a_reader_holding_a_removed_entry_answers_directly_and_leaks_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 5);
+        let index = NetflowIndex::new(u64::MAX);
+
+        // Via `remove`: the reader fetched the entry first, then it is removed.
+        let held = index.entry(&p);
+        index.remove(&p);
+        assert_eq!(
+            index.flows_in(&held, &p, &all()),
+            DirectReader.flows_in_range(&p, &all())
+        );
+        assert_eq!(
+            index.captures_in(&held, &p),
+            DirectReader.capture_states(&p)
+        );
+        assert!(index.summary_in(&held, &p).is_err());
+        assert_eq!(index.status().tier2_bytes, 0);
+        assert_eq!(index.resident_bytes.load(Ordering::Relaxed), 0);
+
+        // Via the sweep.
+        index.summary(&p);
+        let held = Arc::clone(index.entries.lock().unwrap().get(&p).unwrap());
+        let gone = tmp.path().join("run_gone.jsonl");
+        let held_gone = index.entry(&gone);
+        append(&gone, &line(&LedgerLine::Flow(Box::new(flow(1, 1)))));
+        std::fs::remove_file(&gone).unwrap();
+        index.sweep_missing_now();
+        // The file reappears before the stale reader locks its entry.
+        append(&gone, &line(&LedgerLine::Flow(Box::new(flow(1, 1)))));
+        assert_eq!(
+            index.flows_in(&held_gone, &gone, &all()),
+            DirectReader.flows_in_range(&gone, &all())
+        );
+        assert_eq!(
+            index.resident_bytes.load(Ordering::Relaxed),
+            index.status().tier2_bytes
+        );
+        // The live entry is untouched.
+        assert!(!held.lock().unwrap().removed);
+
+        // A public summary() after removal rebuilds a fresh entry.
+        index.remove(&p);
+        assert_eq!(index.summary(&p).unwrap().flow_count, 5);
+        assert_eq!(index.status().files, 1);
     }
 }
