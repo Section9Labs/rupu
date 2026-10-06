@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use rupu_codename::{crew_for, crew_tint};
-use rupu_config::{LayerPaths, PricingConfig};
-use rupu_workspace::{validate_slug, Customer, CustomerStore};
+use rupu_config::{KeySource, LayerPaths, LockOwner, PricingConfig};
+use rupu_workspace::{validate_slug, Customer, CustomerError, CustomerStore};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -128,32 +128,39 @@ pub struct Attribution {
 }
 
 /// Recorded customer, else the workspace's current assignment (`derived`),
-/// else none. A workspace id the store rejects reads as "unknown", never an
-/// error: an odd legacy id must not fail a listing.
-pub fn attribute(store: &CustomerStore, recorded: Option<&str>, workspace_id: &str) -> Attribution {
+/// else none. A workspace id the store rejects (a malformed legacy id) reads
+/// as unassigned: nothing can be assigned under it. Any other failure to
+/// read the assignment — an unreadable sidecar, say — is a 500 naming the
+/// workspace: callers fail the request rather than count the work as having
+/// no customer.
+pub fn attribute(
+    store: &CustomerStore,
+    recorded: Option<&str>,
+    workspace_id: &str,
+) -> Result<Attribution, ApiError> {
     if let Some(slug) = recorded {
-        return Attribution {
+        return Ok(Attribution {
             slug: Some(slug.to_string()),
             derived: false,
-        };
+        });
     }
-    match store.customer_of(workspace_id) {
-        Ok(Some(slug)) => Attribution {
-            slug: Some(slug),
-            derived: true,
-        },
-        Ok(None) => Attribution {
-            slug: None,
-            derived: false,
-        },
-        Err(e) => {
-            tracing::debug!(workspace_id, error = %e, "customer attribution unavailable");
-            Attribution {
-                slug: None,
-                derived: false,
-            }
-        }
-    }
+    let slug = match store.customer_of(workspace_id) {
+        Ok(slug) => slug,
+        Err(CustomerError::InvalidWsId(_)) => None,
+        Err(e) => return Err(assignment_error(workspace_id, &e)),
+    };
+    Ok(Attribution {
+        derived: slug.is_some(),
+        slug,
+    })
+}
+
+/// The 500 for an assignment that cannot be read, naming the workspace.
+fn assignment_error(ws_id: &str, e: &CustomerError) -> ApiError {
+    ApiError::internal(format!(
+        "the customer assignment of workspace {ws_id} cannot be read: {e}; \
+         repair or remove `workspaces/{ws_id}.customer` under the rupu home"
+    ))
 }
 
 /// A per-request memo over a [`CustomerStore`]: each workspace's current
@@ -179,30 +186,35 @@ impl CustomerLookup {
         &self.store
     }
 
-    /// `ws_id`'s current assignment, as [`attribute`] reads it (a workspace
-    /// id the store rejects reads as unassigned).
-    pub fn assigned(&mut self, ws_id: &str) -> Option<String> {
+    /// `ws_id`'s current assignment, as [`attribute`] reads it. An
+    /// assignment that cannot be read fails the request (500 naming the
+    /// workspace).
+    pub fn assigned(&mut self, ws_id: &str) -> Result<Option<String>, ApiError> {
         if let Some(hit) = self.assignments.get(ws_id) {
-            return hit.clone();
+            return Ok(hit.clone());
         }
-        let slug = attribute(&self.store, None, ws_id).slug;
+        let slug = attribute(&self.store, None, ws_id)?.slug;
         self.assignments.insert(ws_id.to_string(), slug.clone());
-        slug
+        Ok(slug)
     }
 
     /// [`attribute`], memoized per workspace id.
-    pub fn attribute(&mut self, recorded: Option<&str>, workspace_id: &str) -> Attribution {
+    pub fn attribute(
+        &mut self,
+        recorded: Option<&str>,
+        workspace_id: &str,
+    ) -> Result<Attribution, ApiError> {
         if let Some(slug) = recorded {
-            return Attribution {
+            return Ok(Attribution {
                 slug: Some(slug.to_string()),
                 derived: false,
-            };
+            });
         }
-        let slug = self.assigned(workspace_id);
-        Attribution {
+        let slug = self.assigned(workspace_id)?;
+        Ok(Attribution {
             derived: slug.is_some(),
             slug,
-        }
+        })
     }
 
     /// The row reference for `slug`. A slug whose customer record is gone or
@@ -229,10 +241,19 @@ impl CustomerLookup {
     }
 
     /// The customer a project is currently assigned to, as a row reference.
-    pub fn project_customer(&mut self, ws_id: &str) -> Option<CustomerRef> {
-        let slug = self.assigned(ws_id)?;
-        Some(self.customer_ref(&slug))
+    pub fn project_customer(&mut self, ws_id: &str) -> Result<Option<CustomerRef>, ApiError> {
+        Ok(self.assigned(ws_id)?.map(|slug| self.customer_ref(&slug)))
     }
+}
+
+/// The provider account a customer's runs default to.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DefaultAccount {
+    pub account: String,
+    pub locked_by: Option<LockOwner>,
+    /// `true` when the value comes from the global config, not the
+    /// customer's layer.
+    pub inherited: bool,
 }
 
 /// `(global config.toml mtime, customer config.toml mtime)`; `None` = absent.
@@ -242,9 +263,19 @@ fn mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Pricing for a customer's runs: global + that customer's layer, resolved
-/// with `rupu_config::resolve` (locks honoured), cached per slug and
-/// re-validated by the mtimes of the global and customer `config.toml`.
+/// What one resolve of global + a customer's layer yields.
+#[derive(Clone)]
+struct CustomerLayer {
+    pricing: PricingConfig,
+    /// `Err` = the layers do not resolve (the message says why).
+    default_account: Result<Option<DefaultAccount>, String>,
+}
+
+/// A customer's resolved config (global + that customer's layer, resolved
+/// with `rupu_config::resolve`, locks honoured): its pricing — what its runs
+/// are priced with — and its default account. Cached per slug and
+/// re-validated by the mtimes of the global and customer `config.toml`, so
+/// the files are read once per change, not once per request or customer.
 ///
 /// The no-customer baseline follows the same rule: the global file is
 /// re-resolved (global layer only) when its mtime moves, so a global pricing
@@ -255,7 +286,7 @@ pub struct CustomerPricing {
     startup: PricingConfig,
     store: CustomerStore,
     baseline: Mutex<Option<(Option<SystemTime>, PricingConfig)>>,
-    cache: Mutex<HashMap<String, (Stamps, PricingConfig)>>,
+    cache: Mutex<HashMap<String, (Stamps, CustomerLayer)>>,
 }
 
 impl CustomerPricing {
@@ -295,6 +326,62 @@ impl CustomerPricing {
         pricing
     }
 
+    /// `slug`'s resolved layer (valid slug only), from the cache when the
+    /// files are unchanged.
+    fn layer(&self, slug: &str) -> CustomerLayer {
+        let global_path = self.global_dir.join("config.toml");
+        let customer_path = self.store.config_path(slug);
+        let stamps: Stamps = (mtime(&global_path), mtime(&customer_path));
+
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((cached, layer)) = cache.get(slug) {
+                if *cached == stamps {
+                    return layer.clone();
+                }
+            }
+        }
+        let layer = match rupu_config::resolve(LayerPaths::new(
+            Some(&global_path),
+            Some(&customer_path),
+            None,
+        )) {
+            Ok(r) => {
+                let prov = r.provenance.get("default_provider");
+                let default_account =
+                    r.config
+                        .default_provider
+                        .clone()
+                        .map(|account| DefaultAccount {
+                            account,
+                            locked_by: prov.and_then(|p| p.locked_by),
+                            inherited: prov.is_none_or(|p| p.source != KeySource::Customer),
+                        });
+                CustomerLayer {
+                    pricing: r.config.pricing,
+                    default_account: Ok(default_account),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    customer = slug,
+                    error = %e,
+                    "customer config layer unusable; using global pricing"
+                );
+                CustomerLayer {
+                    pricing: self.global_pricing(),
+                    default_account: Err(e.to_string()),
+                }
+            }
+        };
+        // The fallback is cached too, so a bad layer warns once per change.
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(slug.to_string(), (stamps, layer.clone()));
+        layer
+    }
+
     /// `None` (or an invalid slug) => the global pricing. A customer whose
     /// layer is missing resolves to global pricing; one that is malformed
     /// warns once (until the file changes) and also falls back to global.
@@ -310,39 +397,48 @@ impl CustomerPricing {
             );
             return self.global_pricing();
         }
-        let global_path = self.global_dir.join("config.toml");
-        let customer_path = self.store.config_path(slug);
-        let stamps: Stamps = (mtime(&global_path), mtime(&customer_path));
+        self.layer(slug).pricing
+    }
 
-        {
-            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((cached, pricing)) = cache.get(slug) {
-                if *cached == stamps {
-                    return pricing.clone();
+    /// The customer's default provider account over global + its layer
+    /// (`None` when neither sets one). `Err` = the layers do not resolve,
+    /// with the reason.
+    pub fn default_account(&self, slug: &str) -> Result<Option<DefaultAccount>, String> {
+        validate_slug(slug).map_err(|e| e.to_string())?;
+        self.layer(slug).default_account
+    }
+}
+
+/// One request's pricing per customer: resolved once, then borrowed for
+/// every run and transcript the request prices.
+pub struct PricingMemo<'a> {
+    pricing: &'a CustomerPricing,
+    none: Option<PricingConfig>,
+    by_slug: HashMap<String, PricingConfig>,
+}
+
+impl<'a> PricingMemo<'a> {
+    pub fn new(pricing: &'a CustomerPricing) -> Self {
+        Self {
+            pricing,
+            none: None,
+            by_slug: HashMap::new(),
+        }
+    }
+
+    /// The pricing for work attributed to `slug` (`None` = no customer).
+    pub fn get(&mut self, slug: Option<&str>) -> &PricingConfig {
+        let pricing = self.pricing;
+        match slug {
+            None => self.none.get_or_insert_with(|| pricing.for_customer(None)),
+            Some(s) => {
+                if !self.by_slug.contains_key(s) {
+                    self.by_slug
+                        .insert(s.to_string(), pricing.for_customer(Some(s)));
                 }
+                &self.by_slug[s]
             }
         }
-        let pricing = match rupu_config::resolve(LayerPaths::new(
-            Some(&global_path),
-            Some(&customer_path),
-            None,
-        )) {
-            Ok(r) => r.config.pricing,
-            Err(e) => {
-                tracing::warn!(
-                    customer = slug,
-                    error = %e,
-                    "customer pricing layer unusable; using global pricing"
-                );
-                self.global_pricing()
-            }
-        };
-        // The fallback is cached too, so a bad layer warns once per change.
-        self.cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(slug.to_string(), (stamps, pricing.clone()));
-        pricing
     }
 }
 
@@ -443,17 +539,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = assigned_store(tmp.path());
 
-        let a = attribute(&store, Some("zed"), "ws_assigned");
+        let a = attribute(&store, Some("zed"), "ws_assigned").unwrap();
         assert_eq!((a.slug.as_deref(), a.derived), (Some("zed"), false));
 
-        let a = attribute(&store, None, "ws_assigned");
+        let a = attribute(&store, None, "ws_assigned").unwrap();
         assert_eq!((a.slug.as_deref(), a.derived), (Some("acme"), true));
 
-        let a = attribute(&store, None, "ws_unassigned");
+        let a = attribute(&store, None, "ws_unassigned").unwrap();
         assert_eq!((a.slug, a.derived), (None, false));
 
         // A workspace id the store rejects never fails a listing.
-        let a = attribute(&store, None, "../weird id");
+        let a = attribute(&store, None, "../weird id").unwrap();
         assert_eq!((a.slug, a.derived), (None, false));
     }
 
@@ -470,21 +566,136 @@ mod tests {
             (None, "../weird id"),
         ] {
             assert_eq!(
-                lookup.attribute(recorded, ws),
-                attribute(&store, recorded, ws)
+                lookup.attribute(recorded, ws).unwrap(),
+                attribute(&store, recorded, ws).unwrap()
             );
         }
 
         // Memoized: removing the sidecar does not change this request's view.
         std::fs::remove_file(tmp.path().join("workspaces/ws_assigned.customer")).unwrap();
-        assert_eq!(lookup.assigned("ws_assigned").as_deref(), Some("acme"));
-        assert_eq!(CustomerLookup::new(store).assigned("ws_assigned"), None);
+        assert_eq!(
+            lookup.assigned("ws_assigned").unwrap().as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            CustomerLookup::new(store.clone())
+                .assigned("ws_assigned")
+                .unwrap(),
+            None
+        );
 
-        let r = lookup.project_customer("ws_assigned").unwrap();
+        let r = lookup.project_customer("ws_assigned").unwrap().unwrap();
         assert_eq!((r.slug.as_str(), r.name.as_str()), ("acme", "Acme"));
         // A dangling slug still shows, named by its slug.
         let d = lookup.customer_ref("gone");
         assert_eq!((d.slug.as_str(), d.name.as_str()), ("gone", "gone"));
+    }
+
+    #[test]
+    fn an_unreadable_assignment_is_an_error_not_unassigned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = assigned_store(tmp.path());
+        // A directory where the sidecar file belongs: read fails with an
+        // error other than NotFound.
+        std::fs::create_dir(tmp.path().join("workspaces/ws_broken.customer")).unwrap();
+
+        let err = attribute(&store, None, "ws_broken").unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("ws_broken"), "{}", err.1);
+        // A recorded customer never needs the sidecar.
+        assert_eq!(
+            attribute(&store, Some("acme"), "ws_broken")
+                .unwrap()
+                .slug
+                .as_deref(),
+            Some("acme")
+        );
+        let err = CustomerLookup::new(store)
+            .attribute(None, "ws_broken")
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("ws_broken"), "{}", err.1);
+    }
+
+    #[test]
+    fn default_account_is_resolved_and_cached_with_the_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(
+            home.join("config.toml"),
+            "default_provider = \"anthropic\"\n",
+        )
+        .unwrap();
+        let store = CustomerStore::new(home);
+        for slug in ["acme", "globex"] {
+            store
+                .create(
+                    slug,
+                    &NewCustomer {
+                        name: slug.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            store.config_path("acme"),
+            "default_provider = \"anthropic-acme\"\n[policy]\nlock = [\"default_provider\"]\n",
+        )
+        .unwrap();
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
+        assert_eq!(
+            pricing.default_account("acme").unwrap(),
+            Some(DefaultAccount {
+                account: "anthropic-acme".into(),
+                locked_by: Some(LockOwner::Customer),
+                inherited: false,
+            })
+        );
+        assert_eq!(
+            pricing.default_account("globex").unwrap(),
+            Some(DefaultAccount {
+                account: "anthropic".into(),
+                locked_by: None,
+                inherited: true,
+            })
+        );
+        std::fs::write(store.config_path("globex"), "= = nope").unwrap();
+        set_mtime(
+            &store.config_path("globex"),
+            SystemTime::now() + Duration::from_secs(60),
+        );
+        assert!(pricing.default_account("globex").is_err());
+        assert!(pricing.default_account("Bad Slug").is_err());
+    }
+
+    #[test]
+    fn pricing_memo_resolves_once_per_customer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let store = CustomerStore::new(home);
+        store
+            .create(
+                "acme",
+                &NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        write_layer(&store.config_path("acme"), 7.0);
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
+        let mut memo = PricingMemo::new(&pricing);
+        assert_eq!(price(memo.get(Some("acme"))), Some(7.0));
+        assert_eq!(price(memo.get(None)), None);
+        // The memo holds this request's view even if the layer changes.
+        write_layer(&store.config_path("acme"), 9.0);
+        set_mtime(
+            &store.config_path("acme"),
+            SystemTime::now() + Duration::from_secs(60),
+        );
+        assert_eq!(price(memo.get(Some("acme"))), Some(7.0));
+        assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(9.0));
     }
 
     const GLOBAL_TOML: &str = "";

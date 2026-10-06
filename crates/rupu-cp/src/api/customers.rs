@@ -14,7 +14,7 @@
 //! as the Projects page. `projects` and `findings_open` follow the current
 //! assignment (findings carry no recorded customer, ruling 6).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FsPath;
 
 use axum::{
@@ -25,7 +25,6 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use rupu_config::{KeySource, LayerPaths, LockOwner, PricingConfig};
 use rupu_orchestrator::runs::RunStore;
 use rupu_workspace::{
     Customer, CustomerError, CustomerStore, MetaPatch, NewCustomer, ProjectRef, Workspace,
@@ -34,10 +33,11 @@ use rupu_workspace::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::api::config::require_writable;
+use crate::api::config::require_writable_to;
 use crate::api::projects::{apply_rollup, project_rollups, project_row, ProjectRow};
 use crate::api::runs::blocking;
-use crate::customers::{customer_dto, CustomerDto, CustomerLookup, CustomerPricing};
+pub use crate::customers::DefaultAccount;
+use crate::customers::{customer_dto, CustomerDto, CustomerLookup, PricingMemo};
 use crate::error::{ApiError, ApiResult};
 use crate::host::dashboard_summary::DashboardRange;
 use crate::state::AppState;
@@ -63,16 +63,6 @@ pub struct CustomerRollup {
     /// Findings in the customer's current projects' coverage ledgers.
     pub findings_open: u64,
     pub last_active: Option<String>,
-}
-
-/// The provider account a customer's runs default to.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct DefaultAccount {
-    pub account: String,
-    pub locked_by: Option<LockOwner>,
-    /// `true` when the value comes from the global config, not the
-    /// customer's layer.
-    pub inherited: bool,
 }
 
 #[derive(Serialize)]
@@ -120,6 +110,11 @@ fn api_err(e: CustomerError) -> ApiError {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     ApiError(status, e.to_string())
+}
+
+/// Customer writes need a `cp serve` deployment (501 otherwise).
+fn require_writable(s: &AppState) -> ApiResult<()> {
+    require_writable_to(s, "managing customers")
 }
 
 fn customers(s: &AppState) -> CustomerStore {
@@ -177,37 +172,30 @@ impl Pass {
     }
 
     /// Each customer's current projects (by the memoized assignment).
-    fn projects_by_customer(&mut self) -> BTreeMap<String, Vec<Workspace>> {
+    fn projects_by_customer(&mut self) -> ApiResult<BTreeMap<String, Vec<Workspace>>> {
         let mut out: BTreeMap<String, Vec<Workspace>> = BTreeMap::new();
         for w in &self.workspaces {
-            if let Some(slug) = self.lookup.assigned(&w.id) {
+            if let Some(slug) = self.lookup.assigned(&w.id)? {
                 out.entry(slug).or_default().push(w.clone());
             }
         }
         for list in out.values_mut() {
             list.sort_by(|a, b| a.path.cmp(&b.path));
         }
-        out
+        Ok(out)
     }
 
-    /// Rollups for each slug in `wanted`, over runs started since `since`.
+    /// Rollups for each slug in `wanted`, over runs started since `since`,
+    /// each priced with its customer's pricing.
     fn rollups(
         &mut self,
         wanted: &BTreeSet<String>,
         since: Option<DateTime<Utc>>,
-        pricing: &CustomerPricing,
-    ) -> BTreeMap<String, CustomerRollup> {
+        prices: &mut PricingMemo<'_>,
+    ) -> ApiResult<BTreeMap<String, CustomerRollup>> {
         let in_range = |at: Option<DateTime<Utc>>| match since {
             None => true,
             Some(cut) => at.is_some_and(|t| t >= cut),
-        };
-        // One resolved pricing per customer for the whole request.
-        let mut prices: HashMap<String, PricingConfig> = HashMap::new();
-        let mut price = |slug: &str| -> PricingConfig {
-            prices
-                .entry(slug.to_string())
-                .or_insert_with(|| pricing.for_customer(Some(slug)))
-                .clone()
         };
         let mut rolls: BTreeMap<String, EntityRollup> = BTreeMap::new();
 
@@ -215,15 +203,14 @@ impl Pass {
             if !in_range(Some(run.started_at)) {
                 continue;
             }
-            let Some(slug) = self
+            let who = self
                 .lookup
-                .attribute(run.customer.as_deref(), &run.workspace_id)
-                .slug
-                .filter(|s| wanted.contains(s))
-            else {
+                .attribute(run.customer.as_deref(), &run.workspace_id)?;
+            let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
                 continue;
             };
-            let usage = crate::usage::summarize_run(&self.run_store, &run.id, &price(&slug));
+            let usage =
+                crate::usage::summarize_run(&self.run_store, &run.id, prices.get(Some(&slug)));
             rolls
                 .entry(slug)
                 .or_default()
@@ -234,17 +221,15 @@ impl Pass {
             if !in_range(src.started_at) {
                 continue;
             }
-            let slug = match src.customer.as_deref() {
-                Some(recorded) => Some(recorded.to_string()),
-                None if src.workspace_id.is_empty() => None,
-                None => self.lookup.assigned(&src.workspace_id),
-            };
-            let Some(slug) = slug.filter(|s| wanted.contains(s)) else {
+            let who = self
+                .lookup
+                .attribute(src.customer.as_deref(), &src.workspace_id)?;
+            let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
                 continue;
             };
             let usage = crate::usage::summarize_run_usage(
                 &crate::usage::transcripts_usage(&src.paths),
-                &price(&slug),
+                prices.get(Some(&slug)),
             );
             rolls
                 .entry(slug)
@@ -252,7 +237,7 @@ impl Pass {
                 .add_spend(&usage, src.started_at.map(|t| t.to_rfc3339()));
         }
 
-        let projects = self.projects_by_customer();
+        let projects = self.projects_by_customer()?;
         let assigned: Vec<Workspace> = projects
             .iter()
             .filter(|(slug, _)| wanted.contains(*slug))
@@ -260,7 +245,7 @@ impl Pass {
             .collect();
         let findings = crate::api::findings::count_findings_by_workspace(&assigned);
 
-        wanted
+        Ok(wanted
             .iter()
             .map(|slug| {
                 let roll = rolls.remove(slug).unwrap_or_default();
@@ -277,36 +262,16 @@ impl Pass {
                 };
                 (slug.clone(), rollup)
             })
-            .collect()
+            .collect())
     }
-}
-
-/// The customer's default provider account, resolved over global + its
-/// layer. `Err` = the layers do not resolve (the message names why).
-fn default_account(
-    global_dir: &FsPath,
-    store: &CustomerStore,
-    slug: &str,
-) -> Result<Option<DefaultAccount>, String> {
-    let global = global_dir.join("config.toml");
-    let layer = store.config_path(slug);
-    let resolved = rupu_config::resolve(LayerPaths::new(Some(&global), Some(&layer), None))
-        .map_err(|e| e.to_string())?;
-    let prov = resolved.provenance.get("default_provider");
-    Ok(resolved
-        .config
-        .default_provider
-        .map(|account| DefaultAccount {
-            account,
-            locked_by: prov.and_then(|p| p.locked_by),
-            inherited: prov.is_none_or(|p| p.source != KeySource::Customer),
-        }))
 }
 
 /// `GET /api/customers?archived=1&range=7d|30d|all` — every customer
 /// (archived ones only with `archived=1`) with its rollups over the range
 /// (default `30d`) and its default account. A customer whose config layer
-/// does not resolve is still listed, with `default_account: null`.
+/// does not resolve is still listed, with `default_account: null`. An
+/// assignment that cannot be read fails the listing (500 naming the
+/// workspace), never counts as "no customer".
 async fn list_customers(
     State(s): State<AppState>,
     Query(q): Query<RangeQuery>,
@@ -320,18 +285,18 @@ async fn list_customers(
         let store = CustomerStore::new(global.clone());
         let list = store.list(include_archived).map_err(api_err)?;
         let wanted: BTreeSet<String> = list.iter().map(|c| c.slug.clone()).collect();
+        let mut prices = PricingMemo::new(&pricing);
         let mut pass = Pass::read(&global, run_store);
-        let mut rollups = pass.rollups(&wanted, since, &pricing);
+        let mut rollups = pass.rollups(&wanted, since, &mut prices)?;
         Ok(list
             .iter()
             .map(|c| CustomerRow {
                 customer: customer_dto(c),
                 rollup: rollups.remove(&c.slug).unwrap_or_default(),
-                default_account: default_account(&global, &store, &c.slug)
-                    .unwrap_or_else(|e| {
-                        tracing::debug!(customer = %c.slug, error = %e, "customer config does not resolve");
-                        None
-                    }),
+                default_account: pricing.default_account(&c.slug).unwrap_or_else(|e| {
+                    tracing::debug!(customer = %c.slug, error = %e, "customer config does not resolve");
+                    None
+                }),
             })
             .collect())
     })
@@ -340,7 +305,8 @@ async fn list_customers(
 }
 
 /// `GET /api/customers/:slug?range=` — one customer (archived included):
-/// its rollups over the range, its current projects, its default account
+/// its rollups over the range, its current projects (with the Projects
+/// page's all-time rollups, priced per run's customer), its default account
 /// and, when its config layer does not resolve, why.
 async fn get_customer(
     State(s): State<AppState>,
@@ -350,38 +316,40 @@ async fn get_customer(
     let since = q.range()?.since(Utc::now());
     let global = s.global_dir.clone();
     let run_store = std::sync::Arc::clone(&s.run_store);
-    let customer_pricing = std::sync::Arc::clone(&s.customer_pricing);
-    let pricing = s.pricing.clone();
+    let pricing = std::sync::Arc::clone(&s.customer_pricing);
     let detail = blocking(move || {
         let store = CustomerStore::new(global.clone());
         let c = store.get(&slug).map_err(api_err)?;
+        let mut prices = PricingMemo::new(&pricing);
         let mut pass = Pass::read(&global, run_store);
         let wanted = BTreeSet::from([slug.clone()]);
         let rollup = pass
-            .rollups(&wanted, since, &customer_pricing)
+            .rollups(&wanted, since, &mut prices)?
             .remove(&slug)
             .unwrap_or_default();
         let mine = pass
-            .projects_by_customer()
+            .projects_by_customer()?
             .remove(&slug)
             .unwrap_or_default();
         let ids: BTreeSet<&str> = mine.iter().map(|w| w.id.as_str()).collect();
-        let project_rolls =
-            project_rollups(&pass.run_store, &pass.runs, &pass.extras, &pricing, |w| {
-                ids.contains(w)
-            });
-        let projects = mine
-            .iter()
-            .map(|w| {
-                let mut row = project_row(w);
-                if let Some(roll) = project_rolls.get(&w.id) {
-                    apply_rollup(&mut row, roll);
-                }
-                row.customer = pass.lookup.project_customer(&w.id);
-                row
-            })
-            .collect();
-        let (default_account, layer_error) = match default_account(&global, &store, &slug) {
+        let project_rolls = project_rollups(
+            &pass.run_store,
+            &pass.runs,
+            &pass.extras,
+            &mut prices,
+            &mut pass.lookup,
+            |w| ids.contains(w),
+        )?;
+        let mut projects = Vec::with_capacity(mine.len());
+        for w in &mine {
+            let mut row = project_row(w);
+            if let Some(roll) = project_rolls.get(&w.id) {
+                apply_rollup(&mut row, roll);
+            }
+            row.customer = pass.lookup.project_customer(&w.id)?;
+            projects.push(row);
+        }
+        let (default_account, layer_error) = match pricing.default_account(&slug) {
             Ok(a) => (a, None),
             Err(e) => (None, Some(e)),
         };
@@ -525,7 +493,7 @@ async fn assign_project(
     require_writable(&s)?;
     let global = s.global_dir.clone();
     let run_store = std::sync::Arc::clone(&s.run_store);
-    let pricing = s.pricing.clone();
+    let pricing = std::sync::Arc::clone(&s.customer_pricing);
     let row = blocking(move || {
         let store = CustomerStore::new(global.clone());
         let w = store
@@ -533,12 +501,16 @@ async fn assign_project(
             .map_err(api_err)?;
         let runs = run_store.list().unwrap_or_default();
         let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
-        let rolls = project_rollups(&run_store, &runs, &extras, &pricing, |id| id == w.id);
+        let mut lookup = CustomerLookup::new(store);
+        let mut prices = PricingMemo::new(&pricing);
+        let rolls = project_rollups(&run_store, &runs, &extras, &mut prices, &mut lookup, |id| {
+            id == w.id
+        })?;
         let mut row = project_row(&w);
         if let Some(roll) = rolls.get(&w.id) {
             apply_rollup(&mut row, roll);
         }
-        row.customer = CustomerLookup::new(store).project_customer(&w.id);
+        row.customer = lookup.project_customer(&w.id)?;
         Ok(row)
     })
     .await?;

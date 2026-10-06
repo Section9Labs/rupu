@@ -112,10 +112,16 @@ struct PolicyBody {
 /// serve` deployment" marker every other write-path gate in this crate uses
 /// (see `api/hosts.rs`'s host-add gate).
 pub(crate) fn require_writable(s: &AppState) -> ApiResult<()> {
+    require_writable_to(s, "editing config")
+}
+
+/// [`require_writable`] for another kind of write: the 501 reads
+/// "`<action>` requires `rupu cp serve`".
+pub(crate) fn require_writable_to(s: &AppState, action: &str) -> ApiResult<()> {
     s.launcher
         .as_ref()
         .map(|_| ())
-        .ok_or_else(|| ApiError::not_available("editing config requires `rupu cp serve`"))
+        .ok_or_else(|| ApiError::not_available(format!("{action} requires `rupu cp serve`")))
 }
 
 /// Materialize the write body into candidate TOML text (form patch merged

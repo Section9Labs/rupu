@@ -275,6 +275,15 @@ const MODEL: &str = "claude-rollup-test";
 
 /// A transcript with one `Usage` event: 1M input tokens of `anthropic/MODEL`.
 fn write_transcript(path: &Path, ws: &str, customer: Option<&str>) {
+    write_transcript_at(path, ws, customer, chrono::Utc::now());
+}
+
+fn write_transcript_at(
+    path: &Path,
+    ws: &str,
+    customer: Option<&str>,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let start = rupu_transcript::Event::RunStart {
         run_id: "r".into(),
@@ -282,7 +291,7 @@ fn write_transcript(path: &Path, ws: &str, customer: Option<&str>) {
         agent: "reviewer".into(),
         provider: "anthropic".into(),
         model: MODEL.into(),
-        started_at: chrono::Utc::now(),
+        started_at,
         mode: rupu_transcript::RunMode::Ask,
         schema: None,
         system_prompt: None,
@@ -307,7 +316,12 @@ fn write_transcript(path: &Path, ws: &str, customer: Option<&str>) {
     std::fs::write(path, &buf).unwrap();
 }
 
-fn record(id: &str, ws: &str, customer: Option<&str>) -> RunRecord {
+fn record(
+    id: &str,
+    ws: &str,
+    customer: Option<&str>,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> RunRecord {
     RunRecord {
         customer: customer.map(String::from),
         id: id.into(),
@@ -318,8 +332,8 @@ fn record(id: &str, ws: &str, customer: Option<&str>) -> RunRecord {
         workspace_id: ws.into(),
         workspace_path: PathBuf::from("/tmp/proj"),
         transcript_dir: PathBuf::from("/tmp/proj/.rupu/transcripts"),
-        started_at: chrono::Utc::now(),
-        finished_at: Some(chrono::Utc::now()),
+        started_at,
+        finished_at: Some(started_at),
         error_message: None,
         awaiting: Vec::new(),
         awaiting_step_id: None,
@@ -357,12 +371,22 @@ fn record(id: &str, ws: &str, customer: Option<&str>) -> RunRecord {
 
 /// A completed workflow run with one step whose transcript carries usage.
 fn seed_run(global: &Path, id: &str, ws: &str, customer: Option<&str>) {
+    seed_run_at(global, id, ws, customer, chrono::Utc::now());
+}
+
+fn seed_run_at(
+    global: &Path,
+    id: &str,
+    ws: &str,
+    customer: Option<&str>,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
     let store = RunStore::new(global.join("runs"));
     store
-        .create(record(id, ws, customer), "name: wf\n")
+        .create(record(id, ws, customer, started_at), "name: wf\n")
         .unwrap();
     let transcript_path = global.join("tx").join(format!("{id}.jsonl"));
-    write_transcript(&transcript_path, ws, customer);
+    write_transcript_at(&transcript_path, ws, customer, started_at);
     store
         .append_step_result(
             id,
@@ -613,4 +637,169 @@ async fn archived_customers_are_hidden_unless_asked_for() {
     assert_eq!(resp.status(), StatusCode::OK);
     let rows = get_json(format!("{base}/api/customers")).await;
     assert_eq!(rows.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn project_rows_are_priced_per_customer_and_sum_to_its_rollup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let proj = tempfile::tempdir().unwrap();
+    seed_workspace(global, "ws_acme", &proj.path().join("acme"));
+    seed_workspace(global, "ws_other", &proj.path().join("other"));
+    std::fs::write(global.join("config.toml"), pricing_toml(1.0)).unwrap();
+    let base = spawn(global, true).await;
+    assert_eq!(
+        create(&base, "acme", "Acme").await.status(),
+        StatusCode::CREATED
+    );
+    std::fs::write(
+        rupu_workspace::CustomerStore::new(global).config_path("acme"),
+        pricing_toml(5.0),
+    )
+    .unwrap();
+    assert_eq!(
+        put_assign(&base, "acme", "ws_acme").await.status(),
+        StatusCode::OK
+    );
+
+    seed_run(global, "run_recorded", "ws_acme", Some("acme"));
+    seed_run(global, "run_derived", "ws_acme", None);
+    seed_run(global, "run_none", "ws_other", None);
+    write_transcript(
+        &global.join("transcripts").join("agent_1.jsonl"),
+        "ws_acme",
+        None,
+    );
+
+    let detail = get_json(format!("{base}/api/customers/acme?range=all")).await;
+    approx(&detail["rollup"]["usage"]["cost_usd"], 15.0);
+    let projects = detail["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    let sum: f64 = projects
+        .iter()
+        .map(|p| p["usage"]["cost_usd"].as_f64().unwrap())
+        .sum();
+    assert!((sum - 15.0).abs() < 1e-9, "projects sum {sum}");
+    assert_eq!(projects[0]["run_count"], 2);
+
+    // The Projects page prices the same way: Acme's runs at $5, the
+    // unassigned project's at the global $1.
+    let rows = get_json(format!("{base}/api/projects")).await;
+    let by_ws = |ws: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["ws_id"] == ws)
+            .unwrap()
+            .clone()
+    };
+    approx(&by_ws("ws_acme")["usage"]["cost_usd"], 15.0);
+    approx(&by_ws("ws_other")["usage"]["cost_usd"], 1.0);
+    let one = get_json(format!("{base}/api/projects/ws_acme")).await;
+    approx(&one["usage"]["cost_usd"], 15.0);
+}
+
+#[tokio::test]
+async fn range_7d_excludes_older_runs_and_transcripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let proj = tempfile::tempdir().unwrap();
+    seed_workspace(global, "ws_acme", &proj.path().join("acme"));
+    let base = spawn(global, true).await;
+    assert_eq!(
+        create(&base, "acme", "Acme").await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        put_assign(&base, "acme", "ws_acme").await.status(),
+        StatusCode::OK
+    );
+
+    let old = chrono::Utc::now() - chrono::Duration::days(10);
+    seed_run(global, "run_new", "ws_acme", None);
+    seed_run_at(global, "run_old", "ws_acme", None, old);
+    write_transcript(
+        &global.join("transcripts").join("agent_new.jsonl"),
+        "ws_acme",
+        None,
+    );
+    write_transcript_at(
+        &global.join("transcripts").join("agent_old.jsonl"),
+        "ws_acme",
+        None,
+        old,
+    );
+
+    let rows = get_json(format!("{base}/api/customers?range=7d")).await;
+    let acme = row(&rows, "acme");
+    assert_eq!(acme["rollup"]["run_count"], 1);
+    assert_eq!(acme["rollup"]["usage"]["input_tokens"], 2_000_000);
+
+    let rows = get_json(format!("{base}/api/customers?range=all")).await;
+    let acme = row(&rows, "acme");
+    assert_eq!(acme["rollup"]["run_count"], 2);
+    assert_eq!(acme["rollup"]["usage"]["input_tokens"], 4_000_000);
+}
+
+async fn error_of(url: String) -> (StatusCode, String) {
+    let resp = reqwest::get(url).await.unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    (
+        status,
+        body["error"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn an_unreadable_assignment_fails_the_listings_naming_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let proj = tempfile::tempdir().unwrap();
+    seed_workspace(global, "ws_broken", &proj.path().join("broken"));
+    // A directory where the assignment sidecar belongs: unreadable, which
+    // must never read as "no customer".
+    std::fs::create_dir(global.join("workspaces").join("ws_broken.customer")).unwrap();
+    let base = spawn(global, true).await;
+    assert_eq!(
+        create(&base, "acme", "Acme").await.status(),
+        StatusCode::CREATED
+    );
+
+    for url in [
+        format!("{base}/api/projects"),
+        format!("{base}/api/projects/ws_broken"),
+        format!("{base}/api/customers"),
+        format!("{base}/api/customers/acme"),
+    ] {
+        let (status, msg) = error_of(url.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{url}");
+        assert!(msg.contains("ws_broken"), "{url}: {msg}");
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_legacy_workspace_id_lists_as_unassigned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let base = spawn(global, true).await;
+    assert_eq!(
+        create(&base, "acme", "Acme").await.status(),
+        StatusCode::CREATED
+    );
+    seed_run(global, "run_legacy", "not a valid id!", None);
+
+    let rows = get_json(format!("{base}/api/customers")).await;
+    assert_eq!(row(&rows, "acme")["rollup"]["run_count"], 0);
+    get_json(format!("{base}/api/projects")).await;
+}
+
+#[tokio::test]
+async fn read_only_customer_writes_name_the_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = spawn(tmp.path(), false).await;
+    let resp = create(&base, "acme", "Acme").await;
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "managing customers requires `rupu cp serve`");
 }
