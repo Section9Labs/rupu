@@ -32,6 +32,14 @@
   {"q": "a\\ b", "terms": [{"neg": false, "key": "text", "op": "eq", "values": ["a b"]}]},
   {"q": "a,b", "terms": [{"neg": false, "key": "text", "op": "eq", "values": ["a,b"]}]},
   {"q": "  severity:high \t tag:x  ", "terms": [{"neg": false, "key": "severity", "op": "eq", "values": ["high"]}, {"neg": false, "key": "tag", "op": "eq", "values": ["x"]}]},
+  {"q": "a=\"c d\"", "terms": [{"neg": false, "key": "text", "op": "eq", "values": ["a=\"c"]}, {"neg": false, "key": "text", "op": "eq", "values": ["d\""]}]},
+  {"q": "a=b\"c d\"", "terms": [{"neg": false, "key": "text", "op": "eq", "values": ["a=b\"c"]}, {"neg": false, "key": "text", "op": "eq", "values": ["d\""]}]},
+  {"q": "12:\"a b\"", "terms": [{"neg": false, "key": "text", "op": "eq", "values": ["12:\"a"]}, {"neg": false, "key": "text", "op": "eq", "values": ["b\""]}]},
+  {"q": "owner:x:\"a b\"", "terms": [{"neg": false, "key": "owner", "op": "eq", "values": ["x:\"a"]}, {"neg": false, "key": "text", "op": "eq", "values": ["b\""]}]},
+  {"q": "owner::\"a b\"", "terms": [{"neg": false, "key": "owner", "op": "eq", "values": [":\"a"]}, {"neg": false, "key": "text", "op": "eq", "values": ["b\""]}]},
+  {"q": "severity>=\"high\"", "terms": [{"neg": false, "key": "severity", "op": "ge", "values": ["high"]}]},
+  {"q": "owner:a,\"b c\"", "terms": [{"neg": false, "key": "owner", "op": "eq", "values": ["a", "b c"]}]},
+  {"q": "a\\", "terms": [{"neg": false, "key": "text", "op": "eq", "values": ["a\\"]}]},
   {"q": "sevrity:high", "error": {"token": 0, "code": "unknown_key"}},
   {"q": "http://example.test", "error": {"token": 0, "code": "unknown_key"}},
   {"q": "severity:urgent", "error": {"token": 0, "code": "bad_value"}},
@@ -45,5 +53,6 @@
   {"q": "severity>=high,critical", "error": {"token": 0, "code": "bad_operator"}},
   {"q": "x:1 owner:\"abc", "error": {"token": 1, "code": "unclosed_quote"}},
   {"q": "owner:\"a\"b", "error": {"token": 0, "code": "bad_quote"}},
-  {"q": "\"phrase\"tail", "error": {"token": 0, "code": "bad_quote"}}
+  {"q": "\"phrase\"tail", "error": {"token": 0, "code": "bad_quote"}},
+  {"q": "\"a\\", "error": {"token": 0, "code": "unclosed_quote"}}
 ]

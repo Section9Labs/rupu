@@ -1,6 +1,10 @@
 //! The findings query language (spec "Query language"). One line, e.g.
 //! `severity>=high tag:class:sqli -tag:false-positive "sql injection"`.
 //!
+//! Quoting: a quote (`"` or `'`) opens only at an item start (the token body
+//! start after an optional `-`, right after a keyed token's operator, or right
+//! after a `,` in a keyed value); `\` escapes the next char. See `scan`.
+//!
 //! This module only parses and validates. `ledger::finding_filter`
 //! evaluates. The web's `src/lib/findingQuery/grammar.ts` is a twin of this
 //! file, held in lockstep by `tests/fixtures/finding_query/`. Change both,
@@ -175,10 +179,6 @@ struct RawToken {
     text: Vec<char>,
 }
 
-fn is_op_char(c: char) -> bool {
-    matches!(c, ':' | '<' | '>' | '=')
-}
-
 fn err(
     token: usize,
     start: usize,
@@ -195,10 +195,40 @@ fn err(
     }
 }
 
+/// Where a keyed token's value begins: the index right after the operator
+/// when the token (after an optional leading `-`) is `[A-Za-z_]+` followed
+/// immediately by an operator (`>=` `<=` `:` `>` `<`, longest match first).
+/// `parse_token` applies the same detection to the decoded token, so the two
+/// always agree on whether a token is keyed.
+fn keyed_value_start(chars: &[char], start: usize) -> Option<usize> {
+    let body = start + usize::from(chars.get(start) == Some(&'-'));
+    let key_len = chars[body..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphabetic() || **c == '_')
+        .count();
+    if key_len == 0 {
+        return None;
+    }
+    let k = body + key_len;
+    match (chars.get(k), chars.get(k + 1)) {
+        (Some('>' | '<'), Some('=')) => Some(k + 2),
+        (Some('>' | '<' | ':'), _) => Some(k + 1),
+        _ => None,
+    }
+}
+
 /// Split into tokens at unquoted whitespace. A quote opens only at an item
-/// start: the token start (after an optional `-`), right after an operator
-/// character, or right after a `,`. `\` escapes the next char, in or out of
-/// quotes.
+/// start, and an item starts in exactly three places, the same ones `items`
+/// decodes:
+///
+/// 1. the token body start, after an optional leading `-`;
+/// 2. right after the key's operator, when the token is keyed (see
+///    `keyed_value_start`);
+/// 3. right after an unescaped, unquoted `,` inside a keyed value.
+///
+/// Nowhere else: not after an operator character in free text (`a="c d"` is
+/// the two words `a="c` and `d"`), and not after a second `:` inside a value
+/// (`owner:x:"a b"`). `\` escapes the next char, in or out of quotes.
 fn scan(q: &str) -> Result<Vec<RawToken>, ParseError> {
     let chars: Vec<char> = q.chars().collect();
     let mut out = Vec::new();
@@ -209,6 +239,7 @@ fn scan(q: &str) -> Result<Vec<RawToken>, ParseError> {
             continue;
         }
         let start = i;
+        let value_start = keyed_value_start(&chars, start);
         let mut item_start = true;
         let mut quote: Option<char> = None;
         while i < chars.len() {
@@ -238,7 +269,8 @@ fn scan(q: &str) -> Result<Vec<RawToken>, ParseError> {
                 i += 1;
                 continue;
             }
-            item_start = is_op_char(c) || c == ',' || (c == '-' && i == start);
+            item_start = (c == '-' && i == start)
+                || value_start.is_some_and(|v| i + 1 == v || (c == ',' && i >= v));
             i += 1;
         }
         let end = i.min(chars.len());
