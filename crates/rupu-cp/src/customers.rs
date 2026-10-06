@@ -166,10 +166,16 @@ fn mtime(path: &std::path::Path) -> Option<SystemTime> {
 /// Pricing for a customer's runs: global + that customer's layer, resolved
 /// with `rupu_config::resolve` (locks honoured), cached per slug and
 /// re-validated by the mtimes of the global and customer `config.toml`.
+///
+/// The no-customer baseline follows the same rule: the global file is
+/// re-resolved (global layer only) when its mtime moves, so a global pricing
+/// edit reaches customer and no-customer runs alike. The startup snapshot is
+/// only the fallback for a global file that does not parse.
 pub struct CustomerPricing {
     global_dir: PathBuf,
-    global: PricingConfig,
+    startup: PricingConfig,
     store: CustomerStore,
+    baseline: Mutex<Option<(Option<SystemTime>, PricingConfig)>>,
     cache: Mutex<HashMap<String, (Stamps, PricingConfig)>>,
 }
 
@@ -178,29 +184,63 @@ impl CustomerPricing {
         Self {
             store: CustomerStore::new(global_dir.clone()),
             global_dir,
-            global,
+            startup: global,
+            baseline: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// `None` (or an invalid slug) ⇒ the global pricing. A customer whose
+    /// The global-only pricing, re-resolved when the global `config.toml`
+    /// mtime changes; the startup snapshot if the file fails to parse.
+    fn global_pricing(&self) -> PricingConfig {
+        let global_path = self.global_dir.join("config.toml");
+        let stamp = mtime(&global_path);
+        let mut slot = self.baseline.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached, pricing)) = slot.as_ref() {
+            if *cached == stamp {
+                return pricing.clone();
+            }
+        }
+        let pricing = match rupu_config::resolve(LayerPaths::global_only(&global_path)) {
+            Ok(r) => r.config.pricing,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "global pricing unusable; using the startup snapshot"
+                );
+                self.startup.clone()
+            }
+        };
+        // The fallback is cached too, so a bad file warns once per change.
+        *slot = Some((stamp, pricing.clone()));
+        pricing
+    }
+
+    /// `None` (or an invalid slug) => the global pricing. A customer whose
     /// layer is missing resolves to global pricing; one that is malformed
     /// warns once (until the file changes) and also falls back to global.
     pub fn for_customer(&self, slug: Option<&str>) -> PricingConfig {
         let Some(slug) = slug else {
-            return self.global.clone();
+            return self.global_pricing();
         };
-        if validate_slug(slug).is_err() {
-            return self.global.clone();
+        if let Err(e) = validate_slug(slug) {
+            tracing::debug!(
+                customer = slug,
+                error = %e,
+                "invalid customer slug; using global pricing"
+            );
+            return self.global_pricing();
         }
         let global_path = self.global_dir.join("config.toml");
         let customer_path = self.store.config_path(slug);
         let stamps: Stamps = (mtime(&global_path), mtime(&customer_path));
 
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((cached, pricing)) = cache.get(slug) {
-            if *cached == stamps {
-                return pricing.clone();
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((cached, pricing)) = cache.get(slug) {
+                if *cached == stamps {
+                    return pricing.clone();
+                }
             }
         }
         let pricing = match rupu_config::resolve(LayerPaths::new(
@@ -215,11 +255,14 @@ impl CustomerPricing {
                     error = %e,
                     "customer pricing layer unusable; using global pricing"
                 );
-                self.global.clone()
+                self.global_pricing()
             }
         };
         // The fallback is cached too, so a bad layer warns once per change.
-        cache.insert(slug.to_string(), (stamps, pricing.clone()));
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(slug.to_string(), (stamps, pricing.clone()));
         pricing
     }
 }
@@ -385,9 +428,115 @@ mod tests {
             .set_modified(later)
             .unwrap();
         assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(9.0));
+    }
 
-        // Unchanged stamps ⇒ cached value is served.
-        assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(9.0));
+    fn set_mtime(path: &std::path::Path, t: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn unchanged_stamps_serve_the_cached_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let store = CustomerStore::new(home);
+        store
+            .create(
+                "acme",
+                &NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let layer = store.config_path("acme");
+        write_layer(&layer, 7.0);
+        let old = std::fs::metadata(&layer).unwrap().modified().unwrap();
+
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
+        assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(7.0));
+
+        // New contents under the OLD mtime: only the stamp says "unchanged",
+        // so the cached 7.0 must still be served.
+        write_layer(&layer, 9.0);
+        set_mtime(&layer, old);
+        assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(7.0));
+    }
+
+    fn write_global(path: &std::path::Path, input: f64) {
+        write_layer(path, input);
+    }
+
+    #[test]
+    fn global_mtime_invalidates_a_customer_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let global = home.join("config.toml");
+        // Global prices claude-x; the customer layer only prices claude-y.
+        write_global(&global, 3.0);
+        let store = CustomerStore::new(home);
+        store
+            .create(
+                "acme",
+                &NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            store.config_path("acme"),
+            "[pricing.anthropic.\"claude-y\"]\ninput_per_mtok = 5.0\noutput_per_mtok = 6.0\n",
+        )
+        .unwrap();
+
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
+        assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(3.0));
+
+        write_global(&global, 4.0);
+        set_mtime(&global, SystemTime::now() + Duration::from_secs(60));
+        assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(4.0));
+    }
+
+    #[test]
+    fn no_customer_follows_global_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let global = home.join("config.toml");
+        write_global(&global, 3.0);
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
+        assert_eq!(price(&pricing.for_customer(None)), Some(3.0));
+
+        write_global(&global, 4.0);
+        set_mtime(&global, SystemTime::now() + Duration::from_secs(60));
+        assert_eq!(price(&pricing.for_customer(None)), Some(4.0));
+    }
+
+    #[test]
+    fn unparsable_global_falls_back_to_the_startup_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(home.join("config.toml"), "= = nope").unwrap();
+        let mut startup = PricingConfig::default();
+        startup
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert(
+                "claude-x".into(),
+                rupu_config::ModelPricing {
+                    input_per_mtok: 1.5,
+                    output_per_mtok: 2.0,
+                    cached_input_per_mtok: None,
+                    cache_write_per_mtok: None,
+                },
+            );
+        let pricing = CustomerPricing::new(home.to_path_buf(), startup);
+        assert_eq!(price(&pricing.for_customer(None)), Some(1.5));
     }
 
     #[test]
@@ -405,17 +554,8 @@ mod tests {
             )
             .unwrap();
         std::fs::write(store.config_path("acme"), "this is = = not toml").unwrap();
-        let mut global = PricingConfig::default();
-        global.models.entry("anthropic".into()).or_default().insert(
-            "claude-x".into(),
-            rupu_config::ModelPricing {
-                input_per_mtok: 1.0,
-                output_per_mtok: 2.0,
-                cached_input_per_mtok: None,
-                cache_write_per_mtok: None,
-            },
-        );
-        let pricing = CustomerPricing::new(home.to_path_buf(), global);
+        write_layer(&home.join("config.toml"), 1.0);
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
         assert_eq!(price(&pricing.for_customer(Some("acme"))), Some(1.0));
     }
 }
