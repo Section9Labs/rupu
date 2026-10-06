@@ -113,11 +113,24 @@ async fn get_config(
     let (resolved, layer_error) = match rupu_config::resolve(layers.layers()) {
         Ok(r) => (r, None),
         // A malformed layer must not lock the operator out of the editor
-        // that fixes it: serve global only, with the error beside it.
+        // that fixes it: serve what still resolves, with the error beside
+        // it. A broken PROJECT layer keeps global + customer (so the
+        // customer's values and lock badges still show); only a broken
+        // customer layer, or none to keep, falls back to global alone.
         Err(e) if layers.customer.is_some() || layers.project.is_some() => {
-            let global_only = rupu_config::resolve(rupu_config::LayerPaths::global_only(&global))
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            (global_only, Some(e.to_string()))
+            let kept = match layers.customer.as_deref() {
+                Some(c) if layers.project.is_some() => {
+                    rupu_config::resolve(rupu_config::LayerPaths::new(Some(&global), Some(c), None))
+                        .ok()
+                }
+                _ => None,
+            };
+            let fallback = match kept {
+                Some(r) => r,
+                None => rupu_config::resolve(rupu_config::LayerPaths::global_only(&global))
+                    .map_err(|e| ApiError::internal(e.to_string()))?,
+            };
+            (fallback, Some(e.to_string()))
         }
         Err(e) => return Err(ApiError::internal(e.to_string())),
     };
@@ -1416,6 +1429,81 @@ input_per_mtok = 5.0
         .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!proj.path().join(".rupu/config.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn get_config_malformed_project_layer_is_200_with_layer_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_bad", proj.path());
+        std::fs::create_dir_all(proj.path().join(".rupu")).unwrap();
+        std::fs::write(
+            proj.path().join(".rupu/config.toml"),
+            "default_model = = x\n",
+        )
+        .unwrap();
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_bad")))
+            .await
+            .expect("the editor must still open")
+            .0;
+        assert!(view.layer_error.is_some());
+        assert_eq!(view.effective["default_model"], "opus");
+        assert_eq!(view.raw_project.as_deref(), Some("default_model = = x\n"));
+    }
+
+    #[tokio::test]
+    async fn get_config_broken_project_layer_keeps_the_customer_layer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let proj = customer_with_project(
+            &tmp,
+            "default_model = \"acme-model\"\n[policy]\nlock = [\"default_model\"]\n",
+        );
+        std::fs::create_dir_all(proj.path().join(".rupu")).unwrap();
+        std::fs::write(
+            proj.path().join(".rupu/config.toml"),
+            "default_model = = x\n",
+        )
+        .unwrap();
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_acme")))
+            .await
+            .expect("the editor must still open")
+            .0;
+        assert!(view.layer_error.is_some());
+        assert_eq!(view.effective["default_model"], "acme-model");
+        let prov = serde_json::to_value(view.provenance.get("default_model").unwrap()).unwrap();
+        assert_eq!(prov["source"], "customer");
+        assert_eq!(prov["locked_by"], "customer");
+        assert_eq!(view.customer_lock, vec!["default_model".to_string()]);
+        assert_eq!(view.customer.as_ref().unwrap().slug, "acme");
+        assert_eq!(view.raw_project.as_deref(), Some("default_model = = x\n"));
+    }
+
+    #[tokio::test]
+    async fn get_config_broken_customer_layer_with_a_project_falls_back_to_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let proj = customer_with_project(&tmp, "default_model = = broken\n");
+        std::fs::create_dir_all(proj.path().join(".rupu")).unwrap();
+        std::fs::write(
+            proj.path().join(".rupu/config.toml"),
+            "default_model = \"proj\"\n",
+        )
+        .unwrap();
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ConfigQuery::project("ws_acme")))
+            .await
+            .expect("the editor must still open")
+            .0;
+        assert!(view.layer_error.is_some());
+        assert_eq!(view.effective["default_model"], "opus");
+        assert!(view.customer_lock.is_empty());
     }
 
     // ── Task 7: end-to-end — round-trip + lock enforcement ─────────────────
