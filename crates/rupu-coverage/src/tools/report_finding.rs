@@ -1243,6 +1243,7 @@ mod tests {
         r.verification = Some(crate::report::Verification {
             status: crate::report::VerificationStatus::Confirmed,
             by_run: None,
+            by_agent: None,
             notes: None,
         });
         r.root_cause = String::new();

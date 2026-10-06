@@ -542,6 +542,9 @@
         "by_run": {
           "type": "string"
         },
+        "by_agent": {
+          "type": "string"
+        },
         "notes": {
           "type": "string"
         }
