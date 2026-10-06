@@ -76,7 +76,11 @@ async fn get_config(
         Some(id) => {
             let ws = load_ws(&s, id)?;
             (
-                Some(project_config_path_of(&ws)?),
+                // A workspace whose root is the global dir's parent (`$HOME`)
+                // has the global config file as its "project config": that
+                // is no project layer — loading it again would let global
+                // values outrank the customer layer.
+                Some(project_config_path_of(&ws)?).filter(|p| !is_same_file(p, &global)),
                 project_customer_config_path(&s, &ws)?,
             )
         }
@@ -269,6 +273,15 @@ fn project_config_path_of(ws: &rupu_workspace::Workspace) -> ApiResult<PathBuf> 
         return Err(ApiError::bad_request("config path escapes project root"));
     }
     Ok(candidate)
+}
+
+/// Whether `a` and `b` name the same file: canonicalized when both exist,
+/// else compared raw.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// The workspace record of project `id`: the id is validated first (the
@@ -482,6 +495,57 @@ mod tests {
         );
         let prov = view.provenance.get("default_model").unwrap();
         assert!(matches!(prov.source, rupu_config::KeySource::Project));
+    }
+
+    #[tokio::test]
+    async fn get_config_never_loads_the_global_file_as_the_project_layer() {
+        // A workspace rooted at the global dir's parent (`$HOME`): its
+        // `.rupu/config.toml` IS the global config.
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join(".rupu");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = AppState::new(home.clone(), rupu_config::PricingConfig::default());
+        std::fs::create_dir_all(home.join("workspaces")).unwrap();
+        std::fs::write(
+            home.join("workspaces/ws_home.toml"),
+            format!(
+                "id = \"ws_home\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+        let customers = rupu_workspace::CustomerStore::new(&home);
+        customers
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            customers.config_path("acme"),
+            "default_model = \"acme-model\"\n",
+        )
+        .unwrap();
+        customers
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_home"))
+            .unwrap();
+
+        let view = get_config(
+            State(s),
+            Query(ProjectQuery {
+                project: Some("ws_home".into()),
+            }),
+        )
+        .await
+        .expect("get_config ok")
+        .0;
+
+        assert_eq!(view.effective["default_model"], "acme-model");
+        assert_eq!(view.raw_project, None);
     }
 
     #[tokio::test]
