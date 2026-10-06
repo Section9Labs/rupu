@@ -2,8 +2,8 @@
 
 > See also: [providers.md](providers.md) · [scm.md](scm.md) · [using-rupu.md](using-rupu.md)
 
-Complete reference for `~/.rupu/config.toml` (global) and `<repo>/.rupu/config.toml`
-(project-local override). This page enumerates every key `rupu-config` accepts; for
+Complete reference for `~/.rupu/config.toml` (global), `~/.rupu/customers/<slug>/config.toml`
+(customer-specific), and `<repo>/.rupu/config.toml` (project-local override). This page enumerates every key `rupu-config` accepts; for
 narrative walkthroughs of the provider and SCM sections, see the linked docs above.
 
 ---
@@ -43,6 +43,7 @@ Typical customer layer:
 
     default_provider = "anthropic-acme"
 
+    # optional — already declared globally by `auth login --account anthropic-acme --kind anthropic`
     [providers.anthropic-acme]
     kind = "anthropic"
 
@@ -54,7 +55,11 @@ Typical customer layer:
     lock = ["default_provider"]
 
 Assign from the repo root: `rupu customer assign acme` (assigns the current directory).
-Log in each named account once: `rupu auth login --account anthropic-acme …`.
+Each account must be declared once in the global config: `rupu auth login --account anthropic-acme --kind anthropic` for a provider account,
+or `rupu auth login --account github-acme --kind github` for an SCM account. The customer layer then references them via `default_provider` or `[[scm.rules]]`.
+
+To view the effective config with sources and locks: `rupu customer show <slug>`.
+To edit and validate a customer layer: `rupu customer edit <slug>`.
 
 ---
 
