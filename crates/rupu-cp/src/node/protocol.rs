@@ -150,6 +150,13 @@ pub fn node_capabilities() -> Vec<String> {
 /// and the resume runs detached, so it would fail without a trace.
 pub const CAP_WORKFLOW_RESUME_IF_UNFINISHED: &str = "workflow.resume_if_unfinished";
 
+/// Host feature: this build has `rupu run list` (the JSON run listing an SSH
+/// coordinator shells). The SSH connector checks it only when a listing
+/// FAILS, in the same remote command: a remote listing it failed for a
+/// reason of its own (shown as the remote's error); one that does not list
+/// it predates the command ("needs a newer rupu").
+pub const CAP_RUN_LIST: &str = "run.list";
+
 /// Every feature this build honours as a host — what `/api/host/info`
 /// serves as `features` and what `rupu __features` prints for an SSH
 /// coordinator. Same vocabulary as the tunnel `Hello.capabilities` and the
@@ -160,6 +167,7 @@ pub fn host_features() -> Vec<String> {
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
         CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
+        CAP_RUN_LIST.to_string(),
     ]
 }
 
@@ -364,6 +372,7 @@ mod tests {
             features.iter().any(|f| f == CAP_AGENT_FINDINGS_PROFILE),
             "{features:?}"
         );
+        assert!(features.iter().any(|f| f == CAP_RUN_LIST), "{features:?}");
     }
 
     #[test]

@@ -57,6 +57,46 @@ struct HostFreshness {
     reason: Option<String>,
 }
 
+/// The freshness entry for a host whose summary failed (`Internal` under a
+/// customer filter is handled by the caller — it fails the request).
+///
+/// - `Unsupported` → `unavailable`, "needs a newer rupu";
+/// - `Invalid` → `unavailable` with the host's own reason: it answered but
+///   could not produce the data (its rupu failed — e.g. an unreadable
+///   assignment on the remote), the same 501 "unavailable" `host_list_error`
+///   gives the run lists — never "offline", which reads as a host that is
+///   down;
+/// - anything else → `offline` with the error.
+fn failed_freshness(
+    host_id: String,
+    name: String,
+    transport_kind: String,
+    e: HostConnectorError,
+) -> HostFreshness {
+    let (state, reason) = match e {
+        HostConnectorError::Unsupported(_) => (
+            "unavailable",
+            "host does not report dashboard data (needs a newer rupu)".to_string(),
+        ),
+        HostConnectorError::Invalid(reason) => {
+            tracing::warn!(host_id = %host_id, error = %reason, "dashboard_summary unavailable");
+            ("unavailable", reason)
+        }
+        e => {
+            tracing::warn!(host_id = %host_id, error = %e, "dashboard_summary failed");
+            ("offline", e.to_string())
+        }
+    };
+    HostFreshness {
+        host_id,
+        name,
+        transport_kind,
+        state,
+        captured_at: None,
+        reason: Some(reason),
+    }
+}
+
 /// The dashboard payload: one aggregate summary plus per-host reporting state.
 ///
 /// `summary` is `#[serde(flatten)]`ed, so the wire form carries `DashboardSummary`'s
@@ -210,33 +250,10 @@ async fn get_dashboard(
                 Err(HostConnectorError::Internal(e)) if customer.is_some() => {
                     return Err(ApiError::internal(e));
                 }
-                Err(HostConnectorError::Unsupported(_)) => (
-                    HostFreshness {
-                        host_id,
-                        name,
-                        transport_kind,
-                        state: "unavailable",
-                        captured_at: None,
-                        reason: Some(
-                            "host does not report dashboard data (needs a newer rupu)".into(),
-                        ),
-                    },
+                Err(e) => (
+                    failed_freshness(host_id, name, transport_kind, e),
                     None,
                 ),
-                Err(e) => {
-                    tracing::warn!(host_id = %host_id, error = %e, "dashboard_summary failed");
-                    (
-                        HostFreshness {
-                            host_id,
-                            name,
-                            transport_kind,
-                            state: "offline",
-                            captured_at: None,
-                            reason: Some(e.to_string()),
-                        },
-                        None,
-                    )
-                }
             })
         }
     });
@@ -876,5 +893,24 @@ mod merge_tests {
             !cycles_partial,
             "same rule for cycles_partial — nothing to be partial about with zero reporting hosts"
         );
+    }
+
+    /// A host that answered but failed (`Invalid`) is "unavailable" with its
+    /// reason — like the run lists' 501 — never "offline"; only a host that
+    /// can't be reached is "offline".
+    #[test]
+    fn a_failed_summary_is_unavailable_unless_the_host_is_down() {
+        let f = |e| failed_freshness("h".into(), "H".into(), "ssh".into(), e);
+        let invalid = f(HostConnectorError::Invalid(
+            "the customer assignment of workspace ws_1 cannot be read".into(),
+        ));
+        assert_eq!(invalid.state, "unavailable");
+        assert!(invalid.reason.as_deref().unwrap().contains("ws_1"));
+        let old = f(HostConnectorError::Unsupported("run list".into()));
+        assert_eq!(old.state, "unavailable");
+        assert!(old.reason.as_deref().unwrap().contains("newer rupu"));
+        let down = f(HostConnectorError::Unreachable("connection refused".into()));
+        assert_eq!(down.state, "offline");
+        assert!(down.captured_at.is_none());
     }
 }

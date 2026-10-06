@@ -25,7 +25,7 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            ArtifactFile, RunSpec, RunSpecKind, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
+            ArtifactFile, RunSpec, RunSpecKind, CAP_RUN_LIST, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
             FEATURES_SUBCOMMAND,
         },
         NodeMirror,
@@ -121,6 +121,44 @@ fn resume_command(run_id: &str) -> String {
         resume(true),
         shell_escape(RESUME_BARE),
         resume(false),
+    )
+}
+
+/// The `rupu run list` argv (after `rupu`) every SSH run listing sends —
+/// `list_runs` and `dashboard_summary` share one cached listing.
+const RUN_LIST_ARGV: [&str; 6] = ["--format", "json", "run", "list", "--limit", "10000"];
+
+/// Printed on stderr by [`run_list_command`] when the listing failed on a
+/// remote whose `rupu __features` lists [`CAP_RUN_LIST`].
+const RUN_LIST_SUPPORTED: &str = "rupu-run-list: supported";
+
+/// The one remote command an SSH run listing sends: `rupu run list`, and —
+/// only when that FAILS — the remote's own `rupu __features`, printing
+/// [`RUN_LIST_SUPPORTED`] on stderr when it lists [`CAP_RUN_LIST`]; the
+/// listing's exit status is kept:
+///
+/// ```text
+/// <rupu run list>; rc=$?;
+/// if [ "$rc" -ne 0 ] && 'rupu' '__features' 2>/dev/null | grep -qF '"run.list"'; then
+///   echo '<supported>' >&2;
+/// fi; exit "$rc"
+/// ```
+///
+/// One ssh session either way (the feature check is a capability gate, not
+/// an extra probe per listing), and a successful listing never runs it.
+/// [`run_list_failure`] reads the marker to tell a remote that has `run
+/// list` but failed from one that predates it.
+fn run_list_command() -> String {
+    let list: Vec<String> = std::iter::once("rupu")
+        .chain(RUN_LIST_ARGV)
+        .map(str::to_string)
+        .collect();
+    let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
+    format!(
+        "{}; rc=$?; if [ \"$rc\" -ne 0 ] && {probe} 2>/dev/null | grep -qF {}; then echo {} >&2; fi; exit \"$rc\"",
+        build_remote_command(&list),
+        shell_escape(&format!("\"{CAP_RUN_LIST}\"")),
+        shell_escape(RUN_LIST_SUPPORTED),
     )
 }
 
@@ -1571,41 +1609,37 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// Classify a failed remote `rupu run list`.
+/// Classify a failed remote `rupu run list` ([`run_list_command`]).
 ///
 /// - an ssh transport failure (host down) passes through as `Unreachable`
 ///   (offline);
-/// - an old remote rupu — one with no `run list`: it parses as "launch an
-///   agent named list", or its clap rejects the flags, or what it prints is
-///   not the JSON report — becomes `Unsupported` ("needs a newer rupu"), so
-///   the freshness strip never reads it as zero runs;
-/// - anything else (the remote rupu ran `run list` and it failed) is
-///   `Invalid` carrying the remote's error as-is — 501 "unavailable: <its
-///   reason>", never mislabelled as a missing command nor as a host that is
-///   down.
+/// - a remote rupu that FAILED and advertises [`CAP_RUN_LIST`] (its stderr
+///   carries [`RUN_LIST_SUPPORTED`]) is `Invalid` carrying the remote's
+///   error as-is — 501 "unavailable: <its reason>", never mislabelled as a
+///   missing command nor as a host that is down;
+/// - anything else — a remote whose `rupu __features` doesn't list the
+///   feature (or predates `__features`), or whose listing printed something
+///   other than the JSON report — predates the command: `Unsupported`
+///   ("needs a newer rupu"), so the freshness strip never reads it as zero
+///   runs.
+///
+/// A capability gate, not a guess from the error text.
 fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError {
-    let predates = match &e {
-        HostConnectorError::Unreachable(msg) => {
-            if is_ssh_transport_failure(msg) {
-                return e;
-            }
-            let lower = msg.to_ascii_lowercase();
-            lower.contains("unexpected argument")
-                || lower.contains("unrecognized subcommand")
-                || (lower.contains("list") && lower.contains("not found"))
-        }
-        HostConnectorError::Remote(0, msg) => msg.starts_with("parse `rupu"),
-        HostConnectorError::NotJson(_) => true,
-        _ => false,
-    };
-    if predates {
-        return HostConnectorError::Unsupported(format!(
-            "remote host {host_id} does not support `rupu run list`: {e}"
-        ));
-    }
     match e {
-        HostConnectorError::Unreachable(msg) => HostConnectorError::Invalid(msg),
-        other => HostConnectorError::Invalid(other.to_string()),
+        HostConnectorError::Unreachable(msg) if is_ssh_transport_failure(&msg) => {
+            HostConnectorError::Unreachable(msg)
+        }
+        HostConnectorError::Unreachable(msg) if msg.contains(RUN_LIST_SUPPORTED) => {
+            let reason: Vec<&str> = msg
+                .lines()
+                .filter(|l| l.trim() != RUN_LIST_SUPPORTED)
+                .collect();
+            HostConnectorError::Invalid(reason.join("\n").trim().to_string())
+        }
+        other => HostConnectorError::Unsupported(format!(
+            "remote host {host_id} does not support `rupu run list` \
+             (it doesn't advertise `{CAP_RUN_LIST}`): {other}"
+        )),
     }
 }
 
@@ -1712,7 +1746,17 @@ async fn exec_rupu_json(
     let owned: Vec<String> = std::iter::once("rupu".to_string())
         .chain(argv.iter().cloned())
         .collect();
-    let cmd = build_remote_command(&owned);
+    exec_json(exec, build_remote_command(&owned), argv.join(" "), mode).await
+}
+
+/// Run the remote shell command `cmd` over `exec` and parse its JSON stdout;
+/// `label` names it (`rupu <label>`) in a parse error.
+async fn exec_json(
+    exec: Arc<dyn RemoteExec>,
+    cmd: String,
+    label: String,
+    mode: ExecMode,
+) -> Result<serde_json::Value, HostConnectorError> {
     let out = match mode {
         ExecMode::ToCompletion => exec.run(&cmd).await,
         ExecMode::Cancellable => exec.run_cancellable(&cmd).await,
@@ -1721,9 +1765,8 @@ async fn exec_rupu_json(
     if !out.success {
         return Err(HostConnectorError::Unreachable(out.stderr));
     }
-    serde_json::from_str(out.stdout.trim()).map_err(|e| {
-        HostConnectorError::Remote(0, format!("parse `rupu {}` output: {e}", argv.join(" ")))
-    })
+    serde_json::from_str(out.stdout.trim())
+        .map_err(|e| HostConnectorError::Remote(0, format!("parse `rupu {label}` output: {e}")))
 }
 
 /// The `rows` array of a CLI `--format json` report (empty when absent).
@@ -2455,6 +2498,27 @@ impl SshHostConnector {
         Ok(rows.as_ref().clone())
     }
 
+    /// The remote's `rupu run list` rows ([`run_list_command`]), through the
+    /// listing cache — `list_runs` and `dashboard_summary` share one fetch.
+    async fn cached_run_list(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let key = RUN_LIST_ARGV.join("\u{1f}");
+        let exec = Arc::clone(&self.exec);
+        let rows = self
+            .listings
+            .get(&key, move || async move {
+                exec_json(
+                    exec,
+                    run_list_command(),
+                    RUN_LIST_ARGV.join(" "),
+                    ExecMode::Cancellable,
+                )
+                .await
+                .map(|v| json_rows(&v))
+            })
+            .await?;
+        Ok(rows.as_ref().clone())
+    }
+
     /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
     /// the CLI's `--format json` report. Used by the list-view connectors.
     async fn remote_json_rows(
@@ -2728,10 +2792,7 @@ impl HostConnector for SshHostConnector {
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        let rows = match self
-            .cached_rows(&["--format", "json", "run", "list", "--limit", "10000"])
-            .await
-        {
+        let rows = match self.cached_run_list().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -3408,10 +3469,7 @@ impl HostConnector for SshHostConnector {
     ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
         use crate::host::dashboard_summary::*;
 
-        let run_rows = self
-            .cached_rows(&["--format", "json", "run", "list", "--limit", "10000"])
-            .await
-            .map_err(|e| {
+        let run_rows = self.cached_run_list().await.map_err(|e| {
                 tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: run list failed");
                 run_list_failure(&self.host_id, e)
             })?;
@@ -4803,14 +4861,18 @@ mod tests {
         assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
     }
 
-    /// A remote `run list` that fails for another reason (here: the remote's
-    /// own unreadable customer assignment) reports that error, not "does not
-    /// support `rupu run list`".
+    /// A remote `run list` that fails on a remote advertising `run.list`
+    /// (here: the remote's own unreadable customer assignment; the command's
+    /// feature check printed its marker) reports that error, not "does not
+    /// support `rupu run list`" — whatever the error's wording.
     #[tokio::test]
     async fn list_runs_reports_any_other_remote_failure_as_is() {
-        let msg = "error: the customer assignment of workspace ws_1 cannot be read: \
-                   Is a directory; repair or remove `workspaces/ws_1.customer`";
-        let fake = std::sync::Arc::new(FakeExec::offline(msg));
+        let msg = format!(
+            "error: the customer assignment of workspace ws_1 cannot be read: \
+             Is a directory; repair or remove `workspaces/ws_1.customer`; \
+             the agent list was not found\n{RUN_LIST_SUPPORTED}\n"
+        );
+        let fake = std::sync::Arc::new(FakeExec::offline(&msg));
         let (conn, _store, _tmp) = make_conn(fake);
         let err = conn.list_runs(all_runs()).await.unwrap_err();
         // `Invalid` → 501 "unavailable: <the remote's reason>", not offline.
@@ -4819,10 +4881,94 @@ mod tests {
             "{err}"
         );
         assert!(!err.to_string().contains("does not support"), "{err}");
+        assert!(!err.to_string().contains(RUN_LIST_SUPPORTED), "{err}");
         assert_eq!(
             crate::api::runs::host_list_error(err).0,
             axum::http::StatusCode::NOT_IMPLEMENTED
         );
+    }
+
+    /// Without the marker, the same failure reads as a remote that predates
+    /// `run list` — the classification is the capability, not the text.
+    #[tokio::test]
+    async fn list_runs_without_the_capability_is_unsupported_whatever_the_error() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "error: the customer assignment of workspace ws_1 cannot be read",
+        ));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err}");
+    }
+
+    /// The run-list command's contract, through a real shell, against a fake
+    /// remote `rupu`: a listing that succeeds never runs the feature check;
+    /// one that fails prints the marker only when `rupu __features` lists
+    /// `run.list`, and the listing's exit status survives either way.
+    #[test]
+    fn run_list_command_checks_the_capability_only_on_failure() {
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let old_clap = "echo \"error: unrecognized subcommand '__features'\" >&2; exit 2";
+        // (why, `run list` body, `__features` body, exit ok, marker expected)
+        let cases: [(&str, &str, String, bool, bool); 4] = [
+            (
+                "listing ok",
+                "echo '{\"rows\":[]}'; exit 0",
+                format!("echo '{report}'"),
+                true,
+                false,
+            ),
+            (
+                "fails, advertises run.list",
+                "echo 'error: boom' >&2; exit 1",
+                format!("echo '{report}'"),
+                false,
+                true,
+            ),
+            (
+                "fails, other features only",
+                "echo 'error: boom' >&2; exit 1",
+                r#"echo '{"features":["agent.findings_profile"]}'"#.to_string(),
+                false,
+                false,
+            ),
+            (
+                "fails, predates __features",
+                "echo 'error: boom' >&2; exit 1",
+                old_clap.to_string(),
+                false,
+                false,
+            ),
+        ];
+        for (why, list, features, ok, marker) in cases {
+            use std::os::unix::fs::PermissionsExt;
+            let bin = tempfile::tempdir().unwrap();
+            let probed = bin.path().join("probed");
+            let rupu = bin.path().join("rupu");
+            std::fs::write(
+                &rupu,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = __features ]; then touch '{}'; {features}; exit 0; fi\n{list}\n",
+                    probed.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&rupu, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(run_list_command())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+                .output()
+                .expect("the list shell itself must run");
+            assert_eq!(out.status.success(), ok, "{why}: {out:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.contains(RUN_LIST_SUPPORTED),
+                marker,
+                "{why}: {stderr}"
+            );
+            assert_eq!(probed.exists(), !ok, "{why}: feature check only on failure");
+        }
     }
 
     #[tokio::test]

@@ -151,20 +151,10 @@ P0/P1/P2, and a fix closes an issue only when it is observed at the consumer.
 | I-88 | P1 | rupu-cli | A disabled autoflow still fires on the cron tick — the CP toggle writes `autoflow.enabled: false` and `push_cron` never reads it | fixed |
 | I-89 | P2 | rupu-config | `--test parse` fails intermittently under heavy parallel load — **not reproduced in 5 attempts**; needs the failing test name captured | open |
 | I-92 | P1 | rupu-runtime | Anthropic-kind `[providers.*].base_url` is ignored; only the process-wide `RUPU_ANTHROPIC_BASE_URL_OVERRIDE` env var routes to a gateway | open |
-| I-93 | P2 | rupu-cp | Remote host status labels are inconsistent: `/api/dashboard` shows an `Invalid` connector failure `offline` where the run list shows it `unavailable`; the SSH `run_list_failure` misclassifier matches stderr text | open |
+| I-93 | P2 | rupu-cp | Remote host status labels are inconsistent: `/api/dashboard` shows an `Invalid` connector failure `offline` where the run list shows it `unavailable`; the SSH `run_list_failure` misclassifier matches stderr text | fixed |
 
 
 ## Open
-
-### I-93 — remote host status is labelled differently by the dashboard and the run lists, and one SSH classifier reads stderr text
-
-Found in the Plan 2A (customers) Task 7 review; not a customers bug, but the customer filter made hosts' states user-visible.
-
-**Symptom.** A remote host whose connector fails with `HostConnectorError::Invalid` (the remote rupu ran `run list` and it failed) is `unavailable` on `GET /api/runs?host=<id>` (`host_list_error`: `Unsupported | Invalid` → 501) but `offline` in `GET /api/dashboard`'s `hosts[]` (`api/dashboard.rs` ~182/233 map only `Unsupported` to `unavailable`). Separately, `run_list_failure` (`host/ssh.rs`) decides "this remote rupu predates `run list`" from stderr substrings (`list` + `not found`), so a remote whose own error text happens to contain both is read as an old rupu (501) instead of a failed command.
-
-**Impact.** The Overview and Activity pages can show the same host in two different states; a failing remote can be mislabelled "does not support run list". Display only — no run is mis-counted (both states exclude the host).
-
-**Fix.** Map `Invalid` like `Unsupported` in the dashboard (one shared host-state helper beside `host_list_error`); classify "predates `run list`" from a typed signal (the hidden `rupu __features` list the SSH connector already reads) rather than stderr text.
 
 ### I-92 — anthropic-kind `[providers.*].base_url` is ignored; only the env override routes to a gateway
 
@@ -369,6 +359,18 @@ Until then this stays open and un-actioned rather than guessed at.
 
 
 ## Fixed
+
+### I-93 — remote host status is labelled differently by the dashboard and the run lists, and one SSH classifier reads stderr text
+
+Found in the Plan 2A (customers) Task 7 review; not a customers bug, but the customer filter made hosts' states user-visible.
+
+**Symptom.** A remote host whose connector fails with `HostConnectorError::Invalid` (the remote rupu ran `run list` and it failed) is `unavailable` on `GET /api/runs?host=<id>` (`host_list_error`: `Unsupported | Invalid` → 501) but `offline` in `GET /api/dashboard`'s `hosts[]` (`api/dashboard.rs` ~182/233 map only `Unsupported` to `unavailable`). Separately, `run_list_failure` (`host/ssh.rs`) decides "this remote rupu predates `run list`" from stderr substrings (`list` + `not found`), so a remote whose own error text happens to contain both is read as an old rupu (501) instead of a failed command.
+
+**Impact.** The Overview and Activity pages can show the same host in two different states; a failing remote can be mislabelled "does not support run list". Display only — no run is mis-counted (both states exclude the host).
+
+**Fix.** Map `Invalid` like `Unsupported` in the dashboard (one shared host-state helper beside `host_list_error`); classify "predates `run list`" from a typed signal (the hidden `rupu __features` list the SSH connector already reads) rather than stderr text.
+
+**Fixed (customers Plan 2A final fix wave).** `api/dashboard.rs` `failed_freshness` maps `Invalid` to `unavailable` with the host's own reason, like `host_list_error`'s 501; the SSH run listing (`host/ssh.rs` `run_list_command`) checks the remote's `rupu __features` for the new `run.list` feature in the same ssh command, only when the listing fails, and `run_list_failure` classifies by that marker (advertised ⇒ `Invalid(<remote error>)`, else `Unsupported`) instead of stderr text. Tests: `a_failed_summary_is_unavailable_unless_the_host_is_down`, `run_list_command_checks_the_capability_only_on_failure`, `list_runs_without_the_capability_is_unsupported_whatever_the_error`.
 
 ### I-88 — a disabled autoflow still fired on the cron tick
 
