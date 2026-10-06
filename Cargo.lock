@@ -4740,6 +4740,7 @@ name = "rupu-config"
 version = "0.82.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "toml",

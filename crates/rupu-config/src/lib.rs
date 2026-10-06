@@ -1,9 +1,10 @@
-//! rupu-config — TOML-backed configuration with global+project layering.
+//! rupu-config — TOML-backed configuration with global+customer+project layering.
 //!
-//! Two-tier configuration: the global file at `~/.rupu/config.toml` is
-//! loaded first and the project file at `<repo>/.rupu/config.toml`
-//! deep-merges into it (project wins on conflict; arrays REPLACE
-//! globals so users can subtract). See [`layer::layer_files`] for the
+//! Three-tier configuration: global (`~/.rupu/config.toml`), customer
+//! (`~/.rupu/customers/<slug>/config.toml`), project
+//! (`<repo>/.rupu/config.toml`). Each deep-merges into the one below it
+//! (higher wins on conflict; arrays REPLACE lower layers so users can
+//! subtract). See [`layer::layer_files`] for the
 //! merge rules.
 
 pub mod autoflow_config;
@@ -39,13 +40,13 @@ pub mod update_config;
 pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
 pub use config::{BashConfig, Config, UiConfig, UiCpConfig, UiPaletteConfig, UiSyntaxConfig};
 pub use findings_config::FindingsConfig;
-pub use layer::{layer_files, layer_files_locked, LayerError};
+pub use layer::{layer_files, layer_files_locked, LayerError, LayerPaths};
 pub use netflow_config::NetflowConfig;
 pub use policy_config::{CpConfig, PolicyConfig};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use recovery_config::{FallbackEntry, RecoveryConfig};
-pub use resolve::{resolve, KeyProvenance, KeySource, Resolved};
+pub use resolve::{resolve, KeyProvenance, KeySource, LockOwner, Resolved};
 pub use runtime_config::RuntimeConfig;
 pub use scm_config::{
     IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmRule, ScmSection,
