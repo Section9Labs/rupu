@@ -5,12 +5,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
+use super::connector::blocking_host;
 use super::ssh::{parse_tail_marker, shell_escape, RemoteExec, RemoteExecError};
 use super::transcript_paths::is_complete;
 
@@ -21,6 +22,11 @@ use super::transcript_paths::is_complete;
 /// formality — see [`FeedDone`]. A timeout just proceeds; it trades a
 /// vanishingly rare stuck-task edge case for never hanging a viewer.
 const REPLACE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The most tailed lines one write hop takes: every line already waiting
+/// when the feed wakes, up to this many, goes to disk in a single hop to the
+/// blocking pool — a byte-zero replay is thousands of lines at once.
+const FEED_WRITE_BATCH: usize = 512;
 
 /// Refcount + liveness for one shared remote tail. Every subscriber holds an
 /// `Arc`; the feeding task is aborted on drop of the last one, which drops
@@ -41,18 +47,23 @@ impl FeedHandle {
 
 impl Drop for FeedHandle {
     fn drop(&mut self) {
+        // Before the abort, like `retire`: a write hop the task already
+        // handed to the blocking pool, but that has not started, then writes
+        // nothing (see `FeedFile::append`).
+        self.alive.store(false, Ordering::SeqCst);
         self.task.abort();
     }
 }
 
-/// Held by the feeding task for its entire body. `JoinHandle::abort()` is
-/// cooperative: a task that is actively running (not suspended at an
-/// `.await`) finishes its current poll — including any in-flight
-/// synchronous `writeln!`/`flush()` — before the cancellation actually
-/// drops its future. Because Rust only runs a value's `Drop` once nothing
-/// is still executing inside it, this guard's `drop` is the one moment
-/// that is guaranteed to run *after* any write the task was mid-way
-/// through, on every exit path (normal stream end, panic, or abort alike).
+/// Shared, behind an `Arc`, by the feeding task for its entire body and by
+/// each write hop the task hands to the blocking pool, for that hop's whole
+/// run. `JoinHandle::abort()` drops the task's future at its next `.await`,
+/// which can be the await on a write hop that is already on the blocking
+/// pool — and that hop is not cancelled: it runs to completion. Its clone of
+/// this guard is what holds `finished` back until it has. `drop` runs only
+/// once the last holder is gone, so it is the one moment that is guaranteed
+/// to run *after* any write the feed started, on every exit path (normal
+/// stream end, panic, or abort alike).
 /// `subscribe` waits on `finished` before truncating the same cache file
 /// for a replacement feed, so a stale task's tail end can never land after
 /// the new feed has already started writing (spec §5.1: no duplicate
@@ -89,6 +100,9 @@ struct FeedEntry {
 
 pub(crate) struct LazyTailRegistry {
     exec: Arc<dyn RemoteExec>,
+    /// A tokio `Mutex`, because `subscribe` holds it across a hop to the
+    /// blocking pool: its re-check of the cache's `.complete` mark and the
+    /// feed it then installs must sit in one critical section (see there).
     feeds: Mutex<HashMap<PathBuf, FeedEntry>>,
 }
 
@@ -114,18 +128,22 @@ impl LazyTailRegistry {
     ///   Later subscribers share the running feed; a dead feed is replaced —
     ///   after confirming, via [`FeedDone`], that the old feed's task has
     ///   actually stopped writing.
+    ///
+    /// Its own disk work (the `.complete` checks, the cache directory) and
+    /// the feed's writes run on tokio's blocking pool.
     pub(crate) async fn subscribe(
         &self,
         remote: &str,
         cache: &Path,
     ) -> Result<Option<Arc<FeedHandle>>, RemoteExecError> {
-        if is_complete(cache) {
+        let path = cache.to_path_buf();
+        if off_runtime(move || Ok(is_complete(&path))).await? {
             return Ok(None);
         }
 
         // Fast path: an existing, live feed is shared without waiting.
         let wait_rx = {
-            let feeds = self.feeds.lock().unwrap();
+            let feeds = self.feeds.lock().await;
             match feeds.get(cache) {
                 Some(entry) => {
                     if let Some(existing) = entry.handle.upgrade() {
@@ -142,14 +160,14 @@ impl LazyTailRegistry {
         // No usable feed. A previous one may still be tearing down — wait
         // (bounded) for its `FeedDone` guard to fire before truncating the
         // same cache file underneath it; see `FeedDone`'s doc comment for
-        // why this is a real race, not a formality. Never await while
-        // holding the std `Mutex` (clippy::await_holding_lock) — the lock
-        // above is already released by the time we get here.
+        // why this is a real race, not a formality. Not under the lock: the
+        // wait can last `REPLACE_WAIT_TIMEOUT`, and every other cache's
+        // subscribe and retire would queue behind it.
         if let Some(mut rx) = wait_rx {
             let _ = tokio::time::timeout(REPLACE_WAIT_TIMEOUT, rx.wait_for(|done| *done)).await;
         }
 
-        let mut feeds = self.feeds.lock().unwrap();
+        let mut feeds = self.feeds.lock().await;
         // Dead entries are never otherwise removed, so the map would grow for
         // the process's lifetime. Prune on the slow path only — the fast path
         // above must stay lock-and-return.
@@ -157,8 +175,11 @@ impl LazyTailRegistry {
         // Re-check completeness UNDER the lock. The check at the top of this
         // function ran before the (awaited) wait for the old feed to stop, and
         // a terminal pull can write the `.complete` sidecar in that window. A
-        // complete cache is authoritative: never tail it.
-        if is_complete(cache) {
+        // complete cache is authoritative: never tail it. The lock is held
+        // across this hop, so no `retire` can slip between the check and the
+        // feed installed below. The same hop creates the cache's directory.
+        let path = cache.to_path_buf();
+        if off_runtime(move || prepare_cache(&path)).await? {
             return Ok(None);
         }
         // Someone else may have installed a fresh, live feed while we
@@ -171,56 +192,55 @@ impl LazyTailRegistry {
             }
         }
 
-        if let Some(dir) = cache.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
-        }
         let cmd = format!("tail -n +1 -F {}", shell_escape(remote));
-        let mut stream = self.exec.spawn_lines(&cmd)?;
+        let stream = self.exec.spawn_lines(&cmd)?;
         let alive = Arc::new(AtomicBool::new(true));
         let (finished_tx, finished_rx) = watch::channel(false);
         let done = FeedDone {
             alive: Arc::clone(&alive),
             finished: finished_tx,
         };
-        let cache_owned = cache.to_path_buf();
+        let mut out = FeedFile {
+            cache: cache.to_path_buf(),
+            file: None,
+        };
         let alive_task = Arc::clone(&alive);
         let task = tokio::spawn(async move {
-            // Held for the whole body: its `Drop` is what tells a
-            // replacing `subscribe` this task will never write again.
-            let _done = done;
-            use std::io::Write as _;
-            // Opened lazily on the first real line — see `subscribe`'s doc
-            // comment: until the remote has proven it can deliver, the
-            // already-collected partial content stays on disk untouched.
-            let mut file: Option<std::fs::File> = None;
-            while let Some(Ok(line)) = stream.next().await {
-                if parse_tail_marker(&line).is_some() || line.trim().is_empty() {
-                    continue;
-                }
-                if file.is_none() {
-                    // The cache became complete (terminal pull finished and
-                    // wrote the sidecar) while we waited for the first remote
-                    // line. The pull retired us or raced our spawn — never
-                    // truncate a complete file.
-                    if is_complete(&cache_owned) {
-                        alive_task.store(false, Ordering::SeqCst);
-                        return;
+            // Held for the whole body, and by each write hop for its own
+            // run: the last `Drop` is what tells a replacing `subscribe`
+            // this feed will never write again.
+            let done = Arc::new(done);
+            // One writer, in order: each hop is awaited before the next
+            // batch is read, and an aborted task starts no further hop.
+            let mut batches = stream.ready_chunks(FEED_WRITE_BATCH);
+            while let Some(batch) = batches.next().await {
+                let mut lines = Vec::with_capacity(batch.len());
+                let mut ended = false;
+                for item in batch {
+                    match item {
+                        Ok(line)
+                            if parse_tail_marker(&line).is_some() || line.trim().is_empty() => {}
+                        Ok(line) => lines.push(line),
+                        Err(_) => {
+                            ended = true;
+                            break;
+                        }
                     }
-                    // Truncate only now, on the first real line, so a feed that
-                    // never yields (host unreachable) leaves previously collected
-                    // content intact; the replay that follows starts from byte zero.
-                    if std::fs::File::create(&cache_owned).is_err() {
-                        return;
-                    }
-                    let Ok(opened) = std::fs::OpenOptions::new().append(true).open(&cache_owned)
-                    else {
-                        return;
-                    };
-                    file = Some(opened);
                 }
-                let Some(f) = file.as_mut() else { return };
-                if writeln!(f, "{line}").and_then(|_| f.flush()).is_err() {
-                    break;
+                if !lines.is_empty() {
+                    let (done, alive) = (Arc::clone(&done), Arc::clone(&alive_task));
+                    let hop = blocking_host(move || {
+                        let _done = done;
+                        let wrote = out.append(&lines, &alive);
+                        Ok((out, wrote))
+                    });
+                    match hop.await {
+                        Ok((back, true)) => out = back,
+                        _ => return,
+                    }
+                }
+                if ended {
+                    return;
                 }
             }
         });
@@ -262,18 +282,16 @@ impl LazyTailRegistry {
     ///
     /// Idempotent: retiring a path with no feed does nothing.
     pub(crate) async fn retire(&self, cache: &Path) {
-        let entry = {
-            let mut feeds = self.feeds.lock().unwrap();
-            feeds.remove(cache)
-        };
+        let entry = self.feeds.lock().await.remove(cache);
         let Some(entry) = entry else { return };
         // Before the abort lands, so `has_live_feed` and `subscribe`'s
         // liveness checks stop reporting this feed immediately.
         entry.alive.store(false, Ordering::SeqCst);
         entry.abort.abort();
-        // `abort()` is cooperative — a task mid-`writeln!` finishes that write
-        // first. Wait for its `FeedDone` guard, exactly as the replace path
-        // does, so the caller really is the only writer when this returns.
+        // A write hop the task already handed to the blocking pool is not
+        // cancelled by the abort; it finishes first. Wait for its `FeedDone`
+        // guard, exactly as the replace path does, so the caller really is
+        // the only writer when this returns.
         let mut rx = entry.finished;
         let _ = tokio::time::timeout(REPLACE_WAIT_TIMEOUT, rx.wait_for(|done| *done)).await;
     }
@@ -288,8 +306,8 @@ impl LazyTailRegistry {
     /// about to write `cache` ask this first: `pull_transcript` steps aside
     /// entirely (the feed is already filling the file), and the terminal pull
     /// retires the feed (`retire`) before its atomic rename.
-    pub(crate) fn has_live_feed(&self, cache: &Path) -> bool {
-        let feeds = self.feeds.lock().unwrap();
+    pub(crate) async fn has_live_feed(&self, cache: &Path) -> bool {
+        let feeds = self.feeds.lock().await;
         feeds
             .get(cache)
             .and_then(|e| e.handle.upgrade())
@@ -297,13 +315,91 @@ impl LazyTailRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn live_feeds(&self) -> usize {
+    pub(crate) async fn live_feeds(&self) -> usize {
         self.feeds
             .lock()
-            .unwrap()
+            .await
             .values()
             .filter(|e| e.handle.strong_count() > 0)
             .count()
+    }
+}
+
+/// Run `subscribe`'s disk work `f` on tokio's blocking pool
+/// ([`blocking_host`]). Either failure — `f`'s own, or a panic in it — means
+/// the feed could not be started: [`RemoteExecError::Spawn`].
+async fn off_runtime<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, RemoteExecError> {
+    let spawn_err = |e: &dyn std::fmt::Display| RemoteExecError::Spawn(e.to_string());
+    blocking_host(move || Ok(f()))
+        .await
+        .map_err(|e| spawn_err(&e))?
+        .map_err(|e| spawn_err(&e))
+}
+
+/// `subscribe`'s locked re-check: `true` when `cache` is complete, else
+/// make sure its directory exists for the feed about to fill it.
+fn prepare_cache(cache: &Path) -> std::io::Result<bool> {
+    if is_complete(cache) {
+        return Ok(true);
+    }
+    if let Some(dir) = cache.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(false)
+}
+
+/// The cache file a feed fills, carried by its task from one write hop to
+/// the next.
+struct FeedFile {
+    cache: PathBuf,
+    /// Opened lazily on the first real line — see `subscribe`'s doc comment:
+    /// until the remote has proven it can deliver, the already-collected
+    /// partial content stays on disk untouched.
+    file: Option<std::fs::File>,
+}
+
+impl FeedFile {
+    /// Append `lines` to the cache, in order: one write hop's blocking body.
+    /// `false` means the feed stops: it was told to before this hop ran
+    /// (`alive` cleared by `retire`, or by the last viewer leaving), the
+    /// cache turned complete before its first line, or the disk failed.
+    fn append(&mut self, lines: &[String], alive: &AtomicBool) -> bool {
+        use std::io::Write as _;
+        if !alive.load(Ordering::SeqCst) {
+            return false;
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                // The cache became complete (terminal pull finished and
+                // wrote the sidecar) while we waited for the first remote
+                // line. The pull retired us or raced our spawn — never
+                // truncate a complete file.
+                if is_complete(&self.cache) {
+                    return false;
+                }
+                // Truncate only now, on the first real line, so a feed that
+                // never yields (host unreachable) leaves previously collected
+                // content intact; the replay that follows starts from byte zero.
+                if std::fs::File::create(&self.cache).is_err() {
+                    return false;
+                }
+                let Ok(opened) = std::fs::OpenOptions::new().append(true).open(&self.cache) else {
+                    return false;
+                };
+                self.file.insert(opened)
+            }
+        };
+        let mut batch = String::new();
+        for line in lines {
+            batch.push_str(line);
+            batch.push('\n');
+        }
+        file.write_all(batch.as_bytes())
+            .and_then(|_| file.flush())
+            .is_ok()
     }
 }
 
@@ -453,12 +549,12 @@ mod tests {
             .unwrap();
         wait_for_content(&cache, "run_start").await;
         assert!(guard.alive());
-        assert_eq!(reg.live_feeds(), 1);
+        assert_eq!(reg.live_feeds().await, 1);
 
         reg.retire(&cache).await;
         assert!(!guard.alive(), "the still-held handle reports dead");
-        assert!(!reg.has_live_feed(&cache));
-        assert_eq!(reg.live_feeds(), 0, "the entry is gone");
+        assert!(!reg.has_live_feed(&cache).await);
+        assert_eq!(reg.live_feeds().await, 0, "the entry is gone");
 
         // …and the registry is clean enough to tail the file again.
         let second = reg
@@ -479,17 +575,23 @@ mod tests {
         let ex = exec(&[r#"{"type":"run_start"}"#], true);
         let reg = LazyTailRegistry::new(ex.clone());
 
-        assert!(!reg.has_live_feed(&cache), "no feed has been opened yet");
+        assert!(
+            !reg.has_live_feed(&cache).await,
+            "no feed has been opened yet"
+        );
         let guard = reg
             .subscribe("/r/run_01LIVE.jsonl", &cache)
             .await
             .unwrap()
             .unwrap();
         wait_for_content(&cache, "run_start").await;
-        assert!(reg.has_live_feed(&cache), "a held guard is a live feed");
+        assert!(
+            reg.has_live_feed(&cache).await,
+            "a held guard is a live feed"
+        );
         drop(guard);
         assert!(
-            !reg.has_live_feed(&cache),
+            !reg.has_live_feed(&cache).await,
             "the last guard is gone → no live feed"
         );
 
@@ -502,7 +604,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(!reg.has_live_feed(&done));
+        assert!(!reg.has_live_feed(&done).await);
     }
 
     #[tokio::test]
@@ -524,13 +626,17 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(ex.spawns.lock().unwrap().len(), 1);
-        assert_eq!(reg.live_feeds(), 1);
+        assert_eq!(reg.live_feeds().await, 1);
         wait_for_content(&cache, "run_start").await;
 
         drop(a);
-        assert_eq!(reg.live_feeds(), 1, "one holder left");
+        assert_eq!(reg.live_feeds().await, 1, "one holder left");
         drop(b);
-        assert_eq!(reg.live_feeds(), 0, "last holder gone → feed released");
+        assert_eq!(
+            reg.live_feeds().await,
+            0,
+            "last holder gone → feed released"
+        );
         // The partial cache stays on disk.
         assert!(cache.exists());
     }
@@ -594,6 +700,235 @@ mod tests {
             "{\"type\":\"run_start\"}\n",
             "replay from an empty file: no duplicate lines"
         );
+    }
+
+    /// The feed's cache writes (the first line's truncate + append open, then
+    /// every append) run on the blocking pool: parked on a FIFO cache, the
+    /// runtime keeps ticking. The stream ends after its one line, so the
+    /// feed's `FeedDone` fires once that line is written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_feed_writes_the_cache_off_the_runtime() {
+        use crate::host::runtime_liveness::{assert_runtime_live_while_parked_on, make_fifo};
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run_01FIFO.jsonl");
+        if !make_fifo(&cache) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+        let ex = exec(&[r#"{"type":"run_start"}"#], false);
+        let reg = LazyTailRegistry::new(ex.clone());
+
+        let _guard = reg
+            .subscribe("/r/run_01FIFO.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut finished = reg.feeds.lock().await[&cache].finished.clone();
+        let feed_done = async move {
+            let _ = finished.wait_for(|done| *done).await;
+        };
+        assert_runtime_live_while_parked_on(feed_done, &cache, true).await;
+    }
+
+    /// `retire` waits for a write the feed already handed to the blocking
+    /// pool: the abort does not cancel that hop, and the hop's clone of
+    /// `FeedDone` holds `finished` back until its write is done. Here the
+    /// hop is parked mid-`write_all` on a full FIFO when `retire` is called.
+    /// Multi-threaded, so the drain below still runs if a regression ever
+    /// puts that write back on a runtime thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_waits_for_a_write_hop_already_on_the_blocking_pool() {
+        use crate::host::runtime_liveness::make_fifo;
+        use rustix::fs::{Mode, OFlags};
+        use rustix::io::Errno;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run_01INFLIGHT.jsonl");
+        if !make_fifo(&cache) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+        // Held open, so the feed's opens return at once; read only when
+        // asked, so a line larger than the pipe's buffer parks its write.
+        let reader =
+            rustix::fs::open(&cache, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).unwrap();
+        let line = format!(r#"{{"type":"run_start","pad":"{}"}}"#, "x".repeat(1 << 20));
+        let ex = exec(&[line.as_str()], true);
+        let reg = LazyTailRegistry::new(ex.clone());
+        let guard = reg
+            .subscribe("/r/run_01INFLIGHT.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        let finished = reg.feeds.lock().await[&cache].finished.clone();
+
+        // The hop has started writing once the pipe holds a byte. Until its
+        // open, a read is EOF (no writer); after it, EAGAIN (nothing yet).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match rustix::io::read(&reader, &mut [0u8; 1]) {
+                Ok(1) => break,
+                Ok(_) | Err(Errno::AGAIN) => {}
+                Err(e) => panic!("reading the FIFO: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the feed never started writing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let retire = reg.retire(&cache);
+        tokio::pin!(retire);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut retire)
+                .await
+                .is_err(),
+            "retire returned while the feed's write hop was still writing"
+        );
+        assert!(!*finished.borrow());
+
+        // Drain the pipe: the write completes, the hop ends (closing the
+        // file, so the drain sees EOF) and drops its `FeedDone`.
+        let drain = std::thread::spawn(move || {
+            let (mut buf, mut total) = (vec![0u8; 64 * 1024], 1);
+            loop {
+                match rustix::io::read(&reader, &mut buf[..]) {
+                    Ok(0) => return total,
+                    Ok(n) => total += n,
+                    Err(Errno::AGAIN) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Err(e) => panic!("draining the FIFO: {e}"),
+                }
+            }
+        });
+        retire.await;
+        assert!(
+            *finished.borrow(),
+            "retire returned before the feed's FeedDone fired"
+        );
+        assert!(!guard.alive());
+        assert_eq!(
+            drain.join().unwrap(),
+            line.len() + 1,
+            "the in-flight write finished whole"
+        );
+    }
+
+    /// `subscribe`'s first `.complete` check (a `stat`, which no FIFO can
+    /// park) waits for the blocking pool.
+    #[test]
+    fn subscribe_checks_completeness_off_the_runtime() {
+        use crate::host::runtime_liveness::{
+            assert_waits_for_the_blocking_pool, one_blocking_thread_runtime, HeldBlockingThread,
+        };
+        one_blocking_thread_runtime().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = tmp.path().join("run_01CHECK.jsonl");
+            std::fs::write(&cache, "{\"type\":\"run_start\"}\n").unwrap();
+            std::fs::write(crate::host::transcript_paths::complete_marker(&cache), b"").unwrap();
+            let ex = exec(&[], true);
+            let reg = LazyTailRegistry::new(ex.clone());
+
+            let held = HeldBlockingThread::hold();
+            let sub = reg.subscribe("/r/run_01CHECK.jsonl", &cache);
+            let got = assert_waits_for_the_blocking_pool(sub, held).await;
+
+            assert!(got.unwrap().is_none(), "a complete cache is not tailed");
+            assert!(ex.spawns.lock().unwrap().is_empty());
+        });
+    }
+
+    /// `subscribe`'s locked re-check and the cache directory it makes (a
+    /// `stat` and a `mkdir`) wait for the blocking pool, under the lock.
+    #[test]
+    fn subscribe_rechecks_and_makes_the_cache_dir_off_the_runtime() {
+        use crate::host::runtime_liveness::{
+            assert_waits_for_the_blocking_pool, one_blocking_thread_runtime, HeldBlockingThread,
+        };
+        one_blocking_thread_runtime().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = tmp.path().join("mirror/h/transcripts/run_01DIR.jsonl");
+            let ex = exec(&[], true);
+            let reg = LazyTailRegistry::new(ex.clone());
+
+            // Taking the lock first parks `subscribe` on it once its first
+            // hop is done (the blocking thread is still free for that one);
+            // the thread is held before the lock is let go, so the hop after
+            // the lock queues behind it.
+            let lock = reg.feeds.lock().await;
+            let sub = reg.subscribe("/r/run_01DIR.jsonl", &cache);
+            tokio::pin!(sub);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut sub)
+                    .await
+                    .is_err(),
+                "subscribe waits for the registry lock"
+            );
+            let held = HeldBlockingThread::hold();
+            drop(lock);
+            let got = assert_waits_for_the_blocking_pool(sub, held).await;
+
+            assert!(got.unwrap().is_some(), "a feed was started");
+            assert!(cache.parent().unwrap().is_dir());
+            assert_eq!(ex.spawns.lock().unwrap().len(), 1);
+        });
+    }
+
+    /// A write hop that has not started when its feed is told to stop —
+    /// retired, or its last viewer gone — writes nothing: the stop at the
+    /// next await point that an abort gave the inline writes. The hop waits
+    /// here behind the runtime's only blocking thread, held until the feed
+    /// has been stopped.
+    #[test]
+    fn a_write_hop_that_starts_after_its_feed_stopped_writes_nothing() {
+        use crate::host::runtime_liveness::{one_blocking_thread_runtime, HeldBlockingThread};
+        for retired in [true, false] {
+            one_blocking_thread_runtime().block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cache = tmp.path().join("run_01QUEUED.jsonl");
+                std::fs::write(&cache, "COLLECTED EARLIER\n").unwrap();
+                let ex = exec(&[r#"{"type":"run_start"}"#], true);
+                let reg = LazyTailRegistry::new(ex.clone());
+                let guard = reg
+                    .subscribe("/r/run_01QUEUED.jsonl", &cache)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut finished = reg.feeds.lock().await[&cache].finished.clone();
+
+                // Held before the feed task first runs, so its write hop
+                // queues behind it.
+                let held = HeldBlockingThread::hold();
+                // Single-threaded: the feed task runs (and queues its hop)
+                // before this sleep's timer is serviced.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(!*finished.borrow(), "the feed's hop is still queued");
+
+                let retire = reg.retire(&cache);
+                tokio::pin!(retire);
+                if retired {
+                    // One poll: clears `alive` and aborts, then waits.
+                    let _ = tokio::time::timeout(std::time::Duration::ZERO, &mut retire).await;
+                } else {
+                    drop(guard);
+                }
+                held.release().await;
+                if retired {
+                    retire.await;
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    finished.wait_for(|done| *done),
+                )
+                .await
+                .expect("the stopped feed's FeedDone fired")
+                .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(&cache).unwrap(),
+                    "COLLECTED EARLIER\n",
+                    "retired: {retired} — the queued hop neither truncated nor wrote"
+                );
+            });
+        }
     }
 
     #[tokio::test]

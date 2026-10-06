@@ -447,7 +447,7 @@ impl HostConnector for TunnelHostConnector {
         &self,
         path: &str,
     ) -> Result<serde_json::Value, HostConnectorError> {
-        read_transcript_file(path)
+        read_transcript_file(path).await
     }
 
     /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
