@@ -189,6 +189,13 @@ pub struct DefaultStepFactory {
     /// its agent declares no `fallbacks:`, and the server-side-fallback
     /// toggle for the step's provider and its hops.
     pub recovery: rupu_config::RecoveryConfig,
+    /// Coverage/findings scope every step reports under. `None` (the
+    /// default for every ordinary workflow run) keeps the historical
+    /// per-workflow scope — the workflow's own name. `Some(name)` is set
+    /// only by an agentiflow-launched workflow unit (`rupu workflow run
+    /// --fleet-run-dir`), so its steps' findings pool into the agentiflow's
+    /// scope instead of the workflow's.
+    pub scope_name_override: Option<String>,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -562,7 +569,13 @@ impl StepFactory for DefaultStepFactory {
             // All steps of a workflow share the same target_id (keyed on the
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.
-            scope_name: Some(self.workflow.name.clone()),
+            // An agentiflow-launched workflow unit overrides it so its steps
+            // pool into the agentiflow's scope; every other run stays on the
+            // workflow's own name.
+            scope_name: self
+                .scope_name_override
+                .clone()
+                .or_else(|| Some(self.workflow.name.clone())),
             // Workflow steps must report as "workflow" surface so coverage
             // FileTouchEvents are correctly attributed; the runner defaults
             // to "agent" when this is None.
@@ -1329,6 +1342,7 @@ steps:
             limits_ctx,
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
         }
     }
 
@@ -1415,6 +1429,49 @@ steps:
             Some(vec!["issues.list".to_string()]),
             "actions: [issues.list] must narrow the agent's [issues.list, issues.create] grant"
         );
+    }
+
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn step_scope_is_the_workflow_name_unless_overridden() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+
+        // Default (`None`): the historical per-workflow scope — unchanged.
+        let f = factory(tmp.path().to_path_buf());
+        assert_eq!(f.scope_name_override, None);
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(opts.scope_name, Some("w".to_string()));
+
+        // An agentiflow-launched workflow unit pools into the agentiflow scope.
+        let mut f = factory(tmp.path().to_path_buf());
+        f.scope_name_override = Some("af_123".to_string());
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(opts.scope_name, Some("af_123".to_string()));
     }
 
     // `#[serial]`: reaches the provider factory (reads
@@ -2002,6 +2059,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -2064,6 +2122,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -2150,6 +2209,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
@@ -2355,6 +2415,7 @@ steps:
             ),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
         };
         // The account `acct-x` is declared as kind `openai` — a builtin
         // vendor, but a name the factory's dispatch `match` would never
@@ -2429,6 +2490,7 @@ steps:
             ),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
         }
     }
 

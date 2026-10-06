@@ -451,6 +451,9 @@ async fn rebuild_opts_from_disk(
         limits_ctx,
         providers: cfg.providers.clone(),
         recovery: cfg.recovery.clone(),
+        // A resumed run is never an agentiflow unit (workflow units refuse
+        // gated workflows), so it keeps the workflow's own scope.
+        scope_name_override: None,
     });
 
     // Rebuild the `run:` step policy from the resolved mode + layered config
