@@ -118,7 +118,8 @@ That lookup is `rupu_cp::api::findings::tag_findings_across(global_dir, ids, add
 - `ledger::query` is the one filter, shared by the agent tool, MCP, CLI and CP. It has two entry points: `select(items, record_of, &FindingQuery)` returns every match unpaged (CLI, CP), and `query(records, &FindingQuery) -> Page` pages the matches (agent tool, MCP). The query fields:
   - `tags` + `tag_mode` (`all` by default, or `any`);
   - `untagged`, which can't be combined with `tags`;
-  - `min_severity`, `concern_id`, `file_prefix`, `run_id`;
+  - `min_severity`, `concern_id`, `file_prefix`;
+  - run scoping, `run_ids`, is **CLI/CP only**: `--run` resolves the run plus its sub-runs into a set of run ids, which is `serde(skip)` on `FindingQuery`. The agent tool and MCP input omit it (an agent or workflow step can't filter by run); their rows carry `run_id` instead;
   - `limit` and `cursor`.
   - `limit` and `cursor` apply to `query` only.
   - Results are ordered by severity, then `declared_at` descending, then id — the same order the CP list already uses.
@@ -140,7 +141,7 @@ That lookup is `rupu_cp::api::findings::tag_findings_across(global_dir, ids, add
 There are two new built-ins: `query_findings` and `tag_findings`. Like `report_finding`, they are **explicit grants**: they are registered only when the agent's `tools:` lists them. A `coverage:` block does *not* register them automatically. The registration sits next to the `report_finding` opt-in in `runner.rs`.
 
 - **`query_findings`**
-  - Input is a `FindingQuery`. `limit` defaults to 50 and is capped at 500; `cursor` is optional.
+  - Input is a `FindingQuery` without run scoping (see above). `limit` defaults to 50 and is capped at 500; `cursor` is optional.
   - It returns `{rows, next_cursor, tags_in_use}`, so a single call gives the agent both the findings and the existing vocabulary.
   - Each row is slim: id, title (or summary), severity, location (file and line range, or target ref), concern_id, tags, declared_at.
   - Scope is every target ledger under the agent's own workspace `.rupu/coverage/`. An agent can't see or tag findings in other workspaces.
