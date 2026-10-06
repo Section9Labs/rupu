@@ -5128,6 +5128,7 @@ dependencies = [
  "ignore",
  "predicates",
  "rand 0.8.6",
+ "rupu-config",
  "rupu-runtime",
  "serde",
  "serde_json",

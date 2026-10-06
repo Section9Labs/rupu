@@ -27,6 +27,7 @@ hex.workspace = true
 subtle.workspace = true
 tempfile.workspace = true
 rupu-runtime = { path = "../rupu-runtime" }
+rupu-config = { path = "../rupu-config" }
 
 [dev-dependencies]
 serial_test.workspace = true

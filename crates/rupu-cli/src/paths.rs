@@ -16,18 +16,9 @@ pub fn global_dir() -> Result<PathBuf> {
 
 /// Walk up from `pwd` looking for the first `.rupu/` directory. Returns
 /// `Some(path)` of the directory containing it, or `None` if not found.
+/// The walk lives in `rupu_workspace` so the CP resolves identically.
 pub fn project_root_for(pwd: &Path) -> Result<Option<PathBuf>> {
-    let canonical = pwd
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", pwd.display()))?;
-    let mut cursor: Option<&Path> = Some(&canonical);
-    while let Some(dir) = cursor {
-        if dir.join(".rupu").is_dir() {
-            return Ok(Some(dir.to_path_buf()));
-        }
-        cursor = dir.parent();
-    }
-    Ok(None)
+    rupu_workspace::project_root_for(pwd).with_context(|| format!("canonicalize {}", pwd.display()))
 }
 
 /// Pick the transcripts directory. Project-local when
@@ -152,56 +143,7 @@ pub fn ensure_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The config files one load layers: global, the customer of the project
-/// (if assigned), and the project's `.rupu/config.toml`. Spec:
-/// `docs/superpowers/specs/2026-10-06-rupu-customers-design.md` §2.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigPaths {
-    pub global: PathBuf,
-    pub customer: Option<PathBuf>,
-    pub project: Option<PathBuf>,
-}
-
-impl ConfigPaths {
-    pub fn layers(&self) -> rupu_config::LayerPaths<'_> {
-        rupu_config::LayerPaths::new(
-            Some(&self.global),
-            self.customer.as_deref(),
-            self.project.as_deref(),
-        )
-    }
-
-    fn without_customer(global: &Path, project_root: Option<&Path>) -> Self {
-        Self {
-            global: global.join("config.toml"),
-            customer: None,
-            project: project_config_path(global, project_root),
-        }
-    }
-}
-
-/// The project layer's config file for `project_root`, or `None` when there
-/// is no project root or its `.rupu/` IS the global dir.
-///
-/// `project_root_for` treats `~/.rupu` as a project marker, so a repo
-/// without its own `.rupu/` resolves to `$HOME`, whose "project config" is
-/// the global `config.toml` itself. Loading that file a second time as the
-/// project layer let global values outrank the customer layer (project beats
-/// customer), so the layer is dropped there. Paths are compared
-/// canonicalized, or raw when either side cannot be canonicalized.
-fn project_config_path(global: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
-    let root = project_root?;
-    let project_dir = root.join(".rupu");
-    let same = match (project_dir.canonicalize(), global.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => project_dir == global,
-    };
-    if same {
-        None
-    } else {
-        Some(project_dir.join("config.toml"))
-    }
-}
+pub use rupu_workspace::ConfigPaths;
 
 /// Layer paths for a load that serves a project. The customer is the one
 /// assigned to the nearest ancestor of `run_dir` (the directory the run or
@@ -222,17 +164,7 @@ pub fn config_paths(
     project_root: Option<&Path>,
     run_dir: &Path,
 ) -> Result<ConfigPaths> {
-    let store = rupu_workspace::CustomerStore::new(global);
-    let mut customer = store.customer_config_for_dir(run_dir)?;
-    if customer.is_none() {
-        if let Some(root) = project_root {
-            customer = store.customer_config_for_dir(root)?;
-        }
-    }
-    Ok(ConfigPaths {
-        customer,
-        ..ConfigPaths::without_customer(global, project_root)
-    })
+    Ok(rupu_workspace::config_paths(global, project_root, run_dir)?)
 }
 
 /// [`config_paths`] for display-only reads (UI preferences, pricing tables,
@@ -361,93 +293,6 @@ mod customer_layer_tests {
             )
             .unwrap();
         store.assign("acme", ProjectRef::Path(project)).unwrap();
-    }
-
-    #[test]
-    fn config_paths_includes_the_customer_of_the_project_root() {
-        let (_t, home, project) = setup();
-        assign(&home, &project);
-        let p = config_paths(&home, Some(&project), Path::new("/")).unwrap();
-        assert_eq!(p.global, home.join("config.toml"));
-        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
-        assert_eq!(p.project, Some(project.join(".rupu/config.toml")));
-    }
-
-    #[test]
-    fn the_global_dir_is_never_also_the_project_layer() {
-        // `project_root_for` resolves a repo without its own `.rupu/` to
-        // `$HOME`, whose `.rupu` is the global dir: its config.toml must not
-        // be loaded a second time as the project layer.
-        let tmp = tempfile::tempdir().unwrap();
-        let global = tmp.path().join(".rupu");
-        std::fs::create_dir_all(&global).unwrap();
-        let p = config_paths(&global, Some(tmp.path()), tmp.path()).unwrap();
-        assert_eq!(p.global, global.join("config.toml"));
-        assert_eq!(p.project, None);
-        // Also through a non-canonical spelling of the same directory.
-        let dotted = tmp.path().join("sub/..");
-        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
-        let p = config_paths(&global, Some(&dotted), tmp.path()).unwrap();
-        assert_eq!(p.project, None);
-        // A root whose `.rupu` is a symlink to the global dir (canonical
-        // compare, not a textual one).
-        #[cfg(unix)]
-        {
-            let alias = tmp.path().join("alias");
-            std::fs::create_dir_all(&alias).unwrap();
-            std::os::unix::fs::symlink(&global, alias.join(".rupu")).unwrap();
-            let p = config_paths(&global, Some(&alias), &alias).unwrap();
-            assert_eq!(p.project, None);
-        }
-        // A normal project root still yields its own config.
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(proj.join(".rupu")).unwrap();
-        let p = config_paths(&global, Some(&proj), &proj).unwrap();
-        assert_eq!(p.project, Some(proj.join(".rupu/config.toml")));
-    }
-
-    #[test]
-    fn config_paths_falls_back_to_the_run_dir_without_a_project_root() {
-        let (_t, home, project) = setup();
-        assign(&home, &project);
-        let p = config_paths(&home, None, &project).unwrap();
-        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
-        assert_eq!(p.project, None);
-    }
-
-    #[test]
-    fn config_paths_looks_up_from_the_run_dir_before_the_project_root() {
-        // `project_root_for` resolves to $HOME (which has `~/.rupu`) for any
-        // repo without its own `.rupu/`; the repo's own assignment must win.
-        let (_t, home, fake_home) = setup();
-        let repo = fake_home.join("code/repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        assign(&home, &repo);
-        let p = config_paths(&home, Some(&fake_home), &repo).unwrap();
-        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
-        assert_eq!(p.project, Some(fake_home.join(".rupu/config.toml")));
-
-        // Even when the project root has a customer of its own.
-        let store = CustomerStore::new(&home);
-        store
-            .create(
-                "homeco",
-                &NewCustomer {
-                    name: "Home".into(),
-                    ..NewCustomer::default()
-                },
-            )
-            .unwrap();
-        store
-            .assign("homeco", ProjectRef::Path(&fake_home))
-            .unwrap();
-        let p = config_paths(&home, Some(&fake_home), &repo).unwrap();
-        assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
-        // An unassigned run dir falls back to the project root's customer.
-        let elsewhere = fake_home.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        let p = config_paths(&home, Some(&fake_home), &elsewhere).unwrap();
-        assert_eq!(p.customer, Some(home.join("customers/homeco/config.toml")));
     }
 
     #[test]

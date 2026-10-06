@@ -72,26 +72,13 @@ async fn get_config(
     Query(q): Query<ProjectQuery>,
 ) -> ApiResult<Json<ConfigView>> {
     let global = s.global_dir.join("config.toml");
-    let (project_path, customer_path) = match &q.project {
-        Some(id) => {
-            let ws = load_ws(&s, id)?;
-            (
-                // A workspace whose root is the global dir's parent (`$HOME`)
-                // has the global config file as its "project config": that
-                // is no project layer — loading it again would let global
-                // values outrank the customer layer.
-                Some(project_config_path_of(&ws)?).filter(|p| !is_same_file(p, &global)),
-                project_customer_config_path(&s, &ws)?,
-            )
-        }
-        None => (None, None),
+    let layers = match &q.project {
+        Some(id) => project_layers(&s, &load_ws(&s, id)?)?,
+        None => rupu_workspace::ConfigPaths::without_customer(&s.global_dir, None),
     };
-    let resolved = rupu_config::resolve(rupu_config::LayerPaths::new(
-        Some(&global),
-        customer_path.as_deref(),
-        project_path.as_deref(),
-    ))
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let project_path = layers.project.clone();
+    let resolved =
+        rupu_config::resolve(layers.layers()).map_err(|e| ApiError::internal(e.to_string()))?;
     let raw_global = std::fs::read_to_string(&global).unwrap_or_default();
     let raw_project = project_path
         .as_deref()
@@ -190,7 +177,13 @@ async fn put_project(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_writable(&s)?;
     let path = project_config_path(&s, &id)?;
-    if is_same_file(&path, &s.global_dir.join("config.toml")) {
+    // The shared rule (`rupu_workspace::ConfigPaths`): a project whose
+    // `.rupu/` is the global dir has no project layer of its own.
+    let root = ws_root(&load_ws(&s, &id)?)?;
+    if rupu_workspace::ConfigPaths::without_customer(&s.global_dir, Some(&root))
+        .project
+        .is_none()
+    {
         return Err(ApiError::bad_request(format!(
             "this project's config is the global config ({}); edit it as the global config",
             path.display()
@@ -263,10 +256,7 @@ fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
 
 /// [`project_config_path`] for an already-loaded workspace record.
 fn project_config_path_of(ws: &rupu_workspace::Workspace) -> ApiResult<PathBuf> {
-    let root = Path::new(&ws.path);
-    let root_canon = root
-        .canonicalize()
-        .map_err(|e| ApiError::bad_request(format!("project path invalid: {e}")))?;
+    let root_canon = ws_root(ws)?;
     let candidate = root_canon.join(".rupu").join("config.toml");
     if !candidate.starts_with(&root_canon) {
         return Err(ApiError::bad_request("config path escapes project root"));
@@ -274,13 +264,11 @@ fn project_config_path_of(ws: &rupu_workspace::Workspace) -> ApiResult<PathBuf> 
     Ok(candidate)
 }
 
-/// Whether `a` and `b` name the same file: canonicalized when both exist,
-/// else compared raw.
-fn is_same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
-    }
+/// The canonicalized root of project `ws`; 400 when its path is invalid.
+fn ws_root(ws: &rupu_workspace::Workspace) -> ApiResult<PathBuf> {
+    Path::new(&ws.path)
+        .canonicalize()
+        .map_err(|e| ApiError::bad_request(format!("project path invalid: {e}")))
 }
 
 /// The workspace record of project `id`: the id is validated first (the
@@ -297,15 +285,17 @@ fn load_ws(s: &AppState, id: &str) -> ApiResult<rupu_workspace::Workspace> {
     }
 }
 
-/// The customer layer of project `ws`, if it is assigned — the same lookup
-/// a run in that project makes. A dangling assignment is an error (500),
-/// matching the run, which would fail too.
-fn project_customer_config_path(
+/// The layers a run in project `ws` would load, through the one resolver
+/// the CLI uses (`rupu_workspace::config_paths`): global, the project's
+/// customer and its `.rupu/config.toml` (absent when that is the global
+/// dir). A dangling customer assignment is an error (500), matching the
+/// run, which would fail too.
+fn project_layers(
     s: &AppState,
     ws: &rupu_workspace::Workspace,
-) -> ApiResult<Option<PathBuf>> {
-    rupu_workspace::CustomerStore::new(&s.global_dir)
-        .customer_config_for_dir(Path::new(&ws.path))
+) -> ApiResult<rupu_workspace::ConfigPaths> {
+    let root = ws_root(ws)?;
+    rupu_workspace::config_paths(&s.global_dir, Some(&root), Path::new(&ws.path))
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
