@@ -1,0 +1,388 @@
+//! `rupu customer` — group projects under a customer whose config layer sits
+//! between global and project. Thin: argument parsing, then
+//! `rupu_workspace::CustomerStore`. Spec:
+//! `docs/superpowers/specs/2026-10-06-rupu-customers-design.md`.
+
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput};
+use crate::paths;
+use clap::Subcommand;
+use comfy_table::Cell;
+use rupu_workspace::{CustomerStore, MetaPatch, NewCustomer, ProjectRef};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[derive(Subcommand, Debug)]
+pub enum Action {
+    /// List customers.
+    List {
+        /// Include archived customers.
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Metadata, assigned projects, and the customer's effective config.
+    Show {
+        slug: String,
+    },
+    /// Create a customer.
+    Create {
+        slug: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        contact: Option<String>,
+        /// `#rrggbb`.
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// Change metadata. An empty value clears `--notes`, `--contact`, `--color`.
+    Set {
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        contact: Option<String>,
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// Edit the customer's config layer in $EDITOR (validated on save).
+    Edit {
+        slug: String,
+        /// Editor command; defaults to `[ui].editor`, then $VISUAL / $EDITOR.
+        #[arg(long)]
+        editor: Option<String>,
+    },
+    /// Hide a customer from pickers; its projects keep running.
+    Archive {
+        slug: String,
+    },
+    Unarchive {
+        slug: String,
+    },
+    /// Delete a customer. Refused while any project is assigned.
+    Delete {
+        slug: String,
+    },
+    /// Assign a project (default: the current directory).
+    Assign {
+        slug: String,
+        /// A project directory or workspace id (`ws_…`).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Remove a project's customer (default: the current directory).
+    Unassign {
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
+    match handle_inner(action, format) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => crate::output::diag::fail(e),
+    }
+}
+
+fn store() -> anyhow::Result<CustomerStore> {
+    Ok(CustomerStore::new(paths::global_dir()?))
+}
+
+/// `--project` as given, else the CURRENT DIRECTORY. Never the nearest
+/// `.rupu/` root: `~/.rupu` is the global dir, so from a repo without its own
+/// `.rupu/` that walk lands on `$HOME` and would assign the whole home
+/// directory. A run looks its customer up by walking up from its own
+/// directory, so the cwd (normally the repo root) is the right record.
+fn project_dir(project: Option<&str>) -> anyhow::Result<ProjectArg> {
+    match project {
+        Some(p) if p.starts_with("ws_") => Ok(ProjectArg::Id(p.to_string())),
+        Some(p) => Ok(ProjectArg::Path(PathBuf::from(p))),
+        None => Ok(ProjectArg::Path(std::env::current_dir()?)),
+    }
+}
+
+enum ProjectArg {
+    Path(PathBuf),
+    Id(String),
+}
+
+impl ProjectArg {
+    fn as_ref(&self) -> ProjectRef<'_> {
+        match self {
+            ProjectArg::Path(p) => ProjectRef::Path(p),
+            ProjectArg::Id(id) => ProjectRef::Id(id),
+        }
+    }
+}
+
+fn handle_inner(action: Action, format: Option<OutputFormat>) -> anyhow::Result<()> {
+    let store = store()?;
+    match action {
+        Action::List { archived } => list(&store, archived, format),
+        Action::Show { slug } => show(&store, &slug),
+        Action::Create {
+            slug,
+            name,
+            notes,
+            contact,
+            color,
+        } => {
+            let c = store.create(
+                &slug,
+                &NewCustomer {
+                    name,
+                    notes,
+                    contact,
+                    color,
+                },
+            )?;
+            println!("created customer {} ({})", c.slug, c.meta.name);
+            println!("config layer: {}", store.config_path(&c.slug).display());
+            Ok(())
+        }
+        Action::Set {
+            slug,
+            name,
+            notes,
+            contact,
+            color,
+        } => {
+            store.update_meta(
+                &slug,
+                &MetaPatch {
+                    name,
+                    notes,
+                    contact,
+                    color,
+                },
+            )?;
+            Ok(())
+        }
+        Action::Edit { slug, editor } => edit(&store, &slug, editor.as_deref()),
+        Action::Archive { slug } => store
+            .set_archived(&slug, true)
+            .map(|_| ())
+            .map_err(Into::into),
+        Action::Unarchive { slug } => store
+            .set_archived(&slug, false)
+            .map(|_| ())
+            .map_err(Into::into),
+        Action::Delete { slug } => {
+            store.delete(&slug)?;
+            println!("deleted customer {slug}");
+            Ok(())
+        }
+        Action::Assign { slug, project } => {
+            let target = project_dir(project.as_deref())?;
+            let ws = store.assign(&slug, target.as_ref())?;
+            println!("assigned {} ({}) to {slug}", ws.path, ws.id);
+            Ok(())
+        }
+        Action::Unassign { project } => {
+            let target = project_dir(project.as_deref())?;
+            let ws = store.unassign(target.as_ref())?;
+            println!("unassigned {} ({})", ws.path, ws.id);
+            Ok(())
+        }
+    }
+}
+
+/// Open the layer in the editor; on a parse/validation error, say why and
+/// offer to re-open, so a typo never leaves a layer that fails every run.
+fn edit(store: &CustomerStore, slug: &str, editor: Option<&str>) -> anyhow::Result<()> {
+    store.get(slug)?;
+    let path = store.config_path(slug);
+    loop {
+        crate::cmd::editor::open_for_edit(editor, &path)?;
+        match rupu_config::layer_files(rupu_config::LayerPaths::new(None, Some(&path), None)) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                eprintln!("{} is invalid: {e}", path.display());
+                if !confirm_reopen()? {
+                    anyhow::bail!(
+                        "left {} invalid — every run of {slug}'s projects will fail until it is fixed",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn confirm_reopen() -> anyhow::Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!("re-open the editor? [Y/n] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(!line.trim().eq_ignore_ascii_case("n"))
+}
+
+fn show(store: &CustomerStore, slug: &str) -> anyhow::Result<()> {
+    let c = store.get(slug)?;
+    println!("{} — {}", c.slug, c.meta.name);
+    if c.meta.archived {
+        println!("archived");
+    }
+    for (label, v) in [
+        ("contact", &c.meta.contact),
+        ("color", &c.meta.color),
+        ("notes", &c.meta.notes),
+    ] {
+        if let Some(v) = v {
+            println!("{label}: {v}");
+        }
+    }
+    println!("created: {}", c.meta.created_at);
+
+    let projects = store.projects_of(slug)?;
+    println!("\nprojects ({}):", projects.len());
+    for ws in &projects {
+        println!("  {}  {}", ws.id, ws.path);
+    }
+
+    let global = paths::global_dir()?.join("config.toml");
+    let layer = store.config_path(slug);
+    println!("\nconfig layer: {}", layer.display());
+    print_effective(&global, &layer)
+}
+
+/// Effective config for a project of this customer that sets nothing
+/// itself: every key the global or customer layer sets, its value, where it
+/// came from, and who locks it.
+fn print_effective(global: &Path, layer: &Path) -> anyhow::Result<()> {
+    let r = rupu_config::resolve(rupu_config::LayerPaths::new(
+        Some(global),
+        Some(layer),
+        None,
+    ))?;
+    let flat = toml::Value::try_from(&r.config)?;
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["KEY", "VALUE", "SOURCE", "LOCKED BY"]);
+    for (key, prov) in &r.provenance {
+        let value = lookup_dotted(&flat, key)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        table.add_row(vec![
+            Cell::new(key),
+            Cell::new(value),
+            Cell::new(format!("{:?}", prov.source).to_lowercase()),
+            Cell::new(
+                prov.locked_by
+                    .map(|o| format!("{o:?}").to_lowercase())
+                    .unwrap_or_else(|| "-".into()),
+            ),
+        ]);
+    }
+    println!("{table}");
+    for w in &r.warnings {
+        println!("warning: {w}");
+    }
+    Ok(())
+}
+
+/// Walk a provenance key. Decoded with the CP write path's
+/// `split_dotted_key` — the canonical decoder of the dotted-key contract —
+/// never a naive `split('.')` (a model id like `GLM-5.2-FP8` is one segment).
+fn lookup_dotted<'a>(v: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    let segs = rupu_cp::config_write::split_dotted_key(key).ok()?;
+    segs.iter().try_fold(v, |cur, seg| cur.get(seg.as_str()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CustomerRow {
+    slug: String,
+    name: String,
+    projects: usize,
+    archived: bool,
+    color: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CustomersReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<CustomerRow>,
+}
+
+struct CustomersOutput {
+    report: CustomersReport,
+}
+
+impl CollectionOutput for CustomersOutput {
+    type JsonReport = CustomersReport;
+    type CsvRow = CustomerRow;
+
+    fn command_name(&self) -> &'static str {
+        "customer list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["slug", "name", "projects", "archived", "color"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["SLUG", "NAME", "PROJECTS", "ARCHIVED", "COLOR"]);
+        for r in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(&r.slug),
+                Cell::new(&r.name),
+                Cell::new(r.projects),
+                Cell::new(if r.archived { "yes" } else { "" }),
+                Cell::new(&r.color),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+fn list(store: &CustomerStore, archived: bool, format: Option<OutputFormat>) -> anyhow::Result<()> {
+    let mut rows = Vec::new();
+    for c in store.list(archived)? {
+        rows.push(CustomerRow {
+            projects: store.projects_of(&c.slug)?.len(),
+            name: c.meta.name,
+            archived: c.meta.archived,
+            color: c.meta.color.unwrap_or_default(),
+            slug: c.slug,
+        });
+    }
+    report::emit_collection(
+        format,
+        &CustomersOutput {
+            report: CustomersReport {
+                kind: "customers",
+                version: 1,
+                rows,
+            },
+        },
+    )
+}
+
+/// Which output formats each action supports: `list` has a collection report;
+/// everything else prints plain text.
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List { .. } => ("customer list", report::TABLE_JSON_CSV),
+        _ => ("customer", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
