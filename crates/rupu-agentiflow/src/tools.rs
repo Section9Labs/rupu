@@ -393,7 +393,8 @@ impl Tool for MsgSend {
     fn description(&self) -> &'static str {
         "Send a message. `to` is a participant id, a role, \"parent\", or \
          \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every \
-         participant sees it once, from the moment it started listening)."
+         participant sees it once, from the moment it started listening; the \
+         broadcast log is capped per run, so don't spam it)."
     }
 
     fn input_schema(&self) -> Value {

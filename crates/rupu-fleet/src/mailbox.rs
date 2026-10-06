@@ -83,6 +83,13 @@ impl Mailbox {
     }
 
     pub fn send(&self, to: &str, msg: &FleetMessage, cap: usize) -> Result<(), FleetError> {
+        // `broadcast` is not a direct inbox: a plain `send` there would write a
+        // file nobody drains. Callers broadcast via `broadcast_send`.
+        if to == BROADCAST {
+            return Err(FleetError::NotAnInbox {
+                channel: to.to_string(),
+            });
+        }
         let path = self.inbox_path(to);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
@@ -378,6 +385,18 @@ mod tests {
         mb.send("heron", &msg("a"), 1).unwrap();
         let err = mb.send("heron", &msg("b"), 1).unwrap_err();
         assert!(matches!(err, FleetError::InboxFull { cap: 1, .. }));
+    }
+
+    #[test]
+    fn send_to_broadcast_is_refused() {
+        // A plain `send` to the broadcast channel would write a file nobody
+        // drains; it must be refused so callers use `broadcast_send`.
+        let tmp = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(tmp.path());
+        let err = mb.send("broadcast", &msg("x"), 64).unwrap_err();
+        assert!(matches!(err, FleetError::NotAnInbox { .. }), "{err:?}");
+        // and nothing was written to a would-be broadcast inbox
+        assert!(mb.drain("broadcast").unwrap().is_empty());
     }
 
     /// Regression for "a concurrent send is never lost": a `send` that opened

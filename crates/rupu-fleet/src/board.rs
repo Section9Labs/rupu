@@ -44,7 +44,7 @@ impl Board {
     ///
     /// Contention never surfaces as `Err`: under any number of concurrent
     /// claimants exactly one is `Granted` and the rest are `Denied`. Reaping an
-    /// expired lease is serialized per key by an `O_EXCL` mutex so a claimant
+    /// expired lease is serialized per key by a `flock` reap lock so a claimant
     /// holding a stale read can never delete another claimant's live lease.
     pub fn claim(&self, key: &str, owner: &str, ttl: Duration) -> Result<ClaimOutcome, FleetError> {
         let path = self.claim_path(key);
