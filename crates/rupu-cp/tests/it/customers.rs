@@ -114,6 +114,14 @@ async fn create_validates_and_is_writable_gated() {
         create(&base, "blank", "  ").await.status(),
         StatusCode::BAD_REQUEST
     );
+    // `none` is the `?customer=` filter's "no customer": reserved.
+    let resp = create(&base, "none", "Nobody").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("reserved"),
+        "{body}"
+    );
 
     // A read-only deployment refuses every write.
     let ro = tempfile::tempdir().unwrap();

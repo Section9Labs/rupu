@@ -101,6 +101,7 @@ pub fn routes() -> Router<AppState> {
 pub(crate) fn api_err(e: CustomerError) -> ApiError {
     let status = match &e {
         CustomerError::InvalidSlug(_)
+        | CustomerError::ReservedSlug(_)
         | CustomerError::InvalidColor(_)
         | CustomerError::EmptyName
         | CustomerError::InvalidWsId(_) => StatusCode::BAD_REQUEST,

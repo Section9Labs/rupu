@@ -172,3 +172,23 @@ async fn customer_with_a_malformed_layer_still_shows_and_display_commands_still_
     assert!(ok(rupu(&["repos", "tracked"]).await), "repos tracked");
     assert!(ok(rupu(&["ui", "themes"]).await), "ui themes");
 }
+
+/// `none` is reserved (it is the `?customer=` filter's "no customer"):
+/// `rupu customer create none` fails and creates nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_refuses_the_reserved_slug_none() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child(".rupu");
+    home.create_dir_all().unwrap();
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_current_dir(tmp.path()).unwrap();
+
+    assert!(
+        !ok(rupu(&["customer", "create", "none", "--name", "Nobody"]).await),
+        "the reserved slug is refused"
+    );
+    let store = rupu_workspace::CustomerStore::new(home.path());
+    assert!(store.list(true).unwrap().is_empty());
+    assert!(ok(rupu(&["customer", "create", "nonesuch", "--name", "Ok"]).await));
+}

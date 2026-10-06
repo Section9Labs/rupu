@@ -22,8 +22,9 @@ narrative walkthroughs of the provider and SCM sections, see the linked docs abo
 
 ### Customer layer
 
-A project can be assigned to a **customer** (`rupu customer assign <slug>`). The
-customer's layer, `~/.rupu/customers/<slug>/config.toml`, sits between the global
+A project can be assigned to a **customer** (`rupu customer assign <slug>`; a slug
+is 1–63 of `a-z`, `0-9`, `-`, and `none` is reserved — it is the "no customer"
+filter). The customer's layer, `~/.rupu/customers/<slug>/config.toml`, sits between the global
 file and the project's `.rupu/config.toml`:
 
 global lock › customer lock › project › customer › global › default

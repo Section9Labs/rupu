@@ -38,6 +38,27 @@ fn slug_grammar_is_enforced() {
     }
 }
 
+/// `none` is the `?customer=` filter's "no customer": `create` refuses it
+/// with a reason, while an existing `none` customer (made before the slug
+/// was reserved) still reads.
+#[test]
+fn create_refuses_the_reserved_slug_none_but_get_and_list_tolerate_one() {
+    let h = home();
+    let store = CustomerStore::new(h.path());
+    let err = store.create("none", &acme()).unwrap_err();
+    assert!(matches!(err, CustomerError::ReservedSlug(ref s) if s == "none"), "{err:?}");
+    assert!(err.to_string().contains("reserved"), "{err}");
+    assert!(matches!(store.get("none"), Err(CustomerError::NotFound(_))));
+    // Written directly, the way a store from before the reservation holds it.
+    store.create("acme", &acme()).unwrap();
+    let acme_dir = store.config_path("acme").parent().unwrap().to_path_buf();
+    let none_dir = acme_dir.with_file_name("none");
+    std::fs::create_dir_all(&none_dir).unwrap();
+    std::fs::copy(acme_dir.join("customer.toml"), none_dir.join("customer.toml")).unwrap();
+    assert_eq!(store.get("none").unwrap().slug, "none");
+    assert!(store.list(true).unwrap().iter().any(|c| c.slug == "none"));
+}
+
 #[test]
 fn create_then_get_round_trips_and_writes_an_empty_layer() {
     let h = home();

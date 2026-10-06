@@ -30,6 +30,11 @@ pub enum CustomerError {
          starting with a letter or digit"
     )]
     InvalidSlug(String),
+    #[error(
+        "customer slug `{0}` is reserved: `?customer=none` selects work with no customer; \
+         choose another slug"
+    )]
+    ReservedSlug(String),
     #[error("invalid color `{0}`: use #rrggbb")]
     InvalidColor(String),
     #[error("customer name must not be empty")]
@@ -139,6 +144,11 @@ pub enum ProjectRef<'a> {
     Path(&'a Path),
     Id(&'a str),
 }
+
+/// Slugs no new customer may take: `none` is the `?customer=` filter's
+/// "work with no customer". [`CustomerStore::create`] refuses them; reading
+/// an existing one (`get` / `list`) stays tolerant.
+pub const RESERVED_SLUGS: &[&str] = &["none"];
 
 pub fn validate_slug(slug: &str) -> Result<(), CustomerError> {
     let mut chars = slug.chars();
@@ -306,6 +316,9 @@ impl CustomerStore {
 
     pub fn create(&self, slug: &str, new: &NewCustomer) -> Result<Customer, CustomerError> {
         validate_slug(slug)?;
+        if RESERVED_SLUGS.contains(&slug) {
+            return Err(CustomerError::ReservedSlug(slug.to_string()));
+        }
         let name = validate_name(&new.name)?;
         let color = new.color.clone().filter(|s| !s.is_empty());
         if let Some(c) = &color {

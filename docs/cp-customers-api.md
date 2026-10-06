@@ -11,7 +11,7 @@ Writes need a `cp serve` deployment and answer **501** otherwise.
 | Route | Success | Errors |
 |---|---|---|
 | `GET /api/customers?archived=1&range=7d\|30d\|all` | 200, rows: customer + `tint` + `rollup` + `default_account` (default range `30d`; archived only with `archived=1`) | 400 bad `range`; 500 an unreadable assignment (names the workspace) |
-| `POST /api/customers` `{slug, name, notes?, contact?, color?}` | 201, the customer | 400 invalid slug / color / empty name; 409 slug exists; 501 |
+| `POST /api/customers` `{slug, name, notes?, contact?, color?}` | 201, the customer | 400 invalid slug / color / empty name, or the reserved slug `none` (the filter's "no customer"); 409 slug exists; 501 |
 | `GET /api/customers/:slug?range=` | 200, `{customer, rollup, projects[], default_account, layer_error}` | 404 unknown; 400 bad `range`; 500 unreadable assignment |
 | `PATCH /api/customers/:slug` | 200; absent fields stay, `""` clears `notes` / `contact` / `color` | 400; 404; 501 |
 | `POST /api/customers/:slug/archive`, `…/unarchive` | 200, the customer | 404; 501 |
