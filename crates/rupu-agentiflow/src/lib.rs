@@ -4,20 +4,34 @@
 //! port. Spec: docs/superpowers/specs/2026-09-30-rupu-agentiflows-design.md.
 
 mod budget;
+mod collectors;
 mod coverage;
 mod def;
+mod dispatch_tools;
 mod envelope;
 mod error;
 mod goal;
 mod lead;
 mod operator;
+mod proc;
+mod roster;
 mod run;
+mod status_tools;
+mod subprocess;
+mod supervisor;
+mod tools;
+mod unit;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
+pub use collectors::{lead_collectors, DirectiveCollector, MailboxCollector};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
     ScopeRoot,
+};
+pub use dispatch_tools::{
+    fleet_dispatch_tools, fleet_dispatch_tools_at_depth, fleet_unit_tools, WorkflowToolCtx,
+    MAX_DEPTH,
 };
 pub use envelope::{
     Digest, Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome,
@@ -25,9 +39,21 @@ pub use envelope::{
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
-pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
+pub use lead::{
+    render_round_prompt, GenerationCapability, GenerationProviderFactory, LeadConfig,
+    ProviderFactory, RunAgentLeadDriver,
+};
 pub use operator::{OperatorMessage, OperatorQueue};
+pub use proc::{pid_is_running, terminate_pid};
+pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
+};
+pub use status_tools::status_tools;
+pub use subprocess::SubprocessUnitLauncher;
+pub use supervisor::FleetSupervisor;
+pub use tools::{fleet_tools, FleetToolCtx};
+pub use unit::{
+    MockUnitLauncher, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
 };

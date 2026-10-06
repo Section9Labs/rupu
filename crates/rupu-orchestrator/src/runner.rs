@@ -12335,6 +12335,7 @@ steps:
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -13589,6 +13590,7 @@ mod dag_scheduler_golden {
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -14136,6 +14138,7 @@ steps:
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -14658,6 +14661,7 @@ loops:
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -14854,6 +14858,7 @@ loops:
                 AgentRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
+                    extra_tools: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -15145,6 +15150,7 @@ loops:
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -15342,6 +15348,7 @@ loops:
                 AgentRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
+                    extra_tools: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -15583,6 +15590,7 @@ loops:
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -15889,6 +15897,7 @@ loops:
                 AgentRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
+                    extra_tools: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -16041,6 +16050,7 @@ loops:
                 AgentRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
+                    extra_tools: Vec::new(),
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -16272,6 +16282,7 @@ loops:
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -16923,6 +16934,7 @@ mod join_and_prune {
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -18556,6 +18568,7 @@ mod resume_and_cancel {
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -19335,6 +19348,7 @@ mod agent_terminal_status {
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: agent_name.to_string(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -19743,6 +19757,7 @@ mod manual_pause_drain {
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: agent_name.to_string(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,

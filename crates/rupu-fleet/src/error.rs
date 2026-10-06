@@ -20,4 +20,6 @@ pub enum FleetError {
     Claimed { key: String, holder: String },
     #[error("inbox for {participant} is full (cap {cap})")]
     InboxFull { participant: String, cap: usize },
+    #[error("'{channel}' is a broadcast channel, not a direct inbox; use broadcast_send/read_broadcast")]
+    NotAnInbox { channel: String },
 }

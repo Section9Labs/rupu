@@ -462,6 +462,146 @@ async fn workflow_run_executes_one_step_via_mock() {
     assert_eq!(workers[0].worker_id, runs[0].worker_id.clone().unwrap());
 }
 
+/// The scope every step of a workflow run reports its coverage/findings
+/// under is observable on disk: `report_finding` makes the step create its
+/// ledger dir (`<workspace>/.rupu/coverage/<target_id(workspace, scope)>`) at
+/// run start. Returns the target ids found under `workspace`.
+fn coverage_target_dirs(workspace: &std::path::Path) -> Vec<String> {
+    let root = workspace.join(".rupu").join("coverage");
+    let mut ids: Vec<String> = std::fs::read_dir(&root)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// Run `rupu workflow run <name> --mode bypass <extra...>` against a one-step
+/// workflow whose agent records findings (`report_finding`), from `project`,
+/// with the mock provider. Returns the exit code and the global dir.
+async fn run_scoped_workflow(
+    tmp: &assert_fs::TempDir,
+    project: &std::path::Path,
+    extra: &[&str],
+) -> (std::process::ExitCode, std::path::PathBuf) {
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/scoped.md")
+        .write_str(
+            "---\nname: scoped\nprovider: anthropic\nmodel: claude-sonnet-4-6\ntools: [report_finding]\n---\nyou record findings.",
+        )
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/scoped-wf.yaml")
+        .write_str("name: scoped-wf\nsteps:\n  - id: a\n    agent: scoped\n    actions: []\n    prompt: hi\n")
+        .unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT);
+    std::env::set_current_dir(project).unwrap();
+
+    let mut argv: Vec<String> = ["rupu", "workflow", "run", "scoped-wf", "--mode", "bypass"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.extend(extra.iter().map(|s| s.to_string()));
+    let exit = rupu_cli::run(argv).await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_HOME");
+    // `ExitCode` is not `PartialEq`; callers compare its `Debug` rendering.
+    (exit, global.path().to_path_buf())
+}
+
+fn exit_is_success(exit: std::process::ExitCode) -> bool {
+    format!("{exit:?}") == format!("{:?}", std::process::ExitCode::from(0))
+}
+
+/// The no-op proof: with none of the agentiflow flags, a workflow run's steps
+/// report under the workflow's own name — exactly as before the flags existed.
+#[tokio::test]
+async fn workflow_run_without_fleet_flags_scopes_steps_to_the_workflow_name() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+
+    let (exit, _global) = run_scoped_workflow(&tmp, project.path(), &[]).await;
+    assert!(exit_is_success(exit), "a plain workflow run exits 0");
+
+    assert_eq!(
+        coverage_target_dirs(project.path()),
+        vec![rupu_coverage::target_id(project.path(), "scoped-wf")],
+        "without --fleet-run-dir the step scope is the workflow name, and only that"
+    );
+}
+
+/// A run launched as an agentiflow unit pools its steps into the agentiflow's
+/// scope (the run dir's name) instead of the workflow's, with an engagement.
+#[tokio::test]
+async fn workflow_run_with_fleet_flags_pools_steps_into_the_agentiflow_scope() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    let fleet_dir = tmp.child("agentiflows/af_123");
+
+    let (exit, _global) = run_scoped_workflow(
+        &tmp,
+        project.path(),
+        &[
+            "--engagement-profile",
+            "network",
+            "--fleet-run-dir",
+            fleet_dir.path().to_str().unwrap(),
+            "--fleet-participant",
+            "scoped-wf#1",
+        ],
+    )
+    .await;
+    assert!(exit_is_success(exit), "an agentiflow-unit run exits 0");
+
+    assert_eq!(
+        coverage_target_dirs(project.path()),
+        vec![rupu_coverage::target_id(project.path(), "af_123")],
+        "with --fleet-run-dir the step scope is the agentiflow's, not the workflow's"
+    );
+}
+
+/// An unknown engagement id fails the run loudly before any run state is
+/// created — never a silent fall-back to the code path.
+#[tokio::test]
+async fn workflow_run_rejects_an_unknown_engagement_profile_before_starting() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+
+    let (exit, global) = run_scoped_workflow(
+        &tmp,
+        project.path(),
+        &["--engagement-profile", "no-such-profile"],
+    )
+    .await;
+    assert!(
+        !exit_is_success(exit),
+        "a bad engagement id must fail the run"
+    );
+
+    let run_store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    assert!(
+        run_store.list().map(|r| r.is_empty()).unwrap_or(true),
+        "no run record may be created for a refused engagement selection"
+    );
+    assert!(
+        coverage_target_dirs(project.path()).is_empty(),
+        "no step ran"
+    );
+}
+
 #[tokio::test]
 async fn workflow_run_supports_focused_and_full_view_modes() {
     let _guard = ENV_LOCK.lock().await;

@@ -10,7 +10,13 @@
 //!   events.jsonl               append-only event log (shape below)
 //!   lead/transcript.r<N>.jsonl the lead's transcript for round N
 //!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
+//!   board/                     the coordination board (posts, claims, directives)
+//!   mailboxes/<participant>/   per-participant inboxes
 //! ```
+//!
+//! `board/` and `mailboxes/` are created lazily by the stores on first write.
+//! The lead reaches them through always-on `board.*` / `msg.send` tools and
+//! reads them back each turn through the inbox / standing-directive collectors.
 //!
 //! The lead's configured base transcript path is `lead/transcript.jsonl`; the
 //! driver writes one file per round beside it (`transcript.r0.jsonl`, ...)
@@ -47,6 +53,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::{target_id, ActiveSet, CoveragePaths};
@@ -56,13 +63,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::budget::{parse_duration, BudgetStage, UsageSource};
-use crate::def::AgentiflowDef;
+use crate::def::{AgentiflowDef, WorkflowsSpec};
+use crate::dispatch_tools::{fleet_unit_tools, WorkflowToolCtx};
 use crate::envelope::{
     Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome, StopReason,
 };
 use crate::error::AgentiflowError;
 use crate::lead::{LeadConfig, ProviderFactory, RunAgentLeadDriver};
 use crate::operator::OperatorQueue;
+use crate::roster::{roster_collector, roster_tools, RosterCtx};
+use crate::status_tools::status_tools;
+use crate::subprocess::SubprocessUnitLauncher;
+use crate::supervisor::FleetSupervisor;
+use crate::unit::UnitLauncher;
 
 /// `agentiflow.json`, the durable record of one run.
 const RECORD_FILE: &str = "agentiflow.json";
@@ -144,7 +157,10 @@ pub struct LeadInputs {
     pub system_prompt: String,
     pub provider_name: String,
     pub model: String,
-    /// Exactly the tools the lead may use; empty grants none (fail closed).
+    /// The builtins/MCP allowlist (the runner filters its registry to this
+    /// list); empty grants none of those. `report_finding` is appended by
+    /// `run_agentiflow` and the board/mailbox tools are always-on `extra_tools`,
+    /// so an empty list does not mean the lead is toolless.
     pub agent_tools: Vec<String>,
 }
 
@@ -165,6 +181,17 @@ pub struct RunAgentiflowOpts {
     pub lead: LeadInputs,
     /// This run's id (see [`new_run_id`]). Must be a safe path component.
     pub run_id: String,
+    /// How the lead's `dispatch` tool starts units. `None` is production: a
+    /// [`SubprocessUnitLauncher`] over the running `rupu` binary, so each unit
+    /// is a detached, process-isolated `rupu run`. A caller (a test, or the
+    /// Plan-4 daemon with its own launcher) injects an implementation here.
+    pub unit_launcher: Option<Arc<dyn UnitLauncher>>,
+    /// The lead's workflow-authoring capability: which provider/model writes a
+    /// new workflow and a factory minting a provider for each generation call.
+    /// Built by the launch site exactly as `make_provider` is (wired for real in
+    /// Plan 4; tests inject a mock). `None` disables `generate_workflow`
+    /// entirely: the lead is not even offered the tool.
+    pub generation: Option<crate::lead::GenerationCapability>,
 }
 
 /// A run id becomes a directory name and an evidence scope name, so it must
@@ -204,6 +231,22 @@ fn has_automatic_terminator(def: &AgentiflowDef) -> bool {
             .as_ref()
             .and_then(|r| r.ceiling.as_ref())
             .is_some_and(|c| c.rounds.is_some() || c.wall_clock.is_some())
+}
+
+/// The workflow ids the lead's roster index names. A listed pool is taken as
+/// written; `workflows: all` is resolved against the catalog as it stands at
+/// run start (a workflow added mid-run is not indexed, though `workflows.list`
+/// still shows it).
+fn pool_workflow_ids(spec: &WorkflowsSpec, ctx: &RosterCtx) -> Vec<String> {
+    match spec {
+        WorkflowsSpec::List(ids) => ids.clone(),
+        WorkflowsSpec::All(_) => {
+            rupu_orchestrator::list_workflow_summaries(&ctx.global, ctx.project.as_deref())
+                .into_iter()
+                .map(|w| w.id)
+                .collect()
+        }
+    }
 }
 
 /// The usage source for this build: reports nothing spent.
@@ -390,6 +433,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         make_provider,
         lead,
         run_id: id,
+        unit_launcher,
+        generation,
     } = opts;
 
     // A thread-scoped tracing subscriber (a test's, say) does not follow the
@@ -482,12 +527,18 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
 
             // ---- envelope and lead ----------------------------------------------------
             let paths = CoveragePaths::new(&workspace, &target_id(&workspace, &id));
+            // The lead records findings against the same engagement the envelope
+            // evaluates, so hand it its own shared copy before `active` moves.
+            let findings_engagement = Arc::new(active.clone());
             let cfg = EnvelopeConfig {
                 goals: def.goals.clone(),
                 coverage: def.coverage.clone(),
                 ceiling_rounds,
                 ceiling_wall_clock,
             };
+            // The lead's status tools evaluate the same pooled scope the envelope
+            // does, so keep a copy of the paths before the envelope takes them.
+            let status_paths = paths.clone();
             let mut envelope = Envelope::new(
                 paths,
                 active,
@@ -497,6 +548,88 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 started,
             );
 
+            // The lead records findings through `report_finding`; the runner only
+            // registers it for an agent that lists it. Dedup so a caller that
+            // already granted it does not get it twice.
+            let mut agent_tools = lead.agent_tools;
+            if !agent_tools.iter().any(|t| t == "report_finding") {
+                agent_tools.push("report_finding".to_string());
+            }
+            // The lead's coordination substrate: a file-backed board and mailboxes
+            // under the run dir, the tools that act on them, and the collectors that
+            // fold its inbox and standing directives into each turn. "lead" is the
+            // lead's participant id (the `to: "lead"` inbox other participants address).
+            let board = Arc::new(rupu_fleet::Board::new(run_dir.clone()));
+            let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir.clone()));
+            let fleet_ctx = Arc::new(crate::tools::FleetToolCtx::new(
+                board.clone(),
+                mailbox.clone(),
+                "lead",
+            ));
+            let mut extra_tools = crate::tools::fleet_tools(fleet_ctx);
+
+            // Units: the lead's `dispatch` / `join` start and await pool agents
+            // as process-isolated `rupu run`s through one supervisor, which also
+            // winds them down when the run stops (below). Production spawns real
+            // subprocesses; a caller-supplied launcher replaces them.
+            let launcher: Arc<dyn UnitLauncher> = match unit_launcher {
+                Some(l) => l,
+                None => match std::env::current_exe() {
+                    Ok(exe) => Arc::new(
+                        SubprocessUnitLauncher::new(exe, global.clone())
+                            .with_workspace(workspace.clone()),
+                    ),
+                    Err(e) => return Err(fail(&mut record, e)),
+                },
+            };
+            let sup = Arc::new(FleetSupervisor::new(launcher, run_dir.clone()));
+            // Where the catalog lives: the roster tools read it, and
+            // `run_workflow` loads and vets the workflow it is asked to start
+            // from it. The pool's workflow ids are resolved ONCE against it, so
+            // the roster index and `run_workflow`'s allowlist agree.
+            let roster_ctx = Arc::new(RosterCtx {
+                global: global.clone(),
+                project: Some(workspace.join(".rupu")),
+            });
+            let pool_workflows = pool_workflow_ids(&def.pool.workflows, &roster_ctx);
+            // `dispatch` / `join` / `run_workflow`: one participant counter, so a
+            // pool agent and a pool workflow of the same name never share a
+            // `<name>#<n>`.
+            extra_tools.extend(fleet_unit_tools(
+                sup.clone(),
+                Arc::new(def.pool.agents.clone()),
+                def.engagement_profiles.clone(),
+                WorkflowToolCtx {
+                    global: global.clone(),
+                    project: roster_ctx.project.clone(),
+                    pool_workflows: pool_workflows.clone(),
+                },
+                run_dir.clone(),
+                generation,
+            ));
+
+            // Roster awareness + steering. The roster tools read the agent and
+            // workflow catalog (global + the workspace's `.rupu`); the status tools
+            // re-run the envelope's own evaluators over the pooled scope and let
+            // the lead write a standing board directive. All appended to the lead's
+            // always-on tools, never replacing the fleet / dispatch tools above.
+            extra_tools.extend(roster_tools(roster_ctx.clone()));
+            extra_tools.extend(status_tools(
+                def.goals.clone(),
+                def.coverage.clone(),
+                status_paths,
+                findings_engagement.clone(),
+                board.clone(),
+            ));
+
+            let mut collectors = crate::collectors::lead_collectors(mailbox, board, "lead");
+            // The lead's ambient index of what it can dispatch: its pool, resolved
+            // against the catalog.
+            collectors.push(roster_collector(
+                def.pool.agents.clone(),
+                pool_workflows,
+                roster_ctx,
+            ));
             let lead_cfg = LeadConfig {
                 agent_name: lead.agent_name,
                 system_prompt: lead.system_prompt,
@@ -509,9 +642,15 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 goals: def.goals.clone(),
                 workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
                 workspace_path: workspace.clone(),
-                agent_tools: lead.agent_tools,
+                agent_tools,
                 // Real limit resolution is Plan 4's; unknown limits are the safe start.
                 limits: ModelLimits::unknown(),
+                // Pool the lead's findings and assets under the run id: the same
+                // `target_id(workspace, id)` the envelope's goal evaluator reads.
+                scope_name: Some(id.clone()),
+                findings_engagement: Some(findings_engagement),
+                extra_tools,
+                collectors,
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,
@@ -538,6 +677,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 }),
             );
             let outcome = envelope.run(&mut lead, &UnmeteredUsage, &*now);
+            // The run is over: SIGTERM every unit still alive so a stop (a
+            // goal met, the ceiling, an operator stop) never leaves orphans.
+            sup.terminate_all();
             // Drop the driver here, in the blocking context its runtime ran in, before
             // anything else can return early.
             drop(lead);
@@ -585,6 +727,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
 mod tests {
     use super::*;
     use crate::operator::OperatorMessage;
+    use rupu_agent::runner::CapturingMockProvider;
     use rupu_agent::{MockProvider, ScriptedTurn};
     use rupu_coverage::{
         append_record, Attribution, FindingEvidence, FindingProfile, FindingRecord, FindingScope,
@@ -669,6 +812,8 @@ mod tests {
                 agent_tools: vec![],
             },
             run_id: id.into(),
+            unit_launcher: None,
+            generation: None,
         }
     }
 
@@ -1038,6 +1183,1149 @@ mod tests {
             pooled_paths(&fx, "af_mine").root,
             pooled_paths(&fx, "af_other").root
         );
+    }
+
+    /// A synthetic, complete full-profile report: the same fixture
+    /// `rupu-coverage`'s own report tests validate.
+    fn sample_report() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        )))
+        .unwrap()
+    }
+
+    /// A factory whose every round makes one `report_finding` call (a
+    /// complete report plus the `network:service` asset the active profile
+    /// requires), then stops.
+    fn report_finding_factory() -> ProviderFactory {
+        Box::new(|| -> Box<dyn rupu_providers::LlmProvider> {
+            Box::new(MockProvider::new(vec![
+                ScriptedTurn::AssistantToolUse {
+                    text: None,
+                    tool_id: "t1".into(),
+                    tool_name: "report_finding".into(),
+                    tool_input: json!({
+                        "scope": "repo",
+                        "report": sample_report(),
+                        "asset": {
+                            "kind": "network:service",
+                            "coordinates": [
+                                { "t": "host", "v": "10.0.0.5" },
+                                { "t": "port", "v": { "number": 22, "proto": "tcp" } }
+                            ]
+                        }
+                    }),
+                    stop: rupu_agent::StopReason::ToolUse,
+                },
+                ScriptedTurn::AssistantText {
+                    text: "Round done.".into(),
+                    stop: rupu_agent::StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ]))
+        })
+    }
+
+    #[test]
+    fn a_lead_finding_lands_in_the_pooled_scope() {
+        // The goal evaluator reads `target_id(workspace, run id)`; the lead's
+        // `report_finding` must write there, not under `target_id(workspace,
+        // <lead agent name>)`, or no finding-goal could ever be met.
+        let fx = fixture();
+        let id = "af_finding";
+        let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = report_finding_factory();
+        let out = run_agentiflow(o).unwrap();
+
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap_or_default();
+        assert!(
+            !findings.trim().is_empty(),
+            "the lead's finding is in the pooled scope ledger"
+        );
+        // ...and the lead's own default scope stayed empty.
+        let stray = CoveragePaths::new(&fx.workspace, &target_id(&fx.workspace, "lead"));
+        assert!(
+            std::fs::read_to_string(&stray.findings)
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "nothing leaked into the lead's own scope"
+        );
+        // The evaluator saw it: the finding goal is met from the pooled ledger.
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+    }
+
+    /// Every request a [`CapturingMockProvider`] saw, shared across the
+    /// providers the factory mints (one per round).
+    type Captured = Arc<std::sync::Mutex<Vec<rupu_providers::LlmRequest>>>;
+
+    /// A factory handing out one `CapturingMockProvider` per round -- `rounds[i]`
+    /// is round i's script -- all recording into the returned [`Captured`].
+    fn capturing_factory(rounds: Vec<Vec<ScriptedTurn>>) -> (ProviderFactory, Captured) {
+        let captured: Captured = Arc::default();
+        let shared = captured.clone();
+        let mut rounds = rounds.into_iter();
+        let factory: ProviderFactory = Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
+            let mut p = CapturingMockProvider::new(rounds.next().unwrap_or_default());
+            p.captured = shared.clone();
+            Box::new(p)
+        });
+        (factory, captured)
+    }
+
+    /// The model-visible text of a request: every text block and tool result.
+    /// (`ToolUse` inputs are deliberately left out so a body the lead merely
+    /// SENT is not mistaken for one that was delivered back to it.)
+    fn request_texts(req: &rupu_providers::LlmRequest) -> Vec<String> {
+        use rupu_providers::types::ContentBlock;
+        req.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn any_contains(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|t| t.contains(needle))
+    }
+
+    fn tool_turn(id: &str, name: &str, input: Value) -> ScriptedTurn {
+        ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: id.into(),
+            tool_name: name.into(),
+            tool_input: input,
+            stop: rupu_agent::StopReason::ToolUse,
+        }
+    }
+
+    fn done_turn() -> ScriptedTurn {
+        ScriptedTurn::AssistantText {
+            text: "Round done.".into(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }
+    }
+
+    #[test]
+    fn the_lead_posts_to_the_board_and_sees_a_standing_directive() {
+        // The lead lists NO tools of its own (`agent_tools` is empty), so
+        // `board.post` can only reach it as an always-on injected tool.
+        let fx = fixture();
+        let id = "af_board";
+        // An operator directive queued on the run's board BEFORE the run starts.
+        // This creates `board/` but not `agentiflow.json`, so the run is not
+        // refused as already existing, and the run never wipes the directory.
+        let seeded = rupu_fleet::Board::new(run_dir(&fx, id));
+        seeded
+            .put_directive(&rupu_fleet::Directive {
+                author: "operator".into(),
+                ts: "2026-10-05T11:59:00Z".into(),
+                body: "never scan outside 10.0.0.0/24".into(),
+                addressed_to: None,
+            })
+            .unwrap();
+
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t1",
+                "board.post",
+                json!({ "kind": "note", "body": "starting on the web tier" }),
+            ),
+            done_turn(),
+        ]]);
+        let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = factory;
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+
+        // (a) The post is in the run's board, read back through a FRESH handle.
+        let fresh = rupu_fleet::Board::new(run_dir(&fx, id));
+        let posts = fresh.read_posts().unwrap();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(posts[0].author, "lead");
+        assert_eq!(posts[0].body, "starting on the web tier");
+        // The directive survived the run untouched.
+        assert_eq!(fresh.read_directives().unwrap().len(), 1);
+        // The spec layout: files live at `<run dir>/board/…`, not a doubled subdir.
+        assert!(run_dir(&fx, id).join("board/posts.jsonl").is_file());
+        assert!(run_dir(&fx, id).join("board/directives.jsonl").is_file());
+        assert!(!run_dir(&fx, id).join("board/board").exists());
+
+        // (b) The DirectiveCollector put the standing directive in front of the
+        // model on its very first call. Injections are not transcript events, so
+        // the request the provider received is where delivery is observable.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one model call per scripted turn");
+        let first = request_texts(&reqs[0]);
+        assert!(
+            any_contains(&first, "never scan outside 10.0.0.0/24")
+                && any_contains(&first, "source: directive:board"),
+            "the directive reaches the lead's first turn: {first:?}"
+        );
+        // ...and stands: it is re-asserted on the next turn too.
+        assert!(any_contains(
+            &request_texts(&reqs[1]),
+            "never scan outside 10.0.0.0/24"
+        ));
+        // (c) The tool ran for real: its success result came back to the model.
+        assert!(
+            any_contains(&request_texts(&reqs[1]), "posted [note]"),
+            "{:?}",
+            request_texts(&reqs[1])
+        );
+    }
+
+    #[test]
+    fn the_lead_receives_mailbox_messages_and_can_send() {
+        let fx = fixture();
+        let id = "af_mail";
+        // A worker's message already waiting in the lead's inbox.
+        let seeded = rupu_fleet::Mailbox::new(run_dir(&fx, id));
+        seeded
+            .send(
+                "lead",
+                &rupu_fleet::FleetMessage {
+                    from: "worker-1".into(),
+                    ts: "2026-10-05T11:59:00Z".into(),
+                    body: "port 22 open on 10.0.0.5".into(),
+                },
+                64,
+            )
+            .unwrap();
+
+        // The lead then messages its own inbox via the injected `msg.send`.
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t1",
+                "msg.send",
+                json!({ "to": "lead", "body": "note-to-self: check ssh next" }),
+            ),
+            done_turn(),
+        ]]);
+        let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = factory;
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one model call per scripted turn");
+        let first = request_texts(&reqs[0]);
+        let second = request_texts(&reqs[1]);
+        // The worker's message was drained into the first turn...
+        assert!(
+            any_contains(&first, "port 22 open on 10.0.0.5")
+                && any_contains(&first, "source: mailbox:lead"),
+            "{first:?}"
+        );
+        assert!(
+            !any_contains(&first, "note-to-self"),
+            "not sent yet on turn 0"
+        );
+        // ...and the lead's own message came back on the turn after it sent it.
+        assert!(
+            any_contains(&second, "note-to-self: check ssh next"),
+            "{second:?}"
+        );
+        // `Once` delivery: the worker's message persisted in history (not
+        // re-drained), so it is still there exactly once.
+        let delivered = second
+            .iter()
+            .filter(|t| t.contains("port 22 open on 10.0.0.5"))
+            .count();
+        assert_eq!(delivered, 1, "{second:?}");
+        // The spec layout: inboxes live at `<run dir>/mailboxes/<participant>/`.
+        assert!(run_dir(&fx, id).join("mailboxes").is_dir());
+        assert!(!run_dir(&fx, id).join("mailboxes/mailboxes").exists());
+        // Both inboxes are now empty.
+        let fresh = rupu_fleet::Mailbox::new(run_dir(&fx, id));
+        assert!(fresh.drain("lead").unwrap().is_empty());
+    }
+
+    // ---- dispatch / join over the fleet supervisor -------------------------
+
+    /// A definition whose pool holds the lead and one worker, `recon`.
+    fn def_with_recon_pool(extra: &str) -> AgentiflowDef {
+        AgentiflowDef::parse_str(&format!(
+            "name: itest\n\
+             lead: lead\n\
+             engagement_profiles: [network]\n\
+             goals:\n  \
+               - id: any-finding\n    \
+                 objective: \"Record at least one finding.\"\n    \
+                 target: {{ findings: {{}}, count_gte: 1 }}\n\
+             scope: {{ authorized: true }}\n\
+             pool: {{ agents: [lead, recon] }}\n\
+             {extra}"
+        ))
+        .unwrap()
+    }
+
+    /// A lead scripted to: try an out-of-pool dispatch, dispatch `recon`, then
+    /// `join` on the handle that dispatch returned, then stop. The handle is a
+    /// fresh run id, so (unlike a static [`ScriptedTurn`]) the third turn is
+    /// built from the tool result the lead actually received.
+    struct DispatchingLead {
+        calls: usize,
+        captured: Captured,
+        base: MockProvider,
+    }
+
+    impl DispatchingLead {
+        fn new(captured: Captured) -> Self {
+            Self {
+                calls: 0,
+                captured,
+                base: MockProvider::new(vec![]),
+            }
+        }
+
+        /// The handle in the latest `dispatch` result the request carries.
+        fn handle_in(req: &rupu_providers::LlmRequest) -> String {
+            request_texts(req)
+                .iter()
+                .rev()
+                .find_map(|t| {
+                    serde_json::from_str::<Value>(t)
+                        .ok()
+                        .and_then(|v| v["handle"].as_str().map(str::to_string))
+                })
+                .expect("a dispatch result with a handle reached the lead")
+        }
+
+        fn next(&mut self, req: &rupu_providers::LlmRequest) -> MockProvider {
+            self.captured.lock().unwrap().push(req.clone());
+            let turn = match self.calls {
+                0 => tool_turn(
+                    "t0",
+                    "dispatch",
+                    json!({ "agent": "not-in-pool", "prompt": "scan" }),
+                ),
+                1 => tool_turn(
+                    "t1",
+                    "dispatch",
+                    json!({ "agent": "recon", "prompt": "scan" }),
+                ),
+                2 => tool_turn(
+                    "t2",
+                    "join",
+                    json!({ "handle": Self::handle_in(req), "timeout_secs": 30 }),
+                ),
+                _ => done_turn(),
+            };
+            self.calls += 1;
+            MockProvider::new(vec![turn])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rupu_providers::LlmProvider for DispatchingLead {
+        async fn send(
+            &mut self,
+            req: &rupu_providers::LlmRequest,
+        ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+            self.next(req).send(req).await
+        }
+
+        async fn stream(
+            &mut self,
+            req: &rupu_providers::LlmRequest,
+            on_event: &mut (dyn FnMut(rupu_providers::StreamEvent) + Send),
+        ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+            self.next(req).stream(req, on_event).await
+        }
+
+        fn default_model(&self) -> &str {
+            self.base.default_model()
+        }
+
+        fn provider_id(&self) -> rupu_providers::ProviderId {
+            self.base.provider_id()
+        }
+    }
+
+    fn a_unit_finding(id: &str) -> FindingRecord {
+        FindingRecord {
+            id: id.into(),
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: FindingScope::Repo,
+            summary: "reported by a unit".into(),
+            severity: Severity::High,
+            concern_id: None,
+            evidence: FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".into(),
+                references: vec![],
+            },
+            declared_by: Attribution {
+                run_id: "run_unit".into(),
+                model: "m".into(),
+                surface: Surface::Workflow,
+                codename: None,
+                agent: Some("recon".into()),
+                provider: None,
+            },
+            declared_at: Utc::now(),
+            profile: FindingProfile::Summary,
+            report: None,
+        }
+    }
+
+    #[test]
+    fn the_lead_dispatches_a_pool_agent_joins_it_and_the_pooled_ledger_has_its_finding() {
+        use crate::unit::{MockUnitLauncher, UnitOutcome, UnitStatus};
+        let fx = fixture();
+        let id = "af_dispatch";
+
+        // The mock unit does what a real one would, at spawn: it reports a
+        // finding into the run's POOLED scope and posts to the run's board.
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![
+                UnitStatus::Running,
+                UnitStatus::Done(UnitOutcome {
+                    output: "recon found one issue".into(),
+                    success: true,
+                }),
+            ])
+            .with_on_spawn(move |spec, run_dir| {
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_unit")).unwrap();
+                rupu_fleet::Board::new(run_dir.to_path_buf())
+                    .post(&rupu_fleet::BoardPost {
+                        author: spec.participant.clone(),
+                        ts: "2026-10-05T12:00:01Z".into(),
+                        kind: rupu_fleet::PostKind::Observation,
+                        body: "recon is on it".into(),
+                        addressed_to: None,
+                    })
+                    .unwrap();
+            }),
+        );
+
+        let captured: Captured = Arc::default();
+        let shared = captured.clone();
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
+            Box::new(DispatchingLead::new(shared.clone()))
+        });
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+
+        // The unit's finding satisfied the flow's goal, via the pooled scope.
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
+        assert!(findings.contains("fnd_unit"), "{findings}");
+
+        // Exactly one unit started: the pool agent, with the def's engagement and
+        // a minted unit participant. The out-of-pool request spawned nothing.
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert_eq!(spawned[0].agent, "recon");
+        assert_eq!(spawned[0].prompt, "scan");
+        assert_eq!(spawned[0].engagement, ["network"]);
+        assert_eq!(spawned[0].participant, "recon#1");
+
+        // The lead saw what each tool call returned.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 4, "one model call per scripted turn");
+        // (a) fail-closed: the out-of-pool dispatch came back as an error.
+        let after_refusal = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after_refusal, "not in this flow's pool"),
+            "{after_refusal:?}"
+        );
+        // (b) the real dispatch returned a handle...
+        let handle = DispatchingLead::handle_in(&reqs[2]);
+        assert!(handle.starts_with("run_"), "{handle}");
+        // (c) ...and join returned the unit's outcome for it.
+        let after_join = request_texts(&reqs[3]);
+        assert!(
+            any_contains(&after_join, "recon found one issue")
+                && any_contains(&after_join, "\"status\":\"done\""),
+            "{after_join:?}"
+        );
+
+        // The supervisor recorded the unit under its handle, as done.
+        let unit: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                run_dir(&fx, id)
+                    .join("units")
+                    .join(&handle)
+                    .join("unit.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unit["agent"], "recon");
+        assert_eq!(unit["participant"], "recon#1");
+        assert_eq!(unit["status"]["state"], "done");
+
+        // The unit's board post is on the run's board.
+        let posts = rupu_fleet::Board::new(run_dir(&fx, id))
+            .read_posts()
+            .unwrap();
+        assert!(
+            posts
+                .iter()
+                .any(|p| p.author == "recon#1" && p.body == "recon is on it"),
+            "{posts:?}"
+        );
+        // A unit that finished by itself is not signalled at wind-down.
+        assert!(launcher.terminated().is_empty());
+    }
+
+    // ---- run_workflow over the fleet supervisor ----------------------------
+
+    /// Chooses a lead turn from the turn index and the request it answers.
+    type PickTurn = Arc<dyn Fn(usize, &rupu_providers::LlmRequest) -> ScriptedTurn + Send + Sync>;
+
+    /// A lead whose every turn is chosen by `pick(turn index, request)`: for a
+    /// script that depends on what an earlier tool call returned (a handle).
+    struct PickingLead {
+        calls: usize,
+        captured: Captured,
+        pick: PickTurn,
+        base: MockProvider,
+    }
+
+    impl PickingLead {
+        fn factory(
+            captured: Captured,
+            pick: impl Fn(usize, &rupu_providers::LlmRequest) -> ScriptedTurn + Send + Sync + 'static,
+        ) -> ProviderFactory {
+            let pick = Arc::new(pick);
+            Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
+                Box::new(PickingLead {
+                    calls: 0,
+                    captured: captured.clone(),
+                    pick: pick.clone(),
+                    base: MockProvider::new(vec![]),
+                })
+            })
+        }
+
+        fn next(&mut self, req: &rupu_providers::LlmRequest) -> MockProvider {
+            self.captured.lock().unwrap().push(req.clone());
+            let turn = (self.pick)(self.calls, req);
+            self.calls += 1;
+            MockProvider::new(vec![turn])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rupu_providers::LlmProvider for PickingLead {
+        async fn send(
+            &mut self,
+            req: &rupu_providers::LlmRequest,
+        ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+            self.next(req).send(req).await
+        }
+
+        async fn stream(
+            &mut self,
+            req: &rupu_providers::LlmRequest,
+            on_event: &mut (dyn FnMut(rupu_providers::StreamEvent) + Send),
+        ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+            self.next(req).stream(req, on_event).await
+        }
+
+        fn default_model(&self) -> &str {
+            self.base.default_model()
+        }
+
+        fn provider_id(&self) -> rupu_providers::ProviderId {
+            self.base.provider_id()
+        }
+    }
+
+    /// A definition whose pool holds the lead and `recon`, plus exactly the
+    /// listed pool workflows.
+    fn def_with_workflow_pool(workflows: &[&str]) -> AgentiflowDef {
+        AgentiflowDef::parse_str(&format!(
+            "name: itest\n\
+             lead: lead\n\
+             engagement_profiles: [network]\n\
+             goals:\n  \
+               - id: any-finding\n    \
+                 objective: \"Record at least one finding.\"\n    \
+                 target: {{ findings: {{}}, count_gte: 1 }}\n\
+             scope: {{ authorized: true }}\n\
+             pool: {{ agents: [lead, recon], workflows: [{}] }}\n\
+             round: {{ ceiling: {{ rounds: 1 }} }}\n",
+            workflows.join(", ")
+        ))
+        .unwrap()
+    }
+
+    /// Write a workflow file under the fixture workspace's `.rupu/workflows/`.
+    fn write_workflow(fx: &Fixture, id: &str, yaml: &str) {
+        let dir = fx.workspace.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.yaml")), yaml).unwrap();
+    }
+
+    #[test]
+    fn the_lead_runs_a_pool_workflow_as_a_unit_joins_it_and_the_goal_is_met() {
+        use crate::unit::{MockUnitLauncher, UnitKind, UnitOutcome, UnitStatus};
+        let fx = fixture();
+        let id = "af_workflow";
+        // A benign one-step workflow whose only agent (`recon`) is in the pool.
+        write_workflow(
+            &fx,
+            "sweep",
+            "name: sweep\n\
+             inputs:\n  target: { type: string, required: true }\n\
+             steps:\n  - id: only\n    agent: recon\n    prompt: \"scan {{ inputs.target }}\"\n",
+        );
+
+        // The mock stands in for the real `rupu workflow run`: at spawn it does
+        // what the workflow's agent would -- reports a finding into the run's
+        // POOLED scope. (This test proves the tool + dispatch, not a real run.)
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![
+                UnitStatus::Running,
+                UnitStatus::Done(UnitOutcome {
+                    output: "sweep found one issue".into(),
+                    success: true,
+                }),
+            ])
+            .with_on_spawn(move |spec, _| {
+                assert_eq!(spec.kind, UnitKind::Workflow);
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_wf")).unwrap();
+            }),
+        );
+
+        let captured: Captured = Arc::default();
+        let mut o = opts(&fx, def_with_workflow_pool(&["sweep"]), id);
+        o.make_provider = PickingLead::factory(captured.clone(), |i, req| match i {
+            0 => tool_turn(
+                "t0",
+                "run_workflow",
+                json!({ "workflow": "sweep", "inputs": { "target": "10.0.0.5" } }),
+            ),
+            1 => tool_turn(
+                "t1",
+                "join",
+                json!({ "handle": DispatchingLead::handle_in(req), "timeout_secs": 30 }),
+            ),
+            _ => done_turn(),
+        });
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+
+        // The workflow unit's finding satisfied the flow's goal via the pooled scope.
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
+        assert!(findings.contains("fnd_wf"), "{findings}");
+
+        // Exactly one unit started: the workflow, bound to the def's engagement,
+        // carrying the lead's inputs and no prompt.
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert_eq!(spawned[0].kind, UnitKind::Workflow);
+        assert_eq!(spawned[0].agent, "sweep");
+        assert_eq!(spawned[0].prompt, "");
+        assert_eq!(spawned[0].engagement, ["network"]);
+        assert_eq!(spawned[0].participant, "sweep#1");
+        assert_eq!(
+            spawned[0].inputs,
+            [("target".to_string(), "10.0.0.5".to_string())]
+        );
+
+        // The lead got a handle back, and join returned the unit's outcome.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 3, "one model call per scripted turn");
+        let handle = DispatchingLead::handle_in(&reqs[1]);
+        assert!(handle.starts_with("run_"), "{handle}");
+        let after_join = request_texts(&reqs[2]);
+        assert!(
+            any_contains(&after_join, "sweep found one issue")
+                && any_contains(&after_join, "\"status\":\"done\""),
+            "{after_join:?}"
+        );
+
+        // The supervisor recorded the unit as a workflow unit, done.
+        let unit: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                run_dir(&fx, id)
+                    .join("units")
+                    .join(&handle)
+                    .join("unit.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unit["kind"], "workflow");
+        assert_eq!(unit["agent"], "sweep");
+        assert_eq!(unit["participant"], "sweep#1");
+        assert_eq!(unit["status"]["state"], "done");
+        // A unit that finished by itself is not signalled at wind-down.
+        assert!(launcher.terminated().is_empty());
+    }
+
+    #[test]
+    fn run_workflow_fails_closed_on_every_bad_request_and_spawns_nothing() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_workflow_refused";
+        // Four workflows, each in the pool EXCEPT `unlisted`, each broken one way.
+        write_workflow(
+            &fx,
+            "unlisted",
+            "name: unlisted\nsteps:\n  - id: s\n    agent: recon\n    prompt: hi\n",
+        );
+        write_workflow(
+            &fx,
+            "wide",
+            "name: wide\nsteps:\n  - id: s\n    agent: rogue\n    prompt: hi\n",
+        );
+        write_workflow(
+            &fx,
+            "gated",
+            "name: gated\nsteps:\n  - id: g\n    approval:\n      required: true\n",
+        );
+        write_workflow(
+            &fx,
+            "needs-input",
+            "name: needs-input\n\
+             inputs:\n  target: { type: string, required: true }\n\
+             steps:\n  - id: s\n    agent: recon\n    prompt: \"{{ inputs.target }}\"\n",
+        );
+
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let captured: Captured = Arc::default();
+        let mut o = opts(
+            &fx,
+            def_with_workflow_pool(&["wide", "gated", "needs-input"]),
+            id,
+        );
+        o.make_provider = PickingLead::factory(captured.clone(), |i, _| match i {
+            0 => tool_turn("t0", "run_workflow", json!({ "workflow": "unlisted" })),
+            1 => tool_turn("t1", "run_workflow", json!({ "workflow": "wide" })),
+            2 => tool_turn("t2", "run_workflow", json!({ "workflow": "gated" })),
+            3 => tool_turn("t3", "run_workflow", json!({ "workflow": "needs-input" })),
+            _ => done_turn(),
+        });
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+
+        // Nothing was ever started, so the goal could not be met.
+        assert_ne!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+        assert!(launcher.spawned().is_empty(), "{:?}", launcher.spawned());
+        assert!(!run_dir(&fx, id).join("units").exists());
+
+        // The lead saw each refusal, naming its reason.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 5, "one model call per scripted turn");
+        let reasons = [
+            "workflow 'unlisted' is not in this flow's pool",
+            "workflow 'wide' dispatches agents outside the pool: rogue",
+            "v1 cannot run a gated or host/distribute workflow as a unit (gated)",
+            "input `target` is required",
+        ];
+        for (i, reason) in reasons.iter().enumerate() {
+            let after = request_texts(&reqs[i + 1]);
+            assert!(any_contains(&after, reason), "turn {i}: {after:?}");
+        }
+    }
+
+    // ---- generate_workflow threaded through run_agentiflow -----------------
+
+    /// A workflow whose only agent (`recon`) is in `def_with_recon_pool`'s pool.
+    const GENERATED_WF: &str =
+        "name: fresh-sweep\nsteps:\n  - id: only\n    agent: recon\n    prompt: scan\n";
+
+    /// The names of the tools a request offered the lead.
+    fn offered_tools(req: &rupu_providers::LlmRequest) -> Vec<&str> {
+        req.tools.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_lead_generates_a_workflow_and_it_runs_as_a_file_backed_unit() {
+        use crate::lead::{GenerationCapability, GenerationProviderFactory};
+        use crate::unit::{MockUnitLauncher, UnitKind, UnitOutcome, UnitStatus};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fx = fixture();
+        let id = "af_generate";
+
+        // The mock unit does what the real `rupu workflow run --file` would:
+        // reports a finding into the run's POOLED scope at spawn.
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![
+                UnitStatus::Running,
+                UnitStatus::Done(UnitOutcome {
+                    output: "generated sweep found one issue".into(),
+                    success: true,
+                }),
+            ])
+            .with_on_spawn(move |spec, _| {
+                assert_eq!(spec.kind, UnitKind::Workflow);
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_gen")).unwrap();
+            }),
+        );
+
+        // The lead's authoring capability: every generation call gets a fresh
+        // `MockProvider` that writes a valid, pool-only workflow.
+        let minted = Arc::new(AtomicUsize::new(0));
+        let counter = minted.clone();
+        let factory: GenerationProviderFactory = Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: GENERATED_WF.into(),
+                stop: rupu_agent::StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }])) as Box<dyn rupu_providers::LlmProvider>
+        });
+
+        let captured: Captured = Arc::default();
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = PickingLead::factory(captured.clone(), |i, req| match i {
+            0 => tool_turn(
+                "t0",
+                "generate_workflow",
+                json!({ "description": "sweep the exposed gateway" }),
+            ),
+            1 => tool_turn(
+                "t1",
+                "join",
+                json!({ "handle": DispatchingLead::handle_in(req), "timeout_secs": 30 }),
+            ),
+            _ => done_turn(),
+        });
+        o.unit_launcher = Some(launcher.clone());
+        o.generation = Some(GenerationCapability {
+            provider: "mock".into(),
+            model: "mock-1".into(),
+            factory,
+        });
+        let out = run_agentiflow(o).unwrap();
+
+        // The generated workflow's finding satisfied the flow's goal.
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
+        assert!(findings.contains("fnd_gen"), "{findings}");
+        assert_eq!(minted.load(Ordering::Relaxed), 1, "one generation call");
+
+        // Exactly one unit started: a file-backed workflow unit bound to the
+        // flow's engagement, with no prompt and no catalog id behind it.
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert_eq!(spawned[0].kind, UnitKind::Workflow);
+        assert_eq!(spawned[0].agent, "fresh-sweep");
+        assert_eq!(spawned[0].prompt, "");
+        assert_eq!(spawned[0].engagement, ["network"]);
+        assert_eq!(spawned[0].participant, "fresh-sweep#1");
+        // The materialized file lives under the run dir, holds exactly what
+        // the generator wrote, and parses.
+        let file = spawned[0]
+            .workflow_file
+            .clone()
+            .expect("a generated workflow is file-backed");
+        assert_eq!(file.parent().unwrap(), run_dir(&fx, id).join("generated"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().trim(),
+            GENERATED_WF.trim()
+        );
+        assert_eq!(
+            rupu_orchestrator::Workflow::parse_file(&file).unwrap().name,
+            "fresh-sweep"
+        );
+
+        // The lead was offered the tool, got a handle back, and join returned
+        // the unit's outcome for it.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 3, "one model call per scripted turn");
+        assert!(
+            offered_tools(&reqs[0]).contains(&"generate_workflow"),
+            "{:?}",
+            offered_tools(&reqs[0])
+        );
+        let after_generate = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after_generate, "\"generated_file\"")
+                && any_contains(&after_generate, "fresh-sweep#1"),
+            "{after_generate:?}"
+        );
+        let handle = DispatchingLead::handle_in(&reqs[1]);
+        assert!(handle.starts_with("run_"), "{handle}");
+        let after_join = request_texts(&reqs[2]);
+        assert!(
+            any_contains(&after_join, "generated sweep found one issue")
+                && any_contains(&after_join, "\"status\":\"done\""),
+            "{after_join:?}"
+        );
+
+        // The supervisor recorded it as a workflow unit, done.
+        let unit: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                run_dir(&fx, id)
+                    .join("units")
+                    .join(&handle)
+                    .join("unit.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unit["kind"], "workflow");
+        assert_eq!(unit["participant"], "fresh-sweep#1");
+        assert_eq!(unit["status"]["state"], "done");
+    }
+
+    #[test]
+    fn without_a_generation_capability_the_lead_is_not_offered_generate_workflow() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_no_generate";
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+
+        let captured: Captured = Arc::default();
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        // The lead calls the tool anyway (a model can name a tool it was never
+        // offered): it must come back as an unknown-tool error, spawning nothing.
+        o.make_provider = PickingLead::factory(captured.clone(), |i, _| match i {
+            0 => tool_turn(
+                "t0",
+                "generate_workflow",
+                json!({ "description": "sweep the exposed gateway" }),
+            ),
+            _ => done_turn(),
+        });
+        o.unit_launcher = Some(launcher.clone());
+        assert!(o.generation.is_none());
+        let out = run_agentiflow(o).unwrap();
+        assert_ne!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one model call per scripted turn");
+        // Absence is proven twice: the advertised tool list omits it (while the
+        // sibling unit tools are present, so the list is the real one)...
+        let offered = offered_tools(&reqs[0]);
+        assert!(!offered.contains(&"generate_workflow"), "{offered:?}");
+        for sibling in ["dispatch", "join", "run_workflow"] {
+            assert!(offered.contains(&sibling), "{sibling} missing: {offered:?}");
+        }
+        // ...and invoking it anyway is refused as unknown.
+        let after = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after, "unknown tool: generate_workflow"),
+            "{after:?}"
+        );
+        assert!(launcher.spawned().is_empty(), "{:?}", launcher.spawned());
+        assert!(!run_dir(&fx, id).join("generated").exists());
+        assert!(!run_dir(&fx, id).join("units").exists());
+    }
+
+    // ---- roster awareness + status / steering tools -----------------------
+
+    /// Write one agent file under the fixture's global `agents/` dir.
+    fn write_agent(fx: &Fixture, name: &str, description: &str) {
+        let dir = fx.global.join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: {description}\ntools: [read_file]\n---\nYou are {name}.\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_lead_sees_the_roster_steers_the_board_and_checks_goal_status() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_roster";
+
+        // The catalog: the two pool agents plus `scout`, which the pool does NOT
+        // name -- so it can only reach the lead through `agents.list`, never
+        // through the pool-scoped roster index.
+        write_agent(&fx, "lead", "Runs the engagement.");
+        write_agent(&fx, "recon", "Maps the exposed gateway surface.");
+        write_agent(&fx, "scout", "Walks the legacy intranet pages.");
+
+        // The mock unit reports a finding into the run's POOLED scope at spawn.
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![UnitStatus::Running]).with_on_spawn(move |_, _| {
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_unit")).unwrap();
+            }),
+        );
+
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn("t0", "agents.list", json!({})),
+            // Before any unit has reported: the goal is not yet met.
+            tool_turn("t1", "goal.status", json!({})),
+            tool_turn(
+                "t2",
+                "board.directive",
+                json!({ "body": "prioritize the gateway" }),
+            ),
+            tool_turn(
+                "t3",
+                "dispatch",
+                json!({ "agent": "recon", "prompt": "scan" }),
+            ),
+            // After the unit's finding is pooled: the goal is met.
+            tool_turn("t4", "goal.status", json!({})),
+            done_turn(),
+        ]]);
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 6, "one model call per scripted turn");
+
+        // (a) The RosterCollector's pool index reached the model on its very
+        // first call: the pool's agents, resolved against the catalog. `scout`
+        // is in the catalog but not the pool, so it is absent here.
+        let first = request_texts(&reqs[0]);
+        assert!(
+            any_contains(&first, "source: roster")
+                && any_contains(&first, "Maps the exposed gateway surface."),
+            "the roster index reaches the lead's first turn: {first:?}"
+        );
+        assert!(
+            !any_contains(&first, "scout"),
+            "the index is the pool, not the whole catalog: {first:?}"
+        );
+        // ...and is re-asserted every turn.
+        assert!(any_contains(&request_texts(&reqs[5]), "source: roster"));
+
+        // (b) `agents.list` ran for real: the whole catalog (including `scout`)
+        // came back to the model after that turn.
+        let after_list = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after_list, "Walks the legacy intranet pages."),
+            "{after_list:?}"
+        );
+
+        // (c) `board.directive` wrote a standing directive, read back through a
+        // FRESH board handle over the run dir.
+        let directives = rupu_fleet::Board::new(run_dir(&fx, id))
+            .read_directives()
+            .unwrap();
+        assert_eq!(directives.len(), 1, "{directives:?}");
+        assert_eq!(directives[0].author, "lead");
+        assert_eq!(directives[0].body, "prioritize the gateway");
+
+        // (d) `goal.status` re-evaluated live: unmet before the unit's finding
+        // was pooled, met after it.
+        let before = request_texts(&reqs[2]);
+        assert!(
+            any_contains(&before, "\"id\":\"any-finding\"")
+                && any_contains(&before, "\"satisfied\":false"),
+            "{before:?}"
+        );
+        let after = request_texts(&reqs[5]);
+        assert!(
+            any_contains(&after, "\"id\":\"any-finding\"")
+                && any_contains(&after, "\"satisfied\":true"),
+            "{after:?}"
+        );
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
+        assert!(findings.contains("fnd_unit"), "{findings}");
+    }
+
+    #[test]
+    fn a_listed_workflow_pool_is_taken_as_written_and_all_resolves_to_the_catalog() {
+        let fx = fixture();
+        let wf = fx.global.join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("sweep.yaml"),
+            "name: Sweep\nsteps:\n  - id: only\n    agent: recon\n    prompt: hi\n",
+        )
+        .unwrap();
+        let ctx = RosterCtx {
+            global: fx.global.clone(),
+            project: Some(fx.workspace.join(".rupu")),
+        };
+        // A list is passed through untouched, even for an id the catalog lacks
+        // (the collector marks it `(not found)`).
+        let listed = WorkflowsSpec::List(vec!["sweep".into(), "ghost".into()]);
+        assert_eq!(pool_workflow_ids(&listed, &ctx), ["sweep", "ghost"]);
+        // `all` is the catalog's ids.
+        let all = AgentiflowDef::parse_str(
+            "name: n\nlead: lead\nengagement_profiles: [network]\n\
+             goals:\n  - id: g\n    objective: o\n    target: { findings: {}, count_gte: 1 }\n\
+             scope: { authorized: true }\npool: { agents: [lead], workflows: all }\n",
+        )
+        .unwrap()
+        .pool
+        .workflows;
+        assert_eq!(pool_workflow_ids(&all, &ctx), ["sweep"]);
+    }
+
+    #[test]
+    fn wind_down_terminates_a_unit_the_lead_left_running() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_winddown";
+        // The unit never finishes, and the lead dispatches it without joining.
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let (factory, _captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t1",
+                "dispatch",
+                json!({ "agent": "recon", "prompt": "scan" }),
+            ),
+            done_turn(),
+        ]]);
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        let units: Vec<String> = std::fs::read_dir(run_dir(&fx, id).join("units"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            launcher.terminated(),
+            units,
+            "the live unit was SIGTERMed when the run wound down"
+        );
+        assert_eq!(units.len(), 1);
     }
 
     #[test]

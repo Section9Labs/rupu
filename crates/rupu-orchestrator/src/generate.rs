@@ -141,10 +141,29 @@ has type (string|int|bool), required (bool), description, optional default. Refe
 prompts as {{ inputs.<key> }}.\n  steps: (required list)\n\nEach linear step needs:\n  - id: \
 <unique id>\n    agent: <one of the available agent names>\n    prompt: |\n      <multi-line \
 instruction; may reference {{ inputs.x }} and {{ steps.<id>.output }}>\n    actions: []        \
-# optional allow-list of tool actions\n\nOther step shapes: `parallel:` (a list of sub-steps \
-each with id/agent/prompt), and `panel:` (panelists list + subject + prompt, optional gate). \
-Keep it minimal unless the description calls for fan-out.\n\nNever leave `agent:` empty \
-\u{2014} every linear/for_each step must name a real agent.\n";
+# optional allow-list of tool actions\n\nOther step shapes (used in place of a plain linear step when the\
+description calls for it):\n\
+  - `for_each: <minijinja list expr>` plus `agent`/`prompt` \u{2014} fan one agent over a list; \
+inside the prompt use {{ item }}. Optional `max_parallel: <int>` caps concurrency (default 1).\n\
+  - `parallel:` \u{2014} a list of sub-steps, each with `id`/`agent`/`prompt` (no `actions`). \
+Optional `max_parallel: <int>`.\n\
+  - `panel:` \u{2014} `panelists: [agent names]`, `subject: <template>`, optional `prompt`, \
+optional `gate: { until_no_findings_at_severity_or_above: low|medium|high|critical, fix_with: <agent>, max_iterations }`.\n\
+  - `branch:` \u{2014} `condition: <minijinja>`, `then: [step ids]`, `else: [step ids]` (targets must appear LATER in the list; the two arms must be disjoint); no\
+agent/prompt/`when` on the branch step itself.\n\
+  - `split: [step ids]` \u{2014} fan into concurrent tracks; pair with a later step carrying \
+`join: { wait: all }` (or `any`) as the barrier. The track steps must point at the join via `next: [<join id>]` (or the join must `depends_on` them). Neither split nor join has an agent/prompt.\n\
+\nFlow control (any step):\n\
+  - `next: [ids]` / `depends_on: [ids]` \u{2014} explicit DAG edges; omit both and steps run in \
+list order.\n\
+  - `when: <minijinja>` \u{2014} skip the step when it renders false; `continue_on_error: true` \
+\u{2014} keep going if the step fails.\n\
+  - `loops:` is a TOP-LEVEL map (a sibling of `steps:`, NOT a step field) keyed by loop name: \
+`loops:\n    refine:\n      nodes: [draft, review]\n      until: <minijinja>\n      \
+max_iterations: <int>\n      on_max: fail|proceed`. `nodes` lists at least 2 existing step ids; \
+a step belongs to at most one loop.\n\
+\nPrefer the simplest shape that fits. Every `agent:`/panelist/`for_each` step must name a real \
+available agent \u{2014} never leave `agent:` empty.\n";
 
 /// First authenticated provider (in [`DEFAULT_GEN_MODELS`] order) paired
 /// with its default generation model. `None` when nothing is authed.
@@ -194,6 +213,16 @@ pub async fn generate_definition(
     .await
     .map_err(|_| GenerateError::NoCredentials)?;
 
+    generate_definition_with_provider(req, provider.as_mut()).await
+}
+
+/// Generate a validated definition using an already-built provider,
+/// repairing up to [`MAX_ATTEMPTS`]. The caller owns credential/provider
+/// construction (see [`generate_definition`] for the config-aware shell).
+pub async fn generate_definition_with_provider(
+    req: &GenerateRequest,
+    provider: &mut dyn rupu_providers::LlmProvider,
+) -> Result<GenerateOutcome, GenerateError> {
     let system = build_system_prompt(req.kind, &req.available_agents);
     let mut messages = vec![Message::user(&format!(
         "Create a rupu {} from this description:\n\n{}",
@@ -279,6 +308,43 @@ mod tests {
         assert!(p.contains("fixer"));
     }
 
+    #[test]
+    fn workflow_prompt_teaches_full_format() {
+        let p = build_system_prompt(GenKind::Workflow, &["writer".to_string()]);
+        for kw in [
+            "for_each",
+            "parallel",
+            "panel",
+            "branch",
+            "split",
+            "join",
+            "depends_on",
+            "loops",
+            "until",
+        ] {
+            assert!(p.contains(kw), "prompt must teach `{kw}`");
+        }
+        assert!(p.contains("writer"), "lists available agents");
+        // Pin the loops teaching specifically (the bare word "loops" is weak):
+        for kw in ["on_max", "max_iterations", "NOT a step field"] {
+            assert!(p.contains(kw), "loops teaching must mention `{kw}`");
+        }
+        // Parser-matching details that keep generated workflows parsing on the
+        // first try (verified against workflow.rs in review).
+        assert!(
+            p.contains("low|medium|high|critical"),
+            "panel gate teaches the severity values"
+        );
+        assert!(
+            p.contains("next: [<join id>]"),
+            "split tracks are told to point at the join (inbound edges)"
+        );
+        assert!(
+            p.contains("LATER"),
+            "branch targets must come later in the list"
+        );
+    }
+
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -290,6 +356,31 @@ mod tests {
     static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     const VALID_AGENT_MD: &str = "---\nname: gen-agent\ndescription: a test agent\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou are a helpful test agent.\n";
+
+    /// Drives the provider-taking core directly: no resolver, no env-var
+    /// seam, so no `ENV_LOCK`/`#[serial]` needed.
+    #[tokio::test]
+    async fn with_provider_returns_validated_workflow_on_first_try() {
+        let wf = "name: gen\nsteps:\n  - id: a\n    agent: writer\n    prompt: hi\n";
+        let mut p = rupu_agent::MockProvider::new(vec![rupu_agent::ScriptedTurn::AssistantText {
+            text: wf.to_string(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let req = GenerateRequest {
+            kind: GenKind::Workflow,
+            description: "x".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            available_agents: vec!["writer".into()],
+        };
+        let out = generate_definition_with_provider(&req, &mut p)
+            .await
+            .unwrap();
+        assert_eq!(out.attempts, 1);
+        assert!(out.content.contains("agent: writer"));
+    }
 
     #[tokio::test]
     #[serial_test::serial]

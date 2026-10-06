@@ -62,6 +62,16 @@ pub struct Args {
     /// Pre-assign the run id (so a caller can reference the run before it starts).
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Attach this run to an agentiflow's shared board + mailboxes: the
+    /// agentiflow run dir (`<global>/agentiflows/<id>`). Set by an
+    /// agentiflow lead when it spawns a pool unit; not for direct use.
+    /// Needs `--fleet-participant`.
+    #[arg(long, hide = true, value_name = "PATH", requires = "fleet_participant")]
+    pub fleet_run_dir: Option<std::path::PathBuf>,
+    /// This run's participant id on the agentiflow board (its inbox and the
+    /// owner of its claims). Needs `--fleet-run-dir`.
+    #[arg(long, hide = true, value_name = "ID", requires = "fleet_run_dir")]
+    pub fleet_participant: Option<String>,
     /// Findings contract for this run (`full` | `summary`), overriding the
     /// agent's `findingsProfile`. A placed workflow unit's coordinator
     /// passes its step's resolved profile this way.
@@ -113,6 +123,59 @@ fn resolve_findings_profile(
     agent: Option<rupu_coverage::FindingProfile>,
 ) -> rupu_coverage::FindingProfile {
     rupu_coverage::FindingProfile::resolve(flag, None, agent)
+}
+
+/// What `--fleet-run-dir` / `--fleet-participant` attach to a run: the fleet
+/// coordination tools, the participant's ambient-context collectors, and the
+/// agentiflow's findings scope.
+pub(crate) struct FleetAttachment {
+    /// `board.claim` / `board.release` / `board.post` / `board.read` /
+    /// `msg.send`, bound to the run's participant id.
+    pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
+    /// The participant's inbox and the board's standing directives.
+    pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
+    /// The agentiflow id — the run dir's basename. Findings pool under
+    /// `target_id(workspace, <id>)`, where the goal evaluator looks, rather
+    /// than under the agent's own name.
+    pub scope_name: String,
+}
+
+/// Build the fleet attachment for a unit joining the agentiflow whose run dir
+/// is `run_dir`. The board and mailboxes are the SAME file-backed stores the
+/// lead created there (they append their own `board/` / `mailboxes/`
+/// subdirectories, so the run dir root is passed as is). The findings
+/// engagement set needs no handling here: `run_inner` already carries it on
+/// the run's findings options.
+pub(crate) fn fleet_attachment(run_dir: &Path, participant: &str) -> FleetAttachment {
+    let board = Arc::new(rupu_fleet::Board::new(run_dir));
+    let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir));
+    let ctx = Arc::new(rupu_agentiflow::FleetToolCtx::new(
+        Arc::clone(&board),
+        Arc::clone(&mailbox),
+        participant,
+    ));
+    FleetAttachment {
+        extra_tools: rupu_agentiflow::fleet_tools(ctx),
+        collectors: rupu_agentiflow::lead_collectors(mailbox, board, participant),
+        scope_name: run_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// `--fleet-run-dir` and `--fleet-participant` come as a pair. clap already
+/// refuses one without the other at parse time; this keeps `run_inner` honest
+/// for an `Args` built by hand.
+fn fleet_pair(args: &Args) -> anyhow::Result<Option<(&Path, &str)>> {
+    match (
+        args.fleet_run_dir.as_deref(),
+        args.fleet_participant.as_deref(),
+    ) {
+        (Some(dir), Some(participant)) => Ok(Some((dir, participant))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("--fleet-run-dir and --fleet-participant must be given together"),
+    }
 }
 
 /// `rupu run <agent> [target] [prompt] …` — OR `rupu run pause|resume
@@ -560,6 +623,8 @@ struct RunListReport {
 }
 
 pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
+    // Both-or-neither, refused before anything is touched.
+    let fleet = fleet_pair(&args)?.map(|(dir, participant)| fleet_attachment(dir, participant));
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
 
@@ -1102,9 +1167,16 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             auth: pins.auth,
             origin_provider: provider_name.clone(),
         };
+        // A fleet unit joins the agentiflow's board and pools its findings
+        // under the agentiflow id; every other run keeps the empty defaults.
+        let (fleet_tools, fleet_collectors, fleet_scope) = match fleet {
+            Some(a) => (a.extra_tools, a.collectors, Some(a.scope_name)),
+            None => (Vec::new(), Vec::new(), None),
+        };
         let mut opts = AgentRunOpts {
             seed_source: None,
-            collectors: Vec::new(),
+            collectors: fleet_collectors,
+            extra_tools: fleet_tools,
             agent_name: spec.name.clone(),
             agent_system_prompt,
             agent_tools: spec.tools.clone(),
@@ -1147,7 +1219,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             on_usage: None,
             concerns: spec.concerns.clone(),
             limits,
-            scope_name: None,
+            scope_name: fleet_scope,
             surface_tag: None,
             pause: None,
             codename: Some(codename.to_string()),
@@ -1893,6 +1965,48 @@ mod tests {
         assert_eq!(args.findings_profile, Some(Full));
         assert_eq!(args.agent, "sec");
         assert_eq!(launch_args(&["sec"]).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn fleet_flags_parse_together() {
+        let a = launch_args(&[
+            "unit",
+            "--fleet-run-dir",
+            "/x/agentiflows/af_1",
+            "--fleet-participant",
+            "u",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.fleet_run_dir.as_deref(),
+            Some(Path::new("/x/agentiflows/af_1"))
+        );
+        assert_eq!(a.fleet_participant.as_deref(), Some("u"));
+        assert!(fleet_pair(&a).unwrap().is_some());
+        let none = launch_args(&["unit"]).unwrap();
+        assert!(fleet_pair(&none).unwrap().is_none());
+    }
+
+    #[test]
+    fn fleet_flags_refuse_one_without_the_other() {
+        assert!(launch_args(&["unit", "--fleet-run-dir", "/x"]).is_err());
+        assert!(launch_args(&["unit", "--fleet-participant", "u"]).is_err());
+        // An `Args` built by hand is refused by `fleet_pair` too.
+        let mut half = launch_args(&["unit"]).unwrap();
+        half.fleet_participant = Some("u".into());
+        let err = fleet_pair(&half).unwrap_err().to_string();
+        assert!(err.contains("--fleet-run-dir"), "{err}");
+    }
+
+    #[test]
+    fn fleet_attachment_scopes_to_the_run_dir_and_brings_the_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("agentiflows").join("af_01TEST");
+        let a = fleet_attachment(&run_dir, "unit-x");
+        assert_eq!(a.scope_name, "af_01TEST");
+        let names: Vec<_> = a.extra_tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"board.post"), "{names:?}");
+        assert!(!a.collectors.is_empty());
     }
 
     #[test]

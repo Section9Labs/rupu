@@ -189,6 +189,13 @@ pub struct DefaultStepFactory {
     /// its agent declares no `fallbacks:`, and the server-side-fallback
     /// toggle for the step's provider and its hops.
     pub recovery: rupu_config::RecoveryConfig,
+    /// Coverage/findings scope every step reports under. `None` (the
+    /// default for every ordinary workflow run) keeps the historical
+    /// per-workflow scope — the workflow's own name. `Some(name)` is set
+    /// only by an agentiflow-launched workflow unit (`rupu workflow run
+    /// --fleet-run-dir`), so its steps' findings pool into the agentiflow's
+    /// scope instead of the workflow's.
+    pub scope_name_override: Option<String>,
     /// The process-wide subprocess network-capture backend, handed to every
     /// step's `ToolContext` so its `bash` calls are captured. The factory
     /// never builds it: `rupu_runtime::net_capture::shared` blocks on first
@@ -477,6 +484,7 @@ impl StepFactory for DefaultStepFactory {
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: spec.name,
             agent_system_prompt,
             agent_tools: narrow_agent_tools(spec.tools, &step.actions),
@@ -575,7 +583,13 @@ impl StepFactory for DefaultStepFactory {
             // All steps of a workflow share the same target_id (keyed on the
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.
-            scope_name: Some(self.workflow.name.clone()),
+            // An agentiflow-launched workflow unit overrides it so its steps
+            // pool into the agentiflow's scope; every other run stays on the
+            // workflow's own name.
+            scope_name: self
+                .scope_name_override
+                .clone()
+                .or_else(|| Some(self.workflow.name.clone())),
             // Workflow steps must report as "workflow" surface so coverage
             // FileTouchEvents are correctly attributed; the runner defaults
             // to "agent" when this is None.
@@ -1342,6 +1356,7 @@ steps:
             limits_ctx,
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
             net_capture: None,
         }
     }
@@ -1429,6 +1444,49 @@ steps:
             Some(vec!["issues.list".to_string()]),
             "actions: [issues.list] must narrow the agent's [issues.list, issues.create] grant"
         );
+    }
+
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn step_scope_is_the_workflow_name_unless_overridden() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+
+        // Default (`None`): the historical per-workflow scope — unchanged.
+        let f = factory(tmp.path().to_path_buf());
+        assert_eq!(f.scope_name_override, None);
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(opts.scope_name, Some("w".to_string()));
+
+        // An agentiflow-launched workflow unit pools into the agentiflow scope.
+        let mut f = factory(tmp.path().to_path_buf());
+        f.scope_name_override = Some("af_123".to_string());
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(opts.scope_name, Some("af_123".to_string()));
     }
 
     // `#[serial]`: reaches the provider factory (reads
@@ -1569,6 +1627,50 @@ steps:
         let fo = opts.tool_context.findings.unwrap();
         assert_eq!(fo.artifact_max_bytes, 7);
         assert_eq!(fo.artifact_root, Some(tmp.path().join("store")));
+    }
+
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn findings_base_engagement_reaches_the_step() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_summary_agent(tmp.path());
+        let engagement = std::sync::Arc::new(
+            rupu_coverage::builtin_registry()
+                .unwrap()
+                .active_set(&[rupu_coverage::DEFAULT_PROFILE.to_string()])
+                .unwrap(),
+        );
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(WF_NO_DEFAULT).unwrap();
+        f.findings_base = rupu_coverage::FindingWriteOptions {
+            engagement: Some(engagement.clone()),
+            ..Default::default()
+        };
+        let opts = f
+            .build_opts_for_step(
+                "agent_decides",
+                "fp",
+                "p".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("t.jsonl"),
+                None,
+            )
+            .await;
+        // A regression that rebuilds the step's `FindingWriteOptions` without
+        // cloning `findings_base` would silently drop the engagement, and the
+        // step's findings would route as native code findings.
+        let got = opts
+            .tool_context
+            .findings
+            .unwrap()
+            .engagement
+            .expect("engagement must reach the step's findings");
+        assert!(std::sync::Arc::ptr_eq(&got, &engagement));
+        assert_eq!(got.ids(), vec![rupu_coverage::DEFAULT_PROFILE]);
     }
 
     // ── Findings profile: the full precedence table, and the unit shapes
@@ -2016,6 +2118,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
             net_capture: None,
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
@@ -2079,6 +2182,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
             net_capture: None,
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
@@ -2166,6 +2270,7 @@ steps:
             limits_ctx: hermetic_limits_ctx(tmp.path()),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
             net_capture: None,
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
@@ -2372,6 +2477,7 @@ steps:
             ),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
             net_capture: None,
         };
         // The account `acct-x` is declared as kind `openai` — a builtin
@@ -2447,6 +2553,7 @@ steps:
             ),
             providers: Default::default(),
             recovery: Default::default(),
+            scope_name_override: None,
             net_capture: None,
         }
     }

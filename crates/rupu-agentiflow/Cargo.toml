@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 rupu-coverage = { workspace = true }
+rupu-fleet = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true }
@@ -19,6 +21,9 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 ulid = { workspace = true }
+# kill(2) wrappers for unit liveness/termination (src/proc.rs). The workspace
+# entry already enables `process`; stated here so the need is local.
+rustix = { workspace = true, features = ["process"] }
 
 # In-workspace crates the run_agent-backed lead driver sits on. These are
 # path deps (not [workspace.dependencies] entries), matching how rupu-runtime,
@@ -30,6 +35,14 @@ rupu-tools = { path = "../rupu-tools" }
 # RunTriggerSource (the persisted record's `trigger`). rupu-runtime does not
 # depend on rupu-agentiflow, so this edge is acyclic too.
 rupu-runtime = { path = "../rupu-runtime" }
+# The unit's transcript reader (started-evidence + final answer) for the
+# subprocess launcher. A leaf crate, so this edge is acyclic.
+rupu-transcript = { path = "../rupu-transcript" }
+# The library workflow lister (`list_workflow_summaries`) behind the roster
+# read tools. rupu-orchestrator does not depend on rupu-agentiflow, so this
+# edge is acyclic. (Not a [workspace.dependencies] entry; a path dep like the
+# other in-workspace crates above.)
+rupu-orchestrator = { path = "../rupu-orchestrator" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

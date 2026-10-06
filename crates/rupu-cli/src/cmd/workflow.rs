@@ -399,9 +399,14 @@ pub enum Action {
     },
     /// Run a workflow.
     Run {
-        /// Workflow name (filename stem under `workflows/`).
-        #[arg(add = ArgValueCompleter::new(workflow_names))]
-        name: String,
+        /// Workflow name (filename stem under `workflows/`). Omit when
+        /// running from a file with `--file`.
+        #[arg(
+            required_unless_present = "file",
+            conflicts_with = "file",
+            add = ArgValueCompleter::new(workflow_names)
+        )]
+        name: Option<String>,
         /// Optional run-target: a repo, PR, or issue reference.
         ///
         /// Accepts repo (`github:owner/repo`, `gitlab:group/proj`), PR
@@ -425,6 +430,34 @@ pub enum Action {
         /// Pre-assign the run id (e.g. so a caller can reference the run before it starts).
         #[arg(long)]
         run_id: Option<String>,
+        /// Engagement profile(s) for this run — the asset domain(s) every
+        /// step's findings are validated against (e.g. `network`, `binary`,
+        /// or a composite like `pentest`). Repeatable or comma-separated.
+        /// Empty = the `code` path.
+        #[arg(
+            long = "engagement-profile",
+            visible_alias = "engagement-profiles",
+            value_name = "ID",
+            value_delimiter = ','
+        )]
+        engagement_profiles: Vec<String>,
+        /// Run as an agentiflow unit: the agentiflow run dir
+        /// (`<global>/agentiflows/<id>`). Every step's findings and coverage
+        /// then pool into the agentiflow's scope (the run dir's name)
+        /// instead of the workflow's own. Set by an agentiflow lead when it
+        /// launches a workflow unit; not for direct use. Needs
+        /// `--fleet-participant`.
+        #[arg(long, hide = true, value_name = "PATH", requires = "fleet_participant")]
+        fleet_run_dir: Option<PathBuf>,
+        /// This unit's participant id on the agentiflow board. Needs
+        /// `--fleet-run-dir`. Workflow steps are findings-only (no board
+        /// tools), so it only pairs with the run dir.
+        #[arg(long, hide = true, value_name = "ID", requires = "fleet_run_dir")]
+        fleet_participant: Option<String>,
+        /// Run a workflow directly from a file path instead of resolving a
+        /// name from the catalog. The workflow is not added to the catalog.
+        #[arg(long, value_name = "PATH", conflicts_with = "target")]
+        file: Option<PathBuf>,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -648,19 +681,30 @@ pub async fn handle(
             view,
             plain,
             run_id,
-        } => {
-            run(
-                &name,
-                target.as_deref(),
-                input,
-                mode.as_deref(),
-                None,
-                view,
-                plain,
-                run_id,
-            )
-            .await
-        }
+            engagement_profiles,
+            fleet_run_dir,
+            // Paired with `fleet_run_dir` by clap; workflow steps carry no
+            // board tools, so the id itself is not used here.
+            fleet_participant: _,
+            file,
+        } => match FleetRunOverlay::from_flags(engagement_profiles, fleet_run_dir.as_deref()) {
+            Ok(overlay) => {
+                run(
+                    file.as_deref(),
+                    name.as_deref(),
+                    target.as_deref(),
+                    input,
+                    mode.as_deref(),
+                    None,
+                    view,
+                    plain,
+                    run_id,
+                    overlay,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        },
         Action::Runs {
             limit,
             status,
@@ -3786,6 +3830,9 @@ pub(crate) async fn resume_run(
         limits_ctx,
         providers: cfg.providers.clone(),
         recovery: cfg.recovery.clone(),
+        // A resumed run is never an agentiflow unit (workflow units refuse
+        // gated workflows), so it keeps the workflow's own scope.
+        scope_name_override: None,
         net_capture: Some(net_capture),
     });
 
@@ -4510,7 +4557,20 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, None, None, false).await
+    run_with_outcome(
+        None,
+        Some(name),
+        None,
+        inputs,
+        mode,
+        event,
+        false,
+        None,
+        None,
+        false,
+        FleetRunOverlay::default(),
+    )
+    .await
 }
 
 /// Variant of [`run_by_name`] that pins the run-id. Used by the
@@ -4527,7 +4587,8 @@ pub async fn run_by_name_with_run_id(
     run_id: String,
 ) -> anyhow::Result<RunOutcomeSummary> {
     run_with_outcome(
-        name,
+        None,
+        Some(name),
         None,
         inputs,
         mode,
@@ -4536,6 +4597,7 @@ pub async fn run_by_name_with_run_id(
         Some(run_id),
         None,
         false,
+        FleetRunOverlay::default(),
     )
     .await
 }
@@ -4574,7 +4636,8 @@ pub async fn run_by_path(
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
     run(
-        name,
+        None,
+        Some(name),
         Some(target),
         Vec::new(),
         mode,
@@ -4582,13 +4645,15 @@ pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyh
         None,
         false,
         None,
+        FleetRunOverlay::default(),
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    name: &str,
+    file: Option<&Path>,
+    name: Option<&str>,
     target: Option<&str>,
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
@@ -4596,18 +4661,26 @@ async fn run(
     view: Option<LiveViewMode>,
     plain: bool,
     run_id: Option<String>,
+    overlay: FleetRunOverlay,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true, run_id, view, plain)
-        .await
-        .map(|_| ())
+    run_with_outcome(
+        file, name, target, inputs, mode, event, true, run_id, view, plain, overlay,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Same as [`run`] but returns a [`RunOutcomeSummary`] so non-CLI
 /// callers (the webhook receiver) can surface run-id + pause state.
 /// `run` itself thin-wraps this and discards the value.
+///
+/// The workflow comes from `file` when given (a path outside the catalog,
+/// `rupu workflow run --file`; the run's name is the parsed `name:`),
+/// otherwise from the catalog entry `name`.
 #[allow(clippy::too_many_arguments)]
 async fn run_with_outcome(
-    name: &str,
+    file: Option<&Path>,
+    name: Option<&str>,
     target: Option<&str>,
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
@@ -4616,10 +4689,34 @@ async fn run_with_outcome(
     run_id_override: Option<String>,
     view: Option<LiveViewMode>,
     plain: bool,
+    overlay: FleetRunOverlay,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    let path = locate_workflow(name)?;
-    let body = std::fs::read_to_string(&path)?;
-    let workflow = Workflow::parse(&body)?;
+    let (path, body) = match file {
+        Some(f) => {
+            let body = std::fs::read_to_string(f)
+                .map_err(|e| anyhow::anyhow!("--file {}: {e}", f.display()))?;
+            // Absolute, so the run record's `source_path` stays meaningful
+            // after the run's own working-directory changes.
+            (std::env::current_dir()?.join(f), body)
+        }
+        None => {
+            let name = name.ok_or_else(|| anyhow::anyhow!("workflow name required"))?;
+            let p = locate_workflow(name)?;
+            let body = std::fs::read_to_string(&p)?;
+            (p, body)
+        }
+    };
+    let workflow = Workflow::parse(&body).map_err(|e| match file {
+        Some(f) => anyhow::anyhow!("--file {}: {e}", f.display()),
+        None => anyhow::Error::new(e),
+    })?;
+    // A file-sourced workflow is named by its own `name:`; a catalog one by
+    // the name it was looked up under.
+    let name: String = match (file, name) {
+        (None, Some(n)) => n.to_string(),
+        _ => workflow.name.clone(),
+    };
+    let name = name.as_str();
 
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -4839,6 +4936,7 @@ async fn run_with_outcome(
             live_view,
             plain,
         },
+        overlay,
     )
     .await
 }
@@ -4910,6 +5008,7 @@ async fn run_path_with_outcome(
             live_view: view.unwrap_or(LiveViewMode::Focused),
             plain: false,
         },
+        FleetRunOverlay::default(),
     )
     .await
 }
@@ -4923,7 +5022,16 @@ pub async fn run_with_explicit_context(
     let path = locate_workflow_in(&global, ctx.project_root.as_deref(), name)?;
     let body = std::fs::read_to_string(&path)?;
     let workflow = Workflow::parse(&body)?;
-    execute_workflow_invocation(name, workflow, body, path, global, ctx).await
+    execute_workflow_invocation(
+        name,
+        workflow,
+        body,
+        path,
+        global,
+        ctx,
+        FleetRunOverlay::default(),
+    )
+    .await
 }
 
 fn build_run_envelope(
@@ -5297,6 +5405,51 @@ async fn persist_portable_run_metadata(
     Ok(Some((manifest_path, result)))
 }
 
+/// What an agentiflow-launched workflow unit adds to an otherwise ordinary run
+/// (`rupu workflow run --engagement-profile … --fleet-run-dir …`). The default
+/// is the empty overlay — no engagement, the workflow's own scope — which is
+/// what every run that does not pass those flags (and every autoflow run)
+/// gets, so it behaves exactly as it did before the overlay existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FleetRunOverlay {
+    /// Engagement profile id(s) every step's findings are validated against.
+    /// Empty = the native `code` path (no engagement).
+    pub engagement_profiles: Vec<String>,
+    /// Coverage/findings scope to report every step under instead of the
+    /// workflow's name: the agentiflow run dir's name. `None` = the
+    /// workflow's own name.
+    pub scope_name: Option<String>,
+}
+
+impl FleetRunOverlay {
+    /// Build the overlay from `rupu workflow run`'s flags. The scope is the
+    /// agentiflow run dir's final path component — the same derivation as
+    /// `rupu run`'s `--fleet-run-dir`, so a unit's findings land in the very
+    /// scope the lead's own do.
+    pub(crate) fn from_flags(
+        engagement_profiles: Vec<String>,
+        fleet_run_dir: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let scope_name = fleet_run_dir
+            .map(|dir| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--fleet-run-dir `{}` has no directory name to use as the agentiflow scope",
+                            dir.display()
+                        )
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            engagement_profiles,
+            scope_name,
+        })
+    }
+}
+
 /// Whether `execute_workflow_invocation` prints the shared completion summary.
 ///
 /// Only a direct, interactive run: `attach_ui` excludes cron / webhook /
@@ -5315,7 +5468,16 @@ async fn execute_workflow_invocation(
     workflow_path: PathBuf,
     global: PathBuf,
     ctx: ExplicitWorkflowRunContext,
+    overlay: FleetRunOverlay,
 ) -> anyhow::Result<RunOutcomeSummary> {
+    // Resolved first, before any run state is created: a bad engagement id
+    // fails the invocation loudly instead of leaving a half-started run
+    // record behind. An empty selection is `None` (the native code path).
+    let engagement = crate::findings_opts::resolve_engagement(
+        &global,
+        &ctx.workspace_path,
+        &overlay.engagement_profiles,
+    )?;
     // Borrow alias used by the input-snippet renderer at the
     // `run_workflow` call sites below. `body` is consumed by `opts`
     // (cloned) so we keep the `Path` and `&str` references local.
@@ -5422,6 +5584,21 @@ async fn execute_workflow_invocation(
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
     let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
+    // The write options every finding-recording surface of this run shares:
+    // the dispatcher's sub-agents, the action steps' `FindingsContext`, and
+    // each agent step (the factory clones it per step). The engagement is
+    // `None` — the native code path — unless `--engagement-profile` selected
+    // one, so a run without the flag builds exactly what it always did.
+    let findings_base = rupu_coverage::FindingWriteOptions {
+        engagement,
+        ..crate::findings_opts::base_options(&global, &cfg.findings)
+    };
+    // Coverage/findings scope: the workflow's own name, unless this run is an
+    // agentiflow unit (`--fleet-run-dir`), which pools into the agentiflow's.
+    let scope_name = overlay
+        .scope_name
+        .clone()
+        .unwrap_or_else(|| workflow.name.clone());
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         ctx.project_root.clone(),
@@ -5437,7 +5614,7 @@ async fn execute_workflow_invocation(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
-        crate::findings_opts::base_options(&global, &cfg.findings),
+        findings_base.clone(),
         // Dispatched children append this run's ledger
         // (`<runs>/<run_id>/usage.jsonl`) — the same file the runner writes
         // its own agent steps to.
@@ -5476,17 +5653,17 @@ async fn execute_workflow_invocation(
         &ctx.mode,
         Some(rupu_mcp::FindingsContext {
             workspace_path: ctx.workspace_path.clone(),
-            scope_name: workflow.name.clone(),
+            scope_name,
             run_id: run_id.clone(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
-            options: crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
-                rupu_coverage::FindingProfile::resolve(
+            options: findings_base
+                .clone()
+                .with_profile(rupu_coverage::FindingProfile::resolve(
                     None,
                     workflow.defaults.findings_profile,
                     None,
-                ),
-            ),
+                )),
             codename: Some(rupu_codename::crew_for(&run_id)),
             provider: cfg.default_provider.clone(),
         }),
@@ -5508,10 +5685,11 @@ async fn execute_workflow_invocation(
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-        findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
+        findings_base,
         limits_ctx,
         providers: cfg.providers.clone(),
         recovery: cfg.recovery.clone(),
+        scope_name_override: overlay.scope_name.clone(),
         net_capture: Some(net_capture),
     });
 
@@ -6175,6 +6353,188 @@ fn warn_if_ask_mode_is_effectively_bypass(mode: Option<&str>, mode_str: &str) {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    /// `rupu workflow run`'s agentiflow-unit flags: the engagement selection
+    /// (comma-separated or repeated, plus its plural alias) and the hidden
+    /// `--fleet-run-dir` / `--fleet-participant` pair.
+    #[test]
+    fn workflow_run_parses_engagement_and_fleet_flags() {
+        let cli = crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "--engagement-profile",
+            "network,web",
+            "--fleet-run-dir",
+            "/x/af_123",
+            "--fleet-participant",
+            "p",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::Cmd::Workflow {
+                action:
+                    super::Action::Run {
+                        name,
+                        engagement_profiles,
+                        fleet_run_dir,
+                        fleet_participant,
+                        ..
+                    },
+            } => {
+                assert_eq!(name.as_deref(), Some("w"));
+                assert_eq!(engagement_profiles, vec!["network", "web"]);
+                assert_eq!(
+                    fleet_run_dir.as_deref(),
+                    Some(std::path::Path::new("/x/af_123"))
+                );
+                assert_eq!(fleet_participant.as_deref(), Some("p"));
+            }
+            other => panic!("expected Workflow(Run), got {other:?}"),
+        }
+
+        // The plural alias and a repeated flag both accumulate.
+        let cli = crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "--engagement-profiles",
+            "binary",
+            "--engagement-profile",
+            "web",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::Cmd::Workflow {
+                action:
+                    super::Action::Run {
+                        engagement_profiles,
+                        ..
+                    },
+            } => assert_eq!(engagement_profiles, vec!["binary", "web"]),
+            other => panic!("expected Workflow(Run), got {other:?}"),
+        }
+    }
+
+    /// Without the new flags the parse is what it always was: no engagement,
+    /// no fleet attachment — so the run is unchanged.
+    #[test]
+    fn workflow_run_without_the_new_flags_selects_nothing() {
+        let cli = crate::Cli::try_parse_from(["rupu", "workflow", "run", "w"]).unwrap();
+        match cli.command {
+            crate::Cmd::Workflow {
+                action:
+                    super::Action::Run {
+                        engagement_profiles,
+                        fleet_run_dir,
+                        fleet_participant,
+                        ..
+                    },
+            } => {
+                assert!(engagement_profiles.is_empty());
+                assert!(fleet_run_dir.is_none());
+                assert!(fleet_participant.is_none());
+            }
+            other => panic!("expected Workflow(Run), got {other:?}"),
+        }
+    }
+
+    /// `--file` stands in for the name (and only for the name): it parses
+    /// alone, and neither a name nor a run target may accompany it.
+    #[test]
+    fn workflow_run_file_replaces_the_name() {
+        let cli =
+            crate::Cli::try_parse_from(["rupu", "workflow", "run", "--file", "/x/w.yaml"]).unwrap();
+        match cli.command {
+            crate::Cmd::Workflow {
+                action:
+                    super::Action::Run {
+                        name, file, target, ..
+                    },
+            } => {
+                assert!(name.is_none());
+                assert!(target.is_none());
+                assert_eq!(file.as_deref(), Some(std::path::Path::new("/x/w.yaml")));
+            }
+            other => panic!("expected Workflow(Run), got {other:?}"),
+        }
+        // Neither a name nor --file: the name stays required.
+        assert!(crate::Cli::try_parse_from(["rupu", "workflow", "run"]).is_err());
+        // A name, or a name + target, alongside --file is ambiguous.
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "--file",
+            "/x/w.yaml"
+        ])
+        .is_err());
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "github:o/r",
+            "--file",
+            "/x/w.yaml"
+        ])
+        .is_err());
+    }
+
+    /// The run dir and participant come as a pair, as on `rupu run`.
+    #[test]
+    fn workflow_run_fleet_flags_come_as_a_pair() {
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "--fleet-run-dir",
+            "/x/af_123",
+        ])
+        .is_err());
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "--fleet-participant",
+            "p",
+        ])
+        .is_err());
+    }
+
+    /// The agentiflow scope is the run dir's name; no flags is the empty
+    /// overlay (the workflow's own scope, no engagement) that autoflow and
+    /// every other caller pass.
+    #[test]
+    fn fleet_overlay_scope_is_the_run_dir_name() {
+        use super::FleetRunOverlay;
+        let overlay = FleetRunOverlay::from_flags(
+            vec!["network".into()],
+            Some(std::path::Path::new("/g/agentiflows/af_123")),
+        )
+        .unwrap();
+        assert_eq!(overlay.scope_name.as_deref(), Some("af_123"));
+        assert_eq!(overlay.engagement_profiles, vec!["network"]);
+
+        assert_eq!(
+            FleetRunOverlay::from_flags(Vec::new(), None).unwrap(),
+            FleetRunOverlay::default(),
+            "no flags must be the empty overlay"
+        );
+        assert_eq!(FleetRunOverlay::default().scope_name, None);
+        assert!(FleetRunOverlay::default().engagement_profiles.is_empty());
+
+        // A path with no final component cannot name a scope: refuse it
+        // rather than pool findings under an empty name.
+        assert!(FleetRunOverlay::from_flags(Vec::new(), Some(std::path::Path::new("/"))).is_err());
+    }
+
     #[test]
     fn run_step_prompt_shows_resolved_argv_and_hides_env_values() {
         let prompt = super::render_run_step_prompt(

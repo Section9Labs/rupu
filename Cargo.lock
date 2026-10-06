@@ -4572,12 +4572,17 @@ dependencies = [
 name = "rupu-agentiflow"
 version = "0.82.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "rupu-agent",
  "rupu-coverage",
+ "rupu-fleet",
+ "rupu-orchestrator",
  "rupu-providers",
  "rupu-runtime",
  "rupu-tools",
+ "rupu-transcript",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4674,6 +4679,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest-middleware",
  "rupu-agent",
+ "rupu-agentiflow",
  "rupu-app-canvas",
  "rupu-auth",
  "rupu-codename",
@@ -4681,6 +4687,7 @@ dependencies = [
  "rupu-coverage",
  "rupu-cp",
  "rupu-findings-report",
+ "rupu-fleet",
  "rupu-mcp",
  "rupu-netflow",
  "rupu-orchestrator",
@@ -4846,6 +4853,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "ulid",
 ]
 
 [[package]]

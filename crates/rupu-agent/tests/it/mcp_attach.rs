@@ -26,6 +26,7 @@ async fn mcp_registry_attaches_tools_to_run() {
     let opts = AgentRunOpts {
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: "mcp-test".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

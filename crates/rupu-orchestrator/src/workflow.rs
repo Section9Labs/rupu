@@ -1258,6 +1258,39 @@ impl Workflow {
         )
     }
 
+    /// Every agent this workflow names statically: `agent:` on a linear
+    /// or `for_each:` step, each `parallel:` sub-step's `agent`, each
+    /// `panel:` panelist and the panel gate's `fix_with`, and the
+    /// `agent:` of every `approval.on_reject` cleanup step (linear
+    /// agent steps). Empty names are skipped.
+    ///
+    /// An agent that one of these agents itself `dispatch_agent`s at run
+    /// time is not statically known and is not included.
+    pub fn dispatched_agents(&self) -> std::collections::BTreeSet<String> {
+        let mut agents = std::collections::BTreeSet::new();
+        for step in &self.steps {
+            collect_step_agents(step, &mut agents);
+        }
+        agents
+    }
+
+    /// `true` when any step carries an `approval:` block — a standalone
+    /// gate node or the legacy inline gate on an agent step — i.e. the
+    /// run can park awaiting an operator decision.
+    pub fn has_approval_gate(&self) -> bool {
+        self.steps.iter().any(|step| step.approval.is_some())
+    }
+
+    /// `true` when any step is placed on another host: a linear step
+    /// with `host:` or a `for_each:` step with `distribute:`. (A gate's
+    /// `on_reject` cleanup steps may not be placed — the parser rejects
+    /// it — so they are not walked.)
+    pub fn has_placed_step(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| step.host.is_some() || step.distribute.is_some())
+    }
+
     /// Parse a YAML string. Validates step-id uniqueness and input
     /// defaults / enum constraints; returns clear errors on failure.
     pub fn parse(s: &str) -> Result<Self, WorkflowParseError> {
@@ -1324,6 +1357,35 @@ impl Workflow {
     pub fn parse_file(path: &std::path::Path) -> Result<Self, WorkflowParseError> {
         let s = std::fs::read_to_string(path)?;
         Self::parse(&s)
+    }
+}
+
+/// Add every statically-named agent on `step` (and, recursively, on its
+/// gate's `on_reject` cleanup steps) to `into`. See
+/// [`Workflow::dispatched_agents`].
+fn collect_step_agents(step: &Step, into: &mut std::collections::BTreeSet<String>) {
+    if let Some(agent) = step.agent.as_deref().filter(|a| !a.is_empty()) {
+        into.insert(agent.to_string());
+    }
+    for sub in step.parallel.iter().flatten() {
+        if !sub.agent.is_empty() {
+            into.insert(sub.agent.clone());
+        }
+    }
+    if let Some(panel) = &step.panel {
+        for panelist in panel.panelists.iter().filter(|p| !p.is_empty()) {
+            into.insert(panelist.clone());
+        }
+        if let Some(gate) = &panel.gate {
+            if !gate.fix_with.is_empty() {
+                into.insert(gate.fix_with.clone());
+            }
+        }
+    }
+    if let Some(approval) = &step.approval {
+        for cleanup in &approval.on_reject {
+            collect_step_agents(cleanup, into);
+        }
     }
 }
 
@@ -5259,5 +5321,106 @@ steps:
             crate::runner::step_kind_for_run_record(&step),
             crate::runs::StepKind::Run
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatched_agents_tests {
+    use super::*;
+
+    #[test]
+    fn collects_every_static_agent_shape_including_on_reject() {
+        let yaml = r#"
+name: all-shapes
+steps:
+  - id: lin
+    agent: a
+    prompt: do it
+  - id: fan
+    parallel:
+      - id: p1
+        agent: b
+        prompt: one
+  - id: review
+    panel:
+      panelists: [c]
+      subject: "{{ steps.lin.output }}"
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: d
+        max_iterations: 2
+  - id: gate
+    approval:
+      required: true
+      on_reject:
+        - id: cleanup
+          agent: e
+          prompt: tidy up
+"#;
+        let wf = Workflow::parse(yaml).expect("valid");
+        let got: Vec<String> = wf.dispatched_agents().into_iter().collect();
+        assert_eq!(got, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn for_each_agent_and_duplicates_collapse() {
+        let yaml = r#"
+name: dup
+steps:
+  - id: one
+    agent: a
+    prompt: x
+  - id: many
+    for_each: "{{ inputs.items }}"
+    agent: a
+    prompt: "{{ item }}"
+"#;
+        let wf = Workflow::parse(yaml).expect("valid");
+        assert_eq!(
+            wf.dispatched_agents().into_iter().collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn plain_linear_workflow_has_no_gate_and_no_placement() {
+        let wf = Workflow::parse("name: plain\nsteps:\n  - id: s\n    agent: a\n    prompt: hi\n")
+            .expect("valid");
+        assert!(!wf.has_approval_gate());
+        assert!(!wf.has_placed_step());
+    }
+
+    #[test]
+    fn standalone_and_inline_gates_both_count() {
+        let standalone =
+            Workflow::parse("name: g\nsteps:\n  - id: gate\n    approval:\n      required: true\n")
+                .expect("valid");
+        assert!(standalone.has_approval_gate());
+        assert!(!standalone.has_placed_step());
+
+        let inline = Workflow::parse(
+            "name: g\nsteps:\n  - id: s\n    agent: a\n    prompt: hi\n    approval:\n      required: true\n",
+        )
+        .expect("valid");
+        assert!(inline.has_approval_gate());
+    }
+
+    #[test]
+    fn host_step_is_placed() {
+        let wf = Workflow::parse(
+            "name: h\nsteps:\n  - id: s\n    agent: a\n    prompt: hi\n    host: worker-1\n",
+        )
+        .expect("valid");
+        assert!(wf.has_placed_step());
+        assert!(!wf.has_approval_gate());
+    }
+
+    #[test]
+    fn distributed_for_each_is_placed() {
+        let wf = Workflow::parse(
+            "name: d\nsteps:\n  - id: s\n    for_each: \"{{ inputs.items }}\"\n    agent: a\n    prompt: \"{{ item }}\"\n    distribute:\n      hosts: [h1, h2]\n",
+        )
+        .expect("valid");
+        assert!(wf.has_placed_step());
     }
 }

@@ -219,6 +219,22 @@ fn quote(s: &str) -> String {
 /// `Clone`, so a persistent driver needs a factory rather than one instance.
 pub type ProviderFactory = Box<dyn FnMut() -> Box<dyn LlmProvider> + Send>;
 
+/// Mints a provider for each `generate_workflow` call. Unlike
+/// [`ProviderFactory`] it is shared (`Arc`, `Fn`) because the tool holding it
+/// is invoked through `&self` and may be called many times in one run.
+pub type GenerationProviderFactory = Arc<dyn Fn() -> Box<dyn LlmProvider> + Send + Sync>;
+
+/// How the lead authors new workflows: the provider/model to generate
+/// with and a factory that mints a provider for each generation call.
+/// Built by the launch site exactly like `make_provider` (wired for real in
+/// Plan 4); when absent, the lead is not offered `generate_workflow`.
+#[derive(Clone)]
+pub struct GenerationCapability {
+    pub provider: String,
+    pub model: String,
+    pub factory: GenerationProviderFactory,
+}
+
 /// Static configuration for a [`RunAgentLeadDriver`].
 pub struct LeadConfig {
     pub agent_name: String,
@@ -245,9 +261,11 @@ pub struct LeadConfig {
     pub workspace_id: String,
     /// The lead's workspace root (the file/bash tools' scope).
     pub workspace_path: PathBuf,
-    /// Exactly the tools the lead may use; the runner's registry is filtered
-    /// to this list. Empty (the fail-closed default) grants NO tools. The
-    /// caller lists what the lead needs -- there is deliberately no way to
+    /// The builtins/MCP allowlist: the runner filters its registry to this
+    /// list, so empty (the fail-closed default) grants NO builtins/MCP tools.
+    /// (`report_finding` is appended by `run_agentiflow`, and the board/mailbox
+    /// `extra_tools` are always-on, so an empty list is not "no tools at all".)
+    /// The caller lists what the lead needs -- there is deliberately no way to
     /// say "all builtins" by omission, because the lead runs unattended under
     /// `BypassDecider` on digest text an attacker can influence.
     pub agent_tools: Vec<String>,
@@ -255,6 +273,24 @@ pub struct LeadConfig {
     /// with (including any learned from a context-overflow error) into the
     /// next, as a session does. `ModelLimits::unknown()` when not resolved.
     pub limits: ModelLimits,
+    /// Coverage scope the lead's `report_finding` / `asset_mark` write to. Set
+    /// to the agentiflow id so findings pool under the same target the
+    /// envelope's goal evaluator reads (`target_id(workspace, id)`); `None`
+    /// falls back to the runner's default, `target_id(workspace, agent_name)`.
+    pub scope_name: Option<String>,
+    /// The run's resolved engagement profile set. `Some` enables `asset_mark`
+    /// and makes the lead's findings profile-typed; `None` records bare
+    /// findings with no engagement routing.
+    pub findings_engagement: Option<Arc<rupu_coverage::ActiveSet>>,
+    /// Always-on tools injected into every round's registry AFTER the
+    /// `agent_tools` filter (so they need not be listed there): the lead's
+    /// board / mailbox coordination tools. Shared `Arc`s -- the same instances
+    /// serve every round, so their per-run state (held claims) persists.
+    pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
+    /// Ambient-context collectors run before each of the lead's model calls
+    /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
+    /// into every round's `AgentRunOpts`.
+    pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
 }
 
 /// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
@@ -268,12 +304,14 @@ pub struct LeadConfig {
 /// must create, drive AND drop the driver from a BLOCKING context -- a
 /// dedicated thread or `spawn_blocking` -- never directly on a runtime worker.
 ///
-/// What a round does NOT wire up yet (Plan 3b): fleet-backed turn collectors,
-/// the MCP/SCM registry, dispatchable agents, and a codename. It runs with
-/// `BypassDecider`, so [`LeadConfig::agent_tools`] is the only tool gate: the
-/// runner's registry is filtered to exactly that list (empty = no tools). No
-/// collectors, no parent run, depth 0 -- the same shape as a session turn's
-/// `AgentRunOpts` minus the CLI-only plumbing.
+/// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
+/// dispatchable agents, and a codename. It runs with `BypassDecider`, so the
+/// tool gate is [`LeadConfig::agent_tools`] (the runner's registry is filtered
+/// to exactly that list; empty = no builtins/MCP) plus [`LeadConfig::extra_tools`],
+/// the caller's explicit always-on injections (the board / mailbox tools).
+/// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
+/// into each turn. No parent run, depth 0 -- the same shape as a session
+/// turn's `AgentRunOpts` minus the CLI-only plumbing.
 pub struct RunAgentLeadDriver {
     cfg: LeadConfig,
     make_provider: ProviderFactory,
@@ -336,6 +374,12 @@ impl LeadDriver for RunAgentLeadDriver {
             decider: Arc::new(BypassDecider),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: self.cfg.workspace_path.clone(),
+                findings: self.cfg.findings_engagement.clone().map(|engagement| {
+                    rupu_coverage::FindingWriteOptions {
+                        engagement: Some(engagement),
+                        ..Default::default()
+                    }
+                }),
                 ..Default::default()
             },
             user_message,
@@ -361,11 +405,12 @@ impl LeadDriver for RunAgentLeadDriver {
             on_usage: None,
             concerns: None,
             limits: self.limits.clone(),
-            scope_name: None,
+            scope_name: self.cfg.scope_name.clone(),
             surface_tag: None,
             pause: None,
             seed_source: None,
-            collectors: Vec::new(),
+            collectors: self.cfg.collectors.clone(),
+            extra_tools: self.cfg.extra_tools.clone(),
             recovery: Default::default(),
         };
 
@@ -622,6 +667,10 @@ mod tests {
             workspace_path: dir.to_path_buf(),
             agent_tools: vec![],
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            scope_name: None,
+            findings_engagement: None,
+            extra_tools: Vec::new(),
+            collectors: Vec::new(),
         }
     }
 

@@ -123,6 +123,7 @@ fn build_opts(
         codename: None,
         seed_source: None,
         collectors: Vec::new(),
+        extra_tools: Vec::new(),
         agent_name: "noop".into(),
         agent_system_prompt: "You are a noop agent.".into(),
         agent_tools: None,

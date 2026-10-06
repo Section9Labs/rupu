@@ -159,6 +159,7 @@ impl StepFactory for DispatchFactory {
         AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "writer".into(),
             agent_system_prompt: "you are the writer".into(),
             agent_tools: Some(vec!["dispatch_agent".into()]),
@@ -340,6 +341,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
             AgentRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
+                extra_tools: Vec::new(),
                 agent_name: "writer".into(),
                 agent_system_prompt: "you are the writer".into(),
                 agent_tools: Some(vec!["dispatch_agent".into()]),
