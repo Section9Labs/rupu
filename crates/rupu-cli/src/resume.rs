@@ -10,6 +10,7 @@
 //! handler scope can call it identically to the `approve` subcommand.
 
 use crate::paths;
+use anyhow::Context as _;
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult};
 use rupu_orchestrator::{DefaultStepFactory, RunStore, Workflow};
@@ -301,9 +302,7 @@ pub(crate) fn resume_config_paths(
 ) -> anyhow::Result<paths::ConfigPaths> {
     if let Some(slug) = recorded_customer {
         return rupu_workspace::config_paths_for_customer(global, Some(slug), project_root)
-            .map_err(|e| {
-                anyhow::anyhow!("resume run {run_id} under its recorded customer `{slug}`: {e}")
-            });
+            .with_context(|| format!("resume run {run_id} under its recorded customer `{slug}`"));
     }
     let lookup_dir = customer_lookup_dir(store, run_id, workspace_path)?;
     paths::config_paths(global, project_root, &lookup_dir)
@@ -680,7 +679,17 @@ mod tests {
         let store = store_with_run(tmp.path());
         let err =
             resume_config_paths(&store, &home, "run_1", Some("initech"), &proj, None).unwrap_err();
-        assert!(format!("{err:#}").contains("initech"), "{err:#}");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("run_1"), "{shown}");
+        assert!(shown.contains("initech"), "{shown}");
+        // The store's error stays the source, not a flattened string.
+        assert!(
+            matches!(
+                err.downcast_ref::<rupu_workspace::CustomerError>(),
+                Some(rupu_workspace::CustomerError::NotFound(_))
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

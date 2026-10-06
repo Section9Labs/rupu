@@ -253,6 +253,58 @@ fn workflow_fixture(customer_cfg: &str) -> (assert_fs::TempDir, std::path::PathB
     (tmp, project)
 }
 
+/// A `--run-id` whose `run.json` already exists (a tunnel mirror's stub, or a
+/// reused id) is updated in place at the end of `rupu run` — and gets the
+/// run's customer, not the stub's none.
+#[tokio::test(flavor = "multi_thread")]
+async fn rupu_run_over_an_existing_stub_records_the_customer() {
+    let _guard = ENV_LOCK.lock().await;
+    let (tmp, project) = fixture("permission_mode = \"bypass\"\n", "", "");
+    let home = tmp.child(".rupu");
+    let run_id = "run_customer_stub".to_string();
+    let store = rupu_orchestrator::RunStore::new(home.path().join("runs"));
+    let stub = rupu_orchestrator::RunRecord {
+        workflow_name: "agent:writer".into(),
+        status: rupu_orchestrator::RunStatus::Running,
+        customer: None,
+        ..stub_record(&run_id, home.path())
+    };
+    store.create(stub, "").unwrap();
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", WRITE_SCRIPT);
+    std::env::set_current_dir(&project).unwrap();
+    let code = Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "run".into(),
+        "writer".into(),
+        "go".into(),
+        "--run-id".into(),
+        run_id.clone(),
+    ]))
+    .await;
+    assert!(ok(code), "rupu run failed");
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
+    assert_eq!(record.customer.as_deref(), Some("acme"));
+}
+
+/// A minimal pre-existing `run.json` for `run_id`, round-tripped through
+/// serde so it needs no field list.
+fn stub_record(run_id: &str, home: &std::path::Path) -> rupu_orchestrator::RunRecord {
+    serde_json::from_value(serde_json::json!({
+        "id": run_id,
+        "workflow_name": "stub",
+        "status": "running",
+        "inputs": {},
+        "workspace_id": "",
+        "workspace_path": ".",
+        "transcript_dir": home.join("runs").join(run_id),
+        "started_at": "2026-10-06T00:00:00Z",
+    }))
+    .unwrap()
+}
+
 /// The first line of the only run's first step transcript.
 fn first_step_run_start(home: &std::path::Path) -> String {
     let store = rupu_orchestrator::RunStore::new(home.join("runs"));

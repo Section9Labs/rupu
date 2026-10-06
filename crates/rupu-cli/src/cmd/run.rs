@@ -1463,6 +1463,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                             loaded.final_output = final_output;
                             loaded.error_message = error_message;
                             loaded.cause = cause;
+                            // A stub (a tunnel mirror's, or a reused id)
+                            // knows no customer; this run does.
+                            loaded.customer = cfg_paths.customer_slug.clone();
                             // Under the run lock, on the blocking pool: a cancel
                             // that landed since the load is kept.
                             match store
