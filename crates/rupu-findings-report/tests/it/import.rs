@@ -521,6 +521,7 @@ fn an_exported_report_with_every_optional_part_round_trips() {
     original.verification = Some(Verification {
         status: VerificationStatus::Confirmed,
         by_run: Some("run_02".into()),
+        by_agent: None,
         notes: None,
     });
 

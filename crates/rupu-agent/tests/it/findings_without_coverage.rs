@@ -196,3 +196,197 @@ async fn a_run_stream_receives_the_finding_with_its_scope() {
     });
     assert!(found, "the finding must reach the stream: {lines:?}");
 }
+
+// ---------------------------------------------------------------------------
+// finding.verify: the same opt-in registration, for a verifier run.
+// ---------------------------------------------------------------------------
+
+/// File a full-report finding as a DIFFERENT run, into the ledger the
+/// verifier (agent `net-assessor`) will see, and return its id.
+fn seed_other_runs_finding(workspace: &std::path::Path) -> String {
+    let report: rupu_coverage::FindingReport = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    )))
+    .unwrap();
+    let paths = CoveragePaths::new(workspace, &target_id(workspace, "net-assessor"));
+    paths.ensure_dir().unwrap();
+    let input = rupu_coverage::ReportFindingInput {
+        file_path: None,
+        line_range: None,
+        target_ref: None,
+        scope: rupu_coverage::FindingScope::Repo,
+        summary: None,
+        severity: None,
+        concern_id: None,
+        evidence: None,
+        report: Some(report),
+        asset: None,
+    };
+    let attribution = rupu_coverage::Attribution {
+        run_id: "run_filer".into(),
+        model: "m".into(),
+        surface: rupu_coverage::Surface::Workflow,
+        codename: None,
+        agent: None,
+        provider: None,
+    };
+    let opts = rupu_coverage::FindingWriteOptions::default()
+        .with_profile(rupu_coverage::FindingProfile::Full);
+    rupu_coverage::report_finding(&paths, attribution, input, &opts)
+        .unwrap()
+        .id
+}
+
+fn verify_then_stop(finding_id: &str) -> Vec<ScriptedTurn> {
+    vec![
+        ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "v1".into(),
+            tool_name: "finding.verify".into(),
+            tool_input: serde_json::json!({
+                "finding_id": finding_id,
+                "status": "confirmed",
+                "notes": "reproduced",
+                // Not an input the tool reads: the identity is the run's.
+                "by_run": "run_filer",
+            }),
+            stop: StopReason::ToolUse,
+        },
+        ScriptedTurn::AssistantText {
+            text: "Verified.".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        },
+    ]
+}
+
+fn recorded_verification(
+    workspace: &std::path::Path,
+    id: &str,
+) -> Option<rupu_coverage::Verification> {
+    let paths = CoveragePaths::new(workspace, &target_id(workspace, "net-assessor"));
+    rupu_coverage::read_findings(&paths)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == id)
+        .unwrap()
+        .report
+        .unwrap()
+        .verification
+}
+
+#[tokio::test]
+async fn granted_verifier_records_a_verdict_as_its_own_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let id = seed_other_runs_finding(&workspace);
+
+    // No `concerns:` block and no `report_finding`: `finding.verify` alone in
+    // `tools:` is enough.
+    run_agent(opts_for(
+        &workspace,
+        Some(vec!["finding.verify".to_string()]),
+        verify_then_stop(&id),
+    ))
+    .await
+    .expect("agent run should succeed");
+
+    let v = recorded_verification(&workspace, &id).expect("a verdict was recorded");
+    assert_eq!(v.status, rupu_coverage::VerificationStatus::Confirmed);
+    assert_eq!(v.by_run.as_deref(), Some("run_findings_test"));
+    assert_eq!(v.by_agent.as_deref(), Some("net-assessor"));
+    assert_eq!(v.notes.as_deref(), Some("reproduced"));
+}
+
+#[tokio::test]
+async fn finding_verify_is_absent_when_not_granted() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let id = seed_other_runs_finding(&workspace);
+
+    // Granting `report_finding` (or anything else) does not grant
+    // `finding.verify`.
+    let _ = run_agent(opts_for(
+        &workspace,
+        Some(vec!["report_finding".to_string(), "read_file".to_string()]),
+        verify_then_stop(&id),
+    ))
+    .await;
+
+    assert!(
+        recorded_verification(&workspace, &id).is_none(),
+        "an ungranted agent must not be able to verify a finding"
+    );
+}
+
+#[tokio::test]
+async fn finding_verify_is_not_granted_by_an_absent_or_wildcard_tools_list() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let id = seed_other_runs_finding(&workspace);
+
+    // Only an exact `finding.verify` entry grants it, as with `report_finding`.
+    for tools in [None, Some(vec!["*".to_string()])] {
+        let _ = run_agent(opts_for(&workspace, tools.clone(), verify_then_stop(&id))).await;
+        assert!(
+            recorded_verification(&workspace, &id).is_none(),
+            "tools {tools:?} must not grant finding.verify"
+        );
+    }
+}
+
+/// An agent that ALSO runs the coverage harness (`concerns:`).
+fn concerns_opts_for(
+    workspace: &std::path::Path,
+    agent_tools: Option<Vec<String>>,
+    turns: Vec<ScriptedTurn>,
+) -> AgentRunOpts {
+    let mut opts = opts_for(workspace, agent_tools, turns);
+    opts.concerns = Some(rupu_coverage::ConcernsBlock {
+        entries: vec![rupu_coverage::ConcernsEntry::Include(
+            rupu_coverage::IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: rupu_coverage::CatalogMode::Auto,
+                filter: None,
+            },
+        )],
+    });
+    opts
+}
+
+#[tokio::test]
+async fn a_concerns_agent_holds_finding_verify_only_when_it_lists_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let id = seed_other_runs_finding(&workspace);
+
+    // The coverage bundle brings `report_finding` and the coverage tools, but
+    // not a verdict: without the `tools:` entry the call finds no such tool.
+    run_agent(concerns_opts_for(
+        &workspace,
+        Some(vec!["read_file".to_string()]),
+        verify_then_stop(&id),
+    ))
+    .await
+    .expect("agent run should succeed");
+    assert!(
+        recorded_verification(&workspace, &id).is_none(),
+        "a concerns agent must not auto-hold finding.verify"
+    );
+
+    // Listing it grants it, against the SAME ledger the bundle writes to.
+    run_agent(concerns_opts_for(
+        &workspace,
+        Some(vec!["finding.verify".to_string()]),
+        verify_then_stop(&id),
+    ))
+    .await
+    .expect("agent run should succeed");
+    let v = recorded_verification(&workspace, &id).expect("a verdict was recorded");
+    assert_eq!(v.status, rupu_coverage::VerificationStatus::Confirmed);
+    assert_eq!(v.by_run.as_deref(), Some("run_findings_test"));
+    assert_eq!(v.by_agent.as_deref(), Some("net-assessor"));
+}

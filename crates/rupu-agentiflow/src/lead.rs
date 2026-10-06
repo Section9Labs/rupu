@@ -493,6 +493,7 @@ mod tests {
                 count_gte: Some(10),
                 depth_at_least: None,
                 verified: true,
+                verify_check: None,
             },
             required: true,
             verify_with: None,

@@ -21,13 +21,15 @@ mod subprocess;
 mod supervisor;
 mod tools;
 mod unit;
+#[cfg(test)]
+mod verify_fixtures;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use collectors::{lead_collectors, DirectiveCollector, MailboxCollector};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
-    ScopeRoot,
+    ScopeRoot, VerifyCheck,
 };
 pub use dispatch_tools::{
     fleet_dispatch_tools, fleet_dispatch_tools_at_depth, fleet_unit_tools, WorkflowToolCtx,

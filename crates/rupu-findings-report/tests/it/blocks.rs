@@ -347,6 +347,7 @@ fn provenance_carries_surface_and_for_full_findings_the_record_and_verification(
             r.verification = Some(Verification {
                 status: VerificationStatus::Confirmed,
                 by_run: Some("run_77".into()),
+                by_agent: None,
                 notes: Some("reproduced\non staging".into()),
             });
             r
@@ -398,6 +399,7 @@ fn a_verification_with_only_a_status_is_just_the_status() {
         r.verification = Some(Verification {
             status: VerificationStatus::Disputed,
             by_run: None,
+            by_agent: None,
             notes: None,
         })
     });

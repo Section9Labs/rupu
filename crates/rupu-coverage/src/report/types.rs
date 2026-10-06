@@ -439,6 +439,8 @@ pub struct Verification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_run: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
 
@@ -550,6 +552,28 @@ mod tests {
 
     fn report_fixture() -> FindingReport {
         serde_json::from_value(fixture()).unwrap()
+    }
+
+    #[test]
+    fn verification_round_trips_by_agent() {
+        let v = Verification {
+            status: VerificationStatus::Confirmed,
+            by_run: Some("run_B".into()),
+            by_agent: Some("exploit-verifier".into()),
+            notes: None,
+        };
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(j.contains("\"by_agent\":\"exploit-verifier\""));
+        let back: Verification = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.by_agent.as_deref(), Some("exploit-verifier"));
+        // omitted when None
+        let v2 = Verification {
+            status: VerificationStatus::Confirmed,
+            by_run: None,
+            by_agent: None,
+            notes: None,
+        };
+        assert!(!serde_json::to_string(&v2).unwrap().contains("by_agent"));
     }
 
     #[test]
