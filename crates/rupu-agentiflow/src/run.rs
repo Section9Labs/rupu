@@ -9,6 +9,8 @@
 //!   agentiflow.json            AgentiflowRecord, rewritten atomically (tmp + rename)
 //!   agentiflow.yaml            the definition this run was started from (written once, atomically)
 //!   events.jsonl               append-only event log (shape below)
+//!   usage.jsonl                the lead's usage ledger (one row per LLM call; metered
+//!                              with the units' own ledgers against `budget.usd` / `budget.tokens`)
 //!   lead/transcript.r<N>.jsonl the lead's transcript for round N
 //!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
 //!   board/                     the coordination board (posts, claims, directives)
@@ -57,13 +59,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use rupu_config::PricingConfig;
 use rupu_coverage::{target_id, ActiveSet, CoveragePaths};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_runtime::RunTriggerSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::budget::{parse_duration, BudgetStage, UsageSource};
+use crate::budget::{parse_duration, Budget, BudgetStage};
 use crate::def::{AgentiflowDef, WorkflowsSpec};
 use crate::dispatch_tools::{fleet_unit_tools, WorkflowToolCtx};
 use crate::envelope::{
@@ -77,6 +80,7 @@ use crate::status_tools::status_tools;
 use crate::subprocess::SubprocessUnitLauncher;
 use crate::supervisor::FleetSupervisor;
 use crate::unit::UnitLauncher;
+use crate::usage::{usd_is_priceable, LedgerUsageSource};
 
 /// `agentiflow.json`, the durable record of one run.
 const RECORD_FILE: &str = "agentiflow.json";
@@ -215,6 +219,11 @@ pub struct RunAgentiflowOpts {
     /// the CLI passes `None` when the generating provider has no credential or
     /// cannot be built synchronously (Anthropic OAuth).
     pub generation: Option<crate::lead::GenerationCapability>,
+    /// The layered `[pricing]` config (with its `provider_kinds` attached): what
+    /// prices the ledgers' tokens for `budget.usd`. A model with no price here
+    /// (or in the built-in table) counts as `$0`; when the LEAD's own model is
+    /// unpriced, `budget.usd` is not enforced at all (see [`run_agentiflow`]).
+    pub pricing: PricingConfig,
 }
 
 /// A run id becomes a directory name and an evidence scope name, so it must
@@ -235,20 +244,23 @@ fn validate_run_id(id: &str) -> Result<(), AgentiflowError> {
 }
 
 /// Whether anything but an operator `stop` can end this flow: a required
-/// goal, a coverage target, a wall-clock / round cap on the budget, or a
-/// round / wall-clock ceiling.
+/// goal, a coverage target, a cap on the budget, or a round / wall-clock
+/// ceiling.
 ///
-/// `budget.usd` / `budget.tokens` do NOT count: the usage-ledger-backed
-/// [`UsageSource`] is not wired yet (see [`UnmeteredUsage`]), so those caps
-/// cannot fire in this build and a flow bounded only by them is, honestly,
-/// unbounded.
-fn has_automatic_terminator(def: &AgentiflowDef) -> bool {
+/// A budget cap counts only if it can actually fire: `wall_clock`, `rounds`
+/// and `tokens` always can (the [`LedgerUsageSource`] meters tokens from the
+/// ledgers), but `usd` only when the lead's model is priceable
+/// (`usd_priceable`; see [`enforced_budget`]). A flow bounded only by a usd cap
+/// nothing can price is, honestly, unbounded.
+fn has_automatic_terminator(def: &AgentiflowDef, usd_priceable: bool) -> bool {
     def.goals.iter().any(|g| g.required)
         || def.coverage.is_some()
-        || def
-            .budget
-            .as_ref()
-            .is_some_and(|b| b.wall_clock.is_some() || b.rounds.is_some())
+        || def.budget.as_ref().is_some_and(|b| {
+            b.wall_clock.is_some()
+                || b.rounds.is_some()
+                || b.tokens.is_some()
+                || (usd_priceable && b.usd.is_some())
+        })
         || def
             .round
             .as_ref()
@@ -272,22 +284,19 @@ fn pool_workflow_ids(spec: &WorkflowsSpec, ctx: &RosterCtx) -> Vec<String> {
     }
 }
 
-/// The usage source for this build: reports nothing spent.
+/// The budget the envelope enforces: the definition's, minus a `usd` cap the
+/// run cannot price.
 ///
-/// The ledger-backed source (summing the lead's and the dispatched units'
-/// token / cost usage) lands with real dispatch in Plan 3b. Until then
-/// `budget.usd` / `budget.tokens` are NOT enforced and only the wall-clock and
-/// round dimensions can stop a run; `run_agentiflow` warns when a definition
-/// sets the unenforced ones.
-struct UnmeteredUsage;
-
-impl UsageSource for UnmeteredUsage {
-    fn spent_usd(&self) -> f64 {
-        0.0
+/// A usd cap on spend nothing can price would read `$0` forever and never fire,
+/// so it is dropped from the enforcer rather than passed in as a dimension that
+/// merely looks active (`run_agentiflow` warns about it at launch). Every other
+/// dimension is enforced as written.
+fn enforced_budget(budget: Option<&Budget>, usd_priceable: bool) -> Budget {
+    let mut b = budget.cloned().unwrap_or_default();
+    if !usd_priceable {
+        b.usd = None;
     }
-    fn spent_tokens(&self) -> u64 {
-        0
-    }
+    b
 }
 
 /// The lead's round-0 mission text: each goal's objective, the coverage
@@ -421,8 +430,9 @@ impl LeadDriver for RecordingLead<'_> {
 ///    rejects an unparseable `round.ceiling.wall_clock` or a zero
 ///    `round.lead_max_turns`, all before touching the filesystem.
 /// 2. Warns (`tracing::warn!`, never rejects) when nothing but an operator
-///    `stop` can end the flow, and when `budget.usd` / `budget.tokens` are set
-///    but not yet enforced. Operator-only is a valid, explicit mode.
+///    `stop` can end the flow, and when `budget.usd` is set but cannot be
+///    enforced (the lead's model has no price). Operator-only is a valid,
+///    explicit mode.
 /// 3. Lays out `<global>/agentiflows/<run_id>/` (see the module docs), writes
 ///    a `running` [`AgentiflowRecord`], and runs the envelope over the pooled
 ///    evidence scope with a [`RunAgentLeadDriver`] lead.
@@ -441,10 +451,22 @@ impl LeadDriver for RecordingLead<'_> {
 /// caller should invoke it from `spawn_blocking`, not inline on an executor
 /// thread. A panic on the worker thread is re-raised on the caller.
 ///
-/// # Budget in this build
+/// # Budget enforcement
 ///
-/// Usage is not metered yet ([`UnmeteredUsage`]): `budget.usd` and
-/// `budget.tokens` never trip. Wall-clock and round caps work.
+/// Every dimension is enforced. Spend is metered by a [`LedgerUsageSource`]
+/// that folds the lead's `<run dir>/usage.jsonl` and each launched unit's
+/// `<global>/runs/<unit id>/usage.jsonl`, once per round:
+///
+/// - `budget.tokens` counts billable (input + output) tokens;
+/// - `budget.usd` prices them through [`RunAgentiflowOpts::pricing`] per
+///   `(provider, model)`. It is enforced only when the LEAD's own provider /
+///   model is priceable. Otherwise the cap is dropped (it would read `$0`
+///   forever), a warning says so, and `budget.tokens` / `budget.wall_clock` /
+///   `budget.rounds` still apply. A unit on an unpriced model contributes `$0`
+///   (warned once when first seen) while its tokens still count.
+///
+/// The fold undercounts a unit's `dispatch_agent` sub-agents (see
+/// `usage.rs`), so a cap can trip later than the true spend.
 pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, AgentiflowError> {
     let RunAgentiflowOpts {
         def,
@@ -458,6 +480,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         run_id: id,
         unit_launcher,
         generation,
+        pricing,
     } = opts;
 
     // A thread-scoped tracing subscriber (a test's, say) does not follow the
@@ -490,23 +513,26 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 ));
             }
 
-            if !has_automatic_terminator(&def) {
+            // `budget.usd` can only be enforced against spend that can be priced.
+            // The lead's own model is what is known at launch (the units' models
+            // are chosen by their agent files, in subprocesses).
+            let usd_priceable = usd_is_priceable(&pricing, &lead.provider_name, &lead.model);
+            if !has_automatic_terminator(&def, usd_priceable) {
                 tracing::warn!(
                     name = %def.name,
                     run_id = %id,
                     "agentiflow has no automatic terminator; it will run until an operator stop"
                 );
             }
-            if def
-                .budget
-                .as_ref()
-                .is_some_and(|b| b.usd.is_some() || b.tokens.is_some())
-            {
+            if !usd_priceable && def.budget.as_ref().is_some_and(|b| b.usd.is_some()) {
                 tracing::warn!(
                     name = %def.name,
                     run_id = %id,
-                    "budget.usd / budget.tokens are not enforced yet (usage is not metered); \
-                     only budget.wall_clock / budget.rounds can stop this run"
+                    provider = %lead.provider_name,
+                    model = %lead.model,
+                    "budget.usd cannot be enforced: there is no price for the lead's model, so \
+                     its spend would read $0; add a [pricing.<provider>.\"<model>\"] entry. \
+                     budget.tokens / budget.wall_clock / budget.rounds still apply"
                 );
             }
 
@@ -570,7 +596,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 paths,
                 active,
                 cfg,
-                def.budget.clone().unwrap_or_default(),
+                enforced_budget(def.budget.as_ref(), usd_priceable),
                 OperatorQueue::new(&run_dir),
                 started,
             );
@@ -610,6 +636,10 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 },
             };
             let sup = Arc::new(FleetSupervisor::new(launcher, run_dir.clone()));
+            // Spend: the lead's ledger plus every unit the supervisor launches.
+            let lead_usage = run_dir.join("usage.jsonl");
+            let usage =
+                LedgerUsageSource::new(lead_usage.clone(), sup.clone(), global.clone(), pricing);
             // Where the catalog lives: the roster tools read it, and
             // `run_workflow` loads and vets the workflow it is asked to start
             // from it. The pool's workflow ids are resolved ONCE against it, so
@@ -678,6 +708,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 findings_engagement: Some(findings_engagement),
                 extra_tools,
                 collectors,
+                usage_ledger: Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
+                    lead_usage,
+                )),
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,
@@ -703,7 +736,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     "engagement_profiles": def.engagement_profiles,
                 }),
             );
-            let outcome = envelope.run(&mut lead, &UnmeteredUsage, &*now);
+            let outcome = envelope.run(&mut lead, &usage, &*now);
             // The run is over: SIGTERM every unit still alive so a stop (a
             // goal met, the ceiling, an operator stop) never leaves orphans.
             sup.terminate_all();
@@ -843,7 +876,24 @@ mod tests {
             run_id: id.into(),
             unit_launcher: None,
             generation: None,
+            pricing: PricingConfig::default(),
         }
+    }
+
+    /// `[pricing.mock."mock-1"]`: prices the test lead's model so a `budget.usd`
+    /// cap is enforceable ($1 / Mtok in, $1 / Mtok out).
+    fn mock_pricing() -> PricingConfig {
+        let mut cfg = PricingConfig::default();
+        cfg.models.entry("mock".into()).or_default().insert(
+            "mock-1".into(),
+            rupu_config::ModelPricing {
+                input_per_mtok: 1.0,
+                output_per_mtok: 1.0,
+                cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+        );
+        cfg
     }
 
     fn run_dir(fx: &Fixture, id: &str) -> PathBuf {
@@ -974,30 +1024,56 @@ mod tests {
 
     #[test]
     fn terminator_predicate_counts_only_effective_stops() {
+        // `priced`: whether the lead's model has a price (only `budget.usd`
+        // cares).
+        let t = |def: &AgentiflowDef| has_automatic_terminator(def, true);
         // A required goal terminates.
-        assert!(has_automatic_terminator(&def_with("")));
+        assert!(t(&def_with("")));
         // No required goal, nothing else: operator-only.
         let with = operator_only;
-        assert!(!has_automatic_terminator(&with("")));
-        assert!(has_automatic_terminator(&with(
-            "round: { ceiling: { rounds: 3 } }"
-        )));
-        assert!(has_automatic_terminator(&with(
-            "round: { ceiling: { wall_clock: 1h } }"
-        )));
-        assert!(has_automatic_terminator(&with("budget: { rounds: 5 }")));
-        assert!(has_automatic_terminator(&with(
-            "budget: { wall_clock: 2h }"
-        )));
-        assert!(has_automatic_terminator(&with("coverage: { reach: 0.5 }")));
+        assert!(!t(&with("")));
+        assert!(t(&with("round: { ceiling: { rounds: 3 } }")));
+        assert!(t(&with("round: { ceiling: { wall_clock: 1h } }")));
+        assert!(t(&with("budget: { rounds: 5 }")));
+        assert!(t(&with("budget: { wall_clock: 2h }")));
+        assert!(t(&with("coverage: { reach: 0.5 }")));
         // An empty ceiling / budget block caps nothing.
-        assert!(!has_automatic_terminator(&with("round: { ceiling: {} }")));
-        assert!(!has_automatic_terminator(&with("budget: {}")));
-        // usd / tokens caps are not enforced yet (no usage ledger in 3a), so
-        // they are not a terminator either.
-        assert!(!has_automatic_terminator(&with(
-            "budget: { usd: 5.0, tokens: 1000 }"
-        )));
+        assert!(!t(&with("round: { ceiling: {} }")));
+        assert!(!t(&with("budget: {}")));
+        // A tokens cap is metered from the ledgers, so it is a terminator
+        // whether or not anything is priced.
+        assert!(t(&with("budget: { tokens: 1000 }")));
+        assert!(has_automatic_terminator(
+            &with("budget: { tokens: 1000 }"),
+            false
+        ));
+        // A usd cap is a terminator only when the lead's model is priceable.
+        assert!(t(&with("budget: { usd: 5.0 }")));
+        assert!(!has_automatic_terminator(
+            &with("budget: { usd: 5.0 }"),
+            false
+        ));
+        // ...and an unpriceable usd cap does not hide a real one beside it.
+        assert!(has_automatic_terminator(
+            &with("budget: { usd: 5.0, rounds: 3 }"),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_unpriceable_usd_cap_is_not_passed_to_the_enforcer() {
+        let def = operator_only("budget: { usd: 5.0, tokens: 100, rounds: 3 }");
+        // Priceable: the budget is enforced as written.
+        let b = enforced_budget(def.budget.as_ref(), true);
+        assert_eq!(b.usd, Some(5.0));
+        assert_eq!((b.tokens, b.rounds), (Some(100), Some(3)));
+        // Unpriceable: only the usd dimension is dropped.
+        let b = enforced_budget(def.budget.as_ref(), false);
+        assert_eq!(b.usd, None);
+        assert_eq!((b.tokens, b.rounds), (Some(100), Some(3)));
+        // No budget at all: nothing to enforce either way.
+        let none = enforced_budget(None, false);
+        assert_eq!((none.usd, none.tokens, none.rounds), (None, None, None));
     }
 
     // ---- run_agentiflow, end to end ----------------------------------------
@@ -1240,16 +1316,102 @@ mod tests {
     }
 
     #[test]
-    fn unenforced_usd_and_token_caps_are_warned_about() {
+    fn an_unpriceable_usd_cap_is_warned_about_and_is_not_a_terminator() {
         let fx = fixture();
         let id = "af_usd";
         enqueue_stop(&fx, id);
+        // The test lead is `mock` / `mock-1`: nothing prices it.
         let (out, logs) =
             capture_logs(|| run_agentiflow(opts(&fx, operator_only("budget: { usd: 5.0 }"), id)));
         out.unwrap();
-        assert!(logs.contains("not enforced yet"), "{logs}");
-        // ...and a usd-only budget is not mistaken for a terminator.
+        assert!(logs.contains("budget.usd cannot be enforced"), "{logs}");
+        assert!(logs.contains("mock-1"), "names the model: {logs}");
+        // ...and a usd-only budget it cannot price is not mistaken for a terminator.
         assert!(logs.contains("no automatic terminator"), "{logs}");
+    }
+
+    #[test]
+    fn a_priceable_usd_cap_enforces_and_does_not_warn() {
+        let fx = fixture();
+        let id = "af_usd_priced";
+        enqueue_stop(&fx, id);
+        let mut o = opts(&fx, operator_only("budget: { usd: 5.0 }"), id);
+        o.pricing = mock_pricing();
+        let (out, logs) = capture_logs(|| run_agentiflow(o));
+        out.unwrap();
+        assert!(!logs.contains("cannot be enforced"), "{logs}");
+        // The usd cap IS an automatic terminator now.
+        assert!(!logs.contains("no automatic terminator"), "{logs}");
+    }
+
+    #[test]
+    fn a_tokens_cap_enforces_and_does_not_warn() {
+        let fx = fixture();
+        let id = "af_tokens_warn";
+        enqueue_stop(&fx, id);
+        // No pricing at all: tokens still enforce, so there is nothing to warn about.
+        let (out, logs) = capture_logs(|| {
+            run_agentiflow(opts(&fx, operator_only("budget: { tokens: 1000 }"), id))
+        });
+        out.unwrap();
+        assert!(!logs.contains("cannot be enforced"), "{logs}");
+        assert!(!logs.contains("not enforced"), "{logs}");
+        assert!(!logs.contains("no automatic terminator"), "{logs}");
+    }
+
+    /// Each round of the one-turn test lead bills 1 input + 1 output token to
+    /// `mock` / `mock-1`, so after N rounds the ledger holds 2N billable
+    /// tokens and (at $1 / Mtok both ways) N * 2e-6 USD.
+    #[test]
+    fn a_tokens_cap_stops_the_run_from_the_leads_own_ledger() {
+        let fx = fixture();
+        let id = "af_tokens_stop";
+        // Round 0: 0 spent. Round 1: 2. Round 2: 4 >= 4 -> Hard.
+        let out = run_agentiflow(opts(&fx, operator_only("budget: { tokens: 4 }"), id)).unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::BudgetExhausted {
+                dimension: "tokens".into()
+            }
+        );
+        assert_eq!(out.rounds, 2, "two rounds ran before the cap tripped");
+
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.stop_reason.as_deref(), Some("budget_exhausted:tokens"));
+        // The lead's spend landed in `<run dir>/usage.jsonl`, not a RunStore dir.
+        let ledger = run_dir(&fx, id).join("usage.jsonl");
+        let totals = crate::usage::fold_tokens(&[ledger]);
+        assert_eq!(totals.total.billable(), 4);
+    }
+
+    #[test]
+    fn a_usd_cap_on_a_priced_lead_stops_the_run() {
+        let fx = fixture();
+        let id = "af_usd_stop";
+        // 1e-6 USD cap = the first round's spend (1 in + 1 out at $1/Mtok = 2e-6).
+        let mut o = opts(&fx, operator_only("budget: { usd: 0.000001 }"), id);
+        o.pricing = mock_pricing();
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::BudgetExhausted {
+                dimension: "usd".into()
+            }
+        );
+        assert_eq!(out.rounds, 1, "round 0 ran, then its spend tripped the cap");
+    }
+
+    #[test]
+    fn a_usd_cap_the_lead_cannot_price_never_stops_the_run() {
+        let fx = fixture();
+        let id = "af_usd_unpriced";
+        // No price for `mock` / `mock-1`: the cap is dropped, so only the
+        // ceiling ends the run (an enforced-as-$0 cap would also never trip,
+        // but a ZERO cap would have hard-stopped at round 0 if it were passed in).
+        let def = operator_only("budget: { usd: 0.0 }\nround: { ceiling: { rounds: 2 } }");
+        let out = run_agentiflow(opts(&fx, def, id)).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling);
+        assert_eq!(out.rounds, 2);
     }
 
     #[test]

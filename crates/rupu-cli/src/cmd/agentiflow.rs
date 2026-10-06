@@ -298,6 +298,9 @@ async fn launch(
         // Production: a `SubprocessUnitLauncher` over this binary.
         unit_launcher: None,
         generation,
+        // The layered `[pricing]` config is wired in a later task; until then
+        // nothing is priced, so a `budget.usd` cap is warned about, not enforced.
+        pricing: rupu_config::PricingConfig::default(),
     };
 
     eprintln!("agentiflow {name}: run {run_id}");

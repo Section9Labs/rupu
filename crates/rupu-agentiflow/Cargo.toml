@@ -43,6 +43,10 @@ rupu-transcript = { path = "../rupu-transcript" }
 # edge is acyclic. (Not a [workspace.dependencies] entry; a path dep like the
 # other in-workspace crates above.)
 rupu-orchestrator = { path = "../rupu-orchestrator" }
+# USD pricing (`pricing::lookup`, `ModelPricing::cost_usd`) behind the
+# ledger-backed `budget.usd` meter. rupu-config is foundational (it depends on
+# no other in-workspace crate), so this edge is acyclic.
+rupu-config = { path = "../rupu-config" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

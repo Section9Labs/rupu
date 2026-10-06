@@ -60,4 +60,4 @@ pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
     MockUnitLauncher, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
 };
-pub use usage::{fold_tokens, TokenTotals, Tokens};
+pub use usage::{fold_tokens, LedgerUsageSource, TokenTotals, Tokens};
