@@ -76,6 +76,17 @@ async fn preview(
             ))
         }
     };
+    // The name is joined onto definition paths below: one that could leave
+    // the definitions directory is refused before anything reads a file.
+    if !rupu_workspace::is_safe_definition_name(&name) {
+        return Err(ApiError::bad_request(format!(
+            "invalid {} name `{name}`: no `/`, `\\` or `..`",
+            match kind {
+                Target::Workflow => "workflow",
+                Target::Agent => "agent",
+            }
+        )));
+    }
     if body.scope_kind.is_some() && body.working_dir.is_some() {
         return Err(ApiError::bad_request(
             "scope_kind and working_dir are mutually exclusive — the scope selector determines the working directory",
@@ -181,14 +192,13 @@ fn build(global: &FsPath, dir: &FsPath, target: Target, name: &str) -> ApiResult
                     "agent `{agent}` was not found; its accounts are not listed"
                 ));
             }
+            // Any other loader failure (a malformed agent file — the loader
+            // reads the whole agents directory) fails the launch too, so it
+            // fails the preview: 409 with the loader's message.
             Err(e) => {
-                // The loader reads the whole agents directory, so one
-                // malformed file fails the lookup of every agent: say so once.
-                warnings.push(format!(
-                    "agent definitions could not be loaded: {e}; \
-                     the accounts of this launch's agents are not listed"
-                ));
-                break;
+                return Err(ApiError::conflict(format!(
+                    "agent `{agent}` could not be loaded, so the launch would fail: {e}"
+                )));
             }
         }
     }

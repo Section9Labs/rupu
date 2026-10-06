@@ -135,12 +135,23 @@ pub fn config_paths_for_customer(
     })
 }
 
+/// Whether `name` can name a definition file (`<dir>/<name>.yaml` /
+/// `<name>.md`) without leaving that directory: non-empty, and no `/`, `\`,
+/// `..` or NUL. Checked before a caller-supplied name is joined onto a path.
+pub fn is_safe_definition_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '\0']) && !name.contains("..")
+}
+
 /// The workflow file `name` resolves to from a project: the project's
 /// `.rupu/workflows/<name>.yaml` first, then `<global>/workflows/<name>.yaml`
 /// — `rupu workflow run`'s lookup, shared by the CLI and the CP's launch
 /// preview so the two can never find different files. `None` when neither
-/// exists.
+/// exists, and for a name that is not [`is_safe_definition_name`] (it could
+/// only resolve outside the workflow directories).
 pub fn locate_workflow(global: &Path, project_root: Option<&Path>, name: &str) -> Option<PathBuf> {
+    if !is_safe_definition_name(name) {
+        return None;
+    }
     let file = format!("{name}.yaml");
     project_root
         .map(|r| r.join(".rupu").join("workflows").join(&file))

@@ -142,7 +142,11 @@ It resolves exactly like a launch: the same launch directory
 (`resolve_launch_scope`), the strict `rupu_workspace::config_paths` (a project
 assigned to a customer that no longer exists, or a config that does not load, is
 **409**, as it is a launch failure), `rupu_workspace::locate_workflow` and the
-agent loader. 404 for an unknown workflow, or an unknown agent on an agent launch.
+agent loader — agent files that do not load (one malformed file fails the
+loader for every agent) are a **409** with the loader's message, for an agent
+launch and for a workflow whose agents can't be loaded. 404 for an unknown
+workflow, or an unknown agent on an agent launch. A `workflow` / `agent` name
+containing `/`, `\` or `..` (or empty) is **400** before any file is read.
 
 Response `{customer, accounts, warnings, host?}`:
 
@@ -155,8 +159,8 @@ Response `{customer, accounts, warnings, host?}`:
   (`resolve_provider_name`, `RecoveryConfig::chain_for`, an unnamed fallback
   stays on the run's provider). The SCM entry is the account the launch
   directory's `origin` repo resolves to through `[[scm.rules]]`.
-- `warnings` — resolver warnings; an agent that was not found (its accounts are
-  not listed); agent files that could not be loaded (listed once); an `origin`
+- `warnings` — resolver warnings; a workflow step's agent that was not found
+  (its accounts are not listed); an `origin`
   that is not a github.com / gitlab.com remote ("its SCM account can't be
   previewed" — a self-hosted remote is such a case, never silently omitted); an
   ambiguous or unresolvable SCM account; and, for a non-local `host`, that the

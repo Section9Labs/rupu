@@ -201,4 +201,16 @@ fn locate_workflow_prefers_the_project_then_the_global_layer() {
         Some(global)
     );
     assert_eq!(rupu_workspace::locate_workflow(&home, None, "x"), None);
+    // A name that could leave the workflow directory resolves to nothing,
+    // even when the file it would name exists.
+    std::fs::write(home.join("escape.yaml"), "name: escape\n").unwrap();
+    for bad in ["../escape", "workflows/../../escape", "a\\b", "", ".."] {
+        assert!(!rupu_workspace::is_safe_definition_name(bad), "{bad:?}");
+        assert_eq!(
+            rupu_workspace::locate_workflow(&home, None, bad),
+            None,
+            "{bad:?}"
+        );
+    }
+    assert!(rupu_workspace::is_safe_definition_name("w"));
 }

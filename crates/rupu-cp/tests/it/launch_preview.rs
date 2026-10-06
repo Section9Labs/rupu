@@ -422,10 +422,11 @@ async fn an_origin_off_github_and_gitlab_com_is_a_warning() {
     );
 }
 
-/// One malformed agent file fails the loader for every agent; that is ONE
-/// warning, not one per agent.
+/// One malformed agent file fails the loader for every agent — so the launch
+/// would fail, and the preview is a 409 with the loader's message, for a
+/// workflow whose agents can't be loaded and for an agent target alike.
 #[tokio::test]
-async fn a_malformed_agent_file_warns_once() {
+async fn a_malformed_agent_file_is_a_409_the_launch_would_hit_too() {
     let f = fixture();
     std::fs::write(f.project.join(".rupu/agents/broken.md"), "no frontmatter\n").unwrap();
     std::fs::write(
@@ -434,20 +435,42 @@ async fn a_malformed_agent_file_warns_once() {
     )
     .unwrap();
     let base = spawn(&f.global).await;
-    let resp = post(
-        &base,
+    for body in [
         json!({ "workflow": "two", "working_dir": f.project.display().to_string() }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.unwrap();
-    let loads = body["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|w| w.as_str().unwrap().contains("could not be loaded"))
-        .count();
-    assert_eq!(loads, 1, "{body}");
+        json!({ "agent": "echo", "working_dir": f.project.display().to_string() }),
+    ] {
+        let resp = post(&base, body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{body}");
+        let err: Value = resp.json().await.unwrap();
+        let msg = err["error"].as_str().unwrap();
+        assert!(msg.contains("could not be loaded"), "{body}: {msg}");
+        assert!(
+            msg.contains("broken.md"),
+            "names the loader's failure: {msg}"
+        );
+    }
+}
+
+/// A workflow or agent name that could leave the definitions directory is a
+/// 400 before any file is read.
+#[tokio::test]
+async fn a_name_with_a_path_separator_or_dotdot_is_a_400() {
+    let f = fixture();
+    let base = spawn(&f.global).await;
+    for (key, name) in [
+        ("workflow", "../w"),
+        ("workflow", "a/b"),
+        ("workflow", "a\\b"),
+        ("agent", ".."),
+        ("agent", "x/../echo"),
+    ] {
+        let resp = post(
+            &base,
+            json!({ key: name, "working_dir": f.project.display().to_string() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key} {name}");
+    }
 }
 
 #[tokio::test]

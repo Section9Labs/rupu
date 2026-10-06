@@ -190,5 +190,8 @@ async fn create_refuses_the_reserved_slug_none() {
     );
     let store = rupu_workspace::CustomerStore::new(home.path());
     assert!(store.list(true).unwrap().is_empty());
-    assert!(ok(rupu(&["customer", "create", "nonesuch", "--name", "Ok"]).await));
+    assert!(ok(rupu(&[
+        "customer", "create", "nonesuch", "--name", "Ok"
+    ])
+    .await));
 }
