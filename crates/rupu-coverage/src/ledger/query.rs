@@ -1,59 +1,43 @@
-//! The one finding filter (spec "Read path"): [`select`] returns every
-//! match, for the CLI and CP; [`query`] pages them by cursor, for the agent
-//! tool and MCP. Never a silent cap: a page says how many matched.
+//! The paged read of the findings ledger, for the agent tool and MCP:
+//! [`query`] parses a one-line query string (`ledger::query_lang`), selects
+//! with the one evaluator (`ledger::finding_filter`), and pages the matches
+//! by cursor. Never a silent cap: a page says how many matched.
 
 use crate::catalog::types::Severity;
 use crate::ledger::events::{FindingRecord, FindingScope};
+use crate::ledger::finding_filter::{check_available, select, FindingView, RunScopes};
+use crate::ledger::query_lang::parse_query;
 use crate::ledger::tags::Tag;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 pub const DEFAULT_LIMIT: usize = 50;
 pub const MAX_LIMIT: usize = 500;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TagMode {
-    #[default]
-    All,
-    Any,
-}
-
-/// What to select. Deserialized from agent/MCP tool input, so unknown
+/// Agent tool / MCP input: a findings query string plus paging. Unknown
 /// fields are refused (a typo must not silently widen the selection).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindingQuery {
+    /// A findings query (`severity>=high tag:needs-poc -has:poc`); empty
+    /// matches everything.
     #[serde(default)]
-    pub tags: Vec<Tag>,
-    #[serde(default)]
-    pub tag_mode: TagMode,
-    #[serde(default)]
-    pub untagged: bool,
-    #[serde(default)]
-    pub min_severity: Option<Severity>,
-    #[serde(default)]
-    pub concern_id: Option<String>,
-    #[serde(default)]
-    pub file_prefix: Option<String>,
-    /// [`query`] only.
+    pub q: String,
     #[serde(default)]
     pub limit: Option<usize>,
-    /// [`query`] only: a previous page's `next_cursor`.
+    /// A previous page's `next_cursor`.
     #[serde(default)]
     pub cursor: Option<String>,
-    /// Only findings declared by one of these runs. Set by the CLI/CP from a
-    /// resolved run scope; never tool input.
-    #[serde(skip)]
-    pub run_ids: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueryError {
-    #[error("`untagged` cannot be combined with `tags`")]
-    UntaggedWithTags,
+    #[error("{0}")]
+    Parse(#[from] crate::ledger::query_lang::ParseError),
+    #[error("{0}")]
+    Unavailable(#[from] crate::ledger::finding_filter::Unavailable),
     #[error("`limit` must be between 1 and {MAX_LIMIT}, got {0}")]
     Limit(usize),
     #[error("`cursor` is not one this query returned: {0}")]
@@ -71,48 +55,6 @@ pub fn severity_rank(s: Severity) -> u8 {
     }
 }
 
-fn matches(r: &FindingRecord, q: &FindingQuery) -> bool {
-    if q.untagged && !r.tags.is_empty() {
-        return false;
-    }
-    if !q.tags.is_empty() {
-        let has = |t: &Tag| r.tags.contains(t);
-        let ok = match q.tag_mode {
-            TagMode::All => q.tags.iter().all(has),
-            TagMode::Any => q.tags.iter().any(has),
-        };
-        if !ok {
-            return false;
-        }
-    }
-    if q.min_severity
-        .is_some_and(|min| severity_rank(r.severity) < severity_rank(min))
-    {
-        return false;
-    }
-    if q.concern_id
-        .as_deref()
-        .is_some_and(|c| r.concern_id.as_deref() != Some(c))
-    {
-        return false;
-    }
-    if let Some(prefix) = q.file_prefix.as_deref() {
-        if !r
-            .file_path
-            .as_deref()
-            .is_some_and(|f| f.starts_with(prefix))
-        {
-            return false;
-        }
-    }
-    if let Some(runs) = &q.run_ids {
-        if !runs.contains(&r.declared_by.run_id) {
-            return false;
-        }
-    }
-    true
-}
-
 type SortKey = (Reverse<u8>, Reverse<DateTime<Utc>>, String);
 
 fn sort_key(r: &FindingRecord) -> SortKey {
@@ -121,21 +63,6 @@ fn sort_key(r: &FindingRecord) -> SortKey {
         Reverse(r.declared_at),
         r.id.clone(),
     )
-}
-
-/// Every item whose record matches, ordered severity → newest → id.
-pub fn select<'a, T>(
-    items: &'a [T],
-    record_of: impl Fn(&T) -> &FindingRecord,
-    q: &FindingQuery,
-) -> Result<Vec<&'a T>, QueryError> {
-    if q.untagged && !q.tags.is_empty() {
-        return Err(QueryError::UntaggedWithTags);
-    }
-    // `filter` and `sort_by_cached_key` hand the closures `&&T`: deref once.
-    let mut out: Vec<&T> = items.iter().filter(|i| matches(record_of(*i), q)).collect();
-    out.sort_by_cached_key(|i| sort_key(record_of(*i)));
-    Ok(out)
 }
 
 /// A slim row: what an agent or a table needs, never the report body.
@@ -218,7 +145,9 @@ pub fn query(records: &[FindingRecord], q: &FindingQuery) -> Result<Page, QueryE
     if limit == 0 || limit > MAX_LIMIT {
         return Err(QueryError::Limit(limit));
     }
-    let all = select(records, |r| r, q)?;
+    let parsed = parse_query(&q.q)?;
+    check_available(&parsed, false)?;
+    let all = select(records, FindingView::bare, &parsed, &RunScopes::new());
     let total = all.len();
     let start = match q.cursor.as_deref() {
         None => 0,
@@ -286,12 +215,7 @@ pub fn query_input_schema() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "tags": { "type": "array", "items": { "type": "string" }, "description": "Only findings carrying these tags." },
-            "tag_mode": { "type": "string", "enum": ["all", "any"], "description": "With `tags`: findings carrying all of them (default) or any of them." },
-            "untagged": { "type": "boolean", "description": "Only findings with no tags. Cannot be combined with `tags`." },
-            "min_severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"], "description": "Only this severity and worse." },
-            "concern_id": { "type": "string", "description": "Only findings for this concern id." },
-            "file_prefix": { "type": "string", "description": "Only findings whose file_path starts with this." },
+            "q": { "type": "string", "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything." },
             "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Rows per page (default 50)." },
             "cursor": { "type": "string", "description": "`next_cursor` from the previous page." }
         }
@@ -353,77 +277,75 @@ mod tests {
         FindingQuery::default()
     }
 
-    fn ids(v: &[&FindingRecord]) -> Vec<String> {
-        v.iter().map(|r| r.id.clone()).collect()
+    #[test]
+    fn an_empty_query_pages_every_finding_in_severity_order() {
+        let f = fixture();
+        let p = query(&f, &q()).unwrap();
+        let ids: Vec<&str> = p.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["fnd_crit", "fnd_high_new", "fnd_high_old", "fnd_low"]);
     }
 
     #[test]
-    fn select_orders_by_severity_then_newest_first() {
+    fn query_parses_q_and_pages() {
         let f = fixture();
-        let all = select(&f, |r| r, &q()).unwrap();
-        assert_eq!(
-            ids(&all),
-            ["fnd_crit", "fnd_high_new", "fnd_high_old", "fnd_low"]
-        );
+        let p = query(
+            &f,
+            &FindingQuery {
+                q: "tag:needs-poc".into(),
+                ..q()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.total, 2);
+        let p = query(
+            &f,
+            &FindingQuery {
+                q: "severity>=high".into(),
+                limit: Some(1),
+                ..q()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.total, 3);
+        assert!(p.next_cursor.is_some());
     }
 
     #[test]
-    fn tag_filters_all_any_and_untagged() {
+    fn query_refuses_bad_q_and_provenance_keys() {
         let f = fixture();
-        let both = FindingQuery {
-            tags: parse_tags(&["class:sqli", "needs-poc"]).unwrap(),
-            ..q()
-        };
-        assert_eq!(ids(&select(&f, |r| r, &both).unwrap()), ["fnd_crit"]);
-        let any = FindingQuery {
-            tag_mode: TagMode::Any,
-            ..both.clone()
-        };
-        assert_eq!(
-            ids(&select(&f, |r| r, &any).unwrap()),
-            ["fnd_crit", "fnd_high_new", "fnd_low"]
-        );
-        let untagged = FindingQuery {
-            untagged: true,
-            ..q()
-        };
-        assert_eq!(
-            ids(&select(&f, |r| r, &untagged).unwrap()),
-            ["fnd_high_old"]
-        );
-        let bad = FindingQuery {
-            untagged: true,
-            ..both
-        };
-        assert_eq!(
-            select(&f, |r| r, &bad).unwrap_err(),
-            QueryError::UntaggedWithTags
-        );
+        assert!(matches!(
+            query(
+                &f,
+                &FindingQuery {
+                    q: "sevrity:x".into(),
+                    ..q()
+                }
+            ),
+            Err(QueryError::Parse(_))
+        ));
+        assert!(matches!(
+            query(
+                &f,
+                &FindingQuery {
+                    q: "project:x".into(),
+                    ..q()
+                }
+            ),
+            Err(QueryError::Unavailable(_))
+        ));
     }
 
     #[test]
-    fn other_filters_narrow() {
-        let f = fixture();
-        let high_up = FindingQuery {
-            min_severity: Some(Severity::High),
-            ..q()
-        };
-        assert_eq!(select(&f, |r| r, &high_up).unwrap().len(), 3);
-        let file = FindingQuery {
-            file_prefix: Some("src/fnd_low".into()),
-            ..q()
-        };
-        assert_eq!(ids(&select(&f, |r| r, &file).unwrap()), ["fnd_low"]);
-        let run = FindingQuery {
-            run_ids: Some(["run_fnd_crit".to_string()].into()),
-            ..q()
-        };
-        assert_eq!(ids(&select(&f, |r| r, &run).unwrap()), ["fnd_crit"]);
-        let concern = FindingQuery {
-            concern_id: Some("other".into()),
-            ..q()
-        };
-        assert!(select(&f, |r| r, &concern).unwrap().is_empty());
+    fn query_input_is_q_limit_cursor_only() {
+        let ok: FindingQuery =
+            serde_json::from_value(serde_json::json!({"q": "tag:x", "limit": 5})).unwrap();
+        assert_eq!(ok.q, "tag:x");
+        assert!(
+            serde_json::from_value::<FindingQuery>(serde_json::json!({"tags": ["x"]})).is_err()
+        );
+        let empty: FindingQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.q, "");
     }
 
     #[test]
@@ -510,17 +432,5 @@ mod tests {
         let counts = tags_in_use(&f);
         let got: Vec<(&str, usize)> = counts.iter().map(|c| (c.tag.as_str(), c.count)).collect();
         assert_eq!(got, [("class:sqli", 2), ("needs-poc", 2)]);
-    }
-
-    #[test]
-    fn query_input_rejects_unknown_fields() {
-        let ok: FindingQuery =
-            serde_json::from_value(serde_json::json!({"tags": ["Needs-POC"], "tag_mode": "any"}))
-                .unwrap();
-        assert_eq!(ok.tags[0].as_str(), "needs-poc");
-        assert!(serde_json::from_value::<FindingQuery>(serde_json::json!({"tag": ["x"]})).is_err());
-        assert!(
-            serde_json::from_value::<FindingQuery>(serde_json::json!({"run_ids": ["x"]})).is_err()
-        );
     }
 }

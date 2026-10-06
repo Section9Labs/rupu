@@ -17,14 +17,14 @@ pub use events::{
     FindingRecord, FindingScope, Surface,
 };
 pub use finding_filter::{
-    check_available, facets, run_values, FacetValue, FindingView, RunScopes, Unavailable,
+    check_available, facets, run_values, select, FacetValue, FindingView, RunScopes, Unavailable,
 };
 pub use ingest::{ingest_unit_stream, IngestError, IngestReport, IngestSource};
 pub use manifest::{append_manifest, find_manifest, read_manifests, RunManifest};
 pub use paths::CoveragePaths;
 pub use query::{
-    query, query_input_schema, query_response, select, severity_rank, tags_in_use, FindingQuery,
-    FindingRow, Page, QueryError, TagCount, TagMode, DEFAULT_LIMIT, MAX_LIMIT,
+    query, query_input_schema, query_response, severity_rank, tags_in_use, FindingQuery,
+    FindingRow, Page, QueryError, TagCount, DEFAULT_LIMIT, MAX_LIMIT,
 };
 pub use query_lang::{
     field, parse_query, ErrorCode, FieldDef, FieldKind, Key, Op, ParseError, ParsedQuery, Term,

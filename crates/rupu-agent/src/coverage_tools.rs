@@ -802,7 +802,8 @@ pub fn register(
 // query_findings / tag_findings
 // ---------------------------------------------------------------------------
 
-/// Read this workspace's findings, filtered and paged (`ledger::query`).
+/// Read this workspace's findings, selected by a query string and paged
+/// (`ledger::query`).
 pub struct QueryFindingsTool {
     workspace: PathBuf,
 }
@@ -820,10 +821,10 @@ impl Tool for QueryFindingsTool {
     }
 
     fn description(&self) -> &'static str {
-        "List findings recorded in this project, filtered by tag, severity, concern or file. \
-         Returns one page of slim rows (id, title, severity, location, tags), `next_cursor` \
-         for the next page, `total` matches, and `tags_in_use` — the tags already used in \
-         this project, with counts. Reuse an existing tag where it fits before inventing one."
+        "List findings recorded in this project with a one-line query in `q` (e.g. \
+         `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, \
+         severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an \
+         existing tag where it fits."
     }
 
     fn input_schema(&self) -> Value {

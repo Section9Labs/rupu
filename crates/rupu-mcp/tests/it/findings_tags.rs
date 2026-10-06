@@ -50,7 +50,7 @@ async fn tag_then_query_by_tag() {
     assert_eq!(v["outcomes"][0]["after"], serde_json::json!(["needs-poc"]));
 
     let out = d
-        .call("findings.query", serde_json::json!({"tags": ["needs-poc"]}))
+        .call("findings.query", serde_json::json!({"q": "tag:needs-poc"}))
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();

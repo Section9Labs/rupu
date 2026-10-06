@@ -1350,20 +1350,12 @@
     "name": "findings.record"
   },
   {
-    "description": "List this project's findings, filtered by tag, severity, concern or file: one page of slim rows, `next_cursor`, `total`, and `tags_in_use` (the project's tag vocabulary, with counts).",
+    "description": "List this project's findings matching a one-line query `q` (e.g. `severity>=high tag:needs-poc`): one page of slim rows, `next_cursor`, `total`, and `tags_in_use`.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
-        "concern_id": {
-          "description": "Only findings for this concern id.",
-          "type": "string"
-        },
         "cursor": {
           "description": "`next_cursor` from the previous page.",
-          "type": "string"
-        },
-        "file_prefix": {
-          "description": "Only findings whose file_path starts with this.",
           "type": "string"
         },
         "limit": {
@@ -1372,35 +1364,9 @@
           "minimum": 1,
           "type": "integer"
         },
-        "min_severity": {
-          "description": "Only this severity and worse.",
-          "enum": [
-            "info",
-            "low",
-            "medium",
-            "high",
-            "critical"
-          ],
+        "q": {
+          "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything.",
           "type": "string"
-        },
-        "tag_mode": {
-          "description": "With `tags`: findings carrying all of them (default) or any of them.",
-          "enum": [
-            "all",
-            "any"
-          ],
-          "type": "string"
-        },
-        "tags": {
-          "description": "Only findings carrying these tags.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "untagged": {
-          "description": "Only findings with no tags. Cannot be combined with `tags`.",
-          "type": "boolean"
         }
       },
       "type": "object"

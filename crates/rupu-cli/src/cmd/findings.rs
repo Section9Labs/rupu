@@ -47,19 +47,22 @@ pub enum Action {
     /// at all; a finding that already has a report is left alone; each
     /// changed ledger is backed up first (`findings.jsonl.pre-import-<time>`).
     Import(ImportArgs),
-    /// List findings, filtered by tag, severity, project or run.
+    /// List findings matching a query, e.g. `severity>=high -tag:noise`.
+    ///
+    /// Put flags (`--ids-only`, `--limit`) before the query words.
     List(ListArgs),
     /// Add or remove tags on findings.
     ///
     /// Tags are free-form: lowercase a-z, 0-9 and `. _ : / -`, starting with
     /// a letter or digit, at most 64 characters (`Needs-POC` is stored as
     /// `needs-poc`). Give `-` as the only id to read ids from stdin, one per
-    /// line: `rupu findings list --tag class:sqli --ids-only | rupu findings
+    /// line: `rupu findings list --ids-only tag:class:sqli | rupu findings
     /// tag - --add needs-poc`. Findings in different projects are changed
     /// project by project; an unknown id fails the command after the rest
     /// are changed.
     Tag(TagArgs),
-    /// List the tags in use, with how many findings carry each.
+    /// List the tags in use, with how many findings carry each (optionally
+    /// only on the findings a query selects).
     Tags(TagsArgs),
 }
 
@@ -126,32 +129,15 @@ pub struct ImportArgs {
 }
 
 #[derive(Debug, clap::Args)]
-pub struct ScopeArgs {
-    /// Only this project: a workspace id, or the path of its checkout.
-    #[arg(long, value_name = "WS_ID|PATH", value_parser = non_blank)]
-    project: Option<String>,
-    /// Only the findings a run (and its sub-runs) declared.
-    #[arg(long, value_name = "RUN_ID", value_parser = non_blank)]
-    run: Option<String>,
-}
-
-#[derive(Debug, clap::Args)]
 pub struct ListArgs {
-    #[command(flatten)]
-    scope: ScopeArgs,
-    /// Only findings carrying this tag (repeatable: all of them, or any with
-    /// --any-tag).
-    #[arg(long = "tag", value_name = "TAG", value_parser = tag_arg)]
-    tags: Vec<rupu_coverage::Tag>,
-    /// With several --tag: findings carrying any of them.
-    #[arg(long, requires = "tags")]
-    any_tag: bool,
-    /// Only findings with no tags.
-    #[arg(long, conflicts_with = "tags")]
-    untagged: bool,
-    /// Only this severity and worse.
-    #[arg(long, value_name = "SEVERITY", value_parser = ["critical", "high", "medium", "low", "info"])]
-    severity: Option<String>,
+    /// Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive`.
+    /// Several words are joined with spaces; quote anything with `>`, `<` or
+    /// spaces for your shell. Keys: severity (>=,>,<=,<), tag, has, project,
+    /// cwe, owner, product, verified, profile, scope, concern, agent,
+    /// workflow, file, run, id; bare words search title/summary/id/file.
+    /// Put flags before the query words.
+    #[arg(value_name = "QUERY", allow_hyphen_values = true, num_args = 0..)]
+    query: Vec<String>,
     /// Show at most N findings; how many were left out goes to stderr.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     limit: Option<u64>,
@@ -175,8 +161,10 @@ pub struct TagArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct TagsArgs {
-    #[command(flatten)]
-    scope: ScopeArgs,
+    /// Count only the tags on findings this query selects (same syntax as
+    /// `findings list`).
+    #[arg(value_name = "QUERY", allow_hyphen_values = true, num_args = 0..)]
+    query: Vec<String>,
 }
 
 fn tag_arg(raw: &str) -> Result<rupu_coverage::Tag, String> {
@@ -264,25 +252,54 @@ pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
     }
 }
 
-/// Every finding the scope selects (tags folded), and the run-id set a
-/// `--run` resolves to (the run plus its sub-runs).
-fn scoped_findings(
-    scope: &ScopeArgs,
-) -> anyhow::Result<(
-    Vec<cp_findings::FindingOut>,
-    Option<std::collections::HashSet<String>>,
-)> {
+/// Every finding the query selects, with provenance. `run:` values expand to
+/// the run plus its sub-runs.
+fn queried_findings(query: &[String]) -> anyhow::Result<Vec<cp_findings::FindingOut>> {
     let global = crate::paths::global_dir()?;
+    let parsed = rupu_coverage::parse_query(&query.join(" "))?;
+    let store = RunStore::new(global.join("runs"));
+    let runs: rupu_coverage::RunScopes = rupu_coverage::run_values(&parsed)
+        .into_iter()
+        .map(|r| {
+            let scope = cp_findings::resolve_run_scope(&store, &r);
+            (r, scope)
+        })
+        .collect();
     let mut all = cp_findings::collect_all_findings(&global);
-    if let Some(project) = &scope.project {
-        let ws = cp_findings::resolve_project(&global, project).map_err(anyhow::Error::msg)?;
-        all.retain(|f| f.ws_id == ws);
+    let wf = cp_findings::workflow_names_for(&store, &all);
+    for f in &mut all {
+        f.workflow_name = wf.get(&f.record.declared_by.run_id).cloned();
     }
-    let run_ids = scope
-        .run
-        .as_deref()
-        .map(|r| cp_findings::resolve_run_scope(&RunStore::new(global.join("runs")), r));
-    Ok((all, run_ids))
+    let keep: std::collections::HashSet<String> =
+        rupu_coverage::select(&all, finding_view, &parsed, &runs)
+            .into_iter()
+            .map(finding_key)
+            .collect();
+    let mut out: Vec<cp_findings::FindingOut> = all
+        .into_iter()
+        .filter(|f| keep.contains(&finding_key(f)))
+        .collect();
+    out.sort_by(|a, b| {
+        rupu_coverage::severity_rank(b.record.severity)
+            .cmp(&rupu_coverage::severity_rank(a.record.severity))
+            .then_with(|| b.record.declared_at.cmp(&a.record.declared_at))
+            .then_with(|| a.record.id.cmp(&b.record.id))
+    });
+    Ok(out)
+}
+
+fn finding_view(f: &cp_findings::FindingOut) -> rupu_coverage::FindingView<'_> {
+    rupu_coverage::FindingView {
+        record: &f.record,
+        project: Some(&f.project),
+        ws_id: Some(&f.ws_id),
+        workflow: f.workflow_name.as_deref(),
+    }
+}
+
+/// A finding's identity across projects and targets (ids repeat across them).
+fn finding_key(f: &cp_findings::FindingOut) -> String {
+    format!("{}/{}/{}", f.ws_id, f.target_id, f.record.id)
 }
 
 #[derive(serde::Serialize)]
@@ -305,28 +322,11 @@ fn tag_list(tags: &[rupu_coverage::Tag]) -> String {
 }
 
 fn list_cmd(args: &ListArgs, json: bool) -> anyhow::Result<()> {
-    use rupu_coverage::{FindingQuery, TagMode};
-    let (all, run_ids) = scoped_findings(&args.scope)?;
-    let q = FindingQuery {
-        tags: args.tags.clone(),
-        tag_mode: if args.any_tag {
-            TagMode::Any
-        } else {
-            TagMode::All
-        },
-        untagged: args.untagged,
-        min_severity: args
-            .severity
-            .as_deref()
-            .and_then(cp_findings::parse_min_severity),
-        run_ids,
-        ..Default::default()
-    };
-    let selected = rupu_coverage::ledger::query::select(&all, |f| &f.record, &q)?;
+    let selected = queried_findings(&args.query)?;
     let total = selected.len();
     let shown: Vec<&cp_findings::FindingOut> = match args.limit {
-        Some(n) => selected.into_iter().take(n as usize).collect(),
-        None => selected,
+        Some(n) => selected.iter().take(n as usize).collect(),
+        None => selected.iter().collect(),
     };
     if shown.len() < total {
         eprintln!("showing {} of {total} findings", shown.len());
@@ -466,12 +466,7 @@ fn tag_cmd(args: &TagArgs, json: bool) -> anyhow::Result<()> {
 }
 
 fn tags_cmd(args: &TagsArgs, json: bool) -> anyhow::Result<()> {
-    let (all, run_ids) = scoped_findings(&args.scope)?;
-    let q = rupu_coverage::FindingQuery {
-        run_ids,
-        ..Default::default()
-    };
-    let selected = rupu_coverage::ledger::query::select(&all, |f| &f.record, &q)?;
+    let selected = queried_findings(&args.query)?;
     let counts = rupu_coverage::tags_in_use(selected.iter().map(|f| &f.record));
     if json {
         return crate::output::formats::print_json(&counts);

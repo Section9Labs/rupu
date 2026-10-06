@@ -551,6 +551,17 @@ fn workflow_names_by_run<'a>(
     names
 }
 
+/// `run_id → workflow_name` for the runs that declared `findings`, for a
+/// caller that filters by `workflow:` (the CLI); same join as `GET /api/findings`.
+pub fn workflow_names_for(store: &RunStore, findings: &[FindingOut]) -> HashMap<String, String> {
+    workflow_names_by_run(
+        store,
+        findings
+            .iter()
+            .map(|f| f.record.declared_by.run_id.as_str()),
+    )
+}
+
 /// `GET /api/findings` — every finding across every registered workspace's
 /// coverage targets, tagged with provenance, plus a per-severity summary.
 ///
