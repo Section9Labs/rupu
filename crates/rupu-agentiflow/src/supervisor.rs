@@ -231,6 +231,7 @@ mod tests {
             participant: participant.into(),
             kind: UnitKind::Agent,
             inputs: vec![],
+            workflow_file: None,
         }
     }
 
@@ -266,6 +267,7 @@ mod tests {
                 participant: "recon#1".into(),
                 kind: UnitKind::Agent,
                 inputs: vec![],
+                workflow_file: None,
             })
             .unwrap();
         // units/<id>/unit.json written
@@ -338,6 +340,7 @@ mod tests {
                 participant: "web-assess#1".into(),
                 kind: UnitKind::Workflow,
                 inputs: vec![("target".into(), "x".into())],
+                workflow_file: None,
             })
             .unwrap();
         let j = read_unit_json(dir.path(), &wf);

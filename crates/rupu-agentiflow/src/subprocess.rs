@@ -71,6 +71,9 @@ pub type ArgvBuilder = Box<dyn Fn(&UnitSpec, &str, &Path) -> Vec<OsString> + Sen
 /// where `<name>` is `spec.agent` (the "thing to run") and there is no
 /// `--prompt` (a workflow takes `--input`s instead).
 ///
+/// A generated workflow unit (`spec.workflow_file` is `Some`) instead runs
+/// `workflow run --file <path> --run-id <id> …` with no positional name.
+///
 /// `--mode bypass` because a unit has no tty to answer an approval prompt.
 /// The prompt is ONE `--prompt=<p>` argument, not `--prompt <p>`: clap reads a
 /// separate value that starts with `-` (`"- enumerate hosts"`, `"--foo"`) as a
@@ -103,16 +106,24 @@ fn rupu_agent_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsStrin
 /// The workflow unit's argv (see [`rupu_run_argv`]). `--plain` because the unit
 /// is detached with no tty: the plain printer, never the live graph view.
 pub fn rupu_workflow_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
-        "workflow".into(),
-        "run".into(),
-        spec.agent.clone().into(),
+    // A generated workflow unit runs a materialized file (`--file <path>`, no
+    // positional name); every other workflow unit runs a catalog id.
+    let mut argv: Vec<OsString> = match &spec.workflow_file {
+        Some(file) => vec![
+            "workflow".into(),
+            "run".into(),
+            "--file".into(),
+            file.as_os_str().to_owned(),
+        ],
+        None => vec!["workflow".into(), "run".into(), spec.agent.clone().into()],
+    };
+    argv.extend([
         "--run-id".into(),
         run_id.into(),
         "--mode".into(),
         "bypass".into(),
         "--plain".into(),
-    ];
+    ]);
     for (k, v) in &spec.inputs {
         argv.push("--input".into());
         argv.push(format!("{k}={v}").into());
@@ -506,6 +517,7 @@ mod tests {
             participant: "recon#1".into(),
             kind: UnitKind::Agent,
             inputs: vec![],
+            workflow_file: None,
         }
     }
 
@@ -517,6 +529,7 @@ mod tests {
             participant: "web-assess#1".into(),
             kind: UnitKind::Workflow,
             inputs: vec![("target".into(), "x".into())],
+            workflow_file: None,
         }
     }
 
@@ -617,6 +630,55 @@ mod tests {
             !argv.iter().any(|a| a.starts_with("--prompt")),
             "a workflow has no prompt: {argv:?}"
         );
+    }
+
+    #[test]
+    fn workflow_argv_uses_file_when_set() {
+        let spec = UnitSpec {
+            agent: "gen-abc".into(),
+            prompt: String::new(),
+            engagement: vec!["network".into()],
+            participant: "gen-abc#1".into(),
+            kind: UnitKind::Workflow,
+            inputs: vec![("k".into(), "v".into())],
+            workflow_file: Some(PathBuf::from("/runs/x/generated/gen-abc.yaml")),
+        };
+        let argv = strs(&rupu_workflow_argv(&spec, "run-1", Path::new("/runs/x")));
+        assert_eq!(
+            argv,
+            [
+                "workflow",
+                "run",
+                "--file",
+                "/runs/x/generated/gen-abc.yaml",
+                "--run-id",
+                "run-1",
+                "--mode",
+                "bypass",
+                "--plain",
+                "--input",
+                "k=v",
+                "--engagement-profile",
+                "network",
+                "--fleet-run-dir",
+                "/runs/x",
+                "--fleet-participant",
+                "gen-abc#1",
+            ]
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--file" && w[1] == "/runs/x/generated/gen-abc.yaml"),
+            "{argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "gen-abc"),
+            "no positional name when --file is set: {argv:?}"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--engagement-profile" && w[1] == "network"));
+        assert!(argv.windows(2).any(|w| w[0] == "--input" && w[1] == "k=v"));
     }
 
     #[test]

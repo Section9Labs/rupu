@@ -8,7 +8,7 @@
 //! holding a thread per unit.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// What kind of thing a unit runs.
@@ -51,6 +51,9 @@ pub struct UnitSpec {
     /// `KEY=VALUE` workflow inputs (`--input k=v`, in order). Empty for an
     /// agent unit.
     pub inputs: Vec<(String, String)>,
+    /// For a generated workflow unit: the materialized file to run via
+    /// `--file` instead of a catalog id. `None` for agent and pool-workflow units.
+    pub workflow_file: Option<PathBuf>,
 }
 
 /// A unit's handle: the pre-minted run id (`run_<ULID>`).
@@ -205,6 +208,7 @@ mod tests {
             participant: participant.into(),
             kind: UnitKind::Agent,
             inputs: vec![],
+            workflow_file: None,
         }
     }
 

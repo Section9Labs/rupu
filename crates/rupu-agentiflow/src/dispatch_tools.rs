@@ -234,6 +234,7 @@ impl Tool for DispatchTool {
             participant: c.mint_participant(agent),
             kind: UnitKind::Agent,
             inputs: vec![],
+            workflow_file: None,
         };
         let participant = spec.participant.clone();
         Ok(match c.sup.dispatch(spec) {
@@ -393,6 +394,7 @@ impl Tool for RunWorkflowTool {
             participant: c.mint_participant(workflow),
             kind: UnitKind::Workflow,
             inputs: inputs.into_iter().collect(),
+            workflow_file: None,
         };
         let participant = spec.participant.clone();
         Ok(match c.sup.dispatch(spec) {
