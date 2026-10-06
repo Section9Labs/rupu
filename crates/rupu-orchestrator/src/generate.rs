@@ -141,18 +141,18 @@ has type (string|int|bool), required (bool), description, optional default. Refe
 prompts as {{ inputs.<key> }}.\n  steps: (required list)\n\nEach linear step needs:\n  - id: \
 <unique id>\n    agent: <one of the available agent names>\n    prompt: |\n      <multi-line \
 instruction; may reference {{ inputs.x }} and {{ steps.<id>.output }}>\n    actions: []        \
-# optional allow-list of tool actions\n\nOther step shapes (each replaces the linear `agent`/`prompt`; use only when the \
+# optional allow-list of tool actions\n\nOther step shapes (used in place of a plain linear step when the\
 description calls for it):\n\
   - `for_each: <minijinja list expr>` plus `agent`/`prompt` \u{2014} fan one agent over a list; \
 inside the prompt use {{ item }}. Optional `max_parallel: <int>` caps concurrency (default 1).\n\
   - `parallel:` \u{2014} a list of sub-steps, each with `id`/`agent`/`prompt` (no `actions`). \
 Optional `max_parallel: <int>`.\n\
   - `panel:` \u{2014} `panelists: [agent names]`, `subject: <template>`, optional `prompt`, \
-optional `gate: { until_no_findings_at_severity_or_above, fix_with: <agent>, max_iterations }`.\n\
-  - `branch:` \u{2014} `condition: <minijinja>`, `then: [step ids]`, `else: [step ids]`; no \
+optional `gate: { until_no_findings_at_severity_or_above: low|medium|high|critical, fix_with: <agent>, max_iterations }`.\n\
+  - `branch:` \u{2014} `condition: <minijinja>`, `then: [step ids]`, `else: [step ids]` (targets must appear LATER in the list; the two arms must be disjoint); no\
 agent/prompt/`when` on the branch step itself.\n\
   - `split: [step ids]` \u{2014} fan into concurrent tracks; pair with a later step carrying \
-`join: { wait: all }` (or `any`) as the barrier. Neither has an agent/prompt.\n\
+`join: { wait: all }` (or `any`) as the barrier. The track steps must point at the join via `next: [<join id>]` (or the join must `depends_on` them). Neither split nor join has an agent/prompt.\n\
 \nFlow control (any step):\n\
   - `next: [ids]` / `depends_on: [ids]` \u{2014} explicit DAG edges; omit both and steps run in \
 list order.\n\
@@ -325,6 +325,24 @@ mod tests {
             assert!(p.contains(kw), "prompt must teach `{kw}`");
         }
         assert!(p.contains("writer"), "lists available agents");
+        // Pin the loops teaching specifically (the bare word "loops" is weak):
+        for kw in ["on_max", "max_iterations", "NOT a step field"] {
+            assert!(p.contains(kw), "loops teaching must mention `{kw}`");
+        }
+        // Parser-matching details that keep generated workflows parsing on the
+        // first try (verified against workflow.rs in review).
+        assert!(
+            p.contains("low|medium|high|critical"),
+            "panel gate teaches the severity values"
+        );
+        assert!(
+            p.contains("next: [<join id>]"),
+            "split tracks are told to point at the join (inbound edges)"
+        );
+        assert!(
+            p.contains("LATER"),
+            "branch targets must come later in the list"
+        );
     }
 
     use rupu_auth::backend::ProviderId;
