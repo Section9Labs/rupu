@@ -1614,6 +1614,50 @@ steps:
         assert_eq!(fo.artifact_root, Some(tmp.path().join("store")));
     }
 
+    // `#[serial]`: reaches the provider factory (reads
+    // `RUPU_MOCK_PROVIDER_SCRIPT`), which `generate.rs`'s tests set.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn findings_base_engagement_reaches_the_step() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_summary_agent(tmp.path());
+        let engagement = std::sync::Arc::new(
+            rupu_coverage::builtin_registry()
+                .unwrap()
+                .active_set(&[rupu_coverage::DEFAULT_PROFILE.to_string()])
+                .unwrap(),
+        );
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(WF_NO_DEFAULT).unwrap();
+        f.findings_base = rupu_coverage::FindingWriteOptions {
+            engagement: Some(engagement.clone()),
+            ..Default::default()
+        };
+        let opts = f
+            .build_opts_for_step(
+                "agent_decides",
+                "fp",
+                "p".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("t.jsonl"),
+                None,
+            )
+            .await;
+        // A regression that rebuilds the step's `FindingWriteOptions` without
+        // cloning `findings_base` would silently drop the engagement, and the
+        // step's findings would route as native code findings.
+        let got = opts
+            .tool_context
+            .findings
+            .unwrap()
+            .engagement
+            .expect("engagement must reach the step's findings");
+        assert!(std::sync::Arc::ptr_eq(&got, &engagement));
+        assert_eq!(got.ids(), vec![rupu_coverage::DEFAULT_PROFILE]);
+    }
+
     // ── Findings profile: the full precedence table, and the unit shapes
     // that reach the factory under an id other than a top-level step's ──
 

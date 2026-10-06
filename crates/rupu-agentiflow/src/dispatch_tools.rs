@@ -68,6 +68,11 @@ impl DispatchCtx {
 ///
 /// `pool` is the definition's `pool.agents` (the only agents `dispatch` will
 /// start); `engagement` is the profile set every unit is bound to.
+///
+/// Superseded by [`fleet_unit_tools`], which bundles `dispatch`, `join` and
+/// `run_workflow` over ONE shared participant counter and is what the run
+/// loop uses. Kept for callers that want agent dispatch only; it does NOT
+/// offer `run_workflow`.
 pub fn fleet_dispatch_tools(
     sup: Arc<FleetSupervisor>,
     pool: Arc<Vec<String>>,
@@ -79,6 +84,11 @@ pub fn fleet_dispatch_tools(
 /// [`fleet_dispatch_tools`] for a dispatcher at `depth` in the dispatch tree.
 /// A dispatcher at [`MAX_DEPTH`] or deeper gets a `dispatch` that always
 /// refuses.
+///
+/// Superseded by [`fleet_unit_tools`] (see [`fleet_dispatch_tools`]). It
+/// intentionally does NOT include `run_workflow`: a sub-lead built from it can
+/// dispatch agents and join, but cannot start a workflow unit. A future
+/// sub-lead that should be able to must add `run_workflow` explicitly.
 pub fn fleet_dispatch_tools_at_depth(
     sup: Arc<FleetSupervisor>,
     pool: Arc<Vec<String>>,

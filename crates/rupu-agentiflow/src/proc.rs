@@ -1,9 +1,9 @@
 //! Process liveness + termination for fleet units (`kill(2)` via rustix).
 //!
 //! These mirror `rupu-orchestrator::runs::{pid_is_running, terminate_pid}`. They
-//! are reimplemented here rather than imported because `rupu-agentiflow` does
-//! not depend on `rupu-orchestrator`; the semantics (EPERM = alive, never
-//! signal ourselves, pid 0 / out-of-range = not a process) are kept identical.
+//! are kept as a small local copy so unit control stays a thin `kill(2)`
+//! wrapper in this crate; the semantics (EPERM = alive, never signal
+//! ourselves, pid 0 / out-of-range = not a process) are kept identical.
 
 #[cfg(not(unix))]
 compile_error!("agentiflow unit control is unix-only");

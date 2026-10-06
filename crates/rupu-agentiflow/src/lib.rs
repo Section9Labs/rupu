@@ -29,7 +29,10 @@ pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
     ScopeRoot,
 };
-pub use dispatch_tools::{fleet_dispatch_tools, fleet_dispatch_tools_at_depth, MAX_DEPTH};
+pub use dispatch_tools::{
+    fleet_dispatch_tools, fleet_dispatch_tools_at_depth, fleet_unit_tools, WorkflowToolCtx,
+    MAX_DEPTH,
+};
 pub use envelope::{
     Digest, Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome,
     StopReason,
