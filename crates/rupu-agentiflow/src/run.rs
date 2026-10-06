@@ -7,6 +7,7 @@
 //! ```text
 //! <global>/agentiflows/<id>/
 //!   agentiflow.json            AgentiflowRecord, rewritten atomically (tmp + rename)
+//!   agentiflow.yaml            the definition this run was started from (written once, atomically)
 //!   events.jsonl               append-only event log (shape below)
 //!   lead/transcript.r<N>.jsonl the lead's transcript for round N
 //!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
@@ -79,6 +80,11 @@ use crate::unit::UnitLauncher;
 
 /// `agentiflow.json`, the durable record of one run.
 const RECORD_FILE: &str = "agentiflow.json";
+/// `agentiflow.yaml`, the snapshot of the definition a run was started from.
+/// It is the re-serialized parsed definition (comments and key order are not
+/// preserved), so a run stays inspectable even if the on-disk definition is
+/// later edited or removed.
+const DEF_FILE: &str = "agentiflow.yaml";
 const EVENTS_FILE: &str = "events.jsonl";
 /// Turns the lead may take per round when the definition does not say.
 const DEFAULT_LEAD_MAX_TURNS: u32 = 50;
@@ -139,6 +145,20 @@ impl AgentiflowRecord {
     }
 }
 
+/// Atomically write the definition snapshot `<run_dir>/agentiflow.yaml`: the
+/// YAML goes to a sibling temp file which is then renamed over the target, so
+/// a reader sees no file or a whole one, never a torn write.
+fn write_def_snapshot(run_dir: &Path, def: &AgentiflowDef) -> Result<(), AgentiflowError> {
+    let yaml = serde_yaml::to_string(def)?;
+    std::fs::create_dir_all(run_dir)?;
+    let tmp = run_dir.join(format!(".{DEF_FILE}.tmp"));
+    std::fs::write(&tmp, yaml)?;
+    std::fs::rename(&tmp, run_dir.join(DEF_FILE)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        AgentiflowError::Io(e)
+    })
+}
+
 /// `<global>/agentiflows`: the directory holding every run's directory.
 pub fn agentiflow_dir(global: &Path) -> PathBuf {
     global.join("agentiflows")
@@ -151,7 +171,8 @@ pub fn new_run_id() -> String {
 }
 
 /// The caller-resolved lead: which agent, with which prompt / provider /
-/// model / tools. (Plan 4 wires the real resolver; tests hand in a mock.)
+/// model / tools. (`rupu agentiflow run` resolves it from the lead's agent file
+/// and the layered config -- Plan 4-1; tests hand in a mock.)
 pub struct LeadInputs {
     pub agent_name: String,
     pub system_prompt: String,
@@ -183,14 +204,16 @@ pub struct RunAgentiflowOpts {
     pub run_id: String,
     /// How the lead's `dispatch` tool starts units. `None` is production: a
     /// [`SubprocessUnitLauncher`] over the running `rupu` binary, so each unit
-    /// is a detached, process-isolated `rupu run`. A caller (a test, or the
-    /// Plan-4 daemon with its own launcher) injects an implementation here.
+    /// is a detached, process-isolated `rupu run`. A caller (a test, or a
+    /// daemon with its own launcher) injects an implementation here.
     pub unit_launcher: Option<Arc<dyn UnitLauncher>>,
     /// The lead's workflow-authoring capability: which provider/model writes a
     /// new workflow and a factory minting a provider for each generation call.
-    /// Built by the launch site exactly as `make_provider` is (wired for real in
-    /// Plan 4; tests inject a mock). `None` disables `generate_workflow`
-    /// entirely: the lead is not even offered the tool.
+    /// Built by the launch site exactly as `make_provider` is (`rupu agentiflow
+    /// run` builds both, Plan 4-1; tests inject a mock). `None` disables
+    /// `generate_workflow` entirely: the lead is not even offered the tool --
+    /// the CLI passes `None` when the generating provider has no credential or
+    /// cannot be built synchronously (Anthropic OAuth).
     pub generation: Option<crate::lead::GenerationCapability>,
 }
 
@@ -498,6 +521,10 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             // `steering/` may already exist: an operator can queue a message for a run
             // they were told the id of before it started.
             std::fs::create_dir_all(run_dir.join("lead"))?;
+
+            // The definition snapshot lands before the record, so any run that
+            // has an `agentiflow.json` also has the `agentiflow.yaml` it started from.
+            write_def_snapshot(&run_dir, &def)?;
 
             let mut record = AgentiflowRecord {
                 id: id.clone(),
@@ -1019,6 +1046,58 @@ mod tests {
         let lead = run_dir(&fx, id).join("lead");
         assert!(lead.is_dir());
         assert_eq!(std::fs::read_dir(&lead).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_run_snapshots_its_definition_as_agentiflow_yaml() {
+        let fx = fixture();
+        let id = "af_snapshot";
+        let def = def_with(
+            "description: Snapshot me.\n\
+             coverage: { reach: 0.5, depth: tested }\n\
+             budget: { wall_clock: 2h, rounds: 9, soft_at: 0.8 }\n\
+             round: { lead_max_turns: 3, ceiling: { rounds: 1 } }\n\
+             trigger: manual\n",
+        );
+        let expected = serde_yaml::to_string(&def).unwrap();
+
+        run_agentiflow(opts(&fx, def, id)).unwrap();
+
+        let dir = run_dir(&fx, id);
+        let snap = std::fs::read_to_string(dir.join("agentiflow.yaml")).unwrap();
+        // No half-written temp file is left behind.
+        assert!(!dir.join(".agentiflow.yaml.tmp").exists());
+        let back = AgentiflowDef::parse_str(&snap).unwrap();
+        assert_eq!(back.name, "itest");
+        assert_eq!(back.description.as_deref(), Some("Snapshot me."));
+        assert_eq!(back.lead, "lead");
+        assert_eq!(back.engagement_profiles, ["network"]);
+        assert_eq!(back.goals.len(), 1);
+        assert_eq!(back.goals[0].id, "any-finding");
+        assert_eq!(back.goals[0].target.count_gte, Some(1));
+        assert!(back.scope.authorized);
+        assert_eq!(back.pool.agents, ["lead"]);
+        assert_eq!(back.coverage.as_ref().unwrap().reach, 0.5);
+        assert_eq!(
+            back.coverage.as_ref().unwrap().depth.as_deref(),
+            Some("tested")
+        );
+        let budget = back.budget.as_ref().unwrap();
+        assert_eq!(budget.wall_clock.as_deref(), Some("2h"));
+        assert_eq!(budget.rounds, Some(9));
+        assert_eq!(back.trigger.as_deref(), Some("manual"));
+        // Every field survives: the snapshot re-serializes to the same YAML.
+        assert_eq!(serde_yaml::to_string(&back).unwrap(), expected);
+        assert_eq!(snap, expected);
+    }
+
+    #[test]
+    fn a_rejected_run_writes_no_snapshot() {
+        let fx = fixture();
+        // An id that could escape the run dir is rejected before any disk write.
+        let o = opts(&fx, def_with(""), "../escape");
+        assert!(run_agentiflow(o).is_err());
+        assert!(!agentiflow_dir(&fx.global).exists());
     }
 
     #[test]

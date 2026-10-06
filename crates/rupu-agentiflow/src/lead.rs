@@ -226,8 +226,9 @@ pub type GenerationProviderFactory = Arc<dyn Fn() -> Box<dyn LlmProvider> + Send
 
 /// How the lead authors new workflows: the provider/model to generate
 /// with and a factory that mints a provider for each generation call.
-/// Built by the launch site exactly like `make_provider` (wired for real in
-/// Plan 4); when absent, the lead is not offered `generate_workflow`.
+/// Built by the launch site exactly like `make_provider` (`rupu agentiflow run`
+/// builds both, Plan 4-1); when absent, the lead is not offered
+/// `generate_workflow`.
 #[derive(Clone)]
 pub struct GenerationCapability {
     pub provider: String,
@@ -300,9 +301,10 @@ pub struct LeadConfig {
 /// It drives the async runner from a synchronous trait method by owning a
 /// current-thread tokio runtime and `block_on`-ing it. `Runtime::block_on`
 /// panics when called from inside an async context, and so does DROPPING the
-/// owned `Runtime` there, so whatever runs the envelope (the Plan-4 daemon)
-/// must create, drive AND drop the driver from a BLOCKING context -- a
-/// dedicated thread or `spawn_blocking` -- never directly on a runtime worker.
+/// owned `Runtime` there, so whatever runs the envelope (`rupu agentiflow run`
+/// uses `spawn_blocking`; a future daemon likewise) must create, drive AND drop
+/// the driver from a BLOCKING context -- a dedicated thread or `spawn_blocking`
+/// -- never directly on a runtime worker.
 ///
 /// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
 /// dispatchable agents, and a codename. It runs with `BypassDecider`, so the

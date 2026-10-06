@@ -1,7 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentiflowDef {
     pub name: String,
@@ -23,7 +24,7 @@ pub struct AgentiflowDef {
     pub trigger: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
     pub id: String,
@@ -38,7 +39,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalTarget {
     #[serde(default)]
@@ -62,7 +63,7 @@ pub struct GoalTarget {
 /// Independence (the verifier is a different run than the filer) and
 /// `verify_with` (the verifier is the named agent) apply under either level;
 /// this only widens what the verdict itself must carry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyCheck {
     /// A `Confirmed` verification is enough.
@@ -73,7 +74,7 @@ pub enum VerifyCheck {
     WithPoc,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindingSelector {
     /// Matches a classification id, e.g. "CWE-94" (via FindingReport::all_classifications()).
@@ -81,7 +82,7 @@ pub struct FindingSelector {
     pub classification: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetSelector {
     /// Profile-namespaced kind, e.g. "network:host".
@@ -91,7 +92,7 @@ pub struct AssetSelector {
     pub locator: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
     pub authorized: bool,
@@ -101,7 +102,7 @@ pub struct Scope {
     pub roots: Vec<ScopeRoot>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeRoot {
     /// A ROOT asset kind of an active profile (`parent == None`), e.g.
     /// "network:host" / "web:site" / "code:repo". Profiles are the mode of
@@ -113,7 +114,7 @@ pub struct ScopeRoot {
     pub fields: BTreeMap<String, serde_yaml::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pool {
     #[serde(default)]
@@ -123,7 +124,7 @@ pub struct Pool {
 }
 
 /// `workflows: all` or `workflows: [a, b]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkflowsSpec {
     All(AllKeyword),
@@ -134,13 +135,13 @@ impl Default for WorkflowsSpec {
         WorkflowsSpec::List(Vec::new())
     }
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AllKeyword {
     #[serde(rename = "all")]
     All,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoundConfig {
     #[serde(default)]
@@ -149,7 +150,7 @@ pub struct RoundConfig {
     pub ceiling: Option<Ceiling>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ceiling {
     #[serde(default)]
@@ -428,6 +429,41 @@ impl AgentiflowDef {
     }
 }
 
+/// Resolve an agentiflow DEFINITION by name from disk.
+///
+/// Definitions are `*.yaml` files, one per agentiflow:
+/// `<project>/agentiflows/<id>.yaml` (`project` is the project's `.rupu`
+/// directory, as for `rupu_orchestrator::catalog::load_workflow`) shadows
+/// `<global>/agentiflows/<id>.yaml`. A project file shadows the global one
+/// whether or not it parses: a broken project definition yields `None`, it
+/// never silently falls back to the global copy.
+///
+/// The `<global>/agentiflows/` directory also holds the RUN directories
+/// (`af_<ULID>/`, see [`crate::agentiflow_dir`]). They never collide with
+/// definitions: a definition is a `<name>.yaml` FILE, a run is a directory,
+/// and this reads only `<id>.yaml` files (`is_file()`), never descending into
+/// a run directory.
+///
+/// `None` when the id is not a bare stem (empty, or contains `/`, `\` or
+/// `..`: no path traversal), when no `<id>.yaml` file exists in either scope,
+/// or when the file does not parse as an [`AgentiflowDef`]. Only `.yaml`.
+pub fn load_agentiflow_def(
+    global: &Path,
+    project: Option<&Path>,
+    id: &str,
+) -> Option<AgentiflowDef> {
+    if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
+        return None;
+    }
+    let file = format!("{id}.yaml");
+    let path = project
+        .map(|p| p.join("agentiflows").join(&file))
+        .filter(|p| p.is_file())
+        .or_else(|| Some(global.join("agentiflows").join(&file)).filter(|p| p.is_file()))?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    AgentiflowDef::parse_str(&raw).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +502,105 @@ round:
   ceiling: { rounds: 40, wall_clock: "8h" }
 trigger: manual
 "#;
+
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn loads_agentiflow_def_by_stem_project_shadows_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("proj").join(".rupu");
+        write_file(&global, "agentiflows/acme.yaml", SAMPLE);
+        let got = load_agentiflow_def(&global, None, "acme").unwrap();
+        assert_eq!(got.name, "acme-pentest");
+
+        // The project definition shadows the global one of the same stem.
+        let variant = SAMPLE.replace("name: acme-pentest", "name: acme-project");
+        write_file(&project, "agentiflows/acme.yaml", &variant);
+        let got = load_agentiflow_def(&global, Some(&project), "acme").unwrap();
+        assert_eq!(got.name, "acme-project");
+        // Without a project the global one still resolves.
+        assert_eq!(
+            load_agentiflow_def(&global, None, "acme").unwrap().name,
+            "acme-pentest"
+        );
+
+        // A global-only stem resolves even with a project present.
+        write_file(&global, "agentiflows/other.yaml", SAMPLE);
+        assert!(load_agentiflow_def(&global, Some(&project), "other").is_some());
+    }
+
+    #[test]
+    fn load_agentiflow_def_rejects_bad_and_missing_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write_file(&global, "agentiflows/acme.yaml", SAMPLE);
+        // Bait placed exactly where an UNGUARDED id would resolve, so removing
+        // the guard makes the asserts below fail (the guard is truly exercised):
+        //   `../secret` -> global/agentiflows/../secret.yaml = global/secret.yaml
+        write_file(&global, "secret.yaml", SAMPLE);
+        //   `a/b`       -> global/agentiflows/a/b.yaml
+        write_file(&global, "agentiflows/a/b.yaml", SAMPLE);
+        for bad in [
+            "",
+            "nope",
+            "../secret",
+            "..",
+            "a/b",
+            "a\\b",
+            "../global/agentiflows/acme",
+        ] {
+            assert!(
+                load_agentiflow_def(&global, None, bad).is_none(),
+                "id {bad:?} must not resolve"
+            );
+        }
+        // `.yaml` only: a `.yml` file is not a definition, and the extension is
+        // not part of the id.
+        write_file(&global, "agentiflows/legacy.yml", SAMPLE);
+        assert!(load_agentiflow_def(&global, None, "legacy").is_none());
+        assert!(load_agentiflow_def(&global, None, "acme.yaml").is_none());
+    }
+
+    #[test]
+    fn load_agentiflow_def_none_on_parse_failure_and_no_fallback_past_a_project_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("proj").join(".rupu");
+        write_file(&global, "agentiflows/acme.yaml", SAMPLE);
+        write_file(&global, "agentiflows/broken.yaml", "name: [unterminated\n");
+        assert!(load_agentiflow_def(&global, None, "broken").is_none());
+        // A project file that exists but does not parse still shadows the
+        // global one (as `load_workflow` does): None, not a silent fallback.
+        write_file(&project, "agentiflows/acme.yaml", "bogus: 1\n");
+        assert!(load_agentiflow_def(&global, Some(&project), "acme").is_none());
+    }
+
+    #[test]
+    fn load_agentiflow_def_never_mistakes_a_run_dir_for_a_def() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write_file(&global, "agentiflows/acme.yaml", SAMPLE);
+        // A run directory (`af_<ULID>/`) holding its own definition snapshot
+        // and record sits beside the definition files.
+        let run = "af_01J0000000000000000000000A";
+        write_file(
+            &global,
+            &format!("agentiflows/{run}/agentiflow.yaml"),
+            SAMPLE,
+        );
+        write_file(&global, &format!("agentiflows/{run}/agentiflow.json"), "{}");
+        assert!(load_agentiflow_def(&global, None, run).is_none());
+        // A directory that happens to be named `<id>.yaml` is not a file.
+        std::fs::create_dir_all(global.join("agentiflows/dirdef.yaml")).unwrap();
+        assert!(load_agentiflow_def(&global, None, "dirdef").is_none());
+        // The real definition is unaffected.
+        assert!(load_agentiflow_def(&global, None, "acme").is_some());
+    }
 
     #[test]
     fn parses_a_full_definition() {

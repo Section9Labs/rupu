@@ -110,6 +110,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::workflow::Action,
     },
+    /// Run goal-directed agent fleets (agentiflows).
+    Agentiflow {
+        #[command(subcommand)]
+        action: cmd::agentiflow::Action,
+    },
     /// Run autonomous workflows against persistent issue state.
     Autoflow {
         #[command(subcommand)]
@@ -412,6 +417,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Workflow { action } => {
             cmd::workflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
+        Cmd::Agentiflow { action } => {
+            cmd::agentiflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Autoflow { action } => {
             cmd::autoflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
@@ -479,6 +487,7 @@ fn ensure_output_format_supported(
         }
         Cmd::Agent { action } => cmd::agent::ensure_output_format(action, format),
         Cmd::Workflow { action } => cmd::workflow::ensure_output_format(action, format),
+        Cmd::Agentiflow { action } => cmd::agentiflow::ensure_output_format(action, format),
         Cmd::Autoflow { action } => cmd::autoflow::ensure_output_format(action, format),
         Cmd::Transcript { action } => cmd::transcript::ensure_output_format(action, format),
         Cmd::Config { .. } => output::formats::ensure_supported(

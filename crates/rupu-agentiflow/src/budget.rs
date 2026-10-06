@@ -1,10 +1,10 @@
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Stop/throttle conditions on spend, tokens, wall-clock time, and round
 /// count. All fields are optional — an unset field never triggers a stop.
 /// `BudgetEnforcer` evaluates this against a `UsageSource`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
     #[serde(default)]
