@@ -281,6 +281,211 @@ pub fn read_workspace_findings(workspace: &Path) -> std::io::Result<Vec<FindingR
     Ok(records)
 }
 
+/// One requested change: add and remove tags on a set of findings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagChange {
+    pub finding_ids: Vec<String>,
+    pub add: Vec<Tag>,
+    pub remove: Vec<Tag>,
+}
+
+impl TagChange {
+    /// The checks that need no I/O: something to change, some findings,
+    /// and no tag both added and removed.
+    pub fn check(&self) -> Result<(), TagError> {
+        if self.add.is_empty() && self.remove.is_empty() {
+            return Err(TagError::EmptyChange);
+        }
+        if self.finding_ids.iter().all(|id| id.trim().is_empty()) {
+            return Err(TagError::NoFindings);
+        }
+        let add: BTreeSet<&Tag> = self.add.iter().collect();
+        let conflict: Vec<Tag> = self
+            .remove
+            .iter()
+            .filter(|t| add.contains(t))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !conflict.is_empty() {
+            return Err(TagError::Conflict(conflict));
+        }
+        Ok(())
+    }
+}
+
+/// One finding's tags before and after a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagOutcome {
+    pub finding_id: String,
+    pub before: Vec<Tag>,
+    pub after: Vec<Tag>,
+}
+
+impl TagOutcome {
+    pub fn changed(&self) -> bool {
+        self.before != self.after
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TagError {
+    #[error("nothing to change: give at least one tag to add or remove")]
+    EmptyChange,
+    #[error("no finding ids given")]
+    NoFindings,
+    #[error("a tag cannot be both added and removed: {}", .0.iter().map(Tag::as_str).collect::<Vec<_>>().join(", "))]
+    Conflict(Vec<Tag>),
+    #[error("unknown finding id(s): {}", .0.join(", "))]
+    UnknownFindings(Vec<String>),
+    #[error("{finding_id} would have {count} tags; at most {MAX_TAGS_PER_FINDING} are allowed")]
+    TooManyTags { finding_id: String, count: usize },
+    #[error("finding-tag log I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("finding-tag log encode: {0}")]
+    Encode(#[from] serde_json::Error),
+}
+
+/// Apply `change` to the findings of `log`'s workspace. The ONLY writer of
+/// tag events (spec "Write path").
+///
+/// Under the log's sidecar lock: read every target's declared findings and
+/// the log, fold, refuse the whole batch if any id is unknown or a finding
+/// would exceed [`MAX_TAGS_PER_FINDING`], then append only the events that
+/// change something (so a repeated request writes nothing) in one write,
+/// fsynced, and mirror them to the log's run stream. Findings are read
+/// without their own lock: their ledger is append-only and an import swaps
+/// it by atomic rename, so a read always sees a whole file and an id never
+/// disappears. Outcomes are sorted by finding id.
+pub fn apply(log: &TagLog, change: &TagChange, by: &TagActor) -> Result<Vec<TagOutcome>, TagError> {
+    change.check()?;
+    let ids: Vec<String> = change
+        .finding_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let add: BTreeSet<Tag> = change.add.iter().cloned().collect();
+    let remove: BTreeSet<Tag> = change.remove.iter().cloned().collect();
+    // No coverage directory: no findings here, and nothing is created.
+    if !log.path.parent().is_some_and(Path::is_dir) {
+        return Err(TagError::UnknownFindings(ids));
+    }
+    crate::ledger::stream::locked_at(&log.lock, &log.path, std::fs::File::lock, || {
+        let mut records = read_declared_workspace_findings(&log.workspace)?;
+        fold_tags(&mut records, &read_tag_events(log)?);
+        let current: HashMap<&str, BTreeSet<Tag>> = records
+            .iter()
+            .map(|r| (r.id.as_str(), r.tags.iter().cloned().collect()))
+            .collect();
+        let unknown: Vec<String> = ids
+            .iter()
+            .filter(|id| !current.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(TagError::UnknownFindings(unknown));
+        }
+        let at = Utc::now();
+        let mut events = Vec::new();
+        let mut outcomes = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let before = current[id.as_str()].clone();
+            let mut after = before.clone();
+            for t in &remove {
+                if after.remove(t) {
+                    events.push(new_event(id, TagOp::Remove, t, by, at));
+                }
+            }
+            for t in &add {
+                if after.insert(t.clone()) {
+                    events.push(new_event(id, TagOp::Add, t, by, at));
+                }
+            }
+            if after.len() > MAX_TAGS_PER_FINDING {
+                return Err(TagError::TooManyTags {
+                    finding_id: id.clone(),
+                    count: after.len(),
+                });
+            }
+            outcomes.push(TagOutcome {
+                finding_id: id.clone(),
+                before: before.into_iter().collect(),
+                after: after.into_iter().collect(),
+            });
+        }
+        append_events(log, &events)?;
+        Ok(outcomes)
+    })
+}
+
+fn new_event(finding_id: &str, op: TagOp, tag: &Tag, by: &TagActor, at: DateTime<Utc>) -> TagEvent {
+    TagEvent {
+        id: format!("tge_{}", ulid::Ulid::new()),
+        finding_id: finding_id.to_string(),
+        op,
+        tag: tag.clone(),
+        by: by.clone(),
+        at,
+    }
+}
+
+/// Append `events` in ONE write (a concurrent unlocked appender could
+/// otherwise land between two of them), fsync, then mirror each to the run
+/// stream. The caller holds the log's lock.
+fn append_events(log: &TagLog, events: &[TagEvent]) -> Result<(), TagError> {
+    use std::io::Write;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<_, _>>()?;
+    let mut buf = lines.join("\n");
+    buf.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log.path)?;
+    f.write_all(buf.as_bytes())?;
+    f.sync_data()?;
+    for l in &lines {
+        crate::ledger::stream::stream_json_to(
+            log.run_stream.as_ref(),
+            crate::ledger::stream::Ledger::Tags,
+            l,
+        );
+    }
+    Ok(())
+}
+
+/// Append a remote unit's events (`ingest_unit_stream`) that `log` does not
+/// already hold, by event id, under the log's lock so two ingests cannot
+/// both append one event. Never validated against findings: an orphan is
+/// folded away until its finding arrives. Returns (appended, duplicates).
+pub fn ingest_tag_events(log: &TagLog, events: Vec<TagEvent>) -> Result<(usize, usize), TagError> {
+    if events.is_empty() {
+        return Ok((0, 0));
+    }
+    crate::ledger::stream::locked_at(&log.lock, &log.path, std::fs::File::lock, || {
+        let mut seen: std::collections::HashSet<String> =
+            read_tag_events(log)?.into_iter().map(|e| e.id).collect();
+        let total = events.len();
+        let fresh: Vec<TagEvent> = events
+            .into_iter()
+            .filter(|e| seen.insert(e.id.clone()))
+            .collect();
+        let appended = fresh.len();
+        append_events(log, &fresh)?;
+        Ok((appended, total - appended))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

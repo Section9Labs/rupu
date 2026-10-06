@@ -46,6 +46,8 @@ pub enum Ledger {
     Assets,
     /// The catalog snapshot (`catalog.yaml`); streamed, never appended.
     Catalog,
+    /// Finding-tag events (the workspace's `finding_tags.jsonl`), written only by `ledger::tags`.
+    Tags,
 }
 
 impl Ledger {
@@ -57,6 +59,7 @@ impl Ledger {
             Ledger::Findings => "findings",
             Ledger::Assets => "assets",
             Ledger::Catalog => "catalog",
+            Ledger::Tags => "tags",
         }
     }
 }
@@ -70,7 +73,10 @@ impl Ledger {
 #[serde(tag = "ledger", rename_all = "lowercase")]
 pub enum StreamLine {
     /// First line of every stream: proves the host streams at all.
-    Begin { v: u32, run_id: String },
+    Begin {
+        v: u32,
+        run_id: String,
+    },
     Runs {
         scope_name: String,
         record: RunManifest,
@@ -142,7 +148,12 @@ pub(crate) fn envelope(
 /// loudly and not returned: returning it would make a caller retry — and
 /// duplicate — a record that was written.
 pub(crate) fn stream_json(paths: &CoveragePaths, ledger: Ledger, record_json: &str) {
-    let Some(rs) = &paths.run_stream else {
+    stream_json_to(paths.run_stream.as_ref(), ledger, record_json)
+}
+
+/// [`stream_json`] for a writer that is not a `CoveragePaths` (the tag log).
+pub(crate) fn stream_json_to(run_stream: Option<&RunStream>, ledger: Ledger, record_json: &str) {
+    let Some(rs) = run_stream else {
         return;
     };
     if let Err(e) =
@@ -177,6 +188,12 @@ pub fn append_record(
                 "the catalog is a snapshot, not a ledger; use stream_catalog",
             ))
         }
+        Ledger::Tags => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "finding-tag events are written by ledger::tags::apply, not append_record",
+            ))
+        }
     };
     let json = serde_json::to_string(record)?;
     if ledger == Ledger::Findings {
@@ -207,13 +224,31 @@ fn findings_locked(
     lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
     append: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let lock_file = match open_lock_file(paths) {
+    locked_at(
+        &paths.root.join("findings.jsonl.lock"),
+        &paths.findings,
+        lock,
+        append,
+    )
+}
+
+/// Run `f` holding the sidecar lock at `lock_path`, taken with `lock`, with
+/// the fallback [`findings_locked`] documents: where the filesystem cannot
+/// lock, or the lock file cannot be opened, `f` runs unlocked and a warning
+/// names `ledger`; any other lock failure is an error and `f` does not run.
+pub(crate) fn locked_at<T, E: From<std::io::Error>>(
+    lock_path: &Path,
+    ledger: &Path,
+    lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let lock_file = match open_lock_at(lock_path) {
         Ok(f) => Some(f),
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                ledger = ?paths.findings,
-                "cannot open the findings ledger's lock file; appending without the lock"
+                ledger = ?ledger,
+                "cannot open the ledger's lock file; writing without the lock"
             );
             None
         }
@@ -222,18 +257,18 @@ fn findings_locked(
         let needs_write =
             read_only && e.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error());
         if !(lock_unsupported(&e) || needs_write) {
-            return Err(e);
+            return Err(e.into());
         }
         tracing::warn!(
             error = %e,
-            ledger = ?paths.findings,
-            "this filesystem cannot lock the findings ledger; appending without the lock"
+            ledger = ?ledger,
+            "this filesystem cannot lock the ledger; writing without the lock"
         );
     }
-    let appended = append();
-    // Released after the append.
+    let out = f();
+    // Released after the write.
     drop(lock_file);
-    appended
+    out
 }
 
 /// Whether a lock error means the filesystem cannot lock at all, rather than
@@ -266,24 +301,29 @@ pub(crate) fn lock_findings(paths: &CoveragePaths) -> std::io::Result<std::fs::F
     Ok(f)
 }
 
-/// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing,
-/// and whether it was opened read-only.
+fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<(std::fs::File, bool)> {
+    open_lock_at(&paths.root.join("findings.jsonl.lock"))
+}
+
+/// The lock sidecar at `path` (its directory created if missing), and
+/// whether it was opened read-only.
 ///
 /// A lock needs only a handle on the file on most filesystems, so one this
 /// user may not write (created by another user, say an import run with
 /// `sudo`) is opened read-only instead.
-fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<(std::fs::File, bool)> {
-    paths.ensure_dir()?;
-    let path = paths.root.join("findings.jsonl.lock");
+fn open_lock_at(path: &Path) -> std::io::Result<(std::fs::File, bool)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
     {
         Ok(f) => Ok((f, false)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            std::fs::File::open(&path).map(|f| (f, true)).map_err(|_| e)
+            std::fs::File::open(path).map(|f| (f, true)).map_err(|_| e)
         }
         Err(e) => Err(e),
     }
