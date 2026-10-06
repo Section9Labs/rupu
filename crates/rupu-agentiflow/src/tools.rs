@@ -19,8 +19,11 @@ use std::time::Duration;
 
 /// Lease a `board.claim` takes on a work unit.
 const DEFAULT_CLAIM_TTL: Duration = Duration::from_secs(3600);
-/// Per-participant inbox cap for `msg.send`.
+/// Per-participant inbox cap for `msg.send` (for `"broadcast"`: the cap on the
+/// whole shared log).
 const DEFAULT_MSG_CAP: usize = 256;
+/// The `msg.send` recipient that fans out to every participant.
+const BROADCAST: &str = "broadcast";
 /// Posts `board.read` returns when `limit` is omitted.
 const DEFAULT_READ_LIMIT: usize = 50;
 /// Hard ceiling on `board.read`'s `limit`, so one call cannot flood the context.
@@ -377,7 +380,8 @@ impl Tool for BoardRead {
 
 // ---- msg.send --------------------------------------------------------------
 
-/// `msg.send { to, body }` -> appends to the recipient's inbox.
+/// `msg.send { to, body }` -> appends to the recipient's inbox, or to the
+/// shared broadcast log when `to` is `"broadcast"`.
 struct MsgSend(Arc<FleetToolCtx>);
 
 #[async_trait]
@@ -387,9 +391,9 @@ impl Tool for MsgSend {
     }
 
     fn description(&self) -> &'static str {
-        "Send a direct message to one participant's inbox. `to` is a participant \
-         id, a role, \"parent\", \"lead\", or \"broadcast\"; it is delivered to \
-         exactly the inbox named."
+        "Send a message. `to` is a participant id, a role, \"parent\", or \
+         \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every \
+         participant sees it once, from the moment it started listening)."
     }
 
     fn input_schema(&self) -> Value {
@@ -415,7 +419,15 @@ impl Tool for MsgSend {
             ts: FleetToolCtx::now(),
             body,
         };
-        Ok(match c.mailbox.send(to, &msg, c.msg_cap) {
+        // "broadcast" is not an inbox: it is an append-only log each reader
+        // walks with its own cursor, so one reader cannot consume it for the
+        // rest.
+        let sent = if to == BROADCAST {
+            c.mailbox.broadcast_send(&msg, c.msg_cap)
+        } else {
+            c.mailbox.send(to, &msg, c.msg_cap)
+        };
+        Ok(match sent {
             Ok(()) => done(format!("sent to {to}")),
             Err(e) => failed(format!("msg.send failed: {e}")),
         })
@@ -551,6 +563,70 @@ mod tests {
         assert_eq!(got[0].from, "lead");
         assert_eq!(got[0].body, "scan the subnet");
         assert!(!got[0].ts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn msg_send_broadcast_reaches_every_collector_once() {
+        use crate::collectors::MailboxCollector;
+        use rupu_agent::{Cadence, TurnCollector, TurnContext};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (board, mailbox) = stores(&dir);
+        let ctx_for = |p: &str| TurnContext {
+            run_id: "r".into(),
+            codename: None,
+            participant: p.into(),
+            turn_index: 0,
+        };
+        let a = MailboxCollector::new(mailbox.clone(), "worker-a");
+        let b = MailboxCollector::new(mailbox.clone(), "worker-b");
+        // Register both readers before the broadcast.
+        assert!(a.collect(&ctx_for("worker-a")).is_empty());
+        assert!(b.collect(&ctx_for("worker-b")).is_empty());
+
+        let tools = fleet_tools(Arc::new(FleetToolCtx::new(board, mailbox.clone(), "lead")));
+        let tc = rupu_tools::ToolContext::default();
+        let out = tool(&tools, "msg.send")
+            .invoke(
+                serde_json::json!({"to":"broadcast","body":"regroup at the gateway"}),
+                &tc,
+            )
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{out:?}");
+        assert_eq!(out.stdout, "sent to broadcast");
+
+        for (c, p) in [(&a, "worker-a"), (&b, "worker-b")] {
+            let injs = c.collect(&ctx_for(p));
+            assert_eq!(injs.len(), 1, "{p}: {injs:?}");
+            assert_eq!(injs[0].cadence, Cadence::Once);
+            assert_eq!(injs[0].source, format!("broadcast:{p}"));
+            assert!(injs[0].content.contains("regroup at the gateway"));
+            assert!(injs[0].content.contains("lead"));
+            assert!(c.collect(&ctx_for(p)).is_empty(), "{p}: delivered twice");
+        }
+        // It is not sitting in a shared inbox either.
+        assert!(mailbox.drain("broadcast").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn msg_send_broadcast_to_a_full_log_is_a_visible_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, mailbox) = stores(&dir);
+        let mut raw = FleetToolCtx::new(board, mailbox, "lead");
+        raw.msg_cap = 1;
+        let tools = fleet_tools(Arc::new(raw));
+        let tc = rupu_tools::ToolContext::default();
+        let send = tool(&tools, "msg.send");
+        let args = serde_json::json!({"to":"broadcast","body":"hi"});
+        assert!(send
+            .invoke(args.clone(), &tc)
+            .await
+            .unwrap()
+            .error
+            .is_none());
+        let full = send.invoke(args, &tc).await.unwrap();
+        assert!(full.error.expect("reported").contains("full"));
     }
 
     #[tokio::test]

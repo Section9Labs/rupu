@@ -16,23 +16,28 @@ use std::sync::Arc;
 use rupu_agent::{Cadence, Injection, InjectionKind, TurnCollector, TurnContext};
 use rupu_fleet::{Board, Directive, Mailbox};
 
-/// The shared inbox every participant also reads (`msg.send` to `"broadcast"`).
-const BROADCAST_INBOX: &str = "broadcast";
-
 /// Priority of an inbox message: above ordinary observations, below a standing
 /// directive.
 const MAILBOX_PRIORITY: u8 = 200;
 /// Priority of a standing board directive.
 const DIRECTIVE_PRIORITY: u8 = 230;
 
-/// Drains this participant's inbox (and the shared `"broadcast"` inbox) into
-/// `Once` message injections.
+/// Drains this participant's inbox, and reads the shared broadcast log past its
+/// own cursor, into `Once` message injections.
 ///
-/// `Once` because `Mailbox::drain` consumes what it returns: each message must
-/// be delivered exactly once. The pipeline keeps `Once` injections in the
-/// lead's in-memory conversation (they return via `RunExit.messages` / history),
-/// so the lead carries them across rounds; they are not written as transcript
-/// events.
+/// `Once` because both reads consume: `Mailbox::drain` removes what it returns,
+/// and `Mailbox::read_broadcast` advances this participant's cursor past what
+/// it returns, so each message is delivered exactly once. The pipeline keeps
+/// `Once` injections in the lead's in-memory conversation (they return via
+/// `RunExit.messages` / history), so the lead carries them across rounds; they
+/// are not written as transcript events.
+///
+/// Broadcast is NOT drained from a shared inbox: the first reader would take it
+/// from every other reader. Each participant has its own cursor into one
+/// append-only log, so a broadcast reaches all of them. A participant's first
+/// read starts at the log's current end (no backlog), so the collector should
+/// run once as the participant is registered if it must see every later
+/// broadcast.
 pub struct MailboxCollector {
     pub(crate) mailbox: Arc<Mailbox>,
     pub(crate) participant: String,
@@ -53,24 +58,30 @@ impl TurnCollector for MailboxCollector {
     }
 
     fn collect(&self, _ctx: &TurnContext) -> Vec<Injection> {
-        let source = format!("mailbox:{}", self.participant);
-        let mut inboxes = vec![self.participant.as_str()];
-        if self.participant != BROADCAST_INBOX {
-            inboxes.push(BROADCAST_INBOX);
-        }
+        let message = |source: String, m: rupu_fleet::FleetMessage| Injection {
+            source,
+            kind: InjectionKind::Message,
+            cadence: Cadence::Once,
+            priority: MAILBOX_PRIORITY,
+            content: format!("from {} at {}: {}", m.from, m.ts, m.body),
+        };
         let mut out = Vec::new();
-        for inbox in inboxes {
-            match self.mailbox.drain(inbox) {
-                Ok(messages) => out.extend(messages.into_iter().map(|m| Injection {
-                    source: source.clone(),
-                    kind: InjectionKind::Message,
-                    cadence: Cadence::Once,
-                    priority: MAILBOX_PRIORITY,
-                    content: format!("from {} at {}: {}", m.from, m.ts, m.body),
-                })),
-                Err(e) => {
-                    tracing::warn!(inbox, error = %e, "mailbox collector: drain failed");
-                }
+        match self.mailbox.drain(&self.participant) {
+            Ok(messages) => {
+                let source = format!("mailbox:{}", self.participant);
+                out.extend(messages.into_iter().map(|m| message(source.clone(), m)));
+            }
+            Err(e) => {
+                tracing::warn!(inbox = %self.participant, error = %e, "mailbox collector: drain failed");
+            }
+        }
+        match self.mailbox.read_broadcast(&self.participant) {
+            Ok(messages) => {
+                let source = format!("broadcast:{}", self.participant);
+                out.extend(messages.into_iter().map(|m| message(source.clone(), m)));
+            }
+            Err(e) => {
+                tracing::warn!(participant = %self.participant, error = %e, "mailbox collector: broadcast read failed");
             }
         }
         out
@@ -211,20 +222,41 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_collector_also_drains_the_broadcast_inbox() {
+    fn mailbox_collector_delivers_broadcast_via_its_cursor_not_a_shared_inbox() {
         let dir = tempfile::tempdir().unwrap();
         let mb = Arc::new(Mailbox::new(dir.path()));
+        let lead = MailboxCollector::new(mb.clone(), "lead");
+        let other = MailboxCollector::new(mb.clone(), "worker-2");
+        // First collect registers each reader at the log tip.
+        assert!(lead.collect(&ctx("lead")).is_empty());
+        assert!(other.collect(&ctx("worker-2")).is_empty());
+
         mb.send("lead", &msg("w1", "direct"), 64).unwrap();
-        mb.send("broadcast", &msg("w2", "to everyone"), 64).unwrap();
+        mb.broadcast_send(&msg("w2", "to everyone"), 64).unwrap();
         mb.send("someone-else", &msg("w3", "not mine"), 64).unwrap();
-        let c = MailboxCollector::new(mb.clone(), "lead");
-        let injs = c.collect(&ctx("lead"));
+
+        let injs = lead.collect(&ctx("lead"));
         assert_eq!(injs.len(), 2);
         assert!(injs.iter().all(|i| i.cadence == Cadence::Once));
-        assert!(injs.iter().any(|i| i.content.contains("direct")));
-        assert!(injs.iter().any(|i| i.content.contains("to everyone")));
+        assert!(injs.iter().all(|i| i.kind == InjectionKind::Message));
+        assert!(injs.iter().all(|i| i.priority == 200));
+        let direct = injs.iter().find(|i| i.content.contains("direct")).unwrap();
+        assert_eq!(direct.source, "mailbox:lead");
+        let bcast = injs
+            .iter()
+            .find(|i| i.content.contains("to everyone"))
+            .unwrap();
+        assert_eq!(bcast.source, "broadcast:lead");
+        assert!(bcast.content.contains("w2"), "{}", bcast.content);
         assert!(!injs.iter().any(|i| i.content.contains("not mine")));
-        assert!(c.collect(&ctx("lead")).is_empty());
+        // consumed for the lead only...
+        assert!(lead.collect(&ctx("lead")).is_empty());
+        // ...the lead reading it did not take it from the other reader.
+        let theirs = other.collect(&ctx("worker-2"));
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].source, "broadcast:worker-2");
+        assert!(theirs[0].content.contains("to everyone"));
+        assert!(other.collect(&ctx("worker-2")).is_empty());
     }
 
     #[test]
