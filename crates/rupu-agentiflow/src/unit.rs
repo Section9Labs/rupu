@@ -11,17 +11,46 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// What kind of thing a unit runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnitKind {
+    /// One agent (`rupu run <agent>`).
+    #[default]
+    Agent,
+    /// One workflow (`rupu workflow run <name>`).
+    Workflow,
+}
+
+impl UnitKind {
+    /// The stable lowercase name (`unit.json`'s `kind`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnitKind::Agent => "agent",
+            UnitKind::Workflow => "workflow",
+        }
+    }
+}
+
 /// What to run as a unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitSpec {
-    /// The agent file to run (`rupu run <agent>`).
+    /// The thing to run: the agent file for an [`UnitKind::Agent`] unit
+    /// (`rupu run <agent>`), or the workflow name for a [`UnitKind::Workflow`]
+    /// unit (`rupu workflow run <name>`). The field keeps its 3b-2 name so the
+    /// agent path is untouched; `kind` says how to read it.
     pub agent: String,
-    /// The unit's task prompt.
+    /// The unit's task prompt. Agent units only: a workflow takes `inputs`
+    /// instead and ignores this (conventionally empty).
     pub prompt: String,
     /// Engagement-scope roots the unit is bound to (may be empty).
     pub engagement: Vec<String>,
     /// The unit's participant name on the board / mailboxes (`recon#1`).
     pub participant: String,
+    /// Whether this unit runs an agent or a workflow.
+    pub kind: UnitKind,
+    /// `KEY=VALUE` workflow inputs (`--input k=v`, in order). Empty for an
+    /// agent unit.
+    pub inputs: Vec<(String, String)>,
 }
 
 /// A unit's handle: the pre-minted run id (`run_<ULID>`).
@@ -174,6 +203,8 @@ mod tests {
             prompt: "scan".into(),
             engagement: vec![],
             participant: participant.into(),
+            kind: UnitKind::Agent,
+            inputs: vec![],
         }
     }
 

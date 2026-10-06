@@ -28,7 +28,7 @@ use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
 use crate::supervisor::FleetSupervisor;
-use crate::unit::{UnitSpec, UnitStatus};
+use crate::unit::{UnitKind, UnitSpec, UnitStatus};
 
 /// The deepest dispatch chain allowed. The lead is depth 0 and its units are
 /// depth 1; a dispatch from depth `MAX_DEPTH` or deeper is refused.
@@ -181,6 +181,8 @@ impl Tool for DispatchTool {
             prompt: prompt.to_string(),
             engagement: c.engagement.clone(),
             participant: c.mint_participant(agent),
+            kind: UnitKind::Agent,
+            inputs: vec![],
         };
         let participant = spec.participant.clone();
         Ok(match c.sup.dispatch(spec) {

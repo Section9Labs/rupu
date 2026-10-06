@@ -38,7 +38,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::proc::{kill_group, terminate_group};
-use crate::unit::{UnitError, UnitId, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus};
+use crate::unit::{UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus};
 
 /// How long `Drop` waits for SIGTERMed units to exit before it SIGKILLs them.
 const DROP_GRACE: Duration = Duration::from_millis(1500);
@@ -50,9 +50,17 @@ const DROP_GRACE: Duration = Duration::from_millis(1500);
 /// to assert the argv or to run a trivial command (`/bin/sh -c 'sleep 0.3'`).
 pub type ArgvBuilder = Box<dyn Fn(&UnitSpec, &str, &Path) -> Vec<OsString> + Send + Sync>;
 
-/// The real argv for one unit:
+/// The real argv for one unit, by [`UnitSpec::kind`].
+///
+/// An [`UnitKind::Agent`] unit:
 /// `run <agent> --run-id <id> --mode bypass --prompt=<p>
 /// [--engagement-profile a,b] --fleet-run-dir <run_dir> --fleet-participant <p>`.
+///
+/// A [`UnitKind::Workflow`] unit ([`rupu_workflow_argv`]):
+/// `workflow run <name> --run-id <id> --mode bypass --plain [--input k=v]…
+/// [--engagement-profile a,b] --fleet-run-dir <run_dir> --fleet-participant <p>`,
+/// where `<name>` is `spec.agent` (the "thing to run") and there is no
+/// `--prompt` (a workflow takes `--input`s instead).
 ///
 /// `--mode bypass` because a unit has no tty to answer an approval prompt.
 /// The prompt is ONE `--prompt=<p>` argument, not `--prompt <p>`: clap reads a
@@ -62,6 +70,14 @@ pub type ArgvBuilder = Box<dyn Fn(&UnitSpec, &str, &Path) -> Vec<OsString> + Sen
 /// default `code` path; a non-empty set is comma-joined (the flag's
 /// delimiter), never dropped.
 pub fn rupu_run_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
+    match spec.kind {
+        UnitKind::Agent => rupu_agent_argv(spec, run_id, run_dir),
+        UnitKind::Workflow => rupu_workflow_argv(spec, run_id, run_dir),
+    }
+}
+
+/// The agent unit's argv (see [`rupu_run_argv`]).
+fn rupu_agent_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
         "run".into(),
         spec.agent.clone().into(),
@@ -71,6 +87,34 @@ pub fn rupu_run_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsStr
         "bypass".into(),
         format!("--prompt={}", spec.prompt).into(),
     ];
+    push_unit_tail(&mut argv, spec, run_dir);
+    argv
+}
+
+/// The workflow unit's argv (see [`rupu_run_argv`]). `--plain` because the unit
+/// is detached with no tty: the plain printer, never the live graph view.
+pub fn rupu_workflow_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![
+        "workflow".into(),
+        "run".into(),
+        spec.agent.clone().into(),
+        "--run-id".into(),
+        run_id.into(),
+        "--mode".into(),
+        "bypass".into(),
+        "--plain".into(),
+    ];
+    for (k, v) in &spec.inputs {
+        argv.push("--input".into());
+        argv.push(format!("{k}={v}").into());
+    }
+    push_unit_tail(&mut argv, spec, run_dir);
+    argv
+}
+
+/// The flags every unit kind ends with: the engagement profile (when any) and
+/// the fleet binding.
+fn push_unit_tail(argv: &mut Vec<OsString>, spec: &UnitSpec, run_dir: &Path) {
     if !spec.engagement.is_empty() {
         argv.push("--engagement-profile".into());
         argv.push(spec.engagement.join(",").into());
@@ -79,7 +123,6 @@ pub fn rupu_run_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsStr
     argv.push(run_dir.as_os_str().to_owned());
     argv.push("--fleet-participant".into());
     argv.push(spec.participant.clone().into());
-    argv
 }
 
 /// One tracked unit.
@@ -344,6 +387,19 @@ mod tests {
             prompt: "scan the host".into(),
             engagement: engagement.iter().map(|s| s.to_string()).collect(),
             participant: "recon#1".into(),
+            kind: UnitKind::Agent,
+            inputs: vec![],
+        }
+    }
+
+    fn workflow_spec() -> UnitSpec {
+        UnitSpec {
+            agent: "web-assess".into(),
+            prompt: String::new(),
+            engagement: vec!["web".into()],
+            participant: "web-assess#1".into(),
+            kind: UnitKind::Workflow,
+            inputs: vec![("target".into(), "x".into())],
         }
     }
 
@@ -382,6 +438,95 @@ mod tests {
             Some("/g/agentiflows/af_1")
         );
         assert_eq!(value_after(&argv, "--fleet-participant"), Some("recon#1"));
+    }
+
+    #[test]
+    fn an_agent_unit_argv_is_exactly_the_3b2_shape() {
+        // Regression guard: the workflow branch must not move the agent argv.
+        let argv = strs(&rupu_run_argv(
+            &spec(&["network", "web"]),
+            "run_01ABC",
+            Path::new("/rd"),
+        ));
+        assert_eq!(
+            argv,
+            [
+                "run",
+                "recon",
+                "--run-id",
+                "run_01ABC",
+                "--mode",
+                "bypass",
+                "--prompt=scan the host",
+                "--engagement-profile",
+                "network,web",
+                "--fleet-run-dir",
+                "/rd",
+                "--fleet-participant",
+                "recon#1",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_workflow_unit_argv_is_workflow_run_with_inputs_and_no_prompt() {
+        let argv = strs(&rupu_run_argv(
+            &workflow_spec(),
+            "run_01ABC",
+            Path::new("/rd"),
+        ));
+        assert_eq!(
+            argv,
+            [
+                "workflow",
+                "run",
+                "web-assess",
+                "--run-id",
+                "run_01ABC",
+                "--mode",
+                "bypass",
+                "--plain",
+                "--input",
+                "target=x",
+                "--engagement-profile",
+                "web",
+                "--fleet-run-dir",
+                "/rd",
+                "--fleet-participant",
+                "web-assess#1",
+            ]
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--prompt")),
+            "a workflow has no prompt: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_unit_emits_one_input_flag_per_entry_and_omits_empty_extras() {
+        let mut s = workflow_spec();
+        s.engagement.clear();
+        s.inputs = vec![
+            ("target".into(), "x".into()),
+            ("depth".into(), "a=b c".into()),
+        ];
+        let argv = strs(&rupu_run_argv(&s, "run_1", Path::new("/rd")));
+        let inputs: Vec<&str> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--input")
+            .map(|(i, _)| argv[i + 1].as_str())
+            .collect();
+        assert_eq!(
+            inputs,
+            ["target=x", "depth=a=b c"],
+            "in order, value kept whole"
+        );
+        assert!(!argv.iter().any(|a| a == "--engagement-profile"));
+
+        s.inputs.clear();
+        let argv = strs(&rupu_run_argv(&s, "run_1", Path::new("/rd")));
+        assert!(!argv.iter().any(|a| a == "--input"), "{argv:?}");
     }
 
     #[test]

@@ -49,5 +49,5 @@ pub use subprocess::SubprocessUnitLauncher;
 pub use supervisor::FleetSupervisor;
 pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
-    MockUnitLauncher, UnitError, UnitId, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
+    MockUnitLauncher, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
 };

@@ -15,14 +15,16 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use rupu_fleet::Mailbox;
 
-use crate::unit::{UnitError, UnitId, UnitLauncher, UnitSpec, UnitStatus};
+use crate::unit::{UnitError, UnitId, UnitKind, UnitLauncher, UnitSpec, UnitStatus};
 
 /// How often `join` re-polls a unit that has not finished.
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 struct UnitRec {
+    /// The agent (or, for a workflow unit, the workflow) the unit runs.
     agent: String,
+    kind: UnitKind,
     participant: String,
     started_at: DateTime<Utc>,
     /// The last status observed from the launcher.
@@ -65,6 +67,7 @@ impl FleetSupervisor {
         let id = self.launcher.spawn(&spec, &self.run_dir)?;
         let rec = UnitRec {
             agent: spec.agent,
+            kind: spec.kind,
             participant: spec.participant,
             started_at: Utc::now(),
             status: UnitStatus::Pending,
@@ -182,6 +185,7 @@ impl FleetSupervisor {
         let body = serde_json::json!({
             "run_id": id,
             "agent": rec.agent,
+            "kind": rec.kind.as_str(),
             "participant": rec.participant,
             "started_at": rec.started_at.to_rfc3339(),
             "status": status_json(&rec.status),
@@ -225,6 +229,8 @@ mod tests {
             prompt: "scan".into(),
             engagement: vec![],
             participant: participant.into(),
+            kind: UnitKind::Agent,
+            inputs: vec![],
         }
     }
 
@@ -258,6 +264,8 @@ mod tests {
                 prompt: "scan".into(),
                 engagement: vec![],
                 participant: "recon#1".into(),
+                kind: UnitKind::Agent,
+                inputs: vec![],
             })
             .unwrap();
         // units/<id>/unit.json written
@@ -311,6 +319,36 @@ mod tests {
             .join(&id)
             .join("unit.json.tmp")
             .exists());
+    }
+
+    #[test]
+    fn unit_json_records_the_unit_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let sup = FleetSupervisor::new(launcher, dir.path().to_path_buf());
+
+        let agent = sup.dispatch(spec("recon#1")).unwrap();
+        assert_eq!(read_unit_json(dir.path(), &agent)["kind"], "agent");
+
+        let wf = sup
+            .dispatch(UnitSpec {
+                agent: "web-assess".into(),
+                prompt: String::new(),
+                engagement: vec![],
+                participant: "web-assess#1".into(),
+                kind: UnitKind::Workflow,
+                inputs: vec![("target".into(), "x".into())],
+            })
+            .unwrap();
+        let j = read_unit_json(dir.path(), &wf);
+        assert_eq!(j["kind"], "workflow");
+        assert_eq!(
+            j["agent"], "web-assess",
+            "the workflow name rides in `agent`"
+        );
+        // A status change rewrites the record and keeps the kind.
+        assert_eq!(sup.status(&wf), UnitStatus::Running);
+        assert_eq!(read_unit_json(dir.path(), &wf)["kind"], "workflow");
     }
 
     #[test]
