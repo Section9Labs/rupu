@@ -25,6 +25,7 @@ use tokio::io::AsyncBufReadExt as _;
 
 fn make_run(id: &str) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "obs-wf".into(),
         status: RunStatus::Completed,

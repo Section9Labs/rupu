@@ -2271,6 +2271,7 @@ mod tests {
         workspace_id: &str,
     ) -> rupu_orchestrator::RunRecord {
         rupu_orchestrator::RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: workflow_name.into(),
             status: rupu_orchestrator::RunStatus::Completed,

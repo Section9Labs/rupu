@@ -4148,6 +4148,7 @@ mod tests {
 
     fn sample_run_record() -> RunRecord {
         RunRecord {
+            customer: None,
             id: "run_test".into(),
             workflow_name: "demo".into(),
             status: rupu_orchestrator::RunStatus::Running,

@@ -1105,6 +1105,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             netflow_sink: Some(netflow_sink.clone()),
             net_capture: Some(net_capture),
             tool_call_id: None,
+            // The customer the config above was layered with.
+            customer: cfg_paths.customer_slug.clone(),
         };
 
         let backend_id = "local_checkout".to_string();
@@ -1446,6 +1448,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 loop_progress: Default::default(),
                 gate_decisions: Vec::new(),
                 codename: Some(codename.crew.clone()),
+                // The customer this run's config was layered with.
+                customer: cfg_paths.customer_slug.clone(),
             };
             match store.create(rec, "") {
                 Ok(_) => {}
@@ -2209,6 +2213,7 @@ mod tests {
         finished_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> rupu_cp::api::runs::RunListRow {
         let rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_01".into(),
             workflow_name: "nightly".into(),
             status: rupu_orchestrator::RunStatus::Completed,

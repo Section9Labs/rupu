@@ -276,6 +276,32 @@ async fn workflow_run_takes_the_customer_default_provider() {
         run_start.contains("\"provider\":\"anthropic-acme\""),
         "the step should run on the customer's account: {run_start}"
     );
+    let runs = rupu_orchestrator::RunStore::new(tmp.child(".rupu/runs").path().to_path_buf())
+        .list()
+        .unwrap();
+    assert_eq!(
+        runs[0].customer.as_deref(),
+        Some("acme"),
+        "the run records its customer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rupu_run_records_the_customer() {
+    let _guard = ENV_LOCK.lock().await;
+    let (tmp, project) = fixture("permission_mode = \"bypass\"\n", "", "");
+    let code = run_writer(tmp.child(".rupu").path(), &project).await;
+    assert!(ok(code), "rupu run failed");
+    // Found the way the CP finds standalone runs.
+    let runs = rupu_orchestrator::RunStore::new(tmp.child(".rupu/runs").path().to_path_buf())
+        .list()
+        .unwrap();
+    let agent_runs: Vec<_> = runs
+        .iter()
+        .filter(|r| r.workflow_name.starts_with("agent:"))
+        .collect();
+    assert_eq!(agent_runs.len(), 1, "expected one standalone run: {runs:?}");
+    assert_eq!(agent_runs[0].customer.as_deref(), Some("acme"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -293,8 +319,12 @@ const GATE_WF: &str = "name: gate-wf\nsteps:\n  - id: gate\n    approval:\n     
 /// point the run's `workspace_path` at an unassigned directory — what an
 /// autoflow issue worktree or a temp clone looks like to resume. With
 /// `keep_sidecar = false` the run's `customer_dir` file is removed, as for
-/// a run that predates it. Then `workflow approve` resumes the run; returns
-/// the `RunStart` line of step `a`'s transcript.
+/// a run that predates it. The record's `customer` is cleared too: this
+/// exercises the fallback a run recorded before runs carried their customer
+/// takes (the recorded slug wins whenever it is there —
+/// `resume_uses_the_recorded_customer_after_a_reassignment`). Then
+/// `workflow approve` resumes the run; returns the `RunStart` line of step
+/// `a`'s transcript.
 async fn approve_after_moving_workspace(keep_sidecar: bool) -> String {
     let (tmp, project) = workflow_fixture(
         "default_provider = \"anthropic-acme\"\n[providers.anthropic-acme]\nkind = \"anthropic\"\n",
@@ -336,6 +366,8 @@ async fn approve_after_moving_workspace(keep_sidecar: bool) -> String {
     if !keep_sidecar {
         std::fs::remove_file(store.customer_dir_path(&run_id)).unwrap();
     }
+    assert_eq!(record.customer.as_deref(), Some("acme"));
+    record.customer = None;
     record.workspace_path = elsewhere.path().to_path_buf();
     store.update(&record).unwrap();
 
@@ -373,5 +405,83 @@ async fn resume_without_the_persisted_dir_uses_the_workspace_path() {
     assert!(
         run_start.contains("\"provider\":\"anthropic\""),
         "an unassigned workspace path resolves no customer, as before: {run_start}"
+    );
+}
+
+/// A run keeps the customer it was launched under: reassigning its project to
+/// another customer while it is parked at a gate does not move the resumed
+/// steps onto the new customer's config.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_uses_the_recorded_customer_after_a_reassignment() {
+    let _guard = ENV_LOCK.lock().await;
+    let (tmp, project) = workflow_fixture(
+        "default_provider = \"anthropic-acme\"\n[providers.anthropic-acme]\nkind = \"anthropic\"\n",
+    );
+    let home = tmp.child(".rupu");
+    home.child("workflows/gate-wf.yaml")
+        .write_str(GATE_WF)
+        .unwrap();
+    let customers = CustomerStore::new(home.path());
+    customers
+        .create(
+            "globex",
+            &NewCustomer {
+                name: "Globex".into(),
+                ..NewCustomer::default()
+            },
+        )
+        .unwrap();
+    std::fs::write(
+        customers.config_path("globex"),
+        "default_provider = \"openai-globex\"\n[providers.openai-globex]\nkind = \"openai\"\n",
+    )
+    .unwrap();
+    let run_id = "run_customer_reassigned".to_string();
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", ECHO_SCRIPT);
+    std::env::set_current_dir(&project).unwrap();
+    Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "gate-wf".into(),
+        "--run-id".into(),
+        run_id.clone(),
+        "--plain".into(),
+    ]))
+    .await;
+
+    let store = rupu_orchestrator::RunStore::new(home.path().join("runs"));
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(
+        record.status,
+        rupu_orchestrator::RunStatus::AwaitingApproval
+    );
+    assert_eq!(record.customer.as_deref(), Some("acme"));
+
+    customers.unassign(ProjectRef::Path(&project)).unwrap();
+    customers
+        .assign("globex", ProjectRef::Path(&project))
+        .unwrap();
+
+    let code = Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "approve".into(),
+        run_id.clone(),
+    ]))
+    .await;
+    assert!(ok(code), "approve failed");
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
+    assert_eq!(record.customer.as_deref(), Some("acme"));
+    let steps = store.read_step_results(&run_id).unwrap();
+    let step = steps.iter().find(|s| s.step_id == "a").unwrap();
+    let transcript = std::fs::read_to_string(&step.transcript_path).unwrap();
+    let run_start = transcript.lines().next().unwrap();
+    assert!(
+        run_start.contains("\"provider\":\"anthropic-acme\""),
+        "the resumed step should run under the RECORDED customer, not the new assignment: {run_start}"
     );
 }

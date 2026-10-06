@@ -134,6 +134,10 @@ pub struct ToolContext {
     /// attributes a bash call's captured connections to that call.
     #[serde(skip)]
     pub tool_call_id: Option<String>,
+    /// The customer this run is attributed to (resolved once, at launch).
+    /// `None` = no customer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer: Option<String>,
 }
 
 // Hand-written because the netflow trait objects are not `Debug`.
@@ -166,6 +170,7 @@ impl std::fmt::Debug for ToolContext {
                 &self.net_capture.as_ref().map(|_| "<capture>"),
             )
             .field("tool_call_id", &self.tool_call_id)
+            .field("customer", &self.customer)
             .finish()
     }
 }
@@ -193,6 +198,7 @@ impl Default for ToolContext {
             netflow_sink: None,
             net_capture: None,
             tool_call_id: None,
+            customer: None,
         }
     }
 }

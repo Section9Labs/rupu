@@ -3337,6 +3337,7 @@ mod tests {
 
     fn seed_record(id: &str, workflow: &str, workspace: &std::path::Path) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: workflow.into(),
             status: rupu_orchestrator::runs::RunStatus::Completed,

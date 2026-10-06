@@ -2822,6 +2822,7 @@ mod tests {
         transcript_path: &std::path::Path,
     ) {
         let record = rupu_orchestrator::RunRecord {
+            customer: None,
             id: run_id.into(),
             workflow_name: "wf".into(),
             status: rupu_orchestrator::RunStatus::Completed,

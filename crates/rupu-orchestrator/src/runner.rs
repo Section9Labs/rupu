@@ -441,6 +441,14 @@ pub trait StepFactory: Send + Sync {
     fn permission_mode(&self) -> Option<&str> {
         None
     }
+
+    /// The customer this run is attributed to (the CLI resolves it once, at
+    /// launch). Recorded on the run's `RunRecord` and passed to every step's
+    /// `ToolContext`. Defaulted like `permission_mode` so test factories need
+    /// no change.
+    fn customer(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// `Clone` exists solely so [`run_scheduler`] can wrap one `Arc`-shared copy
@@ -1217,6 +1225,7 @@ pub async fn run_workflow(
                 loop_progress: std::collections::BTreeMap::new(),
                 gate_decisions: Vec::new(),
                 codename: Some(naming.crew().to_string()),
+                customer: opts.factory.customer().map(str::to_string),
             };
             let created = store.create(record, yaml).map_err(map_run_store_err)?;
             _runner_guard = Some(store.register_runner(&run_id));
@@ -16644,6 +16653,7 @@ loops:
         store
             .create(
                 crate::runs::RunRecord {
+                    customer: None,
                     id: run_id.clone(),
                     workflow_name: wf.name.clone(),
                     status: crate::runs::RunStatus::Running,

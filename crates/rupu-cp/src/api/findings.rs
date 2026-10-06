@@ -3934,6 +3934,7 @@ mod tests {
     fn run_record(id: &str, workflow: &str) -> rupu_orchestrator::runs::RunRecord {
         use rupu_orchestrator::runs::{RunRecord, RunStatus};
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: workflow.into(),
             codename: None,

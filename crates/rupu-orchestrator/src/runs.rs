@@ -130,6 +130,10 @@ pub struct RunRecord {
     /// Crew codename (`adjective-noun`) minted for this run. Absent on legacy runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codename: Option<String>,
+    /// The customer this run ran under, recorded at launch (`None` = no
+    /// customer, or a run recorded before customers existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer: Option<String>,
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -4297,6 +4301,7 @@ mod tests {
 
     fn sample_record(id: &str) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "investigate-then-fix".into(),
             status: RunStatus::Pending,

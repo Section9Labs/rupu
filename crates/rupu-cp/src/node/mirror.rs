@@ -179,6 +179,10 @@ impl NodeMirror {
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
             codename: None,
+            // The launch spec carries no customer; the node's own run.json
+            // (`ArtifactFile::RunJson` below) brings the customer the remote
+            // recorded, and that update keeps it.
+            customer: None,
             cause: None,
         };
 
@@ -276,7 +280,8 @@ impl NodeMirror {
                 // fields (status, finished_at, active_step_*, etc.) are taken
                 // from `incoming` — that is the point of the RunJson update.
                 // Ownership was already verified above; `existing` carries the
-                // CP-local fields to re-apply.
+                // CP-local fields to re-apply. `customer` is the node's own
+                // recorded customer and is kept from `incoming`.
                 let mut incoming: RunRecord = serde_json::from_str(&line)?;
                 incoming.id = existing.id;
                 incoming.worker_id = existing.worker_id;

@@ -1031,6 +1031,7 @@ pub(crate) fn synthesize_unpersisted_run(
     let now = chrono::Utc::now();
     let error_message = matches!(status, RunStatus::Failed).then(|| failure.to_string());
     let record = RunRecord {
+        customer: None,
         id: id.to_string(),
         workflow_name: workflow_name.to_string(),
         status,
@@ -1737,6 +1738,7 @@ pub(crate) mod tests {
     /// An `awaiting_approval` run record paused at `step_id`.
     fn awaiting_record(id: &str, step_id: &str) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "wf".into(),
             status: RunStatus::AwaitingApproval,
@@ -3810,6 +3812,7 @@ pub(crate) mod tests {
     /// `host_mirror`.
     fn mirrored_record(id: &str) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "wf".into(),
             status: RunStatus::Running,

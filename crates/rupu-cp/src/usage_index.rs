@@ -1236,6 +1236,7 @@ mod tests {
 
     fn record(id: &str, status: RunStatus, worker: Option<&str>) -> RunRecord {
         RunRecord {
+            customer: None,
             codename: None,
             id: id.into(),
             workflow_name: "wf".into(),

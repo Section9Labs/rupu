@@ -1034,6 +1034,7 @@ pub(crate) mod tests {
         let store = RunStore::new(tmp.path().join("runs"));
         let recorded = PathBuf::from("/does/not/exist/run_local.jsonl");
         let record = rupu_orchestrator::runs::RunRecord {
+            customer: None,
             id: "run_01LOCAL".into(),
             workflow_name: "wf".into(),
             status: rupu_orchestrator::runs::RunStatus::Completed,

@@ -53,6 +53,7 @@ fn seed_session(global: &Path, id: &str) {
 /// Build a minimal `RunRecord` with the given `id` and `status`.
 fn seed_run(id: &str, status: RunStatus) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "fed-workflow".into(),
         status,

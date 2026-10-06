@@ -539,6 +539,7 @@ mod tests {
 
     fn run_record(id: &str, workflow_name: &str, status: RunStatus) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: workflow_name.into(),
             status,

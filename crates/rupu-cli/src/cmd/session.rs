@@ -7789,6 +7789,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // runtime (its first call blocks).
         let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
         let tool_context = ToolContext {
+            customer: None,
             findings: Some(
                 crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
                     rupu_coverage::FindingProfile::resolve(None, None, session.findings_profile),

@@ -421,6 +421,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let child_depth = parent_depth + 1;
 
         let child_tool_ctx = ToolContext {
+            customer: None,
             findings: Some(self.findings_base.clone().with_profile(
                 rupu_coverage::FindingProfile::resolve(None, None, spec.findings_profile),
             )),

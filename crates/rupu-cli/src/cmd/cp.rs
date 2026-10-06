@@ -1934,6 +1934,7 @@ mod tests {
         use rupu_orchestrator::runs::AwaitingGate;
         let now = chrono::Utc::now();
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -2365,6 +2366,7 @@ mod tests {
         let now = chrono::Utc::now();
         let since = now - chrono::Duration::seconds(120);
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_multi_gate".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -2488,6 +2490,7 @@ mod tests {
         let now = chrono::Utc::now();
         let since = now - chrono::Duration::seconds(120);
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_mixed_policy".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -3783,6 +3786,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_sole_gate".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -3877,6 +3881,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_spawn_fail".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -4200,6 +4205,7 @@ mod tests {
         use rupu_orchestrator::runs::AwaitingGate;
         let now = chrono::Utc::now();
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,

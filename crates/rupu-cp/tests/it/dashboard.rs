@@ -65,6 +65,7 @@ fn seed_run(
     status: rupu_orchestrator::runs::RunStatus,
 ) -> rupu_orchestrator::runs::RunRecord {
     rupu_orchestrator::runs::RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "dash-wf".into(),
         status,

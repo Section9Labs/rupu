@@ -281,6 +281,34 @@ pub(crate) fn customer_lookup_dir(
     Ok(dir)
 }
 
+/// The config layers a resumed run loads, and the customer it runs under.
+/// In order:
+///
+/// 1. the customer the run RECORDED at launch (`RunRecord.customer`), even if
+///    the project has been reassigned since — a run keeps the customer it
+///    started under; a recorded customer that no longer exists is an error,
+///    never a fall back to the global config;
+/// 2. for a run recorded before customers: the launch's persisted
+///    `customer_dir` sidecar ([`customer_lookup_dir`]);
+/// 3. else the run's `workspace_path`.
+pub(crate) fn resume_config_paths(
+    store: &RunStore,
+    global: &Path,
+    run_id: &str,
+    recorded_customer: Option<&str>,
+    workspace_path: &Path,
+    project_root: Option<&Path>,
+) -> anyhow::Result<paths::ConfigPaths> {
+    if let Some(slug) = recorded_customer {
+        return rupu_workspace::config_paths_for_customer(global, Some(slug), project_root)
+            .map_err(|e| {
+                anyhow::anyhow!("resume run {run_id} under its recorded customer `{slug}`: {e}")
+            });
+    }
+    let lookup_dir = customer_lookup_dir(store, run_id, workspace_path)?;
+    paths::config_paths(global, project_root, &lookup_dir)
+}
+
 /// Shared disk-rebuild step for [`resume_run`] (approve-resume) and
 /// [`build_reject_cleanup_opts`] (reject-cleanup): reload the persisted
 /// workflow snapshot + prior step results and reconstruct the full
@@ -339,8 +367,16 @@ async fn rebuild_opts_from_disk(
     // Standard wiring (mirrors `run` above; refactor candidate but
     // keeping inline for now to avoid spreading the resume path
     // across the CLI surface).
-    let customer_lookup_dir = customer_lookup_dir(store, run_id, &workspace_path)?;
-    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &customer_lookup_dir)?;
+    // The run's recorded customer, else the launch's lookup dir, else the
+    // workspace path (`resume_config_paths`).
+    let cfg_paths = resume_config_paths(
+        store,
+        &global,
+        run_id,
+        record.customer.as_deref(),
+        &workspace_path,
+        project_root.as_deref(),
+    )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     // Rooted at `global` like everything else here: the resolver reads
     // `<global>/auth.json` and never resolves the home on its own.
@@ -490,6 +526,9 @@ async fn rebuild_opts_from_disk(
         // gated workflows), so it keeps the workflow's own scope.
         scope_name_override: None,
         net_capture: Some(net_capture),
+        // The recorded customer (or, for a run that predates it, the one
+        // looked up above) — what the resumed steps are attributed to.
+        customer: cfg_paths.customer_slug.clone(),
     });
 
     // Rebuild the `run:` step policy from the resolved mode + layered config
@@ -587,5 +626,73 @@ mod tests {
         assert!(err.contains("run_1"), "{err}");
         assert!(err.contains(&repo.display().to_string()), "{err}");
         assert!(err.contains("no longer exists"), "{err}");
+    }
+
+    /// `<tmp>/home` with customers `acme` and `globex`, and an empty
+    /// project dir `<tmp>/proj`.
+    fn customers_home(tmp: &Path) -> (PathBuf, PathBuf) {
+        let home = tmp.join("home");
+        let cs = rupu_workspace::CustomerStore::new(&home);
+        for slug in ["acme", "globex"] {
+            let new = rupu_workspace::NewCustomer {
+                name: slug.into(),
+                ..Default::default()
+            };
+            cs.create(slug, &new).unwrap();
+        }
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        (home, proj)
+    }
+
+    #[test]
+    fn resume_config_paths_use_the_recorded_customer_without_a_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, proj) = customers_home(tmp.path());
+        let store = store_with_run(tmp.path());
+        // The project is assigned to nobody and the run has no sidecar:
+        // only the recorded slug names the customer.
+        let paths = resume_config_paths(&store, &home, "run_1", Some("acme"), &proj, None).unwrap();
+        assert_eq!(paths.customer_slug.as_deref(), Some("acme"));
+        assert_eq!(
+            paths.customer,
+            Some(rupu_workspace::CustomerStore::new(&home).config_path("acme"))
+        );
+    }
+
+    #[test]
+    fn resume_config_paths_prefer_the_recorded_customer_over_the_current_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, proj) = customers_home(tmp.path());
+        rupu_workspace::CustomerStore::new(&home)
+            .assign("globex", rupu_workspace::ProjectRef::Path(&proj))
+            .unwrap();
+        let store = store_with_run(tmp.path());
+        store.write_customer_dir("run_1", &proj).unwrap();
+        let paths = resume_config_paths(&store, &home, "run_1", Some("acme"), &proj, None).unwrap();
+        assert_eq!(paths.customer_slug.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn resume_config_paths_refuse_a_recorded_customer_that_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, proj) = customers_home(tmp.path());
+        let store = store_with_run(tmp.path());
+        let err =
+            resume_config_paths(&store, &home, "run_1", Some("initech"), &proj, None).unwrap_err();
+        assert!(format!("{err:#}").contains("initech"), "{err:#}");
+    }
+
+    #[test]
+    fn resume_config_paths_without_a_recorded_customer_look_it_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, proj) = customers_home(tmp.path());
+        rupu_workspace::CustomerStore::new(&home)
+            .assign("globex", rupu_workspace::ProjectRef::Path(&proj))
+            .unwrap();
+        let store = store_with_run(tmp.path());
+        // A run recorded before customers: the workspace path's assignment.
+        let paths = resume_config_paths(&store, &home, "run_1", None, &proj, None).unwrap();
+        assert_eq!(paths.customer_slug.as_deref(), Some("globex"));
     }
 }

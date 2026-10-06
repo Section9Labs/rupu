@@ -47,6 +47,7 @@ steps:
 
 fn seed_run(id: &str) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "graph-test".into(),
         status: RunStatus::Completed,

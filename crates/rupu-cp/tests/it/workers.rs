@@ -20,6 +20,7 @@ fn seed_run(
     started_at: chrono::DateTime<Utc>,
 ) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "test-workflow".into(),
         status,

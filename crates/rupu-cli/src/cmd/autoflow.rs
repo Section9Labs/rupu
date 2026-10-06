@@ -12616,6 +12616,7 @@ mod tests {
         store
             .create(
                 RunRecord {
+                    customer: None,
                     codename: None,
                     id: "run_fold".into(),
                     workflow_name: "controller".into(),
@@ -14016,6 +14017,7 @@ steps:
         let store = RunStore::new(global.join("runs"));
         std::fs::create_dir_all(global.join("runs")).unwrap();
         let run = RunRecord {
+            customer: None,
             id: "run_dispatch".into(),
             workflow_name: "controller".into(),
             status: RunStatus::Completed,
@@ -14178,6 +14180,7 @@ steps:
         let store = RunStore::new(global.join("runs"));
         std::fs::create_dir_all(global.join("runs")).unwrap();
         let run = RunRecord {
+            customer: None,
             id: "run_wrapped".into(),
             workflow_name: "controller".into(),
             status: RunStatus::Completed,
@@ -14325,6 +14328,7 @@ steps:
         let store = RunStore::new(global.join("runs"));
         std::fs::create_dir_all(global.join("runs")).unwrap();
         let run = RunRecord {
+            customer: None,
             id: "run_fenced".into(),
             workflow_name: "controller".into(),
             status: RunStatus::Completed,
@@ -14487,6 +14491,7 @@ steps:
         let store = RunStore::new(global.join("runs"));
         std::fs::create_dir_all(global.join("runs")).unwrap();
         let run = RunRecord {
+            customer: None,
             id: "run_shorthand".into(),
             workflow_name: "controller".into(),
             status: RunStatus::Completed,
@@ -14639,6 +14644,7 @@ steps:
         let store = RunStore::new(global.join("runs"));
         std::fs::create_dir_all(global.join("runs")).unwrap();
         let run = RunRecord {
+            customer: None,
             id: "run_decision".into(),
             workflow_name: "controller".into(),
             status: RunStatus::Completed,
@@ -14783,6 +14789,7 @@ steps:
         store
             .create(
                 RunRecord {
+                    customer: None,
                     id: "run_rejected".into(),
                     workflow_name: "controller".into(),
                     status: RunStatus::Rejected,
@@ -14937,6 +14944,7 @@ steps:
         run_store
             .create(
                 RunRecord {
+                    customer: None,
                     id: "run_waiting".into(),
                     workflow_name: "issue-supervisor-dispatch".into(),
                     status: RunStatus::AwaitingApproval,
@@ -15116,6 +15124,7 @@ steps:
         run_store
             .create(
                 RunRecord {
+                    customer: None,
                     id: "run_done".into(),
                     workflow_name: "issue-supervisor-dispatch".into(),
                     status: RunStatus::Completed,

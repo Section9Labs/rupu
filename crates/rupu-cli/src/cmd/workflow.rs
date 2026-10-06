@@ -3702,11 +3702,17 @@ pub(crate) async fn resume_run(
     // original run used.
     let project_root = paths::project_root_for(&workspace_path)?;
 
-    // Standard wiring (mirrors `approve` above). The customer comes from the
-    // launch's persisted lookup dir; a run that predates it uses its
-    // workspace path.
-    let customer_lookup_dir = crate::resume::customer_lookup_dir(&store, run_id, &workspace_path)?;
-    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &customer_lookup_dir)?;
+    // Standard wiring (mirrors `approve` above). The customer is the one the
+    // run recorded; a run that predates that uses the launch's persisted
+    // lookup dir, else its workspace path (`resume_config_paths`).
+    let cfg_paths = crate::resume::resume_config_paths(
+        &store,
+        &global,
+        run_id,
+        record.customer.as_deref(),
+        &workspace_path,
+        project_root.as_deref(),
+    )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
@@ -3836,6 +3842,8 @@ pub(crate) async fn resume_run(
         // gated workflows), so it keeps the workflow's own scope.
         scope_name_override: None,
         net_capture: Some(net_capture),
+        // The recorded customer (or the looked-up one for an older run).
+        customer: cfg_paths.customer_slug.clone(),
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -5705,6 +5713,9 @@ async fn execute_workflow_invocation(
         recovery: cfg.recovery.clone(),
         scope_name_override: overlay.scope_name.clone(),
         net_capture: Some(net_capture),
+        // The customer the config above was layered with — recorded on the
+        // run so a resume uses it, not whatever the project maps to later.
+        customer: cfg_paths.customer_slug.clone(),
     });
 
     let workflow_for_resume = workflow.clone();
@@ -6686,6 +6697,7 @@ mod tests {
 
     fn sample_run_record(status: RunStatus, runner_pid: Option<u32>) -> RunRecord {
         RunRecord {
+            customer: None,
             id: "run_test_cancel".into(),
             workflow_name: "sample".into(),
             status,

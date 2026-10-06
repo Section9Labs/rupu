@@ -1406,6 +1406,7 @@ mod tests {
         run_store
             .create(
                 RunRecord {
+                    customer: None,
                     id: "run_123".into(),
                     workflow_name: "storefront-feature-delivery".into(),
                     status: RunStatus::Completed,

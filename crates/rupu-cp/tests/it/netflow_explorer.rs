@@ -69,6 +69,7 @@ fn write_ledger(workspace: &std::path::Path, run_id: &str, flows: &[FlowRecord])
 
 fn seed_run(id: &str, workflow: &str, workspace: &std::path::Path) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: workflow.into(),
         status: RunStatus::Completed,

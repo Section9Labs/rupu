@@ -1788,6 +1788,7 @@ mod tests {
         input_tokens: u32,
     ) {
         let record = rupu_orchestrator::RunRecord {
+            customer: None,
             id: run_id.into(),
             workflow_name: workflow_name.into(),
             status: rupu_orchestrator::RunStatus::Completed,

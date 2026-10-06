@@ -41,6 +41,7 @@ fn seed_workspace_toml(
 /// `proj_path` (the project dir the coverage data lives under).
 fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "test-workflow".into(),
         status,

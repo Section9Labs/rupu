@@ -102,6 +102,7 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
 fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) {
     let run_store = rupu_orchestrator::runs::RunStore::new(dir.join("runs"));
     let record = rupu_orchestrator::RunRecord {
+        customer: None,
         id: run_id.into(),
         workflow_name: "wf".into(),
         status: rupu_orchestrator::RunStatus::Completed,
@@ -209,6 +210,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
     let dir = tempfile::tempdir().unwrap();
     let run_store = rupu_orchestrator::runs::RunStore::new(dir.path().join("runs"));
     let record = rupu_orchestrator::RunRecord {
+        customer: None,
         id: "run_priced".into(),
         workflow_name: "wf".into(),
         status: rupu_orchestrator::RunStatus::Completed,
@@ -591,6 +593,7 @@ fn seed_run_with_usage(
 ) {
     let run_store = rupu_orchestrator::runs::RunStore::new(dir.join("runs"));
     let record = rupu_orchestrator::RunRecord {
+        customer: None,
         id: run_id.into(),
         workflow_name: workflow_name.into(),
         status: rupu_orchestrator::RunStatus::Completed,
@@ -1218,6 +1221,7 @@ fn create_workflow_run(
 ) -> rupu_orchestrator::runs::RunStore {
     let run_store = rupu_orchestrator::runs::RunStore::new(global.join("runs"));
     let record = rupu_orchestrator::RunRecord {
+        customer: None,
         codename: None,
         id: run_id.into(),
         workflow_name: "wf-fold".into(),

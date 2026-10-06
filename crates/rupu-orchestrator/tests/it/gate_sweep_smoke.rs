@@ -53,6 +53,7 @@ steps:
 
 fn base_record(id: &str) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "sweep-smoke".into(),
         status: RunStatus::Pending,

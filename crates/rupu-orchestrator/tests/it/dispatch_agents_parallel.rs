@@ -188,6 +188,7 @@ impl StepFactory for ParallelFactory {
             max_turns: 5,
             decider: Arc::new(BypassDecider),
             tool_context: ToolContext {
+                customer: None,
                 findings: None,
                 workspace_path,
                 bash_env_allowlist: Vec::new(),

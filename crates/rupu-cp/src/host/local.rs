@@ -673,6 +673,7 @@ mod pause_resume_tests {
 
     fn record(id: &str, status: RunStatus) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "wf".into(),
             status,

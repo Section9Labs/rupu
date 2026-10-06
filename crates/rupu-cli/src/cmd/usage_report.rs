@@ -719,6 +719,7 @@ mod tests {
 
     fn sample_run_record(id: &str, started_at: DateTime<Utc>, transcript_dir: &Path) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "phase-delivery-cycle".into(),
             status: RunStatus::Completed,

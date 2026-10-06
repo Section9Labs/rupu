@@ -221,6 +221,7 @@ use std::path::PathBuf;
 
 fn seed_run(id: &str, workspace_path: PathBuf) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "wf".into(),
         status: RunStatus::Completed,

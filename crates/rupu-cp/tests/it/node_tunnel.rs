@@ -2203,6 +2203,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
     // status = AwaitingApproval, awaiting_step_id set, and — crucially —
     // resume_requested_at = None (no marker).
     let rec = RunRecord {
+        customer: None,
         id: "run_node_1".to_string(),
         workflow_name: "gate-workflow".to_string(),
         status: RunStatus::AwaitingApproval,
@@ -2272,6 +2273,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
     // Construct a RunRecord in AwaitingApproval attributed to an SSH host.
     // Crucially resume_requested_at = None (no marker).
     let rec = RunRecord {
+        customer: None,
         id: "run_ssh_1".to_string(),
         workflow_name: "gate-workflow".to_string(),
         status: RunStatus::AwaitingApproval,
@@ -2336,6 +2338,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
     // Construct a RunRecord in AwaitingApproval attributed to a Bucket host.
     // Crucially resume_requested_at = None (no marker).
     let rec = RunRecord {
+        customer: None,
         id: "run_bucket_1".to_string(),
         workflow_name: "gate-workflow".to_string(),
         status: RunStatus::AwaitingApproval,

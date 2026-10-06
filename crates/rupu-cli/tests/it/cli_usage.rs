@@ -120,6 +120,7 @@ fn sample_run_record(
     status: RunStatus,
 ) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: workflow_name.into(),
         status,
