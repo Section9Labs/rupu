@@ -89,7 +89,12 @@ fn enabled_backend(_cfg: &NetflowConfig) -> Arc<dyn SubprocessCapture> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rupu_netflow::{CallAttribution, CaptureState, MemorySink};
+    use rupu_netflow::{CallAttribution, MemorySink};
+    // Only the macOS backend test and the unsupported-platform test inspect
+    // `CaptureState`; the linux backend test does not, so importing it there
+    // trips `-D unused-imports` (the musl lint job).
+    #[cfg(not(target_os = "linux"))]
+    use rupu_netflow::CaptureState;
 
     fn cfg(on: bool) -> NetflowConfig {
         NetflowConfig {
