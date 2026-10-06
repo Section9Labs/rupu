@@ -53,6 +53,27 @@ pub fn list_workflow_summaries(global: &Path, project: Option<&Path>) -> Vec<Wor
     by_name.into_values().collect()
 }
 
+/// Load one workflow by its runnable id (the file stem).
+///
+/// Resolves exactly as [`list_workflow_summaries`] does: the project's
+/// `<project>/workflows/<id>.yaml` (when `project` is `Some`; `project`
+/// is the `.rupu` directory) shadows `<global>/workflows/<id>.yaml`,
+/// even when the project file does not parse. Returns `None` when the
+/// workflow is not found, does not parse, or `id` is not a plain file
+/// stem (empty, or containing a path separator or `..`). Only `.yaml`
+/// is considered, matching the lister.
+pub fn load_workflow(global: &Path, project: Option<&Path>, id: &str) -> Option<Workflow> {
+    if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
+        return None;
+    }
+    let file = format!("{id}.yaml");
+    let path = project
+        .map(|p| p.join("workflows").join(&file))
+        .filter(|p| p.is_file())
+        .or_else(|| Some(global.join("workflows").join(&file)).filter(|p| p.is_file()))?;
+    Workflow::parse_file(&path).ok()
+}
+
 fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -227,5 +248,57 @@ steps:
         let tmp = tempfile::tempdir().unwrap();
         let got = list_workflow_summaries(&tmp.path().join("nope"), Some(&tmp.path().join("nada")));
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn load_workflow_finds_global_by_file_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        // `foo.yaml` declares `name: bar`: it loads as `foo`.
+        write(
+            &global,
+            "workflows/foo.yaml",
+            &ONE_STEP.replace("name: foo", "name: bar"),
+        );
+        let wf = load_workflow(&global, None, "foo").expect("found by stem");
+        assert_eq!(wf.name, "bar");
+        assert_eq!(wf.steps.len(), 1);
+        assert!(load_workflow(&global, None, "bar").is_none(), "not by name");
+    }
+
+    #[test]
+    fn load_workflow_project_shadows_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("proj").join(".rupu");
+        write(&global, "workflows/foo.yaml", TWO_STEPS);
+        write(&project, "workflows/foo.yaml", ONE_STEP);
+        let wf = load_workflow(&global, Some(&project), "foo").expect("found");
+        assert_eq!(wf.steps.len(), 1, "project copy wins");
+        // Falls back to global when the project has no such file.
+        write(&global, "workflows/only-global.yaml", TWO_STEPS);
+        let wf = load_workflow(&global, Some(&project), "only-global").expect("global fallback");
+        assert_eq!(wf.steps.len(), 2);
+    }
+
+    #[test]
+    fn load_workflow_none_for_missing_garbage_and_bad_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write(
+            &global,
+            "workflows/broken.yaml",
+            "name: [unclosed\nsteps: {",
+        );
+        write(&global, "workflows/foo.yaml", ONE_STEP);
+        assert!(load_workflow(&global, None, "missing").is_none());
+        assert!(load_workflow(&global, None, "broken").is_none());
+        assert!(load_workflow(&global, None, "").is_none());
+        assert!(load_workflow(&global, None, "../workflows/foo").is_none());
+        assert!(load_workflow(&global, None, "sub/foo").is_none());
+        // A broken project file shadows a good global one (as in the lister).
+        let project = tmp.path().join("proj").join(".rupu");
+        write(&project, "workflows/foo.yaml", "name: [unclosed\nsteps: {");
+        assert!(load_workflow(&global, Some(&project), "foo").is_none());
     }
 }
