@@ -1169,10 +1169,24 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         };
         // A fleet unit joins the agentiflow's board and pools its findings
         // under the agentiflow id; every other run keeps the empty defaults.
+        let fleet_attached = fleet.is_some();
         let (fleet_tools, fleet_collectors, fleet_scope) = match fleet {
             Some(a) => (a.extra_tools, a.collectors, Some(a.scope_name)),
             None => (Vec::new(), Vec::new(), None),
         };
+        // A fleet unit meters itself: its own `<runs>/<run_id>/usage.jsonl`
+        // is what the agentiflow folds into its budget. A plain `rupu run`
+        // keeps no ledger.
+        let on_usage = fleet_attached.then(|| {
+            rupu_orchestrator::usage_ledger::UsageLedger::for_run(&run_store, &run_id).hook(
+                rupu_orchestrator::usage_ledger::LedgerTag::default(),
+                run_id.clone(),
+                None,
+                transcript_path.clone(),
+                spec.name.clone(),
+                None,
+            )
+        });
         let mut opts = AgentRunOpts {
             seed_source: None,
             collectors: fleet_collectors,
@@ -1216,7 +1230,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
-            on_usage: None,
+            on_usage,
             concerns: spec.concerns.clone(),
             limits,
             scope_name: fleet_scope,
