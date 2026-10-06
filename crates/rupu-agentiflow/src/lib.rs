@@ -39,7 +39,10 @@ pub use envelope::{
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
-pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
+pub use lead::{
+    render_round_prompt, GenerationCapability, GenerationProviderFactory, LeadConfig,
+    ProviderFactory, RunAgentLeadDriver,
+};
 pub use operator::{OperatorMessage, OperatorQueue};
 pub use proc::{pid_is_running, terminate_pid};
 pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
