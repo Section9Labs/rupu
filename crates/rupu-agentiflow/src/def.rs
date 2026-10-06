@@ -539,8 +539,12 @@ trigger: manual
         let tmp = tempfile::tempdir().unwrap();
         let global = tmp.path().join("global");
         write_file(&global, "agentiflows/acme.yaml", SAMPLE);
-        // A file the traversal ids would reach if unguarded.
-        write_file(tmp.path(), "secret.yaml", SAMPLE);
+        // Bait placed exactly where an UNGUARDED id would resolve, so removing
+        // the guard makes the asserts below fail (the guard is truly exercised):
+        //   `../secret` -> global/agentiflows/../secret.yaml = global/secret.yaml
+        write_file(&global, "secret.yaml", SAMPLE);
+        //   `a/b`       -> global/agentiflows/a/b.yaml
+        write_file(&global, "agentiflows/a/b.yaml", SAMPLE);
         for bad in [
             "",
             "nope",
