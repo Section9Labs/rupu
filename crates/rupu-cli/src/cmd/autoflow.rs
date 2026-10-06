@@ -10989,7 +10989,9 @@ pub(crate) async fn execute_autoflow_cycle(
         ExplicitWorkflowRunContext {
             project_root: resolved.project_root.clone(),
             workspace_path,
-            customer_dir: None,
+            // The issue worktree lives under `<RUPU_HOME>/autoflows/worktrees`,
+            // which no customer assignment covers: the customer is the repo's.
+            customer_dir: Some(resolved.preferred_checkout.clone()),
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
@@ -11811,7 +11813,9 @@ pub(crate) async fn execute_pending_dispatch_workflow(
         ExplicitWorkflowRunContext {
             project_root,
             workspace_path,
-            customer_dir: None,
+            // As in `execute_autoflow_cycle`: the repo's checkout, not the
+            // claim's worktree, decides the customer.
+            customer_dir: Some(preferred_checkout.clone()),
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
@@ -15813,6 +15817,161 @@ steps:
             .as_deref()
             .unwrap()
             .contains("issue-123"));
+    }
+
+    /// The `$HOME` situation through a real tick: the repo has no `.rupu/`
+    /// of its own (so `project_root_for` resolves to `<tmp>`, whose `.rupu`
+    /// is the global dir) and is assigned to customer `acme`; the cycle runs
+    /// in an issue worktree under `<RUPU_HOME>/autoflows/worktrees`, which
+    /// no assignment covers. The step must still run on the customer's
+    /// `default_provider` — observed in the step transcript's `RunStart`,
+    /// the account the run actually used — because the cycle looks the
+    /// customer up from the repo's checkout, not the worktree.
+    #[tokio::test]
+    async fn tick_cycle_for_an_assigned_repo_without_rupu_dir_uses_its_customer() {
+        ensure_crypto_provider();
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".rupu");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+        assert!(!repo.join(".rupu").exists());
+
+        let server = MockServer::start();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rupu-scm/tests/fixtures/github/issues_list_happy.json");
+        let body = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("read fixture {}: {e}", fixture.display()))
+            .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(body);
+        });
+
+        // `<tmp>/.rupu` is both the global dir and (through
+        // `project_root_for`) the repo's "project" dir.
+        write_autoflow_project(
+            tmp.path(),
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+        // An agent that names no provider takes `default_provider`.
+        std::fs::write(
+            global.join("agents/echo.md"),
+            "---\nname: echo\nmodel: claude-sonnet-4-6\n---\nyou echo.\n",
+        )
+        .unwrap();
+        let global_cfg = std::fs::read_to_string(global.join("config.toml")).unwrap();
+        std::fs::write(
+            global.join("config.toml"),
+            format!("default_provider = \"anthropic\"\n{global_cfg}"),
+        )
+        .unwrap();
+
+        let customers = rupu_workspace::CustomerStore::new(&global);
+        customers
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            customers.config_path("acme"),
+            "default_provider = \"anthropic-acme\"\n[providers.anthropic-acme]\nkind = \"anthropic\"\n",
+        )
+        .unwrap();
+        customers
+            .assign("acme", rupu_workspace::ProjectRef::Path(&repo))
+            .unwrap();
+
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &repo,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+        let tick = tick_with_resolver(resolver).await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+        tick.unwrap();
+
+        let claim = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        }
+        .load("github:Section9Labs/rupu/issues/123")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            claim.status,
+            ClaimStatus::Complete,
+            "{:?}",
+            claim.last_error
+        );
+        let worktree = claim.worktree_path.clone().unwrap();
+        assert!(
+            Path::new(&worktree).starts_with(&global),
+            "the cycle should run in an issue worktree under RUPU_HOME: {worktree}"
+        );
+        let run_id = claim.last_run_id.clone().unwrap();
+        let steps = rupu_orchestrator::RunStore::new(global.join("runs"))
+            .read_step_results(&run_id)
+            .unwrap();
+        let transcript = std::fs::read_to_string(&steps[0].transcript_path).unwrap();
+        let run_start = transcript.lines().next().unwrap();
+        assert!(
+            run_start.contains("\"provider\":\"anthropic-acme\""),
+            "the cycle should run on the customer's account: {run_start}"
+        );
     }
 
     /// The PR analogue of `tick_discovers_tracked_repo_and_runs_autoflow_cycle`
