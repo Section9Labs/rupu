@@ -4,6 +4,7 @@
 //! below, not as a new `tests/*.rs` — `rupu-cli`'s `tests/it/test_layout.rs`
 //! enforces this.
 
+mod customer_layer;
 mod layering;
 mod parse;
 mod provider_config;

@@ -1,7 +1,10 @@
 //! Provenance-aware config resolution with policy-lock enforcement.
-//! A key listed in the GLOBAL `[policy].lock` takes its GLOBAL value over the
-//! project layer: locked-global > project > global > default. Non-locked keys
-//! keep project > global > default.
+//! Precedence, highest first: global lock > customer lock > project >
+//! customer > global > default. A key in the GLOBAL `[policy].lock` takes its
+//! global value over every other layer; a key in the CUSTOMER `[policy].lock`
+//! (that the customer layer sets) takes its customer value over the project.
+//! Locks come from the global and customer layers only — a project's lock
+//! list is ignored.
 //!
 //! There is deliberately no environment tier. One existed until ISSUES.md I-20:
 //! `resolve()` took an `env: &BTreeMap<String, Value>` and ranked it above
@@ -12,32 +15,49 @@
 //! merged into `Config`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde::Serialize;
 use toml::Value;
 
 use crate::config::Config;
-use crate::layer::{read_optional_toml, LayerError};
+use crate::layer::{policy_lock_of, read_optional_toml, LayerError, LayerPaths};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeySource {
     Global,
+    Customer,
     Project,
     Default,
+}
+
+/// Which layer's `[policy].lock` names a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LockOwner {
+    Global,
+    Customer,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KeyProvenance {
     pub source: KeySource,
+    /// `locked_by.is_some()` — kept so existing consumers (the CP) read it
+    /// unchanged.
     pub locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<LockOwner>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub config: Config,
     pub provenance: BTreeMap<String, KeyProvenance>,
+    /// The customer layer's `[policy].lock`, as written. Not merged into
+    /// `config.policy.lock`, which stays the global list.
+    pub customer_lock: Vec<String>,
+    /// Non-fatal problems worth telling the operator about.
+    pub warnings: Vec<String>,
 }
 
 /// Flatten a TOML table to leaf keys → scalar/array values, where each key is
@@ -148,85 +168,121 @@ fn dotted(parts: &[String]) -> String {
         .join(".")
 }
 
-pub fn resolve(global: Option<&Path>, project: Option<&Path>) -> Result<Resolved, LayerError> {
-    let g = read_optional_toml(global)?; // Option<Value>
-    let p = read_optional_toml(project)?;
+pub fn resolve(paths: LayerPaths<'_>) -> Result<Resolved, LayerError> {
+    let g = read_optional_toml(paths.global)?;
+    let c = read_optional_toml(paths.customer)?;
+    let p = read_optional_toml(paths.project)?;
 
-    let mut fg: BTreeMap<Vec<String>, Value> = BTreeMap::new();
-    if let Some(g) = &g {
-        flatten(&[], g, &mut fg);
+    let flat = |v: &Option<Value>| {
+        let mut out: BTreeMap<Vec<String>, Value> = BTreeMap::new();
+        if let Some(v) = v {
+            flatten(&[], v, &mut out);
+        }
+        out
+    };
+    let (fg, fc, fp) = (flat(&g), flat(&c), flat(&p));
+
+    // Locks come from the GLOBAL and CUSTOMER layers only; a project's
+    // `[policy].lock` is ignored, as it always was.
+    let global_lock = policy_lock_of(g.as_ref());
+    let customer_lock = policy_lock_of(c.as_ref());
+    let g_locked = |key: &str| global_lock.iter().any(|l| l == key);
+    let c_locked = |key: &str| customer_lock.iter().any(|l| l == key);
+
+    let mut warnings = Vec::new();
+    for l in &customer_lock {
+        let set_by_customer = fc.keys().any(|k| &dotted(k) == l);
+        if !set_by_customer && !g_locked(l) {
+            warnings.push(format!(
+                "customer [policy].lock names `{l}`, which the customer layer does not set; \
+                 the lock has no effect"
+            ));
+        }
     }
-    let mut fp: BTreeMap<Vec<String>, Value> = BTreeMap::new();
-    if let Some(p) = &p {
-        flatten(&[], p, &mut fp);
-    }
-    // Locks come from the GLOBAL layer only. `[policy].lock` is a two-segment key.
-    let lock: Vec<String> = fg
-        .iter()
-        .filter(|(k, _)| dotted(k) == "policy.lock")
-        .filter_map(|(_, v)| v.as_array())
-        .flat_map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)))
-        .collect();
-    let is_locked = |key: &str| lock.iter().any(|l| l == key);
 
     let mut winners: BTreeMap<Vec<String>, Value> = BTreeMap::new();
     let mut provenance: BTreeMap<String, KeyProvenance> = BTreeMap::new();
-    let all_keys: std::collections::BTreeSet<Vec<String>> =
-        fg.keys().chain(fp.keys()).cloned().collect();
+    let all_keys: std::collections::BTreeSet<Vec<String>> = fg
+        .keys()
+        .chain(fc.keys())
+        .chain(fp.keys())
+        .cloned()
+        .collect();
 
     for key in all_keys {
         let key_dotted = dotted(&key);
-        let locked = is_locked(&key_dotted);
-        // Precedence: locked ⇒ global wins if present; else project > global.
-        let (val, source) = if locked {
-            if let Some(v) = fg.get(&key) {
-                (Some(v.clone()), KeySource::Global)
-            } else if let Some(v) = fp.get(&key) {
-                (Some(v.clone()), KeySource::Project)
-            } else {
-                (None, KeySource::Default)
-            }
-        } else if let Some(v) = fp.get(&key) {
-            (Some(v.clone()), KeySource::Project)
-        } else if let Some(v) = fg.get(&key) {
-            (Some(v.clone()), KeySource::Global)
+        // A customer lock only counts when the customer layer sets the key
+        // (a lock on a key it does not set "locks nothing" and is reported
+        // in `warnings`). A global lock is reported as before: listed => locked.
+        let locked_by = if g_locked(&key_dotted) {
+            Some(LockOwner::Global)
+        } else if c_locked(&key_dotted) && fc.contains_key(&key) {
+            Some(LockOwner::Customer)
         } else {
-            (None, KeySource::Default)
+            None
         };
-        if let Some(v) = val {
-            winners.insert(key, v);
-            provenance.insert(key_dotted, KeyProvenance { source, locked });
+        // A lock pins its owner's value when that layer sets the key;
+        // otherwise the key falls through to ordinary precedence
+        // (project > customer > global), exactly as a global lock on a key
+        // only the project set always did.
+        let pick = if g_locked(&key_dotted) && fg.contains_key(&key) {
+            Some((&fg, KeySource::Global))
+        } else if c_locked(&key_dotted) && fc.contains_key(&key) {
+            Some((&fc, KeySource::Customer))
+        } else if fp.contains_key(&key) {
+            Some((&fp, KeySource::Project))
+        } else if fc.contains_key(&key) {
+            Some((&fc, KeySource::Customer))
+        } else if fg.contains_key(&key) {
+            Some((&fg, KeySource::Global))
+        } else {
+            None
+        };
+        if let Some((layer, source)) = pick {
+            winners.insert(key.clone(), layer[&key].clone());
+            provenance.insert(
+                key_dotted,
+                KeyProvenance {
+                    source,
+                    locked: locked_by.is_some(),
+                    locked_by,
+                },
+            );
         }
     }
 
     let merged = unflatten(&winners)?;
-    let mut config: Config = merged.try_into().map_err(|source| LayerError::Layered {
-        global_path: global.map(|p| p.display().to_string()),
-        project_path: project.map(|p| p.display().to_string()),
-        source: Box::new(source),
-    })?;
+    let mut config: Config = merged
+        .try_into()
+        .map_err(|source| paths.layered_error(source))?;
 
-    // The `policy.lock` list is itself an unlocked key, so a project's
-    // `[policy].lock` would otherwise land in the resolved config and mislead
-    // consumers (e.g. the CP UI reading `config.policy.lock` for lock badges,
-    // or a project appearing to clear locks). Pin the resolved lock list to
-    // the GLOBAL-derived enforced list and mark its provenance Global so no
-    // consumer ever trusts a project-supplied lock list.
-    config.policy.lock = lock.clone();
+    // The `policy.lock` list is itself an unlocked key, so a lower layer's
+    // `[policy].lock` would otherwise land in the resolved config and
+    // mislead consumers (the CP reading `config.policy.lock` for lock
+    // badges, or a project appearing to clear locks). Pin it to the GLOBAL
+    // list; the customer's list is reported separately in `customer_lock`.
+    config.policy.lock = global_lock.clone();
     let policy_lock_key = vec!["policy".to_string(), "lock".to_string()];
-    if winners.contains_key(&policy_lock_key) || !lock.is_empty() {
+    if winners.contains_key(&policy_lock_key) || !global_lock.is_empty() {
+        let locked_by = g_locked("policy.lock").then_some(LockOwner::Global);
         provenance.insert(
             "policy.lock".to_string(),
             KeyProvenance {
                 source: KeySource::Global,
-                locked: is_locked("policy.lock"),
+                locked: locked_by.is_some(),
+                locked_by,
             },
         );
     }
 
     config.attach_provider_kinds();
     config.validate()?;
-    Ok(Resolved { config, provenance })
+    Ok(Resolved {
+        config,
+        provenance,
+        customer_lock,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -246,7 +302,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "default_model = \"global-m\"\n");
         let p = write_toml(d.path(), "p.toml", "default_model = \"project-m\"\n");
-        let r = resolve(Some(&g), Some(&p)).unwrap();
+        let r = resolve(LayerPaths::new(Some(&g), None, Some(&p))).unwrap();
         assert_eq!(r.config.default_model.as_deref(), Some("project-m"));
         let prov = r.provenance.get("default_model").unwrap();
         assert!(matches!(prov.source, KeySource::Project));
@@ -262,7 +318,7 @@ mod tests {
             "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
         );
         let p = write_toml(d.path(), "p.toml", "permission_mode = \"bypass\"\n");
-        let r = resolve(Some(&g), Some(&p)).unwrap();
+        let r = resolve(LayerPaths::new(Some(&g), None, Some(&p))).unwrap();
         // Locked: the global value wins over the project override.
         assert_eq!(r.config.permission_mode.as_deref(), Some("ask"));
         let prov = r.provenance.get("permission_mode").unwrap();
@@ -279,7 +335,7 @@ mod tests {
             "[autoflow]\nmax_active = 2\n[policy]\nlock = [\"autoflow.max_active\"]\n",
         );
         let p = write_toml(d.path(), "p.toml", "[autoflow]\nmax_active = 99\n");
-        let r = resolve(Some(&g), Some(&p)).unwrap();
+        let r = resolve(LayerPaths::new(Some(&g), None, Some(&p))).unwrap();
         assert_eq!(r.config.autoflow.max_active, Some(2));
         assert!(r.provenance.get("autoflow.max_active").unwrap().locked);
     }
@@ -291,7 +347,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "log_level = \"info\"\n");
         let p = write_toml(d.path(), "p.toml", "log_level = \"debug\"\n");
-        let r = resolve(Some(&g), Some(&p)).unwrap();
+        let r = resolve(LayerPaths::new(Some(&g), None, Some(&p))).unwrap();
         assert_eq!(r.config.log_level.as_deref(), Some("debug"));
         assert!(matches!(
             r.provenance.get("log_level").unwrap().source,
@@ -303,11 +359,11 @@ mod tests {
     fn cp_section_parses_and_defaults() {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "[cp]\nmax_workspace_bytes = 1048576\n");
-        let r = resolve(Some(&g), None).unwrap();
+        let r = resolve(LayerPaths::global_only(&g)).unwrap();
         assert_eq!(r.config.cp.max_workspace_bytes, Some(1_048_576));
         // absent ⇒ None
         let g2 = write_toml(d.path(), "g2.toml", "default_model = \"x\"\n");
-        let r2 = resolve(Some(&g2), None).unwrap();
+        let r2 = resolve(LayerPaths::global_only(&g2)).unwrap();
         assert_eq!(r2.config.cp.max_workspace_bytes, None);
     }
 
@@ -327,7 +383,8 @@ mod tests {
              output_per_mtok = 1.42\n\
              cached_input_per_mtok = 0.82\n",
         );
-        let r = resolve(Some(&g), None).expect("dotted model key must resolve, not error");
+        let r =
+            resolve(LayerPaths::global_only(&g)).expect("dotted model key must resolve, not error");
         let mp = r
             .config
             .pricing
@@ -355,7 +412,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "default_model = \"x\"\n");
         let p = write_toml(d.path(), "p.toml", "[default_model]\nk = \"y\"\n");
-        let r = resolve(Some(&g), Some(&p));
+        let r = resolve(LayerPaths::new(Some(&g), None, Some(&p)));
         assert!(r.is_err(), "expected Err, got {r:?}");
     }
 
@@ -373,7 +430,7 @@ mod tests {
             "p.toml",
             "permission_mode = \"bypass\"\n[policy]\nlock = []\n",
         );
-        let r = resolve(Some(&g), Some(&p)).unwrap();
+        let r = resolve(LayerPaths::new(Some(&g), None, Some(&p))).unwrap();
         // The resolved lock list reflects the GLOBAL list, not the project's.
         assert_eq!(r.config.policy.lock, vec!["permission_mode".to_string()]);
         // Provenance for policy.lock must be Global.
@@ -395,8 +452,10 @@ mod tests {
             "default_model = \"m\"\nlog_level = \"info\"\n",
         );
         let p = write_toml(d.path(), "p.toml", "log_level = \"debug\"\n");
-        let via_layer = crate::layer_files(Some(&g), Some(&p)).unwrap();
-        let via_resolve = resolve(Some(&g), Some(&p)).unwrap().config;
+        let via_layer = crate::layer_files(LayerPaths::new(Some(&g), None, Some(&p))).unwrap();
+        let via_resolve = resolve(LayerPaths::new(Some(&g), None, Some(&p)))
+            .unwrap()
+            .config;
         assert_eq!(via_layer, via_resolve);
     }
 }

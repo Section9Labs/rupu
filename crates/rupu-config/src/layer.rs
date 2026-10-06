@@ -1,7 +1,9 @@
-//! Global+project config layering.
+//! Global + customer + project config layering.
 //!
 //! Rules (locked by spec):
-//! - Project overrides global key-by-key (deep merge for tables).
+//! - Layer order (lowest first): global, customer, project. Only the
+//!   global layer's `[policy].lock` survives into the merged config.
+//! - A higher layer overrides a lower one key-by-key (deep merge for tables).
 //! - Arrays REPLACE — never concatenate. This is what allows users to
 //!   subtract entries by re-declaring the array in the project file.
 //! - Missing files are treated as empty config (not an error). This
@@ -26,9 +28,12 @@ pub enum LayerError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("layered config invalid (merging {global_path:?} + {project_path:?}): {source}")]
+    #[error(
+        "layered config invalid (merging {global_path:?} + {customer_path:?} + {project_path:?}): {source}"
+    )]
     Layered {
         global_path: Option<String>,
+        customer_path: Option<String>,
         project_path: Option<String>,
         #[source]
         source: Box<toml::de::Error>,
@@ -37,56 +42,109 @@ pub enum LayerError {
     Invalid(String),
 }
 
-/// Layer global and project config files into a single [`Config`].
-///
-/// Either argument may be `None` (file not present); the other layer is
-/// returned alone. If both are `None`, the default empty config is
-/// returned. Files that exist on disk but are unreadable produce
-/// [`LayerError::Io`]; files that parse-fail produce [`LayerError::Parse`].
+/// The config files one load layers, lowest first: global, customer,
+/// project. Any may be `None` (or name a missing file) — that layer is
+/// empty. Spec: `docs/superpowers/specs/2026-10-06-rupu-customers-design.md`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LayerPaths<'a> {
+    pub global: Option<&'a Path>,
+    pub customer: Option<&'a Path>,
+    pub project: Option<&'a Path>,
+}
+
+impl<'a> LayerPaths<'a> {
+    pub fn new(
+        global: Option<&'a Path>,
+        customer: Option<&'a Path>,
+        project: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            global,
+            customer,
+            project,
+        }
+    }
+
+    /// Just the global file — for loads that serve no project by design.
+    pub fn global_only(global: &'a Path) -> Self {
+        Self {
+            global: Some(global),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn layered_error(&self, source: toml::de::Error) -> LayerError {
+        let show = |p: Option<&Path>| p.map(|p| p.display().to_string());
+        LayerError::Layered {
+            global_path: show(self.global),
+            customer_path: show(self.customer),
+            project_path: show(self.project),
+            source: Box::new(source),
+        }
+    }
+}
+
+/// `[policy].lock` of one raw layer, as written.
+pub(crate) fn policy_lock_of(layer: Option<&Value>) -> Vec<String> {
+    layer
+        .and_then(|v| v.get("policy"))
+        .and_then(|p| p.get("lock"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Layer global, customer and project config files into a single
+/// [`Config`]: plain layering, no lock enforcement — correct for non-policy
+/// reads only (see [`layer_files_locked`]).
 ///
 /// Merge semantics:
 ///
 /// - **Tables** merge key-by-key recursively.
-/// - **Arrays** in `project` REPLACE arrays in `global` — they never
-///   concatenate. This is deliberate: concatenation makes it impossible
-///   for the project to subtract an entry from the global allow-list.
-/// - **Scalars** in `project` overwrite scalars in `global`.
-pub fn layer_files(global: Option<&Path>, project: Option<&Path>) -> Result<Config, LayerError> {
-    let global_v = read_optional_toml(global)?;
-    let project_v = read_optional_toml(project)?;
+/// - **Arrays** in a higher layer REPLACE arrays below it — they never
+///   concatenate, so a layer can subtract an entry from a lower allow-list.
+/// - **Scalars** in a higher layer overwrite lower ones.
+/// - `policy.lock` is pinned to the GLOBAL layer's list: a customer's or
+///   project's lock list never appears in the merged config.
+pub fn layer_files(paths: LayerPaths<'_>) -> Result<Config, LayerError> {
+    let g = read_optional_toml(paths.global)?;
+    let c = read_optional_toml(paths.customer)?;
+    let p = read_optional_toml(paths.project)?;
+    let global_lock = policy_lock_of(g.as_ref());
 
-    let merged = match (global_v, project_v) {
-        (Some(g), Some(p)) => deep_merge(g, p),
-        (Some(g), None) => g,
-        (None, Some(p)) => p,
-        (None, None) => Value::Table(toml::value::Table::new()),
-    };
+    let merged = [g, c, p]
+        .into_iter()
+        .flatten()
+        .reduce(deep_merge)
+        .unwrap_or_else(|| Value::Table(toml::value::Table::new()));
 
-    let mut cfg: Config = merged.try_into().map_err(|source| LayerError::Layered {
-        global_path: global.map(|p| p.display().to_string()),
-        project_path: project.map(|p| p.display().to_string()),
-        source: Box::new(source),
-    })?;
+    let mut cfg: Config = merged
+        .try_into()
+        .map_err(|source| paths.layered_error(source))?;
+    cfg.policy.lock = global_lock;
     cfg.attach_provider_kinds();
     cfg.validate()?;
     Ok(cfg)
 }
 
-/// Like [`layer_files`], but a key named in the **global** `[policy].lock`
-/// keeps its global value even when the project config sets it.
+/// Like [`layer_files`], but honouring `[policy].lock`: a key the GLOBAL
+/// lock names keeps its global value, and a key the CUSTOMER lock names
+/// keeps its customer value against the project.
 ///
-/// `layer_files` performs plain project-over-global layering and is correct
-/// for non-policy reads. Every path that honors operator policy must use
-/// this instead — see ISSUES.md I-7, where lock enforcement existed only
-/// inside `resolve()` (6 call sites, all in rupu-cp) while 43 CLI loads
-/// bypassed it and let a project config silently override a locked global
-/// key. This delegates entirely to `resolve()` for the actual lock
-/// precedence and dotted-key handling rather than reimplementing them.
-pub fn layer_files_locked(
-    global: Option<&Path>,
-    project: Option<&Path>,
-) -> Result<Config, LayerError> {
-    let resolved = crate::resolve::resolve(global, project)?;
+/// Every path that honors operator policy must use this — see ISSUES.md
+/// I-7. This delegates entirely to `resolve()` for lock precedence and
+/// dotted-key handling rather than reimplementing them, and logs
+/// `resolve`'s warnings (e.g. a customer lock naming a key the customer
+/// does not set).
+pub fn layer_files_locked(paths: LayerPaths<'_>) -> Result<Config, LayerError> {
+    let resolved = crate::resolve::resolve(paths)?;
+    for w in &resolved.warnings {
+        tracing::warn!("{w}");
+    }
     Ok(resolved.config)
 }
 
@@ -147,7 +205,7 @@ mod tests {
             "[providers.openai-oracle]\nkind = \"openai\"\n\n[providers.anthropic]\nmax_retries = 3\n",
         )
         .unwrap();
-        let cfg = layer_files(Some(&g), None).unwrap();
+        let cfg = layer_files(LayerPaths::global_only(&g)).unwrap();
         assert_eq!(
             cfg.pricing
                 .provider_kinds
