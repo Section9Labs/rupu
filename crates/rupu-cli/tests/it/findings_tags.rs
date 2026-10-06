@@ -163,6 +163,28 @@ fn an_unknown_id_fails_but_known_ones_are_tagged() {
 }
 
 #[test]
+fn the_partial_success_note_only_appears_when_something_changed() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_one(tmp.path());
+    // First call changes fnd_a, so the note is true.
+    let out = rupu(tmp.path())
+        .args(["findings", "tag", "fnd_a", "fnd_nope", "--add", "x"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("the other findings were changed"));
+    // Repeating it changes nothing, so the note must not claim otherwise.
+    let out = rupu(tmp.path())
+        .args(["findings", "tag", "fnd_a", "fnd_nope", "--add", "x"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("fnd_nope"), "{stderr}");
+    assert!(!stderr.contains("were changed"), "{stderr}");
+}
+
+#[test]
 fn one_call_tags_findings_in_two_workspaces() {
     let tmp = tempfile::tempdir().unwrap();
     let repo1 = seed_one(tmp.path());

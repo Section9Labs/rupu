@@ -450,7 +450,10 @@ fn tag_cmd(args: &TagArgs, json: bool) -> anyhow::Result<()> {
     if !failed.is_empty() {
         why.push(format!("nothing changed in {}", failed.join(", ")));
     }
-    let partial = result.workspaces.iter().any(|w| w.error.is_none());
+    let partial = result
+        .workspaces
+        .iter()
+        .any(|w| w.error.is_none() && w.outcomes.iter().any(|o| o.changed()));
     anyhow::bail!(
         "{}{}",
         why.join("; "),
