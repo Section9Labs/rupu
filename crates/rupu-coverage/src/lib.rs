@@ -66,6 +66,10 @@ pub use ledger::{
     query, query_input_schema, query_response, select, severity_rank, tags_in_use, FindingQuery,
     FindingRow, Page, QueryError, TagCount, TagMode, DEFAULT_LIMIT, MAX_LIMIT,
 };
+pub use ledger::{
+    field, parse_query, ErrorCode, FieldDef, FieldKind, Key, Op, ParseError as QueryParseError,
+    ParsedQuery, Term, FIELDS, SEVERITIES,
+};
 pub use report::{
     Classification, DisasmLine, EvidenceBlock, FindingProfile, FindingReport, FindingWriteOptions,
     Verification, VerificationStatus,
