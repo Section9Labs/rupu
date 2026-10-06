@@ -16,6 +16,7 @@ mod operator;
 mod proc;
 mod roster;
 mod run;
+mod status_tools;
 mod subprocess;
 mod supervisor;
 mod tools;
@@ -38,11 +39,12 @@ pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
 pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
 pub use operator::{OperatorMessage, OperatorQueue};
 pub use proc::{pid_is_running, terminate_pid};
-pub use roster::{roster_tools, RosterCtx};
+pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
+pub use status_tools::status_tools;
 pub use subprocess::SubprocessUnitLauncher;
 pub use supervisor::FleetSupervisor;
 pub use tools::{fleet_tools, FleetToolCtx};
