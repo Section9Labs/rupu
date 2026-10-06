@@ -8,6 +8,7 @@ pub mod codename;
 pub mod codename_legacy;
 pub mod codename_palette;
 pub mod config_write;
+pub mod customers;
 pub mod definition_generator;
 pub mod embed;
 pub mod error;
