@@ -11,6 +11,7 @@ narrative walkthroughs of the provider and SCM sections, see the linked docs abo
 ## Locations and layering
 
 - `~/.rupu/config.toml` — global config.
+- `~/.rupu/customers/<slug>/config.toml` — customer-specific config (see *Customer layer* below).
 - `<project>/.rupu/config.toml` — project-local overrides. Scalars and tables override the
   global value; arrays replace rather than merge.
 - Every section is `deny_unknown_fields`: an unrecognized key fails to parse. Three
@@ -18,6 +19,42 @@ narrative walkthroughs of the provider and SCM sections, see the linked docs abo
   as opaque no-op shims so an old config doesn't lose every other setting it carries.
 - All fields are optional. A missing value at one layer can be supplied by another;
   the actual defaults applied are documented per key below.
+
+### Customer layer
+
+A project can be assigned to a **customer** (`rupu customer assign <slug>`). The
+customer's layer, `~/.rupu/customers/<slug>/config.toml`, sits between the global
+file and the project's `.rupu/config.toml`:
+
+global lock › customer lock › project › customer › global › default
+
+- The project still wins on any key the customer has not locked.
+- A customer locks keys with its own `[policy].lock` — e.g. `["default_provider"]`
+  so a repo's committed config cannot move the customer's runs onto another account.
+  It cannot unlock a key the global `[policy].lock` names.
+- Arrays replace, as between global and project: a customer that declares
+  `[[scm.rules]]` replaces the global rules for its projects.
+- A run uses the customer of the nearest assigned ancestor of its working directory —
+  so subdirectories inherit their project's customer, and a repo needs no `.rupu/` of its own.
+- A project assigned to a customer that no longer exists, or a customer layer that
+  does not parse, fails the run — it never falls back to the global config.
+
+Typical customer layer:
+
+    default_provider = "anthropic-acme"
+
+    [providers.anthropic-acme]
+    kind = "anthropic"
+
+    [[scm.rules]]
+    owner = "acme-corp"
+    account = "github-acme"
+
+    [policy]
+    lock = ["default_provider"]
+
+Assign from the repo root: `rupu customer assign acme` (assigns the current directory).
+Log in each named account once: `rupu auth login --account anthropic-acme …`.
 
 ---
 
@@ -204,7 +241,7 @@ schema — passing reasoning tokens again here would double-bill them.
 
 | Key    | Type            | Default | Notes |
 |--------|-----------------|---------|-------|
-| `lock` | array\<string\> | `[]`    | Dotted config-key paths (e.g. `permission_mode`, `autoflow.max_active`) whose GLOBAL value overrides project + env at resolution. Only read from the global layer — a project cannot declare its own locks |
+| `lock` | array\<string\> | `[]`    | Dotted config-key paths (e.g. `permission_mode`, `autoflow.max_active`) whose GLOBAL value overrides project + env at resolution. A customer layer's `[policy].lock` locks keys against the project layer only (see *Customer layer*). A project cannot declare its own locks. |
 
 ---
 

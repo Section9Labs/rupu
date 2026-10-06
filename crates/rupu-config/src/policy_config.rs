@@ -2,10 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Global enforcement policy. Keys named here (dotted paths, e.g.
-/// `"permission_mode"`, `"autoflow.max_active"`) are LOCKED: their GLOBAL value
-/// overrides project + env at resolution. Only read from the global layer — a
-/// project cannot declare its own locks.
+/// Enforcement policy. Global `[policy].lock` keys override everything; a customer
+/// layer's `[policy].lock` locks keys against the project layer only. A project
+/// cannot declare its own locks. Keys are dotted paths (e.g. `"permission_mode"`)
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
