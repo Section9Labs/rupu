@@ -33,6 +33,7 @@ pub enum RunTriggerSource {
     EventDispatch,
     CronEvent,
     Autoflow,
+    Agentiflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

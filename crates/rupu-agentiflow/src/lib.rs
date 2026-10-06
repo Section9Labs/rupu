@@ -9,7 +9,9 @@ mod def;
 mod envelope;
 mod error;
 mod goal;
+mod lead;
 mod operator;
+mod run;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
@@ -23,4 +25,9 @@ pub use envelope::{
 };
 pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
+pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
 pub use operator::{OperatorMessage, OperatorQueue};
+pub use run::{
+    agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
+    RunAgentiflowOpts,
+};

@@ -39,16 +39,17 @@
 //! A goal or coverage evaluation that errors (unreadable ledger, a kind no
 //! active profile owns, ...) is reported as **not met**, never as met, so a
 //! broken evaluator can never falsely end the flow as a success. The error is
-//! logged and surfaced in the wind-down summary; the budget and ceilings still
-//! bound the flow. An operator-queue read failure is likewise logged and
-//! retried next round.
+//! logged, handed to the lead that round in [`Digest::warnings`], and surfaced
+//! in the wind-down summary; the budget and ceilings still bound the flow. An
+//! operator-queue read failure is likewise logged, warned, and retried next
+//! round.
 
 use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use rupu_coverage::{ActiveSet, CoveragePaths};
 
-use crate::budget::{BudgetEnforcer, BudgetStage, UsageSource};
+use crate::budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 use crate::coverage::{CoverageEvaluator, CoverageOutcome, CoverageTarget};
 use crate::def::Goal;
 use crate::goal::{GoalEvaluator, GoalOutcome};
@@ -70,6 +71,11 @@ pub struct Digest {
     pub converge: bool,
     /// Operator messages drained this round, oldest first.
     pub steering: Vec<OperatorMessage>,
+    /// Non-fatal problems found while assessing this round (a goal or coverage
+    /// evaluation error, an unreadable operator queue). Evaluation errors read
+    /// as "not met" in `goals` / `coverage`; this is how the lead learns *why*
+    /// rather than seeing only a bare unmet outcome.
+    pub warnings: Vec<String>,
 }
 
 /// The context handed to [`LeadDriver::run_round`].
@@ -126,7 +132,7 @@ impl fmt::Display for StopReason {
 }
 
 /// The envelope's configuration, distilled from the `AgentiflowDef` by the
-/// caller (the budget lives in the [`BudgetEnforcer`]).
+/// caller (the budget is passed to [`Envelope::new`] separately).
 #[derive(Debug, Clone)]
 pub struct EnvelopeConfig {
     pub goals: Vec<Goal>,
@@ -176,10 +182,14 @@ impl Envelope {
         paths: CoveragePaths,
         active: ActiveSet,
         cfg: EnvelopeConfig,
-        budget: BudgetEnforcer,
+        budget: Budget,
         operator: OperatorQueue,
         started: DateTime<Utc>,
     ) -> Self {
+        // One instant: the budget's wall-clock dimension and the envelope's
+        // wall-clock ceiling both measure from `started`, so a caller cannot
+        // hand them mismatched zeros.
+        let budget = BudgetEnforcer::new(budget, started);
         Self {
             paths,
             active,
@@ -225,6 +235,7 @@ impl Envelope {
                     budget: a.budget,
                     converge,
                     steering: a.steering,
+                    warnings: a.warnings,
                 },
             };
             if let RoundOutcome::Error(msg) = lead.run_round(&ctx) {
@@ -260,6 +271,7 @@ impl Envelope {
                     Ok(o) => o,
                     Err(e) => {
                         tracing::warn!(goal = %g.id, error = %e, "agentiflow goal evaluation failed");
+                        warnings.push(format!("goal `{}` evaluation error: {e}", g.id));
                         GoalOutcome {
                             id: g.id.clone(),
                             met: false,
@@ -385,7 +397,6 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::Budget;
     use crate::def::{AssetSelector, GoalTarget};
     use chrono::TimeZone;
     use rupu_coverage::{Asset, Coordinate, Locator};
@@ -531,7 +542,7 @@ mod tests {
             paths,
             active(),
             cfg,
-            BudgetEnforcer::new(budget, t0()),
+            budget,
             OperatorQueue::new(dir.path()),
             t0(),
         )
@@ -872,5 +883,72 @@ mod tests {
             "{}",
             out.summary
         );
+    }
+
+    #[test]
+    fn goal_evaluation_error_reaches_the_lead_as_a_digest_warning() {
+        // The evaluator errors (`not-a-rung`): the goal reads as unmet AND the
+        // lead is told this round, not just in the final summary.
+        let (dir, paths) = seed(&[host_asset("10.0.0.1", Some("exploited"))]);
+        let mut g = host_goal("g1", true);
+        g.target.depth_at_least = Some("not-a-rung".into());
+        let mut c = cfg(vec![g]);
+        c.ceiling_rounds = Some(2);
+        let mut env = envelope(&dir, paths, c, no_budget());
+        let mut lead = CapturingLead::default();
+        let out = env.run(&mut lead, &NO_SPEND, &fixed());
+        assert_eq!(lead.seen.len(), 2);
+        for ctx in &lead.seen {
+            assert!(!ctx.digest.warnings.is_empty(), "{:?}", ctx.digest);
+            assert!(
+                ctx.digest.warnings.iter().any(|w| w.contains("g1")),
+                "warning names the goal: {:?}",
+                ctx.digest.warnings
+            );
+        }
+        // Still surfaced in the wind-down summary.
+        assert!(out.summary.contains("Warning:"), "{}", out.summary);
+        assert!(out.summary.contains("g1"), "{}", out.summary);
+    }
+
+    #[test]
+    fn coverage_evaluation_error_reaches_the_lead_as_a_digest_warning() {
+        // An unreadable asset ledger (a directory where the file should be)
+        // makes the coverage evaluation error.
+        let (dir, paths) = seed(&[]);
+        std::fs::remove_file(&paths.assets).unwrap();
+        std::fs::create_dir(&paths.assets).unwrap();
+        let mut c = cfg(vec![]);
+        c.coverage = Some(CoverageTarget {
+            reach: 0.9,
+            depth: None,
+            kinds: None,
+        });
+        c.ceiling_rounds = Some(1);
+        let mut env = envelope(&dir, paths, c, no_budget());
+        let mut lead = CapturingLead::default();
+        env.run(&mut lead, &NO_SPEND, &fixed());
+        assert_eq!(lead.seen.len(), 1);
+        assert!(
+            lead.seen[0]
+                .digest
+                .warnings
+                .iter()
+                .any(|w| w.contains("coverage evaluation error")),
+            "{:?}",
+            lead.seen[0].digest.warnings
+        );
+    }
+
+    #[test]
+    fn digest_warnings_are_empty_when_every_evaluation_succeeds() {
+        let (dir, paths) = seed(&[]);
+        let mut c = cfg(vec![host_goal("g1", true)]);
+        c.ceiling_rounds = Some(1);
+        let mut env = envelope(&dir, paths, c, no_budget());
+        let mut lead = CapturingLead::default();
+        env.run(&mut lead, &NO_SPEND, &fixed());
+        assert_eq!(lead.seen.len(), 1);
+        assert!(lead.seen[0].digest.warnings.is_empty());
     }
 }
