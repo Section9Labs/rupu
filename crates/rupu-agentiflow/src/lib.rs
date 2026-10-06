@@ -14,6 +14,7 @@ mod goal;
 mod lead;
 mod operator;
 mod proc;
+mod roster;
 mod run;
 mod subprocess;
 mod supervisor;
@@ -37,6 +38,7 @@ pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
 pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
 pub use operator::{OperatorMessage, OperatorQueue};
 pub use proc::{pid_is_running, terminate_pid};
+pub use roster::{roster_tools, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,

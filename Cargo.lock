@@ -4507,6 +4507,7 @@ dependencies = [
  "rupu-agent",
  "rupu-coverage",
  "rupu-fleet",
+ "rupu-orchestrator",
  "rupu-providers",
  "rupu-runtime",
  "rupu-tools",
