@@ -30,12 +30,16 @@ global lock › customer lock › project › customer › global › default
 
 - The project still wins on any key the customer has not locked.
 - A customer locks keys with its own `[policy].lock` — e.g. `["default_provider"]`
-  so a repo's committed config cannot move the customer's runs onto another account.
-  It cannot unlock a key the global `[policy].lock` names.
+  so a repo's `.rupu/config.toml` cannot move the customer's runs onto another account.
+  A lock covers config keys only: an agent whose own frontmatter names `provider:` /
+  `auth:` still runs on that provider. It cannot unlock a key the global
+  `[policy].lock` names.
 - Arrays replace, as between global and project: a customer that declares
   `[[scm.rules]]` replaces the global rules for its projects.
 - A run uses the customer of the nearest assigned ancestor of its working directory —
   so subdirectories inherit their project's customer, and a repo needs no `.rupu/` of its own.
+  An autoflow run uses its repo's checkout (not its issue worktree), and `rupu workflow
+  resume` / `approve` reuse the directory the run was launched from.
 - A project assigned to a customer that no longer exists, or a customer layer that
   does not parse, fails the run — it never falls back to the global config.
 
