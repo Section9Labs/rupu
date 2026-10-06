@@ -26,7 +26,9 @@ Findings can then be queried and filtered by tag on every one of those surfaces.
 2. **How agents work on tagged items:** for now, through agent tools — `query_findings` and `tag_findings`, with MCP mirrors. A workflow `for_each` that fans out over a tag query is a follow-up plan, not part of this spec.
 3. **Vocabulary:** free-form and normalized, with no registry. A "tags in use" listing (with counts) supports autocomplete and lets agents reuse existing tags. `namespace:value` (e.g. `status:needs-poc`, `class:sqli`) is a convention only.
 4. **Identity:** tags belong to the finding id (`fnd_<ULID>`). A vulnerability reported again in a later run is a new finding with no tags. Carrying tags forward needs cross-run finding identity (fingerprinting), which is out of scope.
-5. **Storage:** an append-only tag-event log next to each ledger, folded on read. Finding lines are never rewritten for tags.
+5. **Storage:** one append-only tag-event log per workspace (`.rupu/coverage/finding_tags.jsonl`), folded on read. Finding lines are never rewritten for tags.
+
+   This was refined while planning. A per-target log can't work: a run stream labels each line with the writing agent's own scope, and the coordinator turns that scope back into a target id. So an event tagging a finding in *another* target would be filed under the wrong target and never applied. Finding ids are globally unique ULIDs, so a workspace-wide log needs no per-target routing.
 
 ## Tag syntax
 
@@ -55,7 +57,7 @@ pub tags: Vec<Tag>,
 
 ### The tag-event log
 
-`CoveragePaths` gets `finding_tags: root.join("finding_tags.jsonl")`, and the file holds one `TagEvent` per line:
+The log lives at `<workspace>/.rupu/coverage/finding_tags.jsonl`, one per workspace and shared by all of its targets. `discover_targets` lists directories only, so the file is never mistaken for a target. `TagLog` (workspace, log path, lock path, optional `RunStream`) addresses it, and `CoveragePaths::tag_log()` returns the workspace's log carrying that path's run stream. The file holds one `TagEvent` per line:
 
 ```json
 {"id":"tge_01J…","finding_id":"fnd_01J…","op":"add","tag":"needs-poc",
@@ -88,8 +90,10 @@ pub struct TagOutcome { pub finding_id: String, pub before: Vec<Tag>, pub after:
 
 `apply` does this in order:
 
-1. It takes `findings.jsonl.lock`, the same sidecar lock every findings append already takes in `append_record`. Tag writes and finding appends are therefore serialized with each other, and with `attach_reports`.
-2. It reads `findings.jsonl` and `finding_tags.jsonl` and folds them.
+1. It takes the tag log's own sidecar lock, `finding_tags.jsonl.lock`. This uses the same lock helper (and the same unlockable-filesystem fallback) as `findings.jsonl.lock`, so tag writers are serialized with each other.
+   - Findings are read *without* their lock. That's safe: the findings ledger is append-only and `attach_reports` swaps it by atomic rename, so a reader always sees a whole file, and a finding id never disappears.
+   - A workspace with no `.rupu/coverage/` directory has no findings. Every id is unknown there, and nothing (not even the lock file) is created.
+2. It reads every target's declared findings in the workspace plus `finding_tags.jsonl`, and folds them.
 3. It validates the whole batch before writing anything. The batch is rejected if:
    - any `finding_id` is unknown (`TagError::UnknownFindings(ids)`);
    - a tag appears in both `add` and `remove`;
@@ -100,27 +104,31 @@ pub struct TagOutcome { pub finding_id: String, pub before: Vec<Tag>, pub after:
 6. If `paths.run_stream` is set, it mirrors each event to the run's `coverage.jsonl` as a new `tags` line kind. This uses `stream_json`, the same path findings take.
 7. It returns before and after tags for each requested finding, including findings that didn't change.
 
-If locking is unsupported, it falls back the same way `append_record` does today.
+If locking is unsupported, it falls back the same way `append_record` does today. Finding lines are untouched.
 
-**Batches that span ledgers.** Findings live in per-target ledgers (`<workspace>/.rupu/coverage/<target_id>/`) across workspaces. When the CP or CLI change findings spread over several ledgers, they first find which ledger holds each id, then call `apply` once per ledger. Each ledger's batch is atomic; **the whole request is not**. Results are reported per ledger, and any id that no ledger holds is listed as `unknown`. The id-to-ledger lookup is one shared function, `ledger::locate_findings(roots, ids)`, used by both the CLI and the CP.
+**Batches that span workspaces.** When the CP or CLI change findings spread over several registered workspaces, they first find which workspace holds each id, then call `apply` once per workspace. Each workspace's batch is atomic; **the whole request is not**. Results are reported per workspace, and any id that no workspace holds is listed as `unknown`.
+
+That lookup is `rupu_cp::api::findings::tag_findings_across(global_dir, ids, add, remove, by)`. It sits next to `collect_all_findings` / `finding_ledgers`, which already own the registered-workspace walk; `rupu findings export|import` call it from there the same way. An id found in two distinct workspaces (a checkout registered twice under different paths) is tagged in both.
 
 ## Read path
 
-- `read_findings` (`ledger/views.rs`) returns records with **folded** `tags`. Every existing consumer therefore sees effective tags with no change of its own: the CP `FindingOut` DTO (which flattens `FindingRecord`), export, import and the new CLI list.
+- `read_findings` (`ledger/views.rs`) returns records with **folded** `tags` (via `read_declared_findings` + the workspace's log). `read_workspace_findings(workspace)` returns every target's findings in a workspace, folded once. Every existing consumer therefore sees effective tags with no change of its own: the CP `FindingOut` DTO (which flattens `FindingRecord`), export, import and the new CLI list.
 - `tag_history(paths, finding_id) -> Vec<TagEvent>` returns one finding's events in file order.
 - `tags_in_use(ledgers) -> Vec<(Tag, usize)>` returns each tag with the number of findings that currently carry it, sorted by count descending, then by tag.
-- `query(ledgers, &FindingQuery) -> Page<FindingRow>` is the one query implementation shared by the agent tool, MCP, CLI and CP:
+- `ledger::query` is the one filter, shared by the agent tool, MCP, CLI and CP. It has two entry points: `select(items, record_of, &FindingQuery)` returns every match unpaged (CLI, CP), and `query(records, &FindingQuery) -> Page` pages the matches (agent tool, MCP). The query fields:
   - `tags` + `tag_mode` (`all` by default, or `any`);
   - `untagged`, which can't be combined with `tags`;
   - `min_severity`, `concern_id`, `file_prefix`, `run_id`;
   - `limit` and `cursor`.
+  - `limit` and `cursor` apply to `query` only.
   - Results are ordered by severity, then `declared_at` descending, then id — the same order the CP list already uses.
   - The cursor is the last row's `(severity, declared_at, id)` key. Findings appended while someone is paging therefore never shift or repeat rows. Results are paged, never silently cut short.
 
 ## Remote units
 
 - `coverage.jsonl` gets a `tags` line kind, which carries one `TagEvent`.
-- `ledger::ingest::ingest_unit_stream` appends `tags` lines to the coordinator's `finding_tags.jsonl` for the matching scope. It takes the coordinator's findings lock and dedupes by event `id`, seeding the seen-set from the ids already on disk, the way findings are seeded today.
+- `ledger::ingest::ingest_unit_stream` appends `tags` lines to the coordinator workspace's `finding_tags.jsonl`, whatever their `scope_name`. It takes the tag log's lock and dedupes by event `id`, seeding the seen-set from the ids already on disk, the way findings are seeded today.
+- An *older* coordinator can't parse a `tags` line. It counts the line as malformed, so it doesn't strip the unit's `.rupu/coverage/` from the workspace-sync delta, and the delta carries the unit's tag log over. That's an acceptable degrade, and needs no version gate.
 - No finding lookup happens at ingest, because folding already ignores orphan events.
 - This needs no transport changes. Every connector already carries the coverage stream byte for byte.
 - `strip_delta_coverage` / `Delta::without_coverage` already strip all of `.rupu/coverage/`, which covers `finding_tags.jsonl`.
@@ -152,11 +160,12 @@ There are two new built-ins: `query_findings` and `tag_findings`. Like `report_f
 
 - `rupu findings list [--project P] [--run R] [--tag T]… [--any-tag] [--untagged] [--severity MIN] [--limit N] [--ids-only]`
   - Output is a table; the global `--format json` gives JSON rows.
+  - `--limit` truncates, and says so on stderr (`showing N of M`).
   - `--ids-only` prints one id per line.
   - Ledger discovery uses the same `--project` / `--run` resolution as `findings export`.
 - `rupu findings tag <ID>… [--add T]… [--remove T]…`
   - An `<ID>` of `-` reads ids from stdin, one per line, ignoring blank lines.
-  - It prints `id: before → after` for each finding, and exits non-zero if any id is unknown. Ledgers that succeeded keep their changes; this is stated in the output.
+  - It prints `id: before → after` for each finding, and exits non-zero if any id is unknown or any workspace failed. Workspaces that succeeded keep their changes; this is stated in the output.
   - Example: `rupu findings list --tag class:sqli --severity high --ids-only | rupu findings tag - --add needs-poc`.
 - `rupu findings tags [--project P] [--run R]` lists tags in use, with counts.
 
@@ -166,7 +175,7 @@ There are two new built-ins: `query_findings` and `tag_findings`. Like `report_f
 - `GET /api/findings/tags?ws_id=&run_id=` returns `[{tag, count}]`.
 - `POST /api/findings/tags`
   - Body: `{finding_ids, add, remove}`.
-  - Response: `{ledgers: [{ws_id, target_id, outcomes: [TagOutcome]}], unknown: [id]}`.
+  - Response: `tag_findings_across`'s result, `{workspaces: [{ws_id, outcomes: [TagOutcome]} | {ws_id, error}], unknown: [id]}`.
   - Status codes: 200 when at least one id was found; 404 when none were; 400 for invalid tags, add and remove of the same tag, an empty change, or a change over the cap.
   - It is a plain local append under the lock, with no runtime or worker involved. The CP already writes config and workflow YAML, and this follows the same pattern.
 - `GET /api/findings/:id` adds `tag_history: [TagEvent]`.
@@ -201,8 +210,8 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
   - `tag_findings` → `apply` round trip, with the agent's attribution.
   - The tools are registered only when listed in `tools:`.
   - The query tool pages with its cursor.
-- **`rupu-cp`:**
-  - Handler tests: the tag filter modes, tags-in-use counts, a bulk `POST` spanning two ledgers plus one unknown id, the 400 and 404 cases, and `tag_history` on the detail endpoint.
+- **`rupu-cp`** (Plan 2):
+  - Handler tests: the tag filter modes, tags-in-use counts, a bulk `POST` spanning two workspaces plus one unknown id, the 400 and 404 cases, and `tag_history` on the detail endpoint.
   - Vitest for the filter state and the bulk bar's request shape.
 - **`rupu-cli`:** `list` / `tag` / `tags` against a fixture workspace, including stdin `-` and the exit code for unknown ids. These tests touch no env or cwd, so they belong in the `it` binary.
 
@@ -215,6 +224,7 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
 
 1. **Plan 1: core, CLI, agent and MCP tools.**
    - `Tag`, the record field, the tag log, `apply`, fold, query, tags-in-use, the stream line kind, ingest.
+   - `rupu_cp::api::findings::tag_findings_across`, a library function the CLI uses; it gets no HTTP route until Plan 2.
    - The `report_finding` / `findings.record` `tags` input.
    - `query_findings` / `tag_findings` and their MCP mirrors.
    - `rupu findings list|tag|tags`.
