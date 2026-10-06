@@ -46,7 +46,8 @@ pub enum Ledger {
     Assets,
     /// The catalog snapshot (`catalog.yaml`); streamed, never appended.
     Catalog,
-    /// Finding-tag events (the workspace's `finding_tags.jsonl`), written only by `ledger::tags`.
+    /// Finding-tag events (the workspace's `finding_tags.jsonl`), written only
+    /// by `ledger::tags`.
     Tags,
 }
 
@@ -73,10 +74,7 @@ impl Ledger {
 #[serde(tag = "ledger", rename_all = "lowercase")]
 pub enum StreamLine {
     /// First line of every stream: proves the host streams at all.
-    Begin {
-        v: u32,
-        run_id: String,
-    },
+    Begin { v: u32, run_id: String },
     Runs {
         scope_name: String,
         record: RunManifest,

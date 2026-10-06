@@ -1,4 +1,5 @@
-//! `findings.record`, `findings.query`, `findings.tag` — the findings ledger from a workflow `action:` step.
+//! `findings.record`, `findings.query`, `findings.tag` — the findings ledger
+//! from a workflow `action:` step.
 //!
 //! The agent-side equivalent is the `report_finding` builtin
 //! (`rupu-agent/src/coverage_tools.rs`), which an agent reaches directly.

@@ -399,9 +399,9 @@ pub enum TagError {
 /// the log, fold, refuse the whole batch if any id is unknown or the change
 /// would take a finding past [`MAX_TAGS_PER_FINDING`] (a finding already
 /// over it, say after two remote units' events were ingested, can still be
-/// changed so long as its tag count does not grow), then append only the events that
-/// change something (so a repeated request writes nothing) in one write,
-/// fsynced, and mirror them to the log's run stream. Findings are read
+/// changed so long as its tag count does not grow), then append only the
+/// events that change something (so a repeated request writes nothing) in
+/// one write, fsynced, and mirror them to the log's run stream. Findings are read
 /// without their own lock: their ledger is append-only and an import swaps
 /// it by atomic rename, so a read always sees a whole file and an id never
 /// disappears. Outcomes are sorted by finding id.
