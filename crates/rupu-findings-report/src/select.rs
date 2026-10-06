@@ -5,6 +5,8 @@ use crate::number::rank;
 use rupu_coverage::{FindingProfile, Severity};
 use std::collections::HashSet;
 
+pub use rupu_coverage::report::cwe::{concern_cwe, parse_cwe};
+
 /// What to keep. Every field narrows the result; unset fields keep everything.
 #[derive(Debug, Clone, Default)]
 pub struct Selection {
@@ -27,42 +29,6 @@ pub struct Selection {
     /// Keep summary-profile findings. Off by default: a report is about the
     /// findings that carry a full write-up.
     pub include_summaries: bool,
-}
-
-/// The number of a requested CWE: `CWE-79`, `cwe-79`, `cwe_79`, `cwe79` or a
-/// bare `79` (surrounding whitespace ignored). `None` for anything else.
-pub fn parse_cwe(raw: &str) -> Option<u32> {
-    let s = raw.trim();
-    let digits = match s.get(..3) {
-        Some(p) if p.eq_ignore_ascii_case("cwe") => {
-            let rest = &s[3..];
-            rest.strip_prefix(['-', '_']).unwrap_or(rest)
-        }
-        _ => s,
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// The CWE number a `concern_id` names, by the web's rule (`lib/cwe.ts`
-/// `cweFromFinding`: the first `cwe[-_]?<digits>`, case-insensitive). The
-/// whole digit run is read, so `cwe-top25-2023:cwe-798-hardcoded-credentials`
-/// is 798 and never 79, and `cwe-79` / `cwe-79-xss` are 79.
-pub fn concern_cwe(concern_id: &str) -> Option<u32> {
-    let lower = concern_id.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(at) = lower[from..].find("cwe") {
-        let rest = &lower[from + at + 3..];
-        let rest = rest.strip_prefix(['-', '_']).unwrap_or(rest);
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 {
-            return rest[..digits].parse().ok();
-        }
-        from += at + 3;
-    }
-    None
 }
 
 /// Filter `numbered` (already numbered, so numbers stay stable whatever is
