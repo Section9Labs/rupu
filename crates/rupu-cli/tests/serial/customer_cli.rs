@@ -81,6 +81,10 @@ async fn set_archive_and_unarchive() {
         !ok(rupu(&["customer", "set", "acme", "--color", "red"]).await),
         "bad color refused"
     );
+    assert!(
+        !ok(rupu(&["customer", "set", "acme"]).await),
+        "set with no flags refused"
+    );
     assert!(ok(rupu(&["customer", "archive", "acme"]).await));
     let store = rupu_workspace::CustomerStore::new(home.path());
     let c = store.get("acme").unwrap();

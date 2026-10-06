@@ -152,6 +152,9 @@ fn handle_inner(action: Action, format: Option<OutputFormat>) -> anyhow::Result<
             contact,
             color,
         } => {
+            if name.is_none() && notes.is_none() && contact.is_none() && color.is_none() {
+                anyhow::bail!("nothing to change — pass --name/--notes/--contact/--color");
+            }
             store.update_meta(
                 &slug,
                 &MetaPatch {
@@ -161,17 +164,20 @@ fn handle_inner(action: Action, format: Option<OutputFormat>) -> anyhow::Result<
                     color,
                 },
             )?;
+            println!("updated customer {slug}");
             Ok(())
         }
         Action::Edit { slug, editor } => edit(&store, &slug, editor.as_deref()),
-        Action::Archive { slug } => store
-            .set_archived(&slug, true)
-            .map(|_| ())
-            .map_err(Into::into),
-        Action::Unarchive { slug } => store
-            .set_archived(&slug, false)
-            .map(|_| ())
-            .map_err(Into::into),
+        Action::Archive { slug } => {
+            store.set_archived(&slug, true)?;
+            println!("archived customer {slug}");
+            Ok(())
+        }
+        Action::Unarchive { slug } => {
+            store.set_archived(&slug, false)?;
+            println!("unarchived customer {slug}");
+            Ok(())
+        }
         Action::Delete { slug } => {
             store.delete(&slug)?;
             println!("deleted customer {slug}");
@@ -197,9 +203,16 @@ fn handle_inner(action: Action, format: Option<OutputFormat>) -> anyhow::Result<
 fn edit(store: &CustomerStore, slug: &str, editor: Option<&str>) -> anyhow::Result<()> {
     store.get(slug)?;
     let path = store.config_path(slug);
+    let global = paths::global_dir()?.join("config.toml");
     loop {
         crate::cmd::editor::open_for_edit(editor, &path)?;
-        match rupu_config::layer_files(rupu_config::LayerPaths::new(None, Some(&path), None)) {
+        // What a run loads, minus the project: `Config::validate` is
+        // cross-field, so the layer is checked on top of the global one.
+        match rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+            Some(&global),
+            Some(&path),
+            None,
+        )) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 eprintln!("{} is invalid: {e}", path.display());
@@ -255,35 +268,69 @@ fn show(store: &CustomerStore, slug: &str) -> anyhow::Result<()> {
     print_effective(&global, &layer)
 }
 
+/// One line of the effective-config table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveRow {
+    key: String,
+    value: String,
+    source: String,
+    locked_by: String,
+}
+
+/// Shown in place of a value that cannot be found under its provenance key.
+const UNRESOLVED: &str = "<unresolved>";
+
+/// A serde-lowercase enum (`KeySource`, `LockOwner`) as its wire string.
+fn wire_name<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| UNRESOLVED.to_string())
+}
+
 /// Effective config for a project of this customer that sets nothing
 /// itself: every key the global or customer layer sets, its value, where it
-/// came from, and who locks it.
-fn print_effective(global: &Path, layer: &Path) -> anyhow::Result<()> {
+/// came from, and who locks it; plus the resolver's warnings.
+fn effective_rows(global: &Path, layer: &Path) -> anyhow::Result<(Vec<EffectiveRow>, Vec<String>)> {
     let r = rupu_config::resolve(rupu_config::LayerPaths::new(
         Some(global),
         Some(layer),
         None,
     ))?;
     let flat = toml::Value::try_from(&r.config)?;
+    let rows = r
+        .provenance
+        .iter()
+        .map(|(key, prov)| EffectiveRow {
+            key: key.clone(),
+            value: lookup_dotted(&flat, key)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| UNRESOLVED.to_string()),
+            source: wire_name(&prov.source),
+            locked_by: prov
+                .locked_by
+                .as_ref()
+                .map(wire_name)
+                .unwrap_or_else(|| "-".into()),
+        })
+        .collect();
+    Ok((rows, r.warnings))
+}
+
+fn print_effective(global: &Path, layer: &Path) -> anyhow::Result<()> {
+    let (rows, warnings) = effective_rows(global, layer)?;
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["KEY", "VALUE", "SOURCE", "LOCKED BY"]);
-    for (key, prov) in &r.provenance {
-        let value = lookup_dotted(&flat, key)
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+    for r in &rows {
         table.add_row(vec![
-            Cell::new(key),
-            Cell::new(value),
-            Cell::new(format!("{:?}", prov.source).to_lowercase()),
-            Cell::new(
-                prov.locked_by
-                    .map(|o| format!("{o:?}").to_lowercase())
-                    .unwrap_or_else(|| "-".into()),
-            ),
+            Cell::new(&r.key),
+            Cell::new(&r.value),
+            Cell::new(&r.source),
+            Cell::new(&r.locked_by),
         ]);
     }
     println!("{table}");
-    for w in &r.warnings {
+    for w in &warnings {
         println!("warning: {w}");
     }
     Ok(())
@@ -385,4 +432,66 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         _ => ("customer", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn effective_rows_show_value_source_and_lock_with_a_dotted_model_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = write(tmp.path(), "global.toml", "default_model = \"g\"\n");
+        let layer = write(
+            tmp.path(),
+            "customer.toml",
+            r#"
+[pricing.oracle."GLM-5.2-FP8"]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+
+[policy]
+lock = ['pricing.oracle."GLM-5.2-FP8".input_per_mtok']
+"#,
+        );
+        let (rows, _warnings) = effective_rows(&global, &layer).unwrap();
+        let row = |key: &str| {
+            rows.iter()
+                .find(|r| r.key == key)
+                .unwrap_or_else(|| panic!("no row for {key}: {rows:?}"))
+                .clone()
+        };
+
+        let glm = row(r#"pricing.oracle."GLM-5.2-FP8".input_per_mtok"#);
+        assert_eq!(glm.value, "1.0");
+        assert_eq!(glm.source, "customer");
+        assert_eq!(glm.locked_by, "customer");
+
+        let model = row("default_model");
+        assert_eq!(model.value, "\"g\"");
+        assert_eq!(model.source, "global");
+        assert_eq!(model.locked_by, "-");
+
+        assert!(rows.iter().all(|r| r.value != UNRESOLVED), "{rows:?}");
+    }
+
+    #[test]
+    fn lookup_dotted_is_none_for_a_malformed_or_missing_key() {
+        let v: toml::Value = toml::from_str("a = 1\n[b]\nc = 2\n").unwrap();
+        assert_eq!(
+            lookup_dotted(&v, "b.c").and_then(|v| v.as_integer()),
+            Some(2)
+        );
+        assert!(lookup_dotted(&v, "b.missing").is_none());
+        assert!(
+            lookup_dotted(&v, "b.\"unterminated").is_none(),
+            "decode error"
+        );
+    }
 }
