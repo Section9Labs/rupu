@@ -67,6 +67,8 @@ rupu-cp = { path = "../rupu-cp", default-features = false }
 rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-coverage = { path = "../rupu-coverage" }
+rupu-agentiflow = { workspace = true }
+rupu-fleet = { workspace = true }
 rupu-codename = { workspace = true }
 rupu-update = { path = "../rupu-update" }
 comfy-table.workspace = true

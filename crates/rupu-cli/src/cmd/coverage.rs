@@ -1236,6 +1236,8 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         continue_from: None,
         model: None,
         provider: None,
+        fleet_run_dir: None,
+        fleet_participant: None,
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),
