@@ -846,14 +846,39 @@ mod tests {
         }
     }
 
-    /// Wait for a process to be gone. A killed grandchild is re-parented to
-    /// init, which reaps it a moment later, so a brief zombie window is normal.
+    /// Wait for a grandchild to be gone. A killed grandchild is re-parented to
+    /// init, which normally reaps it a moment later — but not when PID 1 never
+    /// reaps: in CI's `docker run … cargo test` container, `cargo` is PID 1 and
+    /// the killed grandchild stays a zombie for good. A zombie has exited, so
+    /// it counts as gone here. (Leaders are this process's own children; the
+    /// tests assert those are reaped, not merely dead, and keep doing so.)
     fn wait_gone(pid: u32, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while pid_is_running(pid) {
+        while pid_is_running(pid) && !is_zombie(pid) {
             assert!(Instant::now() < deadline, "{what} (pid {pid}) survived");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Whether `pid` has exited but not been reaped (`/proc/<pid>/stat` state
+    /// `Z`, or `X` while it is being torn down). The state follows the
+    /// parenthesised command name, which may itself contain `)`.
+    #[cfg(target_os = "linux")]
+    fn is_zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.trim_start().chars().next()
+            })
+            .is_some_and(|state| state == 'Z' || state == 'X')
+    }
+
+    /// Off Linux the tests run under a reaping init (launchd), so a killed
+    /// grandchild's zombie window is brief and waiting it out is enough.
+    #[cfg(not(target_os = "linux"))]
+    fn is_zombie(_pid: u32) -> bool {
+        false
     }
 
     /// A launcher whose unit is `sh -c 'sleep 30 & echo $! > <file>; wait'`: a
