@@ -597,6 +597,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     project: roster_ctx.project.clone(),
                     pool_workflows: pool_workflows.clone(),
                 },
+                run_dir.clone(),
+                None,
             ));
 
             // Roster awareness + steering. The roster tools read the agent and

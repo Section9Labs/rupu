@@ -219,6 +219,22 @@ fn quote(s: &str) -> String {
 /// `Clone`, so a persistent driver needs a factory rather than one instance.
 pub type ProviderFactory = Box<dyn FnMut() -> Box<dyn LlmProvider> + Send>;
 
+/// Mints a provider for each `generate_workflow` call. Unlike
+/// [`ProviderFactory`] it is shared (`Arc`, `Fn`) because the tool holding it
+/// is invoked through `&self` and may be called many times in one run.
+pub type GenerationProviderFactory = Arc<dyn Fn() -> Box<dyn LlmProvider> + Send + Sync>;
+
+/// How the lead authors new workflows: the provider/model to generate
+/// with and a factory that mints a provider for each generation call.
+/// Built by the launch site exactly like `make_provider` (wired for real in
+/// Plan 4); when absent, the lead is not offered `generate_workflow`.
+#[derive(Clone)]
+pub struct GenerationCapability {
+    pub provider: String,
+    pub model: String,
+    pub factory: GenerationProviderFactory,
+}
+
 /// Static configuration for a [`RunAgentLeadDriver`].
 pub struct LeadConfig {
     pub agent_name: String,

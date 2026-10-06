@@ -13,6 +13,10 @@
 //! * `run_workflow { workflow, inputs? }` starts a pool WORKFLOW as a unit (its
 //!   own `rupu workflow run` process), after five fail-closed checks that all
 //!   run before anything is spawned (see [`RunWorkflowTool`]).
+//! * `generate_workflow { description, inputs? }` (offered only when the run has
+//!   a [`GenerationCapability`]) authors a NEW workflow with the lead's own
+//!   provider, vets it fail-closed against the pool, writes it under the run
+//!   dir and starts it as a unit (see [`GenerateWorkflowTool`]).
 //! * `join { handle, timeout_secs? }` blocks (real sleeps) until the unit is
 //!   terminal or the timeout elapses, so it runs on the blocking pool rather
 //!   than on the executor thread driving the lead's turn.
@@ -29,9 +33,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rupu_orchestrator::generate::{generate_definition_with_provider, GenKind, GenerateRequest};
+use rupu_orchestrator::Workflow;
 use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
+use crate::lead::GenerationCapability;
 use crate::supervisor::FleetSupervisor;
 use crate::unit::{UnitKind, UnitSpec, UnitStatus};
 
@@ -116,16 +123,21 @@ pub struct WorkflowToolCtx {
     pub pool_workflows: Vec<String>,
 }
 
-/// The lead's `dispatch`, `join` and `run_workflow` tools (the lead is depth 0).
+/// The lead's `dispatch`, `join` and `run_workflow` tools (the lead is depth 0),
+/// plus `generate_workflow` when `generation` is given.
 ///
-/// The three share ONE participant counter: an agent and a workflow with the
+/// All of them share ONE participant counter: an agent and a workflow with the
 /// same name must never mint the same `<name>#<n>`, because the supervisor
-/// registers a broadcast cursor per participant.
+/// registers a broadcast cursor per participant. `run_dir` is where
+/// `generate_workflow` materializes the workflows it authors
+/// (`<run_dir>/generated/`).
 pub fn fleet_unit_tools(
     sup: Arc<FleetSupervisor>,
     pool: Arc<Vec<String>>,
     engagement: Vec<String>,
     workflows: WorkflowToolCtx,
+    run_dir: PathBuf,
+    generation: Option<GenerationCapability>,
 ) -> Vec<Arc<dyn Tool>> {
     let ctx = Arc::new(DispatchCtx {
         sup,
@@ -134,11 +146,18 @@ pub fn fleet_unit_tools(
         depth: 0,
         next: AtomicU32::new(0),
     });
-    vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(DispatchTool(ctx.clone())),
         Arc::new(JoinTool(ctx.clone())),
-        Arc::new(RunWorkflowTool { ctx, wf: workflows }),
-    ]
+        Arc::new(RunWorkflowTool {
+            ctx: ctx.clone(),
+            wf: workflows,
+        }),
+    ];
+    if let Some(gen) = generation {
+        tools.push(Arc::new(GenerateWorkflowTool { ctx, gen, run_dir }));
+    }
+    tools
 }
 
 // ---- output / argument helpers ---------------------------------------------
@@ -400,6 +419,182 @@ impl Tool for RunWorkflowTool {
         Ok(match c.sup.dispatch(spec) {
             Ok(handle) => done(json!({ "handle": handle, "participant": participant }).to_string()),
             Err(e) => failed(format!("run_workflow failed: {e}")),
+        })
+    }
+}
+
+// ---- generate_workflow ---------------------------------------------------------
+
+/// Appended to the lead's description so the generator knows the workflow will
+/// run unattended in one local process.
+const GENERATE_CONSTRAINT: &str = "\n\nConstraints: the workflow runs unattended as a single \
+local process. Do NOT use approval gates (`approval:`), `host:`, or `distribute:`.";
+
+/// `generate_workflow { description, inputs? }` -> `{ "handle": .., "participant": ..,
+/// "generated_file": .. }`.
+///
+/// Authors a NEW workflow with the lead's own provider (the
+/// [`GenerationCapability`]), then runs it as a process-isolated unit
+/// (`rupu workflow run --file`). A generated workflow is model output, so it
+/// gets the same fail-closed vetting `run_workflow` gives a catalog workflow,
+/// in this order, all before anything is written or spawned (a failure is a
+/// `ToolOutput.error` the lead can react to):
+///
+/// 1. the dispatch depth is below [`MAX_DEPTH`];
+/// 2. the generator produced a workflow that parses (it repairs a few times);
+/// 3. it has no approval gate and no host / distribute placement;
+/// 4. every agent it dispatches is in the flow's pool;
+/// 5. its `inputs:` resolve against the supplied `inputs`.
+///
+/// Only then is the generator's exact text written to
+/// `<run_dir>/generated/<name>-<ulid>.yaml` and handed to the supervisor.
+struct GenerateWorkflowTool {
+    ctx: Arc<DispatchCtx>,
+    gen: GenerationCapability,
+    run_dir: PathBuf,
+}
+
+/// A filename-safe form of a workflow name: lowercase ASCII alphanumerics, with
+/// every other run of characters collapsed to one `-`. Never empty.
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out: String = out.trim_matches('-').chars().take(48).collect();
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "workflow".to_string()
+    } else {
+        out
+    }
+}
+
+#[async_trait]
+impl Tool for GenerateWorkflowTool {
+    fn name(&self) -> &'static str {
+        "generate_workflow"
+    }
+
+    fn description(&self) -> &'static str {
+        "Author a NEW workflow for a described task and run it as an independent \
+         unit, in its own process. Returns a handle immediately without waiting; \
+         pass it to `join` to wait for the workflow's result. The workflow may \
+         only dispatch agents in this flow's pool; it runs unattended (no approval \
+         gates, no remote placement)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["description"],
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "What the workflow should do, in plain language"
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "Values for any inputs the generated workflow declares, as name: value pairs",
+                    "additionalProperties": { "type": ["string", "number", "boolean"] }
+                }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let description = req_str(&input, "description")?;
+        let inputs = match workflow_inputs(&input) {
+            Ok(m) => m,
+            Err(e) => return Err(ToolError::InvalidInput(e)),
+        };
+        let c = &self.ctx;
+
+        // 1. Depth guard, before any model call is paid for.
+        if c.depth >= MAX_DEPTH {
+            return Ok(failed(format!(
+                "generate_workflow refused: maximum dispatch depth ({MAX_DEPTH}) reached"
+            )));
+        }
+
+        // 2. Generate. The pool is handed over so the model names real agents;
+        //    it is only a hint -- check 4 is the enforcement.
+        let req = GenerateRequest {
+            kind: GenKind::Workflow,
+            description: format!("{description}{GENERATE_CONSTRAINT}"),
+            provider: self.gen.provider.clone(),
+            model: self.gen.model.clone(),
+            available_agents: (*c.pool).clone(),
+        };
+        let mut provider = (self.gen.factory)();
+        let outcome = match generate_definition_with_provider(&req, provider.as_mut()).await {
+            Ok(o) => o,
+            Err(e) => return Ok(failed(format!("workflow generation failed: {e}"))),
+        };
+        // Belt and braces: the generator already validated by parsing.
+        let wf = match Workflow::parse(&outcome.content) {
+            Ok(w) => w,
+            Err(e) => return Ok(failed(format!("generated workflow did not parse: {e}"))),
+        };
+
+        // 3. No operator-in-the-loop and no remote placement in v1.
+        if wf.has_approval_gate() || wf.has_placed_step() {
+            return Ok(failed(
+                "generated workflow cannot run as a unit: it uses an approval gate or \
+                 host/distribute placement",
+            ));
+        }
+
+        // 4. A workflow may only dispatch agents the flow's pool names.
+        let pool: BTreeSet<String> = c.pool.iter().cloned().collect();
+        let missing: Vec<String> = wf.dispatched_agents().difference(&pool).cloned().collect();
+        if !missing.is_empty() {
+            return Ok(failed(format!(
+                "generated workflow dispatches agents not in this flow's pool: {missing:?}"
+            )));
+        }
+
+        // 5. Its inputs must resolve -- the spawned process's stderr is nulled.
+        if let Err(e) = rupu_orchestrator::runner::resolve_inputs(&wf, &inputs) {
+            return Ok(failed(format!(
+                "generated workflow inputs did not resolve: {e}"
+            )));
+        }
+
+        // Materialize the EXACT text that was validated, under the run dir.
+        let dir = self.run_dir.join("generated");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Ok(failed(format!("could not create generated/ dir: {e}")));
+        }
+        let path = dir.join(format!("{}-{}.yaml", slug(&wf.name), ulid::Ulid::new()));
+        if let Err(e) = std::fs::write(&path, &outcome.content) {
+            return Ok(failed(format!("could not write generated workflow: {e}")));
+        }
+
+        let spec = UnitSpec {
+            agent: wf.name.clone(),
+            prompt: String::new(),
+            engagement: c.engagement.clone(),
+            participant: c.mint_participant(&wf.name),
+            kind: UnitKind::Workflow,
+            inputs: inputs.into_iter().collect(),
+            workflow_file: Some(path.clone()),
+        };
+        let participant = spec.participant.clone();
+        Ok(match c.sup.dispatch(spec) {
+            Ok(handle) => done(
+                json!({
+                    "handle": handle,
+                    "participant": participant,
+                    "generated_file": path.display().to_string(),
+                })
+                .to_string(),
+            ),
+            Err(e) => failed(format!("generated workflow failed to start: {e}")),
         })
     }
 }
@@ -738,7 +933,12 @@ mod tests {
                 project: None,
                 pool_workflows: pool_workflows.iter().map(|s| s.to_string()).collect(),
             },
+            dir.join("run"),
+            None,
         );
+        // No generation capability: `generate_workflow` is not mounted, so the
+        // pops below still land on run_workflow / join / dispatch.
+        assert_eq!(v.len(), 3);
         let run_workflow = v.pop().unwrap();
         let _join = v.pop().unwrap();
         let dispatch = v.pop().unwrap();
@@ -773,6 +973,8 @@ mod tests {
                 project: None,
                 pool_workflows: vec![],
             },
+            dir.path().join("run"),
+            None,
         );
         let names: Vec<_> = v.iter().map(|t| t.name()).collect();
         assert_eq!(names, ["dispatch", "join", "run_workflow"]);
@@ -1035,5 +1237,308 @@ mod tests {
             );
         }
         assert!(launcher.spawned().is_empty());
+    }
+
+    // ---- generate_workflow ---------------------------------------------------
+
+    use crate::lead::{GenerationCapability, GenerationProviderFactory};
+    use rupu_agent::{MockProvider, ScriptedTurn};
+
+    fn text_turn(text: &str) -> ScriptedTurn {
+        ScriptedTurn::AssistantText {
+            text: text.into(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }
+    }
+
+    /// A capability whose every generation call gets a fresh `MockProvider`
+    /// playing `turns`, and a counter of how many providers were minted.
+    fn scripted_generation(
+        turns: Vec<ScriptedTurn>,
+    ) -> (GenerationCapability, Arc<std::sync::atomic::AtomicUsize>) {
+        let minted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = minted.clone();
+        let factory: GenerationProviderFactory = Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Box::new(MockProvider::new(turns.clone())) as Box<dyn rupu_providers::LlmProvider>
+        });
+        (
+            GenerationCapability {
+                provider: "mock".into(),
+                model: "mock-1".into(),
+                factory,
+            },
+            minted,
+        )
+    }
+
+    /// The unit tools over a pool of exactly `writer`, engagement `network`, with
+    /// generation scripted to `turns`. Returns `(dispatch, generate_workflow,
+    /// run_dir)`; the tool order is dispatch, join, run_workflow, generate_workflow.
+    fn gen_tools(
+        launcher: Arc<MockUnitLauncher>,
+        dir: &std::path::Path,
+        turns: Vec<ScriptedTurn>,
+    ) -> (Arc<dyn Tool>, Arc<dyn Tool>, PathBuf) {
+        let run_dir = dir.join("run");
+        let sup = Arc::new(FleetSupervisor::new(launcher, run_dir.clone()));
+        let (gen, _) = scripted_generation(turns);
+        let mut v = fleet_unit_tools(
+            sup,
+            Arc::new(vec!["writer".to_string()]),
+            vec!["network".to_string()],
+            WorkflowToolCtx {
+                global: dir.join("global"),
+                project: None,
+                pool_workflows: vec![],
+            },
+            run_dir.clone(),
+            Some(gen),
+        );
+        assert_eq!(
+            v.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            ["dispatch", "join", "run_workflow", "generate_workflow"]
+        );
+        let generate = v.pop().unwrap();
+        let _run_workflow = v.pop().unwrap();
+        let _join = v.pop().unwrap();
+        let dispatch = v.pop().unwrap();
+        (dispatch, generate, run_dir)
+    }
+
+    /// Invoke `generate_workflow`, assert it refused with `needle`, and that
+    /// nothing was spawned and no `generated/` dir (hence no file) was created.
+    async fn assert_gen_refused(
+        launcher: &MockUnitLauncher,
+        tool: &Arc<dyn Tool>,
+        run_dir: &std::path::Path,
+        input: Value,
+        needle: &str,
+    ) {
+        let out = tool.invoke(input, &ToolContext::default()).await.unwrap();
+        let err = out.error.expect("refused");
+        assert!(err.contains(needle), "{err}");
+        assert!(out.stdout.is_empty());
+        assert!(launcher.spawned().is_empty(), "nothing was spawned");
+        assert!(
+            !run_dir.join("generated").exists(),
+            "no generated file is left behind"
+        );
+    }
+
+    const GEN_WF: &str =
+        "name: fresh-sweep\nsteps:\n  - id: only\n    agent: writer\n    prompt: hi\n";
+
+    #[tokio::test]
+    async fn generate_workflow_dispatches_a_file_backed_unit_with_engagement() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let (d, g, run_dir) = gen_tools(launcher.clone(), dir.path(), vec![text_turn(GEN_WF)]);
+        let ctx = ToolContext::default();
+
+        // A prior dispatch takes `writer#1`, so the generated unit must not reuse it.
+        let first = d
+            .invoke(json!({ "agent": "writer", "prompt": "go" }), &ctx)
+            .await
+            .unwrap();
+        assert!(first.error.is_none(), "{:?}", first.error);
+
+        let out = g
+            .invoke(json!({ "description": "sweep the hosts" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert!(v["handle"].as_str().unwrap().starts_with("run_"), "{v}");
+        assert_eq!(v["participant"], "fresh-sweep#2");
+
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 2, "the dispatch and the generated unit");
+        let unit = &spawned[1];
+        assert_eq!(unit.kind, UnitKind::Workflow);
+        assert_eq!(unit.agent, "fresh-sweep");
+        assert_eq!(unit.prompt, "");
+        assert_eq!(unit.engagement, ["network"]);
+        assert_eq!(unit.participant, "fresh-sweep#2");
+        assert_ne!(unit.participant, spawned[0].participant);
+
+        let file = unit.workflow_file.clone().expect("file-backed unit");
+        assert_eq!(file.parent().unwrap(), run_dir.join("generated"));
+        assert!(
+            file.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("fresh-sweep-"),
+            "{file:?}"
+        );
+        assert_eq!(file.extension().unwrap(), "yaml");
+        assert_eq!(v["generated_file"], file.display().to_string());
+        // The file is the validated text, verbatim, and parses.
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().trim(),
+            GEN_WF.trim()
+        );
+        let wf = Workflow::parse_file(&file).expect("the materialized file parses");
+        assert_eq!(wf.name, "fresh-sweep");
+    }
+
+    #[tokio::test]
+    async fn generate_workflow_passes_resolved_inputs_to_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let wf = "name: typed-gen\n\
+                  inputs:\n  topic: { type: string, required: true }\n\
+                  steps:\n  - id: s\n    agent: writer\n    prompt: \"{{ inputs.topic }}\"\n";
+        let (_, g, run_dir) = gen_tools(launcher.clone(), dir.path(), vec![text_turn(wf)]);
+
+        // A required input that is not supplied is refused before anything is written.
+        assert_gen_refused(
+            &launcher,
+            &g,
+            &run_dir,
+            json!({ "description": "x" }),
+            "input `topic` is required",
+        )
+        .await;
+
+        let out = g
+            .invoke(
+                json!({ "description": "x", "inputs": { "topic": "ssh" } }),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(
+            spawned[0].inputs,
+            [("topic".to_string(), "ssh".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_workflow_refuses_out_of_pool_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        // `writer` is in the pool; `haxor` is not.
+        let wf = "name: wide\nsteps:\n  - id: a\n    agent: writer\n    prompt: x\n  \
+                  - id: b\n    agent: haxor\n    prompt: y\n";
+        let (_, g, run_dir) = gen_tools(launcher.clone(), dir.path(), vec![text_turn(wf)]);
+        assert_gen_refused(
+            &launcher,
+            &g,
+            &run_dir,
+            json!({ "description": "x" }),
+            "haxor",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn generate_workflow_refuses_gated_or_placed_workflow() {
+        for wf in [
+            // A standalone gate node.
+            "name: gated\nsteps:\n  - id: g\n    approval:\n      required: true\n",
+            // An inline approval on an agent step.
+            "name: ig\nsteps:\n  - id: s\n    agent: writer\n    prompt: hi\n    approval:\n      required: true\n",
+            // A step placed on another host.
+            "name: placed\nsteps:\n  - id: s\n    agent: writer\n    prompt: hi\n    host: worker-1\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+            let (_, g, run_dir) = gen_tools(launcher.clone(), dir.path(), vec![text_turn(wf)]);
+            assert_gen_refused(
+                &launcher,
+                &g,
+                &run_dir,
+                json!({ "description": "x" }),
+                "cannot run as a unit: it uses an approval gate or host/distribute placement",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_workflow_surfaces_generator_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        // Unparseable on every attempt: the generator exhausts its repairs.
+        let junk = vec![
+            text_turn("name: [not a workflow"),
+            text_turn("name: [still not"),
+            text_turn("steps: nope"),
+        ];
+        let (_, g, run_dir) = gen_tools(launcher.clone(), dir.path(), junk);
+        let out = g
+            .invoke(json!({ "description": "x" }), &ToolContext::default())
+            .await
+            .unwrap();
+        let err = out.error.expect("generation failed");
+        assert!(err.contains("workflow generation failed"), "{err}");
+        assert!(err.contains("did not parse"), "{err}");
+        assert!(out.stdout.is_empty());
+        assert!(launcher.spawned().is_empty(), "nothing was spawned");
+        assert!(!run_dir.join("generated").exists());
+    }
+
+    #[tokio::test]
+    async fn generate_workflow_refuses_at_max_depth_before_calling_the_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let run_dir = dir.path().join("run");
+        let sup = Arc::new(FleetSupervisor::new(launcher.clone(), run_dir.clone()));
+        let (gen, minted) = scripted_generation(vec![text_turn(GEN_WF)]);
+        let tool = GenerateWorkflowTool {
+            ctx: Arc::new(DispatchCtx {
+                sup,
+                pool: Arc::new(vec!["writer".to_string()]),
+                engagement: vec![],
+                depth: MAX_DEPTH,
+                next: AtomicU32::new(0),
+            }),
+            gen,
+            run_dir: run_dir.clone(),
+        };
+        let out = tool
+            .invoke(json!({ "description": "x" }), &ToolContext::default())
+            .await
+            .unwrap();
+        assert!(out.error.unwrap().contains("depth"));
+        assert_eq!(minted.load(Ordering::Relaxed), 0, "no provider was minted");
+        assert!(launcher.spawned().is_empty());
+        assert!(!run_dir.join("generated").exists());
+    }
+
+    #[tokio::test]
+    async fn generate_workflow_malformed_arguments_are_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![]));
+        let (_, g, run_dir) = gen_tools(launcher.clone(), dir.path(), vec![text_turn(GEN_WF)]);
+        let ctx = ToolContext::default();
+        for bad in [
+            json!({}),
+            json!({ "description": " " }),
+            json!({ "description": "x", "inputs": "topic=x" }),
+            json!({ "description": "x", "inputs": { "k": ["a"] } }),
+        ] {
+            assert!(
+                matches!(g.invoke(bad, &ctx).await, Err(ToolError::InvalidInput(_))),
+                "generate_workflow needs a description and an object of scalar inputs"
+            );
+        }
+        assert!(launcher.spawned().is_empty());
+        assert!(!run_dir.join("generated").exists());
+    }
+
+    #[test]
+    fn slug_is_filename_safe_and_never_empty() {
+        assert_eq!(slug("Fresh Sweep!"), "fresh-sweep");
+        assert_eq!(slug("../../etc/passwd"), "etc-passwd");
+        assert_eq!(slug("  --  "), "workflow");
+        assert_eq!(slug(""), "workflow");
+        assert!(slug(&"a".repeat(200)).len() <= 48);
     }
 }
