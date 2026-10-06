@@ -328,6 +328,10 @@ async fn workflow_run_takes_the_customer_default_provider() {
         run_start.contains("\"provider\":\"anthropic-acme\""),
         "the step should run on the customer's account: {run_start}"
     );
+    assert!(
+        run_start.contains("\"customer\":\"acme\""),
+        "the step transcript should record the customer: {run_start}"
+    );
     let runs = rupu_orchestrator::RunStore::new(tmp.child(".rupu/runs").path().to_path_buf())
         .list()
         .unwrap();
@@ -354,6 +358,19 @@ async fn rupu_run_records_the_customer() {
         .collect();
     assert_eq!(agent_runs.len(), 1, "expected one standalone run: {runs:?}");
     assert_eq!(agent_runs[0].customer.as_deref(), Some("acme"));
+    // The agent's own transcript names the customer on its first line too —
+    // what the CP's usage sources read.
+    let transcript = tmp
+        .child(".rupu/transcripts")
+        .path()
+        .join(format!("{}.jsonl", agent_runs[0].id));
+    let first = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("read {}: {e}", transcript.display()));
+    let first = first.lines().next().unwrap();
+    assert!(
+        first.contains("\"customer\":\"acme\""),
+        "run_start should record the customer: {first}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

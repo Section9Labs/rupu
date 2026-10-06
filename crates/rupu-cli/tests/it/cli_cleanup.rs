@@ -154,6 +154,7 @@ fn write_archived_standalone_transcript(
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {

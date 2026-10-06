@@ -1361,6 +1361,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            customer: None,
         });
         for &(i, o) in turns {
             out += &usage_line(provider, model, i, o, None);
@@ -1400,6 +1401,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            customer: None,
         }));
         append(&p, "{\"type\":\"tool_result\",\"blob\":\"xxxxxxxxxxxxxxxxxxxx\"}\n");
         append(&p, &usage_line("anthropic", "m", 10, 5, None));

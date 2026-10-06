@@ -464,6 +464,7 @@ async fn rebuild_opts_from_disk(
         None,
         cfg.providers.clone(),
         cfg.recovery.clone(),
+        cfg_paths.customer_slug.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over

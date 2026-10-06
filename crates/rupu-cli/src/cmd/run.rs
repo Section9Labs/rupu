@@ -1062,6 +1062,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             Some(coverage_stream.clone()),
             cfg.providers.clone(),
             cfg.recovery.clone(),
+            cfg_paths.customer_slug.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),

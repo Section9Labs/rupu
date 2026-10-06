@@ -77,6 +77,7 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "internal-vllm".into(),
@@ -271,6 +272,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             })
             .unwrap(),
             serde_json::to_string(&rupu_transcript::Event::Usage {
@@ -556,6 +558,7 @@ fn write_run_transcript_for(
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     };
     let usage = rupu_transcript::Event::Usage {
         provider: provider.into(),
@@ -1130,6 +1133,7 @@ fn write_fold_transcript(
         mode: rupu_transcript::RunMode::Ask,
         schema: None,
         system_prompt: None,
+        customer: None,
     }];
     for (input, output) in usages {
         events.push(rupu_transcript::Event::Usage {

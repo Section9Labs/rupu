@@ -72,6 +72,11 @@ pub enum Event {
         /// `None` on transcripts written before codenames existed.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         codename: Option<String>,
+        /// Customer this run ran under (`rupu customer`). `None` on
+        /// transcripts written before customers existed or for runs with
+        /// no customer.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        customer: Option<String>,
     },
     TurnStart {
         turn_idx: u32,
@@ -729,5 +734,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn run_start_customer_roundtrips_and_is_optional() {
+        let e = Event::RunStart {
+            run_id: "r".into(),
+            workspace_id: "w".into(),
+            agent: "a".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            started_at: "2026-08-31T00:00:00Z".parse().unwrap(),
+            mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
+            codename: None,
+            customer: Some("acme".into()),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""customer":"acme""#), "{s}");
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+
+        let legacy = r#"{"type":"run_start","data":{"run_id":"r","workspace_id":"w","agent":"a","provider":"p","model":"m","started_at":"2026-08-31T00:00:00Z","mode":"bypass"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Event>(legacy).unwrap(),
+            Event::RunStart { customer: None, .. }
+        ));
+        let Event::RunStart {
+            run_id,
+            workspace_id,
+            agent,
+            provider,
+            model,
+            started_at,
+            mode,
+            ..
+        } = e
+        else {
+            unreachable!()
+        };
+        let none = Event::RunStart {
+            run_id,
+            workspace_id,
+            agent,
+            provider,
+            model,
+            started_at,
+            mode,
+            schema: None,
+            system_prompt: None,
+            codename: None,
+            customer: None,
+        };
+        assert!(!serde_json::to_string(&none).unwrap().contains("customer"));
     }
 }

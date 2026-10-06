@@ -65,6 +65,12 @@ struct SessionDto {
     /// Stored crew/role codename; absent on legacy sessions (derived on read).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codename: Option<String>,
+    /// The customer the session's directory was assigned to as of its latest
+    /// turn (`session.json`'s `customer`). Always serialized (`null` when
+    /// none) so a coordinator can tell "no customer" from a peer too old to
+    /// report one.
+    #[serde(default)]
+    customer: Option<String>,
     /// The recorded turns — read for [`session_usage`], never serialized
     /// (the list/detail wire shape is unchanged; `/api/sessions/:id/runs`
     /// serves the turns). Parsed leniently: an unexpected shape reads as no
@@ -1100,11 +1106,26 @@ mod tests {
             workspace_id: "w".into(),
             codename: None,
             runs: Vec::new(),
+            customer: None,
         };
         let u = session_usage_from_totals(&dto, &rupu_config::PricingConfig::default());
         assert_eq!(u.input_tokens, 1_000_000);
         assert!(u.priced);
         assert!((u.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+    }
+
+    /// `session.json`'s `customer` rides on the row; a row with none says
+    /// `null` (never omits the key), so a coordinator can tell "no customer"
+    /// from a peer too old to report one.
+    #[test]
+    fn session_row_carries_the_customer_or_null() {
+        let with: SessionDto =
+            serde_json::from_str(r#"{"session_id":"s1","customer":"acme"}"#).unwrap();
+        assert_eq!(serde_json::to_value(&with).unwrap()["customer"], "acme");
+        let without: SessionDto = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(v.as_object().unwrap().contains_key("customer"));
+        assert!(v["customer"].is_null());
     }
 
     /// A `runs` field of an unexpected shape never fails the session parse
@@ -1139,6 +1160,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Ask,
                 schema: None,
                 system_prompt: None,
+                customer: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),
@@ -1184,6 +1206,7 @@ mod tests {
                 entry("run_gone", &tmp.path().join("archived.jsonl"), 900),
                 entry("run_live", &live, 0),
             ],
+            customer: None,
         };
         let store = rupu_orchestrator::runs::RunStore::new(tmp.path().join("runs"));
         let u = session_usage(&dto, &store, &rupu_config::PricingConfig::default());

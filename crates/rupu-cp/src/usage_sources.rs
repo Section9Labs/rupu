@@ -60,6 +60,10 @@ pub struct ExtraSource {
     pub agent: String,
     /// The transcript's `RunStart` workspace; empty when unknown.
     pub workspace_id: String,
+    /// The customer the run recorded on its `RunStart` (a session turn that
+    /// predates customers falls back to its `session.json`'s); `None` ⇒ no
+    /// customer recorded.
+    pub customer: Option<String>,
     /// Own transcript + recursive dispatch sub-runs, each labelled with `id`.
     pub paths: Vec<(String, PathBuf)>,
 }
@@ -70,6 +74,7 @@ struct Head {
     agent: String,
     workspace_id: String,
     started_at: Option<DateTime<Utc>>,
+    customer: Option<String>,
 }
 
 /// A path's canonical form, or the path itself when it can't be resolved.
@@ -101,6 +106,7 @@ fn head_of(path: &Path) -> Head {
         agent: h.agent,
         workspace_id: h.workspace_id,
         started_at: Some(h.started_at),
+        customer: h.customer,
     };
     cache
         .lock()
@@ -214,6 +220,7 @@ pub fn extra_sources(
                 } else {
                     head.agent
                 };
+                let customer = head.customer.or_else(|| session.customer.clone());
                 let paths = source_paths(run_store, &id, &own, &is_claimed);
                 out.push(ExtraSource {
                     kind: SourceKind::Session,
@@ -222,6 +229,7 @@ pub fn extra_sources(
                     started_at,
                     agent,
                     workspace_id: head.workspace_id,
+                    customer,
                     paths,
                 });
             }
@@ -295,6 +303,7 @@ pub fn extra_sources(
             started_at: head.started_at,
             agent: head.agent,
             workspace_id: head.workspace_id,
+            customer: head.customer,
             paths,
         });
     }
@@ -319,6 +328,10 @@ mod tests {
     use super::*;
 
     fn transcript(path: &Path, agent: &str) {
+        transcript_for(path, agent, None);
+    }
+
+    fn transcript_for(path: &Path, agent: &str, customer: Option<&str>) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let ev = rupu_transcript::Event::RunStart {
             codename: None,
@@ -331,6 +344,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            customer: customer.map(str::to_string),
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');
@@ -440,6 +454,49 @@ mod tests {
                 ("run_T", SourceKind::Session, Some("ses_1")),
             ]
         );
+    }
+
+    /// A source's customer is the one its transcript's `run_start` recorded;
+    /// a session turn whose transcript names none (written before customers)
+    /// falls back to the session's `customer` from `session.json`.
+    #[test]
+    fn a_source_carries_the_customer_its_transcript_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let store = RunStore::new(global.join("runs"));
+        let tdir = global.join("transcripts");
+        transcript_for(&tdir.join("run_A.jsonl"), "lead", Some("acme"));
+        transcript(&tdir.join("run_B.jsonl"), "lead");
+        // Session turns: one recorded its customer, one predates customers.
+        let recorded = global.join("sess/run_S1.jsonl");
+        let legacy = global.join("sess/run_S2.jsonl");
+        transcript_for(&recorded, "chatter", Some("globex"));
+        transcript(&legacy, "chatter");
+        let sdir = global.join("sessions/ses_1");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let session = serde_json::json!({
+            "session_id": "ses_1",
+            "agent_name": "chatter",
+            "customer": "initech",
+            "runs": [
+                { "run_id": "run_S1", "transcript_path": recorded },
+                { "run_id": "run_S2", "transcript_path": legacy },
+            ],
+        });
+        std::fs::write(sdir.join("session.json"), session.to_string()).unwrap();
+
+        let got = extra_sources(global, &store, &HashSet::new());
+        let customer_of = |id: &str| {
+            got.iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("no source {id}: {got:?}"))
+                .customer
+                .as_deref()
+        };
+        assert_eq!(customer_of("run_A"), Some("acme"));
+        assert_eq!(customer_of("run_B"), None);
+        assert_eq!(customer_of("run_S1"), Some("globex"));
+        assert_eq!(customer_of("run_S2"), Some("initech"));
     }
 
     #[test]

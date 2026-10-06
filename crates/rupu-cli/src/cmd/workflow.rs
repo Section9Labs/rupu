@@ -3780,6 +3780,7 @@ pub(crate) async fn resume_run(
         None,
         cfg.providers.clone(),
         cfg.recovery.clone(),
+        cfg_paths.customer_slug.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -5647,6 +5648,7 @@ async fn execute_workflow_invocation(
         None,
         cfg.providers.clone(),
         cfg.recovery.clone(),
+        cfg_paths.customer_slug.clone(),
     );
     // One codename namer for the whole run — shared by the orchestrator
     // (static slots), the sub-agent dispatcher (`>role#n`), and the inline

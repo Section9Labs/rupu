@@ -107,6 +107,9 @@ pub struct CliAgentDispatcher {
     /// its agent declares no `fallbacks:`, and the server-side-fallback
     /// toggle for the child's provider and its hops.
     recovery: rupu_config::RecoveryConfig,
+    /// The customer the parent run runs under; every dispatched child's
+    /// `ToolContext` (and so its transcript's `RunStart`) records it too.
+    customer: Option<String>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -147,6 +150,7 @@ impl CliAgentDispatcher {
         coverage_stream: Option<PathBuf>,
         providers: std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
         recovery: rupu_config::RecoveryConfig,
+        customer: Option<String>,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -172,6 +176,7 @@ impl CliAgentDispatcher {
             coverage_stream,
             providers,
             recovery,
+            customer,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -421,7 +426,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let child_depth = parent_depth + 1;
 
         let child_tool_ctx = ToolContext {
-            customer: None,
+            customer: self.customer.clone(),
             findings: Some(self.findings_base.clone().with_profile(
                 rupu_coverage::FindingProfile::resolve(None, None, spec.findings_profile),
             )),
@@ -723,6 +728,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         })
         .unwrap();
         w.write(&Event::AssistantMessage {
@@ -878,6 +884,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1000,6 +1007,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1021,6 +1029,64 @@ mod tests {
             transcript.contains("input 7,000 · output 900"),
             "the notice must state the child's own pinned limits: {transcript}"
         );
+    }
+
+    /// A dispatched child runs under its PARENT's customer: its transcript's
+    /// `run_start` records the customer the dispatcher was built with.
+    #[tokio::test]
+    async fn dispatched_child_inherits_the_parents_customer() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+            None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
+            None,
+            Default::default(),
+            Default::default(),
+            Some("acme".into()),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "go".into(), "parent_run_1", 0, None)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let head = rupu_transcript::JsonlReader::head(&outcome.transcript_path).unwrap();
+        assert_eq!(head.customer.as_deref(), Some("acme"));
     }
 
     /// Spec 2026-09-30-rupu-remote-findings-transport-design.md deviation 4:
@@ -1075,6 +1141,7 @@ mod tests {
             Some(stream.clone()),
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1178,6 +1245,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -1288,6 +1356,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -1357,6 +1426,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1416,6 +1486,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         // An interim message with a tool call, then a refusal on the final
@@ -1517,6 +1588,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1602,6 +1674,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1694,6 +1767,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1791,6 +1865,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1873,6 +1948,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            None,
         );
 
         std::env::set_var(

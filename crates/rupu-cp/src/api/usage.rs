@@ -1757,6 +1757,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         };
         let usage = rupu_transcript::Event::Usage {
             provider: "anthropic".into(),

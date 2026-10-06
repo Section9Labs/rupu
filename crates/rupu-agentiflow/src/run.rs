@@ -192,6 +192,11 @@ pub struct RunAgentiflowOpts {
     /// Plan 4; tests inject a mock). `None` disables `generate_workflow`
     /// entirely: the lead is not even offered the tool.
     pub generation: Option<crate::lead::GenerationCapability>,
+    /// The customer this run belongs to (`rupu customer`), resolved by the
+    /// launch site from the workspace's assignment
+    /// (`rupu_workspace::config_paths(..).customer_slug`) -- never inferred
+    /// here. The lead's transcripts record it. `None` ⇒ no customer.
+    pub customer: Option<String>,
 }
 
 /// A run id becomes a directory name and an evidence scope name, so it must
@@ -435,6 +440,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         run_id: id,
         unit_launcher,
         generation,
+        customer,
     } = opts;
 
     // A thread-scoped tracing subscriber (a test's, say) does not follow the
@@ -651,6 +657,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 findings_engagement: Some(findings_engagement),
                 extra_tools,
                 collectors,
+                customer,
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,
@@ -816,6 +823,7 @@ mod tests {
             run_id: id.into(),
             unit_launcher: None,
             generation: None,
+            customer: None,
         }
     }
 

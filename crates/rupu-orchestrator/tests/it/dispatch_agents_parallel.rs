@@ -100,6 +100,7 @@ impl AgentDispatcher for FakeDispatcher {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             })
             .unwrap();
         writer

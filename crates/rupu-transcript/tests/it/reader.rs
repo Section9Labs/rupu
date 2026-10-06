@@ -29,6 +29,7 @@ fn reads_complete_run_summary() {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             Event::TurnStart { turn_idx: 0 },
             Event::TurnEnd {
@@ -73,6 +74,7 @@ fn missing_run_complete_reports_aborted() {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             Event::TurnStart { turn_idx: 0 },
             // no TurnEnd, no RunComplete
@@ -99,6 +101,7 @@ fn truncated_last_line_does_not_crash() {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         })
         .unwrap();
     }
@@ -199,6 +202,7 @@ fn head_reads_run_start_without_needing_the_rest_of_the_file() {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: Some("acme".into()),
             },
             Event::TurnStart { turn_idx: 0 },
         ],
@@ -214,6 +218,7 @@ fn head_reads_run_start_without_needing_the_rest_of_the_file() {
     assert_eq!(head.run_id, "run_head");
     assert_eq!(head.agent, "agent-a");
     assert_eq!(head.started_at, started);
+    assert_eq!(head.customer.as_deref(), Some("acme"));
 }
 
 /// A file sharing the transcripts directory but written by another

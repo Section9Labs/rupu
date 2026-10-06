@@ -400,6 +400,12 @@ struct SessionRecord {
     /// that predate it: those look the customer up from `workspace_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launch_dir: Option<PathBuf>,
+    /// The customer the session's directory is assigned to (`rupu
+    /// customer`), as of its latest turn: each turn re-resolves it, so
+    /// a reassignment mid-session shows here while every transcript keeps
+    /// the customer it ran under. `None` ⇒ no customer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    customer: Option<String>,
     transcripts_dir: PathBuf,
     #[serde(default)]
     repo_ref: Option<String>,
@@ -1684,6 +1690,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root,
         launch_dir: Some(pwd.clone()),
+        customer: cfg_paths.customer_slug.clone(),
         transcripts_dir,
         repo_ref,
         issue_ref,
@@ -7302,6 +7309,9 @@ async fn run_compact_request(
     )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = crate::accounts::resolver_for(&cfg);
+    // This request's customer: the directory's assignment now, which is
+    // what the pseudo-turn transcript records and the session record shows.
+    session.customer = cfg_paths.customer_slug.clone();
 
     paths::ensure_dir(&session.transcripts_dir)?;
 
@@ -7363,6 +7373,7 @@ async fn run_compact_request(
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: session.customer.clone(),
     })?;
     writer.flush()?;
 
@@ -7608,6 +7619,7 @@ fn finalize_compact_run(
     // and could keep referencing a transcript that no longer matches the
     // history just persisted above.
     s.history_source_transcript = session.history_source_transcript.clone();
+    s.customer = session.customer.clone();
     s.status = if status == RunStatus::Ok {
         SessionStatus::Idle
     } else {
@@ -7692,6 +7704,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
+    // This turn's customer, from the directory's assignment now (the strict
+    // lookup above already failed a dangling one): recorded on the turn's
+    // transcript and shown on the session record.
+    let turn_customer = cfg_paths.customer_slug.clone();
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -7789,7 +7805,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // runtime (its first call blocks).
         let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
         let tool_context = ToolContext {
-            customer: None,
+            customer: turn_customer.clone(),
             findings: Some(
                 crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
                     rupu_coverage::FindingProfile::resolve(None, None, session.findings_profile),
@@ -7979,6 +7995,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         clear_session_live_usage(&global, scope, &args.session_id)?;
 
         session = read_session(&global, &args.session_id)?.0;
+        session.customer = turn_customer.clone();
         session.updated_at = Utc::now();
         session.active_run_id = None;
         session.active_transcript_path = None;
@@ -8720,6 +8737,7 @@ mod tests {
                 mode: RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                customer: None,
             })
             .unwrap()];
             for _ in 0..*turns {
@@ -8821,6 +8839,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             })
             .unwrap(),
         );
@@ -10404,6 +10423,7 @@ mod tests {
             compact_at_percent: None,
             model_limits: None,
             history_source_transcript: None,
+            customer: None,
         }
     }
 
@@ -10565,6 +10585,83 @@ mod tests {
         let l = back.model_limits.expect("stored limits survive a reload");
         assert_eq!(l.input.tokens, Some(200_000));
         assert_eq!(l.output.tokens, Some(64_000));
+    }
+
+    /// Every turn records the customer its directory is assigned to NOW —
+    /// on its own transcript's `run_start` and on the session record — so a
+    /// reassignment mid-session shows on the record while each earlier
+    /// transcript keeps the customer it ran under.
+    #[tokio::test]
+    async fn turns_record_their_customer_and_follow_a_reassignment() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".rupu")).expect("create project");
+        let store = rupu_workspace::CustomerStore::new(&global);
+        store
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("create customer");
+        store
+            .assign("acme", rupu_workspace::ProjectRef::Path(&project))
+            .expect("assign project");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_customer_turns01".into();
+        record.workspace_path = project.clone();
+        record.launch_dir = Some(project.clone());
+        record.project_root = Some(project.clone());
+        record.customer = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.runs = Vec::new();
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+        let turn = |run_id: &str| RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: run_id.into(),
+            prompt: "hi".into(),
+        };
+        let first = run_turn(turn("run_customer_1")).await;
+        let after_first = read_session(&global, &record.session_id).expect("read").0;
+        store
+            .unassign(rupu_workspace::ProjectRef::Path(&project))
+            .expect("unassign project");
+        let second = run_turn(turn("run_customer_2")).await;
+        let after_second = read_session(&global, &record.session_id).expect("read").0;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        first.expect("turn 1 completes");
+        second.expect("turn 2 completes");
+
+        assert_eq!(after_first.customer.as_deref(), Some("acme"));
+        assert_eq!(after_second.customer, None, "unassigned by turn 2");
+        let head = |run_id: &str| {
+            JsonlReader::head(record.transcripts_dir.join(format!("{run_id}.jsonl")))
+                .expect("transcript head")
+        };
+        assert_eq!(head("run_customer_1").customer.as_deref(), Some("acme"));
+        assert_eq!(head("run_customer_2").customer, None);
     }
 
     /// 3j (transcript fidelity plan 1): the session worker's send path
@@ -11379,6 +11476,7 @@ mod tests {
                     mode: RunMode::Bypass,
                     schema: None,
                     system_prompt: None,
+                    customer: None,
                 },
                 usage_event(6_000, 50, None),
                 TranscriptEvent::RunComplete {
@@ -11434,6 +11532,7 @@ mod tests {
                     mode: RunMode::Bypass,
                     schema: None,
                     system_prompt: None,
+                    customer: None,
                 },
                 usage_event(6_000, 50, None),
                 TranscriptEvent::RunComplete {

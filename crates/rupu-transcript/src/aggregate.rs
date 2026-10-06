@@ -251,6 +251,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         }
     }
 

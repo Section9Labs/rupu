@@ -166,6 +166,9 @@ pub struct RunHead {
     pub model: String,
     pub started_at: DateTime<Utc>,
     pub mode: RunMode,
+    /// Customer recorded on `run_start`; `None` on older transcripts and
+    /// for runs with no customer.
+    pub customer: Option<String>,
 }
 
 pub struct JsonlReader;
@@ -270,6 +273,7 @@ impl JsonlReader {
                     model,
                     started_at,
                     mode,
+                    customer,
                     ..
                 }) => {
                     return Ok(RunHead {
@@ -280,6 +284,7 @@ impl JsonlReader {
                         model,
                         started_at,
                         mode,
+                        customer,
                     })
                 }
                 // A real IO error is fatal; a bad line is not (the tolerated

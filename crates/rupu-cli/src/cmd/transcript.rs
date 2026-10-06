@@ -2622,6 +2622,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: Some(codename.into()),
+                customer: None,
             };
             std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
             tp

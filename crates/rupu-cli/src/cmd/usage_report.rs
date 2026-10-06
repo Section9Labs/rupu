@@ -689,6 +689,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             })
             .unwrap();
         writer
@@ -1128,6 +1129,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         };
         events[0] = Ok(run_start);
         let mut writer = JsonlWriter::create(&transcript_path).unwrap();

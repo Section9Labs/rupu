@@ -147,6 +147,10 @@ pub(crate) struct SessionForRunsDto {
     provider_name: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// The customer the session's directory was assigned to as of its latest
+    /// turn; the fallback for a turn whose transcript predates customers.
+    #[serde(default)]
+    pub(crate) customer: Option<String>,
     #[serde(default)]
     pub(crate) runs: Vec<SessionRunRecordDto>,
 }
@@ -1616,6 +1620,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         };
         let line = serde_json::to_string(&ev).unwrap();
         fs::write(dir.join(format!("{run_id}.jsonl")), format!("{line}\n")).unwrap();
@@ -1700,6 +1705,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: Some("cobalt-harbor/heron".into()),
+            customer: None,
         };
         let dir = tmp.path().join("transcripts");
         fs::create_dir_all(&dir).unwrap();
@@ -2242,6 +2248,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),

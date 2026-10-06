@@ -4660,6 +4660,7 @@ mod tests {
                     schema: None,
                     system_prompt: None,
                     codename: None,
+                    customer: None,
                 },
                 TxEvent::AssistantMessage {
                     content: "Summarized the implementation plan.".into(),
@@ -5071,6 +5072,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Child output\n\n- item one\n- item two".into(),
@@ -5209,6 +5211,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Reviewer output\n\n- looks good".into(),
