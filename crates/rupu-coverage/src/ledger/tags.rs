@@ -493,12 +493,19 @@ fn append_events(log: &TagLog, events: &[TagEvent]) -> Result<(), TagError> {
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<_, _>>()?;
-    let mut buf = lines.join("\n");
-    buf.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(&log.path)?;
+    // A crash can leave the log ending mid-line. Start on a fresh line so
+    // the torn one stays a skipped line instead of swallowing our first event.
+    let mut buf = String::new();
+    if ends_mid_line(&mut f)? {
+        buf.push('\n');
+    }
+    buf.push_str(&lines.join("\n"));
+    buf.push('\n');
     f.write_all(buf.as_bytes())?;
     f.sync_data()?;
     for l in &lines {
@@ -509,6 +516,18 @@ fn append_events(log: &TagLog, events: &[TagEvent]) -> Result<(), TagError> {
         );
     }
     Ok(())
+}
+
+/// True when the file is non-empty and its last byte is not `\n`.
+fn ends_mid_line(f: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if f.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// Append a remote unit's events (`ingest_unit_stream`) that `log` does not

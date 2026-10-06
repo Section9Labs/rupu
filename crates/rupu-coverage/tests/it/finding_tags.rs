@@ -339,6 +339,32 @@ fn racing_writers_adding_the_same_tag_land_exactly_one_event() {
     assert_eq!(events[0].op, TagOp::Add);
 }
 
+/// A crash can leave the log ending mid-line with no newline; the next event
+/// must start on its own line instead of gluing onto the torn one.
+#[test]
+fn an_event_appended_after_a_torn_tail_line_is_not_swallowed() {
+    let ws = tempfile::TempDir::new().unwrap();
+    seed(ws.path());
+    let log = TagLog::for_workspace(ws.path());
+    std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &log.path,
+        br#"{"id":"tge_torn","finding_id":"fnd_a","op":"ad"#,
+    )
+    .unwrap();
+
+    apply(&log, &change(&["fnd_a"], &["after-crash"], &[]), &by()).unwrap();
+
+    let events = read_tag_events(&log).unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "the torn line is skipped, the new event kept"
+    );
+    assert_eq!(events[0].tag.as_str(), "after-crash");
+    assert_eq!(tags_of(ws.path(), "fnd_a"), ["after-crash"]);
+}
+
 #[test]
 fn a_finding_already_over_the_cap_can_still_shrink_but_never_grow() {
     let ws = tempfile::TempDir::new().unwrap();
