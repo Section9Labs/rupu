@@ -38,8 +38,14 @@ global lock › customer lock › project › customer › global › default
   `[[scm.rules]]` replaces the global rules for its projects.
 - A run uses the customer of the nearest assigned ancestor of its working directory —
   so subdirectories inherit their project's customer, and a repo needs no `.rupu/` of its own.
-  An autoflow run uses its repo's checkout (not its issue worktree), and `rupu workflow
-  resume` / `approve` reuse the directory the run was launched from.
+  An autoflow run uses its repo's checkout (not its issue worktree).
+- A run **records** the customer it ran under (`run.json`, every transcript's `RunStart`,
+  and a session's `session.json`). `rupu workflow resume` / `approve` run on the recorded
+  customer even if the project has since been reassigned; only a run from before this
+  was recorded falls back to the directory it was launched from. A recorded customer that
+  no longer exists fails the resume. Runs recorded before customers show the project's
+  *current* customer, marked derived in the CP API
+  ([`cp-customers-api.md`](cp-customers-api.md)).
 - A project assigned to a customer that no longer exists, or a customer layer that
   does not parse, fails the run — it never falls back to the global config.
 
@@ -64,6 +70,8 @@ or `rupu auth login --account github-acme --kind github` for an SCM account. The
 
 To view the effective config with sources and locks: `rupu customer show <slug>`.
 To edit and validate a customer layer: `rupu customer edit <slug>`.
+
+The control plane manages customers, filters its lists by `?customer=` and previews a launch's accounts — see [`cp-customers-api.md`](cp-customers-api.md).
 
 ---
 

@@ -515,8 +515,10 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
 /// empty contribution plus a warning — it never fails the whole merge.
 ///
 /// With a customer `filter`, each host's rows are filtered on the coordinator
-/// by their `customer` key BEFORE the caller pages the merge (every host is
-/// asked for up to [`FAN_OUT_LIMIT`] rows). A host whose rows carry no such
+/// by their `customer` key BEFORE the caller pages the merge (every host's
+/// WHOLE list is read, [`FAN_OUT_LIMIT`] rows a page, so a peer that clamps its
+/// page size never hides a match; unfiltered, a host is asked once for up to
+/// [`FAN_OUT_LIMIT`] rows). A host whose rows carry no such
 /// key — a peer too old to report customers — contributes nothing and is
 /// returned in the second element, for the
 /// [`crate::customers::HOSTS_WITHOUT_CUSTOMER_HEADER`].
