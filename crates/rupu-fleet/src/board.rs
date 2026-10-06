@@ -56,8 +56,12 @@ impl Board {
         }
         let mut last_holder = String::new();
         for _ in 0..CLAIM_ATTEMPTS {
-            if self.try_create_claim(&path, owner, ttl)? {
-                return Ok(ClaimOutcome::Granted(ClaimGuard { path }));
+            if let Some(token) = self.try_create_claim(&path, owner, ttl)? {
+                return Ok(ClaimOutcome::Granted(ClaimGuard {
+                    path,
+                    lock_path: self.reap_lock_path(key),
+                    token,
+                }));
             }
             // A lease exists. Inspect it.
             let Some(rec) = read_claim(&path)? else {
@@ -79,21 +83,24 @@ impl Board {
         })
     }
 
-    /// `Ok(true)` if the create succeeded, `Ok(false)` if a lease already
+    /// `Ok(Some(token))` if the create succeeded (the token is unique to this
+    /// grant and recorded in the claim file), `Ok(None)` if a lease already
     /// exists (contention is not an error).
     fn try_create_claim(
         &self,
         path: &Path,
         owner: &str,
         ttl: Duration,
-    ) -> Result<bool, FleetError> {
+    ) -> Result<Option<String>, FleetError> {
         let now = Utc::now();
         let expires =
             now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let token = ulid::Ulid::new().to_string();
         let rec = ClaimRecord {
             owner: owner.to_string(),
             acquired_at: now.to_rfc3339(),
             lease_expires_at: expires.to_rfc3339(),
+            token: token.clone(),
         };
         match std::fs::OpenOptions::new()
             .create_new(true)
@@ -106,9 +113,9 @@ impl Board {
                     action: format!("write claim {}", path.display()),
                     source: e,
                 })?;
-                Ok(true)
+                Ok(Some(token))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(FleetError::Io {
                 action: format!("create claim {}", path.display()),
                 source: e,
@@ -532,6 +539,34 @@ mod tests {
             .claim("held:key", "agent-b", Duration::from_secs(60))
             .unwrap();
         assert!(matches!(outcome, ClaimOutcome::Granted(_)));
+    }
+
+    #[test]
+    fn a_stale_guards_drop_does_not_delete_a_successors_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Board::new(dir.path());
+        // A grants with a 0s lease (immediately expired).
+        let a = board
+            .claim("host:1.1.2.2", "agent-a", Duration::from_secs(0))
+            .unwrap();
+        let ClaimOutcome::Granted(a_guard) = a else {
+            panic!("A granted")
+        };
+        // B claims the same key: reaps A's expired lease, re-grants to B.
+        let b = board
+            .claim("host:1.1.2.2", "agent-b", Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            matches!(b, ClaimOutcome::Granted(_)),
+            "B granted after reaping A"
+        );
+        // A's guard drops (A's run ends). It must NOT delete B's live claim.
+        drop(a_guard);
+        assert_eq!(
+            board.claim_holder("host:1.1.2.2").unwrap().as_deref(),
+            Some("agent-b"),
+            "B still holds the key after A's stale guard dropped"
+        );
     }
 
     #[test]
