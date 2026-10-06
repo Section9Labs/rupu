@@ -2,7 +2,9 @@
 //!
 //! Rules (locked by spec):
 //! - Layer order (lowest first): global, customer, project. Only the
-//!   global layer's `[policy].lock` survives into the merged config.
+//!   global layer's `[policy].lock` survives into the merged config (the
+//!   customer's lock list is enforced by `resolve` and reported in
+//!   `Resolved.customer_lock`).
 //! - A higher layer overrides a lower one key-by-key (deep merge for tables).
 //! - Arrays REPLACE — never concatenate. This is what allows users to
 //!   subtract entries by re-declaring the array in the project file.
