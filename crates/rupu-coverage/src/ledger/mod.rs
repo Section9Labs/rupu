@@ -1,5 +1,6 @@
 pub mod discover;
 pub mod events;
+pub mod finding_filter;
 pub mod ingest;
 pub mod manifest;
 pub mod paths;
@@ -14,6 +15,9 @@ pub use discover::{discover_targets, DiscoveredTarget};
 pub use events::{
     AssertionStatus, Attribution, ConcernAssertion, Evidence, FileTouchEvent, FindingEvidence,
     FindingRecord, FindingScope, Surface,
+};
+pub use finding_filter::{
+    check_available, facets, run_values, FacetValue, FindingView, RunScopes, Unavailable,
 };
 pub use ingest::{ingest_unit_stream, IngestError, IngestReport, IngestSource};
 pub use manifest::{append_manifest, find_manifest, read_manifests, RunManifest};
