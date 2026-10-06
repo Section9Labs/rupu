@@ -265,7 +265,8 @@ fn show(store: &CustomerStore, slug: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?.join("config.toml");
     let layer = store.config_path(slug);
     println!("\nconfig layer: {}", layer.display());
-    print_effective(&global, &layer)
+    print!("{}", effective_section(&global, &layer, slug));
+    Ok(())
 }
 
 /// One line of the effective-config table.
@@ -317,8 +318,21 @@ fn effective_rows(global: &Path, layer: &Path) -> anyhow::Result<(Vec<EffectiveR
     Ok((rows, r.warnings))
 }
 
-fn print_effective(global: &Path, layer: &Path) -> anyhow::Result<()> {
-    let (rows, warnings) = effective_rows(global, layer)?;
+/// The effective-config section of `rupu customer show`. A layer that does
+/// not load (a malformed customer `config.toml`, say) is shown as its error
+/// in place of the table, so `show` still prints the customer's metadata and
+/// projects and exits 0 — it is how you find out what is wrong.
+fn effective_section(global: &Path, layer: &Path, slug: &str) -> String {
+    let (rows, warnings) = match effective_rows(global, layer) {
+        Ok(r) => r,
+        Err(e) => {
+            return format!(
+                "effective config unavailable — the config does not load:\n  {e:#}\n\
+                 fix it with `rupu customer edit {slug}`; runs of this customer's \
+                 projects fail until it loads\n"
+            )
+        }
+    };
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["KEY", "VALUE", "SOURCE", "LOCKED BY"]);
     for r in &rows {
@@ -329,11 +343,11 @@ fn print_effective(global: &Path, layer: &Path) -> anyhow::Result<()> {
             Cell::new(&r.locked_by),
         ]);
     }
-    println!("{table}");
+    let mut out = format!("{table}\n");
     for w in &warnings {
-        println!("warning: {w}");
+        out.push_str(&format!("warning: {w}\n"));
     }
-    Ok(())
+    out
 }
 
 /// Walk a provenance key. Decoded with the CP write path's
@@ -479,6 +493,24 @@ lock = ['pricing.oracle."GLM-5.2-FP8".input_per_mtok']
         assert_eq!(model.locked_by, "-");
 
         assert!(rows.iter().all(|r| r.value != UNRESOLVED), "{rows:?}");
+    }
+
+    #[test]
+    fn effective_section_shows_a_malformed_layer_as_its_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = write(tmp.path(), "global.toml", "default_model = \"g\"\n");
+        let layer = write(tmp.path(), "customer.toml", "default_provider = \n");
+        let out = effective_section(&global, &layer, "acme");
+        assert!(out.contains("effective config unavailable"), "{out}");
+        assert!(out.contains("customer.toml"), "names the file: {out}");
+        assert!(out.contains("rupu customer edit acme"), "{out}");
+
+        let good = write(tmp.path(), "good.toml", "default_provider = \"x\"\n");
+        let out = effective_section(&global, &good, "acme");
+        assert!(
+            out.contains("default_provider") && out.contains("customer"),
+            "{out}"
+        );
     }
 
     #[test]
