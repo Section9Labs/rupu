@@ -118,20 +118,31 @@ impl WorkspaceStore {
         Ok(out)
     }
 
-    /// Write the record atomically: serialize to `<id>.toml.tmp`, then
-    /// rename. POSIX rename is atomic; readers never see a partial file.
+    /// Write the record atomically: serialize into a uniquely named temp
+    /// file in the store dir, then rename it over `<id>.toml`. Every launch
+    /// upserts, so two runs of one project write the same record at once; a
+    /// shared fixed temp name would let them tear each other's bytes into a
+    /// corrupt record (which `list` then skips and the customer lookup
+    /// refuses). The temp name (`.tmpXXXX`) never ends in `.toml`, so `list`
+    /// ignores it, and a failed write or rename removes it.
     fn write(&self, ws: &Workspace) -> Result<(), StoreError> {
+        use std::io::Write;
         self.ensure_root()?;
         let body = toml::to_string(ws)?;
         let path = self.record_path(&ws.id);
-        let tmp_path = path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, body).map_err(|e| StoreError::Io {
-            action: format!("write {}", tmp_path.display()),
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.root).map_err(|e| StoreError::Io {
+            action: format!("create temp file in {}", self.root.display()),
             source: e,
         })?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| StoreError::Io {
-            action: format!("rename {} -> {}", tmp_path.display(), path.display()),
-            source: e,
+        tmp.write_all(body.as_bytes())
+            .and_then(|()| tmp.as_file().sync_all())
+            .map_err(|e| StoreError::Io {
+                action: format!("write temp file for {}", path.display()),
+                source: e,
+            })?;
+        tmp.persist(&path).map_err(|e| StoreError::Io {
+            action: format!("rename temp file -> {}", path.display()),
+            source: e.error,
         })?;
         Ok(())
     }
