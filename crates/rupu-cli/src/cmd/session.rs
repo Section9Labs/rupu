@@ -7337,7 +7337,11 @@ async fn run_compact_request(
     let resolver = crate::accounts::resolver_for(&cfg);
     // This request's customer: the directory's assignment now, which is
     // what the pseudo-turn transcript records and the session record shows.
+    // Persisted now, before the request runs, so one that fails before its
+    // finalize still leaves the record showing it (re-read first, as the
+    // turn path does, so a concurrent write is not clobbered).
     session.customer = Some(cfg_paths.customer_slug.clone());
+    persist_session_customer(global, session_id, &session.customer)?;
 
     paths::ensure_dir(&session.transcripts_dir)?;
 
@@ -7736,16 +7740,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     let turn_customer = cfg_paths.customer_slug.clone();
     // Persist it now, before the turn runs: a turn that fails before its
     // finalize below must not leave the record showing the previous turn's
-    // customer. Re-read first so a concurrent write is not clobbered (the
-    // finalize below follows the same rule).
-    {
-        let mut current = read_session(&global, &args.session_id)?.0;
-        if current.customer != Some(turn_customer.clone()) {
-            current.customer = Some(turn_customer.clone());
-            write_session(&global, scope, &current)?;
-        }
-        session.customer = Some(turn_customer.clone());
-    }
+    // customer.
+    session.customer = Some(turn_customer.clone());
+    persist_session_customer(&global, &args.session_id, &session.customer)?;
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -8297,6 +8294,22 @@ fn session_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf 
 
 fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
     session_dir(global, scope, session_id).join("session.json")
+}
+
+/// Write `customer` onto `session_id`'s record before a turn or compaction
+/// runs: re-read first so a concurrent write is not clobbered (the request's
+/// finalize follows the same rule), and write only when it changed.
+fn persist_session_customer(
+    global: &Path,
+    session_id: &str,
+    customer: &rupu_transcript::RecordedField,
+) -> anyhow::Result<()> {
+    let (mut current, scope) = read_session(global, session_id)?;
+    if current.customer != *customer {
+        current.customer = customer.clone();
+        write_session(global, scope, &current)?;
+    }
+    Ok(())
 }
 
 /// The customer `session_id`'s record holds (tri-state,
@@ -11801,6 +11814,57 @@ mod tests {
             compaction_usage(&request.transcript_path),
             vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
         );
+    }
+
+    /// A compaction request persists its customer on the session record
+    /// BEFORE it runs (as a turn does), so one that fails early still leaves
+    /// the record showing the customer it resolved.
+    #[tokio::test]
+    async fn a_compaction_that_fails_early_still_records_its_customer() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_customer01");
+        let store = rupu_workspace::CustomerStore::new(&global);
+        store
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("create customer");
+        store
+            .assign(
+                "acme",
+                rupu_workspace::ProjectRef::Path(&record.workspace_path),
+            )
+            .expect("assign");
+        record.customer = Some(None);
+        record.provider_name = "no-such-provider".into();
+        record.context_window_tokens = Some(1000);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let request = SessionTurnRequest {
+            version: SessionTurnRequest::VERSION,
+            request_id: "req_1".into(),
+            run_id: "run_compact_customer".into(),
+            prompt: "[compact]".into(),
+            transcript_path: record.transcripts_dir.join("run_compact_customer.jsonl"),
+            enqueued_at: Utc::now(),
+            compact: true,
+        };
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let result =
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request).await;
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        assert!(result.is_err(), "the provider can't be built");
+        let after = read_session(&global, &record.session_id).expect("read").0;
+        assert_eq!(after.customer, Some(Some("acme".to_string())));
     }
 
     /// The run-start `model_limits` notice message from a turn's transcript.

@@ -601,7 +601,6 @@ struct Assignment {
     slug: String,
 }
 
-/// A sidecar's slug; `None` when the file is absent or blank.
 /// Remove an assignment sidecar; already gone is fine.
 fn remove_sidecar(sidecar: &Path) -> Result<(), CustomerError> {
     match std::fs::remove_file(sidecar) {
@@ -664,6 +663,7 @@ fn with_assignment_lock<T>(
     out
 }
 
+/// A sidecar's slug; `None` when the file is absent or blank.
 fn read_sidecar(path: &Path) -> Result<Option<String>, CustomerError> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),

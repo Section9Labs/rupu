@@ -1611,12 +1611,13 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
 
 /// Classify a failed remote `rupu run list` ([`run_list_command`]).
 ///
-/// - an ssh transport failure (host down) passes through as `Unreachable`
-///   (offline);
 /// - a remote rupu that FAILED and advertises [`CAP_RUN_LIST`] (its stderr
-///   carries [`RUN_LIST_SUPPORTED`]) is `Invalid` carrying the remote's
+///   carries [`RUN_LIST_SUPPORTED`] — checked first: the marker proves the
+///   remote shell ran) is `Invalid` carrying the remote's
 ///   error as-is — 501 "unavailable: <its reason>", never mislabelled as a
 ///   missing command nor as a host that is down;
+/// - otherwise an ssh transport failure (host down) passes through as
+///   `Unreachable` (offline);
 /// - anything else — a remote whose `rupu __features` doesn't list the
 ///   feature (or predates `__features`), or whose listing printed something
 ///   other than the JSON report — predates the command: `Unsupported`
@@ -1626,15 +1627,19 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
 /// A capability gate, not a guess from the error text.
 fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError {
     match e {
-        HostConnectorError::Unreachable(msg) if is_ssh_transport_failure(&msg) => {
-            HostConnectorError::Unreachable(msg)
-        }
+        // Checked FIRST: the marker proves the remote shell ran, so the
+        // failure is the remote rupu's own — even if its error text happens
+        // to contain a transport phrase ("broken pipe", "connection refused"
+        // from something it talked to) — never an offline host.
         HostConnectorError::Unreachable(msg) if msg.contains(RUN_LIST_SUPPORTED) => {
             let reason: Vec<&str> = msg
                 .lines()
                 .filter(|l| l.trim() != RUN_LIST_SUPPORTED)
                 .collect();
             HostConnectorError::Invalid(reason.join("\n").trim().to_string())
+        }
+        HostConnectorError::Unreachable(msg) if is_ssh_transport_failure(&msg) => {
+            HostConnectorError::Unreachable(msg)
         }
         other => HostConnectorError::Unsupported(format!(
             "remote host {host_id} does not support `rupu run list` \
@@ -4885,6 +4890,22 @@ mod tests {
         assert_eq!(
             crate::api::runs::host_list_error(err).0,
             axum::http::StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    /// The marker proves the remote shell ran: a remote error whose text
+    /// contains a transport phrase is still the remote's failure (`Invalid`),
+    /// never an offline host.
+    #[tokio::test]
+    async fn the_capability_marker_wins_over_transport_phrases() {
+        let msg =
+            format!("error: fetch failed: broken pipe; connection refused\n{RUN_LIST_SUPPORTED}\n");
+        let fake = std::sync::Arc::new(FakeExec::offline(&msg));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.list_runs(all_runs()).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m) if m.contains("broken pipe")),
+            "{err}"
         );
     }
 
