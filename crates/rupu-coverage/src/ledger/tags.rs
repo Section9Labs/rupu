@@ -98,6 +98,16 @@ pub fn parse_tags<S: AsRef<str>>(raw: &[S]) -> Result<Vec<Tag>, TagParseError> {
     Ok(set.into_iter().collect())
 }
 
+/// The `tags` property `report_finding` and `findings.record` advertise.
+pub fn tags_schema_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "maxItems": MAX_TAGS_PER_FINDING,
+        "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (query_findings / findings.query list them)."
+    })
+}
+
 /// The tag log's file name, at `<workspace>/.rupu/coverage/`.
 pub const TAG_LOG_FILE: &str = "finding_tags.jsonl";
 

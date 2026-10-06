@@ -86,6 +86,7 @@ pub fn specs() -> Vec<ToolSpec> {
     // `json!` cannot embed a function call as a value inside the literal, so
     // the report schema is attached after construction.
     input_schema["properties"]["report"] = rupu_coverage::report::schema::advertised_schema();
+    input_schema["properties"]["tags"] = rupu_coverage::tags_schema_property();
     vec![ToolSpec {
         name: "findings.record",
         description: "Record a security finding in this project's findings ledger, so it appears \
@@ -102,6 +103,8 @@ pub fn specs() -> Vec<ToolSpec> {
 
 #[derive(Debug, Deserialize)]
 pub struct RecordArgs {
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub scope: rupu_coverage::FindingScope,
     #[serde(default)]
     pub summary: Option<String>,
@@ -177,6 +180,7 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         // Engagement asset arg is wired through the MCP tool in the selection
         // step; until then findings.record uses the native code path.
         asset: None,
+        tags: args.tags,
     };
     // Locator, profile and report validation live in `report_finding` so both
     // the agent builtin and this tool enforce the same rule. Two paths

@@ -36,6 +36,10 @@ pub struct ReportFindingInput {
     /// the native code path (no active engagement).
     #[serde(default)]
     pub asset: Option<AssetRef>,
+    /// Tags to declare the finding with: free-form, normalized and validated
+    /// (`ledger::tags::Tag`), at most 32. Changed later with `tag_findings`.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// The asset a finding is about: a profile-namespaced `kind` and the locator
@@ -62,6 +66,10 @@ pub enum ReportFindingError {
     Io(#[from] std::io::Error),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("{0}")]
+    Tag(#[from] crate::ledger::tags::TagParseError),
+    #[error("a finding can carry at most {max} tags; {count} were given")]
+    TooManyTags { count: usize, max: usize },
     #[error("scope `{scope}` requires {needs}, but {got}")]
     Locator {
         scope: &'static str,
@@ -104,6 +112,13 @@ pub fn report_finding(
 ) -> Result<ReportFindingOutput, ReportFindingError> {
     use crate::report::FindingProfile;
 
+    let tags = crate::ledger::tags::parse_tags(&input.tags)?;
+    if tags.len() > crate::ledger::tags::MAX_TAGS_PER_FINDING {
+        return Err(ReportFindingError::TooManyTags {
+            count: tags.len(),
+            max: crate::ledger::tags::MAX_TAGS_PER_FINDING,
+        });
+    }
     validate_locator(&input)?;
     let (summary, severity, evidence, report) = match opts.profile {
         FindingProfile::Summary => {
@@ -218,7 +233,7 @@ pub fn report_finding(
         declared_at: Utc::now(),
         profile: opts.profile,
         report,
-        tags: Vec::new(),
+        tags,
     };
     paths.ensure_dir()?;
     // One write per line, under the ledger lock, then the run stream — see
@@ -614,6 +629,7 @@ mod tests {
             }),
             report: None,
             asset: None,
+            tags: Vec::new(),
         }
     }
 
@@ -727,6 +743,7 @@ mod tests {
                 }),
                 report: None,
                 asset: None,
+                tags: Vec::new(),
             },
             &summary_opts(),
         )
@@ -758,6 +775,7 @@ mod tests {
                 }),
                 report: None,
                 asset: None,
+                tags: Vec::new(),
             },
             &summary_opts(),
         )
@@ -817,6 +835,7 @@ mod tests {
             evidence: None,
             report: Some(report),
             asset: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1708,5 +1727,48 @@ mod tests {
         assert!(err.contains("report.artifacts"), "{err}");
         assert!(err.contains("40 artifact files"), "{err}");
         assert!(!paths.findings.exists(), "nothing written on rejection");
+    }
+
+    #[test]
+    fn declared_tags_are_normalized_onto_the_record() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut inp = input(FindingScope::Repo);
+        inp.tags = vec!["Needs-POC".into(), "class:sqli".into(), "needs-poc".into()];
+        let opts = crate::report::FindingWriteOptions::default()
+            .with_profile(crate::report::FindingProfile::Summary);
+        report_finding(&paths, attribution(), inp, &opts).unwrap();
+        let rec = &crate::ledger::views::read_findings(&paths).unwrap()[0];
+        let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
+        assert_eq!(tags, ["class:sqli", "needs-poc"]);
+    }
+
+    #[test]
+    fn an_invalid_tag_fails_the_call_before_anything_is_written() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut inp = input(FindingScope::Repo);
+        inp.tags = vec!["not ok".into()];
+        let opts = crate::report::FindingWriteOptions::default()
+            .with_profile(crate::report::FindingProfile::Summary);
+        let err = report_finding(&paths, attribution(), inp, &opts).unwrap_err();
+        assert!(err.to_string().contains("invalid tag `not ok`"), "{err}");
+        assert!(!paths.findings.exists());
+        assert!(!paths.assets.exists());
+    }
+
+    #[test]
+    fn more_than_the_cap_is_refused() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut inp = input(FindingScope::Repo);
+        inp.tags = (0..33).map(|i| format!("t{i}")).collect();
+        let opts = crate::report::FindingWriteOptions::default()
+            .with_profile(crate::report::FindingProfile::Summary);
+        let err = report_finding(&paths, attribution(), inp, &opts).unwrap_err();
+        assert!(
+            matches!(err, ReportFindingError::TooManyTags { count: 33, max: 32 }),
+            "{err}"
+        );
     }
 }

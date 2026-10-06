@@ -492,6 +492,7 @@ fn summary_schema() -> Value {
         "type": "object",
         "required": ["scope", "summary", "severity", "evidence"],
         "properties": {
+            "tags": rupu_coverage::tags_schema_property(),
             "file_path": {
                 "type": "string",
                 "description": "Workspace-relative path of the affected file, if applicable."

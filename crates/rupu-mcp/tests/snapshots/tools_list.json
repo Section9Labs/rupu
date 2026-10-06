@@ -1329,6 +1329,14 @@
           "description": "One sentence stating the weakness. Summary profile only.",
           "type": "string"
         },
+        "tags": {
+          "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (query_findings / findings.query list them).",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
         "target_ref": {
           "description": "The host, endpoint URL, or resource id — required for the target scopes.",
           "type": "string"
