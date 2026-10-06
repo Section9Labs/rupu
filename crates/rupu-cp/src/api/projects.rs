@@ -210,7 +210,11 @@ async fn list_projects(
                 crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
             let mut prices = crate::customers::PricingMemo::new(&pricing);
             let customers = project_customers(&mut lookup, &ws_ids)?;
-            let runs = run_store.list().unwrap_or_default();
+            // An unreadable run store fails the rollups rather than show
+            // every project with no spend.
+            let runs = run_store
+                .list()
+                .map_err(|e| ApiError::internal(format!("cannot list runs: {e}")))?;
             let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
             let rollups =
                 project_rollups(&run_store, &runs, &extras, &mut prices, &mut lookup, |_| {

@@ -208,6 +208,7 @@ fn build(global: &FsPath, dir: &FsPath, target: Target, name: &str) -> ApiResult
             name: &a.name,
             provider: a.provider.as_deref(),
             fallbacks: a.fallbacks.as_deref(),
+            auth: a.auth,
         })
         .collect();
 
@@ -322,6 +323,7 @@ fn scm_entry(
         role: AccountRole::Scm,
         account: account.0.clone(),
         kind: Some(repo.platform.as_str().to_string()),
+        auth_mode: None,
         agents: Vec::new(),
         source: if unchecked {
             format!("{source} · credentials not checked")

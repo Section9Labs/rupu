@@ -655,6 +655,28 @@ async fn a_malformed_layer_prices_at_global_rates_and_says_so() {
     assert!(rows[0]["pricing_error"].is_string(), "{rows}");
 }
 
+/// A run store that cannot be listed fails the rollups (500) — never a
+/// rollup of zero spend.
+#[tokio::test]
+async fn an_unreadable_run_store_fails_the_rollups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let base = spawn(global, true).await;
+    assert_eq!(
+        create(&base, "acme", "Acme").await.status(),
+        StatusCode::CREATED
+    );
+    // `runs` exists but is not a directory: listing it fails (not NotFound).
+    let runs = global.join("runs");
+    let _ = std::fs::remove_dir_all(&runs);
+    std::fs::write(&runs, "not a directory").unwrap();
+    for path in ["/api/customers", "/api/customers/acme", "/api/projects"] {
+        let (status, body) = error_of(format!("{base}{path}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}: {body}");
+        assert!(body.contains("cannot list runs"), "{path}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn archived_customers_are_hidden_unless_asked_for() {
     let tmp = tempfile::tempdir().unwrap();

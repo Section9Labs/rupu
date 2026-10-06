@@ -158,23 +158,27 @@ struct Pass {
 }
 
 impl Pass {
-    /// Blocking IO.
-    fn read(s_global: &FsPath, run_store: std::sync::Arc<RunStore>) -> Self {
-        let runs = run_store.list().unwrap_or_default();
+    /// Blocking IO. A run store or workspace registry that cannot be read
+    /// fails the request (500): a rollup over what could be read would
+    /// report a customer's work as smaller than it is.
+    fn read(s_global: &FsPath, run_store: std::sync::Arc<RunStore>) -> ApiResult<Self> {
+        let runs = run_store
+            .list()
+            .map_err(|e| ApiError::internal(format!("cannot list runs: {e}")))?;
         let claimed = crate::usage_sources::claimed_transcripts(&run_store, &runs);
         let extras = crate::usage_sources::extra_sources(s_global, &run_store, &claimed);
         let workspaces = WorkspaceStore {
             root: s_global.join("workspaces"),
         }
         .list()
-        .unwrap_or_default();
-        Self {
+        .map_err(|e| ApiError::internal(format!("cannot list projects: {e}")))?;
+        Ok(Self {
             run_store,
             runs,
             extras,
             workspaces,
             lookup: CustomerLookup::new(CustomerStore::new(s_global)),
-        }
+        })
     }
 
     /// Each customer's current projects (by the memoized assignment).
@@ -293,7 +297,7 @@ async fn list_customers(
         let list = store.list(include_archived).map_err(api_err)?;
         let wanted: BTreeSet<String> = list.iter().map(|c| c.slug.clone()).collect();
         let mut prices = PricingMemo::new(&pricing);
-        let mut pass = Pass::read(&global, run_store);
+        let mut pass = Pass::read(&global, run_store)?;
         let mut rollups = pass.rollups(&wanted, since, &mut prices)?;
         Ok(list
             .iter()
@@ -335,7 +339,7 @@ async fn get_customer(
         let store = CustomerStore::new(global.clone());
         let c = store.get(&slug).map_err(api_err)?;
         let mut prices = PricingMemo::new(&pricing);
-        let mut pass = Pass::read(&global, run_store);
+        let mut pass = Pass::read(&global, run_store)?;
         let wanted = BTreeSet::from([slug.clone()]);
         let rollup = pass
             .rollups(&wanted, since, &mut prices)?
@@ -513,7 +517,9 @@ async fn assign_project(
         let w = store
             .assign(&slug, ProjectRef::Id(&ws_id))
             .map_err(api_err)?;
-        let runs = run_store.list().unwrap_or_default();
+        let runs = run_store
+            .list()
+            .map_err(|e| ApiError::internal(format!("cannot list runs: {e}")))?;
         let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
         let mut lookup = CustomerLookup::new(store);
         let mut prices = PricingMemo::new(&pricing);

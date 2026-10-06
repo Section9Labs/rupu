@@ -161,7 +161,10 @@ Response `{customer, accounts, warnings, host?}`:
 
 - `customer` — the row reference (`slug`, `name`, `tint`, `archived`) or `null`.
 - `accounts` — `rupu_runtime::credential_manifest` entries
-  `{role: provider|fallback|scm, account, kind, agents[], source}`; `source` says
+  `{role: provider|fallback|scm, account, kind, auth_mode, agents[], source}`
+  (`auth_mode` is the agent's `auth:` — `api-key` / `sso` — on its provider entry
+  and on a fallback hop on that same provider, else `null`; entries are
+  deduplicated by role + account + `auth_mode`); `source` says
   where the choice came from ("agent frontmatter", "customer default", "global
   default · locked", "customer [recovery].fallbacks", "rule owner = acme-corp",
   …). Provider and fallback entries follow the run's own resolution rules

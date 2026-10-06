@@ -7,6 +7,10 @@
 //! [`rupu_config::RecoveryConfig::chain_for`] with the `recovery_opts` rule
 //! that an unnamed fallback entry stays on the run's own provider), so the
 //! preview cannot disagree with the run.
+//!
+//! Entries are deduplicated by (role, account, `auth_mode`): two agents on one
+//! account with different `auth:` modes authenticate differently, so they are
+//! two entries.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +34,12 @@ pub struct ManifestEntry {
     /// The vendor the account authenticates against (`anthropic`, `openai`,
     /// `github`, ...), when known.
     pub kind: Option<String>,
+    /// The agent's `auth:` mode (`api-key` / `sso`) on a provider entry,
+    /// and on a fallback entry on the agent's own provider — the hop rule
+    /// `RuntimeHopBuilder` applies (a hop on another provider uses that
+    /// provider's default). `None` = the account's default credential; always
+    /// `None` for scm.
+    pub auth_mode: Option<String>,
     /// Which agent(s) use it (provider/fallback); empty for scm.
     pub agents: Vec<String>,
     /// Human-readable origin: "agent frontmatter", "customer default",
@@ -43,6 +53,8 @@ pub struct AgentFacts<'a> {
     pub name: &'a str,
     pub provider: Option<&'a str>,
     pub fallbacks: Option<&'a [FallbackEntry]>,
+    /// The agent's `auth:` frontmatter.
+    pub auth: Option<rupu_providers::AuthMode>,
 }
 
 fn layer_label(source: KeySource) -> &'static str {
@@ -89,17 +101,19 @@ fn kind_of(cfg: &Config, account: &str) -> Option<String> {
     rupu_auth::ProviderId::from_vendor_str(account).map(|p| p.as_str().to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push(
     out: &mut Vec<ManifestEntry>,
     role: AccountRole,
     account: String,
     kind: Option<String>,
+    auth_mode: Option<String>,
     agent: &str,
     source: String,
 ) {
     if let Some(existing) = out
         .iter_mut()
-        .find(|e| e.role == role && e.account == account)
+        .find(|e| e.role == role && e.account == account && e.auth_mode == auth_mode)
     {
         if !existing.agents.iter().any(|a| a == agent) {
             existing.agents.push(agent.to_string());
@@ -115,12 +129,13 @@ fn push(
         role,
         account,
         kind,
+        auth_mode,
         agents: vec![agent.to_string()],
         source,
     });
 }
 
-/// Accounts a run will use. Deduplicates by (role, account), merging
+/// Accounts a run will use. Deduplicates by (role, account, auth_mode), merging
 /// `agents` and joining each distinct `source` with "; ". `scm` is appended as given.
 pub fn credential_manifest(
     cfg: &Config,
@@ -137,11 +152,13 @@ pub fn credential_manifest(
         } else {
             origin(provenance, "default_provider", "default", "built-in")
         };
+        let auth = agent.auth.map(|a| a.as_str().to_string());
         push(
             &mut out,
             AccountRole::Provider,
             provider.clone(),
             kind_of(cfg, &provider),
+            auth.clone(),
             agent.name,
             source,
         );
@@ -164,11 +181,14 @@ pub fn credential_manifest(
                 .filter(|p| !p.trim().is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| provider.clone());
+            // The agent's `auth:` applies only to a hop on its own provider.
+            let hop_auth = (account == provider).then(|| auth.clone()).flatten();
             push(
                 &mut out,
                 AccountRole::Fallback,
                 account.clone(),
                 kind_of(cfg, &account),
+                hop_auth,
                 agent.name,
                 chain_source.clone(),
             );
@@ -203,6 +223,7 @@ mod tests {
             name,
             provider,
             fallbacks: None,
+            auth: None,
         }
     }
 
@@ -295,6 +316,7 @@ mod tests {
                 name: "b",
                 provider: Some("openai"),
                 fallbacks: Some(&own),
+                auth: None,
             }],
             None,
         );
@@ -329,6 +351,7 @@ mod tests {
             role: AccountRole::Scm,
             account: "github-acme".into(),
             kind: Some("github".into()),
+            auth_mode: None,
             agents: vec![],
             source: "rule owner = acme-corp".into(),
         };
@@ -340,5 +363,61 @@ mod tests {
         );
         assert_eq!(m.last(), Some(&scm));
         assert_eq!(m.len(), 2);
+    }
+
+    /// The agent's `auth:` rides on its provider entry and on a fallback hop
+    /// on that same provider — not on a hop to another provider — and two
+    /// agents on one account with different modes are two entries.
+    #[test]
+    fn auth_mode_follows_the_agent_onto_its_own_provider_only() {
+        use rupu_providers::AuthMode;
+        let cfg = cfg_default("anthropic");
+        let chain = [
+            FallbackEntry {
+                provider: None,
+                model: "same-provider".into(),
+            },
+            FallbackEntry {
+                provider: Some("openai".into()),
+                model: "other".into(),
+            },
+        ];
+        let m = credential_manifest(
+            &cfg,
+            &BTreeMap::new(),
+            &[
+                AgentFacts {
+                    name: "a",
+                    provider: None,
+                    fallbacks: Some(&chain),
+                    auth: Some(AuthMode::ApiKey),
+                },
+                AgentFacts {
+                    name: "b",
+                    provider: None,
+                    fallbacks: None,
+                    auth: None,
+                },
+            ],
+            None,
+        );
+        let find = |role, account: &str, auth: Option<&str>| {
+            m.iter()
+                .find(|e| e.role == role && e.account == account && e.auth_mode.as_deref() == auth)
+                .unwrap_or_else(|| panic!("{role:?} {account} {auth:?} in {m:#?}"))
+        };
+        assert_eq!(
+            find(AccountRole::Provider, "anthropic", Some("api-key")).agents,
+            ["a"]
+        );
+        assert_eq!(find(AccountRole::Provider, "anthropic", None).agents, ["b"]);
+        assert_eq!(
+            find(AccountRole::Fallback, "anthropic", Some("api-key")).agents,
+            ["a"]
+        );
+        assert_eq!(find(AccountRole::Fallback, "openai", None).agents, ["a"]);
+        assert!(m
+            .iter()
+            .all(|e| !(e.account == "openai" && e.auth_mode.is_some())));
     }
 }

@@ -644,17 +644,24 @@ pub fn remote_aggregate_reason(host_id: &str) -> String {
 }
 
 /// Keep the remote `rows` whose `customer` matches `filter`. `None` when any
-/// row lacks the `customer` key (the host can't say whose that run is —
-/// never read as "no customer"); a `null` value is "no customer". An empty page is
-/// filterable and stays empty.
+/// row lacks the `customer` key, or carries a value that is neither a string
+/// nor `null` (the host can't say whose that run is — never read as "no
+/// customer"); a `null` value is "no customer". An empty page is filterable
+/// and stays empty.
 pub fn filter_remote_rows(
     rows: Vec<serde_json::Value>,
     filter: &CustomerFilter,
 ) -> Option<Vec<serde_json::Value>> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let customer = row.as_object()?.get("customer")?;
-        if filter.matches(customer.as_str()) {
+        let customer = match row.as_object()?.get("customer")? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.as_str()),
+            // A slug is a string: anything else is a row this coordinator
+            // cannot read, not "no customer".
+            _ => return None,
+        };
+        if filter.matches(customer) {
             out.push(row);
         }
     }
@@ -747,6 +754,34 @@ mod tests {
         assert!(!f.matches(None));
         assert!(u.matches(None));
         assert!(!u.matches(Some("acme")));
+    }
+
+    /// A remote row is filterable by a string or `null` `customer`; a row
+    /// without the key — or with any other value — makes the page
+    /// unfilterable (the host can't report), never "no customer".
+    #[test]
+    fn remote_rows_fail_closed_on_a_missing_or_malformed_customer() {
+        use serde_json::json;
+        let acme = CustomerFilter::Slug("acme".into());
+        let none = CustomerFilter::Unassigned;
+        let rows = vec![
+            json!({"id": "a", "customer": "acme"}),
+            json!({"id": "n", "customer": null}),
+        ];
+        assert_eq!(filter_remote_rows(rows.clone(), &acme).unwrap().len(), 1);
+        assert_eq!(filter_remote_rows(rows, &none).unwrap()[0]["id"], "n");
+        for bad in [
+            json!(7),
+            json!({"slug": "acme"}),
+            json!(["acme"]),
+            json!(false),
+        ] {
+            let rows = vec![json!({"id": "x", "customer": bad.clone()})];
+            assert!(filter_remote_rows(rows.clone(), &none).is_none(), "{bad}");
+            assert!(filter_remote_rows(rows, &acme).is_none(), "{bad}");
+        }
+        assert!(filter_remote_rows(vec![json!({"id": "x"})], &none).is_none());
+        assert_eq!(filter_remote_rows(vec![], &none), Some(vec![]));
     }
 
     fn assigned_store(home: &std::path::Path) -> CustomerStore {
