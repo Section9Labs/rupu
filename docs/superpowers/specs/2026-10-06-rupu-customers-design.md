@@ -359,7 +359,7 @@ are `StepFailed` with the message above. The CP shows both in the run's Events t
 1. **Model, config layer and CLI** — `CustomerStore`, sidecars, `LayerPaths` and the
    three-layer resolver, every call site converted, `rupu customer`, docs.
    (`docs/superpowers/plans/2026-10-06-rupu-customers-plan-1-model-config-cli.md`.)
-2. **CP surfaces** — run attribution (`customer` on run records and `RunStart`, moved
+2. **CP surfaces**, in two plans — 2A backend (`docs/superpowers/plans/2026-10-06-rupu-customers-plan-2a-cp-backend.md`) and 2B web (after the mockup is approved) — run attribution (`customer` on run records and `RunStart`, moved
    here from Plan 1 because its first consumer is the rollups), `credential_manifest`
    (moved here because its first consumer is the launch preview), API, rollups,
    `?customer=` filter, picker, Customers pages, management, launch preview (customer +
