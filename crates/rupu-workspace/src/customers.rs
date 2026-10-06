@@ -53,6 +53,25 @@ pub enum CustomerError {
     },
     #[error("no rupu project is registered as {0}")]
     NoProject(String),
+    #[error("invalid project id `{0}`: use letters, digits, `-` and `_`")]
+    InvalidWsId(String),
+    #[error(
+        "customer assignment {sidecar} cannot be resolved: {reason} \
+         (repair the workspace record, or remove the sidecar)"
+    )]
+    UnresolvableAssignment { sidecar: String, reason: String },
+    #[error(
+        "project {project} has two workspace records assigned to different customers: \
+         `{first_slug}` ({first_sidecar}) and `{second_slug}` ({second_sidecar}); \
+         remove one of the sidecars"
+    )]
+    ConflictingAssignments {
+        project: String,
+        first_slug: String,
+        first_sidecar: String,
+        second_slug: String,
+        second_sidecar: String,
+    },
     #[error("io {action}: {source}")]
     Io {
         action: String,
@@ -134,6 +153,21 @@ pub fn validate_slug(slug: &str) -> Result<(), CustomerError> {
         Ok(())
     } else {
         Err(CustomerError::InvalidSlug(slug.to_string()))
+    }
+}
+
+/// A workspace id's shape: non-empty letters, digits, `-` and `_` (a ULID
+/// in practice). Checked before an id is joined onto a path, so an id from
+/// a caller (`../../etc`) can never name a file outside the store.
+pub fn validate_ws_id(id: &str) -> Result<(), CustomerError> {
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(CustomerError::InvalidWsId(id.to_string()))
     }
 }
 
@@ -273,7 +307,8 @@ impl CustomerStore {
     pub fn create(&self, slug: &str, new: &NewCustomer) -> Result<Customer, CustomerError> {
         validate_slug(slug)?;
         let name = validate_name(&new.name)?;
-        if let Some(c) = &new.color {
+        let color = new.color.clone().filter(|s| !s.is_empty());
+        if let Some(c) = &color {
             validate_color(c)?;
         }
         if self.exists(slug) {
@@ -283,7 +318,7 @@ impl CustomerStore {
             name,
             notes: new.notes.clone().filter(|s| !s.is_empty()),
             contact: new.contact.clone().filter(|s| !s.is_empty()),
-            color: new.color.clone(),
+            color,
             archived: false,
             created_at: Utc::now().to_rfc3339(),
         };
@@ -347,9 +382,12 @@ impl CustomerStore {
     ) -> Result<Workspace, CustomerError> {
         let store = self.workspaces();
         match project {
-            ProjectRef::Id(id) => store
-                .load(id)?
-                .ok_or_else(|| CustomerError::NoProject(id.to_string())),
+            ProjectRef::Id(id) => {
+                validate_ws_id(id)?;
+                store
+                    .load(id)?
+                    .ok_or_else(|| CustomerError::NoProject(id.to_string()))
+            }
             ProjectRef::Path(p) if register_missing => Ok(register(&store, p)?),
             ProjectRef::Path(p) => find_by_path(&store, p)?
                 .ok_or_else(|| CustomerError::NoProject(p.display().to_string())),
@@ -386,22 +424,77 @@ impl CustomerStore {
     /// The slug in `ws_id`'s sidecar, as written — not checked against the
     /// customer directory (see [`Self::customer_config_for_dir`] for that).
     pub fn customer_of(&self, ws_id: &str) -> Result<Option<String>, CustomerError> {
-        let path = self.workspaces().customer_sidecar_path(ws_id);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(CustomerError::Io {
-                action: format!("read {}", path.display()),
+        validate_ws_id(ws_id)?;
+        read_sidecar(&self.workspaces().customer_sidecar_path(ws_id))
+    }
+
+    /// Every assignment sidecar (`workspaces/<id>.customer`) with a
+    /// non-empty slug. No sidecars (the common case) costs one `read_dir`.
+    fn assignments(&self) -> Result<Vec<Assignment>, CustomerError> {
+        let root = self.workspaces().root;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => {
+                return Err(CustomerError::Io {
+                    action: format!("read_dir {}", root.display()),
+                    source: e,
+                })
+            }
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| CustomerError::Io {
+                action: "read_dir entry".into(),
                 source: e,
-            }),
+            })?;
+            let sidecar = entry.path();
+            if sidecar.extension().and_then(|s| s.to_str()) != Some("customer") {
+                continue;
+            }
+            let id = sidecar
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Some(slug) = read_sidecar(&sidecar)? else {
+                continue;
+            };
+            out.push(Assignment { sidecar, id, slug });
+        }
+        // Deterministic order, so a conflict error names the same pair
+        // every time.
+        out.sort_by(|a, b| a.sidecar.cmp(&b.sidecar));
+        Ok(out)
+    }
+
+    /// The workspace record a sidecar assigns. A sidecar whose record is
+    /// missing, unreadable or corrupt is an error, never skipped: skipping
+    /// it would run that project on global config.
+    fn assigned_record(&self, a: &Assignment) -> Result<Workspace, CustomerError> {
+        let unresolvable = |reason: String| CustomerError::UnresolvableAssignment {
+            sidecar: a.sidecar.display().to_string(),
+            reason,
+        };
+        validate_ws_id(&a.id).map_err(|e| unresolvable(e.to_string()))?;
+        match self.workspaces().load(&a.id) {
+            Ok(Some(ws)) => Ok(ws),
+            Ok(None) => Err(unresolvable(format!(
+                "workspace record {}.toml is missing",
+                a.id
+            ))),
+            Err(e) => Err(unresolvable(e.to_string())),
         }
     }
 
+    /// The projects assigned to `slug`. Fails when one of its sidecars
+    /// names a record that cannot be read, so [`Self::delete`] never
+    /// removes a customer a project still points at.
     pub fn projects_of(&self, slug: &str) -> Result<Vec<Workspace>, CustomerError> {
         let mut out = Vec::new();
-        for ws in self.workspaces().list()? {
-            if self.customer_of(&ws.id)?.as_deref() == Some(slug) {
-                out.push(ws);
+        for a in self.assignments()? {
+            if a.slug == slug {
+                out.push(self.assigned_record(&a)?);
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -417,34 +510,54 @@ impl CustomerStore {
     /// on launch paths must fail the run, never fall back to global config.
     /// A `dir` that does not exist (a deleted worktree, say) is looked up
     /// from its nearest existing ancestor.
+    ///
+    /// Driven by the assignment sidecars, and fail-closed: a sidecar whose
+    /// workspace record cannot be read is an error
+    /// ([`CustomerError::UnresolvableAssignment`]), as are two records for
+    /// the same directory assigned to different customers
+    /// ([`CustomerError::ConflictingAssignments`]). A record whose directory
+    /// no longer exists is skipped — nothing can run there.
     pub fn customer_for_dir(&self, dir: &Path) -> Result<Option<String>, CustomerError> {
+        let assignments = self.assignments()?;
+        if assignments.is_empty() {
+            return Ok(None);
+        }
         let canonical = canonicalize_nearest(dir)?;
-        // One pass over the records, keyed by canonical path.
-        let mut by_path: BTreeMap<PathBuf, String> = BTreeMap::new();
-        for ws in self.workspaces().list()? {
-            if let Ok(p) = Path::new(&ws.path).canonicalize() {
-                by_path.insert(p, ws.id);
+        let mut by_path: BTreeMap<PathBuf, Vec<&Assignment>> = BTreeMap::new();
+        for a in &assignments {
+            let ws = self.assigned_record(a)?;
+            match Path::new(&ws.path).canonicalize() {
+                Ok(p) => by_path.entry(p).or_default().push(a),
+                Err(e) => warn!(
+                    sidecar = %a.sidecar.display(),
+                    path = %ws.path,
+                    error = %e,
+                    "skipping assignment whose project directory is gone"
+                ),
             }
         }
         for ancestor in canonical.ancestors() {
-            let Some(id) = by_path.get(ancestor) else {
+            let Some(found) = by_path.get(ancestor) else {
                 continue;
             };
-            let Some(slug) = self.customer_of(id)? else {
-                continue;
-            };
-            if validate_slug(&slug).is_err() || !self.exists(&slug) {
-                return Err(CustomerError::Dangling {
+            let first = found[0];
+            if let Some(other) = found.iter().find(|a| a.slug != first.slug) {
+                return Err(CustomerError::ConflictingAssignments {
                     project: ancestor.display().to_string(),
-                    slug,
-                    sidecar: self
-                        .workspaces()
-                        .customer_sidecar_path(id)
-                        .display()
-                        .to_string(),
+                    first_slug: first.slug.clone(),
+                    first_sidecar: first.sidecar.display().to_string(),
+                    second_slug: other.slug.clone(),
+                    second_sidecar: other.sidecar.display().to_string(),
                 });
             }
-            return Ok(Some(slug));
+            if validate_slug(&first.slug).is_err() || !self.exists(&first.slug) {
+                return Err(CustomerError::Dangling {
+                    project: ancestor.display().to_string(),
+                    slug: first.slug.clone(),
+                    sidecar: first.sidecar.display().to_string(),
+                });
+            }
+            return Ok(Some(first.slug.clone()));
         }
         Ok(None)
     }
@@ -454,6 +567,26 @@ impl CustomerStore {
         Ok(self
             .customer_for_dir(dir)?
             .map(|slug| self.config_path(&slug)))
+    }
+}
+
+/// One `workspaces/<id>.customer` sidecar.
+#[derive(Debug)]
+struct Assignment {
+    sidecar: PathBuf,
+    id: String,
+    slug: String,
+}
+
+/// A sidecar's slug; `None` when the file is absent or blank.
+fn read_sidecar(path: &Path) -> Result<Option<String>, CustomerError> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CustomerError::Io {
+            action: format!("read {}", path.display()),
+            source: e,
+        }),
     }
 }
 
@@ -474,21 +607,33 @@ fn canonicalize_nearest(dir: &Path) -> Result<PathBuf, CustomerError> {
         })
 }
 
-/// Temp file + rename, so readers never see a partial file.
+/// A uniquely named temp file in the target's directory + rename, so readers
+/// never see a partial file, concurrent writers never share (and tear) one
+/// temp file, and a failed write or rename leaves no temp file behind
+/// (`NamedTempFile` removes itself on drop).
 fn write_atomic(path: &Path, body: &str) -> Result<(), CustomerError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CustomerError::Io {
-            action: format!("create_dir_all {}", parent.display()),
-            source: e,
-        })?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body).map_err(|e| CustomerError::Io {
-        action: format!("write {}", tmp.display()),
+    use std::io::Write;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|e| CustomerError::Io {
+        action: format!("create_dir_all {}", parent.display()),
         source: e,
     })?;
-    std::fs::rename(&tmp, path).map_err(|e| CustomerError::Io {
-        action: format!("rename {} -> {}", tmp.display(), path.display()),
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| CustomerError::Io {
+        action: format!("create temp file in {}", parent.display()),
         source: e,
-    })
+    })?;
+    tmp.write_all(body.as_bytes())
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| CustomerError::Io {
+            action: format!("write temp file for {}", path.display()),
+            source: e,
+        })?;
+    tmp.persist(path).map_err(|e| CustomerError::Io {
+        action: format!("rename temp file -> {}", path.display()),
+        source: e.error,
+    })?;
+    Ok(())
 }
