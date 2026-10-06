@@ -190,6 +190,12 @@ async fn put_project(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_writable(&s)?;
     let path = project_config_path(&s, &id)?;
+    if is_same_file(&path, &s.global_dir.join("config.toml")) {
+        return Err(ApiError::bad_request(format!(
+            "this project's config is the global config ({}); edit it as the global config",
+            path.display()
+        )));
+    }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let cand = candidate_toml(&body, &existing)?;
     reject_locked_project_keys(&s, &cand)?;
@@ -546,6 +552,39 @@ mod tests {
 
         assert_eq!(view.effective["default_model"], "acme-model");
         assert_eq!(view.raw_project, None);
+    }
+
+    #[tokio::test]
+    async fn put_project_refuses_when_the_project_config_is_the_global_config() {
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join(".rupu");
+        std::fs::create_dir_all(home.join("workspaces")).unwrap();
+        let original = "default_model = \"opus\"\n";
+        std::fs::write(home.join("config.toml"), original).unwrap();
+        std::fs::write(
+            home.join("workspaces/ws_home.toml"),
+            format!(
+                "id = \"ws_home\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+        let s = AppState::new(home.clone(), rupu_config::PricingConfig::default())
+            .with_launcher(Some(Arc::new(DummyLauncher)));
+
+        let body = ConfigWriteBody {
+            raw: Some("default_model = \"x\"\n".into()),
+            patch: None,
+        };
+        let err = put_project(State(s), AxPath("ws_home".into()), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            original,
+            "the global config must not be written through the project endpoint"
+        );
     }
 
     #[tokio::test]
