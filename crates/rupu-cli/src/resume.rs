@@ -14,7 +14,7 @@ use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult};
 use rupu_orchestrator::{DefaultStepFactory, RunStore, Workflow};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Build the `action_dispatcher` every `OrchestratorRunOpts` construction
@@ -251,6 +251,22 @@ pub async fn build_reject_cleanup_opts(
     Ok((opts, chain_len))
 }
 
+/// The directory a resumed run looks its customer up from: the launch's
+/// persisted `<run>/customer_dir` (the repo's checkout for an autoflow
+/// worktree or clone-target run), else — for a run that predates it — its
+/// `workspace_path`. A sidecar that exists but cannot be read is an error,
+/// never a silent fall back.
+pub(crate) fn customer_lookup_dir(
+    store: &RunStore,
+    run_id: &str,
+    workspace_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    Ok(store
+        .read_customer_dir(run_id)
+        .map_err(|e| anyhow::anyhow!("read customer lookup dir of run {run_id}: {e}"))?
+        .unwrap_or_else(|| workspace_path.to_path_buf()))
+}
+
 /// Shared disk-rebuild step for [`resume_run`] (approve-resume) and
 /// [`build_reject_cleanup_opts`] (reject-cleanup): reload the persisted
 /// workflow snapshot + prior step results and reconstruct the full
@@ -309,7 +325,8 @@ async fn rebuild_opts_from_disk(
     // Standard wiring (mirrors `run` above; refactor candidate but
     // keeping inline for now to avoid spreading the resume path
     // across the CLI surface).
-    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &workspace_path)?;
+    let customer_lookup_dir = customer_lookup_dir(store, run_id, &workspace_path)?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &customer_lookup_dir)?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     // Rooted at `global` like everything else here: the resolver reads
     // `<global>/auth.json` and never resolves the home on its own.

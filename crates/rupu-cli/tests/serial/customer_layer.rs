@@ -286,3 +286,92 @@ async fn workflow_run_fails_on_a_dangling_assignment() {
     let code = run_hello_wf(tmp.child(".rupu").path(), &project).await;
     assert!(!ok(code), "must not fall back to global config");
 }
+
+const GATE_WF: &str = "name: gate-wf\nsteps:\n  - id: gate\n    approval:\n      prompt: go?\n  - id: a\n    agent: echo\n    actions: []\n    prompt: hi\n";
+
+/// Launch `gate-wf` from the assigned project (it parks at its gate), then
+/// point the run's `workspace_path` at an unassigned directory — what an
+/// autoflow issue worktree or a temp clone looks like to resume. With
+/// `keep_sidecar = false` the run's `customer_dir` file is removed, as for
+/// a run that predates it. Then `workflow approve` resumes the run; returns
+/// the `RunStart` line of step `a`'s transcript.
+async fn approve_after_moving_workspace(keep_sidecar: bool) -> String {
+    let (tmp, project) = workflow_fixture(
+        "default_provider = \"anthropic-acme\"\n[providers.anthropic-acme]\nkind = \"anthropic\"\n",
+    );
+    let home = tmp.child(".rupu");
+    home.child("workflows/gate-wf.yaml")
+        .write_str(GATE_WF)
+        .unwrap();
+    let elsewhere = tmp.child("elsewhere");
+    elsewhere.create_dir_all().unwrap();
+    let run_id = "run_customer_dir_resume".to_string();
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", ECHO_SCRIPT);
+    std::env::set_current_dir(&project).unwrap();
+    Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "gate-wf".into(),
+        "--run-id".into(),
+        run_id.clone(),
+        "--plain".into(),
+    ]))
+    .await;
+
+    let store = rupu_orchestrator::RunStore::new(home.path().join("runs"));
+    let mut record = store.load(&run_id).unwrap();
+    assert_eq!(
+        record.status,
+        rupu_orchestrator::RunStatus::AwaitingApproval
+    );
+    let persisted = store.read_customer_dir(&run_id).unwrap();
+    assert_eq!(
+        persisted.as_deref().map(|p| p.canonicalize().unwrap()),
+        Some(project.canonicalize().unwrap()),
+        "the launch persists its customer lookup dir"
+    );
+    if !keep_sidecar {
+        std::fs::remove_file(store.customer_dir_path(&run_id)).unwrap();
+    }
+    record.workspace_path = elsewhere.path().to_path_buf();
+    store.update(&record).unwrap();
+
+    std::env::set_current_dir(elsewhere.path()).unwrap();
+    let code = Box::pin(rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "approve".into(),
+        run_id.clone(),
+    ]))
+    .await;
+    assert!(ok(code), "approve failed");
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
+    let steps = store.read_step_results(&run_id).unwrap();
+    let step = steps.iter().find(|s| s.step_id == "a").unwrap();
+    let transcript = std::fs::read_to_string(&step.transcript_path).unwrap();
+    transcript.lines().next().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_takes_the_customer_from_the_persisted_launch_dir() {
+    let _guard = ENV_LOCK.lock().await;
+    let run_start = approve_after_moving_workspace(true).await;
+    assert!(
+        run_start.contains("\"provider\":\"anthropic-acme\""),
+        "the resumed step should run on the customer's account: {run_start}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_without_the_persisted_dir_uses_the_workspace_path() {
+    let _guard = ENV_LOCK.lock().await;
+    let run_start = approve_after_moving_workspace(false).await;
+    assert!(
+        run_start.contains("\"provider\":\"anthropic\""),
+        "an unassigned workspace path resolves no customer, as before: {run_start}"
+    );
+}

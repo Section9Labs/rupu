@@ -3702,8 +3702,11 @@ pub(crate) async fn resume_run(
     // original run used.
     let project_root = paths::project_root_for(&workspace_path)?;
 
-    // Standard wiring (mirrors `approve` above).
-    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &workspace_path)?;
+    // Standard wiring (mirrors `approve` above). The customer comes from the
+    // launch's persisted lookup dir; a run that predates it uses its
+    // workspace path.
+    let customer_lookup_dir = crate::resume::customer_lookup_dir(&store, run_id, &workspace_path)?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &customer_lookup_dir)?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
@@ -5512,11 +5515,15 @@ async fn execute_workflow_invocation(
             .and_then(|repo| repo.repo_ref.as_deref()),
     )?;
     let prepared_run = prepare_local_run(&run_envelope, &worker_record.worker_id)?;
-    let cfg_paths = paths::config_paths(
-        &global,
-        ctx.project_root.as_deref(),
-        ctx.customer_dir.as_deref().unwrap_or(&ctx.workspace_path),
-    )?;
+    // The directory this run's customer is looked up from. Persisted next to
+    // the run (below) so `workflow resume` finds the same customer even when
+    // `workspace_path` is an autoflow worktree or a temp clone.
+    let customer_lookup_dir = ctx
+        .customer_dir
+        .clone()
+        .unwrap_or_else(|| ctx.workspace_path.clone());
+    let cfg_paths =
+        paths::config_paths(&global, ctx.project_root.as_deref(), &customer_lookup_dir)?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
@@ -5565,6 +5572,9 @@ async fn execute_workflow_invocation(
     run_store
         .write_run_envelope(&run_id, &run_envelope)
         .map_err(|e| anyhow::anyhow!("persist run envelope: {e}"))?;
+    run_store
+        .write_customer_dir(&run_id, &customer_lookup_dir)
+        .map_err(|e| anyhow::anyhow!("persist customer lookup dir: {e}"))?;
 
     // Hoisted above the dispatcher build (was created a few lines further
     // down, right before `opts`) so `CliAgentDispatcher` can be handed a
@@ -7325,6 +7335,88 @@ mod tests {
             .unwrap()
             .is_empty());
         std::env::remove_var("RUPU_HOME");
+    }
+
+    /// `workflow resume` looks the run's customer up from the launch's
+    /// persisted `<run>/customer_dir`, not from `workspace_path` (here an
+    /// unassigned directory, as an autoflow issue worktree or a temp clone
+    /// is). Observed as the account the resumed step ran on: the agent names
+    /// no provider, the customer's layer sets `default_provider`. Without
+    /// the file (a run that predates it) the lookup uses `workspace_path`,
+    /// as before, and the step runs on the global default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_takes_the_customer_from_the_persisted_launch_dir() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        for (keep_sidecar, expected) in [(true, "anthropic-acme"), (false, "anthropic")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(home.join("agents")).unwrap();
+            std::fs::write(
+                home.join("agents/echo.md"),
+                "---\nname: echo\nmodel: claude-sonnet-4-6\n---\nyou echo.",
+            )
+            .unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                "default_provider = \"anthropic\"\n",
+            )
+            .unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let customers = rupu_workspace::CustomerStore::new(&home);
+            customers
+                .create(
+                    "acme",
+                    &rupu_workspace::NewCustomer {
+                        name: "Acme".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            std::fs::write(
+                customers.config_path("acme"),
+                "default_provider = \"anthropic-acme\"\n[providers.anthropic-acme]\nkind = \"anthropic\"\n",
+            )
+            .unwrap();
+            customers
+                .assign("acme", rupu_workspace::ProjectRef::Path(&repo))
+                .unwrap();
+
+            let store = rupu_orchestrator::RunStore::new(home.join("runs"));
+            let mut record = sample_run_record(RunStatus::Paused, None);
+            record.id = format!("run_customer_dir_{keep_sidecar}");
+            record.workspace_path = tmp.path().join("worktree");
+            record.transcript_dir = tmp.path().join("transcripts");
+            std::fs::create_dir_all(&record.workspace_path).unwrap();
+            store
+                .create(
+                    record.clone(),
+                    "name: sample\nsteps:\n  - id: a\n    agent: echo\n    actions: []\n    prompt: hi\n",
+                )
+                .unwrap();
+            if keep_sidecar {
+                store.write_customer_dir(&record.id, &repo).unwrap();
+            }
+
+            std::env::set_var("RUPU_HOME", &home);
+            std::env::set_var(
+                "RUPU_MOCK_PROVIDER_SCRIPT",
+                r#"[{ "AssistantText": { "text": "done", "stop": "end_turn" } }]"#,
+            );
+            let result = resume_run(&record.id, Some("bypass"), true, false, false).await;
+            std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+            std::env::remove_var("RUPU_HOME");
+            result.expect("the resume runs to completion");
+
+            let steps = store.read_step_results(&record.id).unwrap();
+            let step = steps.iter().find(|s| s.step_id == "a").unwrap();
+            let transcript = std::fs::read_to_string(&step.transcript_path).unwrap();
+            let run_start = transcript.lines().next().unwrap();
+            assert!(
+                run_start.contains(&format!("\"provider\":\"{expected}\"")),
+                "keep_sidecar={keep_sidecar}: {run_start}"
+            );
+        }
     }
 
     /// A cancel that lands between the resume's load and its flip to
