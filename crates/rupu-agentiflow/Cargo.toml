@@ -35,6 +35,9 @@ rupu-tools = { path = "../rupu-tools" }
 # RunTriggerSource (the persisted record's `trigger`). rupu-runtime does not
 # depend on rupu-agentiflow, so this edge is acyclic too.
 rupu-runtime = { path = "../rupu-runtime" }
+# The unit's transcript reader (started-evidence + final answer) for the
+# subprocess launcher. A leaf crate, so this edge is acyclic.
+rupu-transcript = { path = "../rupu-transcript" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

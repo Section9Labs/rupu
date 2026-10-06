@@ -14,6 +14,7 @@ mod lead;
 mod operator;
 mod proc;
 mod run;
+mod subprocess;
 mod supervisor;
 mod tools;
 mod unit;
@@ -38,6 +39,7 @@ pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
+pub use subprocess::SubprocessUnitLauncher;
 pub use supervisor::FleetSupervisor;
 pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
