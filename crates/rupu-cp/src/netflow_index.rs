@@ -104,8 +104,6 @@ impl LedgerSummary {
         }
     }
 
-    // Read by Task 5's budget accounting (`status`).
-    #[allow(dead_code)]
     pub(crate) fn heap_bytes(&self) -> usize {
         self.points.capacity() * std::mem::size_of::<HistPoint>()
             + self.origins.iter().map(|o| o.len() + 48).sum::<usize>()
@@ -164,10 +162,7 @@ struct Entry {
 pub struct NetflowIndex {
     entries: Mutex<HashMap<PathBuf, Arc<Mutex<Entry>>>>,
     resident_bytes: AtomicU64,
-    // Read by Task 5's eviction pass.
-    #[allow(dead_code)]
     budget_bytes: AtomicU64,
-    #[allow(dead_code)]
     evictions: AtomicU64,
 }
 
@@ -363,14 +358,93 @@ impl NetflowIndex {
         true
     }
 
-    /// Placeholder until Task 5 adds eviction.
-    fn enforce_budget(&self) {}
+    pub fn set_budget_bytes(&self, bytes: u64) {
+        self.budget_bytes.store(bytes, Ordering::Relaxed);
+    }
 
-    /// Placeholder until Task 5 fills the memory figures.
+    /// Drop tier 2 of the files with the oldest newest-flow first until the
+    /// resident rows fit the budget. Entries locked by an in-flight read are
+    /// skipped this pass (they are re-checked on the next call). Only
+    /// `try_lock` is used while the map lock is held, so this never blocks
+    /// behind a read.
+    fn enforce_budget(&self) {
+        let budget = self.budget_bytes.load(Ordering::Relaxed);
+        if self.resident_bytes.load(Ordering::Relaxed) <= budget {
+            return;
+        }
+        let mut candidates: Vec<_> = {
+            let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+            map.values()
+                .filter_map(|entry| {
+                    let e = entry.try_lock().ok()?;
+                    e.resident.as_ref()?;
+                    Some((e.summary.max_ts, Arc::clone(entry)))
+                })
+                .collect()
+        };
+        candidates.sort_by_key(|(max_ts, _)| *max_ts);
+        let mut evicted = 0u64;
+        let mut freed = 0u64;
+        for (_, entry) in candidates {
+            if self.resident_bytes.load(Ordering::Relaxed) <= budget {
+                break;
+            }
+            if let Ok(mut e) = entry.try_lock() {
+                if let Some(r) = e.resident.take() {
+                    self.resident_bytes
+                        .fetch_sub(r.accounted, Ordering::Relaxed);
+                    freed += r.accounted;
+                    evicted += 1;
+                }
+            }
+        }
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted, Ordering::Relaxed);
+            tracing::debug!(
+                evicted,
+                freed_bytes = freed,
+                budget_bytes = budget,
+                "netflow index evicted rows"
+            );
+        }
+    }
+
+    /// Sizes for diagnostics. An entry locked by an in-flight read is not
+    /// counted in the per-file figures (`files` and `tier2_bytes` still are).
     pub fn status(&self) -> IndexStatus {
-        IndexStatus {
-            files: self.entries.lock().unwrap_or_else(|p| p.into_inner()).len() as u64,
-            ..IndexStatus::default()
+        let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = IndexStatus {
+            files: map.len() as u64,
+            flows: 0,
+            tier1_bytes: 0,
+            tier2_bytes: self.resident_bytes.load(Ordering::Relaxed),
+            budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
+            resident_files: 0,
+            evictions_total: self.evictions.load(Ordering::Relaxed),
+        };
+        for entry in map.values() {
+            if let Ok(e) = entry.try_lock() {
+                st.flows += e.summary.flow_count as u64;
+                st.tier1_bytes += e.summary.heap_bytes() as u64;
+                st.resident_files += u64::from(e.resident.is_some());
+            }
+        }
+        st
+    }
+
+    /// Forget every entry whose path is not in `keep` (called with the full
+    /// global listing, so pruned or unregistered ledgers do not linger).
+    /// Entries that never loaded are dropped by the same rule.
+    pub fn retain_only(&self, keep: &std::collections::HashSet<PathBuf>) {
+        let dropped: Vec<Arc<Mutex<Entry>>> = {
+            let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+            let gone: Vec<PathBuf> = map.keys().filter(|p| !keep.contains(*p)).cloned().collect();
+            gone.into_iter().filter_map(|p| map.remove(&p)).collect()
+        };
+        // Outside the map lock: waiting on an in-flight read is fine here.
+        for entry in dropped {
+            let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+            self.drop_resident(&mut e);
         }
     }
 }
@@ -681,5 +755,79 @@ mod tests {
         append(&p, &line(&LedgerLine::Flow(Box::new(flow(9, 900)))));
         assert_same(&index, &p, &all());
         assert_eq!(index.summary(&p).unwrap().flow_count, 3);
+    }
+
+    fn ledger_with(dir: &Path, name: &str, base: u64, secs: i64, n: u64) -> PathBuf {
+        let p = dir.join(name);
+        for i in 0..n {
+            append(
+                &p,
+                &line(&LedgerLine::Flow(Box::new(flow(base + i, secs + i as i64)))),
+            );
+        }
+        p
+    }
+
+    #[test]
+    fn over_budget_evicts_the_oldest_files_rows_and_rereads_them_correctly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = ledger_with(tmp.path(), "run_old.jsonl", 0, 100, 200);
+        let new = ledger_with(tmp.path(), "run_new.jsonl", 1000, 10_000, 200);
+        let index = NetflowIndex::new(u64::MAX);
+        index.flows_in_range(&old, &all());
+        index.flows_in_range(&new, &all());
+        let both = index.status().tier2_bytes;
+        // Room for roughly one file's rows.
+        index.set_budget_bytes(both * 2 / 3);
+        index.flows_in_range(&new, &all());
+        let st = index.status();
+        assert!(st.tier2_bytes <= st.budget_bytes, "{st:?}");
+        assert_eq!(st.resident_files, 1);
+        assert!(st.evictions_total >= 1);
+        // Evicted rows are re-read on demand and the answer is unchanged.
+        assert_same(&index, &old, &all());
+    }
+
+    #[test]
+    fn a_zero_budget_still_answers_every_read_exactly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 50);
+        let index = NetflowIndex::new(0);
+        assert_same(&index, &p, &all());
+        append(&p, &line(&LedgerLine::Flow(Box::new(flow(999, 999)))));
+        assert_same(&index, &p, &all());
+        assert_eq!(index.status().tier2_bytes, 0);
+        assert_eq!(index.summary(&p).unwrap().flow_count, 51);
+    }
+
+    #[test]
+    fn status_counts_files_flows_and_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 3);
+        let b = ledger_with(tmp.path(), "run_b.jsonl", 10, 100, 4);
+        let index = NetflowIndex::new(1 << 30);
+        index.summary(&a);
+        index.summary(&b);
+        let st = index.status();
+        assert_eq!((st.files, st.flows, st.resident_files), (2, 7, 2));
+        assert!(st.tier1_bytes > 0 && st.tier2_bytes > 0);
+        assert_eq!(st.budget_bytes, 1 << 30);
+    }
+
+    #[test]
+    fn retain_only_drops_entries_not_listed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 3);
+        let b = ledger_with(tmp.path(), "run_b.jsonl", 10, 100, 4);
+        let index = NetflowIndex::new(u64::MAX);
+        index.summary(&a);
+        index.summary(&b);
+        index.retain_only(&std::iter::once(a.clone()).collect());
+        let st = index.status();
+        assert_eq!((st.files, st.flows), (1, 3));
+        assert!(st.tier2_bytes > 0);
+        index.retain_only(&std::collections::HashSet::new());
+        let st = index.status();
+        assert_eq!((st.files, st.flows, st.tier2_bytes), (0, 0, 0));
     }
 }
