@@ -21,6 +21,7 @@ mod subprocess;
 mod supervisor;
 mod tools;
 mod unit;
+mod usage;
 #[cfg(test)]
 mod verify_fixtures;
 
@@ -59,3 +60,4 @@ pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
     MockUnitLauncher, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
 };
+pub use usage::{fold_tokens, TokenTotals, Tokens};
