@@ -230,6 +230,25 @@ impl AgentiflowDef {
                             g.id
                         )));
                     }
+                    // `verify_with` must name an agent the pool can actually run, or
+                    // the goal could never be met (fail closed, like the lead check).
+                    // The pool test is on the EXACT string: `is_verified` matches the
+                    // finding's `by_agent` against it verbatim, so a padded name could
+                    // never be satisfied.
+                    if let Some(name) = g.verify_with.as_deref() {
+                        if name.trim().is_empty() {
+                            return Err(Invalid(format!(
+                                "goal `{}`: `verify_with` is blank (it must name a verifier agent in pool.agents)",
+                                g.id
+                            )));
+                        }
+                        if !self.pool.agents.iter().any(|a| a == name) {
+                            return Err(Invalid(format!(
+                                "goal `{}`: verify_with `{}` is not in pool.agents (a verifier must be a pool agent)",
+                                g.id, name
+                            )));
+                        }
+                    }
                 }
                 (None, Some(a)) => {
                     let Some(depth) = g.target.depth_at_least.as_deref() else {
@@ -636,6 +655,38 @@ trigger: manual
         );
         d.goals[0].verify_with = Some("exploit-verifier".into());
         d.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn validate_verify_with_must_name_a_pool_agent() {
+        let target = "{ findings: { classification: \"CWE-94\" }, count_gte: 1 }";
+
+        // a verifier outside the pool can never run -> rejected, and named
+        let mut d = with_target(target);
+        d.goals[0].verify_with = Some("ghost".into());
+        let msg = reason(&d);
+        assert!(msg.contains("ghost"), "{msg}");
+        assert!(msg.contains("pool.agents"), "{msg}");
+
+        // a real pool agent is fine
+        let mut d = with_target(target);
+        d.goals[0].verify_with = Some("exploit-verifier".into());
+        d.validate(&active()).unwrap();
+
+        // a name that differs only by padding is not the pool agent
+        let mut d = with_target(target);
+        d.goals[0].verify_with = Some(" exploit-verifier ".into());
+        assert!(reason(&d).contains("is not in pool.agents"));
+    }
+
+    #[test]
+    fn validate_blank_verify_with_is_rejected() {
+        let target = "{ findings: { classification: \"CWE-94\" }, count_gte: 1 }";
+        for blank in ["", "   "] {
+            let mut d = with_target(target);
+            d.goals[0].verify_with = Some(blank.into());
+            assert!(reason(&d).contains("`verify_with` is blank"), "{blank:?}");
+        }
     }
 
     #[test]
