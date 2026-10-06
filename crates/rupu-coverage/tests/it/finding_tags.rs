@@ -269,6 +269,76 @@ fn concurrent_writers_lose_no_events() {
     assert_eq!(tags_of(&root, "fnd_b"), ["w1-19"]);
 }
 
+/// Deterministic: hold the tag log's sidecar lock ourselves and show a writer
+/// waits on it. Unlike the stress test above, this fails if the lock is a no-op.
+#[test]
+fn a_writer_waits_for_the_tag_log_lock() {
+    let ws = tempfile::TempDir::new().unwrap();
+    seed(ws.path());
+    let log = TagLog::for_workspace(ws.path());
+    std::fs::create_dir_all(log.lock.parent().unwrap()).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&log.lock)
+        .unwrap();
+    held.lock().unwrap();
+
+    let writer = {
+        let root = ws.path().to_path_buf();
+        std::thread::spawn(move || {
+            let log = TagLog::for_workspace(&root);
+            apply(&log, &change(&["fnd_a"], &["locked"], &[]), &by()).unwrap()
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !writer.is_finished(),
+        "apply returned while the lock was held"
+    );
+    assert!(
+        !log.path.exists(),
+        "apply wrote the tag log while the lock was held"
+    );
+
+    drop(held);
+    let out = writer.join().unwrap();
+    assert!(out[0].changed());
+    assert_eq!(read_tag_events(&log).unwrap().len(), 1);
+    assert_eq!(tags_of(ws.path(), "fnd_a"), ["locked"]);
+}
+
+/// Racing writers asking for the same tag: whoever takes the lock second sees
+/// the first's event and finds nothing to do, so exactly one `add` lands.
+#[test]
+fn racing_writers_adding_the_same_tag_land_exactly_one_event() {
+    let ws = tempfile::TempDir::new().unwrap();
+    seed(ws.path());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let writers: Vec<_> = (0..8)
+        .map(|_| {
+            let root = ws.path().to_path_buf();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let log = TagLog::for_workspace(&root);
+                barrier.wait();
+                apply(&log, &change(&["fnd_a"], &["same"], &[]), &by()).unwrap()
+            })
+        })
+        .collect();
+    let changed = writers
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|out| out[0].changed())
+        .count();
+    assert_eq!(changed, 1);
+    let events = read_tag_events(&TagLog::for_workspace(ws.path())).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].op, TagOp::Add);
+}
+
 #[test]
 fn a_finding_already_over_the_cap_can_still_shrink_but_never_grow() {
     let ws = tempfile::TempDir::new().unwrap();
