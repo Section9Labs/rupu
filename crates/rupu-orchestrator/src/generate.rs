@@ -141,10 +141,29 @@ has type (string|int|bool), required (bool), description, optional default. Refe
 prompts as {{ inputs.<key> }}.\n  steps: (required list)\n\nEach linear step needs:\n  - id: \
 <unique id>\n    agent: <one of the available agent names>\n    prompt: |\n      <multi-line \
 instruction; may reference {{ inputs.x }} and {{ steps.<id>.output }}>\n    actions: []        \
-# optional allow-list of tool actions\n\nOther step shapes: `parallel:` (a list of sub-steps \
-each with id/agent/prompt), and `panel:` (panelists list + subject + prompt, optional gate). \
-Keep it minimal unless the description calls for fan-out.\n\nNever leave `agent:` empty \
-\u{2014} every linear/for_each step must name a real agent.\n";
+# optional allow-list of tool actions\n\nOther step shapes (each replaces the linear `agent`/`prompt`; use only when the \
+description calls for it):\n\
+  - `for_each: <minijinja list expr>` plus `agent`/`prompt` \u{2014} fan one agent over a list; \
+inside the prompt use {{ item }}. Optional `max_parallel: <int>` caps concurrency (default 1).\n\
+  - `parallel:` \u{2014} a list of sub-steps, each with `id`/`agent`/`prompt` (no `actions`). \
+Optional `max_parallel: <int>`.\n\
+  - `panel:` \u{2014} `panelists: [agent names]`, `subject: <template>`, optional `prompt`, \
+optional `gate: { until_no_findings_at_severity_or_above, fix_with: <agent>, max_iterations }`.\n\
+  - `branch:` \u{2014} `condition: <minijinja>`, `then: [step ids]`, `else: [step ids]`; no \
+agent/prompt/`when` on the branch step itself.\n\
+  - `split: [step ids]` \u{2014} fan into concurrent tracks; pair with a later step carrying \
+`join: { wait: all }` (or `any`) as the barrier. Neither has an agent/prompt.\n\
+\nFlow control (any step):\n\
+  - `next: [ids]` / `depends_on: [ids]` \u{2014} explicit DAG edges; omit both and steps run in \
+list order.\n\
+  - `when: <minijinja>` \u{2014} skip the step when it renders false; `continue_on_error: true` \
+\u{2014} keep going if the step fails.\n\
+  - `loops:` is a TOP-LEVEL map (a sibling of `steps:`, NOT a step field) keyed by loop name: \
+`loops:\n    refine:\n      nodes: [draft, review]\n      until: <minijinja>\n      \
+max_iterations: <int>\n      on_max: fail|proceed`. `nodes` lists at least 2 existing step ids; \
+a step belongs to at most one loop.\n\
+\nPrefer the simplest shape that fits. Every `agent:`/panelist/`for_each` step must name a real \
+available agent \u{2014} never leave `agent:` empty.\n";
 
 /// First authenticated provider (in [`DEFAULT_GEN_MODELS`] order) paired
 /// with its default generation model. `None` when nothing is authed.
@@ -287,6 +306,25 @@ mod tests {
         );
         assert!(p.contains("reviewer"));
         assert!(p.contains("fixer"));
+    }
+
+    #[test]
+    fn workflow_prompt_teaches_full_format() {
+        let p = build_system_prompt(GenKind::Workflow, &["writer".to_string()]);
+        for kw in [
+            "for_each",
+            "parallel",
+            "panel",
+            "branch",
+            "split",
+            "join",
+            "depends_on",
+            "loops",
+            "until",
+        ] {
+            assert!(p.contains(kw), "prompt must teach `{kw}`");
+        }
+        assert!(p.contains("writer"), "lists available agents");
     }
 
     use rupu_auth::backend::ProviderId;
