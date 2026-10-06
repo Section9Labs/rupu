@@ -18,7 +18,7 @@ use crate::ledger::manifest::read_manifests;
 use crate::ledger::paths::CoveragePaths;
 use crate::ledger::stream::{append_record, Ledger, StreamLine};
 use crate::ledger::target_id::target_id;
-use crate::ledger::views::{read_concern_assertions, read_file_events, read_findings};
+use crate::ledger::views::{read_concern_assertions, read_declared_findings, read_file_events};
 use crate::report::ArtifactStorage;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -111,7 +111,7 @@ impl SeenLines for Occurrences {
 
 fn load_seen(paths: &CoveragePaths) -> Result<Seen, IngestError> {
     let mut s = Seen::default();
-    for f in read_findings(paths)? {
+    for f in read_declared_findings(paths)? {
         s.findings.insert(f.id);
     }
     for m in read_manifests(paths)? {
@@ -262,6 +262,7 @@ mod tests {
         Attribution, FindingEvidence, FindingRecord, FindingScope, Surface,
     };
     use crate::ledger::stream::{StreamLine, STREAM_VERSION};
+    use crate::ledger::views::read_findings;
     use crate::report::{ArtifactKind, ArtifactRef, ArtifactStorage, FindingReport};
     use chrono::Utc;
 

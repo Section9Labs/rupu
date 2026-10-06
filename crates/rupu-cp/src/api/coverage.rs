@@ -9,9 +9,9 @@ use axum::{
 };
 use rupu_coverage::report::ReportSummary;
 use rupu_coverage::{
-    builtin_names, coverage_status, discover_targets, file_views, list_runs, read_file_events,
-    read_findings, read_snapshot, resolve_builtin, run_audit, run_diff, CoveragePaths,
-    CoverageStatusInput, DiffError, FindingRecord, RunSelector,
+    builtin_names, coverage_status, discover_targets, file_views, list_runs,
+    read_declared_findings, read_file_events, read_findings, read_snapshot, resolve_builtin,
+    run_audit, run_diff, CoveragePaths, CoverageStatusInput, DiffError, FindingRecord, RunSelector,
 };
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ async fn list_coverage(State(s): State<AppState>) -> ApiResult<Json<Vec<Coverage
         let project = project_name(&w.path);
         for t in targets {
             let paths = CoveragePaths::new(wp, &t.target_id);
-            let findings = match read_findings(&paths) {
+            let findings = match read_declared_findings(&paths) {
                 Ok(f) => f.len(),
                 Err(ref e) => {
                     tracing::warn!(ws_id = %w.id, target_id = %t.target_id, error = %e, "failed to read findings; using 0");

@@ -143,7 +143,7 @@ pub fn report_finding(
                 return Err(ReportFindingError::DerivedFieldsSupplied);
             }
             let report = input.report.ok_or(ReportFindingError::ReportRequired)?;
-            let known: Vec<String> = crate::ledger::read_findings(paths)?
+            let known: Vec<String> = crate::ledger::read_declared_findings(paths)?
                 .into_iter()
                 .map(|f| f.id)
                 .collect();

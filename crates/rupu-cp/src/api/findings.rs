@@ -13,7 +13,9 @@ use axum::{
 use rupu_coverage::report::{
     raster_image_type, summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
 };
-use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
+use rupu_coverage::{
+    discover_targets, read_declared_findings, CoveragePaths, FindingRecord, Severity,
+};
 use rupu_findings_report::model::{ExportFinding, ExportInput, ReportMeta};
 use rupu_findings_report::number::{
     assign_numbers, filename, fit_file_name, is_valid_prefix, number_map, sanitize_title,
@@ -304,15 +306,33 @@ fn each_ledger(
                 continue;
             }
         };
+        // The tag log is workspace-wide: read it once here, not once per
+        // target (`read_findings` would re-read it for every target, on
+        // page-polled paths). Same tolerance as `read_findings`: an
+        // unreadable log is warned about and findings keep declared tags.
+        let tag_log = rupu_coverage::TagLog::for_workspace(wp);
+        let tag_events = match rupu_coverage::read_tag_events(&tag_log) {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    ws_id = %w.id,
+                    path = %tag_log.path.display(),
+                    error = %e,
+                    "cannot read the finding-tag log; showing declared tags only"
+                );
+                Vec::new()
+            }
+        };
         for t in targets {
             let paths = CoveragePaths::new(wp, &t.target_id);
-            let records = match read_findings(&paths) {
+            let mut records = match read_declared_findings(&paths) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(ws_id = %w.id, target_id = %t.target_id, error = %e, "failed to read findings; skipping target");
                     continue;
                 }
             };
+            rupu_coverage::fold_tags(&mut records, &tag_events);
             f(w, &t.target_id, paths, records);
         }
     }
