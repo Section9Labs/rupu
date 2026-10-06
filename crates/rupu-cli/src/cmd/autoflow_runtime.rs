@@ -1637,4 +1637,39 @@ mod tests {
                     .is_some_and(|detail| detail.contains("Add cart drawer"))
         }));
     }
+
+    #[test]
+    fn repo_config_skips_become_cycle_failed_events_honouring_the_repo_filter() {
+        let skips = vec![
+            legacy::RepoConfigSkip {
+                repo_ref: "github:acme/bad".into(),
+                error: "customer `acme` does not exist".into(),
+            },
+            legacy::RepoConfigSkip {
+                repo_ref: "github:acme/other".into(),
+                error: "parse config.toml".into(),
+            },
+        ];
+
+        let mut events = Vec::new();
+        push_repo_config_skip_events(&mut events, &skips, None);
+        assert_eq!(events.len(), 2);
+        for (event, skip) in events.iter().zip(&skips) {
+            assert!(matches!(event.kind, AutoflowCycleEventKind::CycleFailed));
+            assert_eq!(event.repo_ref.as_deref(), Some(skip.repo_ref.as_str()));
+            let detail = event.detail.as_deref().unwrap();
+            assert!(detail.contains("config failed to load"), "{detail}");
+            assert!(detail.contains(&skip.error), "{detail}");
+        }
+
+        // A cycle filtered to one repo reports only that repo's skip.
+        let mut events = Vec::new();
+        push_repo_config_skip_events(&mut events, &skips, Some("github:acme/other"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].repo_ref.as_deref(), Some("github:acme/other"));
+
+        let mut events = Vec::new();
+        push_repo_config_skip_events(&mut events, &skips, Some("github:acme/healthy"));
+        assert!(events.is_empty());
+    }
 }
