@@ -34,8 +34,8 @@ pub use autoflow_worktree::{
     ensure_issue_worktree, remove_issue_worktree, AutoflowWorktree, AutoflowWorktreeError,
 };
 pub use customers::{
-    validate_slug, Customer, CustomerError, CustomerMeta, CustomerStore, MetaPatch, NewCustomer,
-    ProjectRef,
+    validate_slug, validate_ws_id, Customer, CustomerError, CustomerMeta, CustomerStore, MetaPatch,
+    NewCustomer, ProjectRef,
 };
 pub use discover::{discover, DiscoverError, Discovery};
 pub use host_store::{

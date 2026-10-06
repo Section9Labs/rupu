@@ -289,3 +289,220 @@ fn lookup_from_a_dir_that_does_not_exist_uses_its_nearest_existing_ancestor() {
         Some("acme")
     );
 }
+
+/// A second workspace record for `ws`'s directory, as a hand-copied or
+/// racing `register` would leave, assigned to `slug`.
+fn duplicate_record(home: &std::path::Path, ws: &rupu_workspace::Workspace, id: &str, slug: &str) {
+    let mut dup = ws.clone();
+    dup.id = id.to_string();
+    let root = home.join("workspaces");
+    std::fs::write(
+        root.join(format!("{id}.toml")),
+        toml::to_string(&dup).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(format!("{id}.customer")), format!("{slug}\n")).unwrap();
+}
+
+#[test]
+fn duplicate_records_for_one_dir_assigned_to_different_customers_are_an_error() {
+    let h = home();
+    let project = assert_fs::TempDir::new().unwrap();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    store.create("globex", &acme()).unwrap();
+    let ws = store
+        .assign("acme", ProjectRef::Path(project.path()))
+        .unwrap();
+    duplicate_record(h.path(), &ws, "ws_dup", "globex");
+    match store.customer_for_dir(project.path()) {
+        Err(CustomerError::ConflictingAssignments {
+            first_slug,
+            first_sidecar,
+            second_slug,
+            second_sidecar,
+            ..
+        }) => {
+            let mut slugs = [first_slug, second_slug];
+            slugs.sort();
+            assert_eq!(slugs, ["acme".to_string(), "globex".to_string()]);
+            let sidecars = format!("{first_sidecar} {second_sidecar}");
+            assert!(sidecars.contains("ws_dup.customer"), "{sidecars}");
+            assert!(
+                sidecars.contains(&format!("{}.customer", ws.id)),
+                "{sidecars}"
+            );
+        }
+        other => panic!("expected ConflictingAssignments, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_records_for_one_dir_assigned_to_the_same_customer_are_fine() {
+    let h = home();
+    let project = assert_fs::TempDir::new().unwrap();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    let ws = store
+        .assign("acme", ProjectRef::Path(project.path()))
+        .unwrap();
+    duplicate_record(h.path(), &ws, "ws_dup", "acme");
+    assert_eq!(
+        store.customer_for_dir(project.path()).unwrap().as_deref(),
+        Some("acme")
+    );
+}
+
+#[test]
+fn a_corrupt_record_behind_a_sidecar_fails_closed() {
+    let h = home();
+    let project = assert_fs::TempDir::new().unwrap();
+    let elsewhere = assert_fs::TempDir::new().unwrap();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    let ws = store
+        .assign("acme", ProjectRef::Path(project.path()))
+        .unwrap();
+    std::fs::write(
+        h.path().join(format!("workspaces/{}.toml", ws.id)),
+        "this is = = not toml",
+    )
+    .unwrap();
+    let sidecar = format!("{}.customer", ws.id);
+    // Even a lookup for an unrelated dir refuses: the broken record could
+    // be any directory's assignment.
+    for dir in [project.path(), elsewhere.path()] {
+        match store.customer_for_dir(dir) {
+            Err(CustomerError::UnresolvableAssignment { sidecar: s, .. }) => {
+                assert!(s.ends_with(&sidecar), "{s}")
+            }
+            other => panic!("expected UnresolvableAssignment, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        store.projects_of("acme"),
+        Err(CustomerError::UnresolvableAssignment { .. })
+    ));
+    assert!(matches!(
+        store.delete("acme"),
+        Err(CustomerError::UnresolvableAssignment { .. })
+    ));
+    assert!(store.get("acme").is_ok(), "delete must not remove acme");
+
+    // A sidecar whose record is gone is just as unresolvable.
+    std::fs::remove_file(h.path().join(format!("workspaces/{}.toml", ws.id))).unwrap();
+    assert!(matches!(
+        store.customer_for_dir(project.path()),
+        Err(CustomerError::UnresolvableAssignment { .. })
+    ));
+}
+
+#[test]
+fn lookup_with_records_but_no_sidecars_is_none() {
+    let h = home();
+    let project = assert_fs::TempDir::new().unwrap();
+    upsert(&ws_store(h.path()), project.path()).unwrap();
+    // A corrupt record without a sidecar is not an assignment: the lookup
+    // never reads records when no sidecar exists.
+    std::fs::write(h.path().join("workspaces/ws_junk.toml"), "= = =").unwrap();
+    let store = CustomerStore::new(h.path());
+    assert_eq!(store.customer_for_dir(project.path()).unwrap(), None);
+}
+
+#[test]
+fn a_traversal_ws_id_is_refused_before_it_reaches_a_path() {
+    let h = home();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    for bad in ["../../etc", "a/b", "", "ws id"] {
+        assert!(
+            matches!(
+                store.assign("acme", ProjectRef::Id(bad)),
+                Err(CustomerError::InvalidWsId(_))
+            ),
+            "{bad:?}"
+        );
+        assert!(matches!(
+            store.customer_of(bad),
+            Err(CustomerError::InvalidWsId(_))
+        ));
+        assert!(matches!(
+            store.unassign(ProjectRef::Id(bad)),
+            Err(CustomerError::InvalidWsId(_))
+        ));
+    }
+    // Nothing was written anywhere under the home.
+    assert!(!h.path().join("workspaces").exists());
+    assert!(!h.path().join("etc.customer").exists());
+    rupu_workspace::validate_ws_id("ws_01HXYZ-abc").unwrap();
+}
+
+#[test]
+fn create_treats_an_empty_color_as_none() {
+    let h = home();
+    let store = CustomerStore::new(h.path());
+    let mut c = acme();
+    c.color = Some(String::new());
+    let created = store.create("acme", &c).unwrap();
+    assert_eq!(created.meta.color, None);
+    assert_eq!(store.get("acme").unwrap().meta.color, None);
+}
+
+/// Every non-hidden-temp entry name in `dir`, and whether any temp file
+/// (`.tmp*`, `*.tmp`) is left behind.
+fn leftover_temp_files(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp") || n.ends_with(".tmp"))
+        .collect()
+}
+
+#[test]
+fn concurrent_writers_never_tear_the_metadata_file() {
+    let h = home();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for j in 0..25 {
+                    store
+                        .update_meta(
+                            "acme",
+                            &MetaPatch {
+                                notes: Some(format!("writer {i} pass {j} {}", "x".repeat(i * 50))),
+                                ..MetaPatch::default()
+                            },
+                        )
+                        // A reader may race a rename; only a torn file is a bug.
+                        .ok();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let meta = store.get("acme").unwrap().meta;
+    assert!(meta.notes.unwrap().starts_with("writer "));
+    assert!(leftover_temp_files(&h.path().join("customers/acme")).is_empty());
+}
+
+#[test]
+fn a_failed_rename_leaves_no_temp_file() {
+    let h = home();
+    let project = assert_fs::TempDir::new().unwrap();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    let ws = upsert(&ws_store(h.path()), project.path()).unwrap();
+    // A directory where the sidecar goes makes the final rename fail.
+    let sidecar = h.path().join(format!("workspaces/{}.customer", ws.id));
+    std::fs::create_dir_all(sidecar.join("blocker")).unwrap();
+    assert!(matches!(
+        store.assign("acme", ProjectRef::Id(&ws.id)),
+        Err(CustomerError::Io { .. })
+    ));
+    assert!(leftover_temp_files(&h.path().join("workspaces")).is_empty());
+}

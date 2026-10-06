@@ -237,15 +237,8 @@ async fn put_policy(
 /// alphanumerics plus `-`/`_` only — is sufficient and rejects every
 /// traversal shape above without needing to special-case `..` or separators.
 fn validate_ws_id(id: &str) -> ApiResult<()> {
-    let valid = !id.is_empty()
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if valid {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(format!("invalid project id `{id}`")))
-    }
+    rupu_workspace::validate_ws_id(id)
+        .map_err(|_| ApiError::bad_request(format!("invalid project id `{id}`")))
 }
 
 /// Resolve a project's `.rupu/config.toml` path from its workspace id and
