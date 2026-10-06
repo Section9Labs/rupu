@@ -7,6 +7,7 @@ mod budget;
 mod collectors;
 mod coverage;
 mod def;
+mod dispatch_tools;
 mod envelope;
 mod error;
 mod goal;
@@ -26,6 +27,7 @@ pub use def::{
     AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope,
     ScopeRoot,
 };
+pub use dispatch_tools::{fleet_dispatch_tools, fleet_dispatch_tools_at_depth, MAX_DEPTH};
 pub use envelope::{
     Digest, Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome,
     StopReason,
