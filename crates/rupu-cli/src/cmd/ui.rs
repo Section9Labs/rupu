@@ -678,9 +678,7 @@ async fn themes(global_format: Option<crate::output::formats::OutputFormat>) -> 
     // UI prefs only — lock does not apply (I-7)
     let cfg = match pwd.as_deref() {
         Some(pwd) => {
-            let cfg_paths =
-                crate::paths::config_paths_for_display(&global, project_root.as_deref(), pwd);
-            rupu_config::layer_files(cfg_paths.layers())?
+            crate::paths::load_config_for_display(&global, project_root.as_deref(), pwd, false)
         }
         None => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
             &global.join("config.toml"),

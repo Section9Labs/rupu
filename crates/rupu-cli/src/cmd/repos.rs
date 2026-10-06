@@ -439,9 +439,8 @@ async fn tracked_inner(
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(cfg_paths.layers())?;
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None, None);
     let store = RepoRegistryStore {
         root: paths::repos_dir(&global),
