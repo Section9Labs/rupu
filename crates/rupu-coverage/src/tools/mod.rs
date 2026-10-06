@@ -6,6 +6,7 @@ pub mod coverage_mark;
 pub mod coverage_remaining;
 pub mod coverage_status;
 pub mod report_finding;
+pub mod verify_finding;
 pub use asset_mark::{asset_mark, AssetMarkError, AssetMarkInput, AssetMarkOutput};
 pub use attach_report::{attach_reports, AttachBatch, AttachItem, AttachOutcome};
 pub use coverage_concerns_detail::{
@@ -21,3 +22,4 @@ pub use coverage_status::{coverage_status, CoverageStatusInput};
 pub use report_finding::{
     report_finding, AssetRef, ReportFindingError, ReportFindingInput, ReportFindingOutput,
 };
+pub use verify_finding::{verify_finding, VerifyError, VerifyInput};

@@ -1,7 +1,15 @@
-//! Attach a report to an existing summary finding: the one place a finding
-//! line is rewritten rather than appended. Used by `rupu findings import`,
-//! the one-time migration of reports that were written beside summary
-//! findings before the full profile existed (spec: "Backfill").
+//! Attach a report to an existing summary finding: where a finding line is
+//! rewritten rather than appended. Used by `rupu findings import`, the
+//! one-time migration of reports that were written beside summary findings
+//! before the full profile existed (spec: "Backfill").
+//!
+//! The rewrite machinery is shared with `verify_finding`, the only other
+//! rewriter of a finding line (it merges a verdict onto a report this module
+//! never touches): the pre-flight and lock (`begin_rewrite`), the ledger
+//! read into terminator-preserving lines (`LedgerImage`), the atomic
+//! replacement (`replace_ledger`) and, for the one-line edit,
+//! `with_findings_line_rewrite`. What each does differently is a
+//! `RewriteKind`: the name its messages call it and the backup it keeps.
 //!
 //! A report attaches whole or not at all: it goes through the same
 //! validation and artifact store as `report_finding` (evidence-block files
@@ -118,44 +126,24 @@ fn attach_reports_with(
     dry_run: bool,
     before_rename: &mut dyn FnMut(),
 ) -> std::io::Result<AttachBatch> {
-    // Checked on a dry run too, so the dry run predicts the refusal.
-    let mut write_error = refuse_symlinked_ledger(&paths.findings).err();
-    // A dry run writes nothing, so it needs no exclusion (and taking the lock
-    // would create the sidecar, and fail on a read-only directory).
-    let _lock = if dry_run || write_error.is_some() {
-        None
-    } else {
-        match lock_findings(paths) {
-            Ok(lock) => Some(lock),
-            Err(e) => {
-                write_error = Some(e);
-                None
-            }
-        }
-    };
+    // The symlink refusal is checked on a dry run too, so the dry run
+    // predicts it. A dry run writes nothing, so it needs no exclusion (and
+    // taking the lock would create the sidecar, and fail on a read-only
+    // directory).
+    let mut guard = begin_rewrite(paths, RewriteKind::Import, !dry_run);
+    let mut write_error = guard.error.take();
     // A ledger that will not be written is only assessed, as a dry run
     // assesses it, so each item still gets its own outcome.
     let assess_only = dry_run || write_error.is_some();
-    let raw = match std::fs::read(&paths.findings) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    let read_len = raw.len() as u64;
-    // One segment per line, each with its own terminator. Segments nothing
-    // replaces are written back exactly as read.
-    let mut segments: Vec<Vec<u8>> = raw
-        .split_inclusive(|b| *b == b'\n')
-        .map(<[u8]>::to_vec)
-        .collect();
+    let LedgerImage {
+        mut segments,
+        read_len,
+    } = LedgerImage::read(&paths.findings)?;
     let mut at: HashMap<String, Vec<usize>> = HashMap::new();
     let mut records: HashMap<usize, FindingRecord> = HashMap::new();
-    for (i, seg) in segments.iter().enumerate() {
-        if let Some(r) = line_text(seg).and_then(|t| serde_json::from_str::<FindingRecord>(t).ok())
-        {
-            at.entry(r.id.clone()).or_default().push(i);
-            records.insert(i, r);
-        }
+    for (i, r) in finding_lines(&segments) {
+        at.entry(r.id.clone()).or_default().push(i);
+        records.insert(i, r);
     }
     let mut known: Vec<String> = at.keys().cloned().collect();
 
@@ -216,7 +204,13 @@ fn attach_reports_with(
 
     let mut backup = None;
     if changed {
-        match replace_ledger(paths, &segments, read_len, before_rename) {
+        match replace_ledger(
+            paths,
+            RewriteKind::Import,
+            &segments,
+            read_len,
+            before_rename,
+        ) {
             Ok(b) => backup = Some(b),
             Err(e) => write_error = Some(e),
         }
@@ -235,14 +229,185 @@ fn attach_reports_with(
     })
 }
 
+/// What a ledger rewrite is for: the name its messages call it, and the
+/// backup and staging file it keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteKind {
+    /// `rupu findings import`: one rewrite attaches a whole batch. Each keeps
+    /// its own `findings.jsonl.pre-import-<stamp>` backup.
+    Import,
+    /// `verify_finding`: one line gets a verdict, once per verifier run, so
+    /// backups would pile up a ledger copy per verdict. It keeps a single
+    /// rolling `findings.jsonl.pre-verify`: the ledger as it stood before the
+    /// latest rewrite.
+    Verify,
+}
+
+impl RewriteKind {
+    /// The operation as a message names it ("changed during import").
+    fn op(self) -> &'static str {
+        match self {
+            RewriteKind::Import => "import",
+            RewriteKind::Verify => "verification",
+        }
+    }
+
+    /// The staging file the replacement is written to before the rename.
+    fn tmp_name(self) -> &'static str {
+        match self {
+            RewriteKind::Import => "findings.jsonl.import-tmp",
+            RewriteKind::Verify => "findings.jsonl.verify-tmp",
+        }
+    }
+}
+
+/// The pre-flight of a ledger rewrite: holds the findings lock until it
+/// drops, and carries why the rewrite cannot go ahead, if it cannot.
+pub(crate) struct RewriteLock {
+    _lock: Option<std::fs::File>,
+    /// The ledger is a symlink, or the lock could not be taken. The ledger
+    /// is not to be written, and the lock is not held.
+    pub(crate) error: Option<std::io::Error>,
+}
+
+/// Refuse a symlinked ledger, then (with `take_lock`) take the sidecar lock
+/// every findings append also takes, so no append interleaves with the
+/// rewrite. Hold the result until the rewrite is done. A failure is
+/// [`RewriteLock::error`], not an `Err`, so a caller that can still assess
+/// without writing (an import's dry run) goes on to.
+pub(crate) fn begin_rewrite(
+    paths: &CoveragePaths,
+    kind: RewriteKind,
+    take_lock: bool,
+) -> RewriteLock {
+    let mut error = refuse_symlinked_ledger(&paths.findings, kind).err();
+    let lock = if !take_lock || error.is_some() {
+        None
+    } else {
+        match lock_findings(paths) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                error = Some(e);
+                None
+            }
+        }
+    };
+    RewriteLock { _lock: lock, error }
+}
+
+/// The findings ledger as read: one segment per line, each with its own
+/// terminator, so a segment nothing replaces is written back exactly as read.
+pub(crate) struct LedgerImage {
+    pub(crate) segments: Vec<Vec<u8>>,
+    /// The ledger's length when it was read: [`replace_ledger`]'s guard
+    /// against a writer that did not take the lock.
+    pub(crate) read_len: u64,
+}
+
+impl LedgerImage {
+    /// A ledger that does not exist reads as empty.
+    pub(crate) fn read(path: &Path) -> std::io::Result<Self> {
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            read_len: raw.len() as u64,
+            segments: raw
+                .split_inclusive(|b| *b == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect(),
+        })
+    }
+}
+
+/// Each line that parses as a finding record, with its index in `segments`.
+/// A line that is not UTF-8 or not a record is skipped, as every reader
+/// skips it.
+pub(crate) fn finding_lines(
+    segments: &[Vec<u8>],
+) -> impl Iterator<Item = (usize, FindingRecord)> + '_ {
+    segments.iter().enumerate().filter_map(|(i, seg)| {
+        line_text(seg)
+            .and_then(|t| serde_json::from_str::<FindingRecord>(t).ok())
+            .map(|r| (i, r))
+    })
+}
+
+/// How a one-line rewrite ended; `E` is why the edit refused.
+#[derive(Debug)]
+pub(crate) enum LineRewrite<E> {
+    /// The line was edited and the ledger replaced.
+    Replaced,
+    /// No line matched; nothing was written.
+    NoMatch,
+    /// More than one line matched, so none can be said to be the one;
+    /// nothing was written.
+    Ambiguous,
+    /// The edit refused; nothing was written.
+    Refused(E),
+}
+
+/// Rewrite the one finding line `select` picks, under the findings lock:
+/// read the ledger, hand the line's parsed record and its JSON to `edit`,
+/// and replace the ledger ([`replace_ledger`]) with that line re-serialized
+/// and every other line, and the edited line's terminator, as they were.
+///
+/// The line is edited as JSON, not re-serialized from `FindingRecord`, so
+/// keys this version does not know survive (as in `upgraded_line`).
+/// `before_rename` is [`attach_reports_with`]'s test seam.
+///
+/// `Err` is an I/O failure; the ledger is then as it was.
+pub(crate) fn with_findings_line_rewrite<E>(
+    paths: &CoveragePaths,
+    kind: RewriteKind,
+    select: impl Fn(&FindingRecord) -> bool,
+    edit: impl FnOnce(&FindingRecord, &mut serde_json::Value) -> Result<(), E>,
+    before_rename: &mut dyn FnMut(),
+) -> std::io::Result<LineRewrite<E>> {
+    let mut guard = begin_rewrite(paths, kind, true);
+    if let Some(e) = guard.error.take() {
+        return Err(e);
+    }
+    let LedgerImage {
+        mut segments,
+        read_len,
+    } = LedgerImage::read(&paths.findings)?;
+    let mut picked: Vec<(usize, FindingRecord)> = finding_lines(&segments)
+        .filter(|(_, r)| select(r))
+        .collect();
+    if picked.len() != 1 {
+        // Only exactly one matching line is one to write.
+        return Ok(if picked.is_empty() {
+            LineRewrite::NoMatch
+        } else {
+            LineRewrite::Ambiguous
+        });
+    }
+    let (i, record) = picked.remove(0);
+    let text = line_text(&segments[i])
+        .ok_or_else(|| std::io::Error::other("a finding line stopped being UTF-8"))?;
+    let mut value: serde_json::Value = serde_json::from_str(text)?;
+    if let Err(e) = edit(&record, &mut value) {
+        return Ok(LineRewrite::Refused(e));
+    }
+    let mut line = serde_json::to_string(&value)?;
+    line.push_str(terminator(&segments[i]));
+    segments[i] = line.into_bytes();
+    replace_ledger(paths, kind, &segments, read_len, before_rename)?;
+    Ok(LineRewrite::Replaced)
+}
+
 /// Refuse a ledger that is a symlink: replacing it by rename would put a
 /// regular file where the link was, and the file it points to would silently
 /// stop receiving findings.
-fn refuse_symlinked_ledger(findings: &Path) -> std::io::Result<()> {
+fn refuse_symlinked_ledger(findings: &Path, kind: RewriteKind) -> std::io::Result<()> {
     match std::fs::symlink_metadata(findings) {
         Ok(m) if m.file_type().is_symlink() => Err(std::io::Error::other(format!(
-            "{} is a symlink; import does not replace a symlinked ledger (it would replace the link, not the file it points to)",
-            findings.display()
+            "{} is a symlink; {} does not replace a symlinked ledger (it would replace the link, not the file it points to)",
+            findings.display(),
+            kind.op()
         ))),
         _ => Ok(()),
     }
@@ -356,22 +521,29 @@ fn backup_path(root: &Path, stamp: &str) -> PathBuf {
 
 /// Back the ledger up byte for byte, then replace it with `segments` via a
 /// temp file and a rename, so a reader sees the old ledger or the new one,
-/// never a mix. Returns the backup's path. On any failure before the rename
-/// nothing is left behind: not the temp file, not the backup (including a
-/// partial one).
+/// never a mix. Returns the backup's path (a [`RewriteKind`]'s: a fresh one
+/// per import, one rolling one for a verification). On any failure before the
+/// rename nothing is left behind: not the temp file, not the backup
+/// (including a partial one).
 ///
 /// The lock only excludes writers that take it. `read_len` is the ledger's
 /// length when it was read; if it has changed by the time the replacement is
 /// ready, a writer that did not take the lock appended in between and the
-/// rename would drop its line, so the import is abandoned instead.
-fn replace_ledger(
+/// rename would drop its line, so the rewrite is abandoned instead.
+pub(crate) fn replace_ledger(
     paths: &CoveragePaths,
+    kind: RewriteKind,
     segments: &[Vec<u8>],
     read_len: u64,
     before_rename: &mut dyn FnMut(),
 ) -> std::io::Result<PathBuf> {
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let backup = backup_path(&paths.root, &stamp);
+    let backup = match kind {
+        RewriteKind::Import => {
+            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            backup_path(&paths.root, &stamp)
+        }
+        RewriteKind::Verify => paths.root.join("findings.jsonl.pre-verify"),
+    };
     // Synced before the swap: the backup is the only copy of what the
     // rewrite overwrites, so it must not be lost where the new ledger
     // survives (a crash soon after the rename, with delayed allocation).
@@ -383,8 +555,8 @@ fn replace_ledger(
         let _ = std::fs::remove_file(&backup);
         return Err(e);
     }
-    let tmp = paths.root.join("findings.jsonl.import-tmp");
-    let swapped = stage_and_swap(paths, segments, read_len, &tmp, before_rename);
+    let tmp = paths.root.join(kind.tmp_name());
+    let swapped = stage_and_swap(paths, kind, segments, read_len, &tmp, before_rename);
     if swapped.is_err() {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&backup);
@@ -392,9 +564,9 @@ fn replace_ledger(
     swapped?;
     // Make the rename itself durable, not only the file's contents. Best
     // effort: the ledger has been swapped by now, so a filesystem that cannot
-    // sync a directory must not turn a completed import into an error (the
-    // caller would lose the outcomes, and a retry would find every item
-    // already attached).
+    // sync a directory must not turn a completed rewrite into an error (an
+    // import's caller would lose the outcomes, and a retry would find every
+    // item already attached).
     if let Err(e) = std::fs::File::open(&paths.root).and_then(|d| d.sync_all()) {
         tracing::warn!(
             ?e,
@@ -409,12 +581,16 @@ fn replace_ledger(
 /// user (an import run with `sudo`), the ledger would otherwise become that
 /// user's, and its owner's agents could no longer append to it; where the
 /// owner cannot be kept (an importer who is neither the owner nor root), the
-/// import is refused rather than taking the ledger over. A group the
+/// rewrite is refused rather than taking the ledger over. A group the
 /// importer cannot give it (the owner, not in the ledger's group, as when a
 /// container wrote it) changes to the importer's, with no group access and a
 /// warning: its owner can still append.
 #[cfg(unix)]
-fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<()> {
+fn keep_owner(
+    f: &std::fs::File,
+    ledger: &std::fs::Metadata,
+    kind: RewriteKind,
+) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let now = f.metadata()?;
     let gid = (now.gid() != ledger.gid()).then(|| rustix::fs::Gid::from_raw(ledger.gid()));
@@ -422,9 +598,10 @@ fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<
         let uid = rustix::fs::Uid::from_raw(ledger.uid());
         return rustix::fs::fchown(f, Some(uid), gid).map_err(|e| {
             std::io::Error::other(format!(
-                "cannot keep the ledger's owner ({}) on its replacement: {}; run the import as the ledger's owner",
+                "cannot keep the ledger's owner ({}) on its replacement: {}; run the {} as the ledger's owner",
                 ledger.uid(),
-                std::io::Error::from(e)
+                std::io::Error::from(e),
+                kind.op()
             ))
         });
     }
@@ -444,12 +621,13 @@ fn keep_owner(f: &std::fs::File, ledger: &std::fs::Metadata) -> std::io::Result<
 }
 
 #[cfg(not(unix))]
-fn keep_owner(_: &std::fs::File, _: &std::fs::Metadata) -> std::io::Result<()> {
+fn keep_owner(_: &std::fs::File, _: &std::fs::Metadata, _: RewriteKind) -> std::io::Result<()> {
     Ok(())
 }
 
 fn stage_and_swap(
     paths: &CoveragePaths,
+    kind: RewriteKind,
     segments: &[Vec<u8>],
     read_len: u64,
     tmp: &Path,
@@ -460,7 +638,7 @@ fn stage_and_swap(
     // Before any content is written, so it is never readable at a looser
     // mode than the ledger it replaces.
     f.set_permissions(ledger.permissions())?;
-    keep_owner(&f, &ledger)?;
+    keep_owner(&f, &ledger, kind)?;
     for segment in segments {
         f.write_all(segment)?;
     }
@@ -468,9 +646,10 @@ fn stage_and_swap(
     drop(f);
     before_rename();
     if std::fs::metadata(&paths.findings)?.len() != read_len {
-        return Err(std::io::Error::other(
-            "the findings ledger changed during import (a writer that does not take the ledger lock appended to it); nothing was written, retry the import",
-        ));
+        let op = kind.op();
+        return Err(std::io::Error::other(format!(
+            "the findings ledger changed during {op} (a writer that does not take the ledger lock appended to it); nothing was written, retry the {op}",
+        )));
     }
     std::fs::rename(tmp, &paths.findings)
 }

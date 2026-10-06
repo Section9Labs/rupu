@@ -9,3 +9,4 @@ mod cwe_index_mode_end_to_end;
 mod determinism;
 mod end_to_end;
 mod report_schema_lockstep;
+mod verify_finding;
