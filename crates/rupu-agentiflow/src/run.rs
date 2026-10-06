@@ -186,6 +186,12 @@ pub struct RunAgentiflowOpts {
     /// is a detached, process-isolated `rupu run`. A caller (a test, or the
     /// Plan-4 daemon with its own launcher) injects an implementation here.
     pub unit_launcher: Option<Arc<dyn UnitLauncher>>,
+    /// The lead's workflow-authoring capability: which provider/model writes a
+    /// new workflow and a factory minting a provider for each generation call.
+    /// Built by the launch site exactly as `make_provider` is (wired for real in
+    /// Plan 4; tests inject a mock). `None` disables `generate_workflow`
+    /// entirely: the lead is not even offered the tool.
+    pub generation: Option<crate::lead::GenerationCapability>,
 }
 
 /// A run id becomes a directory name and an evidence scope name, so it must
@@ -428,6 +434,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         lead,
         run_id: id,
         unit_launcher,
+        generation,
     } = opts;
 
     // A thread-scoped tracing subscriber (a test's, say) does not follow the
@@ -598,7 +605,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     pool_workflows: pool_workflows.clone(),
                 },
                 run_dir.clone(),
-                None,
+                generation,
             ));
 
             // Roster awareness + steering. The roster tools read the agent and
@@ -806,6 +813,7 @@ mod tests {
             },
             run_id: id.into(),
             unit_launcher: None,
+            generation: None,
         }
     }
 
@@ -1935,6 +1943,203 @@ mod tests {
             let after = request_texts(&reqs[i + 1]);
             assert!(any_contains(&after, reason), "turn {i}: {after:?}");
         }
+    }
+
+    // ---- generate_workflow threaded through run_agentiflow -----------------
+
+    /// A workflow whose only agent (`recon`) is in `def_with_recon_pool`'s pool.
+    const GENERATED_WF: &str =
+        "name: fresh-sweep\nsteps:\n  - id: only\n    agent: recon\n    prompt: scan\n";
+
+    /// The names of the tools a request offered the lead.
+    fn offered_tools(req: &rupu_providers::LlmRequest) -> Vec<&str> {
+        req.tools.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_lead_generates_a_workflow_and_it_runs_as_a_file_backed_unit() {
+        use crate::lead::{GenerationCapability, GenerationProviderFactory};
+        use crate::unit::{MockUnitLauncher, UnitKind, UnitOutcome, UnitStatus};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fx = fixture();
+        let id = "af_generate";
+
+        // The mock unit does what the real `rupu workflow run --file` would:
+        // reports a finding into the run's POOLED scope at spawn.
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![
+                UnitStatus::Running,
+                UnitStatus::Done(UnitOutcome {
+                    output: "generated sweep found one issue".into(),
+                    success: true,
+                }),
+            ])
+            .with_on_spawn(move |spec, _| {
+                assert_eq!(spec.kind, UnitKind::Workflow);
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_gen")).unwrap();
+            }),
+        );
+
+        // The lead's authoring capability: every generation call gets a fresh
+        // `MockProvider` that writes a valid, pool-only workflow.
+        let minted = Arc::new(AtomicUsize::new(0));
+        let counter = minted.clone();
+        let factory: GenerationProviderFactory = Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: GENERATED_WF.into(),
+                stop: rupu_agent::StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }])) as Box<dyn rupu_providers::LlmProvider>
+        });
+
+        let captured: Captured = Arc::default();
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = PickingLead::factory(captured.clone(), |i, req| match i {
+            0 => tool_turn(
+                "t0",
+                "generate_workflow",
+                json!({ "description": "sweep the exposed gateway" }),
+            ),
+            1 => tool_turn(
+                "t1",
+                "join",
+                json!({ "handle": DispatchingLead::handle_in(req), "timeout_secs": 30 }),
+            ),
+            _ => done_turn(),
+        });
+        o.unit_launcher = Some(launcher.clone());
+        o.generation = Some(GenerationCapability {
+            provider: "mock".into(),
+            model: "mock-1".into(),
+            factory,
+        });
+        let out = run_agentiflow(o).unwrap();
+
+        // The generated workflow's finding satisfied the flow's goal.
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
+        assert!(findings.contains("fnd_gen"), "{findings}");
+        assert_eq!(minted.load(Ordering::Relaxed), 1, "one generation call");
+
+        // Exactly one unit started: a file-backed workflow unit bound to the
+        // flow's engagement, with no prompt and no catalog id behind it.
+        let spawned = launcher.spawned();
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert_eq!(spawned[0].kind, UnitKind::Workflow);
+        assert_eq!(spawned[0].agent, "fresh-sweep");
+        assert_eq!(spawned[0].prompt, "");
+        assert_eq!(spawned[0].engagement, ["network"]);
+        assert_eq!(spawned[0].participant, "fresh-sweep#1");
+        // The materialized file lives under the run dir, holds exactly what
+        // the generator wrote, and parses.
+        let file = spawned[0]
+            .workflow_file
+            .clone()
+            .expect("a generated workflow is file-backed");
+        assert_eq!(file.parent().unwrap(), run_dir(&fx, id).join("generated"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().trim(),
+            GENERATED_WF.trim()
+        );
+        assert_eq!(
+            rupu_orchestrator::Workflow::parse_file(&file).unwrap().name,
+            "fresh-sweep"
+        );
+
+        // The lead was offered the tool, got a handle back, and join returned
+        // the unit's outcome for it.
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 3, "one model call per scripted turn");
+        assert!(
+            offered_tools(&reqs[0]).contains(&"generate_workflow"),
+            "{:?}",
+            offered_tools(&reqs[0])
+        );
+        let after_generate = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after_generate, "\"generated_file\"")
+                && any_contains(&after_generate, "fresh-sweep#1"),
+            "{after_generate:?}"
+        );
+        let handle = DispatchingLead::handle_in(&reqs[1]);
+        assert!(handle.starts_with("run_"), "{handle}");
+        let after_join = request_texts(&reqs[2]);
+        assert!(
+            any_contains(&after_join, "generated sweep found one issue")
+                && any_contains(&after_join, "\"status\":\"done\""),
+            "{after_join:?}"
+        );
+
+        // The supervisor recorded it as a workflow unit, done.
+        let unit: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                run_dir(&fx, id)
+                    .join("units")
+                    .join(&handle)
+                    .join("unit.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unit["kind"], "workflow");
+        assert_eq!(unit["participant"], "fresh-sweep#1");
+        assert_eq!(unit["status"]["state"], "done");
+    }
+
+    #[test]
+    fn without_a_generation_capability_the_lead_is_not_offered_generate_workflow() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_no_generate";
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+
+        let captured: Captured = Arc::default();
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        // The lead calls the tool anyway (a model can name a tool it was never
+        // offered): it must come back as an unknown-tool error, spawning nothing.
+        o.make_provider = PickingLead::factory(captured.clone(), |i, _| match i {
+            0 => tool_turn(
+                "t0",
+                "generate_workflow",
+                json!({ "description": "sweep the exposed gateway" }),
+            ),
+            _ => done_turn(),
+        });
+        o.unit_launcher = Some(launcher.clone());
+        assert!(o.generation.is_none());
+        let out = run_agentiflow(o).unwrap();
+        assert_ne!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one model call per scripted turn");
+        // Absence is proven twice: the advertised tool list omits it (while the
+        // sibling unit tools are present, so the list is the real one)...
+        let offered = offered_tools(&reqs[0]);
+        assert!(!offered.contains(&"generate_workflow"), "{offered:?}");
+        for sibling in ["dispatch", "join", "run_workflow"] {
+            assert!(offered.contains(&sibling), "{sibling} missing: {offered:?}");
+        }
+        // ...and invoking it anyway is refused as unknown.
+        let after = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after, "unknown tool: generate_workflow"),
+            "{after:?}"
+        );
+        assert!(launcher.spawned().is_empty(), "{:?}", launcher.spawned());
+        assert!(!run_dir(&fx, id).join("generated").exists());
+        assert!(!run_dir(&fx, id).join("units").exists());
     }
 
     // ---- roster awareness + status / steering tools -----------------------
