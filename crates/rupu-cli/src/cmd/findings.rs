@@ -252,54 +252,21 @@ pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
     }
 }
 
-/// Every finding the query selects, with provenance. `run:` values expand to
-/// the run plus its sub-runs.
+/// Every finding the query words select, with provenance.
 fn queried_findings(query: &[String]) -> anyhow::Result<Vec<cp_findings::FindingOut>> {
-    let global = crate::paths::global_dir()?;
+    // A trailing flag would parse as a negated free-text word: refuse it.
+    if let Some(word) = query.iter().find(|w| w.starts_with("--")) {
+        anyhow::bail!(
+            "`{word}` looks like a flag — put flags (like --ids-only, --limit) before the query words"
+        );
+    }
     let parsed = rupu_coverage::parse_query(&query.join(" "))?;
-    let store = RunStore::new(global.join("runs"));
-    let runs: rupu_coverage::RunScopes = rupu_coverage::run_values(&parsed)
-        .into_iter()
-        .map(|r| {
-            let scope = cp_findings::resolve_run_scope(&store, &r);
-            (r, scope)
-        })
-        .collect();
-    let mut all = cp_findings::collect_all_findings(&global);
-    let wf = cp_findings::workflow_names_for(&store, &all);
-    for f in &mut all {
-        f.workflow_name = wf.get(&f.record.declared_by.run_id).cloned();
-    }
-    let keep: std::collections::HashSet<String> =
-        rupu_coverage::select(&all, finding_view, &parsed, &runs)
-            .into_iter()
-            .map(finding_key)
-            .collect();
-    let mut out: Vec<cp_findings::FindingOut> = all
-        .into_iter()
-        .filter(|f| keep.contains(&finding_key(f)))
-        .collect();
-    out.sort_by(|a, b| {
-        rupu_coverage::severity_rank(b.record.severity)
-            .cmp(&rupu_coverage::severity_rank(a.record.severity))
-            .then_with(|| b.record.declared_at.cmp(&a.record.declared_at))
-            .then_with(|| a.record.id.cmp(&b.record.id))
-    });
-    Ok(out)
-}
-
-fn finding_view(f: &cp_findings::FindingOut) -> rupu_coverage::FindingView<'_> {
-    rupu_coverage::FindingView {
-        record: &f.record,
-        project: Some(&f.project),
-        ws_id: Some(&f.ws_id),
-        workflow: f.workflow_name.as_deref(),
-    }
-}
-
-/// A finding's identity across projects and targets (ids repeat across them).
-fn finding_key(f: &cp_findings::FindingOut) -> String {
-    format!("{}/{}/{}", f.ws_id, f.target_id, f.record.id)
+    let global = crate::paths::global_dir()?;
+    Ok(cp_findings::query_findings(
+        &RunStore::new(global.join("runs")),
+        cp_findings::collect_all_findings(&global),
+        &parsed,
+    ))
 }
 
 #[derive(serde::Serialize)]

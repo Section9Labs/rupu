@@ -551,15 +551,60 @@ fn workflow_names_by_run<'a>(
     names
 }
 
-/// `run_id → workflow_name` for the runs that declared `findings`, for a
-/// caller that filters by `workflow:` (the CLI); same join as `GET /api/findings`.
-pub fn workflow_names_for(store: &RunStore, findings: &[FindingOut]) -> HashMap<String, String> {
-    workflow_names_by_run(
+/// A finding as the query evaluator sees it: its record plus the project,
+/// workspace and workflow this surface knows.
+pub fn finding_view(f: &FindingOut) -> rupu_coverage::FindingView<'_> {
+    rupu_coverage::FindingView {
+        record: &f.record,
+        project: Some(&f.project),
+        ws_id: Some(&f.ws_id),
+        workflow: f.workflow_name.as_deref(),
+    }
+}
+
+/// The findings a parsed query selects, sorted severity (worst first), then
+/// newest, then id. Joins `workflow_name` onto rows that lack it (so
+/// `workflow:` works), and expands each `run:` value to the run plus its
+/// sub-runs ([`resolve_run_scope`]). `rupu findings list|tags` and
+/// `GET /api/findings` both go through this.
+pub fn query_findings(
+    store: &RunStore,
+    mut findings: Vec<FindingOut>,
+    q: &rupu_coverage::ParsedQuery,
+) -> Vec<FindingOut> {
+    let wf = workflow_names_by_run(
         store,
         findings
             .iter()
+            .filter(|f| f.workflow_name.is_none())
             .map(|f| f.record.declared_by.run_id.as_str()),
-    )
+    );
+    for f in &mut findings {
+        if f.workflow_name.is_none() {
+            f.workflow_name = wf.get(&f.record.declared_by.run_id).cloned();
+        }
+    }
+    let runs: rupu_coverage::RunScopes = rupu_coverage::run_values(q)
+        .into_iter()
+        .map(|r| {
+            let scope = resolve_run_scope(store, &r);
+            (r, scope)
+        })
+        .collect();
+    // Ids repeat across workspaces and targets: key by all three.
+    let key = |f: &FindingOut| format!("{}/{}/{}", f.ws_id, f.target_id, f.record.id);
+    let keep: HashSet<String> = rupu_coverage::select(&findings, finding_view, q, &runs)
+        .into_iter()
+        .map(key)
+        .collect();
+    findings.retain(|f| keep.contains(&key(f)));
+    findings.sort_by(|a, b| {
+        rupu_coverage::severity_rank(b.record.severity)
+            .cmp(&rupu_coverage::severity_rank(a.record.severity))
+            .then_with(|| b.record.declared_at.cmp(&a.record.declared_at))
+            .then_with(|| a.record.id.cmp(&b.record.id))
+    });
+    findings
 }
 
 /// `GET /api/findings` — every finding across every registered workspace's
@@ -2149,6 +2194,55 @@ mod tests {
             scope.contains("sub_child"),
             "nested layout → dir name (was: {scope:?})"
         );
+    }
+
+    /// `query_findings` joins provenance (project) and expands `run:` to the
+    /// run's sub-runs recovered from its events.
+    #[test]
+    fn query_findings_matches_project_and_expands_run_to_sub_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let ev_path = store.events_path("run_parent");
+        std::fs::create_dir_all(ev_path.parent().unwrap()).unwrap();
+        let ev = Event::UnitStarted {
+            run_id: "run_parent".into(),
+            step_id: "assess".into(),
+            index: 0,
+            unit_key: "u".into(),
+            agent: None,
+            transcript_path: tmp.path().join("transcripts/run_unit0.jsonl"),
+            host: None,
+            codename: None,
+        };
+        std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
+        let mut other = finding_run(
+            "run_other",
+            "nope",
+            Severity::Critical,
+            "2026-01-04T00:00:00Z",
+        );
+        other.project = "elsewhere".to_string();
+        let all = vec![
+            finding_run("run_parent", "top", Severity::High, "2026-01-01T00:00:00Z"),
+            finding_run(
+                "run_unit0",
+                "unit",
+                Severity::Medium,
+                "2026-01-02T00:00:00Z",
+            ),
+            other,
+        ];
+        let ids = |q: &str| -> Vec<String> {
+            let parsed = rupu_coverage::parse_query(q).unwrap();
+            query_findings(&store, all.clone(), &parsed)
+                .into_iter()
+                .map(|f| f.record.id)
+                .collect()
+        };
+        assert_eq!(ids("run:run_parent"), ["top", "unit"]);
+        assert_eq!(ids("project:proj"), ["top", "unit"]);
+        assert_eq!(ids("project:elsewhere"), ["nope"]);
+        assert_eq!(ids(""), ["nope", "top", "unit"]);
     }
 
     #[test]

@@ -310,3 +310,20 @@ fn a_bad_query_is_a_clear_error() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown key `sevrity`"));
 }
+
+#[test]
+fn a_flag_after_the_query_words_is_refused_not_misparsed() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_one(tmp.path());
+    let out = rupu(tmp.path())
+        .args(["findings", "list", "tag:x", "--ids-only"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("put flags"), "{stderr}");
+    assert!(
+        stderr.contains("`--ids-only` looks like a flag"),
+        "{stderr}"
+    );
+}
