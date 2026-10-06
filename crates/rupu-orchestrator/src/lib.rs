@@ -10,6 +10,7 @@
 //! `{{ steps.<id>.output }}` in the next step's prompt template
 //! (rendered with minijinja).
 
+pub mod catalog;
 pub mod codenames;
 pub mod cron_schedule;
 pub mod event_match;
@@ -25,6 +26,7 @@ pub mod templates;
 pub mod usage_ledger;
 pub mod workflow;
 
+pub use catalog::{list_workflow_summaries, WorkflowSummary};
 pub use event_match::event_matches;
 pub use event_vocab::{
     annotate_event_payload, candidate_event_ids, derived_event_ids, matching_event_id,
