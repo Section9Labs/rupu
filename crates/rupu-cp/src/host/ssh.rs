@@ -3051,7 +3051,7 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
-        read_transcript_file(path)
+        read_transcript_file(path).await
     }
 
     fn local_transcript_path(&self, recorded: &Path) -> PathBuf {
@@ -3073,7 +3073,7 @@ impl HostConnector for SshHostConnector {
         // every later subscriber joins the same zombie. The web panel mounts a
         // GET and a stream for the same path, so this is the common case, not
         // an edge one. Step aside — the handler serves the file the feed fills.
-        if self.lazy.has_live_feed(&cache) {
+        if self.lazy.has_live_feed(&cache).await {
             return Ok(());
         }
         let remote = recorded
@@ -3675,6 +3675,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::host::runtime_liveness::{assert_runtime_live_while_parked_on, make_fifo};
 
     #[test]
     fn shell_escape_wraps_and_escapes_quotes() {
@@ -6346,7 +6347,7 @@ mod tests {
             .unwrap()
             .expect("a live feed is shared, not refused");
         assert!(handle.alive());
-        assert!(conn.lazy.has_live_feed(&cache));
+        assert!(conn.lazy.has_live_feed(&cache).await);
 
         pump_pull_step_transcripts(
             fake.as_ref(),
@@ -6361,9 +6362,9 @@ mod tests {
             !handle.alive(),
             "the feed must be stopped before the authoritative write"
         );
-        assert!(!conn.lazy.has_live_feed(&cache));
+        assert!(!conn.lazy.has_live_feed(&cache).await);
         assert_eq!(
-            conn.lazy.live_feeds(),
+            conn.lazy.live_feeds().await,
             0,
             "the registry entry is gone, so the ssh child is released"
         );
@@ -6385,96 +6386,6 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "stray tmp files left behind: {strays:?}");
-    }
-
-    /// Put a FIFO at `path` (replacing any file there). `false` when
-    /// `mkfifo` is unavailable; the caller then skips.
-    fn make_fifo(path: &std::path::Path) -> bool {
-        let _ = std::fs::remove_file(path);
-        std::process::Command::new("mkfifo")
-            .arg(path)
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-
-    /// Serve the end of `fifo` that its parked opener waits for, from when
-    /// `release` is set (or a 5 s watchdog passes) until `done` is set.
-    /// Never blocks:
-    ///
-    /// * the opener WRITES: hold a non-blocking read end. The writer's open
-    ///   returns, it writes and closes; nobody waits for an EOF.
-    /// * the opener READS: open a non-blocking write end and close it again,
-    ///   every few ms (ENXIO until the reader has opened). Each close is an
-    ///   EOF for the reader. One is not enough: macOS loses it when the close
-    ///   lands while the reader is still waking from its open (about 0.2–0.8%
-    ///   of single handoffs measured), and the next handoff gets through.
-    fn serve_fifo_peer(
-        fifo: std::path::PathBuf,
-        opener_writes: bool,
-        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        use rustix::fs::{Mode, OFlags};
-        use std::sync::atomic::Ordering::SeqCst;
-        let tick = std::time::Duration::from_millis(5);
-        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !release.load(SeqCst) && std::time::Instant::now() < watchdog {
-            std::thread::sleep(tick);
-        }
-        let _read_end = opener_writes
-            .then(|| rustix::fs::open(&fifo, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()));
-        while !done.load(SeqCst) {
-            if !opener_writes {
-                let _ = rustix::fs::open(&fifo, OFlags::WRONLY | OFlags::NONBLOCK, Mode::empty());
-            }
-            std::thread::sleep(tick);
-        }
-    }
-
-    /// Drive `op`, whose file I/O will park on the FIFO at `fifo` until its
-    /// peer opens, and assert that the runtime stays live meanwhile: on a
-    /// current-thread runtime a timer must fire while `op` is still pending.
-    /// Blocking I/O on the runtime thread freezes the timer, so `op` would
-    /// instead complete in its first poll once the watchdog serves the peer
-    /// (after 5 s) — a failure, not a hang.
-    async fn assert_runtime_live_while_parked_on<T>(
-        op: impl std::future::Future<Output = T>,
-        fifo: &std::path::Path,
-        opener_writes: bool,
-    ) -> T {
-        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-        use std::sync::Arc;
-        /// Stops the peer however the caller leaves, the panic below included.
-        struct Stop(Arc<AtomicBool>);
-        impl Drop for Stop {
-            fn drop(&mut self) {
-                self.0.store(true, SeqCst);
-            }
-        }
-        let (release, done) = (
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let peer = {
-            let (fifo, release, done) =
-                (fifo.to_path_buf(), Arc::clone(&release), Arc::clone(&done));
-            std::thread::spawn(move || serve_fifo_peer(fifo, opener_writes, release, done))
-        };
-        let stop = Stop(done);
-        tokio::pin!(op);
-        tokio::select! {
-            biased;
-            _ = &mut op => panic!(
-                "finished before its FIFO had a peer: the I/O ran on the runtime \
-                 thread and froze it until the watchdog served the peer"
-            ),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-        }
-        release.store(true, SeqCst);
-        let out = op.await;
-        drop(stop);
-        peer.join().unwrap();
-        out
     }
 
     /// The terminal pull's run-store scan (`recorded_transcript_paths`)

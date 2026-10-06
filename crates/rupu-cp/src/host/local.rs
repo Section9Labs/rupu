@@ -434,7 +434,7 @@ impl HostConnector for LocalHostConnector {
     // this method does NOT. Do not resolve("local") + get_transcript with
     // user input.
     async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
-        read_transcript_file(path)
+        read_transcript_file(path).await
     }
 
     /// Stage a packed workspace into a fresh scratch dir under the CP cache.
