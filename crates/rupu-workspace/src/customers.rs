@@ -413,10 +413,8 @@ impl CustomerStore {
             return Err(CustomerError::Archived(slug.to_string()));
         }
         let ws = self.resolve_project(project, true)?;
-        write_atomic(
-            &self.workspaces().customer_sidecar_path(&ws.id),
-            &format!("{slug}\n"),
-        )?;
+        let sidecar = self.workspaces().customer_sidecar_path(&ws.id);
+        with_assignment_lock(&sidecar, || write_atomic(&sidecar, &format!("{slug}\n")))?;
         Ok(ws)
     }
 
@@ -424,14 +422,26 @@ impl CustomerStore {
     pub fn unassign(&self, project: ProjectRef<'_>) -> Result<Workspace, CustomerError> {
         let ws = self.resolve_project(project, false)?;
         let sidecar = self.workspaces().customer_sidecar_path(&ws.id);
-        match std::fs::remove_file(&sidecar) {
-            Ok(()) => Ok(ws),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ws),
-            Err(e) => Err(CustomerError::Io {
-                action: format!("remove {}", sidecar.display()),
-                source: e,
-            }),
-        }
+        with_assignment_lock(&sidecar, || remove_sidecar(&sidecar))?;
+        Ok(ws)
+    }
+
+    /// Unassign `project` only if it is assigned to `slug` — a
+    /// compare-and-remove: the read and the removal happen under the
+    /// assignment's lock (`workspaces/<id>.customer.lock`, which every
+    /// assignment write takes), so a concurrent reassignment to another
+    /// customer is never removed. `Ok(true)` = removed; `Ok(false)` = the
+    /// project is not (or no longer) assigned to `slug`, nothing changed.
+    pub fn unassign_if(&self, slug: &str, project: ProjectRef<'_>) -> Result<bool, CustomerError> {
+        let ws = self.resolve_project(project, false)?;
+        let sidecar = self.workspaces().customer_sidecar_path(&ws.id);
+        with_assignment_lock(&sidecar, || {
+            if read_sidecar(&sidecar)?.as_deref() != Some(slug) {
+                return Ok(false);
+            }
+            remove_sidecar(&sidecar)?;
+            Ok(true)
+        })
     }
 
     /// The slug in `ws_id`'s sidecar, as written — not checked against the
@@ -592,6 +602,68 @@ struct Assignment {
 }
 
 /// A sidecar's slug; `None` when the file is absent or blank.
+/// Remove an assignment sidecar; already gone is fine.
+fn remove_sidecar(sidecar: &Path) -> Result<(), CustomerError> {
+    match std::fs::remove_file(sidecar) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CustomerError::Io {
+            action: format!("remove {}", sidecar.display()),
+            source: e,
+        }),
+    }
+}
+
+/// Run `f` holding the exclusive lock on `<sidecar>.lock`, which serializes
+/// every write of one project's assignment (assign, unassign,
+/// [`CustomerStore::unassign_if`]); readers need none — the sidecar itself
+/// is replaced by atomic rename. The lock is a separate file so the rename
+/// cannot strand it. A filesystem that cannot lock at all runs `f` unlocked
+/// with a warning (the assignment write is still atomic); any other lock
+/// failure is an error and `f` does not run.
+fn with_assignment_lock<T>(
+    sidecar: &Path,
+    f: impl FnOnce() -> Result<T, CustomerError>,
+) -> Result<T, CustomerError> {
+    let mut name = sidecar.as_os_str().to_owned();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CustomerError::Io {
+            action: format!("create_dir_all {}", parent.display()),
+            source: e,
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| CustomerError::Io {
+            action: format!("open {}", lock_path.display()),
+            source: e,
+        })?;
+    match file.lock() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                error = %e,
+                "this filesystem cannot lock the customer assignment; writing without the lock"
+            );
+        }
+        Err(e) => {
+            return Err(CustomerError::Io {
+                action: format!("lock {}", lock_path.display()),
+                source: e,
+            })
+        }
+    }
+    let out = f();
+    drop(file);
+    out
+}
+
 fn read_sidecar(path: &Path) -> Result<Option<String>, CustomerError> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),

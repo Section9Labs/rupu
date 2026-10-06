@@ -66,6 +66,40 @@ fn create_refuses_the_reserved_slug_none_but_get_and_list_tolerate_one() {
     assert!(store.list(true).unwrap().iter().any(|c| c.slug == "none"));
 }
 
+/// `unassign_if` removes the assignment only when it names `slug`: a
+/// reassignment to another customer that landed first (simulated by writing
+/// the sidecar directly) is left in place.
+#[test]
+fn unassign_if_is_a_compare_and_remove() {
+    let h = home();
+    let store = CustomerStore::new(h.path());
+    store.create("acme", &acme()).unwrap();
+    let project = h.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let ws = store.assign("acme", ProjectRef::Path(&project)).unwrap();
+    let sidecar = h
+        .path()
+        .join("workspaces")
+        .join(format!("{}.customer", ws.id));
+
+    // A concurrent reassignment to globex wins the race.
+    std::fs::write(&sidecar, "globex\n").unwrap();
+    assert!(!store.unassign_if("acme", ProjectRef::Id(&ws.id)).unwrap());
+    assert_eq!(
+        store.customer_of(&ws.id).unwrap().as_deref(),
+        Some("globex")
+    );
+
+    // Assigned to acme: removed.
+    std::fs::write(&sidecar, "acme\n").unwrap();
+    assert!(store.unassign_if("acme", ProjectRef::Id(&ws.id)).unwrap());
+    assert_eq!(store.customer_of(&ws.id).unwrap(), None);
+    // Nothing assigned: nothing to remove.
+    assert!(!store.unassign_if("acme", ProjectRef::Id(&ws.id)).unwrap());
+    // The lock file never reads as an assignment.
+    assert!(store.projects_of("acme").unwrap().is_empty());
+}
+
 #[test]
 fn create_then_get_round_trips_and_writes_an_empty_layer() {
     let h = home();

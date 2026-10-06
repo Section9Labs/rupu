@@ -541,12 +541,16 @@ async fn unassign_project(
     let store = customers(&s);
     blocking(move || {
         store.get(&slug).map_err(api_err)?;
-        if store.customer_of(&ws_id).map_err(api_err)?.as_deref() != Some(slug.as_str()) {
+        // Compare-and-remove under the assignment lock: a reassignment to
+        // another customer that lands concurrently is never removed.
+        if !store
+            .unassign_if(&slug, ProjectRef::Id(&ws_id))
+            .map_err(api_err)?
+        {
             return Err(ApiError::not_found(format!(
                 "project {ws_id} is not assigned to customer `{slug}`"
             )));
         }
-        store.unassign(ProjectRef::Id(&ws_id)).map_err(api_err)?;
         Ok(StatusCode::NO_CONTENT)
     })
     .await
