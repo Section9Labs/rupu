@@ -13,6 +13,14 @@
 //!   (`final_turn_text`) from the unit's transcript, which the runner appends
 //!   incrementally.
 //!
+//! A [`UnitKind::Workflow`] unit differs only in where that evidence lives. Its
+//! run id is the *workflow run's* id, not a transcript's (each step gets a
+//! fresh transcript), and its answer is not a final turn, so liveness and the
+//! outcome come from the run store instead: `<global>/runs/<id>/run.json` (the
+//! status, written at start with `runner_pid`) and `step_results.jsonl` (the
+//! last non-skipped step's output is the unit's answer). `Child::try_wait` is
+//! still the one terminal signal for both kinds.
+//!
 //! # Zombies
 //!
 //! `kill(pid, 0)` succeeds for a zombie (an exited child nobody has reaped),
@@ -39,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use crate::proc::{kill_group, terminate_group};
 use crate::unit::{UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus};
+use rupu_orchestrator::{RunStatus, RunStore, RunStoreError};
 
 /// How long `Drop` waits for SIGTERMed units to exit before it SIGKILLs them.
 const DROP_GRACE: Duration = Duration::from_millis(1500);
@@ -132,6 +141,9 @@ struct Live {
     /// Cached at spawn (`Child::id`). The unit leads its own process group, so
     /// this is also its pgid: the target of group termination.
     pid: u32,
+    /// What the unit runs, which picks where `poll` reads its evidence and how
+    /// `terminate` stops it.
+    kind: UnitKind,
     /// The terminal status once observed, so a later `poll` is idempotent and
     /// never re-reads the transcript.
     done: Option<UnitStatus>,
@@ -251,6 +263,92 @@ impl SubprocessUnitLauncher {
         let events = rupu_transcript::JsonlReader::iter(path).ok()?;
         rupu_transcript::final_turn_text(events.filter_map(Result::ok))
     }
+
+    /// The run store a workflow unit's `rupu workflow run` writes into
+    /// (`RUPU_HOME` is `self.global`, see `spawn`).
+    fn run_store(&self) -> RunStore {
+        RunStore::new(self.global.join("runs"))
+    }
+
+    /// The status of a unit whose process is still alive.
+    ///
+    /// Started-evidence is a non-empty transcript for an agent and a readable
+    /// `run.json` for a workflow (any non-terminal status: the runner has
+    /// begun, even if it is parked or between steps). A `run.json` that does
+    /// not parse is read as not started: its writes are atomic renames, so
+    /// that is only ever a path that does not exist yet.
+    fn alive_status(&self, id: &str, kind: UnitKind) -> UnitStatus {
+        let started = match kind {
+            UnitKind::Agent => self.has_started(id),
+            UnitKind::Workflow => self.run_store().load(id).is_ok(),
+        };
+        if started {
+            UnitStatus::Running
+        } else {
+            UnitStatus::Pending
+        }
+    }
+
+    /// The terminal status for a workflow unit whose process has exited with
+    /// `exit`: `run.json` is the verdict, the exit status only explains a run
+    /// that died without writing one.
+    fn workflow_outcome_of(&self, id: &str, exit: ExitStatus) -> UnitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        let store = self.run_store();
+        let record = match store.load(id) {
+            Ok(record) => record,
+            Err(RunStoreError::NotFound(_)) => {
+                return UnitStatus::Failed("workflow exited before writing run.json".into());
+            }
+            Err(e) => return UnitStatus::Failed(format!("could not read run.json: {e}")),
+        };
+        match record.status {
+            RunStatus::Completed => UnitStatus::Done(UnitOutcome {
+                output: self.last_step_output(&store, id),
+                success: true,
+            }),
+            RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => UnitStatus::Failed(
+                record
+                    .error_message
+                    .unwrap_or_else(|| format!("workflow run {}", record.status.as_str())),
+            ),
+            // Backstop: a gated workflow is refused when the unit is
+            // requested, so a unit never legitimately parks.
+            RunStatus::AwaitingApproval | RunStatus::Paused => {
+                UnitStatus::Failed("workflow unit parked at an approval gate".into())
+            }
+            // The process is gone but the run never reached a terminal state:
+            // it was killed or crashed mid-run.
+            RunStatus::Pending | RunStatus::Running => UnitStatus::Failed(match exit.signal() {
+                Some(sig) => format!(
+                    "workflow killed by signal {sig} while {}",
+                    record.status.as_str()
+                ),
+                None => format!(
+                    "workflow exited with {exit} while its run was still {}",
+                    record.status.as_str()
+                ),
+            }),
+        }
+    }
+
+    /// A completed workflow's answer: the output of the last step that was not
+    /// skipped, in append order. Empty when there is none (or the log is
+    /// unreadable: the run still completed).
+    fn last_step_output(&self, store: &RunStore, id: &str) -> String {
+        match store.read_step_results(id) {
+            Ok(rows) => rows
+                .into_iter()
+                .rev()
+                .find(|r| !r.skipped)
+                .map(|r| r.output)
+                .unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(run_id = id, error = %e, "could not read a completed workflow's step results");
+                String::new()
+            }
+        }
+    }
 }
 
 impl UnitLauncher for SubprocessUnitLauncher {
@@ -281,6 +379,7 @@ impl UnitLauncher for SubprocessUnitLauncher {
             Live {
                 child,
                 pid,
+                kind: spec.kind,
                 done: None,
             },
         );
@@ -290,7 +389,7 @@ impl UnitLauncher for SubprocessUnitLauncher {
     fn poll(&self, id: &UnitId, _run_dir: &Path) -> UnitStatus {
         // Phase 1, under the lock and cheap: `try_wait` is the terminal signal
         // (and reaps the child), never `pid_is_running`, which a zombie passes.
-        let exit = {
+        let (exit, kind) = {
             let mut live = self.lock();
             let Some(unit) = live.get_mut(&id.0) else {
                 return UnitStatus::Failed(format!("unknown unit {}", id.0));
@@ -298,15 +397,12 @@ impl UnitLauncher for SubprocessUnitLauncher {
             if let Some(done) = &unit.done {
                 return done.clone();
             }
+            let kind = unit.kind;
             match unit.child.try_wait() {
-                Ok(Some(status)) => status,
+                Ok(Some(status)) => (status, kind),
                 Ok(None) => {
                     drop(live);
-                    return if self.has_started(&id.0) {
-                        UnitStatus::Running
-                    } else {
-                        UnitStatus::Pending
-                    };
+                    return self.alive_status(&id.0, kind);
                 }
                 Err(e) => {
                     let failed = UnitStatus::Failed(format!("could not poll unit: {e}"));
@@ -315,8 +411,11 @@ impl UnitLauncher for SubprocessUnitLauncher {
                 }
             }
         };
-        // Phase 2, off the lock: the transcript can be large.
-        let status = self.outcome_of(&id.0, exit);
+        // Phase 2, off the lock: a transcript or step log can be large.
+        let status = match kind {
+            UnitKind::Agent => self.outcome_of(&id.0, exit),
+            UnitKind::Workflow => self.workflow_outcome_of(&id.0, exit),
+        };
         if let Some(unit) = self.lock().get_mut(&id.0) {
             unit.done = Some(status.clone());
         }
@@ -338,6 +437,24 @@ impl UnitLauncher for SubprocessUnitLauncher {
         // the pgid (`process_group(0)`), and signalling the group also reaches
         // the unit's grandchildren, which a pid-only SIGTERM would orphan.
         if matches!(unit.child.try_wait(), Ok(None)) {
+            if unit.kind == UnitKind::Workflow {
+                // Mark the run `Cancelled` (and let the store signal the
+                // runner) BEFORE the group dies, so `run.json` never keeps
+                // saying `Running` for a unit that is gone. Best-effort, and
+                // under the same lock as the group signal below so the leader
+                // cannot be reaped (its pid recycled) in between; the store's
+                // own wait on `run.json` is bounded (2s).
+                if let Err(e) = self.run_store().cancel(
+                    &id.0,
+                    "agentiflow",
+                    "fleet terminate",
+                    chrono::Utc::now(),
+                ) {
+                    tracing::debug!(run_id = %id.0, error = %e, "could not cancel a terminated workflow unit's run");
+                }
+            }
+            // The group also reaches a workflow's step grandchildren (bash
+            // tools), which the store's pid-only SIGTERM would orphan.
             terminate_group(unit.pid);
         }
     }
@@ -907,6 +1024,266 @@ mod tests {
 
         assert!(!pid_is_running(leader), "leader left running or a zombie");
         wait_gone(grandchild, "the SIGTERM-ignoring grandchild");
+    }
+
+    // ---- workflow units: run.json + step_results.jsonl ----
+
+    /// A real `RunRecord` (deserialized through the store's own serde, so a
+    /// field the store renames fails here, not silently in production).
+    fn run_record(id: &str, status: &str, error: Option<&str>) -> rupu_orchestrator::RunRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "workflow_name": "web-assess",
+            "status": status,
+            "inputs": {},
+            "workspace_id": "ws_test",
+            "workspace_path": "/work",
+            "transcript_dir": "/work/transcripts",
+            "started_at": "2026-10-06T00:00:00Z",
+            "error_message": error,
+        }))
+        .expect("run.json shape")
+    }
+
+    /// A real `StepResultRecord`: `(step_id, output, skipped)`.
+    fn step_row(run_id: &str, step: (&str, &str, bool)) -> rupu_orchestrator::StepResultRecord {
+        serde_json::from_value(serde_json::json!({
+            "step_id": step.0,
+            "run_id": run_id,
+            "transcript_path": "/work/transcripts/step.jsonl",
+            "output": step.1,
+            "success": true,
+            "skipped": step.2,
+            "rendered_prompt": "",
+            "finished_at": "2026-10-06T00:00:01Z",
+        }))
+        .expect("step_results.jsonl row shape")
+    }
+
+    /// Stage `<root>/runs/<id>/{run.json,step_results.jsonl,...}` through the
+    /// real `RunStore`, exactly as `rupu workflow run` would leave them.
+    fn stage_run(
+        root: &Path,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+        steps: &[(&str, &str, bool)],
+    ) {
+        let store = RunStore::new(root.join("runs"));
+        store
+            .create(
+                run_record(id, status, error),
+                "name: web-assess\nsteps: []\n",
+            )
+            .unwrap();
+        for step in steps {
+            store.append_step_result(id, &step_row(id, *step)).unwrap();
+        }
+    }
+
+    /// A launcher whose "rupu" is a script that, after `delay`, installs a
+    /// run dir staged (with the real store types) for the unit's own run id
+    /// into `<global>/runs/<id>` by an atomic directory rename, then runs
+    /// `after`: the fake `rupu workflow run … --run-id <id>`.
+    fn workflow_launcher(
+        global: &Path,
+        status: &'static str,
+        error: Option<&'static str>,
+        steps: &'static [(&'static str, &'static str, bool)],
+        delay: &str,
+        after: &str,
+    ) -> SubprocessUnitLauncher {
+        let global_dir = global.to_path_buf();
+        let stage = global.join("stage");
+        let (delay, after) = (delay.to_string(), after.to_string());
+        SubprocessUnitLauncher::new("/bin/sh", global).with_argv(move |_, id, _| {
+            stage_run(&stage, id, status, error, steps);
+            let script = format!(
+                "sleep {delay}; mkdir -p {g}/runs; \
+                 cp -R {s}/runs/{id} {g}/runs/.{id}.tmp && mv {g}/runs/.{id}.tmp {g}/runs/{id}; \
+                 {after}",
+                g = global_dir.display(),
+                s = stage.display(),
+            );
+            vec!["-c".into(), script.into()]
+        })
+    }
+
+    #[test]
+    fn a_completed_workflow_is_done_with_the_last_non_skipped_steps_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = workflow_launcher(
+            dir.path(),
+            "completed",
+            None,
+            &[
+                ("scan", "first", false),
+                ("report", "the final report", false),
+                ("cleanup", "skipped output", true),
+            ],
+            "0.3",
+            "exit 0",
+        );
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+
+        // Alive, and `run.json` is not there yet: not started.
+        assert_eq!(launcher.poll(&id, dir.path()), UnitStatus::Pending);
+
+        let done = wait_terminal(&launcher, &id, dir.path());
+        assert_eq!(
+            done,
+            UnitStatus::Done(UnitOutcome {
+                output: "the final report".into(),
+                success: true,
+            })
+        );
+        assert_eq!(launcher.poll(&id, dir.path()), done, "idempotent");
+    }
+
+    #[test]
+    fn a_completed_workflow_with_no_steps_is_done_with_empty_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = workflow_launcher(dir.path(), "completed", None, &[], "0", "exit 0");
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        assert_eq!(
+            wait_terminal(&launcher, &id, dir.path()),
+            UnitStatus::Done(UnitOutcome {
+                output: String::new(),
+                success: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_workflow_is_failed_with_the_runs_error_message() {
+        let dir = tempfile::tempdir().unwrap();
+        // The process exits 0 on its own: only `run.json` says it failed.
+        let launcher = workflow_launcher(
+            dir.path(),
+            "failed",
+            Some("step `scan` failed: boom"),
+            &[("scan", "partial", false)],
+            "0",
+            "exit 0",
+        );
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        assert_eq!(
+            wait_terminal(&launcher, &id, dir.path()),
+            UnitStatus::Failed("step `scan` failed: boom".into())
+        );
+    }
+
+    #[test]
+    fn a_rejected_or_cancelled_workflow_without_a_message_is_failed_with_a_default() {
+        for status in ["rejected", "cancelled"] {
+            let dir = tempfile::tempdir().unwrap();
+            let launcher = workflow_launcher(dir.path(), status, None, &[], "0", "exit 0");
+            let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+            let got = wait_terminal(&launcher, &id, dir.path());
+            assert_eq!(got, UnitStatus::Failed(format!("workflow run {status}")));
+        }
+    }
+
+    #[test]
+    fn a_workflow_parked_at_a_gate_is_failed_as_a_backstop() {
+        for status in ["awaiting_approval", "paused"] {
+            let dir = tempfile::tempdir().unwrap();
+            let launcher = workflow_launcher(dir.path(), status, None, &[], "0", "exit 0");
+            let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+            assert_eq!(
+                wait_terminal(&launcher, &id, dir.path()),
+                UnitStatus::Failed("workflow unit parked at an approval gate".into()),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workflow_that_exits_without_writing_run_json_is_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = sh(dir.path(), "exit 0");
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        assert_eq!(
+            wait_terminal(&launcher, &id, dir.path()),
+            UnitStatus::Failed("workflow exited before writing run.json".into())
+        );
+    }
+
+    #[test]
+    fn a_workflow_killed_mid_run_is_failed_not_stuck_running() {
+        let dir = tempfile::tempdir().unwrap();
+        // `run.json` says `running` and the runner dies by SIGKILL: the run
+        // never reached a terminal state, so the unit must not read as alive.
+        let launcher = workflow_launcher(dir.path(), "running", None, &[], "0", "kill -9 $$");
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let got = wait_terminal(&launcher, &id, dir.path());
+        assert!(
+            matches!(&got, UnitStatus::Failed(why) if why.contains("signal 9") && why.contains("running")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_workflow_is_running_once_run_json_exists_and_is_reaped_when_it_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = workflow_launcher(
+            dir.path(),
+            "running",
+            None,
+            &[("scan", "so far", false)],
+            "0",
+            "sleep 5",
+        );
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let pid = pid_of(&launcher, &id);
+
+        // The copy lands a moment after spawn; poll until it has.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while launcher.poll(&id, dir.path()) != UnitStatus::Running {
+            assert!(Instant::now() < deadline, "never became Running");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pid_is_running(pid));
+
+        launcher.terminate(&id);
+        assert!(wait_terminal(&launcher, &id, dir.path()).is_terminal());
+        assert!(!pid_is_running(pid), "reaped, not a zombie");
+    }
+
+    #[test]
+    fn terminating_a_workflow_unit_cancels_its_run_and_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("step.pid");
+        // A runner with an in-flight step grandchild, like `rupu workflow run`
+        // mid bash-tool.
+        let launcher = workflow_launcher(
+            dir.path(),
+            "running",
+            None,
+            &[],
+            "0",
+            &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+        );
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let grandchild = read_pid_file(&pidfile);
+        let leader = pid_of(&launcher, &id);
+
+        launcher.terminate(&id);
+
+        // `run.json` no longer says `running`: the store cancelled the run...
+        let rec = RunStore::new(dir.path().join("runs")).load(&id.0).unwrap();
+        assert_eq!(rec.status, RunStatus::Cancelled);
+        assert_eq!(rec.error_message.as_deref(), Some("fleet terminate"));
+        // ...the unit reads as failed with that reason...
+        assert_eq!(
+            wait_terminal(&launcher, &id, dir.path()),
+            UnitStatus::Failed("fleet terminate".into())
+        );
+        assert!(!pid_is_running(leader), "reaped, not a zombie");
+        // ...and the step's grandchild died with the group.
+        wait_gone(grandchild, "the workflow unit's step grandchild");
+        // Terminating a finished unit is a harmless no-op.
+        launcher.terminate(&id);
     }
 
     #[test]
