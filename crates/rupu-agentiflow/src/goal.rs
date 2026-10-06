@@ -3,7 +3,7 @@
 //! asset goals match assets by kind + locator and a minimum rung on the
 //! owning profile's depth ladder.
 
-use crate::def::{AssetSelector, FindingSelector, Goal};
+use crate::def::{AssetSelector, FindingSelector, Goal, VerifyCheck};
 use rupu_coverage::{
     read_assets, read_findings, ActiveSet, Asset, Coordinate, CoveragePaths, FindingRecord,
     Locator, VerificationStatus,
@@ -28,15 +28,50 @@ pub struct GoalOutcome {
     pub detail: String,
 }
 
-/// A finding is verified only when its report carries a `Confirmed`
-/// verification. A record with no report (Summary profile) or no verification
-/// block is unverified.
-fn is_verified(rec: &FindingRecord) -> bool {
-    rec.report
-        .as_ref()
-        .and_then(|r| r.verification.as_ref())
-        .map(|v| v.status == VerificationStatus::Confirmed)
-        .unwrap_or(false)
+/// Whether a goal's findings are gated on verification at all. Naming a
+/// verifier (`verify_with`) implies requiring verification even when
+/// `verified` was left `false`; with NEITHER set, verification is ignored
+/// entirely and an unverified finding counts like any other.
+fn requires_verification(verified: bool, verify_with: Option<&str>) -> bool {
+    verified || verify_with.is_some()
+}
+
+/// Whether `rec` clears a verification gate. TRUE only when ALL hold:
+///
+/// - its report carries a `Confirmed` verification (a Summary-profile record,
+///   or a report with no verification block, is unverified);
+/// - the verification is independent: `by_run` is present, non-blank, and not
+///   the run that filed the finding (`declared_by.run_id`) — a finding is
+///   never verified by its own filer, and a blank verifier never counts;
+/// - when `verify_with` is `Some(x)`, the verifying agent (`by_agent`) is
+///   exactly `x`;
+/// - when `check` is [`VerifyCheck::WithPoc`], the report lists at least one
+///   artifact (the same `has_poc` notion the CP's report summary uses).
+fn is_verified(rec: &FindingRecord, verify_with: Option<&str>, check: VerifyCheck) -> bool {
+    let Some(report) = rec.report.as_ref() else {
+        return false;
+    };
+    let Some(v) = report.verification.as_ref() else {
+        return false;
+    };
+    if v.status != VerificationStatus::Confirmed {
+        return false;
+    }
+    let Some(by_run) = v.by_run.as_deref().map(str::trim).filter(|r| !r.is_empty()) else {
+        return false;
+    };
+    if by_run == rec.declared_by.run_id.trim() {
+        return false;
+    }
+    if let Some(want) = verify_with {
+        if v.by_agent.as_deref() != Some(want) {
+            return false;
+        }
+    }
+    match check {
+        VerifyCheck::Confirmed => true,
+        VerifyCheck::WithPoc => !report.artifacts.is_empty(),
+    }
 }
 
 /// Whether the finding's report lists `class_id` among its classifications
@@ -51,20 +86,28 @@ fn finding_has_classification(rec: &FindingRecord, class_id: &str) -> bool {
     }
 }
 
-/// Count the findings matching `sel`, optionally only the verified ones.
-/// A selector with no classification matches every finding.
+/// Count the findings matching `sel`. A selector with no classification
+/// matches every finding.
+///
+/// Verification gating applies when `verified` is true OR `verify_with` is
+/// set (see [`requires_verification`]); a gated count keeps only the findings
+/// that clear [`is_verified`] under `verify_with` / `check`. With neither
+/// set, `check` is irrelevant and verification is ignored.
 pub fn count_matching_findings(
     records: &[FindingRecord],
     sel: &FindingSelector,
     verified: bool,
+    verify_with: Option<&str>,
+    check: VerifyCheck,
 ) -> u64 {
+    let gated = requires_verification(verified, verify_with);
     records
         .iter()
         .filter(|r| match &sel.classification {
             Some(id) => finding_has_classification(r, id),
             None => true,
         })
-        .filter(|r| !verified || is_verified(r))
+        .filter(|r| !gated || is_verified(r, verify_with, check))
         .count() as u64
 }
 
@@ -137,7 +180,15 @@ impl GoalEvaluator {
         if let Some(sel) = &goal.target.findings {
             let recs = read_findings(paths).map_err(|e| GoalEvalError::Io(e.to_string()))?;
             let target = goal.target.count_gte.unwrap_or(1);
-            let current = count_matching_findings(&recs, sel, goal.target.verified);
+            let verify_with = goal.verify_with.as_deref();
+            let current = count_matching_findings(
+                &recs,
+                sel,
+                goal.target.verified,
+                verify_with,
+                goal.target.verify_check.unwrap_or_default(),
+            );
+            let gated = requires_verification(goal.target.verified, verify_with);
             return Ok(GoalOutcome {
                 id: goal.id.clone(),
                 met: current >= target,
@@ -147,11 +198,7 @@ impl GoalEvaluator {
                     "{}/{} {}findings{}",
                     current,
                     target,
-                    if goal.target.verified {
-                        "verified "
-                    } else {
-                        ""
-                    },
+                    if gated { "verified " } else { "" },
                     sel.classification
                         .as_deref()
                         .map(|c| format!(" [{c}]"))
@@ -212,7 +259,7 @@ mod tests {
     use chrono::Utc;
     use rupu_coverage::{
         Attribution, FindingEvidence, FindingProfile, FindingRecord, FindingReport, FindingScope,
-        Severity, Surface, VerificationStatus,
+        Severity, Surface, Verification, VerificationStatus,
     };
     use serde_json::json;
 
@@ -296,22 +343,275 @@ mod tests {
         }
     }
 
+    /// Replace the record's verification with a `Confirmed` one carrying the
+    /// given verifier run + agent. The record's own filer is `run_1`.
+    fn confirmed_by(
+        mut rec: FindingRecord,
+        by_run: Option<&str>,
+        by_agent: Option<&str>,
+    ) -> FindingRecord {
+        rec.report.as_mut().expect("full record").verification = Some(Verification {
+            status: VerificationStatus::Confirmed,
+            by_run: by_run.map(String::from),
+            by_agent: by_agent.map(String::from),
+            notes: None,
+        });
+        rec
+    }
+
+    /// Give the record a proof-of-concept artifact.
+    fn with_poc(mut rec: FindingRecord) -> FindingRecord {
+        rec.report.as_mut().expect("full record").artifacts =
+            vec![serde_json::from_value(json!({ "path": "poc.py" })).expect("artifact parses")];
+        rec
+    }
+
+    fn full(classification: &str) -> FindingRecord {
+        mk_finding(Some(classification), None)
+    }
+
+    fn sel(classification: &str) -> crate::def::FindingSelector {
+        crate::def::FindingSelector {
+            classification: Some(classification.into()),
+        }
+    }
+
+    const C: VerifyCheck = VerifyCheck::Confirmed;
+
     #[test]
     fn counts_only_verified_findings_of_the_classification() {
         let recs = vec![
-            mk_finding(Some("CWE-94"), Some(VerificationStatus::Confirmed)),
+            // confirmed by a different run than the filer (`run_1`)
+            confirmed_by(full("CWE-94"), Some("run_v"), None),
             mk_finding(Some("CWE-94"), Some(VerificationStatus::Unverified)),
             mk_finding(Some("CWE-94"), None), // full report, no verification block
             mk_finding(None, None),           // Summary profile, report: None
-            mk_finding(Some("CWE-79"), Some(VerificationStatus::Confirmed)),
+            confirmed_by(full("CWE-79"), Some("run_v"), None),
         ];
-        let sel = crate::def::FindingSelector {
-            classification: Some("CWE-94".into()),
-        };
+        let sel = sel("CWE-94");
         // only the confirmed CWE-94
-        assert_eq!(count_matching_findings(&recs, &sel, true), 1);
+        assert_eq!(count_matching_findings(&recs, &sel, true, None, C), 1);
         // all CWE-94 regardless of verification (the report-less record has no classification)
-        assert_eq!(count_matching_findings(&recs, &sel, false), 3);
+        assert_eq!(count_matching_findings(&recs, &sel, false, None, C), 3);
+    }
+
+    #[test]
+    fn confirmed_without_a_verifier_run_is_not_verified() {
+        // `Confirmed` with no `by_run` at all (the pre-3c shape) no longer counts.
+        let recs = vec![mk_finding(
+            Some("CWE-94"),
+            Some(VerificationStatus::Confirmed),
+        )];
+        assert_eq!(
+            count_matching_findings(&recs, &sel("CWE-94"), true, None, C),
+            0
+        );
+    }
+
+    #[test]
+    fn independent_verification_counts_but_self_verification_does_not() {
+        let sel = sel("CWE-94");
+        // verified by a different run -> counts
+        let other = vec![confirmed_by(full("CWE-94"), Some("run_2"), None)];
+        assert_eq!(count_matching_findings(&other, &sel, true, None, C), 1);
+        // verified by the run that filed it (`run_1`) -> does not
+        let own = vec![confirmed_by(full("CWE-94"), Some("run_1"), None)];
+        assert_eq!(count_matching_findings(&own, &sel, true, None, C), 0);
+        // a self-verification that differs only by whitespace is still the filer
+        let padded = vec![confirmed_by(full("CWE-94"), Some(" run_1 "), None)];
+        assert_eq!(count_matching_findings(&padded, &sel, true, None, C), 0);
+    }
+
+    #[test]
+    fn blank_verifier_run_never_counts() {
+        let sel = sel("CWE-94");
+        for blank in ["", "   ", "\t\n"] {
+            let recs = vec![confirmed_by(full("CWE-94"), Some(blank), None)];
+            assert_eq!(
+                count_matching_findings(&recs, &sel, true, None, C),
+                0,
+                "by_run {blank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_confirmed_verdicts_never_count() {
+        let sel = sel("CWE-94");
+        for status in [
+            VerificationStatus::Unverified,
+            VerificationStatus::Disputed,
+            VerificationStatus::Inconclusive,
+        ] {
+            let mut rec = confirmed_by(full("CWE-94"), Some("run_2"), None);
+            rec.report
+                .as_mut()
+                .unwrap()
+                .verification
+                .as_mut()
+                .unwrap()
+                .status = status;
+            assert_eq!(
+                count_matching_findings(&[rec], &sel, true, None, C),
+                0,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_with_requires_the_named_verifier_agent() {
+        let sel = sel("CWE-94");
+        let recs = vec![
+            confirmed_by(full("CWE-94"), Some("run_2"), Some("exploit-verifier")),
+            confirmed_by(full("CWE-94"), Some("run_3"), Some("some-other-agent")),
+            confirmed_by(full("CWE-94"), Some("run_4"), None), // no agent recorded
+        ];
+        // only the one verified by the named agent
+        assert_eq!(
+            count_matching_findings(&recs, &sel, true, Some("exploit-verifier"), C),
+            1
+        );
+        // without a named verifier, any independent confirmation counts
+        assert_eq!(count_matching_findings(&recs, &sel, true, None, C), 3);
+    }
+
+    #[test]
+    fn verify_with_alone_gates_even_when_verified_is_false() {
+        let sel = sel("CWE-94");
+        let recs = vec![
+            confirmed_by(full("CWE-94"), Some("run_2"), Some("exploit-verifier")),
+            confirmed_by(full("CWE-94"), Some("run_3"), Some("some-other-agent")),
+            full("CWE-94"), // no verification at all
+        ];
+        // `verified: false` but a verifier is named: verification is still required
+        assert_eq!(
+            count_matching_findings(&recs, &sel, false, Some("exploit-verifier"), C),
+            1
+        );
+    }
+
+    #[test]
+    fn verify_with_still_enforces_independence() {
+        // the named agent verified its own run's finding -> not independent
+        let recs = vec![confirmed_by(
+            full("CWE-94"),
+            Some("run_1"),
+            Some("exploit-verifier"),
+        )];
+        assert_eq!(
+            count_matching_findings(&recs, &sel("CWE-94"), true, Some("exploit-verifier"), C),
+            0
+        );
+    }
+
+    #[test]
+    fn with_poc_additionally_requires_an_artifact() {
+        let sel = sel("CWE-94");
+        let recs = vec![
+            with_poc(confirmed_by(full("CWE-94"), Some("run_2"), None)),
+            confirmed_by(full("CWE-94"), Some("run_3"), None), // confirmed, no artifact
+            // an artifact but never verified
+            with_poc(full("CWE-94")),
+            // an artifact, but verified by its own filer
+            with_poc(confirmed_by(full("CWE-94"), Some("run_1"), None)),
+        ];
+        assert_eq!(
+            count_matching_findings(&recs, &sel, true, None, VerifyCheck::WithPoc),
+            1
+        );
+        // plain `confirmed` does not need the artifact
+        assert_eq!(count_matching_findings(&recs, &sel, true, None, C), 2);
+        // with_poc composes with verify_with
+        let named = vec![
+            with_poc(confirmed_by(full("CWE-94"), Some("run_2"), Some("x"))),
+            with_poc(confirmed_by(full("CWE-94"), Some("run_3"), Some("y"))),
+            confirmed_by(full("CWE-94"), Some("run_4"), Some("x")),
+        ];
+        assert_eq!(
+            count_matching_findings(&named, &sel, true, Some("x"), VerifyCheck::WithPoc),
+            1
+        );
+    }
+
+    #[test]
+    fn with_neither_verified_nor_verify_with_verification_is_ignored() {
+        let sel = sel("CWE-94");
+        let recs = vec![
+            full("CWE-94"),                                    // no verification
+            confirmed_by(full("CWE-94"), Some("run_1"), None), // self-verified
+            confirmed_by(full("CWE-94"), Some(""), None),      // blank verifier
+            mk_finding(Some("CWE-94"), Some(VerificationStatus::Disputed)),
+        ];
+        // every one counts: no gate, so independence/check are never consulted
+        assert_eq!(count_matching_findings(&recs, &sel, false, None, C), 4);
+        assert_eq!(
+            count_matching_findings(&recs, &sel, false, None, VerifyCheck::WithPoc),
+            4
+        );
+    }
+
+    /// `evaluate` threads `verify_with` / `verify_check` from the goal into the
+    /// gate, and a `verify_with` alone (with `verified: false`) gates and shows
+    /// in the detail string.
+    #[test]
+    fn evaluate_threads_the_goal_gate_through_to_the_count() {
+        use crate::def::{Goal, GoalTarget};
+        use rupu_coverage::{append_record, Ledger};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CoveragePaths::new(&tmp.path().join("ws"), "pooled");
+        paths.ensure_dir().unwrap();
+        let mut n = 0;
+        for rec in [
+            with_poc(confirmed_by(full("CWE-94"), Some("run_2"), Some("x"))),
+            confirmed_by(full("CWE-94"), Some("run_3"), Some("x")), // no artifact
+            confirmed_by(full("CWE-94"), Some("run_4"), Some("y")), // other agent
+            confirmed_by(full("CWE-94"), Some("run_1"), Some("x")), // self-verified
+        ] {
+            let mut rec = rec;
+            n += 1;
+            rec.id = format!("fnd_{n}");
+            append_record(&paths, Ledger::Findings, &rec).unwrap();
+        }
+        let active = rupu_coverage::builtin_registry()
+            .unwrap()
+            .active_set(&["network".to_string()])
+            .unwrap();
+        let goal = |verified: bool, verify_with: Option<&str>, check: Option<VerifyCheck>| Goal {
+            id: "g".into(),
+            objective: "o".into(),
+            target: GoalTarget {
+                findings: Some(sel("CWE-94")),
+                asset: None,
+                count_gte: Some(2),
+                depth_at_least: None,
+                verified,
+                verify_check: check,
+            },
+            required: true,
+            verify_with: verify_with.map(String::from),
+        };
+        let eval = |g: &Goal| GoalEvaluator::evaluate(g, &paths, &active).unwrap();
+
+        // no gate at all: all four count
+        let o = eval(&goal(false, None, None));
+        assert_eq!((o.current, o.met), (4, true));
+        assert_eq!(o.detail, "4/2 findings [CWE-94]");
+
+        // verified: any independent confirmation (3: runs 2, 3, 4)
+        let o = eval(&goal(true, None, None));
+        assert_eq!((o.current, o.met), (3, true));
+        assert_eq!(o.detail, "3/2 verified findings [CWE-94]");
+
+        // verify_with alone gates: only agent `x`, independent (runs 2, 3)
+        let o = eval(&goal(false, Some("x"), None));
+        assert_eq!((o.current, o.met), (2, true));
+        assert!(o.detail.contains("verified findings"), "{}", o.detail);
+
+        // ...and with_poc narrows it to the one with an artifact
+        let o = eval(&goal(false, Some("x"), Some(VerifyCheck::WithPoc)));
+        assert_eq!((o.current, o.met), (1, false));
     }
 
     fn host_asset(host: &str, depth: Option<&str>) -> Asset {

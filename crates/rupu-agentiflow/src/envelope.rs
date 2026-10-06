@@ -507,6 +507,7 @@ mod tests {
                 count_gte: Some(1),
                 depth_at_least: Some("tested".into()),
                 verified: false,
+                verify_check: None,
             },
             required,
             verify_with: None,

@@ -51,6 +51,26 @@ pub struct GoalTarget {
     pub depth_at_least: Option<String>,
     #[serde(default)]
     pub verified: bool,
+    /// How strict the verification bar is once verification gates the goal
+    /// (`verified: true`, or a `verify_with` on the goal). `None` behaves as
+    /// [`VerifyCheck::Confirmed`].
+    #[serde(default)]
+    pub verify_check: Option<VerifyCheck>,
+}
+
+/// The bar a finding must clear to count toward a verification-gated goal.
+/// Independence (the verifier is a different run than the filer) and
+/// `verify_with` (the verifier is the named agent) apply under either level;
+/// this only widens what the verdict itself must carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyCheck {
+    /// A `Confirmed` verification is enough.
+    #[default]
+    Confirmed,
+    /// A `Confirmed` verification AND a proof-of-concept artifact on the
+    /// report.
+    WithPoc,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,6 +219,17 @@ impl AgentiflowDef {
                             g.id
                         )));
                     }
+                    // `verify_check` only widens a verification gate; with no gate
+                    // (`verified` / `verify_with`) it would be silently ignored.
+                    if g.target.verify_check.is_some()
+                        && !g.target.verified
+                        && g.verify_with.is_none()
+                    {
+                        return Err(Invalid(format!(
+                            "goal `{}`: `verify_check` has no effect without `verified: true` or `verify_with`",
+                            g.id
+                        )));
+                    }
                 }
                 (None, Some(a)) => {
                     let Some(depth) = g.target.depth_at_least.as_deref() else {
@@ -210,6 +241,12 @@ impl AgentiflowDef {
                     if g.target.verified {
                         return Err(Invalid(format!(
                             "goal `{}`: `verified` is not valid on an asset target (the depth rung is the evidence)",
+                            g.id
+                        )));
+                    }
+                    if g.verify_with.is_some() || g.target.verify_check.is_some() {
+                        return Err(Invalid(format!(
+                            "goal `{}`: `verify_with` / `verify_check` are not valid on an asset target (the depth rung is the evidence)",
                             g.id
                         )));
                     }
@@ -548,6 +585,73 @@ trigger: manual
         // ...but it is valid against a web kind.
         let d = with_target("{ asset: { kind: \"web:site\" }, depth_at_least: mapped }");
         d.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn verify_check_parses_snake_case_and_rejects_unknown() {
+        let d = with_target(
+            "{ findings: { classification: \"CWE-94\" }, count_gte: 1, verified: true, verify_check: with_poc }",
+        );
+        assert_eq!(d.goals[0].target.verify_check, Some(VerifyCheck::WithPoc));
+        d.validate(&active()).unwrap();
+
+        let d = with_target(
+            "{ findings: { classification: \"CWE-94\" }, count_gte: 1, verified: true, verify_check: confirmed }",
+        );
+        assert_eq!(d.goals[0].target.verify_check, Some(VerifyCheck::Confirmed));
+
+        // absent -> None (evaluates as Confirmed)
+        assert_eq!(
+            AgentiflowDef::parse_str(SAMPLE).unwrap().goals[0]
+                .target
+                .verify_check,
+            None
+        );
+
+        // an unknown level is a parse error, not a silent default
+        let yaml = SAMPLE.replace(
+            "count_gte: 10, verified: true }",
+            "count_gte: 10, verified: true, verify_check: bogus }",
+        );
+        assert!(AgentiflowDef::parse_str(&yaml).is_err());
+    }
+
+    #[test]
+    fn validate_verify_check_needs_a_verification_gate() {
+        // verify_check with verified: true gates -> ok
+        let d = with_target(
+            "{ findings: { classification: \"CWE-94\" }, count_gte: 1, verified: true, verify_check: with_poc }",
+        );
+        d.validate(&active()).unwrap();
+
+        // verify_check with neither verified nor verify_with would be ignored
+        let d = with_target(
+            "{ findings: { classification: \"CWE-94\" }, count_gte: 1, verify_check: with_poc }",
+        );
+        assert!(reason(&d).contains("`verify_check` has no effect"));
+
+        // ...but a verify_with on the goal is a gate
+        let mut d = with_target(
+            "{ findings: { classification: \"CWE-94\" }, count_gte: 1, verify_check: with_poc }",
+        );
+        d.goals[0].verify_with = Some("exploit-verifier".into());
+        d.validate(&active()).unwrap();
+    }
+
+    #[test]
+    fn validate_asset_goal_rejects_verify_with_and_verify_check() {
+        let mut d = with_target("{ asset: { kind: \"network:host\" }, depth_at_least: exploited }");
+        d.goals[0].verify_with = Some("exploit-verifier".into());
+        assert!(
+            reason(&d).contains("`verify_with` / `verify_check` are not valid on an asset target")
+        );
+
+        let d = with_target(
+            "{ asset: { kind: \"network:host\" }, depth_at_least: exploited, verify_check: with_poc }",
+        );
+        assert!(
+            reason(&d).contains("`verify_with` / `verify_check` are not valid on an asset target")
+        );
     }
 
     #[test]
