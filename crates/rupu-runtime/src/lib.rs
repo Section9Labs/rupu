@@ -1,3 +1,4 @@
+pub mod admission;
 mod artifacts;
 mod autoflow_history;
 mod backend;
@@ -10,6 +11,7 @@ mod run_envelope;
 mod wake;
 mod worker;
 
+pub use admission::{Admission, JobPermit, MemoryProbe, SystemMemoryProbe};
 pub use artifacts::{ArtifactKind, ArtifactManifest, ArtifactRef};
 pub use autoflow_history::{
     AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,

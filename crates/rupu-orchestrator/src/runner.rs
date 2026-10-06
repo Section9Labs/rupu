@@ -9911,6 +9911,43 @@ async fn dispatch_one(
             }
         }
     }
+    // Machine-level admission: bound how many local agent jobs run at once and
+    // hold this one back while system memory is under the headroom floor, so a
+    // wide fan-out / `split:` DAG cannot drive the host out of memory. The
+    // permit is held for the whole agent run and released on drop. Fully open
+    // (immediate) until a run entry point calls `admission::configure`.
+    let _job = rupu_runtime::admission::acquire().await;
+    if _job.throttled() {
+        if let Some(sink) = announce.sink {
+            let mut parts = Vec::new();
+            if !_job.waited_for_slot.is_zero() {
+                parts.push(format!(
+                    "waited {:.1}s for a concurrency slot",
+                    _job.waited_for_slot.as_secs_f64()
+                ));
+            }
+            if !_job.waited_for_memory.is_zero() {
+                parts.push(format!(
+                    "waited {:.1}s for free memory{}",
+                    _job.waited_for_memory.as_secs_f64(),
+                    if _job.memory_timed_out {
+                        " (proceeded anyway — memory did not recover)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            sink.emit(
+                announce.workflow_run_id,
+                &crate::executor::Event::StepWarning {
+                    run_id: announce.workflow_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    index: announce.unit_index,
+                    message: format!("admission throttle: {}", parts.join("; ")),
+                },
+            );
+        }
+    }
     let result = run_agent(agent_opts).await?;
     match result.terminal_error() {
         Some(err) => Err(err),
