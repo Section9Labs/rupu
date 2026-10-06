@@ -141,3 +141,34 @@ async fn assign_without_project_uses_cwd_not_home() {
         "the cwd, not the parent holding the global .rupu"
     );
 }
+
+/// A malformed customer layer fails every launch, but the display commands
+/// still work: `customer show` prints the customer with the layer's error in
+/// place of the effective config (exit 0), and a UI-prefs-only command run
+/// in an assigned project (`repos tracked`, `ui themes`) degrades to the
+/// config without the customer layer instead of failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn customer_with_a_malformed_layer_still_shows_and_display_commands_still_run() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child(".rupu");
+    home.create_dir_all().unwrap();
+    let project = tmp.child("proj");
+    project.child(".rupu").create_dir_all().unwrap();
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_current_dir(project.path()).unwrap();
+
+    assert!(ok(
+        rupu(&["customer", "create", "acme", "--name", "Acme"]).await
+    ));
+    assert!(ok(rupu(&["customer", "assign", "acme"]).await));
+    let store = rupu_workspace::CustomerStore::new(home.path());
+    std::fs::write(store.config_path("acme"), "default_provider = \n").unwrap();
+
+    assert!(
+        ok(rupu(&["customer", "show", "acme"]).await),
+        "show degrades on a malformed layer"
+    );
+    assert!(ok(rupu(&["repos", "tracked"]).await), "repos tracked");
+    assert!(ok(rupu(&["ui", "themes"]).await), "ui themes");
+}
