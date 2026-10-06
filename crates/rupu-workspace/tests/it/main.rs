@@ -4,6 +4,7 @@
 //! below, not as a new `tests/*.rs` — `rupu-cli`'s `tests/it/test_layout.rs`
 //! enforces this.
 
+mod customers;
 mod discover;
 mod record;
 mod upsert;

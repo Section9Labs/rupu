@@ -52,6 +52,12 @@ impl WorkspaceStore {
         self.root.join(format!("{id}.toml"))
     }
 
+    /// `<root>/<id>.customer` — the customer-assignment sidecar
+    /// (`crate::customers`). Not a `.toml` file, so [`Self::list`] skips it.
+    pub(crate) fn customer_sidecar_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.customer"))
+    }
+
     pub fn load(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
         let path = self.record_path(id);
         if !path.exists() {
@@ -131,13 +137,11 @@ impl WorkspaceStore {
     }
 }
 
-/// Look up an existing workspace for `path` (canonicalized) or create a
-/// new one. Bumps `last_run_at` to "now" in either case.
-///
-/// On a new workspace, attempts to detect the git remote URL and the
-/// current branch by shelling out to `git`. Failures are non-fatal —
-/// the corresponding fields stay `None`.
-pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreError> {
+/// Canonicalize `path` and return it with its UTF-8 string form — the key a
+/// workspace record is matched on. Shared by [`upsert`], [`find_by_path`]
+/// and [`register`] so the three can never disagree on what "the same
+/// workspace" means.
+fn canonical_key(path: &Path) -> Result<(PathBuf, String), StoreError> {
     let canonical = path.canonicalize().map_err(|e| StoreError::Io {
         action: format!("canonicalize {}", path.display()),
         source: e,
@@ -146,22 +150,64 @@ pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreErr
     // non-UTF-8 paths. The path is the lookup key for "same workspace
     // already recorded" — a mangled path here would create a duplicate
     // record on every run.
-    let canonical_str = canonical
+    let s = canonical
         .to_str()
         .ok_or_else(|| StoreError::NonUtf8Path {
             path: canonical.display().to_string(),
         })?
         .to_string();
+    Ok((canonical, s))
+}
 
-    let now = Utc::now().to_rfc3339();
-    let existing = store.list()?.into_iter().find(|w| {
+fn find_canonical(
+    store: &WorkspaceStore,
+    canonical: &Path,
+) -> Result<Option<Workspace>, StoreError> {
+    Ok(store.list()?.into_iter().find(|w| {
         Path::new(&w.path)
             .canonicalize()
             .map(|p| p == canonical)
             .unwrap_or(false)
-    });
+    }))
+}
 
-    let ws = match existing {
+/// The workspace recorded for `path`, if any. Never creates one.
+pub fn find_by_path(store: &WorkspaceStore, path: &Path) -> Result<Option<Workspace>, StoreError> {
+    let (canonical, _) = canonical_key(path)?;
+    find_canonical(store, &canonical)
+}
+
+/// The workspace for `path`, registering it if absent. Unlike [`upsert`]
+/// this is not a run: it leaves `last_run_at` alone (unset on a new
+/// record). Used by customer assignment, which may name a project rupu has
+/// never run in.
+pub fn register(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreError> {
+    let (canonical, canonical_str) = canonical_key(path)?;
+    if let Some(w) = find_canonical(store, &canonical)? {
+        return Ok(w);
+    }
+    let ws = Workspace {
+        id: new_id(),
+        path: canonical_str,
+        repo_remote: detect_repo_remote(&canonical),
+        initial_branch: detect_initial_branch(&canonical),
+        created_at: Utc::now().to_rfc3339(),
+        last_run_at: None,
+    };
+    store.write(&ws)?;
+    Ok(ws)
+}
+
+/// Look up an existing workspace for `path` (canonicalized) or create a
+/// new one. Bumps `last_run_at` to "now" in either case.
+///
+/// On a new workspace, attempts to detect the git remote URL and the
+/// current branch by shelling out to `git`. Failures are non-fatal —
+/// the corresponding fields stay `None`.
+pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreError> {
+    let (canonical, canonical_str) = canonical_key(path)?;
+    let now = Utc::now().to_rfc3339();
+    let ws = match find_canonical(store, &canonical)? {
         Some(mut w) => {
             w.last_run_at = Some(now);
             w
@@ -175,7 +221,6 @@ pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreErr
             last_run_at: Some(now),
         },
     };
-
     store.write(&ws)?;
     Ok(ws)
 }
