@@ -10,7 +10,7 @@ Writes need a `cp serve` deployment and answer **501** otherwise.
 
 | Route | Success | Errors |
 |---|---|---|
-| `GET /api/customers?archived=1&range=7d\|30d\|all` | 200, rows: customer + `tint` + `rollup` + `default_account` (default range `30d`; archived only with `archived=1`) | 400 bad `range`; 500 an unreadable assignment (names the workspace) |
+| `GET /api/customers?archived=1&range=7d\|30d\|all` | 200, rows: customer + `tint` + `rollup` + `default_account` + `layer_error` (default range `30d`; archived only with `archived=1`) | 400 bad `range`; 500 an unreadable assignment (names the workspace) |
 | `POST /api/customers` `{slug, name, notes?, contact?, color?}` | 201, the customer | 400 invalid slug / color / empty name, or the reserved slug `none` (the filter's "no customer"); 409 slug exists; 501 |
 | `GET /api/customers/:slug?range=` | 200, `{customer, rollup, projects[], default_account, layer_error}` | 404 unknown; 400 bad `range`; 500 unreadable assignment |
 | `PATCH /api/customers/:slug` | 200; absent fields stay, `""` clears `notes` / `contact` / `color` | 400; 404; 501 |
@@ -37,6 +37,15 @@ pricing of the customer it is attributed to (global + that customer's layer,
 cached per slug and revalidated by the stat of the two `config.toml` files);
 work with no customer is priced at the global pricing. The Projects page's
 rollups use the same per-customer pricing.
+
+A customer whose layer does not resolve (a malformed
+`customers/<slug>/config.toml`) is still listed, with `default_account: null`
+and `layer_error` saying why, and its work is priced at the GLOBAL rates —
+visibly: every usage summary that includes such work (the customer's
+`rollup.usage`, project rollups, run / agent-run / session rows, `/api/usage`'s
+`summary`, `/api/usage/timeline` buckets and `/api/usage/runs` rows) carries
+`pricing_error` naming the customer. `pricing_error` is absent otherwise (it
+is unrelated to `partial`, which flags missing token counts).
 
 ## Attribution
 

@@ -648,6 +648,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 priced: b.priced,
                 runs: b.runs,
                 partial: false,
+                pricing_error: None,
             };
             dto.run_count = b.runs;
             dto.last_run = last_runs.get(&name).cloned();

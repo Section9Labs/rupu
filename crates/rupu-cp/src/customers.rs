@@ -496,6 +496,22 @@ impl CustomerPricing {
         self.layer(slug).pricing
     }
 
+    /// Why `slug`'s work is priced at the global rates although it has a
+    /// customer: its layer (global + `customers/<slug>/config.toml`) does not
+    /// resolve. `None` when it resolves (a customer with no layer file
+    /// resolves to the global pricing by design, which is no error) or for
+    /// no customer. Cached with the layer, so this costs no extra read.
+    pub fn layer_error(&self, slug: Option<&str>) -> Option<String> {
+        let slug = slug?;
+        if validate_slug(slug).is_err() {
+            return None;
+        }
+        self.layer(slug)
+            .default_account
+            .err()
+            .map(|e| format!("customer `{slug}`'s config layer does not resolve ({e}); its work is priced at the global rates"))
+    }
+
     /// The customer's default provider account over global + its layer
     /// (`None` when neither sets one). `Err` = the layers do not resolve,
     /// with the reason.
@@ -509,6 +525,13 @@ impl CustomerPricing {
 /// (`None` = no customer).
 pub trait PriceBook {
     fn pricing_for(&mut self, customer: Option<&str>) -> &PricingConfig;
+
+    /// Why `customer`'s work is priced at the global rates (its layer does
+    /// not resolve) — what callers stamp on `UsageSummary.pricing_error`.
+    /// `None` by default: a flat book has no layers to fail.
+    fn pricing_error_for(&mut self, _customer: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 /// One pricing for every customer — for callers with no customer layers to
@@ -527,11 +550,16 @@ pub struct PricingMemo<'a> {
     pricing: &'a CustomerPricing,
     none: Option<PricingConfig>,
     by_slug: HashMap<String, PricingConfig>,
+    errors: HashMap<String, Option<String>>,
 }
 
 impl PriceBook for PricingMemo<'_> {
     fn pricing_for(&mut self, customer: Option<&str>) -> &PricingConfig {
         self.get(customer)
+    }
+
+    fn pricing_error_for(&mut self, customer: Option<&str>) -> Option<String> {
+        self.error(customer)
     }
 }
 
@@ -541,7 +569,29 @@ impl<'a> PricingMemo<'a> {
             pricing,
             none: None,
             by_slug: HashMap::new(),
+            errors: HashMap::new(),
         }
+    }
+
+    /// [`CustomerPricing::layer_error`] for `slug`, memoized like the
+    /// pricing.
+    pub fn error(&mut self, slug: Option<&str>) -> Option<String> {
+        let slug = slug?;
+        let pricing = self.pricing;
+        self.errors
+            .entry(slug.to_string())
+            .or_insert_with(|| pricing.layer_error(Some(slug)))
+            .clone()
+    }
+
+    /// `u` priced for `slug`: stamps [`Self::error`] on it.
+    pub fn stamp(
+        &mut self,
+        mut u: crate::usage::UsageSummary,
+        slug: Option<&str>,
+    ) -> crate::usage::UsageSummary {
+        u.pricing_error = self.error(slug);
+        u
     }
 
     /// The pricing for work attributed to `slug` (`None` = no customer).
@@ -893,6 +943,45 @@ mod tests {
         );
         assert!(pricing.default_account("globex").is_err());
         assert!(pricing.default_account("Bad Slug").is_err());
+    }
+
+    /// A malformed layer falls back to global pricing and says why (naming
+    /// the customer); a customer with no layer file, or no customer, is no
+    /// error. The memo stamps it on a summary.
+    #[test]
+    fn a_malformed_layer_is_reported_as_a_pricing_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let store = CustomerStore::new(home);
+        for slug in ["acme", "globex"] {
+            store
+                .create(
+                    slug,
+                    &NewCustomer {
+                        name: slug.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(store.config_path("acme"), "= = nope").unwrap();
+        std::fs::remove_file(store.config_path("globex")).unwrap();
+        let pricing = CustomerPricing::new(home.to_path_buf(), PricingConfig::default());
+        let err = pricing.layer_error(Some("acme")).unwrap();
+        assert!(
+            err.contains("`acme`") && err.contains("global rates"),
+            "{err}"
+        );
+        assert_eq!(pricing.layer_error(Some("globex")), None, "no layer file");
+        assert_eq!(pricing.layer_error(None), None);
+
+        let mut memo = PricingMemo::new(&pricing);
+        let u = memo.stamp(crate::usage::UsageSummary::default(), Some("acme"));
+        assert_eq!(u.pricing_error.as_deref(), Some(err.as_str()));
+        assert_eq!(memo.pricing_error_for(Some("globex")), None);
+        // The rollup keeps it.
+        let merged = crate::usage::rollup([crate::usage::UsageSummary::default(), u].into_iter());
+        assert!(merged.pricing_error.is_some());
     }
 
     #[test]

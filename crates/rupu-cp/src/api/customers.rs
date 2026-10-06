@@ -49,6 +49,10 @@ pub struct CustomerRow {
     pub customer: CustomerDto,
     pub rollup: CustomerRollup,
     pub default_account: Option<DefaultAccount>,
+    /// Why the customer's config could not be resolved (a malformed layer):
+    /// `default_account` is then `null` and its work is priced at the global
+    /// rates (`rollup.usage.pricing_error` says so too). `null` otherwise.
+    pub layer_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -213,6 +217,7 @@ impl Pass {
             };
             let usage =
                 crate::usage::summarize_run(&self.run_store, &run.id, prices.get(Some(&slug)));
+            let usage = prices.stamp(usage, Some(&slug));
             rolls
                 .entry(slug)
                 .or_default()
@@ -231,6 +236,7 @@ impl Pass {
                 &crate::usage::transcripts_usage(&src.paths),
                 prices.get(Some(&slug)),
             );
+            let usage = prices.stamp(usage, Some(&slug));
             rolls
                 .entry(slug)
                 .or_default()
@@ -269,7 +275,8 @@ impl Pass {
 /// `GET /api/customers?archived=1&range=7d|30d|all` — every customer
 /// (archived ones only with `archived=1`) with its rollups over the range
 /// (default `30d`) and its default account. A customer whose config layer
-/// does not resolve is still listed, with `default_account: null`. An
+/// does not resolve is still listed, with `default_account: null` and its
+/// `layer_error`, its work priced at the global rates. An
 /// assignment that cannot be read fails the listing (500 naming the
 /// workspace), never counts as "no customer".
 async fn list_customers(
@@ -290,13 +297,20 @@ async fn list_customers(
         let mut rollups = pass.rollups(&wanted, since, &mut prices)?;
         Ok(list
             .iter()
-            .map(|c| CustomerRow {
-                customer: customer_dto(c),
-                rollup: rollups.remove(&c.slug).unwrap_or_default(),
-                default_account: pricing.default_account(&c.slug).unwrap_or_else(|e| {
-                    tracing::debug!(customer = %c.slug, error = %e, "customer config does not resolve");
-                    None
-                }),
+            .map(|c| {
+                let (default_account, layer_error) = match pricing.default_account(&c.slug) {
+                    Ok(a) => (a, None),
+                    Err(e) => {
+                        tracing::debug!(customer = %c.slug, error = %e, "customer config does not resolve");
+                        (None, Some(e))
+                    }
+                };
+                CustomerRow {
+                    customer: customer_dto(c),
+                    rollup: rollups.remove(&c.slug).unwrap_or_default(),
+                    default_account,
+                    layer_error,
+                }
             })
             .collect())
     })

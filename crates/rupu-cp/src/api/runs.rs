@@ -737,6 +737,7 @@ impl RunListRow {
             None => crate::customers::Recorded::of(&r.customer).slug(),
         };
         let mut row = Self::with_usage(r, store, prices.pricing_for(slug));
+        row.usage.pricing_error = prices.pricing_error_for(slug);
         row.customer = who.map(Into::into);
         row
     }

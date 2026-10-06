@@ -594,6 +594,67 @@ async fn default_account_reports_layer_lock_and_inheritance() {
     assert_eq!(detail["default_account"]["account"], "anthropic-acme");
 }
 
+/// A customer whose layer does not resolve is priced at the GLOBAL rates —
+/// and every surface that priced its work says so: the customer row carries
+/// `layer_error`, its rollup / run rows / usage carry `pricing_error`
+/// (naming the customer); work of other customers carries none.
+#[tokio::test]
+async fn a_malformed_layer_prices_at_global_rates_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let proj = tempfile::tempdir().unwrap();
+    seed_workspace(global, "ws_other", &proj.path().join("other"));
+    std::fs::write(global.join("config.toml"), pricing_toml(1.0)).unwrap();
+    let base = spawn(global, true).await;
+    for slug in ["acme", "globex"] {
+        assert_eq!(
+            create(&base, slug, slug).await.status(),
+            StatusCode::CREATED
+        );
+    }
+    let store = rupu_workspace::CustomerStore::new(global);
+    std::fs::write(store.config_path("acme"), "this is = = not toml").unwrap();
+    std::fs::write(store.config_path("globex"), pricing_toml(5.0)).unwrap();
+    seed_run(global, "run_acme", "ws_other", Some("acme"));
+    seed_run(global, "run_globex", "ws_other", Some("globex"));
+
+    let rows = get_json(format!("{base}/api/customers")).await;
+    let acme = row(&rows, "acme");
+    assert!(acme["layer_error"].is_string(), "{acme}");
+    assert!(acme["default_account"].is_null());
+    // 1M input at the GLOBAL $1, flagged.
+    approx(&acme["rollup"]["usage"]["cost_usd"], 1.0);
+    let why = acme["rollup"]["usage"]["pricing_error"].as_str().unwrap();
+    assert!(why.contains("acme") && why.contains("global"), "{why}");
+    let globex = row(&rows, "globex");
+    assert!(globex["layer_error"].is_null());
+    approx(&globex["rollup"]["usage"]["cost_usd"], 5.0);
+    assert!(globex["rollup"]["usage"].get("pricing_error").is_none());
+
+    let runs = get_json(format!("{base}/api/runs?host=local")).await;
+    let run = |id: &str| {
+        runs.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(run("run_acme")["usage"]["pricing_error"].is_string());
+    assert!(run("run_globex")["usage"].get("pricing_error").is_none());
+
+    let usage = get_json(format!("{base}/api/usage?customer=acme")).await;
+    assert!(usage["summary"]["pricing_error"].is_string(), "{usage}");
+    let usage = get_json(format!("{base}/api/usage?customer=globex")).await;
+    assert!(usage["summary"].get("pricing_error").is_none(), "{usage}");
+    // Unfiltered, the merged total says some of it was mispriced.
+    let usage = get_json(format!("{base}/api/usage")).await;
+    assert!(usage["summary"]["pricing_error"].is_string(), "{usage}");
+
+    let rows = get_json(format!("{base}/api/usage/runs?customer=acme")).await;
+    assert!(rows[0]["pricing_error"].is_string(), "{rows}");
+}
+
 #[tokio::test]
 async fn archived_customers_are_hidden_unless_asked_for() {
     let tmp = tempfile::tempdir().unwrap();

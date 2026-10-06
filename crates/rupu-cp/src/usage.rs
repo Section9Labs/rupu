@@ -56,6 +56,13 @@ pub struct UsageSummary {
     /// arrived), so the totals are a lower bound. ORed by [`rollup`].
     #[serde(default)]
     pub partial: bool,
+    /// Set when some contributing work was priced at the GLOBAL rates because
+    /// its customer's config layer does not resolve (a malformed
+    /// `customers/<slug>/config.toml`): the cost may be wrong, and this says
+    /// why (naming the customer). Distinct from `partial`, which is about
+    /// missing token counts. Folded by [`rollup`] (the first one wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_error: Option<String>,
 }
 
 /// Fold token rows into a single summary, pricing each row.
@@ -301,6 +308,9 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
             out.priced = false;
         }
         out.partial |= s.partial;
+        if out.pricing_error.is_none() {
+            out.pricing_error = s.pricing_error;
+        }
     }
     out.total_tokens = out.input_tokens + out.output_tokens;
     out.cost_usd = if any_cost { Some(cost_acc) } else { None };
@@ -720,6 +730,7 @@ pub(crate) mod tests {
             priced: true,
             runs: 1,
             partial: false,
+            pricing_error: None,
         };
         let unpriced = UsageSummary {
             input_tokens: 20,
@@ -731,6 +742,7 @@ pub(crate) mod tests {
             priced: false,
             runs: 1,
             partial: false,
+            pricing_error: None,
         };
         let r = rollup([priced, unpriced].into_iter());
         assert_eq!(r.input_tokens, 30);
@@ -846,6 +858,7 @@ pub(crate) mod tests {
                 priced: true,
                 runs: 1,
                 partial: false,
+                pricing_error: None,
             },
             Some("2026-01-02T00:00:00Z".into()),
         );
@@ -860,6 +873,7 @@ pub(crate) mod tests {
                 priced: true,
                 runs: 1,
                 partial: false,
+                pricing_error: None,
             },
             Some("2026-01-01T00:00:00Z".into()),
         );

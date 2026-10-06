@@ -929,7 +929,9 @@ async fn agent_runs_metrics(
             let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
             runs.iter()
                 .map(|(id, tp, customer)| {
-                    agent_run_metrics(&store, prices.get(customer.as_deref()), id, tp)
+                    let mut m = agent_run_metrics(&store, prices.get(customer.as_deref()), id, tp);
+                    m.usage.pricing_error = prices.error(customer.as_deref());
+                    m
                 })
                 .collect()
         },

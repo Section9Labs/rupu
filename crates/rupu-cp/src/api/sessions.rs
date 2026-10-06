@@ -268,6 +268,7 @@ fn session_usage_from_totals(
         cost_usd,
         runs: 1,
         partial: false,
+        pricing_error: None,
     }
 }
 
@@ -359,10 +360,10 @@ fn scan_session_dir(
                 .slug()
                 .map(str::to_string),
         };
-        let usage = ctx
-            .prices
-            .as_mut()
-            .map(|prices| session_usage(&dto, run_store, prices.get(pricing_slug.as_deref())));
+        let usage = ctx.prices.as_mut().map(|prices| {
+            let u = session_usage(&dto, run_store, prices.get(pricing_slug.as_deref()));
+            prices.stamp(u, pricing_slug.as_deref())
+        });
         match serde_json::to_value(&dto) {
             Ok(mut val) => {
                 if let serde_json::Value::Object(ref mut map) = val {

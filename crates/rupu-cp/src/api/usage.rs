@@ -194,6 +194,9 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
             .get("partial")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        // The CLI report prices with the SSH host's own config; it carries
+        // no customer-layer pricing failure.
+        pricing_error: None,
     };
 
     let empty = Vec::new();
@@ -601,20 +604,28 @@ fn priced_usage(
             None => (None, &[][..]),
         };
         let pricing = prices.pricing_for(customer);
-        return (
+        let (mut summary, breakdown, gap) = (
             crate::usage::summarize(rows, pricing),
             crate::usage::breakdown(rows, pricing, group_by),
             unpriced_gap(rows, pricing),
         );
+        if !rows.is_empty() {
+            summary.pricing_error = prices.pricing_error_for(customer);
+        }
+        return (summary, breakdown, gap);
     }
     let mut summaries = Vec::with_capacity(groups.len());
     let mut breakdown = Vec::new();
     let mut gaps = Vec::with_capacity(groups.len());
     for (customer, rows) in groups {
         let pricing = prices.pricing_for(customer.as_deref());
-        summaries.push(crate::usage::summarize(rows, pricing));
+        let mut summary = crate::usage::summarize(rows, pricing);
         breakdown.extend(crate::usage::breakdown(rows, pricing, group_by));
         gaps.push(unpriced_gap(rows, pricing));
+        if !rows.is_empty() {
+            summary.pricing_error = prices.pricing_error_for(customer.as_deref());
+        }
+        summaries.push(summary);
     }
     (
         crate::usage::rollup(summaries.into_iter()),
@@ -940,6 +951,11 @@ impl Granularity {
 struct UsageTimelineBucket {
     bucket: String,
     rows: Vec<crate::usage::UsageBreakdownRow>,
+    /// Set when some of the bucket's work was priced at the global rates
+    /// because its customer's layer does not resolve
+    /// (`UsageSummary.pricing_error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1033,11 +1049,19 @@ fn build_timeline(
     enumerate_bucket_keys(fill_start, fill_end, granularity)
         .into_iter()
         .map(|bucket| {
-            let rows = grouped
+            let (rows, pricing_error) = grouped
                 .get(&bucket)
-                .map(|groups| priced_usage(groups, prices, crate::usage::GroupBy::Model).1)
+                .map(|groups| {
+                    let (summary, rows, _) =
+                        priced_usage(groups, prices, crate::usage::GroupBy::Model);
+                    (rows, summary.pricing_error)
+                })
                 .unwrap_or_default();
-            UsageTimelineBucket { rows, bucket }
+            UsageTimelineBucket {
+                rows,
+                bucket,
+                pricing_error,
+            }
         })
         .collect()
 }
@@ -1112,6 +1136,10 @@ struct UsageRunRow {
     /// `None` = unpriced. Never fabricated — mirrors `UsageBreakdownRow.cost_usd`.
     cost_usd: Option<f64>,
     priced: bool,
+    /// Set when the row was priced at the global rates because its
+    /// customer's layer does not resolve (`UsageSummary.pricing_error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1152,6 +1180,7 @@ async fn get_usage_runs(
     let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
     let mut out = Vec::new();
     for src in sources {
+        let pricing_error = prices.error(src.customer.as_deref());
         let pricing = prices.get(src.customer.as_deref());
         for row in src.rows {
             let priced_cost =
@@ -1182,6 +1211,7 @@ async fn get_usage_runs(
                 total_tokens: row.input_tokens + row.output_tokens,
                 priced: priced_cost.is_some(),
                 cost_usd: priced_cost,
+                pricing_error: pricing_error.clone(),
             });
         }
     }

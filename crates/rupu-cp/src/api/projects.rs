@@ -151,6 +151,7 @@ pub(crate) fn project_rollups(
         }
         let who = lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)?;
         let usage = crate::usage::summarize_run(run_store, &r.id, prices.get(who.slug.as_deref()));
+        let usage = prices.stamp(usage, who.slug.as_deref());
         out.entry(r.workspace_id.clone())
             .or_default()
             .add(&usage, Some(r.started_at.to_rfc3339()));
@@ -164,6 +165,7 @@ pub(crate) fn project_rollups(
             &crate::usage::transcripts_usage(&src.paths),
             prices.get(who.slug.as_deref()),
         );
+        let usage = prices.stamp(usage, who.slug.as_deref());
         out.entry(src.workspace_id.clone())
             .or_default()
             .add_spend(&usage, src.started_at.map(|t| t.to_rfc3339()));
