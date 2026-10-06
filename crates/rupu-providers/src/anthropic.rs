@@ -6351,7 +6351,10 @@ mod tests {
             client.ensure_valid_token(),
         )
         .await;
-        assert!(dropped.is_err(), "dropped mid-refresh");
+        assert!(
+            dropped.is_err(),
+            "dropped mid-refresh, but the refresh had already returned: {dropped:?}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         client.ensure_valid_token().await.unwrap();
         first.assert_hits(1);
