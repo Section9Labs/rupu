@@ -15,6 +15,7 @@ pub mod fleet_inventory;
 pub mod host;
 pub mod launcher;
 pub mod model_catalog;
+pub mod netflow_index;
 pub mod net;
 pub mod node;
 pub mod pagination;
