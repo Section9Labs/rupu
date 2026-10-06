@@ -14,8 +14,12 @@ use std::path::Path;
 /// One workflow as the catalog sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowSummary {
-    /// The workflow's declared `name:`; the file stem when the file
-    /// did not parse.
+    /// The runnable identifier: the file stem (`<id>.yaml`). Workflows
+    /// are resolved and shadowed by stem everywhere else in rupu, and
+    /// the parser does not require `name:` to match it.
+    pub id: String,
+    /// The workflow's declared `name:` (for display); the file stem
+    /// when the file did not parse.
     pub name: String,
     pub description: Option<String>,
     /// `"global"` or `"project"`.
@@ -31,18 +35,20 @@ pub struct WorkflowSummary {
 /// List the available workflows.
 ///
 /// Scans `<global>/workflows/*.yaml` (scope `"global"`) and, when
-/// `project` is `Some`, `<project>/.rupu/workflows/*.yaml` (scope
+/// `project` is `Some`, `<project>/workflows/*.yaml` (scope
 /// `"project"`). `global` is the global rupu root (`~/.rupu`);
-/// `project` is the directory CONTAINING `.rupu` (the project root).
-/// A project workflow shadows a global one of the same name. A missing
+/// `project` is the project's `.rupu` directory, matching
+/// `rupu_agent::load_agents`, so one `(global, project)` pair serves
+/// both. A project workflow shadows a global one with the same file
+/// stem (`id`), even when the project file does not parse. A missing
 /// directory yields no entries. A file that fails to parse is listed
 /// with `parse_error: Some(..)` and the scan continues. The result is
-/// sorted by name.
+/// sorted by `id`.
 pub fn list_workflow_summaries(global: &Path, project: Option<&Path>) -> Vec<WorkflowSummary> {
     let mut by_name: BTreeMap<String, WorkflowSummary> = BTreeMap::new();
     scan_dir(&global.join("workflows"), "global", &mut by_name);
     if let Some(p) = project {
-        scan_dir(&p.join(".rupu").join("workflows"), "project", &mut by_name);
+        scan_dir(&p.join("workflows"), "project", &mut by_name);
     }
     by_name.into_values().collect()
 }
@@ -60,8 +66,14 @@ fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary
         .collect();
     paths.sort();
     for path in paths {
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
         let summary = match Workflow::parse_file(&path) {
             Ok(wf) => WorkflowSummary {
+                id: id.clone(),
                 name: wf.name,
                 description: wf.description,
                 scope: scope.to_string(),
@@ -70,11 +82,8 @@ fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary
                 parse_error: None,
             },
             Err(e) => WorkflowSummary {
-                name: path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                id: id.clone(),
+                name: id.clone(),
                 description: None,
                 scope: scope.to_string(),
                 input_keys: Vec::new(),
@@ -82,7 +91,7 @@ fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary
                 parse_error: Some(e.to_string()),
             },
         };
-        into.insert(summary.name.clone(), summary);
+        into.insert(id, summary);
     }
 }
 
@@ -111,6 +120,8 @@ steps:
         std::fs::write(p, body).unwrap();
     }
 
+    const ONE_STEP: &str = "name: foo\nsteps:\n  - id: only\n    agent: writer\n    prompt: hi\n";
+
     #[test]
     fn lists_valid_and_broken_files_without_aborting() {
         let tmp = tempfile::tempdir().unwrap();
@@ -133,16 +144,18 @@ steps:
 
         let broken = got
             .iter()
-            .find(|s| s.name == "broken")
+            .find(|s| s.id == "broken")
             .expect("broken listed");
+        assert_eq!(broken.name, "broken");
         assert!(broken.parse_error.is_some());
         assert_eq!(broken.step_count, 0);
         assert_eq!(broken.scope, "global");
 
         let ok = got
             .iter()
-            .find(|s| s.name == "two-step")
+            .find(|s| s.id == "two-step")
             .expect("valid listed");
+        assert_eq!(ok.name, "two-step");
         assert_eq!(ok.parse_error, None);
         assert_eq!(ok.step_count, 2);
         assert_eq!(ok.scope, "global");
@@ -151,26 +164,60 @@ steps:
     }
 
     #[test]
-    fn project_workflow_shadows_global_by_name() {
+    fn project_workflow_shadows_global_by_file_stem() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tmp.path().join("global");
-        let project = tmp.path().join("proj");
+        let project = tmp.path().join("proj").join(".rupu");
         write(
             &global,
             "workflows/foo.yaml",
             TWO_STEPS.replace("two-step", "foo").as_str(),
         );
-        write(
-            &project,
-            ".rupu/workflows/foo.yaml",
-            "name: foo\nsteps:\n  - id: only\n    agent: writer\n    prompt: hi\n",
-        );
+        write(&project, "workflows/foo.yaml", ONE_STEP);
 
         let got = list_workflow_summaries(&global, Some(&project));
         assert_eq!(got.len(), 1, "shadowed, not duplicated: {got:?}");
+        assert_eq!(got[0].id, "foo");
         assert_eq!(got[0].name, "foo");
         assert_eq!(got[0].scope, "project");
         assert_eq!(got[0].step_count, 1);
+    }
+
+    #[test]
+    fn keyed_by_file_stem_not_declared_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("proj").join(".rupu");
+        // `foo.yaml` declares `name: bar`: it runs as `foo`.
+        write(
+            &global,
+            "workflows/foo.yaml",
+            &ONE_STEP.replace("name: foo", "name: bar"),
+        );
+        // A project `bar.yaml` declaring `name: foo` must NOT shadow it.
+        write(&project, "workflows/bar.yaml", ONE_STEP);
+
+        let got = list_workflow_summaries(&global, Some(&project));
+        assert_eq!(got.len(), 2, "distinct stems stay distinct: {got:?}");
+        let foo = got.iter().find(|s| s.id == "foo").unwrap();
+        assert_eq!((foo.name.as_str(), foo.scope.as_str()), ("bar", "global"));
+        let bar = got.iter().find(|s| s.id == "bar").unwrap();
+        assert_eq!((bar.name.as_str(), bar.scope.as_str()), ("foo", "project"));
+    }
+
+    #[test]
+    fn broken_project_file_still_shadows_valid_global_by_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("proj").join(".rupu");
+        write(&global, "workflows/foo.yaml", ONE_STEP);
+        write(&project, "workflows/foo.yaml", "name: [unclosed\nsteps: {");
+
+        let got = list_workflow_summaries(&global, Some(&project));
+        assert_eq!(got.len(), 1, "one foo entry: {got:?}");
+        assert_eq!(got[0].id, "foo");
+        assert_eq!(got[0].scope, "project");
+        assert!(got[0].parse_error.is_some());
     }
 
     #[test]
