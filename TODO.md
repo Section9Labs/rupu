@@ -382,3 +382,21 @@ sizes, so the render and the dagre reservation agree.
 
 So this is purely "commission better art for two node kinds" — worth doing, safe
 to defer indefinitely, and it needs a design call rather than an engineering one.
+
+## Customers — Plans 2–3 and Plan 1 follow-ups
+
+Spec: [`docs/superpowers/specs/2026-10-06-rupu-customers-design.md`](docs/superpowers/specs/2026-10-06-rupu-customers-design.md). Plan 1 (model, config layer, `rupu customer`) shipped; these were deferred from it.
+
+- **Plan 2 — CP surfaces** (unwritten). Prereq: Plan 1. Includes, moved here from Plan 1:
+  - **Run attribution** — `customer` on `RunRecord` and the transcript `RunStart` (needs a field threaded through `AgentRunOpts`, ~150 literals). Deferred because its first consumer is the CP rollups. Runs from before it carry no slug; derive one from the current assignment and mark it derived. Once it lands, `workflow resume` should use the recorded slug and the `runs/<id>/customer_dir` sidecar can go.
+  - **`credential_manifest`** — which accounts a run will use. Deferred because its first consumer is the CP launch preview.
+  - `PUT /api/config/project/:id` checks only global locks; a customer-locked key can be written to the project layer without an early error (resolution still enforces the lock).
+  - The CP's `customer` provenance chip is a raw violet placeholder in `ConfigField.tsx`.
+  - An autoflow repo skipped for a broken customer/config is a `cycle_failed` event but not counted in `failed_cycles`, and it silently drops out of the CP autoflow inventory — give the UI a signal.
+- **Plan 3 — remote shipping** (unwritten). Prereq: Plan 2. Ship the customer layer and the credentials a run needs to SSH/HTTPS hosts. Accounts are declared in the global config by `rupu auth login --account X --kind <vendor>`, so a remote needs the account's kind too (the layer's optional `[providers.X]` block, or the manifest).
+- **Polish deferred from Plan 1** (none are behaviour bugs):
+  - `rupu customer --project ws_foo` is always read as a workspace id; use `./ws_foo` for a directory of that name.
+  - `rupu customer unassign` from a subdirectory of an assigned project errors ("no project") instead of finding the assigned ancestor.
+  - `rupu customer list` JSON/CSV output is untested.
+  - The resolver's warning for a customer lock on a key the customer layer does not set is suppressed when the global layer also locks it; `layer_files_locked` re-logs warnings on every call.
+  - Two concurrent *first* `upsert`s of a new path can create duplicate workspace records (pre-existing). The customer lookup refuses loudly if duplicates carry different customers.
