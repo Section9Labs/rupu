@@ -1954,8 +1954,7 @@ async fn show(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     // UI prefs only — lock does not apply (I-7)
-    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
-    let cfg = rupu_config::layer_files(cfg_paths.layers())?;
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let mut events = Vec::new();
     let mut raw_events = Vec::new();

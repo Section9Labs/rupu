@@ -832,9 +832,8 @@ fn auth_ui_prefs(
     let global = crate::paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = crate::paths::project_root_for(&pwd)?;
-    let cfg_paths = crate::paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(cfg_paths.layers())?;
+    let cfg = crate::paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     Ok(UiPrefs::resolve(
         &cfg.ui,
         no_color,
