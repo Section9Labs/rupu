@@ -667,7 +667,7 @@ async fn an_old_peer_cannot_be_filtered_by_customer() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
         body["error"],
-        format!("host {host} can't report customers (its rupu predates customers)")
+        format!("host {host} can't report a customer for every run")
     );
 
     // Without a filter the old peer still lists.
@@ -713,6 +713,33 @@ async fn an_old_peer_cannot_be_filtered_by_customer() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+    }
+}
+
+/// A peer whose listing could not attribute one row (its CLI omitted that
+/// row's customer keys) can't be filtered either — never counted as "none".
+#[tokio::test]
+async fn a_peer_row_without_a_customer_makes_the_host_unfilterable() {
+    let mock = httpmock::MockServer::start();
+    mock.mock(|when, then| {
+        when.method("GET").path("/api/runs");
+        then.status(200).json_body(json!([
+            remote_run("rr_acme", Some(Some("acme"))),
+            remote_run("rr_unattributed", None),
+        ]));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, host) = spawn_with_remote(tmp.path(), &mock.base_url()).await;
+    for customer in ["acme", "none"] {
+        let resp = reqwest::get(format!("{base}/api/runs?host={host}&customer={customer}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{customer}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["error"],
+            format!("host {host} can't report a customer for every run")
+        );
     }
 }
 

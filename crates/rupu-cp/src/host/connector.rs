@@ -871,17 +871,7 @@ pub(crate) fn mirror_list_runs(
     .map_err(crate::api::runs::RunRowsError::into_host)?;
 
     rows.iter()
-        .map(|r| {
-            let mut v =
-                serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-            if r.customer.is_none() {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.remove("customer");
-                    obj.remove("customer_derived");
-                }
-            }
-            Ok(v)
-        })
+        .map(|r| serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string())))
         .collect()
 }
 

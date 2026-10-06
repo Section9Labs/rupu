@@ -260,12 +260,17 @@ pub enum Cmd {
 /// (the dashboard), so BOTH must be listed — a `resume` left on stderr was
 /// the "bars hopping" corruption. `workflow approve` / `reject` only drive
 /// the headless `crate::resume` primitives (line printers), so they stay on
-/// stderr. The exhaustive unit test below pins this set.
+/// stderr. The exhaustive unit test below pins this set. `run list` and
+/// `run show` are headless queries (JSON / tables on stdout, warnings on
+/// stderr — e.g. a customer assignment `run list` could not read), so they
+/// stay on stderr too.
 fn owns_live_terminal(cmd: &Cmd) -> bool {
+    if let Cmd::Run { argv } = cmd {
+        return !matches!(argv.first().map(String::as_str), Some("list" | "show"));
+    }
     matches!(
         cmd,
-        Cmd::Run { .. }
-            | Cmd::Watch(_)
+        Cmd::Watch(_)
             | Cmd::Session {
                 action: cmd::session::Action::Start(_)
                     | cmd::session::Action::Send(_)
@@ -635,6 +640,11 @@ mod arg_parse_tests {
             "workflow reject is headless"
         );
         assert!(!owns(&["rupu", "workflow", "list"]), "workflow list");
+        assert!(
+            !owns(&["rupu", "run", "list"]),
+            "run list is a headless query"
+        );
+        assert!(!owns(&["rupu", "run", "show", "run_01ABC"]), "run show");
     }
 
     #[test]

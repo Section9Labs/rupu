@@ -559,12 +559,14 @@ struct SessionListRow {
     target: Option<String>,
     active_run_id: Option<String>,
     updated_at: String,
-    /// The customer the session is attributed to: the one its record holds,
-    /// else (`customer_derived`) its workspace's current assignment. Always
-    /// serialized (`null` = no customer) so a coordinator listing this host
-    /// over SSH can tell "no customer" from an older rupu.
-    customer: Option<String>,
-    customer_derived: bool,
+    /// The customer the session is attributed to — `customer` (the one its
+    /// record holds, else its workspace's current assignment) and
+    /// `customer_derived` — serialized whenever known (`customer: null` = no
+    /// customer), so a coordinator listing this host over SSH can tell "no
+    /// customer" from an older rupu. `None` (an assignment that could not be
+    /// read) omits both keys.
+    #[serde(flatten)]
+    customer: Option<rupu_cp::customers::RowCustomer>,
 }
 
 #[derive(Serialize)]
@@ -1280,8 +1282,9 @@ async fn list(
         &[SessionScope::Active]
     };
     // Each row's customer: the session record's, else its workspace's
-    // current assignment (derived). An assignment that cannot be read fails
-    // the command rather than report "no customer".
+    // current assignment (derived). A workspace whose assignment cannot be
+    // read does not fail the listing: its rows omit the customer keys (one
+    // warning per workspace on stderr), never claiming "no customer".
     let mut customers =
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
     for &scope in scopes {
@@ -1289,12 +1292,10 @@ async fn list(
             if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
                 write_session(&global, scope, &session)?;
             }
-            let customer = customers
-                .attribute(session.customer.as_deref(), &session.workspace_id)
-                .map_err(|e| anyhow::anyhow!(e.1))?;
+            let customer =
+                customers.attribute_for_listing(session.customer.as_deref(), &session.workspace_id);
             rows.push(SessionListRow {
-                customer: customer.slug,
-                customer_derived: customer.derived,
+                customer: customer.map(Into::into),
                 session_id: session.session_id.clone(),
                 codename: crate::output::codename::display_codename(
                     session.codename.as_deref(),
@@ -12563,8 +12564,7 @@ mod tests {
             target: target.map(str::to_string),
             active_run_id: active_run_id.map(str::to_string),
             updated_at: updated_at.to_string(),
-            customer: None,
-            customer_derived: false,
+            customer: Some(rupu_cp::customers::RowCustomer::default()),
         }
     }
 
@@ -12590,9 +12590,17 @@ mod tests {
         assert!(v.as_object().unwrap().contains_key("customer"));
         assert!(v["customer"].is_null());
         assert_eq!(v["customer_derived"], false);
-        row.customer = Some("acme".into());
+        row.customer = Some(rupu_cp::customers::RowCustomer {
+            customer: Some("acme".into()),
+            customer_derived: false,
+        });
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["customer"], "acme");
+        // Unattributable (its assignment could not be read): no keys at all.
+        row.customer = None;
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("customer"));
+        assert!(!v.as_object().unwrap().contains_key("customer_derived"));
     }
 
     fn test_now() -> DateTime<Utc> {

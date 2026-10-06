@@ -383,6 +383,49 @@ async fn session_show_supports_focused_compact_and_full_views() {
         .stdout(predicate::str::contains("SENTINELBODY"));
 }
 
+/// A session whose workspace's customer assignment can't be read is still
+/// listed — without its customer keys — with one warning on stderr; stdout
+/// stays valid JSON.
+#[tokio::test]
+async fn session_list_degrades_on_an_unreadable_assignment() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_01", "idle", None, false);
+    write_session(&home, "ses_02", "idle", None, false);
+    std::fs::create_dir_all(home.join("workspaces/ws_test.customer")).unwrap();
+
+    let out = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("RUPU_LOG")
+        .current_dir(tmp.path())
+        .args(["--format", "json", "session", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = report["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for r in rows {
+        let r = r.as_object().unwrap();
+        assert!(!r.contains_key("customer"), "{r:?}");
+        assert!(!r.contains_key("customer_derived"), "{r:?}");
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("listed without a customer").count(),
+        1,
+        "one warning: {stderr}"
+    );
+    assert!(stderr.contains("ws_test"), "names the workspace: {stderr}");
+}
+
 #[tokio::test]
 async fn session_list_reconciles_stale_running_workers() {
     let _guard = ENV_LOCK.lock().await;

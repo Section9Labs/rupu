@@ -1579,9 +1579,10 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
 ///   agent named list", or its clap rejects the flags, or what it prints is
 ///   not the JSON report — becomes `Unsupported` ("needs a newer rupu"), so
 ///   the freshness strip never reads it as zero runs;
-/// - anything else (e.g. the remote's own customer assignment it cannot
-///   read) is the remote's error, reported as-is — never mislabelled as a
-///   missing command.
+/// - anything else (the remote rupu ran `run list` and it failed) is
+///   `Invalid` carrying the remote's error as-is — 501 "unavailable: <its
+///   reason>", never mislabelled as a missing command nor as a host that is
+///   down.
 fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError {
     let predates = match &e {
         HostConnectorError::Unreachable(msg) => {
@@ -1598,11 +1599,13 @@ fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError 
         _ => false,
     };
     if predates {
-        HostConnectorError::Unsupported(format!(
+        return HostConnectorError::Unsupported(format!(
             "remote host {host_id} does not support `rupu run list`: {e}"
-        ))
-    } else {
-        e
+        ));
+    }
+    match e {
+        HostConnectorError::Unreachable(msg) => HostConnectorError::Invalid(msg),
+        other => HostConnectorError::Invalid(other.to_string()),
     }
 }
 
@@ -4810,9 +4813,16 @@ mod tests {
         let fake = std::sync::Arc::new(FakeExec::offline(msg));
         let (conn, _store, _tmp) = make_conn(fake);
         let err = conn.list_runs(all_runs()).await.unwrap_err();
-        assert!(!matches!(err, HostConnectorError::Unsupported(_)), "{err}");
-        assert!(err.to_string().contains("ws_1.customer"), "{err}");
+        // `Invalid` → 501 "unavailable: <the remote's reason>", not offline.
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m) if m.contains("ws_1.customer")),
+            "{err}"
+        );
         assert!(!err.to_string().contains("does not support"), "{err}");
+        assert_eq!(
+            crate::api::runs::host_list_error(err).0,
+            axum::http::StatusCode::NOT_IMPLEMENTED
+        );
     }
 
     #[tokio::test]

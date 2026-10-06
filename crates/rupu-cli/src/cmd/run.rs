@@ -504,8 +504,9 @@ async fn list(
     // Each row carries its customer — recorded, else (a run that predates
     // customers) its workspace's current assignment — and is priced with
     // that customer's pricing (global + its layer), so a coordinator shelling
-    // this command can filter by customer and sees the CP's figures. An
-    // assignment that cannot be read fails the command.
+    // this command can filter by customer and sees the CP's figures. A
+    // workspace whose assignment cannot be read does not fail the listing:
+    // its rows omit the customer keys (one warning per workspace on stderr).
     let mut customers =
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
     let customer_pricing = rupu_cp::customers::CustomerPricing::new(global.clone(), cfg.pricing);
@@ -513,10 +514,9 @@ async fn list(
     let rows: Vec<rupu_cp::api::runs::RunListRow> = all
         .iter()
         .map(|r| {
-            rupu_cp::api::runs::RunListRow::attributed(r, &store, &mut customers, &mut prices)
-                .map_err(|e| anyhow::anyhow!(e.1))
+            rupu_cp::api::runs::RunListRow::for_listing(r, &store, &mut customers, &mut prices)
         })
-        .collect::<anyhow::Result<_>>()?;
+        .collect();
 
     let report = RunListReport {
         kind: "run_list",

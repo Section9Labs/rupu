@@ -163,6 +163,26 @@ fn assignment_error(ws_id: &str, e: &CustomerError) -> ApiError {
     ))
 }
 
+/// A list row's customer keys, `#[serde(flatten)]`ed onto the row:
+/// `customer` (`null` = no customer) and `customer_derived`. A row whose
+/// customer cannot be known holds `None` in place of this and carries
+/// NEITHER key — a coordinator then reads that host as unable to report a
+/// customer for every run, never as "no customer".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RowCustomer {
+    pub customer: Option<String>,
+    pub customer_derived: bool,
+}
+
+impl From<Attribution> for RowCustomer {
+    fn from(who: Attribution) -> Self {
+        Self {
+            customer: who.slug,
+            customer_derived: who.derived,
+        }
+    }
+}
+
 /// A per-request memo over a [`CustomerStore`]: each workspace's current
 /// assignment, and each customer's record, is read at most once however many
 /// rows share it (a legacy run's derived attribution otherwise costs one
@@ -171,6 +191,8 @@ pub struct CustomerLookup {
     store: CustomerStore,
     assignments: HashMap<String, Option<String>>,
     refs: HashMap<String, CustomerRef>,
+    /// Workspaces [`Self::attribute_for_listing`] already warned about.
+    warned: std::collections::HashSet<String>,
 }
 
 impl CustomerLookup {
@@ -179,6 +201,7 @@ impl CustomerLookup {
             store,
             assignments: HashMap::new(),
             refs: HashMap::new(),
+            warned: std::collections::HashSet::new(),
         }
     }
 
@@ -215,6 +238,32 @@ impl CustomerLookup {
             derived: slug.is_some(),
             slug,
         })
+    }
+
+    /// [`Self::attribute`] for a CLI display listing (`rupu run list`,
+    /// `transcript list`, `session list`), which must not fail on one
+    /// workspace's unreadable assignment: `None` = the row's customer cannot
+    /// be known (the row then omits its customer keys), with ONE warning per
+    /// affected workspace naming it. The CP's own handlers use
+    /// [`Self::attribute`] and fail closed instead.
+    pub fn attribute_for_listing(
+        &mut self,
+        recorded: Option<&str>,
+        workspace_id: &str,
+    ) -> Option<Attribution> {
+        match self.attribute(recorded, workspace_id) {
+            Ok(who) => Some(who),
+            Err(e) => {
+                if self.warned.insert(workspace_id.to_string()) {
+                    tracing::warn!(
+                        workspace = workspace_id,
+                        "{}; its rows are listed without a customer",
+                        e.1
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// The row reference for `slug`. A slug whose customer record is gone or
@@ -467,16 +516,20 @@ impl<'a> PricingMemo<'a> {
 // ── remote rows (ruling 5) ────────────────────────────────────────────────
 
 /// Response header a fan-out list sets, naming (comma-separated) the hosts
-/// it skipped because their rows carry no `customer` key — peers too old to
-/// report customers, which a customer filter can neither keep nor drop.
+/// it skipped because some of their rows carry no `customer` key — hosts
+/// that can't report a customer for every run (an older rupu, a mirror of a
+/// worker's legacy runs, rows it could not attribute), which a customer
+/// filter can neither keep nor drop.
 pub const HOSTS_WITHOUT_CUSTOMER_HEADER: &str = "x-rupu-hosts-without-customer";
 
-/// The 501 a single-host request answers when the host is too old to report
-/// customers — the status `host_list_error` gives an `Unsupported` host, so
-/// the web shows it as "unavailable".
+/// The 501 a single-host request answers when the host can't say whose some
+/// of its runs are — a rupu older than customers, a mirror holding a worker's
+/// legacy runs, or rows it could not attribute — the status
+/// `host_list_error` gives an `Unsupported` host, so the web shows it as
+/// "unavailable".
 pub fn customers_unsupported(host_id: &str) -> ApiError {
     ApiError::not_available(format!(
-        "host {host_id} can't report customers (its rupu predates customers)"
+        "host {host_id} can't report a customer for every run"
     ))
 }
 
@@ -494,8 +547,8 @@ pub fn remote_aggregate_reason(host_id: &str) -> String {
 }
 
 /// Keep the remote `rows` whose `customer` matches `filter`. `None` when any
-/// row lacks the `customer` key (an old peer that cannot say — never read
-/// as "no customer"); a `null` value is "no customer". An empty page is
+/// row lacks the `customer` key (the host can't say whose that run is —
+/// never read as "no customer"); a `null` value is "no customer". An empty page is
 /// filterable and stays empty.
 pub fn filter_remote_rows(
     rows: Vec<serde_json::Value>,

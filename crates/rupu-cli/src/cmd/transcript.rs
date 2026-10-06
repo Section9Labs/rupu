@@ -212,12 +212,14 @@ struct TranscriptListRow {
     status: String,
     total_tokens: u64,
     started_at: String,
-    /// The customer the run is attributed to: the one its `run_start`
-    /// recorded, else (`customer_derived`) its workspace's current
-    /// assignment. Always serialized (`null` = no customer) so a coordinator
-    /// listing this host over SSH can tell "no customer" from an older rupu.
-    customer: Option<String>,
-    customer_derived: bool,
+    /// The customer the run is attributed to — `customer` (the one its
+    /// `run_start` recorded, else its workspace's current assignment) and
+    /// `customer_derived` — serialized whenever known (`customer: null` = no
+    /// customer), so a coordinator listing this host over SSH can tell "no
+    /// customer" from an older rupu. `None` (an assignment that could not be
+    /// read) omits both keys.
+    #[serde(flatten)]
+    customer: Option<rupu_cp::customers::RowCustomer>,
 }
 
 #[derive(Serialize)]
@@ -1794,7 +1796,7 @@ async fn list(
         status: RunStatus,
         total_tokens: u64,
         started_at: chrono::DateTime<chrono::Utc>,
-        customer: rupu_cp::customers::Attribution,
+        customer: Option<rupu_cp::customers::Attribution>,
     }
 
     // Pass 1 — sort keys only.
@@ -1841,17 +1843,17 @@ async fn list(
     heads.truncate(limit);
 
     // Each row's customer: recorded on `run_start`, else its workspace's
-    // current assignment (derived). An assignment that cannot be read fails
-    // the command rather than report "no customer".
+    // current assignment (derived). A workspace whose assignment cannot be
+    // read does not fail the listing: its rows omit the customer keys (one
+    // warning per workspace on stderr), never claiming "no customer".
     let mut customers =
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
 
     // Pass 2 — full summaries, for the surviving rows only.
     let mut rows: Vec<Row> = Vec::new();
     for (scope, path, head) in &heads {
-        let customer = customers
-            .attribute(head.customer.as_deref(), &head.workspace_id)
-            .map_err(|e| anyhow::anyhow!(e.1))?;
+        let customer =
+            customers.attribute_for_listing(head.customer.as_deref(), &head.workspace_id);
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
                 customer,
@@ -1911,8 +1913,7 @@ async fn list(
             },
             total_tokens: row.total_tokens,
             started_at: row.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            customer: row.customer.slug.clone(),
-            customer_derived: row.customer.derived,
+            customer: row.customer.clone().map(Into::into),
         })
         .collect();
     let csv_rows: Vec<TranscriptListCsvRow> = report_rows
@@ -2962,8 +2963,7 @@ mod tests {
             status: status.to_string(),
             total_tokens: 1_200,
             started_at: started_at.to_string(),
-            customer: None,
-            customer_derived: false,
+            customer: Some(rupu_cp::customers::RowCustomer::default()),
         }
     }
 
@@ -2983,11 +2983,18 @@ mod tests {
         assert!(v.as_object().unwrap().contains_key("customer"));
         assert!(v["customer"].is_null());
         assert_eq!(v["customer_derived"], false);
-        row.customer = Some("acme".into());
-        row.customer_derived = true;
+        row.customer = Some(rupu_cp::customers::RowCustomer {
+            customer: Some("acme".into()),
+            customer_derived: true,
+        });
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["customer"], "acme");
         assert_eq!(v["customer_derived"], true);
+        // Unattributable (its assignment could not be read): no keys at all.
+        row.customer = None;
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("customer"));
+        assert!(!v.as_object().unwrap().contains_key("customer_derived"));
     }
 
     #[test]

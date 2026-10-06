@@ -17,6 +17,7 @@ mod auth_status_table;
 mod cli_auth_backend_retired;
 mod cli_cleanup;
 mod cli_generate;
+mod cli_list_customers;
 mod cli_man;
 mod cli_scm_bind_walkthrough;
 mod cli_session;
