@@ -16,8 +16,8 @@
 //!
 //! Refused, with the ledger untouched: an id the ledger does not have (or has
 //! twice), a finding without a report, a verdict of `unverified` (the state of
-//! a finding nobody has verified, not a verdict), and a verdict from the run
-//! that filed the finding.
+//! a finding nobody has verified, not a verdict), a verdict from the run
+//! that filed the finding, and a verdict with a blank verifier run id.
 
 use crate::ledger::paths::CoveragePaths;
 use crate::report::{Verification, VerificationStatus};
@@ -54,6 +54,14 @@ pub enum VerifyError {
     /// `unverified` is not a verdict.
     #[error("a verdict must be confirmed, disputed or inconclusive, not unverified")]
     BadStatus,
+    /// The verifier run id is blank. An empty `by_run` would pass both the
+    /// self-verification refusal here and the evaluator's independence check
+    /// (`Some("")` reads as a different run than the filer), so it is refused
+    /// at this chokepoint. This only enforces non-emptiness; the caller
+    /// (`finding.verify`) is responsible for filling it with the verifier's
+    /// own run id, never a value from agent input.
+    #[error("a verification must name the verifier's run id (by_run is blank)")]
+    MissingVerifier,
     /// The ledger could not be locked, read or replaced (it is a symlink, it
     /// changed during the verification, ...). It is as it was.
     #[error("cannot rewrite the findings ledger: {0}")]
@@ -78,6 +86,11 @@ fn verify_finding_with(
     // Before any lock or file: a refusal that needs no ledger leaves it alone.
     if input.status == VerificationStatus::Unverified {
         return Err(VerifyError::BadStatus);
+    }
+    // A blank verifier run id would defeat both the self-verification guard
+    // below and the evaluator's independence check; refuse it here.
+    if input.by_run.trim().is_empty() {
+        return Err(VerifyError::MissingVerifier);
     }
     let outcome = with_findings_line_rewrite(
         paths,

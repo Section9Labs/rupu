@@ -308,6 +308,7 @@ and are not repeated here.
   - [ ] Move the hardened blob opens into one `ArtifactStore::open_blob` (rupu-coverage) instead of `rupu-cli` calling `rupu_cp::api::fs_open`.
   - [ ] SSH pulls: a per-host concurrency limit and a short negative cache — each failing click costs the host one ssh connection (see (e)).
   - [ ] Before release: a manual smoke against a real S3/GCS bucket (InMemory enforces neither the 5 MiB part minimum nor multipart abort), a tunnel pull of more than one chunk, and an SSH pull against an older remote.
+- [ ] **Agentiflow verification verdict over remote transports** (local shipped: `docs/superpowers/plans/2026-10-06-rupu-agentiflows-plan-3c-verify.md`) — `verify_finding` rewrites the local pooled `findings.jsonl` in place and never emits a coverage-stream line, and `ingest_unit_stream` dedups findings by id, so a verdict from a REMOTE verifier unit would not reach the coordinator. Fine while agentiflow verifier units are local `rupu run` processes writing the pooled scope directly; wire a verification into the coverage stream (or a dedicated verdict frame) when remote verification lands.
 - [ ] **Evidence-block files: follow-ups** (shipped: `docs/superpowers/specs/2026-10-02-rupu-evidence-block-artifacts-design.md`)
   - [ ] Exports (`rupu findings export`, the CP export endpoints) print block files by path only; embed `image` blocks in the HTML and PDF.
   - [ ] The Code tab's inline finding card does not render evidence blocks (only the `/findings/:id` page does).

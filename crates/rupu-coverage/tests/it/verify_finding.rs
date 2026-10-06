@@ -315,6 +315,27 @@ fn the_unverified_status_is_not_a_verdict() {
 }
 
 #[test]
+fn a_blank_verifier_run_id_is_refused_and_the_ledger_is_untouched() {
+    let (_d, paths) = setup();
+    let target = seed_full(&paths, "run_A");
+    let before = std::fs::read(&paths.findings).unwrap();
+
+    // An empty `by_run` would pass the self-verification guard (Some("") !=
+    // "run_A") and the evaluator's independence check — a silent hole. Refuse
+    // it at the chokepoint, leaving the ledger untouched.
+    for blank in ["", "   "] {
+        let err = verify_finding(
+            &paths,
+            &verdict(&target, blank, VerificationStatus::Confirmed),
+        )
+        .unwrap_err();
+        assert!(matches!(err, VerifyError::MissingVerifier), "{err:?}");
+    }
+    assert_eq!(std::fs::read(&paths.findings).unwrap(), before);
+    assert_no_rewrite_litter(&paths);
+}
+
+#[test]
 fn an_id_on_two_ledger_lines_is_left_alone() {
     let (_d, paths) = setup();
     let target = seed_full(&paths, "run_A");
