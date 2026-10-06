@@ -727,11 +727,13 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
 mod tests {
     use super::*;
     use crate::operator::OperatorMessage;
+    use crate::verify_fixtures::full_finding;
     use rupu_agent::runner::CapturingMockProvider;
     use rupu_agent::{MockProvider, ScriptedTurn};
+    use rupu_coverage::tools::{verify_finding, VerifyError, VerifyInput};
     use rupu_coverage::{
-        append_record, Attribution, FindingEvidence, FindingProfile, FindingRecord, FindingScope,
-        Ledger, Severity, Surface,
+        append_record, read_findings, Attribution, FindingEvidence, FindingProfile, FindingRecord,
+        FindingScope, Ledger, Severity, Surface, Verification, VerificationStatus,
     };
 
     fn started() -> DateTime<Utc> {
@@ -2257,6 +2259,260 @@ mod tests {
         );
         let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
         assert!(findings.contains("fnd_unit"), "{findings}");
+    }
+
+    // ---- the verification gate, end to end ---------------------------------
+
+    /// A definition whose single goal is "one CWE-94 finding, verified by the
+    /// agent `verifier`", with that verifier (and a filer, `recon`) in the pool.
+    fn def_with_verified_goal(extra: &str) -> AgentiflowDef {
+        AgentiflowDef::parse_str(&format!(
+            "name: itest\n\
+             lead: lead\n\
+             engagement_profiles: [network]\n\
+             goals:\n  \
+               - id: verified-rce\n    \
+                 objective: \"Land one verified CWE-94 finding.\"\n    \
+                 verify_with: verifier\n    \
+                 target: {{ findings: {{ classification: \"CWE-94\" }}, count_gte: 1, verified: true }}\n\
+             scope: {{ authorized: true }}\n\
+             pool: {{ agents: [lead, recon, verifier] }}\n\
+             {extra}"
+        ))
+        .unwrap()
+    }
+
+    /// The text of the latest `goal.status` result for `goal_id` the request carries.
+    fn latest_goal_row(req: &rupu_providers::LlmRequest, goal_id: &str) -> Value {
+        request_texts(req)
+            .iter()
+            .rev()
+            .find(|t| t.contains(&format!("\"id\":\"{goal_id}\"")))
+            .map(|t| serde_json::from_str::<Value>(t).expect("goal.status returns JSON"))
+            .and_then(|rows| rows.as_array().and_then(|r| r.first().cloned()))
+            .expect("a goal.status result reached the lead")
+    }
+
+    fn verify_as(finding_id: &str, status: VerificationStatus, by: (&str, &str)) -> VerifyInput {
+        VerifyInput {
+            finding_id: finding_id.into(),
+            status,
+            by_run: by.0.into(),
+            by_agent: Some(by.1.into()),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn a_verified_goal_is_met_only_once_an_independent_run_confirms_the_finding() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_verify";
+
+        // The mock units do what real ones would, at spawn, into the run's
+        // POOLED scope: `recon` files a full finding as run_A; `verifier`
+        // confirms it as run_B -- a different run, through the real write path.
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![UnitStatus::Running]).with_on_spawn(move |spec, _| {
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                match spec.agent.as_str() {
+                    "recon" => {
+                        let rec = full_finding("fnd_rce", "run_A", "CWE-94");
+                        append_record(&paths, Ledger::Findings, &rec).unwrap();
+                    }
+                    "verifier" => {
+                        let verdict = verify_as(
+                            "fnd_rce",
+                            VerificationStatus::Confirmed,
+                            ("run_B", "verifier"),
+                        );
+                        verify_finding(&paths, &verdict).unwrap();
+                    }
+                    other => panic!("unexpected unit agent {other}"),
+                }
+            }),
+        );
+
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t0",
+                "dispatch",
+                json!({ "agent": "recon", "prompt": "find an RCE" }),
+            ),
+            // Filed, but nobody has verified it yet.
+            tool_turn("t1", "goal.status", json!({})),
+            tool_turn(
+                "t2",
+                "dispatch",
+                json!({ "agent": "verifier", "prompt": "verify fnd_rce" }),
+            ),
+            // Independently confirmed.
+            tool_turn("t3", "goal.status", json!({})),
+            done_turn(),
+        ]]);
+        let mut o = opts(
+            &fx,
+            def_with_verified_goal("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+
+        let spawned: Vec<String> = launcher.spawned().iter().map(|s| s.agent.clone()).collect();
+        assert_eq!(spawned, ["recon", "verifier"]);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 5, "one model call per scripted turn");
+        // Filed under run_A and not yet verified: the lead is told so, and who
+        // has to verify it.
+        let filed = latest_goal_row(&reqs[2], "verified-rce");
+        assert_eq!(filed["satisfied"], false, "{filed}");
+        assert_eq!(filed["current"], 0, "{filed}");
+        let detail = filed["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("1 matched, 0 verified")
+                && detail.contains("1 awaiting verification by verifier"),
+            "{detail}"
+        );
+        // After run_B's confirmation the same goal is met.
+        let verified = latest_goal_row(&reqs[4], "verified-rce");
+        assert_eq!(verified["satisfied"], true, "{verified}");
+        assert_eq!(verified["current"], 1, "{verified}");
+        assert!(
+            verified["detail"]
+                .as_str()
+                .unwrap()
+                .contains("1 matched, 1 verified"),
+            "{verified}"
+        );
+
+        // The pooled ledger: one finding, filed by run_A, confirmed by run_B.
+        let recs = read_findings(&pooled_paths(&fx, id)).unwrap();
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].declared_by.run_id, "run_A");
+        let v = recs[0]
+            .report
+            .as_ref()
+            .unwrap()
+            .verification
+            .as_ref()
+            .unwrap();
+        assert_eq!(v.status, VerificationStatus::Confirmed);
+        assert_eq!(v.by_run.as_deref(), Some("run_B"));
+        assert_eq!(v.by_agent.as_deref(), Some("verifier"));
+    }
+
+    #[test]
+    fn a_verified_goal_is_not_met_by_a_filed_self_verified_or_wrong_agent_finding() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fx = fixture();
+        let id = "af_noverify";
+
+        let self_refused = Arc::new(AtomicBool::new(false));
+        let refused = self_refused.clone();
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![UnitStatus::Running]).with_on_spawn(move |spec, _| {
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                match spec.agent.as_str() {
+                    "recon" => {
+                        // Three findings, all filed by run_A.
+                        for fid in ["fnd_self", "fnd_forged", "fnd_wrong"] {
+                            let mut rec = full_finding(fid, "run_A", "CWE-94");
+                            if fid == "fnd_forged" {
+                                // A verdict written straight into the ledger,
+                                // bypassing the write path: Confirmed, by the
+                                // run that filed the finding.
+                                rec.report.as_mut().unwrap().verification = Some(Verification {
+                                    status: VerificationStatus::Confirmed,
+                                    by_run: Some("run_A".into()),
+                                    by_agent: Some("verifier".into()),
+                                    notes: None,
+                                });
+                            }
+                            append_record(&paths, Ledger::Findings, &rec).unwrap();
+                        }
+                    }
+                    "verifier" => {
+                        // run_A tries to verify its own finding: the write path
+                        // refuses it.
+                        let own = verify_as(
+                            "fnd_self",
+                            VerificationStatus::Confirmed,
+                            ("run_A", "verifier"),
+                        );
+                        refused.store(
+                            matches!(
+                                verify_finding(&paths, &own),
+                                Err(VerifyError::SelfVerification)
+                            ),
+                            Ordering::SeqCst,
+                        );
+                        // An independent run confirms -- but it is not the
+                        // agent the goal names (`verifier`).
+                        let other = verify_as(
+                            "fnd_wrong",
+                            VerificationStatus::Confirmed,
+                            ("run_B", "somebody-else"),
+                        );
+                        verify_finding(&paths, &other).unwrap();
+                    }
+                    other => panic!("unexpected unit agent {other}"),
+                }
+            }),
+        );
+
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn(
+                "t0",
+                "dispatch",
+                json!({ "agent": "recon", "prompt": "find RCEs" }),
+            ),
+            tool_turn(
+                "t1",
+                "dispatch",
+                json!({ "agent": "verifier", "prompt": "verify them" }),
+            ),
+            tool_turn("t2", "goal.status", json!({})),
+            done_turn(),
+        ]]);
+        let mut o = opts(
+            &fx,
+            def_with_verified_goal("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+
+        // Three CWE-94 findings are filed and none clears the gate: the flow
+        // runs to its ceiling instead of reporting its goal met.
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+        assert!(
+            self_refused.load(Ordering::SeqCst),
+            "self-verification is refused at the write path"
+        );
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 4, "one model call per scripted turn");
+        let row = latest_goal_row(&reqs[3], "verified-rce");
+        assert_eq!(row["satisfied"], false, "{row}");
+        assert_eq!(row["current"], 0, "{row}");
+        let detail = row["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("3 matched, 0 verified")
+                && detail.contains("3 awaiting verification by verifier"),
+            "{detail}"
+        );
+
+        // The refused self-verdict left no trace on its finding.
+        let recs = read_findings(&pooled_paths(&fx, id)).unwrap();
+        let own = recs.iter().find(|r| r.id == "fnd_self").unwrap();
+        assert!(own.report.as_ref().unwrap().verification.is_none());
     }
 
     #[test]

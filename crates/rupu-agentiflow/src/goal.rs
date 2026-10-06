@@ -32,7 +32,7 @@ pub struct GoalOutcome {
 /// verifier (`verify_with`) implies requiring verification even when
 /// `verified` was left `false`; with NEITHER set, verification is ignored
 /// entirely and an unverified finding counts like any other.
-fn requires_verification(verified: bool, verify_with: Option<&str>) -> bool {
+pub(crate) fn requires_verification(verified: bool, verify_with: Option<&str>) -> bool {
     verified || verify_with.is_some()
 }
 

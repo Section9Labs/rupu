@@ -21,6 +21,8 @@ mod subprocess;
 mod supervisor;
 mod tools;
 mod unit;
+#[cfg(test)]
+mod verify_fixtures;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use collectors::{lead_collectors, DirectiveCollector, MailboxCollector};

@@ -20,10 +20,10 @@
 
 use crate::coverage::{CoverageEvaluator, CoverageTarget};
 use crate::def::Goal;
-use crate::goal::GoalEvaluator;
+use crate::goal::{count_matching_findings, requires_verification, GoalEvaluator};
 use crate::roster::{done, failed, req_str};
 use async_trait::async_trait;
-use rupu_coverage::{ActiveSet, CoveragePaths};
+use rupu_coverage::{read_findings, ActiveSet, CoveragePaths};
 use rupu_fleet::{Board, Directive};
 use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
@@ -95,6 +95,40 @@ async fn blocking<T: Send + 'static>(
 
 // ---- goal.status ------------------------------------------------------------
 
+/// The line `goal.status` reports for a goal the evaluator scored as `scored`.
+///
+/// A findings goal that gates on verification (`verified: true`, or a
+/// `verify_with`) gets the matched-vs-verified split appended, so the lead can
+/// tell "no findings yet" from "findings filed, nobody has verified them" and,
+/// in the second case, which agent to dispatch:
+/// `... (3 matched, 1 verified; 2 awaiting verification by <agent>)`. Both
+/// counts come from ONE read of the ledger, through the evaluator's own counter
+/// (gate off, then on), so they cannot disagree with how the goal is scored.
+/// Any other goal -- and a goal whose ledger cannot be read, which
+/// [`GoalEvaluator::evaluate`] already reported -- keeps `scored` as is.
+fn goal_detail(goal: &Goal, paths: &CoveragePaths, scored: &str) -> String {
+    let verify_with = goal.verify_with.as_deref();
+    let Some(sel) = goal.target.findings.as_ref() else {
+        return scored.to_string();
+    };
+    if !requires_verification(goal.target.verified, verify_with) {
+        return scored.to_string();
+    }
+    let Ok(records) = read_findings(paths) else {
+        return scored.to_string();
+    };
+    let check = goal.target.verify_check.unwrap_or_default();
+    let matched = count_matching_findings(&records, sel, false, None, check);
+    let verified = count_matching_findings(&records, sel, true, verify_with, check);
+    let awaiting = matched.saturating_sub(verified);
+    let ask = match (awaiting, verify_with) {
+        (0, _) => String::new(),
+        (n, Some(agent)) => format!("; {n} awaiting verification by {agent}"),
+        (n, None) => format!("; {n} awaiting independent verification"),
+    };
+    format!("{scored} ({matched} matched, {verified} verified{ask})")
+}
+
 /// `goal.status` -> `[{id, objective, required, satisfied, current, target,
 /// detail}]`, or `{id, objective, required, error}` for a goal that could not be
 /// evaluated.
@@ -110,8 +144,11 @@ impl Tool for GoalStatus {
         "Re-check every goal against the pooled evidence right now (findings and \
          assets banked since the round began count). Each goal reports `satisfied`, \
          its `current`/`target` tally and a one-line `detail`; a goal that could not \
-         be evaluated carries an `error` instead. Budget is shown in the round \
-         digest, not here."
+         be evaluated carries an `error` instead. A findings goal that requires \
+         verification also reports in `detail` how many findings match it and how \
+         many of those are independently verified, and names the agent that must \
+         verify the rest (dispatch it). Budget is shown in the round digest, not \
+         here."
     }
 
     fn input_schema(&self) -> Value {
@@ -132,7 +169,7 @@ impl Tool for GoalStatus {
                             "satisfied": o.met,
                             "current": o.current,
                             "target": o.target,
-                            "detail": o.detail,
+                            "detail": goal_detail(g, &ctx.paths, &o.detail),
                         }),
                         Err(e) => json!({
                             "id": g.id,
@@ -264,10 +301,12 @@ impl Tool for BoardDirective {
 mod tests {
     use super::*;
     use crate::def::{AssetSelector, FindingSelector, GoalTarget};
+    use crate::verify_fixtures::full_finding;
     use chrono::Utc;
+    use rupu_coverage::tools::{verify_finding, VerifyInput};
     use rupu_coverage::{
         append_record, Asset, Attribution, Coordinate, FindingEvidence, FindingProfile,
-        FindingRecord, FindingScope, Ledger, Locator, Severity, Surface,
+        FindingRecord, FindingScope, Ledger, Locator, Severity, Surface, VerificationStatus,
     };
     use std::collections::BTreeMap;
 
@@ -453,6 +492,159 @@ mod tests {
         assert_eq!(rows[2]["id"], "two");
         assert_eq!(rows[2]["satisfied"], false);
         assert_eq!(rows[2]["detail"], "1/2 findings");
+    }
+
+    // ---- verification-gated findings goals ---------------------------------
+
+    /// A findings goal over `CWE-94`, needing `n`, gated on verification
+    /// through `verified` and/or `verify_with`.
+    fn verified_goal(n: u64, verified: bool, verify_with: Option<&str>) -> Goal {
+        let mut g = finding_goal("rce", n);
+        g.target.findings = Some(FindingSelector {
+            classification: Some("CWE-94".into()),
+        });
+        g.target.verified = verified;
+        g.verify_with = verify_with.map(String::from);
+        g
+    }
+
+    /// File a Full finding (filed by `run_seed`) into the pooled ledger.
+    fn file_full(paths: &CoveragePaths, id: &str, classification: &str) {
+        append_record(
+            paths,
+            Ledger::Findings,
+            &full_finding(id, "run_seed", classification),
+        )
+        .unwrap();
+    }
+
+    /// Record a verdict through the real `finding.verify` write path.
+    fn verify(paths: &CoveragePaths, id: &str, status: VerificationStatus, by: (&str, &str)) {
+        verify_finding(
+            paths,
+            &VerifyInput {
+                finding_id: id.into(),
+                status,
+                by_run: by.0.into(),
+                by_agent: Some(by.1.into()),
+                notes: None,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn only_row(fx: &Fx, goal: Goal) -> Value {
+        let v = json_of(&call(&tools(fx, vec![goal], None), "goal.status", json!({})).await);
+        v.as_array().unwrap()[0].clone()
+    }
+
+    #[tokio::test]
+    async fn goal_status_splits_matched_from_verified_and_names_the_verifier() {
+        let fx = fx();
+        // Three CWE-94 findings, all filed by `run_seed`; one more of another class.
+        for id in ["fnd_a", "fnd_b", "fnd_c"] {
+            file_full(&fx.paths, id, "CWE-94");
+        }
+        file_full(&fx.paths, "fnd_other", "CWE-79");
+        // a: confirmed by the named verifier, from another run -> verified.
+        verify(
+            &fx.paths,
+            "fnd_a",
+            VerificationStatus::Confirmed,
+            ("run_v", "verifier"),
+        );
+        // b: never verified. c: confirmed, but by the wrong agent.
+        verify(
+            &fx.paths,
+            "fnd_c",
+            VerificationStatus::Confirmed,
+            ("run_v", "somebody-else"),
+        );
+
+        let row = only_row(&fx, verified_goal(2, true, Some("verifier"))).await;
+        assert_eq!(row["satisfied"], false);
+        assert_eq!(row["current"], 1);
+        assert_eq!(row["target"], 2);
+        assert_eq!(
+            row["detail"],
+            "1/2 verified findings [CWE-94] \
+             (3 matched, 1 verified; 2 awaiting verification by verifier)"
+        );
+
+        // Verifying the second one meets the goal, and nothing is left to ask for.
+        verify(
+            &fx.paths,
+            "fnd_c",
+            VerificationStatus::Confirmed,
+            ("run_v", "verifier"),
+        );
+        let row = only_row(&fx, verified_goal(2, true, Some("verifier"))).await;
+        assert_eq!(row["satisfied"], true);
+        assert_eq!(row["current"], 2);
+        assert_eq!(
+            row["detail"],
+            "2/2 verified findings [CWE-94] (3 matched, 2 verified; 1 awaiting verification by verifier)"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_status_without_a_named_verifier_asks_for_independent_verification() {
+        let fx = fx();
+        file_full(&fx.paths, "fnd_a", "CWE-94");
+        file_full(&fx.paths, "fnd_b", "CWE-94");
+        verify(
+            &fx.paths,
+            "fnd_a",
+            VerificationStatus::Confirmed,
+            ("run_v", "anyone"),
+        );
+        let row = only_row(&fx, verified_goal(2, true, None)).await;
+        assert_eq!(
+            row["detail"],
+            "1/2 verified findings [CWE-94] (2 matched, 1 verified; 1 awaiting independent verification)"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_status_a_verify_with_alone_gates_and_names_the_verifier() {
+        let fx = fx();
+        file_full(&fx.paths, "fnd_a", "CWE-94");
+        // `verified` is false, but naming a verifier is itself a gate.
+        let row = only_row(&fx, verified_goal(1, false, Some("verifier"))).await;
+        assert_eq!(row["satisfied"], false);
+        assert_eq!(
+            row["detail"],
+            "0/1 verified findings [CWE-94] (1 matched, 0 verified; 1 awaiting verification by verifier)"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_status_with_everything_verified_has_nothing_left_to_ask_for() {
+        let fx = fx();
+        file_full(&fx.paths, "fnd_a", "CWE-94");
+        verify(
+            &fx.paths,
+            "fnd_a",
+            VerificationStatus::Confirmed,
+            ("run_v", "verifier"),
+        );
+        let row = only_row(&fx, verified_goal(1, true, Some("verifier"))).await;
+        assert_eq!(row["satisfied"], true);
+        assert_eq!(
+            row["detail"],
+            "1/1 verified findings [CWE-94] (1 matched, 1 verified)"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_status_leaves_an_ungated_goal_and_its_detail_alone() {
+        let fx = fx();
+        file_full(&fx.paths, "fnd_a", "CWE-94");
+        // Neither `verified` nor `verify_with`: verification is ignored, and the
+        // detail carries no matched/verified split.
+        let row = only_row(&fx, verified_goal(1, false, None)).await;
+        assert_eq!(row["satisfied"], true);
+        assert_eq!(row["detail"], "1/1 findings [CWE-94]");
     }
 
     #[tokio::test]
