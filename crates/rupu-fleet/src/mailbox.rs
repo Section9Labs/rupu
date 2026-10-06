@@ -3,6 +3,9 @@ use crate::types::FleetMessage;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// The reserved participant name the broadcast log lives under.
+const BROADCAST: &str = "broadcast";
+
 #[derive(Debug, Clone)]
 pub struct Mailbox {
     pub root: PathBuf,
@@ -63,6 +66,20 @@ impl Mailbox {
             .join("mailboxes")
             .join(sanitize(participant))
             .join(".lock")
+    }
+
+    fn broadcast_log_path(&self) -> PathBuf {
+        self.root
+            .join("mailboxes")
+            .join(BROADCAST)
+            .join("log.jsonl")
+    }
+
+    fn broadcast_cursor_path(&self, participant: &str) -> PathBuf {
+        self.root
+            .join("mailboxes")
+            .join(sanitize(participant))
+            .join("broadcast.cursor")
     }
 
     pub fn send(&self, to: &str, msg: &FleetMessage, cap: usize) -> Result<(), FleetError> {
@@ -133,6 +150,100 @@ impl Mailbox {
         let _ = std::fs::remove_file(&taken);
         Ok(msgs)
     }
+
+    /// Append `msg` to the shared broadcast log (`mailboxes/broadcast/log.jsonl`).
+    ///
+    /// Unlike [`Mailbox::send`], a broadcast is never consumed: it is an
+    /// append-only log that every reader walks with its own cursor
+    /// ([`Mailbox::read_broadcast`]). `cap` bounds the total number of lines in
+    /// the log (the log is never trimmed), failing with
+    /// [`FleetError::InboxFull`] once it is reached. The cap check and the
+    /// append are one critical section under the broadcast lock.
+    pub fn broadcast_send(&self, msg: &FleetMessage, cap: usize) -> Result<(), FleetError> {
+        let path = self.broadcast_log_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
+                action: format!("create broadcast dir {}", parent.display()),
+                source: e,
+            })?;
+        }
+        let _lock = Self::lock_exclusive(&self.lock_path(BROADCAST))?;
+        if count_lines(&path)? >= cap {
+            return Err(FleetError::InboxFull {
+                participant: BROADCAST.to_string(),
+                cap,
+            });
+        }
+        let mut line = serde_json::to_vec(msg)?;
+        line.push(b'\n');
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| FleetError::Io {
+                action: format!("open broadcast log {}", path.display()),
+                source: e,
+            })?;
+        f.write_all(&line).map_err(|e| FleetError::Io {
+            action: format!("append broadcast log {}", path.display()),
+            source: e,
+        })
+    }
+
+    /// Return the broadcasts `participant` has not yet seen, and advance its
+    /// cursor past them, so every reader sees each broadcast exactly once and
+    /// no reader consumes one on another's behalf.
+    ///
+    /// The cursor (`mailboxes/<participant>/broadcast.cursor`) is the number of
+    /// broadcast-log lines already delivered. A reader with no cursor yet is a
+    /// late joiner: its cursor starts at the CURRENT end of the log, so its
+    /// first read is empty (no backlog) and it sees only what is broadcast
+    /// afterwards. An unreadable cursor is treated the same way, so a damaged
+    /// file can never replay history.
+    ///
+    /// Only complete (newline-terminated) log lines are delivered; a line still
+    /// being appended is picked up by the next read.
+    pub fn read_broadcast(&self, participant: &str) -> Result<Vec<FleetMessage>, FleetError> {
+        let log = self.broadcast_log_path();
+        let cursor_path = self.broadcast_cursor_path(participant);
+        let lock_path = self.lock_path(participant);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
+                action: format!("create mailbox dir {}", parent.display()),
+                source: e,
+            })?;
+        }
+        let _lock = Self::lock_exclusive(&lock_path)?;
+
+        let lines = complete_log_lines(&log)?;
+        let total = lines.len();
+        let cursor = match read_cursor(&cursor_path)? {
+            Some(c) => c,
+            None => {
+                // First read: start at the tip. Nothing is delivered.
+                write_cursor(&cursor_path, total)?;
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut out = Vec::new();
+        for line in lines.iter().skip(cursor) {
+            match serde_json::from_str::<FleetMessage>(line) {
+                Ok(m) => out.push(m),
+                // A line we cannot parse is dropped rather than wedging every
+                // reader on it forever; only this process writes the log.
+                Err(e) => tracing::warn!(
+                    path = %log.display(),
+                    error = %e,
+                    "broadcast log: skipping unparseable line"
+                ),
+            }
+        }
+        if total != cursor {
+            write_cursor(&cursor_path, total)?;
+        }
+        Ok(out)
+    }
 }
 
 fn count_lines(path: &Path) -> Result<usize, FleetError> {
@@ -147,6 +258,60 @@ fn count_lines(path: &Path) -> Result<usize, FleetError> {
             source: e,
         }),
     }
+}
+
+/// The non-blank, newline-terminated lines of the broadcast log, in order. A
+/// missing log is empty. The trailing fragment of a write still in flight has
+/// no terminator yet and is excluded, so a reader never parses (or counts) a
+/// half-written line.
+fn complete_log_lines(path: &Path) -> Result<Vec<String>, FleetError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(FleetError::Io {
+                action: format!("read broadcast log {}", path.display()),
+                source: e,
+            })
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let complete = match text.rfind('\n') {
+        Some(i) => &text[..=i],
+        None => return Ok(Vec::new()),
+    };
+    Ok(complete
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// A reader's persisted broadcast cursor, or `None` when it has none (or it is
+/// not a valid integer).
+fn read_cursor(path: &Path) -> Result<Option<usize>, FleetError> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(t.trim().parse().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(FleetError::Io {
+            action: format!("read broadcast cursor {}", path.display()),
+            source: e,
+        }),
+    }
+}
+
+/// Persist a cursor atomically (temp file + rename), so a crash mid-write can
+/// only leave the previous cursor, never a torn one.
+fn write_cursor(path: &Path, value: usize) -> Result<(), FleetError> {
+    let tmp = path.with_extension("cursor.tmp");
+    std::fs::write(&tmp, format!("{value}\n")).map_err(|e| FleetError::Io {
+        action: format!("write broadcast cursor {}", tmp.display()),
+        source: e,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| FleetError::Io {
+        action: format!("commit broadcast cursor {}", path.display()),
+        source: e,
+    })
 }
 
 fn read_messages(path: &Path) -> Result<Vec<FleetMessage>, FleetError> {
@@ -325,5 +490,118 @@ mod tests {
         let mb = Mailbox::new(tmp.path());
         assert!(mb.drain("ghost").unwrap().is_empty());
         assert!(!tmp.path().join("mailboxes").exists());
+    }
+
+    #[test]
+    fn broadcast_fans_out_to_every_reader_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        // Readers that joined before the broadcast.
+        assert!(mb.read_broadcast("unit-a").unwrap().is_empty());
+        assert!(mb.read_broadcast("unit-b").unwrap().is_empty());
+        mb.broadcast_send(&msg("all hands"), 256).unwrap();
+        let a1 = mb.read_broadcast("unit-a").unwrap();
+        let b1 = mb.read_broadcast("unit-b").unwrap();
+        assert_eq!(a1.len(), 1);
+        assert_eq!(b1.len(), 1);
+        assert_eq!(a1[0].body, "all hands");
+        assert_eq!(b1[0].body, "all hands");
+        // neither sees it again (cursor advanced)
+        assert!(mb.read_broadcast("unit-a").unwrap().is_empty());
+        assert!(mb.read_broadcast("unit-b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_late_reader_starts_at_the_current_log_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        mb.broadcast_send(&msg("early"), 256).unwrap();
+        // late joiner's first read sees no backlog...
+        assert!(mb.read_broadcast("late").unwrap().is_empty());
+        mb.broadcast_send(&msg("after"), 256).unwrap();
+        // ...but does see broadcasts sent after it first read.
+        let got = mb.read_broadcast("late").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "after");
+    }
+
+    #[test]
+    fn a_reader_of_a_never_written_log_sees_the_first_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        assert!(mb.read_broadcast("early-bird").unwrap().is_empty());
+        mb.broadcast_send(&msg("first ever"), 256).unwrap();
+        let got = mb.read_broadcast("early-bird").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "first ever");
+    }
+
+    #[test]
+    fn broadcast_preserves_order_and_does_not_touch_direct_inboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        assert!(mb.read_broadcast("w").unwrap().is_empty());
+        mb.send("w", &msg("direct"), 10).unwrap();
+        mb.broadcast_send(&msg("one"), 10).unwrap();
+        mb.broadcast_send(&msg("two"), 10).unwrap();
+        let got: Vec<String> = mb
+            .read_broadcast("w")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(got, ["one", "two"]);
+        // the direct inbox is independent: still drainable once.
+        let direct = mb.drain("w").unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].body, "direct");
+    }
+
+    #[test]
+    fn broadcast_send_respects_the_total_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        mb.broadcast_send(&msg("a"), 2).unwrap();
+        mb.broadcast_send(&msg("b"), 2).unwrap();
+        let err = mb.broadcast_send(&msg("c"), 2).unwrap_err();
+        assert!(matches!(err, FleetError::InboxFull { cap: 2, .. }));
+        // a read does not free room: the log is append-only.
+        assert!(mb.read_broadcast("r").unwrap().is_empty());
+        assert!(mb.broadcast_send(&msg("d"), 2).is_err());
+    }
+
+    #[test]
+    fn a_damaged_cursor_resets_to_the_tip_instead_of_replaying() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        mb.broadcast_send(&msg("old"), 10).unwrap();
+        assert!(mb.read_broadcast("r").unwrap().is_empty());
+        std::fs::write(mb.broadcast_cursor_path("r"), "not a number").unwrap();
+        assert!(mb.read_broadcast("r").unwrap().is_empty());
+        mb.broadcast_send(&msg("new"), 10).unwrap();
+        let got = mb.read_broadcast("r").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "new");
+    }
+
+    #[test]
+    fn a_half_written_trailing_line_is_left_for_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = Mailbox::new(dir.path());
+        assert!(mb.read_broadcast("r").unwrap().is_empty());
+        mb.broadcast_send(&msg("whole"), 10).unwrap();
+        // Simulate a writer caught mid-append: bytes with no terminator yet.
+        let log = mb.broadcast_log_path();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(br#"{"from":"lead","ts":"t","bo"#).unwrap();
+        let first = mb.read_broadcast("r").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].body, "whole");
+        // Finish the line; the next read delivers it exactly once.
+        f.write_all(b"dy\":\"rest\"}\n").unwrap();
+        let second = mb.read_broadcast("r").unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].body, "rest");
+        assert!(mb.read_broadcast("r").unwrap().is_empty());
     }
 }
