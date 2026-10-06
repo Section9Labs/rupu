@@ -53,6 +53,50 @@ pub fn terminate_pid(pid: u32) -> bool {
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
 }
 
+/// A process-group id as a rustix `Pid`, or `None` when signalling it could
+/// only be a mistake.
+///
+/// Beyond [`rustix_pid`]'s rules (0 and out-of-range are not groups), this
+/// refuses this process's pid and its own process group: `kill(-pgid, …)` on
+/// the coordinator's group would take the coordinator (and its shell) down with
+/// the unit.
+fn group_target(pgid: u32) -> Option<rustix::process::Pid> {
+    let target = rustix_pid(pgid)?;
+    if pgid == std::process::id() || target == rustix::process::getpgrp() {
+        tracing::warn!(
+            pgid,
+            "refusing to signal this process's own group: a recorded unit pgid matched our own"
+        );
+        return None;
+    }
+    Some(target)
+}
+
+/// Send SIGTERM to every process in group `pgid`. Returns whether the signal
+/// was delivered.
+///
+/// A unit is spawned as its own process-group leader (`process_group(0)`), so
+/// its pid *is* its pgid; signalling the group reaches the unit's own children
+/// (a bash tool's long scan) as well as the unit, which a pid-only SIGTERM
+/// would orphan. Only call this for a group whose leader is still unreaped: a
+/// live or zombie leader keeps its pid, and so the pgid, reserved, whereas the
+/// number of a fully dead group could be recycled.
+pub fn terminate_group(pgid: u32) -> bool {
+    let Some(target) = group_target(pgid) else {
+        return false;
+    };
+    rustix::process::kill_process_group(target, rustix::process::Signal::TERM).is_ok()
+}
+
+/// Send SIGKILL to every process in group `pgid` (see [`terminate_group`]).
+/// The escalation for a group that outlived its SIGTERM grace.
+pub fn kill_group(pgid: u32) -> bool {
+    let Some(target) = group_target(pgid) else {
+        return false;
+    };
+    rustix::process::kill_process_group(target, rustix::process::Signal::KILL).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +121,29 @@ mod tests {
         assert!(!terminate_pid(std::process::id()));
         assert!(!terminate_pid(0));
         assert!(!terminate_pid(u32::MAX));
+    }
+
+    #[test]
+    fn group_signals_refuse_our_own_group_and_impossible_ids() {
+        let own_pgrp = rustix::process::getpgrp().as_raw_nonzero().get() as u32;
+        for f in [terminate_group, kill_group] {
+            assert!(!f(std::process::id()));
+            assert!(!f(own_pgrp), "never signal the coordinator's own group");
+            assert!(!f(0));
+            assert!(!f(u32::MAX));
+        }
+    }
+
+    #[test]
+    fn kill_group_reaches_a_unit_leader_in_its_own_group() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert!(kill_group(child.id()));
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
     }
 }

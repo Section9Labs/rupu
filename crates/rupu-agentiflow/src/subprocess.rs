@@ -8,7 +8,7 @@
 //! * mints the unit's run id up front (`run_<ULID>`) and passes it as
 //!   `--run-id`, so the handle is known before the unit starts;
 //! * retains the [`Child`] and its pid, so liveness is `try_wait` and
-//!   termination is SIGTERM-by-pid;
+//!   termination is a SIGTERM to the unit's process group;
 //! * reads started-evidence (a non-empty transcript) and the final outcome
 //!   (`final_turn_text`) from the unit's transcript, which the runner appends
 //!   incrementally.
@@ -21,6 +21,14 @@
 //! retained child's `try_wait` as the *only* terminal signal: it both reports
 //! the exit status and reaps the process. Dropping the launcher terminates
 //! and reaps every unit it still holds, so none is orphaned or left a zombie.
+//!
+//! # Process groups
+//!
+//! Each unit is spawned as its own process-group leader (`process_group(0)`),
+//! so its pid is its pgid. `rupu run`'s SIGTERM handler exits at once without
+//! waiting for the run, so the bash tool's own cleanup never fires; signalling
+//! only the unit's pid would leave an in-flight bash grandchild (a long scan)
+//! re-parented to init. Termination therefore signals the whole group.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -29,7 +37,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::proc::terminate_pid;
+use crate::proc::{kill_group, terminate_group};
 use crate::unit::{UnitError, UnitId, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus};
 
 /// How long `Drop` waits for SIGTERMed units to exit before it SIGKILLs them.
@@ -43,10 +51,13 @@ const DROP_GRACE: Duration = Duration::from_millis(1500);
 pub type ArgvBuilder = Box<dyn Fn(&UnitSpec, &str, &Path) -> Vec<OsString> + Send + Sync>;
 
 /// The real argv for one unit:
-/// `run <agent> --run-id <id> --mode bypass --prompt <p>
+/// `run <agent> --run-id <id> --mode bypass --prompt=<p>
 /// [--engagement-profile a,b] --fleet-run-dir <run_dir> --fleet-participant <p>`.
 ///
 /// `--mode bypass` because a unit has no tty to answer an approval prompt.
+/// The prompt is ONE `--prompt=<p>` argument, not `--prompt <p>`: clap reads a
+/// separate value that starts with `-` (`"- enumerate hosts"`, `"--foo"`) as a
+/// flag and rejects it, whereas the `=` form takes the value verbatim.
 /// `--engagement-profile` is omitted for an empty set so the unit takes the
 /// default `code` path; a non-empty set is comma-joined (the flag's
 /// delimiter), never dropped.
@@ -58,8 +69,7 @@ pub fn rupu_run_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsStr
         run_id.into(),
         "--mode".into(),
         "bypass".into(),
-        "--prompt".into(),
-        spec.prompt.clone().into(),
+        format!("--prompt={}", spec.prompt).into(),
     ];
     if !spec.engagement.is_empty() {
         argv.push("--engagement-profile".into());
@@ -76,7 +86,8 @@ pub fn rupu_run_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsStr
 struct Live {
     /// The retained child: `try_wait` is the liveness signal and reaps it.
     child: Child,
-    /// Cached at spawn (`Child::id`); the SIGTERM target.
+    /// Cached at spawn (`Child::id`). The unit leads its own process group, so
+    /// this is also its pgid: the target of group termination.
     pid: u32,
     /// The terminal status once observed, so a later `poll` is idempotent and
     /// never re-reads the transcript.
@@ -124,15 +135,37 @@ impl SubprocessUnitLauncher {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Where this unit's transcript is, if it exists yet. `rupu run` writes it
-    /// to the project's `.rupu/transcripts` when that directory exists in the
-    /// workspace and to `<global>/transcripts` otherwise; check both.
+    /// The transcripts directory a unit's `rupu run` resolves, mirroring
+    /// `rupu-cli`'s `paths::project_root_for` + `transcripts_dir`: the first
+    /// ancestor of the unit's cwd (the workspace, else ours) that has a `.rupu`
+    /// directory is the project root, and its `.rupu/transcripts` is used when
+    /// that directory exists; otherwise `<global>/transcripts`.
+    fn unit_transcripts_dir(&self) -> PathBuf {
+        let cwd = self
+            .workspace
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let project_root = cwd.and_then(|c| c.canonicalize().ok()).and_then(|c| {
+            c.ancestors()
+                .find(|d| d.join(".rupu").is_dir())
+                .map(Path::to_path_buf)
+        });
+        if let Some(root) = project_root {
+            let local = root.join(".rupu").join("transcripts");
+            if local.is_dir() {
+                return local;
+            }
+        }
+        self.global.join("transcripts")
+    }
+
+    /// Where this unit's transcript is, if it exists yet: the directory
+    /// `rupu run` resolves ([`Self::unit_transcripts_dir`]), then the global one.
     fn transcript_path(&self, id: &str) -> Option<PathBuf> {
         let name = format!("{id}.jsonl");
-        self.workspace
-            .iter()
-            .map(|w| w.join(".rupu").join("transcripts").join(&name))
-            .chain(std::iter::once(self.global.join("transcripts").join(&name)))
+        [self.unit_transcripts_dir(), self.global.join("transcripts")]
+            .into_iter()
+            .map(|dir| dir.join(&name))
             .find(|p| p.is_file())
     }
 
@@ -257,9 +290,12 @@ impl UnitLauncher for SubprocessUnitLauncher {
         }
         // A pid recorded for a child that has since exited may be recycled by
         // an unrelated process, so only a child `try_wait` still reports live
-        // is signalled.
+        // is signalled. A live (or unreaped) leader keeps its pid, and so its
+        // pgid, reserved: the group below cannot be a recycled one. The pid IS
+        // the pgid (`process_group(0)`), and signalling the group also reaches
+        // the unit's grandchildren, which a pid-only SIGTERM would orphan.
         if matches!(unit.child.try_wait(), Ok(None)) {
-            terminate_pid(unit.pid);
+            terminate_group(unit.pid);
         }
     }
 }
@@ -275,11 +311,12 @@ impl Drop for SubprocessUnitLauncher {
                 (u.done.is_none() && matches!(u.child.try_wait(), Ok(None))).then_some(u)
             })
             .collect();
-        // SIGTERM everything first so the units wind down concurrently...
+        // SIGTERM every group first so the units wind down concurrently...
         for unit in &running {
-            terminate_pid(unit.pid);
+            terminate_group(unit.pid);
         }
-        // ...then reap them against one shared deadline, SIGKILLing stragglers.
+        // ...then reap the leaders against one shared deadline, SIGKILLing the
+        // whole group of any straggler (`Child::kill` would hit only its pid).
         let deadline = Instant::now() + DROP_GRACE;
         while !running.is_empty() && Instant::now() < deadline {
             running.retain_mut(|u| matches!(u.child.try_wait(), Ok(None)));
@@ -288,7 +325,9 @@ impl Drop for SubprocessUnitLauncher {
             }
         }
         for unit in running {
-            let _ = unit.child.kill();
+            if !kill_group(unit.pid) {
+                let _ = unit.child.kill();
+            }
             let _ = unit.child.wait();
         }
     }
@@ -330,7 +369,10 @@ mod tests {
         assert_eq!(argv[1], "recon");
         assert_eq!(value_after(&argv, "--run-id"), Some("run_01ABC"));
         assert_eq!(value_after(&argv, "--mode"), Some("bypass"));
-        assert_eq!(value_after(&argv, "--prompt"), Some("scan the host"));
+        assert!(
+            argv.iter().any(|a| a == "--prompt=scan the host"),
+            "the prompt is one --prompt=<p> argument: {argv:?}"
+        );
         assert_eq!(
             value_after(&argv, "--engagement-profile"),
             Some("network,web")
@@ -340,6 +382,30 @@ mod tests {
             Some("/g/agentiflows/af_1")
         );
         assert_eq!(value_after(&argv, "--fleet-participant"), Some("recon#1"));
+    }
+
+    #[test]
+    fn a_prompt_starting_with_a_dash_is_one_attached_argument() {
+        // `--prompt - enumerate` / `--prompt --foo` make clap read the value as
+        // a flag (exit 2); `--prompt=<p>` takes it verbatim.
+        for prompt in ["- enumerate the hosts", "--foo", "-x"] {
+            let mut s = spec(&[]);
+            s.prompt = prompt.into();
+            let argv = strs(&rupu_run_argv(&s, "run_1", Path::new("/rd")));
+            let expected = format!("--prompt={prompt}");
+            assert!(
+                argv.contains(&expected),
+                "expected {expected:?} as a single arg in {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--prompt"),
+                "a bare --prompt would detach the value: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == prompt),
+                "the prompt must never stand alone as its own arg: {argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -396,15 +462,16 @@ mod tests {
     }
 
     /// A launcher that runs `/bin/sh -c <script>` instead of `rupu run`.
-    fn sh(global: &Path, script: &'static str) -> SubprocessUnitLauncher {
+    fn sh(global: &Path, script: &str) -> SubprocessUnitLauncher {
+        let script = script.to_string();
         SubprocessUnitLauncher::new("/bin/sh", global)
-            .with_argv(move |_, _, _| vec!["-c".into(), script.into()])
+            .with_argv(move |_, _, _| vec!["-c".into(), script.clone().into()])
     }
 
-    fn write_transcript(global: &Path, id: &UnitId, answer: Option<&str>) {
+    /// Write a transcript for `id` into `dir` (created if need be).
+    fn write_transcript_in(dir: &Path, id: &UnitId, answer: Option<&str>) {
         use rupu_transcript::{Event, JsonlWriter};
-        let dir = global.join("transcripts");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir).unwrap();
         let mut w = JsonlWriter::create(dir.join(format!("{}.jsonl", id.0))).unwrap();
         w.write(&Event::TurnStart { turn_idx: 0 }).unwrap();
         if let Some(text) = answer {
@@ -415,6 +482,10 @@ mod tests {
             .unwrap();
         }
         w.flush().unwrap();
+    }
+
+    fn write_transcript(global: &Path, id: &UnitId, answer: Option<&str>) {
+        write_transcript_in(&global.join("transcripts"), id, answer);
     }
 
     fn wait_terminal(l: &SubprocessUnitLauncher, id: &UnitId, dir: &Path) -> UnitStatus {
@@ -436,10 +507,57 @@ mod tests {
         l.lock().get(&id.0).expect("tracked unit").pid
     }
 
+    /// Wait for `path` to hold a pid (a script's `echo $! > path`).
+    fn read_pid_file(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "no pid written to {path:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for a process to be gone. A killed grandchild is re-parented to
+    /// init, which reaps it a moment later, so a brief zombie window is normal.
+    fn wait_gone(pid: u32, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_is_running(pid) {
+            assert!(Instant::now() < deadline, "{what} (pid {pid}) survived");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A launcher whose unit is `sh -c 'sleep 30 & echo $! > <file>; wait'`: a
+    /// leader with one in-flight grandchild, like `rupu run` mid bash-tool.
+    fn spawn_with_grandchild(
+        dir: &Path,
+    ) -> (
+        SubprocessUnitLauncher,
+        UnitId,
+        u32, /* grandchild pid */
+    ) {
+        let pidfile = dir.join("grandchild.pid");
+        let launcher = sh(
+            dir,
+            &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+        );
+        let id = launcher.spawn(&spec(&[]), dir).unwrap();
+        let grandchild = read_pid_file(&pidfile);
+        assert!(pid_is_running(grandchild));
+        (launcher, id, grandchild)
+    }
+
     #[test]
     fn lifecycle_pending_then_running_then_terminal_and_stays_terminal() {
         let dir = tempfile::tempdir().unwrap();
-        let launcher = sh(dir.path(), "sleep 0.3");
+        // Long enough that the child never exits on its own mid-test: every
+        // state below is driven explicitly, not raced against its natural exit.
+        let launcher = sh(dir.path(), "sleep 5");
         let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
         let pid = pid_of(&launcher, &id);
 
@@ -448,9 +566,25 @@ mod tests {
         assert!(pid_is_running(pid));
 
         // Started-evidence is a non-empty transcript.
-        write_transcript(dir.path(), &id, Some("all clear"));
+        write_transcript(dir.path(), &id, Some("partial"));
         assert_eq!(launcher.poll(&id, dir.path()), UnitStatus::Running);
 
+        launcher.terminate(&id);
+        let done = wait_terminal(&launcher, &id, dir.path());
+        assert!(matches!(done, UnitStatus::Failed(_)), "{done:?}");
+        // `try_wait` reaped it: asking again is still terminal, never an error.
+        assert_eq!(launcher.poll(&id, dir.path()), done);
+        assert_eq!(launcher.poll(&id, dir.path()), done);
+        assert!(!pid_is_running(pid), "reaped, not a zombie");
+    }
+
+    #[test]
+    fn a_clean_exit_with_an_answer_is_done_successful_and_stays_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = sh(dir.path(), "exit 0");
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        // Written before the first poll, so the outcome read cannot race it.
+        write_transcript(dir.path(), &id, Some("all clear"));
         let done = wait_terminal(&launcher, &id, dir.path());
         assert_eq!(
             done,
@@ -459,8 +593,6 @@ mod tests {
                 success: true,
             })
         );
-        // `try_wait` reaped it: asking again is still terminal, never an error.
-        assert_eq!(launcher.poll(&id, dir.path()), done);
         assert_eq!(launcher.poll(&id, dir.path()), done);
     }
 
@@ -554,6 +686,22 @@ mod tests {
     }
 
     #[test]
+    fn terminate_kills_the_whole_group_including_an_in_flight_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (launcher, id, grandchild) = spawn_with_grandchild(dir.path());
+        let leader = pid_of(&launcher, &id);
+
+        launcher.terminate(&id);
+
+        // The leader dies and is reaped...
+        let status = wait_terminal(&launcher, &id, dir.path());
+        assert!(matches!(status, UnitStatus::Failed(_)), "{status:?}");
+        assert!(!pid_is_running(leader));
+        // ...and so does the grandchild: the group died, not just the leader.
+        wait_gone(grandchild, "the unit's grandchild");
+    }
+
+    #[test]
     fn terminate_of_an_unknown_unit_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         sh(dir.path(), "true").terminate(&UnitId("run_nope".into()));
@@ -582,12 +730,94 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_launcher_also_kills_a_units_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (launcher, id, grandchild) = spawn_with_grandchild(dir.path());
+        let leader = pid_of(&launcher, &id);
+
+        drop(launcher);
+
+        assert!(!pid_is_running(leader), "leader left running or a zombie");
+        wait_gone(grandchild, "the unit's grandchild");
+    }
+
+    #[test]
+    fn drop_escalates_to_sigkill_on_the_group_when_sigterm_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("gc.pid");
+        // The leader AND its grandchild both ignore SIGTERM, so only the
+        // SIGKILL escalation (to the group) can end them.
+        let launcher = sh(
+            dir.path(),
+            &format!(
+                "trap '' TERM; (trap '' TERM; sleep 30) & echo $! > {}; while :; do sleep 1; done",
+                pidfile.display()
+            ),
+        );
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let grandchild = read_pid_file(&pidfile);
+        let leader = pid_of(&launcher, &id);
+
+        drop(launcher);
+
+        assert!(!pid_is_running(leader), "leader left running or a zombie");
+        wait_gone(grandchild, "the SIGTERM-ignoring grandchild");
+    }
+
+    #[test]
+    fn transcript_lookup_walks_workspace_ancestors_to_the_project_rupu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        // A project whose `.rupu/transcripts` exists; the workspace is a deep
+        // SUBDIR of it with no `.rupu` of its own — as in rupu-cli, the first
+        // ancestor with a `.rupu` is the project root.
+        let project = tmp.path().join("project");
+        let transcripts = project.join(".rupu").join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let workspace = project.join("sub").join("deep");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let launcher = sh(&global, "sleep 5").with_workspace(&workspace);
+        let id = launcher.spawn(&spec(&[]), tmp.path()).unwrap();
+        assert_eq!(launcher.poll(&id, tmp.path()), UnitStatus::Pending);
+
+        write_transcript_in(&transcripts, &id, Some("found it"));
+        assert_eq!(
+            launcher.poll(&id, tmp.path()),
+            UnitStatus::Running,
+            "the transcript under the ancestor project is started-evidence"
+        );
+        assert_eq!(launcher.final_text(&id.0).as_deref(), Some("found it"));
+    }
+
+    #[test]
+    fn transcript_lookup_uses_global_when_the_project_has_no_local_transcripts_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        // `.rupu` exists but `.rupu/transcripts` does not: rupu-cli falls back
+        // to `<global>/transcripts` rather than walking further up.
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".rupu")).unwrap();
+        let workspace = project.join("sub");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let launcher = sh(&global, "sleep 5").with_workspace(&workspace);
+        let id = launcher.spawn(&spec(&[]), tmp.path()).unwrap();
+        write_transcript(&global, &id, Some("global one"));
+        assert_eq!(launcher.poll(&id, tmp.path()), UnitStatus::Running);
+        assert_eq!(launcher.final_text(&id.0).as_deref(), Some("global one"));
+    }
+
+    #[test]
     fn units_run_in_their_own_process_group_with_rupu_home_pointing_at_global() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("home.txt");
-        let script: &'static str =
-            Box::leak(format!("echo \"$RUPU_HOME\" > {}; sleep 5", out.display()).into_boxed_str());
-        let launcher = sh(dir.path(), script);
+        let launcher = sh(
+            dir.path(),
+            &format!("echo \"$RUPU_HOME\" > {}; sleep 5", out.display()),
+        );
         let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
         let pid = pid_of(&launcher, &id);
 
