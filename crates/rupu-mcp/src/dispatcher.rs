@@ -134,6 +134,25 @@ impl ToolDispatcher {
                     .map(|id| format!("finding_id: {id}"))
                     .map_err(McpError::Tool)
             }
+            "findings.query" | "findings.tag" => {
+                let ctx = self.findings.clone().ok_or_else(|| {
+                    McpError::Tool(format!(
+                        "{name} is unavailable: this MCP server was started without run \
+                         context, so there is no workspace whose findings to use"
+                    ))
+                })?;
+                let is_query = name == "findings.query";
+                tokio::task::spawn_blocking(move || {
+                    if is_query {
+                        tools::findings::dispatch_query(&ctx, args)
+                    } else {
+                        tools::findings::dispatch_tag(&ctx, args)
+                    }
+                })
+                .await
+                .map_err(|e| McpError::Tool(format!("{name} did not complete: {e}")))?
+                .map_err(McpError::Tool)
+            }
             other => Err(McpError::UnknownTool(other.to_string())),
         }
     }

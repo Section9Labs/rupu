@@ -1,5 +1,6 @@
-//! `rupu findings` — the finding report contract, report exports, and the
-//! one-time import of reports written before the full profile.
+//! `rupu findings` — the finding report contract, report exports, the
+//! one-time import of reports written before the full profile, and finding
+//! tags (list/tag/tags).
 //! Thin: the schema comes from `rupu_coverage::report`, an export is
 //! collected, selected and rendered by `rupu_cp::api::findings` /
 //! `rupu_findings_report`, and an import is parsed by
@@ -46,6 +47,20 @@ pub enum Action {
     /// at all; a finding that already has a report is left alone; each
     /// changed ledger is backed up first (`findings.jsonl.pre-import-<time>`).
     Import(ImportArgs),
+    /// List findings, filtered by tag, severity, project or run.
+    List(ListArgs),
+    /// Add or remove tags on findings.
+    ///
+    /// Tags are free-form: lowercase a-z, 0-9 and `. _ : / -`, starting with
+    /// a letter or digit, at most 64 characters (`Needs-POC` is stored as
+    /// `needs-poc`). Give `-` as the only id to read ids from stdin, one per
+    /// line: `rupu findings list --tag class:sqli --ids-only | rupu findings
+    /// tag - --add needs-poc`. Findings in different projects are changed
+    /// project by project; an unknown id fails the command after the rest
+    /// are changed.
+    Tag(TagArgs),
+    /// List the tags in use, with how many findings carry each.
+    Tags(TagsArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -110,6 +125,64 @@ pub struct ImportArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct ScopeArgs {
+    /// Only this project: a workspace id, or the path of its checkout.
+    #[arg(long, value_name = "WS_ID|PATH", value_parser = non_blank)]
+    project: Option<String>,
+    /// Only the findings a run (and its sub-runs) declared.
+    #[arg(long, value_name = "RUN_ID", value_parser = non_blank)]
+    run: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ListArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+    /// Only findings carrying this tag (repeatable: all of them, or any with
+    /// --any-tag).
+    #[arg(long = "tag", value_name = "TAG", value_parser = tag_arg)]
+    tags: Vec<rupu_coverage::Tag>,
+    /// With several --tag: findings carrying any of them.
+    #[arg(long, requires = "tags")]
+    any_tag: bool,
+    /// Only findings with no tags.
+    #[arg(long, conflicts_with = "tags")]
+    untagged: bool,
+    /// Only this severity and worse.
+    #[arg(long, value_name = "SEVERITY", value_parser = ["critical", "high", "medium", "low", "info"])]
+    severity: Option<String>,
+    /// Show at most N findings; how many were left out goes to stderr.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    limit: Option<u64>,
+    /// Print only the finding ids, one per line.
+    #[arg(long)]
+    ids_only: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TagArgs {
+    /// Finding ids, or `-` alone to read them from stdin.
+    #[arg(required = true, value_name = "FINDING_ID")]
+    ids: Vec<String>,
+    /// Tag to add (repeatable).
+    #[arg(long = "add", value_name = "TAG", value_parser = tag_arg)]
+    add: Vec<rupu_coverage::Tag>,
+    /// Tag to remove (repeatable).
+    #[arg(long = "remove", value_name = "TAG", value_parser = tag_arg)]
+    remove: Vec<rupu_coverage::Tag>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TagsArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+}
+
+fn tag_arg(raw: &str) -> Result<rupu_coverage::Tag, String> {
+    rupu_coverage::Tag::parse(raw).map_err(|e| e.to_string())
+}
+
 /// The document formats `--to` accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ExportFormat {
@@ -164,20 +237,256 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Schema { .. } => "findings schema",
         Action::Export(_) => "findings export",
         Action::Import(_) => "findings import",
+        Action::List(_) => "findings list",
+        Action::Tag(_) => "findings tag",
+        Action::Tags(_) => "findings tags",
     };
-    crate::output::formats::ensure_supported(command_name, format, report::TABLE_ONLY)
+    let supported = match action {
+        Action::List(_) | Action::Tag(_) | Action::Tags(_) => report::TABLE_JSON,
+        _ => report::TABLE_ONLY,
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
+    let json = matches!(format, Some(OutputFormat::Json));
     let result = match action {
         Action::Schema { advertised } => schema_cmd(advertised),
         Action::Export(args) => export_cmd(&args),
         Action::Import(args) => import_cmd(&args),
+        Action::List(args) => list_cmd(&args, json),
+        Action::Tag(args) => tag_cmd(&args, json),
+        Action::Tags(args) => tags_cmd(&args, json),
     };
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
     }
+}
+
+/// Every finding the scope selects (tags folded), and the run-id set a
+/// `--run` resolves to (the run plus its sub-runs).
+fn scoped_findings(
+    scope: &ScopeArgs,
+) -> anyhow::Result<(
+    Vec<cp_findings::FindingOut>,
+    Option<std::collections::HashSet<String>>,
+)> {
+    let global = crate::paths::global_dir()?;
+    let mut all = cp_findings::collect_all_findings(&global);
+    if let Some(project) = &scope.project {
+        let ws = cp_findings::resolve_project(&global, project).map_err(anyhow::Error::msg)?;
+        all.retain(|f| f.ws_id == ws);
+    }
+    let run_ids = scope
+        .run
+        .as_deref()
+        .map(|r| cp_findings::resolve_run_scope(&RunStore::new(global.join("runs")), r));
+    Ok((all, run_ids))
+}
+
+#[derive(serde::Serialize)]
+struct ListRow {
+    #[serde(flatten)]
+    row: rupu_coverage::FindingRow,
+    ws_id: String,
+    project: String,
+}
+
+fn tag_list(tags: &[rupu_coverage::Tag]) -> String {
+    if tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        tags.iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn list_cmd(args: &ListArgs, json: bool) -> anyhow::Result<()> {
+    use rupu_coverage::{FindingQuery, TagMode};
+    let (all, run_ids) = scoped_findings(&args.scope)?;
+    let q = FindingQuery {
+        tags: args.tags.clone(),
+        tag_mode: if args.any_tag {
+            TagMode::Any
+        } else {
+            TagMode::All
+        },
+        untagged: args.untagged,
+        min_severity: args
+            .severity
+            .as_deref()
+            .and_then(cp_findings::parse_min_severity),
+        run_ids,
+        ..Default::default()
+    };
+    let selected = rupu_coverage::ledger::query::select(&all, |f| &f.record, &q)?;
+    let total = selected.len();
+    let shown: Vec<&cp_findings::FindingOut> = match args.limit {
+        Some(n) => selected.into_iter().take(n as usize).collect(),
+        None => selected,
+    };
+    if shown.len() < total {
+        eprintln!("showing {} of {total} findings", shown.len());
+    }
+    if args.ids_only {
+        for f in &shown {
+            println!("{}", f.record.id);
+        }
+        return Ok(());
+    }
+    let rows: Vec<ListRow> = shown
+        .iter()
+        .map(|f| ListRow {
+            row: rupu_coverage::FindingRow::from(&f.record),
+            ws_id: f.ws_id.clone(),
+            project: f.project.clone(),
+        })
+        .collect();
+    if json {
+        return crate::output::formats::print_json(&rows);
+    }
+    if rows.is_empty() {
+        println!("no findings match");
+        return Ok(());
+    }
+    let mut t = crate::output::tables::new_table();
+    t.set_header(vec![
+        "ID", "SEVERITY", "TITLE", "LOCATION", "TAGS", "PROJECT",
+    ]);
+    for r in &rows {
+        let mut title = r.row.title.clone();
+        if title.chars().count() > 60 {
+            title = title.chars().take(59).collect::<String>() + "…";
+        }
+        t.add_row(vec![
+            r.row.id.clone(),
+            r.row.severity.as_str().to_string(),
+            title,
+            r.row.location.clone().unwrap_or_default(),
+            if r.row.tags.is_empty() {
+                String::new()
+            } else {
+                tag_list(&r.row.tags)
+            },
+            r.project.clone(),
+        ]);
+    }
+    println!("{t}");
+    Ok(())
+}
+
+/// The ids to change: the arguments, or stdin's lines when `-` is the only one.
+fn finding_ids(args: &[String], stdin: impl std::io::BufRead) -> anyhow::Result<Vec<String>> {
+    if args.len() == 1 && args[0] == "-" {
+        let mut ids = Vec::new();
+        for line in stdin.lines() {
+            let line = line?;
+            let id = line.trim();
+            if !id.is_empty() {
+                ids.push(id.to_string());
+            }
+        }
+        if ids.is_empty() {
+            anyhow::bail!("no finding ids on stdin");
+        }
+        return Ok(ids);
+    }
+    if args.iter().any(|a| a == "-") {
+        anyhow::bail!("`-` (read ids from stdin) must be the only id");
+    }
+    Ok(args.to_vec())
+}
+
+fn tag_cmd(args: &TagArgs, json: bool) -> anyhow::Result<()> {
+    let change = rupu_coverage::TagChange {
+        finding_ids: finding_ids(&args.ids, std::io::stdin().lock())?,
+        add: args.add.clone(),
+        remove: args.remove.clone(),
+    };
+    let global = crate::paths::global_dir()?;
+    let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli);
+    let result = cp_findings::tag_findings_across(&global, &change, &by)?;
+    if json {
+        crate::output::formats::print_json(&result)?;
+    } else {
+        for w in &result.workspaces {
+            if let Some(e) = &w.error {
+                println!("{}: not changed: {e}", w.ws_id);
+                continue;
+            }
+            for o in &w.outcomes {
+                if o.changed() {
+                    println!(
+                        "{}: {} → {}",
+                        o.finding_id,
+                        tag_list(&o.before),
+                        tag_list(&o.after)
+                    );
+                } else {
+                    println!("{}: {} (unchanged)", o.finding_id, tag_list(&o.after));
+                }
+            }
+        }
+    }
+    let failed: Vec<&str> = result
+        .workspaces
+        .iter()
+        .filter(|w| w.error.is_some())
+        .map(|w| w.ws_id.as_str())
+        .collect();
+    if result.unknown.is_empty() && failed.is_empty() {
+        return Ok(());
+    }
+    let mut why = Vec::new();
+    if !result.unknown.is_empty() {
+        why.push(format!(
+            "unknown finding id(s): {}",
+            result.unknown.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        why.push(format!("nothing changed in {}", failed.join(", ")));
+    }
+    let partial = result
+        .workspaces
+        .iter()
+        .any(|w| w.error.is_none() && w.outcomes.iter().any(|o| o.changed()));
+    anyhow::bail!(
+        "{}{}",
+        why.join("; "),
+        if partial {
+            " (the other findings were changed)"
+        } else {
+            ""
+        }
+    )
+}
+
+fn tags_cmd(args: &TagsArgs, json: bool) -> anyhow::Result<()> {
+    let (all, run_ids) = scoped_findings(&args.scope)?;
+    let q = rupu_coverage::FindingQuery {
+        run_ids,
+        ..Default::default()
+    };
+    let selected = rupu_coverage::ledger::query::select(&all, |f| &f.record, &q)?;
+    let counts = rupu_coverage::tags_in_use(selected.iter().map(|f| &f.record));
+    if json {
+        return crate::output::formats::print_json(&counts);
+    }
+    if counts.is_empty() {
+        println!("no tags in use");
+        return Ok(());
+    }
+    let mut t = crate::output::tables::new_table();
+    t.set_header(vec!["TAG", "FINDINGS"]);
+    for c in &counts {
+        t.add_row(vec![c.tag.as_str().to_string(), c.count.to_string()]);
+    }
+    println!("{t}");
+    Ok(())
 }
 
 fn schema_cmd(advertised: bool) -> anyhow::Result<()> {
@@ -719,7 +1028,7 @@ mod tests {
             .chain(args.iter().copied());
         match Harness::try_parse_from(argv).unwrap().action {
             Action::Export(a) => a,
-            Action::Schema { .. } | Action::Import(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 

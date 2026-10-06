@@ -685,6 +685,7 @@ mod tests {
             }),
             report: None,
             asset: None,
+            tags: Vec::new(),
         };
         let attribution = Attribution {
             run_id: "r".into(),

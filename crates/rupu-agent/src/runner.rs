@@ -1932,6 +1932,37 @@ async fn run_agent_inner(
         }
     }
 
+    // Finding tags (spec 2026-10-06-rupu-finding-tags-design.md): explicit
+    // `tools:` grants like `report_finding`, registered with or without the
+    // coverage harness. Both act on this workspace's findings only — tags
+    // live in one workspace-wide log — and `tag_findings` is allowed in
+    // readonly mode, as `report_finding` is: it annotates the ledger and
+    // never touches the workspace's files.
+    let granted = |name: &str| {
+        opts.agent_tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == name))
+    };
+    let grant_query = granted("query_findings");
+    let grant_tag = granted("tag_findings");
+    if grant_query {
+        registry.insert(
+            "query_findings",
+            std::sync::Arc::new(coverage_tools::QueryFindingsTool::new(
+                opts.workspace_path.clone(),
+            )),
+        );
+    }
+    if grant_tag {
+        let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
+        let log = rupu_coverage::TagLog::for_workspace(&opts.workspace_path)
+            .with_run_stream(run_stream_for(&opts.tool_context, scope));
+        registry.insert(
+            "tag_findings",
+            std::sync::Arc::new(coverage_tools::TagFindingsTool::new(log)),
+        );
+    }
+
     // MCP server: spin up before the loop if we have a Registry.
     let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)> =
         if let Some(scm_registry) = opts.mcp_registry.clone() {

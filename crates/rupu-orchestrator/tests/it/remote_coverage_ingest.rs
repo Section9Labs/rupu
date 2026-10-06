@@ -59,6 +59,7 @@ fn stream_with_finding(id: &str) -> Vec<u8> {
         declared_at: chrono::Utc::now(),
         profile: rupu_coverage::FindingProfile::Summary,
         report: None,
+        tags: Vec::new(),
     };
     let mut out = String::new();
     for line in [

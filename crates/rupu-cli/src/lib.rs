@@ -443,7 +443,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
-        Cmd::Findings { action } => cmd::findings::handle(action).await,
+        Cmd::Findings { action } => cmd::findings::handle(action, cli.format).await,
         Cmd::Cron { action } => {
             cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }

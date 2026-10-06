@@ -13,7 +13,9 @@ use axum::{
 use rupu_coverage::report::{
     raster_image_type, summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
 };
-use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
+use rupu_coverage::{
+    discover_targets, read_declared_findings, CoveragePaths, FindingRecord, Severity,
+};
 use rupu_findings_report::model::{ExportFinding, ExportInput, ReportMeta};
 use rupu_findings_report::number::{
     assign_numbers, filename, fit_file_name, is_valid_prefix, number_map, sanitize_title,
@@ -304,15 +306,33 @@ fn each_ledger(
                 continue;
             }
         };
+        // The tag log is workspace-wide: read it once here, not once per
+        // target (`read_findings` would re-read it for every target, on
+        // page-polled paths). Same tolerance as `read_findings`: an
+        // unreadable log is warned about and findings keep declared tags.
+        let tag_log = rupu_coverage::TagLog::for_workspace(wp);
+        let tag_events = match rupu_coverage::read_tag_events(&tag_log) {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    ws_id = %w.id,
+                    path = %tag_log.path.display(),
+                    error = %e,
+                    "cannot read the finding-tag log; showing declared tags only"
+                );
+                Vec::new()
+            }
+        };
         for t in targets {
             let paths = CoveragePaths::new(wp, &t.target_id);
-            let records = match read_findings(&paths) {
+            let mut records = match read_declared_findings(&paths) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(ws_id = %w.id, target_id = %t.target_id, error = %e, "failed to read findings; skipping target");
                     continue;
                 }
             };
+            rupu_coverage::fold_tags(&mut records, &tag_events);
             f(w, &t.target_id, paths, records);
         }
     }
@@ -380,6 +400,89 @@ pub fn finding_ledgers(global_dir: &std::path::Path) -> HashMap<String, Vec<Cove
         }
     });
     out
+}
+
+/// One workspace's part of a cross-workspace tag change.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTagResult {
+    pub ws_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<rupu_coverage::TagOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What a tag change did across the registered workspaces. Each workspace's
+/// batch is atomic; the whole is not.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TagAcrossResult {
+    pub workspaces: Vec<WorkspaceTagResult>,
+    /// Ids no registered workspace holds.
+    pub unknown: Vec<String>,
+}
+
+/// Apply `change` to findings wherever they live: ids are grouped by the
+/// registered workspace holding them and `rupu_coverage::apply` runs once
+/// per workspace (spec "Batches that span workspaces"). An id found in two
+/// distinct workspace paths is tagged in both. Used by `rupu findings tag`
+/// and, in Plan 2, `POST /api/findings/tags`.
+pub fn tag_findings_across(
+    global_dir: &std::path::Path,
+    change: &rupu_coverage::TagChange,
+    by: &rupu_coverage::TagActor,
+) -> Result<TagAcrossResult, rupu_coverage::TagError> {
+    change.check()?;
+    // finding id → each (ws_id, workspace path) holding it, once per path.
+    let mut homes: HashMap<String, Vec<(String, std::path::PathBuf)>> = HashMap::new();
+    each_ledger(global_dir, |w, _, _, records| {
+        let path = std::path::PathBuf::from(&w.path);
+        for r in records {
+            let entry = homes.entry(r.id).or_default();
+            if !entry.iter().any(|(_, p)| *p == path) {
+                entry.push((w.id.clone(), path.clone()));
+            }
+        }
+    });
+    let mut out = TagAcrossResult::default();
+    let mut by_ws: std::collections::BTreeMap<(String, std::path::PathBuf), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for id in &change.finding_ids {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        match homes.get(id) {
+            Some(hs) => {
+                for h in hs {
+                    by_ws.entry(h.clone()).or_default().push(id.to_string());
+                }
+            }
+            None if !out.unknown.iter().any(|u| u == id) => out.unknown.push(id.to_string()),
+            None => {}
+        }
+    }
+    for ((ws_id, path), ids) in by_ws {
+        let one = rupu_coverage::TagChange {
+            finding_ids: ids,
+            add: change.add.clone(),
+            remove: change.remove.clone(),
+        };
+        let log = rupu_coverage::TagLog::for_workspace(&path);
+        out.workspaces
+            .push(match rupu_coverage::apply(&log, &one, by) {
+                Ok(outcomes) => WorkspaceTagResult {
+                    ws_id,
+                    outcomes,
+                    error: None,
+                },
+                Err(e) => WorkspaceTagResult {
+                    ws_id,
+                    outcomes: vec![],
+                    error: Some(e.to_string()),
+                },
+            });
+    }
+    Ok(out)
 }
 
 /// The set of run ids a finding may be attributed to, for a Findings-tab query
@@ -1731,6 +1834,7 @@ mod tests {
                 declared_at: at(declared_at),
                 profile: rupu_coverage::FindingProfile::Summary,
                 report: None,
+                tags: Vec::new(),
             },
         }
     }
@@ -2104,6 +2208,7 @@ mod tests {
             declared_at: at("2026-01-01T00:00:00Z"),
             profile: rupu_coverage::FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         };
         let mut without_loc = with_loc.clone();
         without_loc.id = "fnd_no_loc".to_string();

@@ -48,6 +48,7 @@ fn summary_record(id: &str) -> FindingRecord {
         declared_at: "2026-09-29T00:00:00Z".parse().unwrap(),
         profile: FindingProfile::Summary,
         report: None,
+        tags: Vec::new(),
     }
 }
 

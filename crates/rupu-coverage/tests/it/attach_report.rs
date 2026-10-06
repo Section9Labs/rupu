@@ -43,6 +43,7 @@ fn seed_summary(paths: &CoveragePaths) -> String {
         }),
         report: None,
         asset: None,
+        tags: Vec::new(),
     };
     let opts = FindingWriteOptions::default().with_profile(FindingProfile::Summary);
     report_finding(paths, attribution(), input, &opts)

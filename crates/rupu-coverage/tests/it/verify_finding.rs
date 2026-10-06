@@ -49,6 +49,7 @@ fn seed_full(paths: &CoveragePaths, run_id: &str) -> String {
         evidence: None,
         report: Some(report()),
         asset: None,
+        tags: Vec::new(),
     };
     let opts = FindingWriteOptions::default().with_profile(FindingProfile::Full);
     report_finding(paths, attribution(run_id), input, &opts)
@@ -73,6 +74,7 @@ fn seed_summary(paths: &CoveragePaths, run_id: &str) -> String {
         }),
         report: None,
         asset: None,
+        tags: Vec::new(),
     };
     let opts = FindingWriteOptions::default().with_profile(FindingProfile::Summary);
     report_finding(paths, attribution(run_id), input, &opts)

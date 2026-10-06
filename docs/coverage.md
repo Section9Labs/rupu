@@ -27,7 +27,10 @@ variance: diff two runs, and replay a run to compare it against the original.
 ## How it works
 
 Coverage data for a *target* lives under `<workspace>/.rupu/coverage/<target_id>/`
-as append-only JSONL plus a catalog snapshot. The one exception is `rupu findings
+as append-only JSONL plus a catalog snapshot. Finding tags are the workspace-level
+exception: their log sits one level up, in `<workspace>/.rupu/coverage/` itself,
+because it spans every target (see [Tagging findings](#tagging-findings)). The other
+exception is `rupu findings
 import`, the one-time migration of older reports: every real import that attaches
 anything replaces `findings.jsonl`, leaving a backup of it beside the ledger each
 time (see [Importing reports](#importing-reports-written-before-the-full-profile)).
@@ -41,6 +44,14 @@ time (see [Importing reports](#importing-reports-written-before-the-full-profile
 | `runs.jsonl` | one manifest per run (its defining inputs, for replay) |
 | `findings.jsonl.lock` | empty; the lock every writer of `findings.jsonl` takes |
 | `findings.jsonl.pre-import-<UTC time>` | a copy of `findings.jsonl` from before a `rupu findings import` replaced it |
+
+Workspace-level files, in `<workspace>/.rupu/coverage/` (not under a `<target_id>/`
+directory):
+
+| File | Contents |
+|------|----------|
+| `finding_tags.jsonl` | every tag add/remove event for the workspace's findings, across all targets |
+| `finding_tags.jsonl.lock` | empty; the lock every writer of `finding_tags.jsonl` takes |
 
 `<target_id>` is derived deterministically from `(workspace, scope_name)`, so the
 same agent against the same repo accumulates into one target across runs, while
@@ -107,6 +118,15 @@ list them in the agent's `tools:`):
 | `coverage_remaining` | list in-scope files still lacking an assertion |
 | `coverage_status` | summary of assessed-vs-gap progress |
 | `coverage_concerns_search` / `coverage_concerns_detail` | search / fetch full bodies for index-mode catalogs |
+
+Two more tools are **not** injected: grant them explicitly in the agent's
+`tools:` (like `report_finding` outside a `concerns:` agent). See
+[Who can tag](#who-can-tag).
+
+| Tool | Purpose |
+|------|---------|
+| `query_findings` | list the workspace's findings, filtered by tag, severity, concern or file; returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
+| `tag_findings` | add or remove tags on one or many findings; returns each finding's tags before and after (explicit `tools:` grant) |
 
 ## Finding reports
 
@@ -798,6 +818,126 @@ rupu older than the import (a session worker, `cp serve`). Stop those before
 importing. The import also holds the lock while it copies artifacts, so an agent
 recording a finding on the same target waits until it finishes: run it when no
 agents are recording.
+
+## Tagging findings
+
+A finding can carry free-form tags (`needs-poc`, `class:sqli`, `status:triaged`)
+that agents, workflow steps and operators use to sort, filter and queue
+findings. Tags are not part of the finding's report and never change its
+severity or its id.
+
+### Syntax
+
+A tag is trimmed and lowercased, then checked: only `a-z`, `0-9` and
+`. _ : / -` are allowed, the first character must be a letter or digit, and it
+is at most 64 characters long. So `Needs-POC` is stored as `needs-poc`. A tag
+that fails the check is rejected with an error naming it; it is never rewritten
+into a valid one. `namespace:value` (`class:sqli`, `status:triaged`) is a
+convention for grouping, not something rupu interprets.
+
+A finding has at most 32 tags. A change that would take a finding past 32 is
+refused. A finding already over the cap (two remote units' tags can add up past
+it when they are ingested) can still lose tags or swap one for another, just
+not gain any.
+
+### Who can tag
+
+- **Agents.** `report_finding` takes an optional `tags` array, so a finding is
+  tagged as it is declared. Two more tools are explicit `tools:` grants, like
+  `report_finding` (an agent without the grant is not offered them):
+
+  ```yaml
+  tools: [read_file, query_findings, tag_findings]
+  ```
+
+  `query_findings` lists the agent's own workspace's findings, filtered by tag,
+  severity, concern or file. It returns `{rows, next_cursor, total,
+  tags_in_use}`: one page of slim rows, a cursor for the next, the number of
+  matches, and every tag already used in the workspace with its count (so an
+  agent reuses a tag instead of inventing a near-duplicate). `limit` defaults
+  to 50 and is at most 500. `tag_findings` adds or removes tags on one or many
+  findings and returns each finding's tags before and after. Both work only on
+  the agent's own workspace, and `tag_findings` is allowed in `readonly` mode:
+  it annotates the ledger and never touches the workspace's files.
+- **Workflow `action:` steps.** The MCP catalog has `findings.query` and
+  `findings.tag` (same inputs and results as the agent tools), and
+  `findings.record` accepts `tags`:
+
+  ```yaml
+  - id: mark
+    action: findings.tag
+    with: { finding_ids: ["fnd_01J…"], add: ["needs-poc"] }
+  ```
+
+- **Operators**, through `rupu findings` (below).
+
+### Where tags live
+
+Tags a finding was declared with are on the finding record in its target's
+`findings.jsonl`. Every later add or remove is an event in one file per
+workspace, `<workspace>/.rupu/coverage/finding_tags.jsonl`: workspace-wide
+(finding ids are globally unique, so no per-target routing is needed),
+append-only, with its own `.lock`. A finding's effective tags are its declared
+tags with the events applied in file order, and every reader (agent tools, MCP,
+CLI) folds on read. Each event records who made it: the agent's attribution
+(run, agent, model) or an operator (`$USER`, and whether through the CLI or the
+control plane). A change that alters nothing (adding a tag the finding has)
+writes no event. A batch with an unknown finding id or a finding that would pass
+the cap is rejected whole by the agent tools and MCP; `rupu findings tag` is
+atomic per workspace (a batch that spans workspaces applies to each independently,
+so the others keep their changes when one is refused).
+
+### CLI
+
+```
+rupu findings list [--project WS_ID|PATH] [--run RUN_ID] [--tag TAG]… [--any-tag]
+                   [--untagged] [--severity SEV] [--limit N] [--ids-only]
+rupu findings tag <ID>… [--add TAG]… [--remove TAG]…
+rupu findings tags [--project WS_ID|PATH] [--run RUN_ID]
+```
+
+`list` spans every project; `--project` and `--run` narrow it. Several `--tag`
+flags match findings that carry all of them, or any of them with `--any-tag`;
+`--untagged` selects findings with none. `--severity` keeps that severity and
+worse. `--limit N` shows the first N, and says "showing N of M findings" on
+stderr when it left some out. `--ids-only` prints bare ids, one per line.
+`tags` lists the tags in use with how many findings carry each.
+
+```bash
+rupu findings tag fnd_01J… --add needs-poc --add class:sqli
+rupu findings list --tag class:sqli --tag class:xss --any-tag --severity high
+rupu findings list --untagged --ids-only
+rupu findings tags
+
+# Tag everything matching a query: a lone `-` reads ids from stdin
+rupu findings list --tag class:sqli --ids-only | rupu findings tag - --add needs-poc
+
+rupu --format json findings list --tag needs-poc
+```
+
+`tag` changes findings across projects, project by project. An unknown id, or a
+workspace that could not be changed (a finding past the cap, an unwritable log),
+makes the command exit non-zero after the other workspaces have kept their
+changes; its output says which were not changed. `--format json` works with all
+three commands (`--format table` is the default).
+
+### Remote units
+
+A placed unit (`host:` / `distribute:`) tags findings in its own workspace.
+Those changes travel to the coordinator in the run's coverage stream, as `tags`
+lines next to the `findings` lines, and `ingest_unit_stream` appends them to
+the coordinator workspace's tag log (a replayed event is dropped as a
+duplicate), so they reach the coordinator exactly as the unit's findings do.
+
+### Limits
+
+- Tags belong to a finding id. A vulnerability an agent reports again is a new
+  finding and starts with no tags.
+- Tagging a finding that exists only in a remote host's own ledgers, and was
+  never ingested into the coordinator, is not supported.
+- The control plane (the findings table, filter, bulk tagging and the report
+  page's editor, with their HTTP endpoints) is a later plan. Today tags are
+  read and written through the agent tools, MCP and `rupu findings`.
 
 ## CLI
 
