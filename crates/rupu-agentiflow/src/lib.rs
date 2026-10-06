@@ -12,8 +12,11 @@ mod error;
 mod goal;
 mod lead;
 mod operator;
+mod proc;
 mod run;
+mod supervisor;
 mod tools;
+mod unit;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use collectors::{lead_collectors, DirectiveCollector, MailboxCollector};
@@ -30,8 +33,13 @@ pub use error::AgentiflowError;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
 pub use lead::{render_round_prompt, LeadConfig, ProviderFactory, RunAgentLeadDriver};
 pub use operator::{OperatorMessage, OperatorQueue};
+pub use proc::{pid_is_running, terminate_pid};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
+pub use supervisor::FleetSupervisor;
 pub use tools::{fleet_tools, FleetToolCtx};
+pub use unit::{
+    MockUnitLauncher, UnitError, UnitId, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
+};

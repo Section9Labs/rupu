@@ -21,6 +21,9 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 ulid = { workspace = true }
+# kill(2) wrappers for unit liveness/termination (src/proc.rs). The workspace
+# entry already enables `process`; stated here so the need is local.
+rustix = { workspace = true, features = ["process"] }
 
 # In-workspace crates the run_agent-backed lead driver sits on. These are
 # path deps (not [workspace.dependencies] entries), matching how rupu-runtime,
