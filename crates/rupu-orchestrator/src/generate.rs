@@ -194,6 +194,16 @@ pub async fn generate_definition(
     .await
     .map_err(|_| GenerateError::NoCredentials)?;
 
+    generate_definition_with_provider(req, provider.as_mut()).await
+}
+
+/// Generate a validated definition using an already-built provider,
+/// repairing up to [`MAX_ATTEMPTS`]. The caller owns credential/provider
+/// construction (see [`generate_definition`] for the config-aware shell).
+pub async fn generate_definition_with_provider(
+    req: &GenerateRequest,
+    provider: &mut dyn rupu_providers::LlmProvider,
+) -> Result<GenerateOutcome, GenerateError> {
     let system = build_system_prompt(req.kind, &req.available_agents);
     let mut messages = vec![Message::user(&format!(
         "Create a rupu {} from this description:\n\n{}",
@@ -290,6 +300,31 @@ mod tests {
     static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     const VALID_AGENT_MD: &str = "---\nname: gen-agent\ndescription: a test agent\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou are a helpful test agent.\n";
+
+    /// Drives the provider-taking core directly: no resolver, no env-var
+    /// seam, so no `ENV_LOCK`/`#[serial]` needed.
+    #[tokio::test]
+    async fn with_provider_returns_validated_workflow_on_first_try() {
+        let wf = "name: gen\nsteps:\n  - id: a\n    agent: writer\n    prompt: hi\n";
+        let mut p = rupu_agent::MockProvider::new(vec![rupu_agent::ScriptedTurn::AssistantText {
+            text: wf.to_string(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let req = GenerateRequest {
+            kind: GenKind::Workflow,
+            description: "x".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            available_agents: vec!["writer".into()],
+        };
+        let out = generate_definition_with_provider(&req, &mut p)
+            .await
+            .unwrap();
+        assert_eq!(out.attempts, 1);
+        assert!(out.content.contains("agent: writer"));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
