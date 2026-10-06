@@ -73,15 +73,25 @@ impl Transport {
 
 type SharedInner = (reqwest::Client, RecordingResolver);
 
-fn shared_pool() -> &'static Mutex<HashMap<Transport, SharedInner>> {
-    static POOL: OnceLock<Mutex<HashMap<Transport, SharedInner>>> = OnceLock::new();
+/// One pool per transport AND per tokio runtime (`None`: built outside any).
+/// A pooled connection's dispatch task lives on the runtime that opened it:
+/// handed to a caller on another runtime, its request waits on a task
+/// nothing drives, and fails with hyper's `DispatchGone` ("runtime dropped
+/// the dispatch task") once that runtime shuts down. A process that does its
+/// HTTP on one runtime — every rupu binary — still has one pool per
+/// transport; each `#[tokio::test]` gets its own.
+type PoolKey = (Transport, Option<tokio::runtime::Id>);
+
+fn shared_pool() -> &'static Mutex<HashMap<PoolKey, SharedInner>> {
+    static POOL: OnceLock<Mutex<HashMap<PoolKey, SharedInner>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Like [`client_with`], but the underlying `reqwest::Client` — and so its
-/// connection pool — is shared process-wide per [`Transport`]. Only the
-/// netflow middleware (`ctx` + `sink`) is per call, so flows are still
-/// attributed to the caller's run.
+/// connection pool — is shared process-wide per [`Transport`] (and per tokio
+/// runtime: see `PoolKey`; send on the runtime that built the client).
+/// Only the netflow middleware (`ctx` + `sink`) is per call, so flows are
+/// still attributed to the caller's run.
 ///
 /// Why: providers are built once per agent run. With a private client each,
 /// every concurrent agent in a fan-out held its own idle keep-alive sockets
@@ -99,9 +109,13 @@ pub fn shared_client(
     transport: Transport,
     sink: Arc<dyn FlowSink>,
 ) -> reqwest::Result<ClientWithMiddleware> {
+    let key = (
+        transport,
+        tokio::runtime::Handle::try_current().ok().map(|h| h.id()),
+    );
     let (inner, resolver) = {
         let mut pool = shared_pool().lock().unwrap_or_else(|e| e.into_inner());
-        match pool.get(&transport) {
+        match pool.get(&key) {
             Some(entry) => entry.clone(),
             None => {
                 let resolver = RecordingResolver::default();
@@ -109,7 +123,7 @@ pub fn shared_client(
                     .builder()
                     .dns_resolver(Arc::new(resolver.clone()))
                     .build()?;
-                pool.insert(transport, (inner.clone(), resolver.clone()));
+                pool.insert(key, (inner.clone(), resolver.clone()));
                 (inner, resolver)
             }
         }
@@ -121,4 +135,39 @@ pub fn shared_client(
             resolver,
         })
         .build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_runtime_gets_its_own_pool() {
+        // A timeout unique to this test keeps its pool entries private to it.
+        let transport = Transport {
+            http1_only: true,
+            timeout: Some(Duration::from_millis(16_180)),
+        };
+        let entries = || {
+            let pool = shared_pool().lock().unwrap();
+            pool.keys().filter(|(t, _)| *t == transport).count()
+        };
+        let build = || {
+            let ctx = FlowCtx::system(crate::Origin::Provider("test".into()));
+            shared_client(ctx, transport, Arc::new(crate::NullSink)).unwrap();
+        };
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+        };
+        let (a, b) = (runtime(), runtime());
+        a.block_on(async {
+            build();
+            build();
+        });
+        assert_eq!(entries(), 1, "callers on one runtime share one pool");
+        b.block_on(async { build() });
+        assert_eq!(entries(), 2, "another runtime gets a pool of its own");
+    }
 }
