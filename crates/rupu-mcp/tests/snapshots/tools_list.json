@@ -1348,5 +1348,98 @@
       "type": "object"
     },
     "name": "findings.record"
+  },
+  {
+    "description": "List this project's findings, filtered by tag, severity, concern or file: one page of slim rows, `next_cursor`, `total`, and `tags_in_use` (the project's tag vocabulary, with counts).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "concern_id": {
+          "description": "Only findings for this concern id.",
+          "type": "string"
+        },
+        "cursor": {
+          "description": "`next_cursor` from the previous page.",
+          "type": "string"
+        },
+        "file_prefix": {
+          "description": "Only findings whose file_path starts with this.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Rows per page (default 50).",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_severity": {
+          "description": "Only this severity and worse.",
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "tag_mode": {
+          "description": "With `tags`: findings carrying all of them (default) or any of them.",
+          "enum": [
+            "all",
+            "any"
+          ],
+          "type": "string"
+        },
+        "tags": {
+          "description": "Only findings carrying these tags.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "untagged": {
+          "description": "Only findings with no tags. Cannot be combined with `tags`.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "findings.query"
+  },
+  {
+    "description": "Add or remove free-form tags (lowercase a-z 0-9 . _ : / -) on one or more of this project's findings. An unknown id rejects the whole call; returns each finding's tags before and after.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "add": {
+          "description": "Tags to add.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "finding_ids": {
+          "description": "Finding ids (fnd_…) from query_findings or report_finding.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "remove": {
+          "description": "Tags to remove.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "finding_ids"
+      ],
+      "type": "object"
+    },
+    "name": "findings.tag"
   }
 ]

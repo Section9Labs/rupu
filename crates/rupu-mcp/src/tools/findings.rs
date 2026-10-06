@@ -1,4 +1,4 @@
-//! `findings.record` — declare a finding from a workflow `action:` step.
+//! `findings.record`, `findings.query`, `findings.tag` — the findings ledger from a workflow `action:` step.
 //!
 //! The agent-side equivalent is the `report_finding` builtin
 //! (`rupu-agent/src/coverage_tools.rs`), which an agent reaches directly.
@@ -87,18 +87,82 @@ pub fn specs() -> Vec<ToolSpec> {
     // the report schema is attached after construction.
     input_schema["properties"]["report"] = rupu_coverage::report::schema::advertised_schema();
     input_schema["properties"]["tags"] = rupu_coverage::tags_schema_property();
-    vec![ToolSpec {
-        name: "findings.record",
-        description: "Record a security finding in this project's findings ledger, so it appears \
+    vec![
+        ToolSpec {
+            name: "findings.record",
+            description:
+                "Record a security finding in this project's findings ledger, so it appears \
                       in the control plane rather than only in an external tracker. Use the \
                       narrowest scope the evidence supports. Under the full findings profile \
                       (the step's `findings_profile`, else the workflow default, else full) \
                       send `report` (a complete finding report) and omit \
                       summary/severity/rationale; under the summary profile send summary, \
                       severity and rationale.",
-        input_schema,
+            input_schema,
+            kind: ToolKind::Write,
+        },
+        query_spec(),
+        tag_spec(),
+    ]
+}
+
+fn query_spec() -> ToolSpec {
+    ToolSpec {
+        name: "findings.query",
+        description: "List this project's findings, filtered by tag, severity, concern or \
+                      file: one page of slim rows, `next_cursor`, `total`, and `tags_in_use` \
+                      (the project's tag vocabulary, with counts).",
+        input_schema: rupu_coverage::query_input_schema(),
+        kind: ToolKind::Read,
+    }
+}
+
+fn tag_spec() -> ToolSpec {
+    ToolSpec {
+        name: "findings.tag",
+        description: "Add or remove free-form tags (lowercase a-z 0-9 . _ : / -) on one or \
+                      more of this project's findings. An unknown id rejects the whole call; \
+                      returns each finding's tags before and after.",
+        input_schema: rupu_coverage::tag_input_schema(),
         kind: ToolKind::Write,
-    }]
+    }
+}
+
+fn attribution(ctx: &FindingsContext) -> rupu_coverage::Attribution {
+    rupu_coverage::Attribution {
+        run_id: ctx.run_id.clone(),
+        model: ctx.model.clone(),
+        surface: ctx.surface,
+        codename: ctx.codename.clone(),
+        agent: None,
+        provider: ctx.provider.clone(),
+    }
+}
+
+/// `findings.query`: one page of this workspace's findings.
+pub fn dispatch_query(ctx: &FindingsContext, args: serde_json::Value) -> Result<String, String> {
+    let q: rupu_coverage::FindingQuery = serde_path_to_error::deserialize(args)
+        .map_err(|e| format!("invalid findings.query input: {e}"))?;
+    let records =
+        rupu_coverage::read_workspace_findings(&ctx.workspace_path).map_err(|e| e.to_string())?;
+    let v = rupu_coverage::query_response(&records, &q).map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+}
+
+/// `findings.tag`: apply one tag change to this workspace's findings.
+pub fn dispatch_tag(ctx: &FindingsContext, args: serde_json::Value) -> Result<String, String> {
+    let input: rupu_coverage::TagChangeInput = serde_path_to_error::deserialize(args)
+        .map_err(|e| format!("invalid findings.tag input: {e}"))?;
+    let change = input.into_change().map_err(|e| e.to_string())?;
+    let by = rupu_coverage::TagActor::Agent(attribution(ctx));
+    let outcomes = rupu_coverage::apply(
+        &rupu_coverage::TagLog::for_workspace(&ctx.workspace_path),
+        &change,
+        &by,
+    )
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&serde_json::json!({ "outcomes": outcomes }))
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,14 +196,7 @@ pub struct RecordArgs {
 pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String, String> {
     let target = rupu_coverage::target_id(&ctx.workspace_path, &ctx.scope_name);
     let paths = rupu_coverage::CoveragePaths::new(&ctx.workspace_path, &target);
-    let attribution = rupu_coverage::Attribution {
-        run_id: ctx.run_id.clone(),
-        model: ctx.model.clone(),
-        surface: ctx.surface,
-        codename: ctx.codename.clone(),
-        agent: None,
-        provider: ctx.provider.clone(),
-    };
+    let attribution = attribution(ctx);
     // Under the full profile the excerpt and references belong inside
     // `report`. `report_finding` refuses summary/severity/evidence there, but
     // `code_excerpt`/`references` are folded into `evidence` only when a

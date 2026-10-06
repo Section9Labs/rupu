@@ -5,5 +5,6 @@
 //! enforces this.
 
 mod findings_record;
+mod findings_tags;
 mod multi_account_dispatch;
 mod schema_snapshot;
