@@ -15,6 +15,7 @@ use rupu_coverage::{
 };
 use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -795,6 +796,119 @@ pub fn register(
         "coverage_concerns_detail",
         Arc::new(CoverageConcernsDetailTool { catalog }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// query_findings / tag_findings
+// ---------------------------------------------------------------------------
+
+/// Read this workspace's findings, filtered and paged (`ledger::query`).
+pub struct QueryFindingsTool {
+    workspace: PathBuf,
+}
+
+impl QueryFindingsTool {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for QueryFindingsTool {
+    fn name(&self) -> &'static str {
+        "query_findings"
+    }
+
+    fn description(&self) -> &'static str {
+        "List findings recorded in this project, filtered by tag, severity, concern or file. \
+         Returns one page of slim rows (id, title, severity, location, tags), `next_cursor` \
+         for the next page, `total` matches, and `tags_in_use` — the tags already used in \
+         this project, with counts. Reuse an existing tag where it fits before inventing one."
+    }
+
+    fn input_schema(&self) -> Value {
+        rupu_coverage::query_input_schema()
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let q: rupu_coverage::FindingQuery = serde_path_to_error::deserialize(input)
+            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let workspace = self.workspace.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+            let records =
+                rupu_coverage::read_workspace_findings(&workspace).map_err(|e| e.to_string())?;
+            rupu_coverage::query_response(&records, &q).map_err(|e| e.to_string())
+        })
+        .await;
+        match result {
+            Ok(Ok(v)) => Ok(ok_output(
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()),
+                started,
+            )),
+            Ok(Err(e)) => Ok(err_output(e, started)),
+            Err(join) => Ok(err_output(
+                format!("query_findings did not complete: {join}"),
+                started,
+            )),
+        }
+    }
+}
+
+/// Add or remove tags on this workspace's findings (`ledger::tags::apply`).
+pub struct TagFindingsTool {
+    log: rupu_coverage::TagLog,
+}
+
+impl TagFindingsTool {
+    pub fn new(log: rupu_coverage::TagLog) -> Self {
+        Self { log }
+    }
+}
+
+#[async_trait]
+impl Tool for TagFindingsTool {
+    fn name(&self) -> &'static str {
+        "tag_findings"
+    }
+
+    fn description(&self) -> &'static str {
+        "Add or remove tags on findings in this project, one or many at once. Tags are \
+         free-form: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit (e.g. \
+         class:sqli, needs-poc, status:triaged). Prefer tags already in use (query_findings \
+         lists them). An unknown finding id rejects the whole call; adding a tag a finding \
+         already has changes nothing. Returns each finding's tags before and after."
+    }
+
+    fn input_schema(&self) -> Value {
+        rupu_coverage::tag_input_schema()
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: rupu_coverage::TagChangeInput = serde_path_to_error::deserialize(input)
+            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let change = match parsed.into_change() {
+            Ok(c) => c,
+            Err(e) => return Ok(err_output(e.to_string(), started)),
+        };
+        let by = rupu_coverage::TagActor::Agent(attribution_from_ctx(ctx));
+        let log = self.log.clone();
+        let result =
+            tokio::task::spawn_blocking(move || rupu_coverage::apply(&log, &change, &by)).await;
+        match result {
+            Ok(Ok(outcomes)) => Ok(ok_output(
+                serde_json::to_string_pretty(&serde_json::json!({ "outcomes": outcomes }))
+                    .unwrap_or_else(|_| "{}".into()),
+                started,
+            )),
+            Ok(Err(e)) => Ok(err_output(e.to_string(), started)),
+            Err(join) => Ok(err_output(
+                format!("tag_findings did not complete: {join}"),
+                started,
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

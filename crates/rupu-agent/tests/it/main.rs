@@ -15,6 +15,7 @@
 mod coverage_integration;
 mod engagement_e2e;
 mod findings_full_profile;
+mod findings_tags;
 mod findings_without_coverage;
 mod loader;
 mod mcp_attach;

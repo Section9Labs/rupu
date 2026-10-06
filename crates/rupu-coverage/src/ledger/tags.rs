@@ -299,6 +299,41 @@ pub struct TagChange {
     pub remove: Vec<Tag>,
 }
 
+/// `tag_findings` / `findings.tag` input. Unknown fields are refused.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagChangeInput {
+    pub finding_ids: Vec<String>,
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+impl TagChangeInput {
+    pub fn into_change(self) -> Result<TagChange, TagParseError> {
+        Ok(TagChange {
+            finding_ids: self.finding_ids,
+            add: parse_tags(&self.add)?,
+            remove: parse_tags(&self.remove)?,
+        })
+    }
+}
+
+/// Input schema shared by `tag_findings` and `findings.tag`.
+pub fn tag_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["finding_ids"],
+        "additionalProperties": false,
+        "properties": {
+            "finding_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Finding ids (fnd_…) from query_findings or report_finding." },
+            "add": { "type": "array", "items": { "type": "string" }, "description": "Tags to add." },
+            "remove": { "type": "array", "items": { "type": "string" }, "description": "Tags to remove." }
+        }
+    })
+}
+
 impl TagChange {
     /// The checks that need no I/O: something to change, some findings,
     /// and no tag both added and removed.
