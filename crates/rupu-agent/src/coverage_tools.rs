@@ -1015,6 +1015,7 @@ mod finding_verify_tests {
             evidence: None,
             report: Some(report),
             asset: None,
+            tags: Vec::new(),
         };
         let attribution = Attribution {
             run_id: run_id.into(),
