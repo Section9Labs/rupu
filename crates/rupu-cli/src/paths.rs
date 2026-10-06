@@ -175,8 +175,31 @@ impl ConfigPaths {
         Self {
             global: global.join("config.toml"),
             customer: None,
-            project: project_root.map(|p| p.join(".rupu/config.toml")),
+            project: project_config_path(global, project_root),
         }
+    }
+}
+
+/// The project layer's config file for `project_root`, or `None` when there
+/// is no project root or its `.rupu/` IS the global dir.
+///
+/// `project_root_for` treats `~/.rupu` as a project marker, so a repo
+/// without its own `.rupu/` resolves to `$HOME`, whose "project config" is
+/// the global `config.toml` itself. Loading that file a second time as the
+/// project layer let global values outrank the customer layer (project beats
+/// customer), so the layer is dropped there. Paths are compared
+/// canonicalized, or raw when either side cannot be canonicalized.
+fn project_config_path(global: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
+    let root = project_root?;
+    let project_dir = root.join(".rupu");
+    let same = match (project_dir.canonicalize(), global.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => project_dir == global,
+    };
+    if same {
+        None
+    } else {
+        Some(project_dir.join("config.toml"))
     }
 }
 
@@ -348,6 +371,29 @@ mod customer_layer_tests {
         assert_eq!(p.global, home.join("config.toml"));
         assert_eq!(p.customer, Some(home.join("customers/acme/config.toml")));
         assert_eq!(p.project, Some(project.join(".rupu/config.toml")));
+    }
+
+    #[test]
+    fn the_global_dir_is_never_also_the_project_layer() {
+        // `project_root_for` resolves a repo without its own `.rupu/` to
+        // `$HOME`, whose `.rupu` is the global dir: its config.toml must not
+        // be loaded a second time as the project layer.
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".rupu");
+        std::fs::create_dir_all(&global).unwrap();
+        let p = config_paths(&global, Some(tmp.path()), tmp.path()).unwrap();
+        assert_eq!(p.global, global.join("config.toml"));
+        assert_eq!(p.project, None);
+        // Also through a non-canonical spelling of the same directory.
+        let dotted = tmp.path().join("sub/..");
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        let p = config_paths(&global, Some(&dotted), tmp.path()).unwrap();
+        assert_eq!(p.project, None);
+        // A normal project root still yields its own config.
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join(".rupu")).unwrap();
+        let p = config_paths(&global, Some(&proj), &proj).unwrap();
+        assert_eq!(p.project, Some(proj.join(".rupu/config.toml")));
     }
 
     #[test]
