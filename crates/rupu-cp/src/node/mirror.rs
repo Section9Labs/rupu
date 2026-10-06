@@ -548,8 +548,9 @@ impl NodeMirror {
     }
 
     /// The store this mirror writes into. Readers that need the run's own
-    /// artifacts (the tail pump's terminal pull) go through here.
-    pub fn run_store(&self) -> &RunStore {
+    /// artifacts (the tail pump's terminal pull) go through here; the shared
+    /// handle lets them take the read to the blocking pool.
+    pub fn run_store(&self) -> &Arc<RunStore> {
         &self.run_store
     }
 
