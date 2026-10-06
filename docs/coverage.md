@@ -27,7 +27,10 @@ variance: diff two runs, and replay a run to compare it against the original.
 ## How it works
 
 Coverage data for a *target* lives under `<workspace>/.rupu/coverage/<target_id>/`
-as append-only JSONL plus a catalog snapshot. The one exception is `rupu findings
+as append-only JSONL plus a catalog snapshot. Finding tags are the workspace-level
+exception: their log sits one level up, in `<workspace>/.rupu/coverage/` itself,
+because it spans every target (see [Tagging findings](#tagging-findings)). The other
+exception is `rupu findings
 import`, the one-time migration of older reports: every real import that attaches
 anything replaces `findings.jsonl`, leaving a backup of it beside the ledger each
 time (see [Importing reports](#importing-reports-written-before-the-full-profile)).
@@ -41,6 +44,14 @@ time (see [Importing reports](#importing-reports-written-before-the-full-profile
 | `runs.jsonl` | one manifest per run (its defining inputs, for replay) |
 | `findings.jsonl.lock` | empty; the lock every writer of `findings.jsonl` takes |
 | `findings.jsonl.pre-import-<UTC time>` | a copy of `findings.jsonl` from before a `rupu findings import` replaced it |
+
+Workspace-level files, in `<workspace>/.rupu/coverage/` (not under a `<target_id>/`
+directory):
+
+| File | Contents |
+|------|----------|
+| `finding_tags.jsonl` | every tag add/remove event for the workspace's findings, across all targets |
+| `finding_tags.jsonl.lock` | empty; the lock every writer of `finding_tags.jsonl` takes |
 
 `<target_id>` is derived deterministically from `(workspace, scope_name)`, so the
 same agent against the same repo accumulates into one target across runs, while
@@ -107,6 +118,15 @@ list them in the agent's `tools:`):
 | `coverage_remaining` | list in-scope files still lacking an assertion |
 | `coverage_status` | summary of assessed-vs-gap progress |
 | `coverage_concerns_search` / `coverage_concerns_detail` | search / fetch full bodies for index-mode catalogs |
+
+Two more tools are **not** injected: grant them explicitly in the agent's
+`tools:` (like `report_finding` outside a `concerns:` agent). See
+[Who can tag](#who-can-tag).
+
+| Tool | Purpose |
+|------|---------|
+| `query_findings` | list the workspace's findings, filtered by tag, severity, concern or file; returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
+| `tag_findings` | add or remove tags on one or many findings; returns each finding's tags before and after (explicit `tools:` grant) |
 
 ## Finding reports
 
@@ -862,8 +882,10 @@ tags with the events applied in file order, and every reader (agent tools, MCP,
 CLI) folds on read. Each event records who made it: the agent's attribution
 (run, agent, model) or an operator (`$USER`, and whether through the CLI or the
 control plane). A change that alters nothing (adding a tag the finding has)
-writes no event, and a batch with an unknown finding id or a finding that would
-pass the cap changes nothing.
+writes no event. A batch with an unknown finding id or a finding that would pass
+the cap is rejected whole by the agent tools and MCP; `rupu findings tag` is
+atomic per workspace (a batch that spans workspaces applies to each independently,
+so the others keep their changes when one is refused).
 
 ### CLI
 
