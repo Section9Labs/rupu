@@ -1872,12 +1872,18 @@ async fn run_agent_inner(
     // registry insert happens after `filter_to` for the same reason the
     // coverage tools do — the grant list gates the six builtins, and these
     // are registered on top of it.
-    if coverage.is_none()
-        && opts
-            .agent_tools
+    //
+    // `finding.verify` follows the same model: a verifier run that records a
+    // verdict on another run's finding needs the ledger but no concern
+    // catalog, and gets the tool only by listing it in `tools:`.
+    let lists_tool = |name: &str| {
+        opts.agent_tools
             .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == "report_finding"))
-    {
+            .is_some_and(|list| list.iter().any(|t| t == name))
+    };
+    let standalone_report = coverage.is_none() && lists_tool("report_finding");
+    let standalone_verify = coverage.is_none() && lists_tool("finding.verify");
+    if standalone_report || standalone_verify {
         let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
         let target = target_id(&opts.workspace_path, scope);
         let paths = CoveragePaths::new(&opts.workspace_path, &target)
@@ -1885,25 +1891,33 @@ async fn run_agent_inner(
         paths
             .ensure_dir()
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
-        // asset_mark is offered whenever an engagement is active, with or
-        // without a concerns block — it needs the active set to validate a
-        // depth against the profile's ladder.
-        if let Some(engagement) = findings_opts.engagement.clone() {
+        if standalone_verify {
             registry.insert(
-                "asset_mark",
-                std::sync::Arc::new(coverage_tools::AssetMarkTool::new(
-                    paths.clone(),
-                    engagement,
+                "finding.verify",
+                std::sync::Arc::new(coverage_tools::FindingVerifyTool::new(paths.clone())),
+            );
+        }
+        if standalone_report {
+            // asset_mark is offered whenever an engagement is active, with or
+            // without a concerns block — it needs the active set to validate a
+            // depth against the profile's ladder.
+            if let Some(engagement) = findings_opts.engagement.clone() {
+                registry.insert(
+                    "asset_mark",
+                    std::sync::Arc::new(coverage_tools::AssetMarkTool::new(
+                        paths.clone(),
+                        engagement,
+                    )),
+                );
+            }
+            registry.insert(
+                "report_finding",
+                std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
+                    paths,
+                    findings_opts.clone(),
                 )),
             );
         }
-        registry.insert(
-            "report_finding",
-            std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
-                paths,
-                findings_opts.clone(),
-            )),
-        );
     }
 
     // MCP server: spin up before the loop if we have a Registry.
@@ -3527,6 +3541,7 @@ mod on_tool_call_tests {
         let opts = AgentRunOpts {
             seed_source: None,
             collectors: Vec::new(),
+            extra_tools: Vec::new(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
