@@ -42,10 +42,11 @@ pub fn read_concern_assertions(paths: &CoveragePaths) -> std::io::Result<Vec<Con
         .collect())
 }
 
-/// Every finding record in the ledger. A line that is not one (blank, not
-/// JSON, or not UTF-8, as a torn write can leave) is skipped on its own: it
-/// never hides the rest of the ledger.
-pub fn read_findings(paths: &CoveragePaths) -> std::io::Result<Vec<FindingRecord>> {
+/// Every finding record in the ledger as declared: its own tags only, no
+/// tag-log events folded in. A line that is not one (blank, not JSON, or not
+/// UTF-8, as a torn write can leave) is skipped on its own: it never hides
+/// the rest of the ledger.
+pub fn read_declared_findings(paths: &CoveragePaths) -> std::io::Result<Vec<FindingRecord>> {
     if !paths.findings.exists() {
         return Ok(vec![]);
     }
@@ -56,6 +57,27 @@ pub fn read_findings(paths: &CoveragePaths) -> std::io::Result<Vec<FindingRecord
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<FindingRecord>(l).ok())
         .collect())
+}
+
+/// Every finding record in the ledger with its effective tags: declared
+/// tags plus the workspace's tag log, folded (`ledger::tags`). A tag log
+/// that cannot be read is warned about and the findings are returned with
+/// their declared tags: an unreadable log never hides findings.
+pub fn read_findings(paths: &CoveragePaths) -> std::io::Result<Vec<FindingRecord>> {
+    let mut records = read_declared_findings(paths)?;
+    if records.is_empty() {
+        return Ok(records);
+    }
+    let log = paths.tag_log();
+    match crate::ledger::tags::read_tag_events(&log) {
+        Ok(events) => crate::ledger::tags::fold_tags(&mut records, &events),
+        Err(e) => tracing::warn!(
+            error = %e,
+            path = %log.path.display(),
+            "cannot read the finding-tag log; showing declared tags only"
+        ),
+    }
+    Ok(records)
 }
 
 pub fn file_views(events: &[FileTouchEvent]) -> Vec<FileView> {

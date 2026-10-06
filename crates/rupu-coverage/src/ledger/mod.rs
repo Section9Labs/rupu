@@ -20,7 +20,14 @@ pub use stream::{
     append_record, stream_catalog, stream_path, write_stream_begin, Ledger, RunStream, StreamLine,
     STREAM_FILE, STREAM_VERSION,
 };
-pub use tags::{parse_tags, Tag, TagParseError, MAX_TAGS_PER_FINDING};
+pub use tags::{
+    fold_tags, parse_tags, read_declared_workspace_findings, read_tag_events,
+    read_workspace_findings, tag_history, OperatorAttribution, OperatorSurface, Tag, TagActor,
+    TagEvent, TagLog, TagOp, TagParseError, MAX_TAGS_PER_FINDING, TAG_LOG_FILE,
+};
 pub use target_id::target_id;
-pub use views::{file_views, read_concern_assertions, read_file_events, read_findings, FileView};
+pub use views::{
+    file_views, read_concern_assertions, read_declared_findings, read_file_events, read_findings,
+    FileView,
+};
 pub use writer::{CoverageWriter, CoverageWriterHandle};

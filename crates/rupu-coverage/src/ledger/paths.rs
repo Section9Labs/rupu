@@ -46,6 +46,12 @@ impl CoveragePaths {
         self.run_stream = stream;
         self
     }
+
+    /// The workspace's tag log, carrying this path's run stream.
+    pub fn tag_log(&self) -> crate::ledger::tags::TagLog {
+        crate::ledger::tags::TagLog::for_workspace(&self.workspace)
+            .with_run_stream(self.run_stream.clone())
+    }
 }
 
 #[cfg(test)]
