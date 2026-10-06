@@ -399,9 +399,14 @@ pub enum Action {
     },
     /// Run a workflow.
     Run {
-        /// Workflow name (filename stem under `workflows/`).
-        #[arg(add = ArgValueCompleter::new(workflow_names))]
-        name: String,
+        /// Workflow name (filename stem under `workflows/`). Omit when
+        /// running from a file with `--file`.
+        #[arg(
+            required_unless_present = "file",
+            conflicts_with = "file",
+            add = ArgValueCompleter::new(workflow_names)
+        )]
+        name: Option<String>,
         /// Optional run-target: a repo, PR, or issue reference.
         ///
         /// Accepts repo (`github:owner/repo`, `gitlab:group/proj`), PR
@@ -449,6 +454,10 @@ pub enum Action {
         /// tools), so it only pairs with the run dir.
         #[arg(long, hide = true, value_name = "ID", requires = "fleet_run_dir")]
         fleet_participant: Option<String>,
+        /// Run a workflow directly from a file path instead of resolving a
+        /// name from the catalog. The workflow is not added to the catalog.
+        #[arg(long, value_name = "PATH", conflicts_with = "target")]
+        file: Option<PathBuf>,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -677,10 +686,12 @@ pub async fn handle(
             // Paired with `fleet_run_dir` by clap; workflow steps carry no
             // board tools, so the id itself is not used here.
             fleet_participant: _,
+            file,
         } => match FleetRunOverlay::from_flags(engagement_profiles, fleet_run_dir.as_deref()) {
             Ok(overlay) => {
                 run(
-                    &name,
+                    file.as_deref(),
+                    name.as_deref(),
                     target.as_deref(),
                     input,
                     mode.as_deref(),
@@ -4541,7 +4552,8 @@ pub async fn run_by_name(
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
     run_with_outcome(
-        name,
+        None,
+        Some(name),
         None,
         inputs,
         mode,
@@ -4569,7 +4581,8 @@ pub async fn run_by_name_with_run_id(
     run_id: String,
 ) -> anyhow::Result<RunOutcomeSummary> {
     run_with_outcome(
-        name,
+        None,
+        Some(name),
         None,
         inputs,
         mode,
@@ -4617,7 +4630,8 @@ pub async fn run_by_path(
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
     run(
-        name,
+        None,
+        Some(name),
         Some(target),
         Vec::new(),
         mode,
@@ -4632,7 +4646,8 @@ pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyh
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    name: &str,
+    file: Option<&Path>,
+    name: Option<&str>,
     target: Option<&str>,
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
@@ -4643,7 +4658,7 @@ async fn run(
     overlay: FleetRunOverlay,
 ) -> anyhow::Result<()> {
     run_with_outcome(
-        name, target, inputs, mode, event, true, run_id, view, plain, overlay,
+        file, name, target, inputs, mode, event, true, run_id, view, plain, overlay,
     )
     .await
     .map(|_| ())
@@ -4652,9 +4667,14 @@ async fn run(
 /// Same as [`run`] but returns a [`RunOutcomeSummary`] so non-CLI
 /// callers (the webhook receiver) can surface run-id + pause state.
 /// `run` itself thin-wraps this and discards the value.
+///
+/// The workflow comes from `file` when given (a path outside the catalog,
+/// `rupu workflow run --file`; the run's name is the parsed `name:`),
+/// otherwise from the catalog entry `name`.
 #[allow(clippy::too_many_arguments)]
 async fn run_with_outcome(
-    name: &str,
+    file: Option<&Path>,
+    name: Option<&str>,
     target: Option<&str>,
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
@@ -4665,9 +4685,32 @@ async fn run_with_outcome(
     plain: bool,
     overlay: FleetRunOverlay,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    let path = locate_workflow(name)?;
-    let body = std::fs::read_to_string(&path)?;
-    let workflow = Workflow::parse(&body)?;
+    let (path, body) = match file {
+        Some(f) => {
+            let body = std::fs::read_to_string(f)
+                .map_err(|e| anyhow::anyhow!("--file {}: {e}", f.display()))?;
+            // Absolute, so the run record's `source_path` stays meaningful
+            // after the run's own working-directory changes.
+            (std::env::current_dir()?.join(f), body)
+        }
+        None => {
+            let name = name.ok_or_else(|| anyhow::anyhow!("workflow name required"))?;
+            let p = locate_workflow(name)?;
+            let body = std::fs::read_to_string(&p)?;
+            (p, body)
+        }
+    };
+    let workflow = Workflow::parse(&body).map_err(|e| match file {
+        Some(f) => anyhow::anyhow!("--file {}: {e}", f.display()),
+        None => anyhow::Error::new(e),
+    })?;
+    // A file-sourced workflow is named by its own `name:`; a catalog one by
+    // the name it was looked up under.
+    let name: String = match (file, name) {
+        (None, Some(n)) => n.to_string(),
+        _ => workflow.name.clone(),
+    };
+    let name = name.as_str();
 
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -6329,7 +6372,7 @@ mod tests {
                         ..
                     },
             } => {
-                assert_eq!(name, "w");
+                assert_eq!(name.as_deref(), Some("w"));
                 assert_eq!(engagement_profiles, vec!["network", "web"]);
                 assert_eq!(
                     fleet_run_dir.as_deref(),
@@ -6385,6 +6428,49 @@ mod tests {
             }
             other => panic!("expected Workflow(Run), got {other:?}"),
         }
+    }
+
+    /// `--file` stands in for the name (and only for the name): it parses
+    /// alone, and neither a name nor a run target may accompany it.
+    #[test]
+    fn workflow_run_file_replaces_the_name() {
+        let cli =
+            crate::Cli::try_parse_from(["rupu", "workflow", "run", "--file", "/x/w.yaml"]).unwrap();
+        match cli.command {
+            crate::Cmd::Workflow {
+                action:
+                    super::Action::Run {
+                        name, file, target, ..
+                    },
+            } => {
+                assert!(name.is_none());
+                assert!(target.is_none());
+                assert_eq!(file.as_deref(), Some(std::path::Path::new("/x/w.yaml")));
+            }
+            other => panic!("expected Workflow(Run), got {other:?}"),
+        }
+        // Neither a name nor --file: the name stays required.
+        assert!(crate::Cli::try_parse_from(["rupu", "workflow", "run"]).is_err());
+        // A name, or a name + target, alongside --file is ambiguous.
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "--file",
+            "/x/w.yaml"
+        ])
+        .is_err());
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "run",
+            "w",
+            "github:o/r",
+            "--file",
+            "/x/w.yaml"
+        ])
+        .is_err());
     }
 
     /// The run dir and participant come as a pair, as on `rupu run`.
