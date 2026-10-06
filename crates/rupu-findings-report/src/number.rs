@@ -211,6 +211,7 @@ mod tests {
             declared_at: at.parse().unwrap(),
             profile: FindingProfile::Summary,
             report: None,
+            tags: Vec::new(),
         }
     }
     fn input(ws: &str, r: FindingRecord) -> ExportInput {

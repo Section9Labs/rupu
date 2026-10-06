@@ -217,6 +217,7 @@ mod tests {
                         FindingProfile::Summary
                     },
                     report,
+                    tags: Vec::new(),
                 },
             },
         }

@@ -401,3 +401,23 @@ async fn structural_errors_name_the_field_path() {
     assert!(msg.contains("report.call_chain[0]"), "{msg}");
     assert!(msg.contains("lable"), "{msg}");
 }
+
+#[tokio::test]
+async fn record_accepts_declared_tags() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx(tmp.path()));
+    let mut input = host_finding();
+    input["tags"] = serde_json::json!(["Class:Authz", "needs-poc"]);
+    dispatcher
+        .call("findings.record", input)
+        .await
+        .expect("record should succeed");
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "chimera-campaign"),
+    );
+    let rec = &rupu_coverage::read_findings(&paths).unwrap()[0];
+    let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
+    assert_eq!(tags, ["class:authz", "needs-poc"]);
+}

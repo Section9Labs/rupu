@@ -12,7 +12,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rupu_coverage::{discover_targets, read_findings, run_audit, CoveragePaths};
+use rupu_coverage::{discover_targets, read_declared_findings, run_audit, CoveragePaths};
 use rupu_orchestrator::RunRecord;
 use rupu_workspace::WorkspaceStore;
 use serde::Serialize;
@@ -275,7 +275,7 @@ async fn get_project(
         .iter()
         .map(|t| {
             let paths = CoveragePaths::new(wp, &t.target_id);
-            read_findings(&paths).map(|f| f.len()).unwrap_or(0)
+            read_declared_findings(&paths).map(|f| f.len()).unwrap_or(0)
         })
         .sum();
     let coverage_obj = json!({
@@ -373,7 +373,7 @@ async fn project_coverage(
     let mut rows = Vec::with_capacity(targets.len());
     for t in targets {
         let paths = CoveragePaths::new(wp, &t.target_id);
-        let findings = read_findings(&paths).map(|f| f.len()).unwrap_or(0);
+        let findings = read_declared_findings(&paths).map(|f| f.len()).unwrap_or(0);
         rows.push(json!({
             "target_id": t.target_id,
             "assertion_lines": t.assertion_lines,

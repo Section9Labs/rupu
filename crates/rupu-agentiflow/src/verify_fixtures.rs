@@ -71,5 +71,6 @@ pub(crate) fn full_finding(id: &str, filed_by_run: &str, classification: &str) -
         declared_at: Utc::now(),
         profile: FindingProfile::Full,
         report: Some(full_report(classification)),
+        tags: Vec::new(),
     }
 }

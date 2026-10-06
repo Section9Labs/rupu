@@ -24,7 +24,7 @@ fn finding_input() -> serde_json::Value {
     })
 }
 
-fn opts_for(
+pub(crate) fn opts_for(
     workspace: &std::path::Path,
     agent_tools: Option<Vec<String>>,
     turns: Vec<ScriptedTurn>,
@@ -222,6 +222,7 @@ fn seed_other_runs_finding(workspace: &std::path::Path) -> String {
         evidence: None,
         report: Some(report),
         asset: None,
+        tags: Vec::new(),
     };
     let attribution = rupu_coverage::Attribution {
         run_id: "run_filer".into(),

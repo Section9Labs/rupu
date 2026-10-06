@@ -66,6 +66,7 @@ fn finding_with(id: &str, artifact: ArtifactRef) -> FindingRecord {
         declared_at: chrono::Utc::now(),
         profile: FindingProfile::Full,
         report: Some(report),
+        tags: Vec::new(),
     }
 }
 
