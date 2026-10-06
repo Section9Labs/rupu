@@ -2033,7 +2033,7 @@ git commit -m "perf(cp): every local netflow read goes through the shared Netflo
 - Modify: `crates/rupu-cp/src/api/netflow.rs`
 
 **Interfaces:**
-- Consumes: `NetflowIndex::summary`, `LedgerReader::flows_in_range`, `retain_only` (Tasks 4–5); `histogram_from_points`, `SankeyUniverse`, `sankey_view_with_universe` (Task 3); `global_ledger_files`, `project_ledger_files`, `index_for` (Task 6).
+- Consumes: `NetflowIndex::summary`, `LedgerReader::flows_in_range`, `sweep_missing` (Tasks 4–5; ruling R5 replaced `retain_only`); `histogram_from_points`, `SankeyUniverse`, `sankey_view_with_universe` (Task 3); `global_ledger_files`, `project_ledger_files`, `index_for` (Task 6).
 - Produces: `pub(crate) fn indexed_explorer(index: &NetflowIndex, files: &[(String, PathBuf)], meta: &RunMetaIndex, table: Option<&AsnTable>, range: &TimeRange, filters: &ExplorerFilters) -> ExplorerResponse`
 
 - [ ] **Step 1: Write the failing equivalence test** (in the same test module):
@@ -2205,7 +2205,7 @@ Global branch closure body:
 
 ```rust
             let files = global_ledger_files(&global_dir);
-            index.retain_only(&files.iter().map(|(_, p)| p.clone()).collect());
+            index.sweep_missing();
             let ledger_ids = files
                 .iter()
                 .filter(|(_, p)| index.summary(p).is_some_and(|s| s.flow_count > 0))
@@ -2245,7 +2245,7 @@ git commit -m "perf(cp): global/project explorer reads whole-history views from 
 - Modify: `docs/configuration.md`, `CLAUDE.md`
 
 **Interfaces:**
-- Consumes: `index_for`, `global_ledger_files`, `NetflowIndex::{summary, retain_only, status}`.
+- Consumes: `index_for`, `global_ledger_files`, `NetflowIndex::{summary, sweep_missing_now, status}`.
 - Produces: `GET /api/netflow/index` → `IndexStatus` JSON; `pub(crate) fn prewarm_netflow_index(index: &NetflowIndex, global_dir: &StdPath) -> usize`.
 
 - [ ] **Step 1: Write the failing integration test** — append to `tests/it/netflow_api.rs`:
@@ -2321,7 +2321,7 @@ pub(crate) fn prewarm_netflow_index(index: &NetflowIndex, global_dir: &StdPath) 
     for (_, path) in &files {
         index.summary(path);
     }
-    index.retain_only(&files.iter().map(|(_, p)| p.clone()).collect());
+    index.sweep_missing_now();
     files.len()
 }
 ```

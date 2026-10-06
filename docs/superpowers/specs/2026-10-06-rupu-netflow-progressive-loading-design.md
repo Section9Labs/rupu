@@ -148,9 +148,11 @@ until its newline arrives (today's `lines()` would parse it). rupu's writer
 always terminates lines, so this only matters for a writer killed mid-line,
 whose partial line is malformed and skipped today anyway.
 
-Entries for files that no longer appear in a global-scope listing are
-dropped at the end of that listing (`retain_only`), so pruned or
-unregistered ledgers do not linger in tier 1.
+Entries whose file no longer exists are dropped by `sweep_missing()`
+(at most once a minute, from global-scope reads; unthrottled at prewarm),
+so pruned ledgers do not linger in tier 1. (Ruling R5: a keep-list from
+the global listing would drop live entries that project/run reads spell
+with a different, non-canonical path.)
 
 `serve_on` prewarms the index on the blocking pool at startup, beside
 `usage::prewarm`, logging elapsed time.
