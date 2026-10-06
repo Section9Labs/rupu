@@ -161,12 +161,13 @@ struct Entry {
     resident: Option<Resident>,
 }
 
-// `budget_bytes` and `evictions` are read by Task 5's eviction pass.
-#[allow(dead_code)]
 pub struct NetflowIndex {
     entries: Mutex<HashMap<PathBuf, Arc<Mutex<Entry>>>>,
     resident_bytes: AtomicU64,
+    // Read by Task 5's eviction pass.
+    #[allow(dead_code)]
     budget_bytes: AtomicU64,
+    #[allow(dead_code)]
     evictions: AtomicU64,
 }
 
@@ -196,10 +197,12 @@ impl NetflowIndex {
         let entry = self.entry(path);
         let out = {
             let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
-            if !self.refresh(&mut e, path) {
-                None
-            } else {
-                Some(Arc::clone(&e.summary))
+            match self.refresh(&mut e, path) {
+                Refresh::Gone => None,
+                // Unreadable right now: serve the last consistent tier 1
+                // if the entry ever loaded; the next call retries.
+                Refresh::Failed => e.stamp.map(|_| Arc::clone(&e.summary)),
+                Refresh::Current => Some(Arc::clone(&e.summary)),
             }
         };
         if out.is_none() {
@@ -221,9 +224,8 @@ impl NetflowIndex {
             .unwrap_or_else(|p| p.into_inner())
             .remove(path);
         if let Some(entry) = removed {
-            if let Ok(mut e) = entry.lock() {
-                self.drop_resident(&mut e);
-            }
+            let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+            self.drop_resident(&mut e);
         }
     }
 
@@ -248,16 +250,17 @@ impl NetflowIndex {
         }
     }
 
-    /// Bring `e` up to date with the file. `false` = the file is gone.
-    fn refresh(&self, e: &mut Entry, path: &Path) -> bool {
+    /// Bring `e` up to date with the file. A failed read leaves the entry
+    /// exactly as it was, with its old stamp, so the next call retries.
+    fn refresh(&self, e: &mut Entry, path: &Path) -> Refresh {
         let Ok(meta) = std::fs::metadata(path) else {
-            return false;
+            return Refresh::Gone;
         };
         let stamp = FileStamp::of(&meta);
         if e.stamp == Some(stamp) {
             // Unchanged file: tier 1 is current; tier 2 may be evicted,
             // which `ensure_rows` handles.
-            return true;
+            return Refresh::Current;
         }
         let ino = inode(&meta);
         let can_tail = e.stamp.is_some()
@@ -266,14 +269,17 @@ impl NetflowIndex {
             && ino == e.ino
             && meta.len() >= e.offset
             && self.prefix_matches(path, &e.prefix);
-        if can_tail {
-            self.tail(e, path);
+        let read = if can_tail {
+            self.tail(e, path)
         } else {
-            self.full_read(e, path);
+            self.full_read(e, path)
+        };
+        if read.is_err() {
+            return Refresh::Failed;
         }
         e.stamp = Some(stamp);
         e.ino = ino;
-        true
+        Refresh::Current
     }
 
     fn prefix_matches(&self, path: &Path, prefix: &[u8]) -> bool {
@@ -284,7 +290,19 @@ impl NetflowIndex {
         f.read_exact(&mut buf).is_ok() && buf == prefix
     }
 
-    fn full_read(&self, e: &mut Entry, path: &Path) {
+    /// Read the file from byte `offset` to its end.
+    fn read_from(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut f = std::fs::File::open(path)?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Rebuild the entry from the whole file. The file is read BEFORE the
+    /// entry is touched: on a read error the entry is left exactly as it was.
+    fn full_read(&self, e: &mut Entry, path: &Path) -> std::io::Result<()> {
+        let buf = Self::read_from(path, 0)?;
         self.drop_resident(e);
         e.offset = 0;
         e.prefix.clear();
@@ -295,20 +313,21 @@ impl NetflowIndex {
             fold: LedgerFold::default(),
             accounted: 0,
         });
-        self.tail(e, path);
+        self.ingest(e, &buf);
+        Ok(())
     }
 
-    /// Feed everything after `e.offset` that ends in a newline.
-    fn tail(&self, e: &mut Entry, path: &Path) {
-        let mut buf = Vec::new();
-        let read = std::fs::File::open(path).and_then(|mut f| {
-            f.seek(SeekFrom::Start(e.offset))?;
-            f.read_to_end(&mut buf)
-        });
-        if read.is_err() {
-            return;
-        }
-        let (complete, used) = split_complete_lines(&buf);
+    /// Feed everything after `e.offset` that ends in a newline. The read
+    /// happens before any mutation: on error the entry is untouched.
+    fn tail(&self, e: &mut Entry, path: &Path) -> std::io::Result<()> {
+        let buf = Self::read_from(path, e.offset)?;
+        self.ingest(e, &buf);
+        Ok(())
+    }
+
+    /// Fold `buf` (the bytes from `e.offset`) into the entry.
+    fn ingest(&self, e: &mut Entry, buf: &[u8]) {
+        let (complete, used) = split_complete_lines(buf);
         let Ok(text) = std::str::from_utf8(complete) else {
             self.drop_resident(e);
             e.unreadable = true;
@@ -319,7 +338,7 @@ impl NetflowIndex {
             e.prefix = buf[..buf.len().min(PREFIX_LEN)].to_vec();
         }
         let summary = Arc::make_mut(&mut e.summary);
-        let resident = e.resident.as_mut().expect("tail runs with rows resident");
+        let resident = e.resident.as_mut().expect("ingest runs with rows resident");
         for line in text.lines() {
             let Some(ev) = resident.fold.feed_line(line) else {
                 continue;
@@ -336,10 +355,12 @@ impl NetflowIndex {
     }
 
     /// Make sure tier 2 is resident, re-reading the file if it was evicted.
-    fn ensure_rows(&self, e: &mut Entry, path: &Path) {
+    /// `false` = the re-read failed; tier 1 is left intact.
+    fn ensure_rows(&self, e: &mut Entry, path: &Path) -> bool {
         if e.resident.is_none() && !e.unreadable {
-            self.full_read(e, path);
+            return self.full_read(e, path).is_ok();
         }
+        true
     }
 
     /// Placeholder until Task 5 adds eviction.
@@ -354,22 +375,39 @@ impl NetflowIndex {
     }
 }
 
+/// What `refresh` found.
+enum Refresh {
+    /// The entry now reflects the file.
+    Current,
+    /// The file is gone.
+    Gone,
+    /// The file exists but could not be read; the entry is unchanged.
+    Failed,
+}
+
 impl LedgerReader for NetflowIndex {
+    /// If the file cannot be read (or its rows re-loaded), this call answers
+    /// with the direct reader's result and caches nothing new.
     fn flows_in_range(&self, path: &Path, range: &TimeRange) -> (Vec<FlowRecord>, u64) {
         let entry = self.entry(path);
         let out = {
             let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
-            if !self.refresh(&mut e, path) {
-                None
-            } else if e.unreadable {
-                Some((Vec::new(), 0))
-            } else if !e.summary.overlaps(range) {
-                Some((Vec::new(), e.summary.dropped))
-            } else {
-                self.ensure_rows(&mut e, path);
-                let dropped = e.summary.dropped;
-                let rows = &e.resident.as_ref().expect("rows ensured").rows;
-                Some((rows.records_in_range(range).collect(), dropped))
+            match self.refresh(&mut e, path) {
+                Refresh::Gone => None,
+                Refresh::Failed => Some(DirectReader.flows_in_range(path, range)),
+                Refresh::Current => {
+                    if e.unreadable {
+                        Some((Vec::new(), 0))
+                    } else if !e.summary.overlaps(range) {
+                        Some((Vec::new(), e.summary.dropped))
+                    } else if !self.ensure_rows(&mut e, path) {
+                        Some(DirectReader.flows_in_range(path, range))
+                    } else {
+                        let dropped = e.summary.dropped;
+                        let rows = &e.resident.as_ref().expect("rows ensured").rows;
+                        Some((rows.records_in_range(range).collect(), dropped))
+                    }
+                }
             }
         };
         let Some(out) = out else {
@@ -381,9 +419,21 @@ impl LedgerReader for NetflowIndex {
     }
 
     fn capture_states(&self, path: &Path) -> Vec<CaptureEntry> {
-        self.summary(path)
-            .map(|s| s.capture.clone())
-            .unwrap_or_default()
+        let entry = self.entry(path);
+        let out = {
+            let mut e = entry.lock().unwrap_or_else(|p| p.into_inner());
+            match self.refresh(&mut e, path) {
+                Refresh::Gone => None,
+                Refresh::Failed => Some(DirectReader.capture_states(path)),
+                Refresh::Current => Some(e.summary.capture.clone()),
+            }
+        };
+        let Some(out) = out else {
+            self.remove(path);
+            return Vec::new();
+        };
+        self.enforce_budget();
+        out
     }
 }
 
@@ -602,5 +652,34 @@ mod tests {
         };
         assert_eq!(index.flows_in_range(&p, &later), (vec![], 4));
         assert_same(&index, &p, &later);
+    }
+
+    #[test]
+    fn a_failed_read_neither_wipes_nor_caches_and_the_next_call_recovers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("run_a.jsonl");
+        append(&p, &line(&LedgerLine::Flow(Box::new(flow(1, 100)))));
+        append(&p, &line(&LedgerLine::Flow(Box::new(flow(2, 200)))));
+        let index = NetflowIndex::new(u64::MAX);
+        assert_same(&index, &p, &all());
+        let before = index.summary(&p).unwrap();
+        assert_eq!(before.flow_count, 2);
+
+        // Metadata succeeds, the read fails (portable, root-safe seam: a
+        // directory under the ledger's name).
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        assert_same(&index, &p, &all());
+        // tier 1 is still the last consistent one, not wiped.
+        assert_eq!(index.summary(&p).unwrap().flow_count, 2);
+
+        // The file comes back with different content: the index recovers
+        // and answers exactly like the direct reader.
+        std::fs::remove_dir(&p).unwrap();
+        append(&p, &line(&LedgerLine::Flow(Box::new(flow(7, 700)))));
+        append(&p, &line(&LedgerLine::Flow(Box::new(flow(8, 800)))));
+        append(&p, &line(&LedgerLine::Flow(Box::new(flow(9, 900)))));
+        assert_same(&index, &p, &all());
+        assert_eq!(index.summary(&p).unwrap().flow_count, 3);
     }
 }
