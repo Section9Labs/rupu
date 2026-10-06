@@ -320,3 +320,73 @@ async fn finding_verify_is_absent_when_not_granted() {
         "an ungranted agent must not be able to verify a finding"
     );
 }
+
+#[tokio::test]
+async fn finding_verify_is_not_granted_by_an_absent_or_wildcard_tools_list() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let id = seed_other_runs_finding(&workspace);
+
+    // Only an exact `finding.verify` entry grants it, as with `report_finding`.
+    for tools in [None, Some(vec!["*".to_string()])] {
+        let _ = run_agent(opts_for(&workspace, tools.clone(), verify_then_stop(&id))).await;
+        assert!(
+            recorded_verification(&workspace, &id).is_none(),
+            "tools {tools:?} must not grant finding.verify"
+        );
+    }
+}
+
+/// An agent that ALSO runs the coverage harness (`concerns:`).
+fn concerns_opts_for(
+    workspace: &std::path::Path,
+    agent_tools: Option<Vec<String>>,
+    turns: Vec<ScriptedTurn>,
+) -> AgentRunOpts {
+    let mut opts = opts_for(workspace, agent_tools, turns);
+    opts.concerns = Some(rupu_coverage::ConcernsBlock {
+        entries: vec![rupu_coverage::ConcernsEntry::Include(
+            rupu_coverage::IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: rupu_coverage::CatalogMode::Auto,
+                filter: None,
+            },
+        )],
+    });
+    opts
+}
+
+#[tokio::test]
+async fn a_concerns_agent_holds_finding_verify_only_when_it_lists_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let id = seed_other_runs_finding(&workspace);
+
+    // The coverage bundle brings `report_finding` and the coverage tools, but
+    // not a verdict: without the `tools:` entry the call finds no such tool.
+    run_agent(concerns_opts_for(
+        &workspace,
+        Some(vec!["read_file".to_string()]),
+        verify_then_stop(&id),
+    ))
+    .await
+    .expect("agent run should succeed");
+    assert!(
+        recorded_verification(&workspace, &id).is_none(),
+        "a concerns agent must not auto-hold finding.verify"
+    );
+
+    // Listing it grants it, against the SAME ledger the bundle writes to.
+    run_agent(concerns_opts_for(
+        &workspace,
+        Some(vec!["finding.verify".to_string()]),
+        verify_then_stop(&id),
+    ))
+    .await
+    .expect("agent run should succeed");
+    let v = recorded_verification(&workspace, &id).expect("a verdict was recorded");
+    assert_eq!(v.status, rupu_coverage::VerificationStatus::Confirmed);
+    assert_eq!(v.by_run.as_deref(), Some("run_findings_test"));
+    assert_eq!(v.by_agent.as_deref(), Some("net-assessor"));
+}

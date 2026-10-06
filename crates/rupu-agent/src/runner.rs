@@ -1873,25 +1873,37 @@ async fn run_agent_inner(
     // coverage tools do — the grant list gates the six builtins, and these
     // are registered on top of it.
     //
-    // `finding.verify` follows the same model: a verifier run that records a
-    // verdict on another run's finding needs the ledger but no concern
-    // catalog, and gets the tool only by listing it in `tools:`.
+    // `finding.verify` follows the same model, with one difference: it is
+    // independent of the concerns block. A verifier that records a verdict on
+    // another run's finding needs the ledger but no concern catalog, and a
+    // `concerns:` agent does NOT hold it either — it is granted only by an
+    // exact `finding.verify` entry in `tools:` (so `tools:` absent or `["*"]`
+    // grants nothing), whether or not the agent runs the coverage harness.
     let lists_tool = |name: &str| {
         opts.agent_tools
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name))
     };
     let standalone_report = coverage.is_none() && lists_tool("report_finding");
-    let standalone_verify = coverage.is_none() && lists_tool("finding.verify");
-    if standalone_report || standalone_verify {
-        let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
-        let target = target_id(&opts.workspace_path, scope);
-        let paths = CoveragePaths::new(&opts.workspace_path, &target)
-            .with_run_stream(run_stream_for(&opts.tool_context, scope));
-        paths
-            .ensure_dir()
-            .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
-        if standalone_verify {
+    let want_verify = lists_tool("finding.verify");
+    if standalone_report || want_verify {
+        // A concerns agent's ledger is the bundle's own (same scope, target
+        // id and run stream, directory already ensured); otherwise it is
+        // built here the same way.
+        let paths = match coverage.as_ref() {
+            Some(bundle) => bundle.paths.clone(),
+            None => {
+                let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
+                let target = target_id(&opts.workspace_path, scope);
+                let paths = CoveragePaths::new(&opts.workspace_path, &target)
+                    .with_run_stream(run_stream_for(&opts.tool_context, scope));
+                paths
+                    .ensure_dir()
+                    .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
+                paths
+            }
+        };
+        if want_verify {
             registry.insert(
                 "finding.verify",
                 std::sync::Arc::new(coverage_tools::FindingVerifyTool::new(paths.clone())),

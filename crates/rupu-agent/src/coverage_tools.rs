@@ -342,9 +342,10 @@ pub struct FindingVerifyTool {
 }
 
 impl FindingVerifyTool {
-    /// Build the tool against an explicit ledger location. `register` wires
-    /// it into the coverage harness; `runner` registers it for an agent that
-    /// lists `finding.verify` in `tools:` and has no `concerns:` block.
+    /// Build the tool against an explicit ledger location. It is never part
+    /// of the coverage bundle (`register` does not add it): `runner`
+    /// registers it only for an agent that lists `finding.verify` in
+    /// `tools:`, with or without a `concerns:` block.
     pub fn new(paths: CoveragePaths) -> Self {
         Self { paths }
     }
@@ -780,10 +781,6 @@ pub fn register(
         }),
     );
     registry.insert(
-        "finding.verify",
-        Arc::new(FindingVerifyTool::new(paths.clone())),
-    );
-    registry.insert(
         "report_finding",
         Arc::new(ReportFindingTool::new(paths, findings)),
     );
@@ -1118,7 +1115,7 @@ mod finding_verify_tests {
     }
 
     #[test]
-    fn the_coverage_bundle_registers_the_tool_beside_report_finding() {
+    fn the_coverage_bundle_registers_report_finding_but_not_finding_verify() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut registry = crate::tool_registry::ToolRegistry::new();
         register(
@@ -1132,7 +1129,8 @@ mod finding_verify_tests {
             FindingWriteOptions::default(),
         );
         let names = registry.known_tools();
-        assert!(names.iter().any(|n| n == "finding.verify"), "{names:?}");
         assert!(names.iter().any(|n| n == "report_finding"), "{names:?}");
+        // A verdict is an explicit `tools:` grant, never part of the bundle.
+        assert!(!names.iter().any(|n| n == "finding.verify"), "{names:?}");
     }
 }
