@@ -4,7 +4,7 @@
 //! render time (spec §6.2), so a dataset that arrives late improves
 //! every historical record with no backfill.
 
-use crate::record::{CaptureState, FlowId, FlowRecord, LedgerLine, Outcome};
+use crate::record::{CaptureState, FlowRecord, Outcome};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -29,60 +29,18 @@ pub fn read_flows_and_dropped(path: &Path) -> std::io::Result<(Vec<FlowRecord>, 
         Err(e) => return Err(e),
     };
 
+    let mut fold = super::fold::LedgerFold::default();
     let mut flows: Vec<FlowRecord> = Vec::new();
-    let mut index: HashMap<FlowId, usize> = HashMap::new();
     let mut dropped = 0u64;
-
     for line in BufReader::new(file).lines() {
         let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(parsed) = serde_json::from_str::<LedgerLine>(&line) else {
-            continue;
-        };
-        match parsed {
-            LedgerLine::Flow(f) => {
-                index.insert(f.id, flows.len());
-                flows.push(*f);
-            }
-            LedgerLine::Complete {
-                id,
-                bytes_in,
-                duration_ms,
-            } => {
-                if let Some(&i) = index.get(&id) {
-                    flows[i].bytes_in = Some(bytes_in);
-                    flows[i].duration_ms = Some(duration_ms);
-                    flows[i].body_complete = true;
-                }
-            }
-            LedgerLine::SocketComplete(c) => {
-                if let Some(&i) = index.get(&c.id) {
-                    if let Some(b) = c.bytes_in {
-                        flows[i].bytes_in = Some(b);
-                    }
-                    if let Some(b) = c.bytes_out {
-                        flows[i].bytes_out = Some(b);
-                    }
-                    if let Some(o) = c.outcome {
-                        flows[i].outcome = o;
-                    }
-                    if c.error.is_some() {
-                        flows[i].error = c.error;
-                    }
-                    flows[i].duration_ms = Some(c.duration_ms);
-                    flows[i].body_complete = true;
-                }
-            }
-            LedgerLine::Dropped { count, .. } => {
-                dropped += count;
-            }
-            // Capture-availability lines carry no flow data.
-            LedgerLine::Capture { .. } => {}
+        match fold.feed_line(&line) {
+            Some(super::fold::FoldEvent::Flow(f)) => flows.push(*f),
+            Some(super::fold::FoldEvent::Patch { index, patch }) => patch.apply(&mut flows[index]),
+            Some(super::fold::FoldEvent::Dropped(n)) => dropped += n,
+            Some(super::fold::FoldEvent::Capture(_)) | None => {}
         }
     }
-
     Ok((flows, dropped))
 }
 
@@ -128,6 +86,7 @@ pub fn read_capture_states(path: &Path) -> std::io::Result<Vec<CaptureEntry>> {
         Err(e) => return Err(e),
     };
     let mut out = Vec::new();
+    let mut fold = super::fold::LedgerFold::default();
     for line in BufReader::new(file).lines() {
         let line = line?;
         // Cheap pre-filter: only `capture` lines carry this exact quoted
@@ -135,19 +94,8 @@ pub fn read_capture_states(path: &Path) -> std::io::Result<Vec<CaptureEntry>> {
         if !line.contains("\"capture\"") {
             continue;
         }
-        if let Ok(LedgerLine::Capture {
-            ts,
-            state,
-            tool_call_id,
-            note,
-        }) = serde_json::from_str::<LedgerLine>(&line)
-        {
-            out.push(CaptureEntry {
-                ts,
-                state,
-                tool_call_id,
-                note,
-            });
+        if let Some(super::fold::FoldEvent::Capture(entry)) = fold.feed_line(&line) {
+            out.push(entry);
         }
     }
     Ok(out)
@@ -433,7 +381,7 @@ pub fn graph_view(flows: &[(String, FlowRecord)]) -> GraphView {
 mod tests {
     use super::*;
     use crate::ctx::{FlowCtx, Origin};
-    use crate::record::{Fidelity, Outcome};
+    use crate::record::{Fidelity, FlowId, LedgerLine, Outcome};
 
     fn flow(id: u64, host: &str, run: Option<&str>, ms: u64, ok: bool) -> FlowRecord {
         FlowRecord {
