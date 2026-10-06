@@ -5,7 +5,8 @@
 //! `target_id(workspace, scope_name)`, de-duplicated (findings by id, every
 //! other ledger by exact record equality — asset lines by how many times each
 //! line occurs, since the store folds last-line-wins and a state may
-//! legitimately recur), and — when the unit ran on another machine — its
+//! legitimately recur; tag events by event id, into the workspace-wide tag
+//! log whatever their scope), and — when the unit ran on another machine — its
 //! finding artifacts are recorded `stored: external` with that host, since
 //! their blobs live in the host's store, not this one.
 
@@ -54,6 +55,8 @@ pub enum IngestError {
     Assets(#[from] AssetStoreError),
     #[error("coverage ingest catalog snapshot: {0}")]
     Catalog(String),
+    #[error("coverage ingest tag log: {0}")]
+    Tags(#[from] crate::ledger::tags::TagError),
 }
 
 /// Keys already present in one target's ledgers.
@@ -177,10 +180,18 @@ pub fn ingest_unit_stream(
         return Ok(report);
     }
 
+    let mut tag_events = Vec::new();
     let mut targets: BTreeMap<String, (CoveragePaths, Seen)> = BTreeMap::new();
     for line in lines {
+        let line = match line {
+            StreamLine::Tags { record, .. } => {
+                tag_events.push(record);
+                continue;
+            }
+            other => other,
+        };
         let scope = match &line {
-            StreamLine::Begin { .. } => continue,
+            StreamLine::Begin { .. } | StreamLine::Tags { .. } => continue,
             StreamLine::Runs { scope_name, .. }
             | StreamLine::Files { scope_name, .. }
             | StreamLine::Concerns { scope_name, .. }
@@ -198,7 +209,7 @@ pub fn ingest_unit_stream(
         }
         let (paths, seen) = targets.get_mut(&scope).expect("inserted above");
         let fresh = match line {
-            StreamLine::Begin { .. } => continue,
+            StreamLine::Begin { .. } | StreamLine::Tags { .. } => continue,
             StreamLine::Runs { record, .. } => {
                 append_unseen(paths, Ledger::Runs, &mut seen.runs, &record)?
             }
@@ -235,6 +246,12 @@ pub fn ingest_unit_stream(
             report.duplicates += 1;
         }
     }
+    let (appended, duplicates) = crate::ledger::tags::ingest_tag_events(
+        &crate::ledger::tags::TagLog::for_workspace(workspace),
+        tag_events,
+    )?;
+    report.appended += appended;
+    report.duplicates += duplicates;
     Ok(report)
 }
 
@@ -625,5 +642,70 @@ mod tests {
         let tid = target_id(ws.path(), "sec");
         let got = crate::read_snapshot(&CoveragePaths::new(ws.path(), &tid).catalog).unwrap();
         assert_eq!(got, catalog);
+    }
+
+    fn tag_event(id: &str, finding_id: &str, tag: &str) -> crate::ledger::tags::TagEvent {
+        crate::ledger::tags::TagEvent {
+            id: id.into(),
+            finding_id: finding_id.into(),
+            op: crate::ledger::tags::TagOp::Add,
+            tag: crate::ledger::tags::Tag::parse(tag).unwrap(),
+            by: crate::ledger::tags::TagActor::Operator(crate::ledger::tags::OperatorAttribution {
+                user: "u".into(),
+                via: crate::ledger::tags::OperatorSurface::Cli,
+            }),
+            at: Utc::now(),
+        }
+    }
+
+    fn tagged_stream() -> Vec<u8> {
+        [
+            serde_json::to_string(&StreamLine::Begin {
+                v: STREAM_VERSION,
+                run_id: "r".into(),
+            })
+            .unwrap(),
+            serde_json::to_string(&StreamLine::Findings {
+                scope_name: "unit".into(),
+                record: finding("fnd_1", false),
+            })
+            .unwrap(),
+            // Tagged under a different scope than its finding: tags route by workspace.
+            serde_json::to_string(&StreamLine::Tags {
+                scope_name: "other-agent".into(),
+                record: tag_event("tge_1", "fnd_1", "needs-poc"),
+            })
+            .unwrap(),
+            serde_json::to_string(&StreamLine::Tags {
+                scope_name: "other-agent".into(),
+                record: tag_event("tge_2", "fnd_orphan", "x"),
+            })
+            .unwrap(),
+        ]
+        .join("\n")
+        .into_bytes()
+    }
+
+    #[test]
+    fn tag_lines_merge_into_the_workspace_log_once() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let r1 = ingest_unit_stream(ws.path(), &IngestSource::default(), &tagged_stream()).unwrap();
+        assert_eq!(r1.appended, 3);
+        assert_eq!(r1.malformed, 0);
+        let all = crate::ledger::tags::read_workspace_findings(ws.path()).unwrap();
+        let f = all.iter().find(|r| r.id == "fnd_1").unwrap();
+        assert_eq!(
+            f.tags,
+            vec![crate::ledger::tags::Tag::parse("needs-poc").unwrap()]
+        );
+
+        let log = crate::ledger::tags::TagLog::for_workspace(ws.path());
+        let before = std::fs::read(&log.path).unwrap();
+        let r2 = ingest_unit_stream(ws.path(), &IngestSource::default(), &tagged_stream()).unwrap();
+        assert_eq!(r2.appended, 0);
+        assert_eq!(r2.duplicates, 3);
+        assert_eq!(std::fs::read(&log.path).unwrap(), before);
+        // The orphan is kept, waiting for its finding.
+        assert_eq!(crate::ledger::tags::read_tag_events(&log).unwrap().len(), 2);
     }
 }

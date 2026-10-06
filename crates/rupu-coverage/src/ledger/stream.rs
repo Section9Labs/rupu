@@ -101,6 +101,12 @@ pub enum StreamLine {
         scope_name: String,
         record: FlatCatalog,
     },
+    /// A finding-tag event. Routed by workspace, not by `scope_name`: the
+    /// tag log is workspace-wide (`ledger::tags`).
+    Tags {
+        scope_name: String,
+        record: crate::ledger::tags::TagEvent,
+    },
 }
 
 /// `<runs_root>/<run_id>/coverage.jsonl`.
