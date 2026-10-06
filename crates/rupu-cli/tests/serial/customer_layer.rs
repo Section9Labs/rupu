@@ -83,7 +83,11 @@ async fn the_customer_layer_applies_when_the_project_is_silent() {
         "permission_mode = \"readonly\"\n",
         "",
     );
-    run_writer(tmp.child(".rupu").path(), &project).await;
+    let code = run_writer(tmp.child(".rupu").path(), &project).await;
+    assert!(
+        ok(code),
+        "the run must complete; the write must be denied, not skipped"
+    );
     assert!(
         !project.join("out.txt").exists(),
         "the customer's readonly mode should have denied write_file"
@@ -113,7 +117,11 @@ async fn a_customer_lock_beats_the_project() {
         "permission_mode = \"readonly\"\n[policy]\nlock = [\"permission_mode\"]\n",
         "permission_mode = \"bypass\"\n",
     );
-    run_writer(tmp.child(".rupu").path(), &project).await;
+    let code = run_writer(tmp.child(".rupu").path(), &project).await;
+    assert!(
+        ok(code),
+        "the run must complete; the write must be denied, not skipped"
+    );
     assert!(
         !project.join("out.txt").exists(),
         "the repo config overrode a customer-LOCKED permission_mode"
@@ -130,7 +138,11 @@ async fn a_subdirectory_run_inherits_the_customer() {
     );
     let sub = project.join("src");
     std::fs::create_dir_all(&sub).unwrap();
-    run_writer(tmp.child(".rupu").path(), &sub).await;
+    let code = run_writer(tmp.child(".rupu").path(), &sub).await;
+    assert!(
+        ok(code),
+        "the run must complete; the write must be denied, not skipped"
+    );
     assert!(!sub.join("out.txt").exists() && !project.join("out.txt").exists());
 }
 
@@ -192,7 +204,11 @@ async fn a_repo_without_its_own_rupu_dir_uses_its_customer() {
     .unwrap();
     store.assign("acme", ProjectRef::Path(repo.path())).unwrap();
 
-    run_writer(home.path(), repo.path()).await;
+    let code = run_writer(home.path(), repo.path()).await;
+    assert!(
+        ok(code),
+        "the run must complete; the write must be denied, not skipped"
+    );
     assert!(
         !repo.path().join("out.txt").exists(),
         "the repo's customer (readonly) should have denied write_file"

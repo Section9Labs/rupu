@@ -389,6 +389,16 @@ mod customer_layer_tests {
         std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
         let p = config_paths(&global, Some(&dotted), tmp.path()).unwrap();
         assert_eq!(p.project, None);
+        // A root whose `.rupu` is a symlink to the global dir (canonical
+        // compare, not a textual one).
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias");
+            std::fs::create_dir_all(&alias).unwrap();
+            std::os::unix::fs::symlink(&global, alias.join(".rupu")).unwrap();
+            let p = config_paths(&global, Some(&alias), &alias).unwrap();
+            assert_eq!(p.project, None);
+        }
         // A normal project root still yields its own config.
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(proj.join(".rupu")).unwrap();
