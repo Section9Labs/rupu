@@ -111,7 +111,7 @@ struct PolicyBody {
 /// Writes require an installed `RunLauncher` — the same "is this a `cp
 /// serve` deployment" marker every other write-path gate in this crate uses
 /// (see `api/hosts.rs`'s host-add gate).
-fn require_writable(s: &AppState) -> ApiResult<()> {
+pub(crate) fn require_writable(s: &AppState) -> ApiResult<()> {
     s.launcher
         .as_ref()
         .map(|_| ())

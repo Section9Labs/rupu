@@ -1847,6 +1847,24 @@ export interface RefreshOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+/** A customer's tint: its explicit color, else derived from the slug. */
+export interface TintDto {
+  light: string;
+  dark: string;
+}
+
+/** What a row shows about its customer. */
+export interface CustomerRef {
+  slug: string;
+  name: string;
+  tint: TintDto;
+  archived: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -1864,6 +1882,8 @@ export interface ProjectRow {
   usage: UsageSummary;
   run_count: number;
   last_active?: string | null;
+  /** The project's current customer; `null` = none. */
+  customer: CustomerRef | null;
 }
 
 export interface ProjectDetail {

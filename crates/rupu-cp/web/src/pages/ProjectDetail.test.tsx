@@ -59,6 +59,7 @@ const DETAIL: ProjectDetailType = {
     usage: USAGE,
     run_count: 1,
     last_active: null,
+    customer: null,
   },
   runs: { total: 1, running: 0, by_status: {}, by_surface: { workflow: 1, autoflow: 0 } },
   sessions: { total: 0, active: 0 },

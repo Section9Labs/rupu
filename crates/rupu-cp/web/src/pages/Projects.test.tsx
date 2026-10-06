@@ -36,6 +36,7 @@ const ROWS: ProjectRow[] = [
     created_at: '2026-07-01T00:00:00Z',
     usage: USAGE,
     run_count: 4,
+    customer: null,
   },
 ];
 

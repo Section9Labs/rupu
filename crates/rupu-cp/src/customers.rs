@@ -156,6 +156,85 @@ pub fn attribute(store: &CustomerStore, recorded: Option<&str>, workspace_id: &s
     }
 }
 
+/// A per-request memo over a [`CustomerStore`]: each workspace's current
+/// assignment, and each customer's record, is read at most once however many
+/// rows share it (a legacy run's derived attribution otherwise costs one
+/// sidecar read per row).
+pub struct CustomerLookup {
+    store: CustomerStore,
+    assignments: HashMap<String, Option<String>>,
+    refs: HashMap<String, CustomerRef>,
+}
+
+impl CustomerLookup {
+    pub fn new(store: CustomerStore) -> Self {
+        Self {
+            store,
+            assignments: HashMap::new(),
+            refs: HashMap::new(),
+        }
+    }
+
+    pub fn store(&self) -> &CustomerStore {
+        &self.store
+    }
+
+    /// `ws_id`'s current assignment, as [`attribute`] reads it (a workspace
+    /// id the store rejects reads as unassigned).
+    pub fn assigned(&mut self, ws_id: &str) -> Option<String> {
+        if let Some(hit) = self.assignments.get(ws_id) {
+            return hit.clone();
+        }
+        let slug = attribute(&self.store, None, ws_id).slug;
+        self.assignments.insert(ws_id.to_string(), slug.clone());
+        slug
+    }
+
+    /// [`attribute`], memoized per workspace id.
+    pub fn attribute(&mut self, recorded: Option<&str>, workspace_id: &str) -> Attribution {
+        if let Some(slug) = recorded {
+            return Attribution {
+                slug: Some(slug.to_string()),
+                derived: false,
+            };
+        }
+        let slug = self.assigned(workspace_id);
+        Attribution {
+            derived: slug.is_some(),
+            slug,
+        }
+    }
+
+    /// The row reference for `slug`. A slug whose customer record is gone or
+    /// unreadable (a dangling assignment) still shows, named by its slug —
+    /// never as "no customer".
+    pub fn customer_ref(&mut self, slug: &str) -> CustomerRef {
+        if let Some(hit) = self.refs.get(slug) {
+            return hit.clone();
+        }
+        let r = match self.store.get(slug) {
+            Ok(c) => customer_ref(&c),
+            Err(e) => {
+                tracing::debug!(customer = slug, error = %e, "customer record unavailable");
+                CustomerRef {
+                    slug: slug.to_string(),
+                    name: slug.to_string(),
+                    tint: tint_for(slug, None),
+                    archived: false,
+                }
+            }
+        };
+        self.refs.insert(slug.to_string(), r.clone());
+        r
+    }
+
+    /// The customer a project is currently assigned to, as a row reference.
+    pub fn project_customer(&mut self, ws_id: &str) -> Option<CustomerRef> {
+        let slug = self.assigned(ws_id)?;
+        Some(self.customer_ref(&slug))
+    }
+}
+
 /// `(global config.toml mtime, customer config.toml mtime)`; `None` = absent.
 type Stamps = (Option<SystemTime>, Option<SystemTime>);
 
@@ -376,6 +455,36 @@ mod tests {
         // A workspace id the store rejects never fails a listing.
         let a = attribute(&store, None, "../weird id");
         assert_eq!((a.slug, a.derived), (None, false));
+    }
+
+    #[test]
+    fn lookup_memoizes_and_matches_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = assigned_store(tmp.path());
+        let mut lookup = CustomerLookup::new(store.clone());
+
+        for (recorded, ws) in [
+            (Some("zed"), "ws_assigned"),
+            (None, "ws_assigned"),
+            (None, "ws_unassigned"),
+            (None, "../weird id"),
+        ] {
+            assert_eq!(
+                lookup.attribute(recorded, ws),
+                attribute(&store, recorded, ws)
+            );
+        }
+
+        // Memoized: removing the sidecar does not change this request's view.
+        std::fs::remove_file(tmp.path().join("workspaces/ws_assigned.customer")).unwrap();
+        assert_eq!(lookup.assigned("ws_assigned").as_deref(), Some("acme"));
+        assert_eq!(CustomerLookup::new(store).assigned("ws_assigned"), None);
+
+        let r = lookup.project_customer("ws_assigned").unwrap();
+        assert_eq!((r.slug.as_str(), r.name.as_str()), ("acme", "Acme"));
+        // A dangling slug still shows, named by its slug.
+        let d = lookup.customer_ref("gone");
+        assert_eq!((d.slug.as_str(), d.name.as_str()), ("gone", "gone"));
     }
 
     const GLOBAL_TOML: &str = "";

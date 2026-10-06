@@ -10,6 +10,7 @@ mod autoflows;
 mod bucket_e2e;
 mod common;
 mod coverage;
+mod customers;
 mod dashboard;
 mod embed;
 mod endpoints;

@@ -13,6 +13,10 @@ pub struct AppState {
     pub workspace_dir: PathBuf,
     pub run_store: Arc<RunStore>,
     pub pricing: rupu_config::PricingConfig,
+    /// Pricing per customer (global + that customer's layer), cached per slug
+    /// and re-validated by the config files' mtimes — what customer rollups
+    /// price a run with (plan ruling 9).
+    pub customer_pricing: Arc<crate::customers::CustomerPricing>,
     /// The resolved global config snapshot, reloaded after a config write so
     /// newly-started runs see updated values. Read via `config.read()`.
     pub config: Arc<RwLock<rupu_config::Config>>,
@@ -129,11 +133,17 @@ impl AppState {
 
         let config = Arc::new(RwLock::new(Self::resolve_global_config(&global_dir)));
 
+        let customer_pricing = Arc::new(crate::customers::CustomerPricing::new(
+            global_dir.clone(),
+            pricing.clone(),
+        ));
+
         Self {
             global_dir,
             workspace_dir,
             run_store,
             pricing,
+            customer_pricing,
             config,
             launcher: None,
             session_sender: None,

@@ -4,6 +4,7 @@ pub mod autoflows;
 pub mod code;
 pub mod config;
 pub mod coverage;
+pub mod customers;
 pub mod dashboard;
 pub mod events;
 pub mod findings;

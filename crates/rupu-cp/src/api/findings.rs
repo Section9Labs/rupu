@@ -294,10 +294,18 @@ fn project_name(path: &str) -> String {
 /// is skipped with a `warn!` rather than failing the caller.
 fn each_ledger(
     global_dir: &std::path::Path,
-    mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+    f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
 ) {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
-    for w in &workspaces {
+    each_ledger_in(&workspaces, f);
+}
+
+/// [`each_ledger`] over the given workspaces only.
+fn each_ledger_in(
+    workspaces: &[rupu_workspace::Workspace],
+    mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+) {
+    for w in workspaces {
         let wp = std::path::Path::new(&w.path);
         let targets = match discover_targets(wp) {
             Ok(t) => t,
@@ -336,6 +344,20 @@ fn each_ledger(
             f(w, &t.target_id, paths, records);
         }
     }
+}
+
+/// Finding counts per workspace id, over `workspaces` only — the same walk
+/// (and the same tolerance) as [`collect_all_findings`], without building
+/// the per-finding DTOs. Every finding counts as open, exactly as
+/// `count_open_findings` (`host/local.rs`) counts them.
+pub(crate) fn count_findings_by_workspace(
+    workspaces: &[rupu_workspace::Workspace],
+) -> HashMap<String, u64> {
+    let mut out: HashMap<String, u64> = HashMap::new();
+    each_ledger_in(workspaces, |w, _, _, records| {
+        *out.entry(w.id.clone()).or_default() += records.len() as u64;
+    });
+    out
 }
 
 /// Collect every finding across every registered workspace's coverage
