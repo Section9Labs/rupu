@@ -301,7 +301,7 @@ struct FindingRecordWire {
     #[serde(default)]
     report: Option<serde_json::Value>,
     #[serde(default)]
-    tags: Vec<String>,
+    tags: Option<Vec<serde_json::Value>>,
 }
 
 impl From<FindingRecordWire> for FindingRecord {
@@ -342,12 +342,19 @@ impl From<FindingRecordWire> for FindingRecord {
 }
 
 /// Declared tags as read from a ledger line: a tag this build cannot read
-/// (a newer writer's syntax, a hand edit) is dropped with a warning naming
+/// (a newer writer's syntax, a non-string entry, a hand edit) is dropped with a warning naming
 /// the finding, never the whole line. Deduped and sorted.
-fn lenient_tags(finding_id: &str, raw: Vec<String>) -> Vec<crate::ledger::tags::Tag> {
+fn lenient_tags(
+    finding_id: &str,
+    raw: Option<Vec<serde_json::Value>>,
+) -> Vec<crate::ledger::tags::Tag> {
     let mut set = std::collections::BTreeSet::new();
-    for r in raw {
-        match crate::ledger::tags::Tag::parse(&r) {
+    for r in raw.unwrap_or_default() {
+        let parsed = match r.as_str() {
+            Some(s) => crate::ledger::tags::Tag::parse(s).map_err(|e| e.to_string()),
+            None => Err(format!("not a string: {r}")),
+        };
+        match parsed {
             Ok(t) => {
                 set.insert(t);
             }
@@ -600,5 +607,15 @@ mod tests {
             serde_json::from_str(&finding_line(",\"tags\":[\"ok\",\"not ok\"]")).unwrap();
         let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
         assert_eq!(tags, ["ok"]);
+    }
+
+    #[test]
+    fn a_non_string_tag_entry_or_null_tags_never_fails_the_line() {
+        let rec: FindingRecord =
+            serde_json::from_str(&finding_line(",\"tags\":[\"ok\",5,{\"x\":1}]")).unwrap();
+        let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
+        assert_eq!(tags, ["ok"]);
+        let rec: FindingRecord = serde_json::from_str(&finding_line(",\"tags\":null")).unwrap();
+        assert!(rec.tags.is_empty());
     }
 }
