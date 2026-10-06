@@ -83,7 +83,10 @@ pub struct Scope {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScopeRoot {
-    /// Profile-namespaced root kind, e.g. "network:scope" / "web:target".
+    /// A ROOT asset kind of an active profile (`parent == None`), e.g.
+    /// "network:host" / "web:site" / "code:repo". Profiles are the mode of
+    /// work and carry no scope/target kind; the concrete coordinates below are
+    /// the agentiflow's own, agnostic to the profile.
     pub kind: String,
     /// Remaining keys are the root kind's coordinates/attributes, captured opaquely.
     #[serde(flatten)]
