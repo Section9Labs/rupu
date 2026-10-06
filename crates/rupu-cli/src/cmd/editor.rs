@@ -80,10 +80,9 @@ fn config_editor() -> Option<String> {
     let global = crate::paths::global_dir().ok()?;
     let pwd = std::env::current_dir().ok()?;
     let project_root = crate::paths::project_root_for(&pwd).ok().flatten();
-    let cfg_paths = crate::paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // `[ui].editor` is spawned as a subprocess by `open_for_edit` above — it
     // is policy-bearing (I-7), not a display preference, so a locked global
     // value must survive a conflicting project config.
-    let cfg = rupu_config::layer_files_locked(cfg_paths.layers()).ok()?;
+    let cfg = crate::paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
     cfg.ui.editor
 }

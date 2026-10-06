@@ -192,8 +192,12 @@ pub fn prefs_for_diag(no_color: bool) -> UiPrefs {
                 .ok();
             };
             let project_root = paths::project_root_for(&pwd).ok().flatten();
-            let cfg_paths = paths::config_paths_for_display(&g, project_root.as_deref(), &pwd);
-            rupu_config::layer_files(cfg_paths.layers()).ok()
+            Some(paths::load_config_for_display(
+                &g,
+                project_root.as_deref(),
+                &pwd,
+                false,
+            ))
         })
         .unwrap_or_default();
     UiPrefs::resolve(&cfg.ui, no_color, None, None, None)

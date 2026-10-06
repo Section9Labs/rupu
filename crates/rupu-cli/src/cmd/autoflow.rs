@@ -1410,25 +1410,32 @@ pub async fn handle(
     // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
     // an `AccountSpec` to reach `get`'s near-expiry refresh branch, and
     // autoflow subcommands (`autoflow serve` chief among them) are
-    // long-lived. Best-effort global+cwd-project config, matching
-    // `resolve_config`'s own shape — this is only the resolver's
-    // account roster; which repo's config a given polling *source*
-    // discovers against deeper in the call graph is the separate,
-    // deliberately-untouched per-source `Registry::discover` question.
-    let cfg = paths::global_dir()
-        .ok()
-        .map(|global| {
-            let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let project_root = paths::project_root_for(&pwd).ok().flatten();
-            resolve_config(&global, project_root.as_deref()).unwrap_or_default()
-        })
-        .unwrap_or_default();
+    // long-lived. Global + cwd customer + cwd project config — this is
+    // only the resolver's account roster; which repo's config a given
+    // polling *source* discovers against deeper in the call graph is the
+    // separate, deliberately-untouched per-source `Registry::discover`
+    // question. Strict: the roster decides which accounts resolve, so a
+    // broken customer layer fails the command rather than silently
+    // dropping every declared account.
+    let cfg = match autoflow_resolver_config() {
+        Ok(cfg) => cfg,
+        Err(e) => return crate::output::diag::fail(e),
+    };
     let resolver: Arc<dyn CredentialResolver> = Arc::new(crate::accounts::resolver_for(&cfg));
     let result = handle_with_resolver(action, resolver, global_format, absolute, all_columns).await;
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
     }
+}
+
+/// The config behind `handle`'s credential resolver (see there).
+fn autoflow_resolver_config() -> anyhow::Result<Config> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = paths::project_root_for(&pwd).ok().flatten();
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
 }
 
 async fn handle_with_resolver(
@@ -1840,7 +1847,7 @@ async fn serve(
     quiet: bool,
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
-    let cfg = autoflow_ui_config().unwrap_or_default();
+    let cfg = autoflow_ui_config();
     let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, view);
     let view_mode = prefs.live_view;
     let repo_filter = normalize_repo_filter(repo)?;
@@ -4115,9 +4122,7 @@ fn retained_serve_ui_prefs() -> UiPrefs {
     let cfg = match (global.as_ref(), pwd.as_deref()) {
         // UI prefs only — lock does not apply (I-7)
         (Some(global_dir), Some(pwd)) => {
-            let cfg_paths =
-                paths::config_paths_for_display(global_dir, project_root.as_deref(), pwd);
-            rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default()
+            paths::load_config_for_display(global_dir, project_root.as_deref(), pwd, false)
         }
         (Some(global_dir), None) => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
             &global_dir.join("config.toml"),
@@ -4770,9 +4775,8 @@ async fn monitor(
         .to_std()
         .map_err(|_| anyhow!("monitor interval must be non-negative"))?;
     let repo_filter = normalize_repo_filter(repo)?;
-    let live_view_mode = autoflow_ui_config()
-        .map(|cfg| UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view)
-        .unwrap_or(view.unwrap_or(LiveViewMode::Focused));
+    let live_view_mode =
+        UiPrefs::resolve(&autoflow_ui_config().ui, false, None, None, view).live_view;
 
     if !watch {
         let report = build_monitor_report(repo_filter.as_deref(), worker)?;
@@ -4921,9 +4925,8 @@ async fn history(
         repo_filter: repo_filter.as_deref(),
         ..query
     };
-    let live_view_mode = autoflow_ui_config()
-        .map(|cfg| UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view)
-        .unwrap_or(view.unwrap_or(LiveViewMode::Focused));
+    let live_view_mode =
+        UiPrefs::resolve(&autoflow_ui_config().ui, false, None, None, view).live_view;
 
     if !watch {
         let report = build_history_report(&query)?;
@@ -7786,22 +7789,24 @@ fn truncate_text(value: &str, max: usize) -> String {
 }
 
 fn autoflow_pricing_config() -> rupu_config::PricingConfig {
-    autoflow_ui_config()
-        .map(|cfg| cfg.pricing)
-        .unwrap_or_default()
+    autoflow_ui_config().pricing
 }
 
-fn autoflow_ui_config() -> anyhow::Result<Config> {
-    let global = paths::global_dir()?;
-    let Ok(pwd) = std::env::current_dir() else {
-        return Ok(Config::default());
+/// Display-only config (UI prefs, pricing) for the cwd: never fails, a
+/// broken layer is logged (see [`paths::load_config_for_display`]).
+fn autoflow_ui_config() -> Config {
+    let Ok(global) = paths::global_dir() else {
+        return Config::default();
     };
-    let project_root = paths::project_root_for(&pwd)?;
-    resolve_config(&global, project_root.as_deref())
+    let Ok(pwd) = std::env::current_dir() else {
+        return Config::default();
+    };
+    let project_root = paths::project_root_for(&pwd).ok().flatten();
+    paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true)
 }
 
 fn autoflow_ui_prefs() -> anyhow::Result<UiPrefs> {
-    let cfg = autoflow_ui_config().unwrap_or_default();
+    let cfg = autoflow_ui_config();
     Ok(UiPrefs::resolve(&cfg.ui, false, None, None, None))
 }
 
@@ -9479,7 +9484,7 @@ fn visible_autoflows() -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
     let mut out = Vec::new();
 
     if let Some(project_root) = &project_root {
-        let cfg = resolve_config(&global, Some(project_root))?;
+        let cfg = resolve_config_in(&global, Some(project_root), &pwd)?;
         let repo_ref = cfg.autoflow.repo.clone().or_else(|| {
             autodetect_repo_from_path(project_root)
                 .ok()
@@ -9600,6 +9605,20 @@ pub(crate) fn discover_tick_autoflows(
     global: &Path,
     repo_store: &RepoRegistryStore,
 ) -> anyhow::Result<Vec<ResolvedAutoflowWorkflow>> {
+    // Skips are logged by `record_repo_config_skip`; callers that keep an
+    // autoflow history use `discover_tick_autoflows_reporting`.
+    discover_tick_autoflows_reporting(global, repo_store, &mut Vec::new())
+}
+
+/// [`discover_tick_autoflows`], also returning (in `skips`) each tracked
+/// repo left out because its config failed to load — one broken repo (a
+/// dangling customer assignment, a malformed layer) never stops discovery
+/// for the others.
+pub(crate) fn discover_tick_autoflows_reporting(
+    global: &Path,
+    repo_store: &RepoRegistryStore,
+    skips: &mut Vec<RepoConfigSkip>,
+) -> anyhow::Result<Vec<ResolvedAutoflowWorkflow>> {
     let mut out = Vec::new();
     let global_cfg = resolve_config(global, None)?;
     if global_cfg.autoflow.enabled.unwrap_or(true) {
@@ -9642,7 +9661,13 @@ pub(crate) fn discover_tick_autoflows(
         let Some(project_root) = project_root else {
             continue;
         };
-        let cfg = resolve_config(global, Some(&project_root))?;
+        let cfg = match resolve_config_in(global, Some(&project_root), &preferred_checkout) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                record_repo_config_skip(skips, &tracked.repo_ref, &e);
+                continue;
+            }
+        };
         if cfg.autoflow.enabled == Some(false) {
             continue;
         }
@@ -10964,6 +10989,7 @@ pub(crate) async fn execute_autoflow_cycle(
         ExplicitWorkflowRunContext {
             project_root: resolved.project_root.clone(),
             workspace_path,
+            customer_dir: None,
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
@@ -11699,7 +11725,7 @@ pub(crate) fn resolve_autoflow_workflow_for_repo(
     let preferred_checkout = PathBuf::from(&tracked.preferred_path);
     let project_root =
         paths::project_root_for(&preferred_checkout)?.or_else(|| Some(preferred_checkout.clone()));
-    let cfg = resolve_config(global, project_root.as_deref())?;
+    let cfg = resolve_config_in(global, project_root.as_deref(), &preferred_checkout)?;
     let workflow_path = locate_workflow_in(global, project_root.as_deref(), name)?;
     resolve_autoflow_from_path(
         global,
@@ -11756,7 +11782,7 @@ pub(crate) async fn execute_pending_dispatch_workflow(
     let preferred_checkout = PathBuf::from(&tracked.preferred_path);
     let project_root =
         paths::project_root_for(&preferred_checkout)?.or_else(|| Some(preferred_checkout.clone()));
-    let cfg = resolve_config(global, project_root.as_deref())?;
+    let cfg = resolve_config_in(global, project_root.as_deref(), &preferred_checkout)?;
     let workspace_path = claim
         .worktree_path
         .as_deref()
@@ -11785,6 +11811,7 @@ pub(crate) async fn execute_pending_dispatch_workflow(
         ExplicitWorkflowRunContext {
             project_root,
             workspace_path,
+            customer_dir: None,
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
@@ -11906,7 +11933,7 @@ fn resolve_visible_autoflow_workflow(
         .clone()
         .or_else(|| entry.project_root.clone())
         .ok_or_else(|| anyhow!("autoflow `{}` is missing a preferred checkout", entry.name))?;
-    let cfg = resolve_config(global, entry.project_root.as_deref())?;
+    let cfg = resolve_config_in(global, entry.project_root.as_deref(), &preferred_checkout)?;
     resolve_autoflow_from_path(
         global,
         entry.workflow_path.clone(),
@@ -11973,17 +12000,51 @@ fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Valu
 }
 
 /// Global + customer + project config for `project_root`, strictly (a
-/// dangling customer assignment is an error). With no project this serves
-/// no project, so it reads the global file alone.
+/// dangling customer assignment is an error), with the customer looked up
+/// from `project_root` itself. With no project this serves no project, so it
+/// reads the global file alone. Prefer [`resolve_config_in`] wherever the
+/// repo's own directory is known.
 fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<Config> {
     match project_root {
-        Some(root) => {
-            let cfg_paths = paths::config_paths(global, Some(root), root)?;
-            Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
-        }
+        Some(root) => resolve_config_in(global, Some(root), root),
         None => Ok(rupu_config::layer_files_locked(
             rupu_config::LayerPaths::global_only(&global.join("config.toml")),
         )?),
+    }
+}
+
+/// [`resolve_config`] with the customer looked up from `run_dir` (a tracked
+/// repo's checkout, the cwd) first — `project_root_for` resolves to `$HOME`
+/// for a repo without its own `.rupu/`, which would miss the repo's
+/// assignment (see [`paths::config_paths`]).
+fn resolve_config_in(
+    global: &Path,
+    project_root: Option<&Path>,
+    run_dir: &Path,
+) -> anyhow::Result<Config> {
+    let cfg_paths = paths::config_paths(global, project_root, run_dir)?;
+    Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
+}
+
+/// A tracked repo an autoflow tick left out because its config (customer
+/// layer included) failed to load. The tick records each as a
+/// `cycle_failed` event naming the repo, so the skip is visible in the
+/// autoflow history rather than only in a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoConfigSkip {
+    pub(crate) repo_ref: String,
+    pub(crate) error: String,
+}
+
+fn record_repo_config_skip(skips: &mut Vec<RepoConfigSkip>, repo_ref: &str, error: &anyhow::Error) {
+    let error = format!("{error:#}");
+    warn!(repo_ref, error = %error, "skipping tracked repo this cycle: its config failed to load");
+    let skip = RepoConfigSkip {
+        repo_ref: repo_ref.to_string(),
+        error,
+    };
+    if !skips.contains(&skip) {
+        skips.push(skip);
     }
 }
 
@@ -11993,6 +12054,7 @@ pub(crate) fn cleanup_terminal_claims(
     claim_store: &AutoflowClaimStore,
     now: chrono::DateTime<chrono::Utc>,
     repo_filter: Option<&str>,
+    skips: &mut Vec<RepoConfigSkip>,
 ) -> anyhow::Result<usize> {
     let mut cleaned = 0usize;
     for claim in claim_store.list()? {
@@ -12002,8 +12064,15 @@ pub(crate) fn cleanup_terminal_claims(
         if !matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released) {
             continue;
         }
-        let Some(cleanup_after) = cleanup_after_for_claim(global, repo_store, &claim)? else {
-            continue;
+        // A repo whose config fails to load keeps its claims this cycle
+        // (recorded as a skip) — it never stops the other repos' cleanup.
+        let cleanup_after = match cleanup_after_for_claim(global, repo_store, &claim) {
+            Ok(Some(cleanup_after)) => cleanup_after,
+            Ok(None) => continue,
+            Err(e) => {
+                record_repo_config_skip(skips, &claim.repo_ref, &e);
+                continue;
+            }
         };
         if !claim_cleanup_due(&claim, now, cleanup_after)? {
             continue;
@@ -12030,16 +12099,19 @@ fn cleanup_after_for_claim(
     claim: &AutoflowClaimRecord,
 ) -> anyhow::Result<Option<chrono::Duration>> {
     let tracked = repo_store.load(&claim.repo_ref)?;
-    let project_root = tracked
+    let preferred_checkout = tracked
         .as_ref()
-        .and_then(|tracked| PathBuf::from(&tracked.preferred_path).canonicalize().ok())
-        .and_then(|preferred_checkout| {
-            paths::project_root_for(&preferred_checkout)
+        .and_then(|tracked| PathBuf::from(&tracked.preferred_path).canonicalize().ok());
+    let cfg = match preferred_checkout {
+        Some(preferred_checkout) => {
+            let project_root = paths::project_root_for(&preferred_checkout)
                 .ok()
                 .flatten()
-                .or(Some(preferred_checkout))
-        });
-    let cfg = resolve_config(global, project_root.as_deref())?;
+                .unwrap_or_else(|| preferred_checkout.clone());
+            resolve_config_in(global, Some(&project_root), &preferred_checkout)?
+        }
+        None => resolve_config(global, None)?,
+    };
     cfg.autoflow
         .cleanup_after
         .as_deref()
@@ -15505,6 +15577,136 @@ steps:
         let run_store = RunStore::new(global.join("runs"));
         let run = run_store.load(run_id).unwrap();
         assert_eq!(run.workflow_name, "issue-to-spec-and-plan");
+    }
+
+    const MINIMAL_AUTOFLOW_YAML: &str = r#"name: watcher
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#;
+
+    /// One tracked repo with a dangling customer assignment must not stop
+    /// discovery (or terminal-claim cleanup) for the others: the broken repo
+    /// is skipped and reported, the healthy one is discovered.
+    #[test]
+    fn discovery_skips_a_repo_whose_customer_is_dangling_and_keeps_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(&global).unwrap();
+        let good = tmp.path().join("good");
+        let bad = tmp.path().join("bad");
+        write_autoflow_project(
+            &good,
+            "http://127.0.0.1:9",
+            "watcher",
+            MINIMAL_AUTOFLOW_YAML,
+        );
+        write_autoflow_project(&bad, "http://127.0.0.1:9", "watcher", MINIMAL_AUTOFLOW_YAML);
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert("github:acme/good", &good, None, None)
+            .unwrap();
+        repo_store
+            .upsert("github:acme/bad", &bad, None, None)
+            .unwrap();
+
+        let customers = rupu_workspace::CustomerStore::new(&global);
+        customers
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        customers
+            .assign("acme", rupu_workspace::ProjectRef::Path(&bad))
+            .unwrap();
+        std::fs::remove_dir_all(global.join("customers/acme")).unwrap();
+
+        let mut skips = Vec::new();
+        let discovered =
+            discover_tick_autoflows_reporting(&global, &repo_store, &mut skips).unwrap();
+        let repos: Vec<&str> = discovered.iter().map(|r| r.repo_ref.as_str()).collect();
+        assert_eq!(repos, vec!["github:acme/good"]);
+        assert_eq!(skips.len(), 1, "{skips:?}");
+        assert_eq!(skips[0].repo_ref, "github:acme/bad");
+        assert!(
+            skips[0].error.contains("does not exist"),
+            "{}",
+            skips[0].error
+        );
+
+        // Terminal-claim cleanup: the broken repo's claim is skipped and
+        // reported, not a whole-cycle failure.
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:acme/bad/issues/1".into(),
+                repo_ref: "github:acme/bad".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
+                workflow: "watcher".into(),
+                status: ClaimStatus::Complete,
+                worktree_path: None,
+                branch: None,
+                last_run_id: None,
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                artifact_manifest_path: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: None,
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let mut skips = Vec::new();
+        let cleaned = cleanup_terminal_claims(
+            &global,
+            &repo_store,
+            &claim_store,
+            chrono::Utc::now(),
+            None,
+            &mut skips,
+        )
+        .unwrap();
+        assert_eq!(cleaned, 0);
+        assert_eq!(skips.len(), 1, "{skips:?}");
+        assert_eq!(skips[0].repo_ref, "github:acme/bad");
     }
 
     #[tokio::test]

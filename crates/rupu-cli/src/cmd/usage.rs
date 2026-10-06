@@ -252,8 +252,7 @@ fn layered_config(
     project_root: Option<&std::path::Path>,
     run_dir: &std::path::Path,
 ) -> rupu_config::Config {
-    let cfg_paths = paths::config_paths_for_display(global, project_root, run_dir);
-    rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default()
+    paths::load_config_for_display(global, project_root, run_dir, true)
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

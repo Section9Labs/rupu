@@ -328,8 +328,12 @@ fn resolve_watch_pricing() -> rupu_config::PricingConfig {
     let loaded = match std::env::current_dir() {
         Ok(pwd) => {
             let project_root = paths::project_root_for(&pwd).ok().flatten();
-            let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
-            rupu_config::layer_files_locked(cfg_paths.layers())
+            Ok(paths::load_config_for_display(
+                &global,
+                project_root.as_deref(),
+                &pwd,
+                true,
+            ))
         }
         Err(_) => rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
             &global.join("config.toml"),
@@ -349,11 +353,12 @@ fn resolve_watch_prefs(view: Option<LiveViewMode>) -> UiPrefs {
         .map(|global| {
             // UI prefs only — lock does not apply (I-7)
             match pwd.as_deref() {
-                Some(pwd) => {
-                    let cfg_paths =
-                        paths::config_paths_for_display(global, project_root.as_deref(), pwd);
-                    rupu_config::layer_files(cfg_paths.layers())
-                }
+                Some(pwd) => Ok(paths::load_config_for_display(
+                    global,
+                    project_root.as_deref(),
+                    pwd,
+                    false,
+                )),
                 None => rupu_config::layer_files(rupu_config::LayerPaths::global_only(
                     &global.join("config.toml"),
                 )),

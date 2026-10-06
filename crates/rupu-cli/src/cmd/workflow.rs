@@ -1410,10 +1410,7 @@ async fn list(
         // global scope chip for the same name.
         push_yaml_names(&p.join(".rupu/workflows"), "project", &mut by_name);
     }
-    let cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "config");
-        rupu_config::Config::default()
-    });
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None)
         .with_table_flags(absolute, all_columns);
 
@@ -1507,9 +1504,8 @@ async fn show(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default();
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
 
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, view);
     let view_mode = prefs.live_view;
@@ -2654,10 +2650,7 @@ async fn runs(
 
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "config");
-        rupu_config::Config::default()
-    });
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
         .with_table_flags(absolute, all_columns);
 
@@ -2741,8 +2734,8 @@ fn run_cost_usd(
 
 /// Global + customer + project config, strictly: a dangling customer
 /// assignment or a malformed layer is an error. `create --gen-provider`
-/// propagates it (the config picks the provider); the display callers log
-/// it and fall back to defaults.
+/// propagates it (the config picks the provider). Display callers use
+/// [`paths::load_config_for_display`] instead, which logs and degrades.
 fn layered_config_workflow(
     global: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -2882,10 +2875,7 @@ async fn show_run(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = layered_config_workflow(&global, project_root.as_deref(), &pwd).unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "config");
-        rupu_config::Config::default()
-    });
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let runs_dir = global.join("runs");
     let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
@@ -4501,6 +4491,10 @@ pub struct ExecutionWorkerContext {
 pub struct ExplicitWorkflowRunContext {
     pub project_root: Option<PathBuf>,
     pub workspace_path: PathBuf,
+    /// The directory the run was launched from, for the customer lookup,
+    /// when it differs from `workspace_path` — e.g. a run target cloned to
+    /// a temp dir. `None` looks the customer up from `workspace_path`.
+    pub customer_dir: Option<PathBuf>,
     pub workspace_id: String,
     pub inputs: Vec<(String, String)>,
     pub mode: String,
@@ -4919,6 +4913,7 @@ async fn run_with_outcome(
         ExplicitWorkflowRunContext {
             project_root: project_root.clone(),
             workspace_path,
+            customer_dir: Some(pwd.clone()),
             workspace_id: ws.id,
             inputs,
             mode: {
@@ -4995,6 +4990,7 @@ async fn run_path_with_outcome(
         ExplicitWorkflowRunContext {
             project_root,
             workspace_path,
+            customer_dir: None,
             workspace_id: ws.id,
             inputs,
             mode: {
@@ -5516,7 +5512,11 @@ async fn execute_workflow_invocation(
             .and_then(|repo| repo.repo_ref.as_deref()),
     )?;
     let prepared_run = prepare_local_run(&run_envelope, &worker_record.worker_id)?;
-    let cfg_paths = paths::config_paths(&global, ctx.project_root.as_deref(), &ctx.workspace_path)?;
+    let cfg_paths = paths::config_paths(
+        &global,
+        ctx.project_root.as_deref(),
+        ctx.customer_dir.as_deref().unwrap_or(&ctx.workspace_path),
+    )?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 

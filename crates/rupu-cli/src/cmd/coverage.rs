@@ -83,11 +83,12 @@ fn ui_prefs(workspace: &Path) -> UiPrefs {
     let global = crate::paths::global_dir().ok();
     let project_root = crate::paths::project_root_for(workspace).ok().flatten();
     let cfg = match global.as_deref() {
-        Some(global) => {
-            let cfg_paths =
-                crate::paths::config_paths_for_display(global, project_root.as_deref(), workspace);
-            rupu_config::layer_files_locked(cfg_paths.layers())
-        }
+        Some(global) => Ok(crate::paths::load_config_for_display(
+            global,
+            project_root.as_deref(),
+            workspace,
+            true,
+        )),
         // No global dir: no global layer and no customer store to look
         // the customer up in — just the project layer, as before.
         None => {

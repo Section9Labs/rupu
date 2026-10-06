@@ -415,16 +415,10 @@ impl CustomerStore {
     /// project's customer. Errors with [`CustomerError::Dangling`] when the
     /// nearest assignment names a customer that no longer exists — callers
     /// on launch paths must fail the run, never fall back to global config.
+    /// A `dir` that does not exist (a deleted worktree, say) is looked up
+    /// from its nearest existing ancestor.
     pub fn customer_for_dir(&self, dir: &Path) -> Result<Option<String>, CustomerError> {
-        let canonical = match dir.canonicalize() {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(CustomerError::Io {
-                    action: format!("canonicalize {}", dir.display()),
-                    source: e,
-                })
-            }
-        };
+        let canonical = canonicalize_nearest(dir)?;
         // One pass over the records, keyed by canonical path.
         let mut by_path: BTreeMap<PathBuf, String> = BTreeMap::new();
         for ws in self.workspaces().list()? {
@@ -461,6 +455,23 @@ impl CustomerStore {
             .customer_for_dir(dir)?
             .map(|slug| self.config_path(&slug)))
     }
+}
+
+/// `dir` canonicalized, or — when it does not exist — its nearest existing
+/// ancestor canonicalized. Errors only when no ancestor resolves.
+fn canonicalize_nearest(dir: &Path) -> Result<PathBuf, CustomerError> {
+    let first_err = match dir.canonicalize() {
+        Ok(p) => return Ok(p),
+        Err(e) => e,
+    };
+    dir.ancestors()
+        .skip(1)
+        .filter(|a| !a.as_os_str().is_empty())
+        .find_map(|a| a.canonicalize().ok())
+        .ok_or_else(|| CustomerError::Io {
+            action: format!("canonicalize {}", dir.display()),
+            source: first_err,
+        })
 }
 
 /// Temp file + rename, so readers never see a partial file.

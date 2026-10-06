@@ -364,9 +364,8 @@ fn ui_prefs(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(cfg_paths.layers()).unwrap_or_default();
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     Ok(
         crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
             .with_table_flags(absolute, all_columns),
@@ -703,8 +702,7 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg_paths = paths::config_paths_for_display(&global, project_root.as_deref(), &pwd);
-    let cfg = rupu_config::layer_files_locked(cfg_paths.layers()).unwrap_or_default();
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
 
     let workflows = collect_event_workflows()?;
     let cursors_root = global.join("cron-state").join("event-cursors");
