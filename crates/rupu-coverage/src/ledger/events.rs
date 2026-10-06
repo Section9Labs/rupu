@@ -301,7 +301,7 @@ struct FindingRecordWire {
     #[serde(default)]
     report: Option<serde_json::Value>,
     #[serde(default)]
-    tags: Option<Vec<serde_json::Value>>,
+    tags: Option<serde_json::Value>,
 }
 
 impl From<FindingRecordWire> for FindingRecord {
@@ -342,14 +342,24 @@ impl From<FindingRecordWire> for FindingRecord {
 }
 
 /// Declared tags as read from a ledger line: a tag this build cannot read
-/// (a newer writer's syntax, a non-string entry, a hand edit) is dropped with a warning naming
-/// the finding, never the whole line. Deduped and sorted.
-fn lenient_tags(
-    finding_id: &str,
-    raw: Option<Vec<serde_json::Value>>,
-) -> Vec<crate::ledger::tags::Tag> {
+/// (a newer writer's syntax, a non-string entry, a hand edit) is dropped with
+/// a warning naming the finding, never the whole line. A `tags` value that is
+/// not an array (other than null) reads as no tags, with the same warning.
+/// Deduped and sorted.
+fn lenient_tags(finding_id: &str, raw: Option<serde_json::Value>) -> Vec<crate::ledger::tags::Tag> {
+    let entries = match raw {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(a)) => a,
+        Some(other) => {
+            tracing::warn!(
+                finding_id = %finding_id,
+                "ignoring a finding's tags that are not an array: {other}"
+            );
+            Vec::new()
+        }
+    };
     let mut set = std::collections::BTreeSet::new();
-    for r in raw.unwrap_or_default() {
+    for r in entries {
         let parsed = match r.as_str() {
             Some(s) => crate::ledger::tags::Tag::parse(s).map_err(|e| e.to_string()),
             None => Err(format!("not a string: {r}")),
@@ -617,5 +627,11 @@ mod tests {
         assert_eq!(tags, ["ok"]);
         let rec: FindingRecord = serde_json::from_str(&finding_line(",\"tags\":null")).unwrap();
         assert!(rec.tags.is_empty());
+        // A scalar or object in place of the array drops the tags, not the line.
+        for bad in [",\"tags\":\"oops\"", ",\"tags\":{\"a\":1}", ",\"tags\":7"] {
+            let rec: FindingRecord = serde_json::from_str(&finding_line(bad)).unwrap();
+            assert!(rec.tags.is_empty(), "{bad}");
+            assert_eq!(rec.id, "fnd_1", "{bad}");
+        }
     }
 }
