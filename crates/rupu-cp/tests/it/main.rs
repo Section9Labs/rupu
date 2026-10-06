@@ -25,6 +25,7 @@ mod host_reads;
 mod host_registry;
 mod host_run_netflow;
 mod hosts_api;
+mod launch_preview;
 mod legacy_codenames;
 mod models_api;
 mod netflow_api;

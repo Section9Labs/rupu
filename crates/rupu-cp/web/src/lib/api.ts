@@ -1896,6 +1896,41 @@ export interface CustomerRef {
 }
 
 // ---------------------------------------------------------------------------
+// Launch preview
+// ---------------------------------------------------------------------------
+
+/** `POST /api/launch/preview` — exactly one of `workflow` / `agent`. */
+export interface PreviewBody {
+  workflow?: string;
+  agent?: string;
+  working_dir?: string;
+  /** Same selector as the launch bodies; exclusive with `working_dir`. */
+  scope_kind?: string;
+  scope_id?: string;
+  host?: string;
+}
+
+/** One account a run would authenticate as. */
+export interface ManifestEntry {
+  role: 'provider' | 'fallback' | 'scm';
+  account: string;
+  /** The vendor the account authenticates against, when known. */
+  kind: string | null;
+  /** The agent(s) using it (provider/fallback); empty for scm. */
+  agents: string[];
+  /** Where the choice came from, e.g. "customer default · locked". */
+  source: string;
+}
+
+export interface PreviewResponse {
+  customer: CustomerRef | null;
+  accounts: ManifestEntry[];
+  warnings: string[];
+  /** Echoed when a non-local host was named. */
+  host?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -2100,6 +2135,17 @@ function subscribeSharedFirehose(sub: FirehoseSubscriber): () => void {
 // ---------------------------------------------------------------------------
 
 export const api = {
+  // --- Launch preview ---
+  /** The customer and the provider / fallback / SCM accounts a launch from
+   *  this directory would use. 409 when the launch itself would fail (a
+   *  project assigned to a customer that no longer exists). */
+  launchPreview(body: PreviewBody): Promise<PreviewResponse> {
+    return request<PreviewResponse>('/api/launch/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
   // --- Dashboard ---
   /**
    * `range` selects the trend window; `host` (optional) scopes the fan-out to

@@ -656,7 +656,7 @@ struct LaunchBody {
 /// silently proceeding without an override under a non-default `$RUPU_HOME`.
 /// Applies here to [`resolve_workflow_scoped_explicit`] instead of the agent
 /// resolver.
-fn resolve_launch_scope(
+pub(crate) fn resolve_launch_scope(
     s: &AppState,
     name: &str,
     scope_kind: Option<&str>,

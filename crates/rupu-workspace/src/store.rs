@@ -236,7 +236,9 @@ pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreErr
     Ok(ws)
 }
 
-fn detect_repo_remote(path: &Path) -> Option<String> {
+/// The `origin` remote URL of the git checkout at `path`, or `None` when
+/// `path` is not a checkout or has no `origin`.
+pub fn detect_repo_remote(path: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(path)

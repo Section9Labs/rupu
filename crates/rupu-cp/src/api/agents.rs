@@ -919,7 +919,7 @@ async fn run_agent_with(
 ///   that global-scope pinning isn't available under that `$RUPU_HOME`
 ///   rather than silently proceeding without an override (which could still
 ///   let a colliding project shadow it).
-fn resolve_launch_scope(
+pub(crate) fn resolve_launch_scope(
     s: &AppState,
     name: &str,
     scope_kind: Option<&str>,
