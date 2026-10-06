@@ -174,7 +174,21 @@ pub(crate) fn apply_rollup(row: &mut ProjectRow, roll: &crate::usage::EntityRoll
     row.last_active = roll.last_active.clone();
 }
 
-async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectRow>>> {
+/// `?customer=<slug>|none` on `GET /api/projects`.
+#[derive(serde::Deserialize, Default)]
+struct ProjectsQuery {
+    customer: Option<String>,
+}
+
+/// `GET /api/projects[?customer=<slug>|none]` — every registered project with
+/// its rollup and current customer. `?customer=` keeps the projects CURRENTLY
+/// assigned to that customer (`none` = to no customer; plan ruling 6). A bad
+/// slug is a 400.
+async fn list_projects(
+    State(s): State<AppState>,
+    Query(q): Query<ProjectsQuery>,
+) -> ApiResult<Json<Vec<ProjectRow>>> {
+    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
     let workspaces = store(&s).list().unwrap_or_default();
     let ws_ids: Vec<String> = workspaces.iter().map(|w| w.id.clone()).collect();
     // Every workflow run grouped by owning workspace id, plus each project's
@@ -206,6 +220,9 @@ async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectR
             apply_rollup(row, roll);
         }
         row.customer = customers.remove(&row.ws_id);
+    }
+    if let Some(f) = &filter {
+        rows.retain(|r| f.matches(r.customer.as_ref().map(|c| c.slug.as_str())));
     }
     // Newest activity first; `None` sorts last (None < Some(_) in Rust's
     // default Ord, so reversing puts Some(_) before None).
@@ -260,7 +277,7 @@ async fn get_project(
             _ => autoflow += 1,
         }
     }
-    let recent_runs: Vec<RunListRow> = runs.iter().take(10).map(RunListRow::from).collect();
+    let mut recent_runs: Vec<RunListRow> = runs.iter().take(10).map(RunListRow::from).collect();
     let runs_obj = json!({
         "total": total,
         "running": running,
@@ -272,7 +289,7 @@ async fn get_project(
     // Sessions are only counted here, so they are listed without folding
     // their transcripts. Usage is the project's workflow runs plus its
     // standalone agent runs and session turns, each transcript once.
-    let (scoped_sessions, usage, mut customers) = {
+    let (scoped_sessions, usage, mut customers, recent_who) = {
         let run_store = std::sync::Arc::clone(&s.run_store);
         let global = s.global_dir.clone();
         let pricing = std::sync::Arc::clone(&s.customer_pricing);
@@ -283,6 +300,12 @@ async fn get_project(
                 crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
             let mut prices = crate::customers::PricingMemo::new(&pricing);
             let customers = project_customers(&mut lookup, std::slice::from_ref(&ws))?;
+            // The recent runs' customers: recorded, else derived.
+            let recent_who = scoped
+                .iter()
+                .take(10)
+                .map(|r| lookup.attribute(r.customer.as_deref(), &r.workspace_id))
+                .collect::<Result<Vec<_>, ApiError>>()?;
             let sessions = crate::api::sessions::collect_sessions_with(
                 &global,
                 crate::api::sessions::SessionScan {
@@ -302,10 +325,13 @@ async fn get_project(
             .remove(&ws)
             .unwrap_or_default()
             .usage;
-            Ok((sessions, usage, customers))
+            Ok((sessions, usage, customers, recent_who))
         })
         .await?
     };
+    for (row, who) in recent_runs.iter_mut().zip(recent_who) {
+        row.set_customer(who);
+    }
     let sessions_active = scoped_sessions
         .iter()
         .filter(|v| session_is_active(v))
@@ -368,6 +394,9 @@ fn session_is_active(v: &Value) -> bool {
 }
 
 /// `GET /api/projects/:ws_id/runs` — scoped slim run list, newest-first.
+/// Each row carries its customer (recorded, else the project's current
+/// assignment) and is priced with that customer's pricing (spec §1); work
+/// with no customer at the global pricing.
 async fn project_runs(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
@@ -377,14 +406,23 @@ async fn project_runs(
     load_workspace(&s, &ws_id)?;
     let runs = scoped_runs(&s, &ws_id)?; // already sorted newest-first
     let page_runs = crate::pagination::paginate(runs, &page);
-    // The usage fold runs on the blocking pool.
+    // The usage fold and the assignment read run on the blocking pool.
     let store = std::sync::Arc::clone(&s.run_store);
-    let pricing = s.pricing.clone();
+    let customer_pricing = std::sync::Arc::clone(&s.customer_pricing);
+    let global = s.global_dir.clone();
     let rows = crate::api::runs::blocking(move || {
-        Ok(page_runs
+        let mut lookup =
+            crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+        let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
+        page_runs
             .iter()
-            .map(|r| RunListRow::with_usage(r, &store, &pricing))
-            .collect())
+            .map(|r| {
+                let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
+                let mut row = RunListRow::with_usage(r, &store, prices.get(who.slug.as_deref()));
+                row.set_customer(who);
+                Ok(row)
+            })
+            .collect()
     })
     .await?;
     Ok(Json(rows))

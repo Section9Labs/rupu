@@ -1,0 +1,782 @@
+//! `?customer=` on the CP's lists and aggregates (customers Plan 2A,
+//! Task 7): runs, workflow runs, agent runs, sessions, findings, projects,
+//! usage and the dashboard. Local rows are filtered by attribution (recorded
+//! customer, else the workspace's current assignment) BEFORE they are paged;
+//! remote rows are filtered on the coordinator, and a peer whose rows carry
+//! no `customer` key is too old to say — 501 on a single-host request, and
+//! skipped + named in `X-Rupu-Hosts-Without-Customer` on a fan-out.
+
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Duration, Utc};
+use reqwest::StatusCode;
+use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore, StepKind, StepResultRecord};
+use rupu_workspace::{CustomerStore, NewCustomer};
+use serde_json::{json, Value};
+
+const MODEL: &str = "claude-filter-test";
+
+// ── harness ─────────────────────────────────────────────────────────────
+
+async fn spawn(dir: &Path) -> String {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    serve(state).await
+}
+
+async fn spawn_with_remote(dir: &Path, mock_base_url: &str) -> (String, String) {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let host = state
+        .hosts
+        .add_host("old-peer", mock_base_url, None)
+        .expect("add_host");
+    let id = host.id.clone();
+    (serve(state).await, id)
+}
+
+async fn serve(state: rupu_cp::state::AppState) -> String {
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn get_json(url: String) -> Value {
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {url}");
+    resp.json().await.unwrap()
+}
+
+fn ids(rows: &Value, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {rows}"))
+        .iter()
+        .map(|r| r[key].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+fn by_id<'a>(rows: &'a Value, key: &str, id: &str) -> &'a Value {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r[key] == id)
+        .unwrap_or_else(|| panic!("no row {id} in {rows}"))
+}
+
+// ── seeding ─────────────────────────────────────────────────────────────
+
+/// Register `<global>/workspaces/<id>.toml` pointing at a fresh project dir.
+fn seed_workspace(global: &Path, id: &str, project: &Path) {
+    let dir = global.join("workspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(project).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.toml")),
+        format!(
+            "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn create_customer(global: &Path, slug: &str) {
+    CustomerStore::new(global)
+        .create(
+            slug,
+            &NewCustomer {
+                name: slug.to_uppercase(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+
+fn assign(global: &Path, slug: &str, ws: &str) {
+    CustomerStore::new(global)
+        .assign(slug, rupu_workspace::ProjectRef::Id(ws))
+        .unwrap();
+}
+
+/// A transcript with one `Usage` event: 1M input tokens of `anthropic/MODEL`.
+fn write_transcript(
+    path: &Path,
+    run_id: &str,
+    ws: &str,
+    customer: Option<&str>,
+    started_at: DateTime<Utc>,
+) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let start = rupu_transcript::Event::RunStart {
+        run_id: run_id.into(),
+        workspace_id: ws.into(),
+        agent: "reviewer".into(),
+        provider: "anthropic".into(),
+        model: MODEL.into(),
+        started_at,
+        mode: rupu_transcript::RunMode::Ask,
+        schema: None,
+        system_prompt: None,
+        codename: None,
+        customer: customer.map(String::from),
+    };
+    let usage = rupu_transcript::Event::Usage {
+        provider: "anthropic".into(),
+        model: MODEL.into(),
+        served_model: None,
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+        purpose: None,
+    };
+    let mut buf = Vec::new();
+    for ev in [&start, &usage] {
+        buf.extend(serde_json::to_vec(ev).unwrap());
+        buf.push(b'\n');
+    }
+    std::fs::write(path, &buf).unwrap();
+}
+
+fn record(id: &str, ws: &str, customer: Option<&str>, started_at: DateTime<Utc>) -> RunRecord {
+    RunRecord {
+        customer: customer.map(String::from),
+        id: id.into(),
+        workflow_name: "wf".into(),
+        status: RunStatus::Completed,
+        inputs: BTreeMap::new(),
+        event: None,
+        workspace_id: ws.into(),
+        workspace_path: PathBuf::from("/tmp/proj"),
+        transcript_dir: PathBuf::from("/tmp/proj/.rupu/transcripts"),
+        started_at,
+        finished_at: Some(started_at),
+        error_message: None,
+        awaiting: Vec::new(),
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: None,
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+        resume_gate_id: None,
+        resume_approver: None,
+        resume_rerequested_at: None,
+        reject_cleanup_pending: None,
+        permission_mode: None,
+        final_output: None,
+        loop_progress: Default::default(),
+        gate_decisions: Vec::new(),
+        codename: None,
+        cause: None,
+    }
+}
+
+/// A completed workflow run with one step whose transcript carries usage.
+fn seed_run(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateTime<Utc>) {
+    let store = RunStore::new(global.join("runs"));
+    store
+        .create(record(id, ws, customer, at), "name: wf\n")
+        .unwrap();
+    let transcript_path = global.join("tx").join(format!("{id}.jsonl"));
+    write_transcript(&transcript_path, id, ws, customer, at);
+    store
+        .append_step_result(
+            id,
+            &StepResultRecord {
+                run_outcome: None,
+                step_id: "s1".into(),
+                run_id: id.into(),
+                transcript_path,
+                output: String::new(),
+                success: true,
+                skipped: false,
+                rendered_prompt: String::new(),
+                kind: StepKind::Linear,
+                items: vec![],
+                findings: vec![],
+                iterations: 0,
+                resolved: true,
+                finished_at: Utc::now(),
+                loop_iteration: None,
+                host: None,
+                codename: None,
+                cause: None,
+                error: None,
+            },
+        )
+        .unwrap();
+}
+
+/// A standalone `rupu run`: `<global>/transcripts/<id>.{meta.json,jsonl}`.
+fn seed_agent_run(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateTime<Utc>) {
+    let dir = global.join("transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.meta.json")),
+        json!({ "run_id": id, "trigger_source": "run_cli" }).to_string(),
+    )
+    .unwrap();
+    write_transcript(&dir.join(format!("{id}.jsonl")), id, ws, customer, at);
+}
+
+fn seed_session(global: &Path, id: &str, ws: &str, customer: Option<&str>, at: DateTime<Utc>) {
+    let dir = global.join("sessions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut v = json!({
+        "session_id": id,
+        "agent_name": "reviewer",
+        "workspace_id": ws,
+        "created_at": at.to_rfc3339(),
+        "updated_at": at.to_rfc3339(),
+        "status": "idle",
+    });
+    if let Some(c) = customer {
+        v["customer"] = json!(c);
+    }
+    std::fs::write(dir.join("session.json"), v.to_string()).unwrap();
+}
+
+/// One finding in a project's coverage ledger.
+fn seed_finding(project: &Path, id: &str) {
+    let dir = project.join(".rupu").join("coverage").join("t1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let finding = format!(
+        "{{\"id\":\"{id}\",\"file_path\":\"src/a.rs\",\"line_range\":[1,5],\
+\"scope\":\"line\",\"summary\":\"thing\",\"severity\":\"high\",\
+\"concern_id\":\"ssrf\",\
+\"evidence\":{{\"rationale\":\"because\"}},\
+\"declared_by\":{{\"run_id\":\"run_x\",\"model\":\"claude\",\"surface\":\"workflow\"}},\
+\"declared_at\":\"2026-06-19T00:00:00Z\"}}\n"
+    );
+    std::fs::write(dir.join("findings.jsonl"), finding).unwrap();
+}
+
+/// Two customers + unassigned work:
+/// - `ws_acme` assigned to acme, `ws_globex` to globex, `ws_none` to nobody;
+/// - `r_acme` recorded acme (in `ws_none`: the RECORDED slug wins),
+///   `r_acme_legacy` recorded nothing in `ws_acme` (derived acme),
+///   `r_globex` recorded globex, `r_none` nothing in `ws_none`.
+struct Fleet {
+    _tmp: tempfile::TempDir,
+    _proj: tempfile::TempDir,
+    global: PathBuf,
+}
+
+fn seed_fleet() -> Fleet {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path().to_path_buf();
+    for ws in ["ws_acme", "ws_globex", "ws_none"] {
+        seed_workspace(&global, ws, &proj.path().join(ws));
+    }
+    create_customer(&global, "acme");
+    create_customer(&global, "globex");
+    assign(&global, "acme", "ws_acme");
+    assign(&global, "globex", "ws_globex");
+
+    let now = Utc::now();
+    seed_run(
+        &global,
+        "r_acme",
+        "ws_none",
+        Some("acme"),
+        now - Duration::hours(1),
+    );
+    seed_run(
+        &global,
+        "r_acme_legacy",
+        "ws_acme",
+        None,
+        now - Duration::hours(2),
+    );
+    seed_run(
+        &global,
+        "r_globex",
+        "ws_globex",
+        Some("globex"),
+        now - Duration::hours(3),
+    );
+    seed_run(&global, "r_none", "ws_none", None, now - Duration::hours(4));
+
+    seed_agent_run(
+        &global,
+        "a_acme",
+        "ws_none",
+        Some("acme"),
+        now - Duration::hours(1),
+    );
+    seed_agent_run(
+        &global,
+        "a_acme_legacy",
+        "ws_acme",
+        None,
+        now - Duration::hours(2),
+    );
+    seed_agent_run(&global, "a_none", "ws_none", None, now - Duration::hours(3));
+
+    seed_session(
+        &global,
+        "s_acme",
+        "ws_none",
+        Some("acme"),
+        now - Duration::hours(1),
+    );
+    seed_session(
+        &global,
+        "s_acme_legacy",
+        "ws_acme",
+        None,
+        now - Duration::hours(2),
+    );
+    seed_session(
+        &global,
+        "s_globex",
+        "ws_globex",
+        Some("globex"),
+        now - Duration::hours(3),
+    );
+
+    seed_finding(&proj.path().join("ws_acme"), "f_acme");
+    seed_finding(&proj.path().join("ws_globex"), "f_globex");
+
+    Fleet {
+        _tmp: tmp,
+        _proj: proj,
+        global,
+    }
+}
+
+// ── 1. runs ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn runs_filter_by_recorded_or_derived_customer() {
+    let f = seed_fleet();
+    let base = spawn(&f.global).await;
+
+    for path in [
+        "/api/runs?host=local",
+        "/api/runs",
+        "/api/runs/workflows?host=local",
+    ] {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let rows = get_json(format!("{base}{path}{sep}customer=acme")).await;
+        assert_eq!(ids(&rows, "id"), ["r_acme", "r_acme_legacy"], "{path}");
+        let rec = by_id(&rows, "id", "r_acme");
+        assert_eq!(rec["customer"], "acme");
+        assert_eq!(rec["customer_derived"], false);
+        let legacy = by_id(&rows, "id", "r_acme_legacy");
+        assert_eq!(legacy["customer"], "acme");
+        assert_eq!(legacy["customer_derived"], true);
+
+        let rows = get_json(format!("{base}{path}{sep}customer=none")).await;
+        assert_eq!(ids(&rows, "id"), ["r_none"], "{path}");
+        assert!(rows[0].as_object().unwrap().contains_key("customer"));
+        assert!(rows[0]["customer"].is_null());
+        assert_eq!(rows[0]["customer_derived"], false);
+    }
+
+    // No filter: every run, each row carrying its attribution.
+    let rows = get_json(format!("{base}/api/runs?host=local")).await;
+    assert_eq!(rows.as_array().unwrap().len(), 4);
+    assert_eq!(by_id(&rows, "id", "r_globex")["customer"], "globex");
+    assert_eq!(
+        by_id(&rows, "id", "r_acme_legacy")["customer_derived"],
+        true
+    );
+}
+
+// ── 2. filter before paging ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_filter_applies_before_pagination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    seed_workspace(global, "ws_x", &proj.path().join("x"));
+    create_customer(global, "acme");
+    let now = Utc::now();
+    for i in 0..30 {
+        // The oldest three (i = 27..30) are Acme's.
+        let customer = (i >= 27).then_some("acme");
+        seed_run(
+            global,
+            &format!("run_{i:02}"),
+            "ws_x",
+            customer,
+            now - Duration::minutes(i),
+        );
+    }
+    let base = spawn(global).await;
+    for path in [
+        "/api/runs?host=local",
+        "/api/runs/workflows?host=local",
+        "/api/runs",
+    ] {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let rows = get_json(format!("{base}{path}{sep}customer=acme&limit=10&offset=0")).await;
+        assert_eq!(ids(&rows, "id"), ["run_27", "run_28", "run_29"], "{path}");
+    }
+}
+
+// ── 3. the other lists and aggregates ───────────────────────────────────
+
+#[tokio::test]
+async fn agent_runs_and_sessions_filter_by_customer() {
+    let f = seed_fleet();
+    let base = spawn(&f.global).await;
+
+    for path in ["/api/runs/agents?host=local&", "/api/runs/agents?"] {
+        let rows = get_json(format!("{base}{path}customer=acme")).await;
+        assert_eq!(ids(&rows, "run_id"), ["a_acme", "a_acme_legacy"], "{path}");
+        assert_eq!(by_id(&rows, "run_id", "a_acme")["customer_derived"], false);
+        let legacy = by_id(&rows, "run_id", "a_acme_legacy");
+        assert_eq!(legacy["customer"], "acme");
+        assert_eq!(legacy["customer_derived"], true);
+        let rows = get_json(format!("{base}{path}customer=none")).await;
+        assert_eq!(ids(&rows, "run_id"), ["a_none"], "{path}");
+    }
+
+    for path in ["/api/sessions?host=local&", "/api/sessions?"] {
+        let rows = get_json(format!("{base}{path}customer=acme")).await;
+        assert_eq!(
+            ids(&rows, "session_id"),
+            ["s_acme", "s_acme_legacy"],
+            "{path}"
+        );
+        let legacy = by_id(&rows, "session_id", "s_acme_legacy");
+        assert_eq!(legacy["customer"], "acme");
+        assert_eq!(legacy["customer_derived"], true);
+        let rows = get_json(format!("{base}{path}customer=globex")).await;
+        assert_eq!(ids(&rows, "session_id"), ["s_globex"], "{path}");
+    }
+}
+
+#[tokio::test]
+async fn projects_and_findings_filter_by_current_assignment() {
+    let f = seed_fleet();
+    let base = spawn(&f.global).await;
+
+    let rows = get_json(format!("{base}/api/projects?customer=acme")).await;
+    assert_eq!(ids(&rows, "ws_id"), ["ws_acme"]);
+    let rows = get_json(format!("{base}/api/projects?customer=none")).await;
+    assert_eq!(ids(&rows, "ws_id"), ["ws_none"]);
+
+    let body = get_json(format!("{base}/api/findings?customer=acme")).await;
+    assert_eq!(ids(&body["findings"], "id"), ["f_acme"]);
+    assert_eq!(body["findings"][0]["customer"], "acme");
+    assert_eq!(body["summary"]["total"], 1);
+    // Unfiltered rows carry the customer too (null when none).
+    let body = get_json(format!("{base}/api/findings")).await;
+    assert_eq!(body["summary"]["total"], 2);
+    assert_eq!(
+        by_id(&body["findings"], "id", "f_globex")["customer"],
+        "globex"
+    );
+}
+
+#[tokio::test]
+async fn usage_counts_only_the_customers_spend() {
+    let f = seed_fleet();
+    let base = spawn(&f.global).await;
+
+    // Acme: two workflow runs + two standalone agent runs, 1M input each.
+    let body = get_json(format!("{base}/api/usage?customer=acme")).await;
+    assert_eq!(body["summary"]["input_tokens"], 4_000_000, "{body}");
+    let body = get_json(format!("{base}/api/usage?customer=globex")).await;
+    assert_eq!(body["summary"]["input_tokens"], 1_000_000, "{body}");
+    let body = get_json(format!("{base}/api/usage?customer=none")).await;
+    assert_eq!(body["summary"]["input_tokens"], 2_000_000, "{body}");
+    let body = get_json(format!("{base}/api/usage")).await;
+    assert_eq!(body["summary"]["input_tokens"], 7_000_000, "{body}");
+
+    let rows = get_json(format!("{base}/api/usage/runs?customer=acme")).await;
+    assert_eq!(
+        ids(&rows, "run_id"),
+        ["a_acme", "a_acme_legacy", "r_acme", "r_acme_legacy"]
+    );
+
+    let buckets = get_json(format!("{base}/api/usage/timeline?customer=globex")).await;
+    let total: u64 = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|b| b["rows"].as_array().unwrap().iter())
+        .map(|r| r["input_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 1_000_000);
+
+    let resp = reqwest::get(format!("{base}/api/usage/outliers?customer=acme"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn usage_prices_each_source_with_its_customers_pricing() {
+    let f = seed_fleet();
+    // Global prices MODEL at $1/Mtok input; Acme's layer at $5.
+    let toml = |p: f64| {
+        format!("[pricing.anthropic.\"{MODEL}\"]\ninput_per_mtok = {p}\noutput_per_mtok = 1.0\n")
+    };
+    std::fs::write(f.global.join("config.toml"), toml(1.0)).unwrap();
+    let acme_cfg = CustomerStore::new(&f.global).config_path("acme");
+    std::fs::write(acme_cfg, toml(5.0)).unwrap();
+    let base = spawn(&f.global).await;
+
+    let body = get_json(format!("{base}/api/usage?customer=acme")).await;
+    let cost = body["summary"]["cost_usd"].as_f64().unwrap();
+    assert!((cost - 20.0).abs() < 1e-9, "4M at $5 = $20, got {cost}");
+    // Unfiltered: Acme at $5 (4M) + globex and none at $1 (3M).
+    let body = get_json(format!("{base}/api/usage")).await;
+    let cost = body["summary"]["cost_usd"].as_f64().unwrap();
+    assert!((cost - 23.0).abs() < 1e-9, "got {cost}");
+}
+
+#[tokio::test]
+async fn dashboard_counts_only_the_customers_runs() {
+    let f = seed_fleet();
+    let base = spawn(&f.global).await;
+
+    let manual = |body: &Value| -> u64 {
+        body["throughput_buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["manual"].as_u64().unwrap())
+            .sum()
+    };
+    let body = get_json(format!("{base}/api/dashboard?range=all&customer=acme")).await;
+    assert_eq!(manual(&body), 2, "{body}");
+    assert_eq!(body["findings_open"], 1);
+    let body = get_json(format!(
+        "{base}/api/dashboard?range=all&host=local&customer=none"
+    ))
+    .await;
+    assert_eq!(manual(&body), 1, "{body}");
+    assert_eq!(body["findings_open"], 0);
+    let body = get_json(format!("{base}/api/dashboard?range=all")).await;
+    assert_eq!(manual(&body), 4, "{body}");
+    assert_eq!(body["findings_open"], 2);
+}
+
+// ── 4. bad slug ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_bad_slug_is_a_400_everywhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = spawn(tmp.path()).await;
+    for path in [
+        "/api/runs",
+        "/api/runs/workflows",
+        "/api/runs/agents",
+        "/api/sessions",
+        "/api/findings",
+        "/api/projects",
+        "/api/usage",
+        "/api/usage/timeline",
+        "/api/usage/runs",
+        "/api/usage/outliers",
+        "/api/dashboard",
+    ] {
+        let resp = reqwest::get(format!("{base}{path}?customer=Bad%20Slug"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+}
+
+// ── 5. remote hosts ─────────────────────────────────────────────────────
+
+fn remote_run(id: &str, customer: Option<Option<&str>>) -> Value {
+    let mut v = json!({
+        "id": id,
+        "workflow_name": "wf",
+        "status": "completed",
+        "started_at": "2026-10-01T00:00:00Z",
+        "finished_at": null,
+        "trigger": "manual",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+                  "cache_write_tokens": 0, "total_tokens": 0, "cost_usd": null,
+                  "priced": true, "runs": 1, "partial": false},
+        "turns": 0,
+        "duration_ms": null,
+        "codename": "cobalt-harbor",
+        "codename_derived": false,
+    });
+    if let Some(c) = customer {
+        v["customer"] = json!(c);
+        v["customer_derived"] = json!(false);
+    }
+    v
+}
+
+#[tokio::test]
+async fn an_old_peer_cannot_be_filtered_by_customer() {
+    let mock = httpmock::MockServer::start();
+    mock.mock(|when, then| {
+        when.method("GET").path("/api/runs");
+        then.status(200)
+            .json_body(json!([remote_run("rr_1", None), remote_run("rr_2", None)]));
+    });
+    mock.mock(|when, then| {
+        when.method("GET").path("/api/runs/agents");
+        then.status(200).json_body(json!([{
+            "run_id": "ra_1", "source": "standalone", "started_at": "2026-10-01T00:00:00Z",
+        }]));
+    });
+    mock.mock(|when, then| {
+        when.method("GET").path("/api/sessions");
+        then.status(200).json_body(json!([{
+            "session_id": "rs_1", "updated_at": "2026-10-01T00:00:00Z",
+        }]));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, host) = spawn_with_remote(tmp.path(), &mock.base_url()).await;
+
+    // Single host: 501, naming the host.
+    let resp = reqwest::get(format!("{base}/api/runs?host={host}&customer=acme"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"],
+        format!("host {host} can't report customers (its rupu predates customers)")
+    );
+
+    // Without a filter the old peer still lists.
+    let rows = get_json(format!("{base}/api/runs?host={host}")).await;
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+
+    // Fan-out: the old peer is skipped and named in the header.
+    let resp = reqwest::get(format!("{base}/api/runs?customer=acme"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-rupu-hosts-without-customer")
+            .map(|v| v.to_str().unwrap().to_string()),
+        Some(host.clone())
+    );
+    let rows: Value = resp.json().await.unwrap();
+    assert!(rows.as_array().unwrap().is_empty(), "{rows}");
+
+    // The agent-run and session lists follow the same rule.
+    for path in ["/api/runs/agents", "/api/sessions"] {
+        let resp = reqwest::get(format!("{base}{path}?host={host}&customer=acme"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+        let resp = reqwest::get(format!("{base}{path}?customer=acme"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get("x-rupu-hosts-without-customer")
+                .and_then(|v| v.to_str().ok()),
+            Some(host.as_str()),
+            "{path}"
+        );
+    }
+
+    // Aggregates are not filtered remotely: 501.
+    for path in ["/api/usage", "/api/dashboard"] {
+        let resp = reqwest::get(format!("{base}{path}?host={host}&customer=acme"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_new_peers_rows_are_filtered_on_the_coordinator() {
+    let mock = httpmock::MockServer::start();
+    mock.mock(|when, then| {
+        when.method("GET").path("/api/runs");
+        then.status(200).json_body(json!([
+            remote_run("rr_acme", Some(Some("acme"))),
+            remote_run("rr_none", Some(None)),
+            remote_run("rr_globex", Some(Some("globex"))),
+        ]));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, host) = spawn_with_remote(tmp.path(), &mock.base_url()).await;
+
+    let rows = get_json(format!("{base}/api/runs?host={host}&customer=acme")).await;
+    assert_eq!(ids(&rows, "id"), ["rr_acme"]);
+    let rows = get_json(format!("{base}/api/runs?host={host}&customer=none")).await;
+    assert_eq!(ids(&rows, "id"), ["rr_none"]);
+
+    let resp = reqwest::get(format!("{base}/api/runs?customer=globex"))
+        .await
+        .unwrap();
+    assert!(resp
+        .headers()
+        .get("x-rupu-hosts-without-customer")
+        .is_none());
+    let rows: Value = resp.json().await.unwrap();
+    assert_eq!(ids(&rows, "id"), ["rr_globex"]);
+}
+
+// ── fail closed ─────────────────────────────────────────────────────────
+
+/// An assignment that cannot be read fails the request (500 naming the
+/// workspace) — it never reads as "no customer".
+#[tokio::test]
+async fn an_unreadable_assignment_fails_the_request() {
+    let f = seed_fleet();
+    // Replace ws_acme's sidecar with a directory: present, but unreadable.
+    let sidecar = f.global.join("workspaces").join("ws_acme.customer");
+    std::fs::remove_file(&sidecar).unwrap();
+    std::fs::create_dir_all(&sidecar).unwrap();
+    let base = spawn(&f.global).await;
+    for path in [
+        "/api/runs?host=local&customer=none",
+        // Unfiltered too: the row cannot claim a customer it can't read, and
+        // the fan-out must not drop the local host's runs silently.
+        "/api/runs?host=local",
+        "/api/runs",
+        "/api/runs/workflows",
+        "/api/runs/agents?host=local&customer=none",
+        "/api/sessions?host=local&customer=none",
+        "/api/findings?customer=none",
+        "/api/usage/runs?customer=none",
+        "/api/dashboard?host=local&customer=none",
+    ] {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        let body: Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("ws_acme"),
+            "{path}: {body}"
+        );
+    }
+}

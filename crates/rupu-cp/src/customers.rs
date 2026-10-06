@@ -409,12 +409,34 @@ impl CustomerPricing {
     }
 }
 
+/// What prices a piece of work, by the customer it is attributed to
+/// (`None` = no customer).
+pub trait PriceBook {
+    fn pricing_for(&mut self, customer: Option<&str>) -> &PricingConfig;
+}
+
+/// One pricing for every customer — for callers with no customer layers to
+/// consult (a mirrored remote run, a unit test).
+pub struct FlatPricing<'a>(pub &'a PricingConfig);
+
+impl PriceBook for FlatPricing<'_> {
+    fn pricing_for(&mut self, _customer: Option<&str>) -> &PricingConfig {
+        self.0
+    }
+}
+
 /// One request's pricing per customer: resolved once, then borrowed for
 /// every run and transcript the request prices.
 pub struct PricingMemo<'a> {
     pricing: &'a CustomerPricing,
     none: Option<PricingConfig>,
     by_slug: HashMap<String, PricingConfig>,
+}
+
+impl PriceBook for PricingMemo<'_> {
+    fn pricing_for(&mut self, customer: Option<&str>) -> &PricingConfig {
+        self.get(customer)
+    }
 }
 
 impl<'a> PricingMemo<'a> {
@@ -440,6 +462,65 @@ impl<'a> PricingMemo<'a> {
             }
         }
     }
+}
+
+// ── remote rows (ruling 5) ────────────────────────────────────────────────
+
+/// Response header a fan-out list sets, naming (comma-separated) the hosts
+/// it skipped because their rows carry no `customer` key — peers too old to
+/// report customers, which a customer filter can neither keep nor drop.
+pub const HOSTS_WITHOUT_CUSTOMER_HEADER: &str = "x-rupu-hosts-without-customer";
+
+/// The 501 a single-host request answers when the host is too old to report
+/// customers — the status `host_list_error` gives an `Unsupported` host, so
+/// the web shows it as "unavailable".
+pub fn customers_unsupported(host_id: &str) -> ApiError {
+    ApiError::not_available(format!(
+        "host {host_id} can't report customers (its rupu predates customers)"
+    ))
+}
+
+/// The 501 for an aggregate (`/api/usage`, `/api/dashboard`) asked of a
+/// remote host with a customer filter: a remote aggregate arrives already
+/// summed, so the coordinator cannot filter it (ruling 5).
+pub fn remote_aggregate_unsupported(host_id: &str) -> ApiError {
+    ApiError::not_available(remote_aggregate_reason(host_id))
+}
+
+/// The reason a fan-out aggregate gives for a remote host it leaves out
+/// under a customer filter.
+pub fn remote_aggregate_reason(host_id: &str) -> String {
+    format!("host {host_id} can't be filtered by customer: its totals are summed remotely")
+}
+
+/// Keep the remote `rows` whose `customer` matches `filter`. `None` when any
+/// row lacks the `customer` key (an old peer that cannot say — never read
+/// as "no customer"); a `null` value is "no customer". An empty page is
+/// filterable and stays empty.
+pub fn filter_remote_rows(
+    rows: Vec<serde_json::Value>,
+    filter: &CustomerFilter,
+) -> Option<Vec<serde_json::Value>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let customer = row.as_object()?.get("customer")?;
+        if filter.matches(customer.as_str()) {
+            out.push(row);
+        }
+    }
+    Some(out)
+}
+
+/// The fan-out header value for the hosts skipped, if any.
+pub fn hosts_without_customer_header(hosts: &[String]) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    if hosts.is_empty() {
+        return headers;
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&hosts.join(",")) {
+        headers.insert(HOSTS_WITHOUT_CUSTOMER_HEADER, v);
+    }
+    headers
 }
 
 #[cfg(test)]

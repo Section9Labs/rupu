@@ -151,6 +151,10 @@ pub(crate) struct SessionForRunsDto {
     /// turn; the fallback for a turn whose transcript predates customers.
     #[serde(default)]
     pub(crate) customer: Option<String>,
+    /// The workspace the session runs in — derives a legacy session turn's
+    /// customer from the workspace's current assignment.
+    #[serde(default)]
+    workspace_id: Option<String>,
     #[serde(default)]
     pub(crate) runs: Vec<SessionRunRecordDto>,
 }
@@ -181,6 +185,17 @@ struct AgentRunRow {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    /// The customer the run is attributed to: the one its transcript's
+    /// `RunStart` recorded (a session turn falls back to its session's),
+    /// else (`customer_derived`) its workspace's CURRENT assignment — see
+    /// [`attribute_agent_runs`]. ALWAYS serialized (`null` = no customer)
+    /// so a coordinator can tell "no customer" from a peer too old to say.
+    customer: Option<String>,
+    customer_derived: bool,
+    /// The run's workspace (`RunStart`, else the session's) — what a legacy
+    /// run's customer is derived from. Not on the wire.
+    #[serde(skip)]
+    workspace_id: Option<String>,
 }
 
 /// One actionable autoflow *event* — a single launched run or awaiting/failed
@@ -263,6 +278,8 @@ fn read_transcript_run_start(path: &std::path::Path) -> TranscriptRunStart {
             model,
             started_at,
             codename,
+            workspace_id,
+            customer,
             ..
         })) => TranscriptRunStart {
             agent: Some(agent),
@@ -270,6 +287,8 @@ fn read_transcript_run_start(path: &std::path::Path) -> TranscriptRunStart {
             codename,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model).filter(|m| !m.is_empty()),
+            workspace_id: Some(workspace_id).filter(|w| !w.is_empty()),
+            customer,
         },
         _ => TranscriptRunStart::default(),
     }
@@ -283,6 +302,8 @@ struct TranscriptRunStart {
     codename: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    workspace_id: Option<String>,
+    customer: Option<String>,
 }
 
 /// Resolve `session_id`'s `agent_name` by loading its `session.json` from
@@ -389,6 +410,8 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             codename: stored_codename,
             provider,
             model,
+            workspace_id,
+            customer,
         } = match &transcript_path {
             Some(tp) => read_transcript_run_start(std::path::Path::new(tp)),
             None => TranscriptRunStart::default(),
@@ -423,6 +446,9 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
                 host_id: None,
                 provider,
                 model,
+                customer,
+                customer_derived: false,
+                workspace_id,
             },
             dto.pid,
         ));
@@ -545,6 +571,9 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     host_id: None,
                     provider: dto.provider_name.clone().filter(|p| !p.is_empty()),
                     model: dto.model.clone().filter(|m| !m.is_empty()),
+                    customer: dto.customer.clone(),
+                    customer_derived: false,
+                    workspace_id: dto.workspace_id.clone().filter(|w| !w.is_empty()),
                 });
             }
         }
@@ -665,7 +694,37 @@ fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
         // model that actually served it — so it wins over the session's.
         provider: standalone.provider.or(session.provider),
         model: standalone.model.or(session.model),
+        // The turn's own `RunStart` records the customer it ran under; the
+        // session's is only its latest turn's.
+        customer: standalone.customer.or(session.customer),
+        customer_derived: false,
+        workspace_id: standalone.workspace_id.or(session.workspace_id),
     }
+}
+
+/// Attribute each local agent run to its customer: the recorded one, else
+/// (`customer_derived`) its workspace's CURRENT assignment; a run with
+/// neither a recorded customer nor a known workspace has none. An
+/// assignment that cannot be read fails the request.
+fn attribute_agent_runs(
+    lookup: &mut crate::customers::CustomerLookup,
+    rows: &mut [AgentRunRow],
+) -> Result<(), crate::error::ApiError> {
+    for row in rows {
+        let who = match (&row.customer, row.workspace_id.as_deref()) {
+            (Some(_), _) | (None, Some(_)) => lookup.attribute(
+                row.customer.as_deref(),
+                row.workspace_id.as_deref().unwrap_or_default(),
+            )?,
+            (None, None) => crate::customers::Attribution {
+                slug: None,
+                derived: false,
+            },
+        };
+        row.customer = who.slug;
+        row.customer_derived = who.derived;
+    }
+    Ok(())
 }
 
 /// Collect every local agent-run row (standalone transcripts + active and
@@ -719,6 +778,9 @@ struct AgentRunsQuery {
     since: Option<String>,
     #[serde(default)]
     until: Option<String>,
+    /// `?customer=<slug>|none` — see `list_agent_runs`.
+    #[serde(default)]
+    customer: Option<String>,
 }
 
 impl AgentRunsQuery {
@@ -769,7 +831,7 @@ fn agent_in_lifecycle(status: Option<&str>, group: Option<&str>) -> bool {
 // Shared fan-out helpers (re-exported from host_fanout)
 // ---------------------------------------------------------------------------
 
-use crate::api::host_fanout::{fan_out_via, sort_values_newest_first};
+use crate::api::host_fanout::{fan_out_via, fan_out_via_filtered, sort_values_newest_first};
 
 // ---------------------------------------------------------------------------
 // `GET /api/runs/agents`
@@ -798,22 +860,27 @@ fn agent_run_metrics(
     }
 }
 
-/// [`agent_run_metrics`] for each `(run_id, transcript_path)`, in order, off
-/// the async executor. Never fails: a panicked fold reports every run as an
-/// empty, `partial` result.
+/// [`agent_run_metrics`] for each `(run_id, transcript_path, customer)`, in
+/// order, off the async executor, each priced with its customer's pricing
+/// (work with no customer at the global pricing).
+/// Never fails: a panicked fold reports every run as an empty, `partial`
+/// result.
 async fn agent_runs_metrics(
     s: &AppState,
-    runs: Vec<(String, String)>,
+    runs: Vec<(String, String, Option<String>)>,
 ) -> Vec<crate::usage::RunMetrics> {
     let store = std::sync::Arc::clone(&s.run_store);
-    let pricing = s.pricing.clone();
+    let customer_pricing = std::sync::Arc::clone(&s.customer_pricing);
     let fallback_pricing = s.pricing.clone();
     let n = runs.len();
     crate::usage::usage_blocking(
         "agent_run_metrics",
         move || {
+            let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
             runs.iter()
-                .map(|(id, tp)| agent_run_metrics(&store, &pricing, id, tp))
+                .map(|(id, tp, customer)| {
+                    agent_run_metrics(&store, prices.get(customer.as_deref()), id, tp)
+                })
                 .collect()
         },
         move || {
@@ -844,41 +911,67 @@ async fn agent_runs_metrics(
 ///
 /// Missing directories return `[]` (no 500). Offline hosts contribute nothing
 /// (warn + skip) and do not cause 500.
+///
+/// `?customer=` keeps the runs attributed to that customer (recorded on the
+/// transcript's `RunStart`, a session turn falling back to its session's,
+/// else the workspace's current assignment; `none` = no customer). Local
+/// runs are filtered before they are paged. A remote host's rows are
+/// filtered on the coordinator by their `customer` key; a remote whose rows
+/// carry none is too old to say — 501 on `?host=<it>`, skipped on the
+/// fan-out and named in the `X-Rupu-Hosts-Without-Customer` header. A bad
+/// slug is a 400.
 async fn list_agent_runs(
     State(s): State<AppState>,
     Query(q): Query<AgentRunsQuery>,
-) -> ApiResult<Json<Vec<serde_json::Value>>> {
+) -> ApiResult<(axum::http::HeaderMap, Json<Vec<serde_json::Value>>)> {
     let host = q.host.as_deref().unwrap_or("all");
+    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
     // ── Single remote host ────────────────────────────────────────────────────
     if host != "local" && host != "all" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured agent-run listing — works for SSH hosts (which can't serve
         // the generic proxy) by shelling `rupu transcript list`.
-        let mut rows = conn
+        let rows = conn
             .list_agent_runs()
             .await
             .map_err(crate::api::runs::host_list_error)?;
+        let mut rows = match &filter {
+            None => rows,
+            Some(f) => crate::customers::filter_remote_rows(rows, f)
+                .ok_or_else(|| crate::customers::customers_unsupported(host))?,
+        };
         let lifecycle = q.lifecycle.as_deref();
         rows.retain(|r| agent_in_lifecycle(r.get("status").and_then(|v| v.as_str()), lifecycle));
         // Newest-first before paging: the connector returns the host's whole
         // list in CLI / mirror order, and the web's per-host merge relies on
         // each host's pages arriving ordered by `started_at`.
         sort_values_newest_first(&mut rows, "started_at");
-        return Ok(Json(
-            crate::pagination::paginate(rows, &q.page())
-                .into_iter()
-                .map(|mut row| {
-                    row["host_id"] = serde_json::json!(host);
-                    crate::codename::inject_codename_row(&mut row, "run_id", Some("agent"));
-                    row
-                })
-                .collect(),
+        return Ok((
+            axum::http::HeaderMap::new(),
+            Json(
+                crate::pagination::paginate(rows, &q.page())
+                    .into_iter()
+                    .map(|mut row| {
+                        row["host_id"] = serde_json::json!(host);
+                        crate::codename::inject_codename_row(&mut row, "run_id", Some("agent"));
+                        row
+                    })
+                    .collect(),
+            ),
         ));
     }
 
     // ── Collect local runs ────────────────────────────────────────────────────
     let mut local_rows = collect_and_sort_local_agent_runs(&s.global_dir);
+    // Attribute every row (each workspace's assignment read once), then keep
+    // the customer's — before anything is paged.
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir));
+    attribute_agent_runs(&mut lookup, &mut local_rows)?;
+    if let Some(f) = &filter {
+        local_rows.retain(|r| f.matches(r.customer.as_deref()));
+    }
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
@@ -887,9 +980,15 @@ async fn list_agent_runs(
         let range = q.range();
         local_rows.retain(|r| range.contains_str(r.started_at.as_deref()));
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
-        let wanted: Vec<(String, String)> = page_rows
+        let wanted: Vec<(String, String, Option<String>)> = page_rows
             .iter()
-            .filter_map(|r| Some((r.run_id.clone(), r.transcript_path.clone()?)))
+            .filter_map(|r| {
+                Some((
+                    r.run_id.clone(),
+                    r.transcript_path.clone()?,
+                    r.customer.clone(),
+                ))
+            })
             .collect();
         let mut metrics = agent_runs_metrics(&s, wanted).await.into_iter();
         for row in &mut page_rows {
@@ -901,11 +1000,14 @@ async fn list_agent_runs(
                 row.duration_ms = m.duration_ms;
             }
         }
-        return Ok(Json(
-            page_rows
-                .into_iter()
-                .map(|r| serde_json::to_value(r).unwrap())
-                .collect(),
+        return Ok((
+            axum::http::HeaderMap::new(),
+            Json(
+                page_rows
+                    .into_iter()
+                    .map(|r| serde_json::to_value(r).unwrap())
+                    .collect(),
+            ),
         ));
     }
 
@@ -918,9 +1020,13 @@ async fn list_agent_runs(
         })
         .collect();
 
-    let mut all_values = fan_out_via(&s.hosts, local_values, "agent_runs", |c| async move {
-        c.list_agent_runs().await
-    })
+    let (mut all_values, without_customer) = fan_out_via_filtered(
+        &s.hosts,
+        local_values,
+        "agent_runs",
+        |c| async move { c.list_agent_runs().await },
+        filter.as_ref(),
+    )
     .await;
 
     sort_values_newest_first(&mut all_values, "started_at");
@@ -942,15 +1048,17 @@ async fn list_agent_runs(
     let mut page_values = crate::pagination::paginate(all_values, &q.page());
 
     // Fill usage for local rows on this page only (remote rows already have it)
-    let local_agent_run = |row: &serde_json::Value| -> Option<(String, String)> {
+    let local_agent_run = |row: &serde_json::Value| -> Option<(String, String, Option<String>)> {
         if row["host_id"].as_str() != Some("local") {
             return None;
         }
         let tp = row["transcript_path"].as_str()?;
         let run_id = row["run_id"].as_str().unwrap_or_default();
-        Some((run_id.to_string(), tp.to_string()))
+        let customer = row["customer"].as_str().map(String::from);
+        Some((run_id.to_string(), tp.to_string(), customer))
     };
-    let wanted: Vec<(String, String)> = page_values.iter().filter_map(local_agent_run).collect();
+    let wanted: Vec<(String, String, Option<String>)> =
+        page_values.iter().filter_map(local_agent_run).collect();
     let mut metrics = agent_runs_metrics(&s, wanted).await.into_iter();
     for row in &mut page_values {
         if local_agent_run(row).is_some() {
@@ -961,7 +1069,10 @@ async fn list_agent_runs(
         }
     }
 
-    Ok(Json(page_values))
+    Ok((
+        crate::customers::hosts_without_customer_header(&without_customer),
+        Json(page_values),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,6 +2173,9 @@ mod tests {
                 codename_derived: false,
                 provider: None,
                 model: None,
+                customer: None,
+                customer_derived: false,
+                workspace_id: None,
             }
         }
 
@@ -2522,6 +2636,7 @@ mod tests {
                 host: Some("host_fake".into()),
                 since: None,
                 until: None,
+                customer: None,
             }),
         )
         .await
@@ -2578,7 +2693,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = state_with_unsorted_remote_lists(&tmp);
         for (offset, want) in NEWEST_FIRST_PAGES {
-            let Json(rows) = list_agent_runs(
+            let (_, Json(rows)) = list_agent_runs(
                 State(s.clone()),
                 Query(AgentRunsQuery {
                     offset: Some(offset),
@@ -2587,6 +2702,7 @@ mod tests {
                     host: Some("host_fake".into()),
                     since: None,
                     until: None,
+                    customer: None,
                 }),
             )
             .await
@@ -2679,7 +2795,7 @@ mod tests {
                 rupu_config::PricingConfig::default(),
             )
             .with_hosts(registry.clone());
-            let Json(rows) = list_agent_runs(
+            let (_, Json(rows)) = list_agent_runs(
                 State(s),
                 Query(AgentRunsQuery {
                     offset: None,
@@ -2688,6 +2804,7 @@ mod tests {
                     host: Some(host.into()),
                     since: None,
                     until: None,
+                    customer: None,
                 }),
             )
             .await
@@ -2736,7 +2853,7 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
 
-        let Json(rows) = list_agent_runs(
+        let (_, Json(rows)) = list_agent_runs(
             State(s),
             Query(AgentRunsQuery {
                 offset: None,
@@ -2745,6 +2862,7 @@ mod tests {
                 host: Some("local".into()),
                 since: Some("2026-08-05T00:00:00Z".into()),
                 until: Some("2026-08-15T00:00:00Z".into()),
+                customer: None,
             }),
         )
         .await
@@ -2782,6 +2900,9 @@ mod tests {
         .expect("ok");
 
         assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
-        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
+        assert_eq!(
+            rows[0]["started_at"],
+            serde_json::json!(day(10).to_rfc3339())
+        );
     }
 }

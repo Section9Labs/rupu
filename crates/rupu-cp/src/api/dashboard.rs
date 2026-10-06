@@ -94,12 +94,26 @@ struct DashboardResponse {
 struct DashboardQuery {
     range: Option<String>,
     host: Option<String>,
+    /// `?customer=<slug>|none` — see `get_dashboard`.
+    customer: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
+/// `GET /api/dashboard[?range=][&host=<id>][&customer=<slug>|none]`.
+///
+/// `?customer=` narrows the LOCAL host's contribution to that customer's work
+/// (`none` = no customer): runs by attribution (recorded, else the
+/// workspace's current assignment), `findings_open` by the customer's
+/// projects (current assignment), autoflow cycles by the projects of the
+/// repos they touched (a cycle no project resolves for is left out). The
+/// `fleet` counts are not run-scoped and stay unfiltered. A remote host's
+/// summary arrives already summed and cannot be filtered (plan ruling 5):
+/// `?host=<remote>` with `customer` is a 501, and the fan-out reports each
+/// remote host `unavailable` (never counted). An assignment that cannot be
+/// read fails the request (500). A bad slug is a 400.
 async fn get_dashboard(
     State(s): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<DashboardQuery>,
@@ -110,6 +124,7 @@ async fn get_dashboard(
             ApiError::bad_request(format!("unknown range {r:?}; expected 7d | 30d | all"))
         })?,
     };
+    let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
     // Which hosts to ask: one named host, or every registered host.
     // `HostRegistry` has no per-id lookup (`list_hosts()` is the only
@@ -123,6 +138,9 @@ async fn get_dashboard(
                 .into_iter()
                 .find(|h| h.id == id)
                 .ok_or_else(|| ApiError::not_found(format!("unknown host {id}")))?;
+            if customer.is_some() && found.id != "local" {
+                return Err(crate::customers::remote_aggregate_unsupported(id));
+            }
             vec![found]
         }
         None => s.hosts.list_hosts(),
@@ -133,12 +151,28 @@ async fn get_dashboard(
         let host_id = h.id.clone();
         let name = h.name.clone();
         let (transport_kind, _base_url) = transport_fields(&h.transport);
+        let customer = customer.clone();
         async move {
+            if customer.is_some() && host_id != "local" {
+                // A remote summary arrives summed: it can't be filtered by
+                // customer here (ruling 5). Say so; never count it.
+                return Ok((
+                    HostFreshness {
+                        reason: Some(crate::customers::remote_aggregate_reason(&host_id)),
+                        host_id,
+                        name,
+                        transport_kind,
+                        state: "unavailable",
+                        captured_at: None,
+                    },
+                    None,
+                ));
+            }
             let conn = match registry.resolve(&host_id) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(host_id = %host_id, error = %e, "dashboard: could not resolve host connector");
-                    return (
+                    return Ok((
                         HostFreshness {
                             host_id,
                             name,
@@ -148,10 +182,14 @@ async fn get_dashboard(
                             reason: Some(e.to_string()),
                         },
                         None,
-                    );
+                    ));
                 }
             };
-            match conn.dashboard_summary(range).await {
+            let summary = match &customer {
+                None => conn.dashboard_summary(range).await,
+                Some(f) => conn.dashboard_summary_for_customer(range, f).await,
+            };
+            Ok(match summary {
                 Ok(sum) => {
                     (
                         HostFreshness {
@@ -164,6 +202,11 @@ async fn get_dashboard(
                         },
                         Some(sum),
                     )
+                }
+                // The local host could not read a customer assignment: fail
+                // the request rather than count its work as no customer's.
+                Err(HostConnectorError::Internal(e)) if customer.is_some() => {
+                    return Err(ApiError::internal(e));
                 }
                 Err(HostConnectorError::Unsupported(_)) => (
                     HostFreshness {
@@ -192,11 +235,14 @@ async fn get_dashboard(
                         None,
                     )
                 }
-            }
+            })
         }
     });
 
-    let results = futures_util::future::join_all(futs).await;
+    let results = futures_util::future::join_all(futs)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     // Split into per-host freshness (always kept) and the summaries that
     // actually reported (fed to the pure merge below). A non-reporting host

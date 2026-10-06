@@ -72,6 +72,12 @@ pub struct FindingOut {
     /// crew derived from `declared_by.run_id` for a legacy finding.
     pub codename: String,
     pub codename_derived: bool,
+    /// The customer the finding's project is CURRENTLY assigned to (findings
+    /// record none; plan ruling 6). Always serialized (`null` = no customer)
+    /// so a coordinator can tell "no customer" from a peer too old to say.
+    /// Set by the list and detail handlers; `None` from
+    /// [`collect_all_findings`].
+    pub customer: Option<String>,
     #[serde(flatten)]
     pub record: FindingRecord,
 }
@@ -175,6 +181,9 @@ pub struct FindingsQuery {
     pub workflow: Option<String>,
     /// Keep only findings whose `declared_by.run_id` matches.
     pub run_id: Option<String>,
+    /// `?customer=<slug>|none` — keep only findings whose project is
+    /// currently assigned to that customer (`none` = to no customer).
+    pub customer: Option<String>,
 }
 
 /// Per-severity counts plus the grand total.
@@ -404,6 +413,7 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
                 workflow_name: None,
                 permalink,
                 report_summary: None,
+                customer: None,
                 record,
             });
         }
@@ -579,11 +589,25 @@ fn workflow_names_by_run<'a>(
 /// Tolerant by design: a workspace whose path is gone, or a target whose
 /// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather than
 /// failing the whole request. A missing registry yields an empty response.
+///
+/// Each row carries `customer`: its project's CURRENT assignment (findings
+/// record no customer; plan ruling 6). `?customer=<slug>|none` keeps the
+/// findings of that customer's projects (the summary counts only those); a
+/// bad slug is a 400, and an assignment that cannot be read fails the request.
 async fn list_findings(
     State(s): State<AppState>,
     Query(q): Query<FindingsQuery>,
 ) -> ApiResult<Json<FindingsResponse>> {
+    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
     let mut out: Vec<FindingOut> = collect_all_findings(&s.global_dir);
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir));
+    for f in &mut out {
+        f.customer = lookup.assigned(&f.ws_id)?;
+    }
+    if let Some(filter) = &filter {
+        out.retain(|f| filter.matches(f.customer.as_deref()));
+    }
 
     // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
     // distinct run id once; a load error / NotFound leaves that id out of the
@@ -639,6 +663,9 @@ async fn get_finding(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let mut finding =
         found.ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    finding.customer =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir))
+            .assigned(&finding.ws_id)?;
     if let Ok(run) = s.run_store.load(&finding.record.declared_by.run_id) {
         finding.workflow_name = Some(run.workflow_name);
     }
@@ -1838,6 +1865,7 @@ mod tests {
             workflow_name: workflow_name.map(|s| s.to_string()),
             permalink: None,
             report_summary: None,
+            customer: None,
             record: FindingRecord {
                 id: id.to_string(),
                 file_path: Some("src/a.rs".to_string()),

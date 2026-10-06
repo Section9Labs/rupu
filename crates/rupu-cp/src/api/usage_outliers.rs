@@ -43,6 +43,9 @@ pub fn routes() -> Router<AppState> {
 struct OutliersQuery {
     since: Option<String>,
     until: Option<String>,
+    /// `?customer=<slug>|none` — candidates and baselines from that
+    /// customer's local sources only.
+    customer: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +187,10 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
 /// legitimately changes which runs feed the per-workflow median baseline
 /// below, so it can change which runs are flagged as outliers — that is
 /// intended, not a bug.
+///
+/// Each source is priced with the pricing of the customer it is attributed
+/// to. `?customer=<slug>|none` keeps that customer's sources only — they are
+/// both the candidates and the baselines; a bad slug is a 400.
 async fn get_usage_outliers(
     State(s): State<AppState>,
     Query(q): Query<OutliersQuery>,
@@ -192,11 +199,16 @@ async fn get_usage_outliers(
         crate::api::usage::resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
             .map_err(ApiError::bad_request)?;
 
-    let (sources, _) = crate::api::usage::local_sources(&s, since, until, None).await?;
+    let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
+
+    let (sources, _) = crate::api::usage::local_sources(&s, since, until, None, customer).await?;
+    // Each source is priced with its customer's pricing (spec §1).
+    let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
     let run_costs: Vec<RunCost> = sources
         .into_iter()
         .map(|src| RunCost {
-            cost_usd: crate::usage::summarize(&src.rows, &s.pricing).cost_usd,
+            cost_usd: crate::usage::summarize(&src.rows, prices.get(src.customer.as_deref()))
+                .cost_usd,
             run_id: src.id,
             kind: src.kind,
             workflow_name: src.workflow,

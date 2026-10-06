@@ -501,10 +501,23 @@ async fn list(
     all.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     all.truncate(limit);
 
+    // Each row carries its customer — recorded, else (a run that predates
+    // customers) its workspace's current assignment — so a coordinator
+    // shelling this command can filter by customer. An assignment that
+    // cannot be read fails the command rather than report "no customer".
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
     let rows: Vec<rupu_cp::api::runs::RunListRow> = all
         .iter()
-        .map(|r| rupu_cp::api::runs::RunListRow::with_usage(r, &store, &cfg.pricing))
-        .collect();
+        .map(|r| {
+            let mut row = rupu_cp::api::runs::RunListRow::with_usage(r, &store, &cfg.pricing);
+            let who = customers
+                .attribute(r.customer.as_deref(), &r.workspace_id)
+                .map_err(|e| anyhow::anyhow!(e.1))?;
+            row.set_customer(who);
+            Ok(row)
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     let report = RunListReport {
         kind: "run_list",

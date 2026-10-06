@@ -39,6 +39,8 @@ struct UsageQuery {
     until: Option<String>,
     group_by: Option<String>,
     host: Option<String>,
+    /// `?customer=<slug>|none` — see `get_usage`.
+    customer: Option<String>,
 }
 
 /// The models we could not price, named.
@@ -438,6 +440,9 @@ pub(crate) struct LocalSource {
     /// Stamped with `workflow`, `workspace_id` and `host_id = "local"`.
     pub(crate) rows: Vec<rupu_transcript::UsageRow>,
     pub(crate) partial: bool,
+    /// The customer the source is attributed to — recorded, else its
+    /// workspace's current assignment — and whose pricing prices it.
+    pub(crate) customer: Option<String>,
 }
 
 /// Every local spend source started in `[start, end]` (and in `workspace`,
@@ -448,6 +453,11 @@ pub(crate) struct LocalSource {
 /// [`crate::usage::transcripts_usage`]). Also returns the earliest start
 /// across ALL sources, for the timeline's gap-fill.
 ///
+/// Each kept source is attributed to its customer (recorded, else its
+/// workspace's current assignment); with a `customer` filter only that
+/// customer's sources are kept. An assignment that cannot be read fails the
+/// call.
+///
 /// Blocking IO — call through [`local_sources`].
 fn collect_local_sources(
     store: &rupu_orchestrator::runs::RunStore,
@@ -455,9 +465,14 @@ fn collect_local_sources(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     workspace: Option<&str>,
-) -> Result<(Vec<LocalSource>, Option<DateTime<Utc>>), String> {
+    customer: Option<&crate::customers::CustomerFilter>,
+) -> Result<(Vec<LocalSource>, Option<DateTime<Utc>>), ApiError> {
     use crate::usage_sources::{claimed_transcripts, extra_sources, SourceKind};
-    let runs = store.list().map_err(|e| e.to_string())?;
+    let runs = store
+        .list()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global));
     let in_scope =
         |at: DateTime<Utc>, ws: &str| at >= start && at <= end && workspace.is_none_or(|w| ws == w);
     let mut earliest = runs.iter().map(|r| r.started_at).min();
@@ -466,6 +481,10 @@ fn collect_local_sources(
         .iter()
         .filter(|r| in_scope(r.started_at, &r.workspace_id))
     {
+        let who = lookup.attribute(r.customer.as_deref(), &r.workspace_id)?;
+        if customer.is_some_and(|f| !f.matches(who.slug.as_deref())) {
+            continue;
+        }
         let u = crate::usage::run_usage(store, &r.id);
         let mut rows = u.rows.clone();
         // Attribute each row to the run it came from: `r` is already in
@@ -489,6 +508,7 @@ fn collect_local_sources(
             transcript_path: None,
             rows,
             partial: u.partial,
+            customer: who.slug,
         });
     }
 
@@ -499,6 +519,17 @@ fn collect_local_sources(
         let Some(at) = src.started_at else { continue };
         earliest = Some(earliest.map_or(at, |e| e.min(at)));
         if !in_scope(at, &src.workspace_id) {
+            continue;
+        }
+        let who = if src.customer.is_none() && src.workspace_id.is_empty() {
+            crate::customers::Attribution {
+                slug: None,
+                derived: false,
+            }
+        } else {
+            lookup.attribute(src.customer.as_deref(), &src.workspace_id)?
+        };
+        if customer.is_some_and(|f| !f.matches(who.slug.as_deref())) {
             continue;
         }
         let u = crate::usage::transcripts_usage(&src.paths);
@@ -521,6 +552,7 @@ fn collect_local_sources(
             transcript_path,
             rows,
             partial: u.partial,
+            customer: who.slug,
         });
     }
     Ok((out, earliest))
@@ -534,15 +566,67 @@ pub(crate) async fn local_sources(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     workspace: Option<String>,
+    customer: Option<crate::customers::CustomerFilter>,
 ) -> Result<(Vec<LocalSource>, Option<DateTime<Utc>>), ApiError> {
     let store = Arc::clone(&s.run_store);
     let global = s.global_dir.clone();
     tokio::task::spawn_blocking(move || {
-        collect_local_sources(&store, &global, start, end, workspace.as_deref())
+        collect_local_sources(
+            &store,
+            &global,
+            start,
+            end,
+            workspace.as_deref(),
+            customer.as_ref(),
+        )
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::internal)
+}
+
+/// Usage rows grouped by the customer whose pricing prices them.
+pub(crate) type RowsByCustomer =
+    std::collections::BTreeMap<Option<String>, Vec<rupu_transcript::UsageRow>>;
+
+/// `summarize` / `breakdown` / `unpriced_gap` over rows that may belong to
+/// several customers, each customer's rows priced with its own pricing. One
+/// group (the common case, and every deployment without customers) prices
+/// exactly as a single call would; several are merged like hosts are.
+fn priced_usage(
+    groups: &RowsByCustomer,
+    prices: &mut dyn crate::customers::PriceBook,
+    group_by: crate::usage::GroupBy,
+) -> (
+    crate::usage::UsageSummary,
+    Vec<crate::usage::UsageBreakdownRow>,
+    UnpricedGap,
+) {
+    if groups.len() <= 1 {
+        let (customer, rows) = match groups.iter().next() {
+            Some((c, rows)) => (c.as_deref(), rows.as_slice()),
+            None => (None, &[][..]),
+        };
+        let pricing = prices.pricing_for(customer);
+        return (
+            crate::usage::summarize(rows, pricing),
+            crate::usage::breakdown(rows, pricing, group_by),
+            unpriced_gap(rows, pricing),
+        );
+    }
+    let mut summaries = Vec::with_capacity(groups.len());
+    let mut breakdown = Vec::new();
+    let mut gaps = Vec::with_capacity(groups.len());
+    for (customer, rows) in groups {
+        let pricing = prices.pricing_for(customer.as_deref());
+        summaries.push(crate::usage::summarize(rows, pricing));
+        breakdown.extend(crate::usage::breakdown(rows, pricing, group_by));
+        gaps.push(unpriced_gap(rows, pricing));
+    }
+    (
+        crate::usage::rollup(summaries.into_iter()),
+        merge_breakdown_rows(breakdown, group_by),
+        merge_unpriced(gaps.into_iter()),
+    )
 }
 
 /// Build this host's own usage contribution for `[start, end]` from every
@@ -556,16 +640,18 @@ async fn local_usage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     group_by: crate::usage::GroupBy,
+    customer: Option<crate::customers::CustomerFilter>,
 ) -> Result<HostUsage, ApiError> {
-    let (sources, _) = local_sources(s, start, end, None).await?;
+    let (sources, _) = local_sources(s, start, end, None, customer).await?;
     let partial = sources.iter().any(|src| src.partial);
-    let all_rows: Vec<rupu_transcript::UsageRow> =
-        sources.into_iter().flat_map(|src| src.rows).collect();
+    let mut groups = RowsByCustomer::new();
+    for src in sources {
+        groups.entry(src.customer).or_default().extend(src.rows);
+    }
 
-    let mut summary = crate::usage::summarize(&all_rows, &s.pricing);
+    let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
+    let (mut summary, breakdown, unpriced) = priced_usage(&groups, &mut prices, group_by);
     summary.partial = partial;
-    let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, group_by);
-    let unpriced = unpriced_gap(&all_rows, &s.pricing);
     Ok(HostUsage {
         summary,
         breakdown,
@@ -573,12 +659,32 @@ async fn local_usage(
     })
 }
 
+/// `GET /api/usage[?host=<id>][&customer=<slug>|none]` — the token + cost
+/// overview, fanned out across hosts.
+///
+/// Every local source is priced with the pricing of the customer it is
+/// attributed to (global + that customer's layer; work with no customer at
+/// global pricing). `?customer=` keeps only that customer's local sources
+/// (`none` = no customer). A remote host's usage arrives already summed, so it
+/// cannot be filtered (plan ruling 5): with `customer` set, `?host=<remote>`
+/// is a 501 and the fan-out reports each remote host `unavailable` (never
+/// counted). A bad slug is a 400.
 async fn get_usage(
     State(s): State<AppState>,
     Query(q): Query<UsageQuery>,
 ) -> ApiResult<Json<UsageResponse>> {
     let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
         .map_err(ApiError::bad_request)?;
+    let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
+    if customer.is_some() {
+        if let Some(id) = q.host.as_deref().filter(|id| *id != "local") {
+            // 404 for an unknown host first, as without a filter.
+            if !s.hosts.list_hosts().iter().any(|h| h.id == id) {
+                return Err(ApiError::not_found(format!("unknown host {id}")));
+            }
+            return Err(crate::customers::remote_aggregate_unsupported(id));
+        }
+    }
     let group_by = match q.group_by.as_deref() {
         None => crate::usage::GroupBy::Model,
         Some(g) => crate::usage::GroupBy::parse(g).ok_or_else(|| {
@@ -610,9 +716,10 @@ async fn get_usage(
         let host_id = h.id.clone();
         let name = h.name.clone();
         let (transport_kind, _base_url) = crate::api::hosts::transport_fields(&h.transport);
+        let customer = customer.clone();
         async move {
             if host_id == "local" {
-                return match local_usage(&state, start, end, group_by).await {
+                return match local_usage(&state, start, end, group_by, customer).await {
                     Ok(usage) => (
                         HostFreshness {
                             host_id,
@@ -636,6 +743,22 @@ async fn get_usage(
                         None,
                     ),
                 };
+            }
+
+            if customer.is_some() {
+                // A remote's usage arrives summed: it can't be filtered by
+                // customer here (ruling 5). Say so; never count it.
+                return (
+                    HostFreshness {
+                        reason: Some(crate::customers::remote_aggregate_reason(&host_id)),
+                        host_id,
+                        name,
+                        transport_kind,
+                        state: "unavailable",
+                        captured_at: None,
+                    },
+                    None,
+                );
             }
 
             // Remote host: proxy `GET /api/usage` on the remote's OWN local
@@ -828,6 +951,8 @@ struct TimelineQuery {
     since: Option<String>,
     until: Option<String>,
     bucket: Option<String>,
+    /// `?customer=<slug>|none` — local sources of that customer only.
+    customer: Option<String>,
 }
 
 /// Map a timestamp to its bucket key. `Day` → that day's `YYYY-MM-DD`; `Week`
@@ -881,29 +1006,40 @@ fn enumerate_bucket_keys(
     keys
 }
 
-/// Group per-run `(started_at, rows)` by bucket key, then emit a CONTINUOUS run
-/// of buckets from `fill_start` to `fill_end` inclusive at the granularity —
-/// synthesizing an empty bucket (`rows: []`) for every period with no runs, so
-/// the timeline has no gaps and reaches `fill_end`. Buckets are chronological.
+/// Group per-run `(started_at, customer, rows)` by bucket key, then emit a
+/// CONTINUOUS run of buckets from `fill_start` to `fill_end` inclusive at the
+/// granularity — synthesizing an empty bucket (`rows: []`) for every period
+/// with no runs, so the timeline has no gaps and reaches `fill_end`. Buckets
+/// are chronological. Each run's rows are priced with its customer's pricing
+/// (`prices`).
 fn build_timeline(
-    runs_with_rows: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)>,
-    pricing: &rupu_config::PricingConfig,
+    runs_with_rows: Vec<(
+        DateTime<Utc>,
+        Option<String>,
+        Vec<rupu_transcript::UsageRow>,
+    )>,
+    prices: &mut dyn crate::customers::PriceBook,
     granularity: Granularity,
     fill_start: DateTime<Utc>,
     fill_end: DateTime<Utc>,
 ) -> Vec<UsageTimelineBucket> {
-    let mut grouped: std::collections::BTreeMap<String, Vec<rupu_transcript::UsageRow>> =
+    let mut grouped: std::collections::BTreeMap<String, RowsByCustomer> =
         std::collections::BTreeMap::new();
-    for (started_at, rows) in runs_with_rows {
+    for (started_at, customer, rows) in runs_with_rows {
         let key = bucket_key(started_at, granularity);
-        grouped.entry(key).or_default().extend(rows);
+        grouped
+            .entry(key)
+            .or_default()
+            .entry(customer)
+            .or_default()
+            .extend(rows);
     }
     enumerate_bucket_keys(fill_start, fill_end, granularity)
         .into_iter()
         .map(|bucket| {
             let rows = grouped
                 .get(&bucket)
-                .map(|rows| crate::usage::breakdown(rows, pricing, crate::usage::GroupBy::Model))
+                .map(|groups| priced_usage(groups, prices, crate::usage::GroupBy::Model).1)
                 .unwrap_or_default();
             UsageTimelineBucket { rows, bucket }
         })
@@ -917,22 +1053,28 @@ async fn get_usage_timeline(
     let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
         .map_err(ApiError::bad_request)?;
     let granularity = Granularity::parse(q.bucket.as_deref()).map_err(ApiError::bad_request)?;
+    let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
-    let (sources, earliest_overall) = local_sources(&s, start, end, None).await?;
+    let (sources, earliest_overall) = local_sources(&s, start, end, None, customer).await?;
 
     // Clamp the fill start to the first-ever source; none at all → empty series.
     let Some(fill_start) = timeline_fill_start(start, earliest_overall) else {
         return Ok(Json(Vec::new()));
     };
 
-    let runs_with_rows: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)> = sources
+    let runs_with_rows: Vec<(
+        DateTime<Utc>,
+        Option<String>,
+        Vec<rupu_transcript::UsageRow>,
+    )> = sources
         .into_iter()
-        .map(|src| (src.started_at, src.rows))
+        .map(|src| (src.started_at, src.customer, src.rows))
         .collect();
 
+    let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
     Ok(Json(build_timeline(
         runs_with_rows,
-        &s.pricing,
+        &mut prices,
         granularity,
         fill_start,
         end,
@@ -981,6 +1123,8 @@ struct UsageRunsQuery {
     since: Option<String>,
     until: Option<String>,
     workspace_id: Option<String>,
+    /// `?customer=<slug>|none` — local sources of that customer only.
+    customer: Option<String>,
 }
 
 /// `GET /api/usage/runs?since=&until=&workspace_id=` — flat per-`(run × model)` rows.
@@ -995,7 +1139,9 @@ struct UsageRunsQuery {
 /// once) rather than re-deriving it, then flattens: one `UsageRunRow` per
 /// `UsageRow` a source produced, carrying that source's `run_id`/`kind`/
 /// `started_at` and a per-row price from the SAME
-/// `rupu_config::pricing::lookup` path `summarize`/`breakdown` use.
+/// `rupu_config::pricing::lookup` path `summarize`/`breakdown` use, with the
+/// pricing of the customer the source is attributed to. `?customer=` keeps
+/// that customer's sources only (`none` = no customer); a bad slug is a 400.
 async fn get_usage_runs(
     State(s): State<AppState>,
     Query(q): Query<UsageRunsQuery>,
@@ -1003,21 +1149,26 @@ async fn get_usage_runs(
     let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
         .map_err(ApiError::bad_request)?;
 
-    let (sources, _) = local_sources(&s, start, end, q.workspace_id.clone()).await?;
+    let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
+    let (sources, _) = local_sources(&s, start, end, q.workspace_id.clone(), customer).await?;
+
+    let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
     let mut out = Vec::new();
     for src in sources {
+        let pricing = prices.get(src.customer.as_deref());
         for row in src.rows {
             let priced_cost =
-                rupu_config::pricing::lookup(&s.pricing, &row.provider, &row.model, &row.agent)
-                    .map(|price| {
+                rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent).map(
+                    |price| {
                         price.cost_usd(
                             row.input_tokens,
                             row.output_tokens,
                             row.cached_tokens,
                             row.cache_write_tokens,
                         )
-                    });
+                    },
+                );
             out.push(UsageRunRow {
                 run_id: src.id.clone(),
                 kind: src.kind.as_str(),
@@ -1474,6 +1625,66 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    /// The timeline over runs with no customer, all at one pricing — what
+    /// these tests exercise (shadows the glob-imported `build_timeline`).
+    fn build_timeline(
+        runs: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)>,
+        pricing: &rupu_config::PricingConfig,
+        granularity: Granularity,
+        fill_start: DateTime<Utc>,
+        fill_end: DateTime<Utc>,
+    ) -> Vec<UsageTimelineBucket> {
+        super::build_timeline(
+            runs.into_iter().map(|(t, rows)| (t, None, rows)).collect(),
+            &mut crate::customers::FlatPricing(pricing),
+            granularity,
+            fill_start,
+            fill_end,
+        )
+    }
+
+    /// A bucket holding two customers' runs prices each at its customer's
+    /// pricing and merges them by model.
+    #[test]
+    fn build_timeline_prices_each_customer_with_its_own_pricing() {
+        struct ByCustomer(rupu_config::PricingConfig, rupu_config::PricingConfig);
+        impl crate::customers::PriceBook for ByCustomer {
+            fn pricing_for(&mut self, customer: Option<&str>) -> &rupu_config::PricingConfig {
+                match customer {
+                    Some(_) => &self.1,
+                    None => &self.0,
+                }
+            }
+        }
+        let priced = |input_per_mtok: f64| -> rupu_config::PricingConfig {
+            toml::from_str(&format!(
+                "[anthropic.\"m\"]\ninput_per_mtok = {input_per_mtok}\noutput_per_mtok = 0.0\n"
+            ))
+            .unwrap()
+        };
+        let mut prices = ByCustomer(priced(1.0), priced(5.0));
+        let at = dt("2026-06-24T10:00:00Z");
+        let buckets = super::build_timeline(
+            vec![
+                (at, None, vec![urow("anthropic", "m", 1_000_000, 0)]),
+                (
+                    at,
+                    Some("acme".into()),
+                    vec![urow("anthropic", "m", 1_000_000, 0)],
+                ),
+            ],
+            &mut prices,
+            Granularity::Day,
+            at,
+            at,
+        );
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].rows.len(), 1, "one model row after the merge");
+        let row = &buckets[0].rows[0];
+        assert_eq!(row.input_tokens, 2_000_000);
+        assert!((row.cost_usd.unwrap() - 6.0).abs() < 1e-9, "{row:?}");
+    }
+
     fn urow(provider: &str, model: &str, input: u64, output: u64) -> rupu_transcript::UsageRow {
         rupu_transcript::UsageRow {
             provider: provider.into(),
@@ -1899,6 +2110,7 @@ mod tests {
                 until: None,
                 group_by: Some("workflow".into()),
                 host: None,
+                customer: None,
             }),
         )
         .await
@@ -1956,6 +2168,7 @@ mod tests {
                 until: None,
                 group_by: Some("project".into()),
                 host: None,
+                customer: None,
             }),
         )
         .await
@@ -1988,6 +2201,7 @@ mod tests {
                 since: None,
                 until: None,
                 bucket: None,
+                customer: None,
             }),
         )
         .await

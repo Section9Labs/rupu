@@ -587,6 +587,21 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("dashboard summary".into()))
     }
 
+    /// [`Self::dashboard_summary`] narrowed to one customer's work (plan
+    /// ruling 5). Only the local host implements it: a remote host's summary
+    /// arrives already summed, so the default — every remote transport — is
+    /// `Unsupported`, which callers render as a 501 / "unavailable", never as
+    /// zero.
+    async fn dashboard_summary_for_customer(
+        &self,
+        _range: crate::host::dashboard_summary::DashboardRange,
+        _customer: &crate::customers::CustomerFilter,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "dashboard summary by customer".into(),
+        ))
+    }
+
     /// Stage a packed workspace on the host; returns the remote working dir.
     ///
     /// `payload` is a wire-encoded [`rupu_workspace::Payload`] (see
@@ -837,12 +852,15 @@ pub(crate) fn mirror_list_runs(
         params.lifecycle.as_deref(),
         workflow_only,
         Some(worker_id),
-        pricing,
+        &mut crate::customers::FlatPricing(pricing),
         // No since/until on `RunListQuery` yet — see `LocalHostConnector::
         // list_runs`'s matching call site for why this is deferred.
         &crate::pagination::DateRangeQuery::default(),
+        // A mirrored remote run's workspace is not in this coordinator's
+        // store, so only the customer the run recorded is reported.
+        crate::api::runs::RowCustomers::default(),
     )
-    .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+    .map_err(crate::api::runs::RunRowsError::into_host)?;
 
     rows.iter()
         .map(|r| serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string())))

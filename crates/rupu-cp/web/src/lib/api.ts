@@ -450,6 +450,12 @@ export interface RunListRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** The customer the run is attributed to: the one it recorded, else
+   *  (`customer_derived: true`) its project's CURRENT assignment; `null` = no
+   *  customer. Absent ONLY on rows from a peer too old to report customers —
+   *  never read absence as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   /** Originating host id — `"local"` for runs on this CP; a remote host id
    *  for proxied runs. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
@@ -712,6 +718,12 @@ export interface AgentRunRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** The customer the run is attributed to: the one it recorded, else
+   *  (`customer_derived: true`) its project's CURRENT assignment; `null` = no
+   *  customer. Absent ONLY on rows from a peer too old to report customers —
+   *  never read absence as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   /** Originating host id — `"local"` for local runs; a remote host id for
    *  proxied runs. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
@@ -1287,6 +1299,12 @@ export interface SessionSummary {
   total_tokens_cached?: number;
   usage?: UsageSummary;
   last_error?: string | null;
+  /** The customer the session is attributed to: the one it recorded, else
+   *  (`customer_derived: true`) its project's CURRENT assignment; `null` = no
+   *  customer. Absent ONLY on rows from a peer too old to report customers —
+   *  never read absence as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   /** Originating host id — `"local"` for local sessions; a remote host id for
    *  proxied sessions. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
@@ -1500,6 +1518,9 @@ export interface FindingOut extends FindingRecord {
   project: string;
   target_id: string;
   workflow_name?: string | null;
+  /** The customer the finding's project is CURRENTLY assigned to (findings
+   *  record none); `null` = no customer. */
+  customer?: string | null;
 }
 
 /** Finding detail with evidence status — response from `GET /api/findings/:id`. */

@@ -6,6 +6,7 @@
 //! the shared builders in `crate::api::runs` so the JSON shape is identical to
 //! what the HTTP API serves.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,6 +44,11 @@ pub struct LocalHostConnector {
     /// staging scratch dirs live under `<global_dir>/workspace-sync/`.
     global_dir: PathBuf,
     pricing: rupu_config::PricingConfig,
+    /// Pricing per customer (global + that customer's layer; work with no
+    /// customer at the global pricing, re-read when `config.toml` changes) —
+    /// what run-list rows are priced with. `pricing` is its fallback for a
+    /// global file that does not parse.
+    customer_pricing: Arc<crate::customers::CustomerPricing>,
     /// Optional fleet-inventory port. `None` in a read-only `rupu cp` (no
     /// adapter is installed without `cp serve`), which is why every field it
     /// feeds is `Option` — absent means unreported, not zero.
@@ -67,6 +73,10 @@ impl LocalHostConnector {
             session_starter,
             session_sender,
             run_store,
+            customer_pricing: Arc::new(crate::customers::CustomerPricing::new(
+                global_dir.clone(),
+                rupu_config::PricingConfig::default(),
+            )),
             global_dir,
             pricing: rupu_config::PricingConfig::default(),
             inventory: None,
@@ -75,6 +85,10 @@ impl LocalHostConnector {
 
     /// Override the pricing configuration used for usage summaries.
     pub fn with_pricing(mut self, pricing: rupu_config::PricingConfig) -> Self {
+        self.customer_pricing = Arc::new(crate::customers::CustomerPricing::new(
+            self.global_dir.clone(),
+            pricing.clone(),
+        ));
         self.pricing = pricing;
         self
     }
@@ -182,9 +196,15 @@ impl HostConnector for LocalHostConnector {
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let workflow_only = params.kind == RunKind::Workflow;
         let store = Arc::clone(&self.run_store);
-        let pricing = self.pricing.clone();
+        let customer_pricing = Arc::clone(&self.customer_pricing);
+        let global = self.global_dir.clone();
         // Store reads + the usage fold run on the blocking pool.
         let rows = blocking_host(move || {
+            // Each row carries its customer (recorded, else derived from the
+            // workspace's current assignment) and is priced per customer.
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
             query_run_rows(
                 &store,
                 params.offset,
@@ -192,7 +212,7 @@ impl HostConnector for LocalHostConnector {
                 params.lifecycle.as_deref(),
                 workflow_only,
                 None, // local host shows all runs regardless of worker_id
-                &pricing,
+                &mut prices,
                 // `RunListQuery` (the cross-host connector protocol) carries no
                 // since/until — a remote-per-gate style contract extension is
                 // out of scope for this task (perf & interaction arc, Plan 5
@@ -201,8 +221,12 @@ impl HostConnector for LocalHostConnector {
                 // instead of routing through this trait method at all (see
                 // `api::runs::list_workflow_runs`).
                 &crate::pagination::DateRangeQuery::default(),
+                crate::api::runs::RowCustomers {
+                    lookup: Some(&mut lookup),
+                    filter: None,
+                },
             )
-            .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+            .map_err(crate::api::runs::RunRowsError::into_host)
         })
         .await?;
         // Convert typed rows to Value so the trait's return type is uniform
@@ -469,12 +493,54 @@ impl HostConnector for LocalHostConnector {
         &self,
         range: crate::host::dashboard_summary::DashboardRange,
     ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
-        let runs = self
+        self.summary(range, None)
+    }
+
+    async fn dashboard_summary_for_customer(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+        customer: &crate::customers::CustomerFilter,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        self.summary(range, Some(customer))
+    }
+}
+
+impl LocalHostConnector {
+    /// This host's dashboard summary, optionally narrowed to one customer's
+    /// work: runs by attribution (recorded, else the workspace's current
+    /// assignment), open findings by their project's current assignment,
+    /// and autoflow cycles by the customers of the projects whose repos they
+    /// touched (a cycle no project resolves for is left out under a filter).
+    /// The fleet counts are not run-scoped and stay unfiltered. An
+    /// assignment that cannot be read fails the summary (`Internal`).
+    fn summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+        customer: Option<&crate::customers::CustomerFilter>,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        let mut runs = self
             .run_store
             .list()
             .map_err(|e| HostConnectorError::Invalid(format!("run store list failed: {e}")))?;
-        let cycles = match collect_cycle_rollups(&self.global_dir) {
+        let mut lookup = crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(
+            &self.global_dir,
+        ));
+        let internal = |e: crate::error::ApiError| HostConnectorError::Internal(e.1);
+        if let Some(f) = customer {
+            let mut kept = Vec::with_capacity(runs.len());
+            for r in runs {
+                let who = lookup
+                    .attribute(r.customer.as_deref(), &r.workspace_id)
+                    .map_err(internal)?;
+                if f.matches(who.slug.as_deref()) {
+                    kept.push(r);
+                }
+            }
+            runs = kept;
+        }
+        let cycles = match collect_cycle_rollups(&self.global_dir, customer, &mut lookup) {
             Ok(c) => c,
+            Err(HostConnectorError::Internal(e)) => return Err(HostConnectorError::Internal(e)),
             Err(e) => {
                 // Degrade to empty, but never silently: an IO failure must not
                 // be indistinguishable from "this host has no cycles" (spec
@@ -485,8 +551,14 @@ impl HostConnector for LocalHostConnector {
         };
         // This host DOES report findings — `Some`, never the bare `None` a
         // host that cannot report findings (e.g. SSH) sets. `count_open_findings`
-        // is infallible (see its doc comment).
-        let findings_open = Some(count_open_findings(&self.global_dir));
+        // is infallible (see its doc comment) — bar an unreadable assignment
+        // under a customer filter.
+        let findings_open = Some(match customer {
+            None => count_open_findings(&self.global_dir),
+            Some(f) => {
+                count_open_findings_of(&self.global_dir, f, &mut lookup).map_err(internal)?
+            }
+        });
         // This host reads its own stores, so it reports the `<global_dir>`
         // fleet counts directly, then folds the inventory port's snapshot on
         // top for the provider- and SCM-backed fields. `snapshot()` reads an
@@ -516,8 +588,16 @@ impl HostConnector for LocalHostConnector {
 /// (`dashboard_summary.rs`). Reads through `AutoflowHistoryStore` exactly as
 /// `list_autoflow_runs` (`api/run_streams.rs`) does — one place that parses
 /// `AutoflowCycleRecord`.
+///
+/// Under a `customer` filter a cycle is kept when the projects of the repos
+/// it touched (its events' `repo_ref`s and its `repo_filter`, matched to
+/// registered workspaces by their `repo_remote`) include one of that
+/// customer's; a cycle no registered project resolves for is left out. An
+/// assignment that cannot be read is `Internal`.
 fn collect_cycle_rollups(
     global_dir: &std::path::Path,
+    customer: Option<&crate::customers::CustomerFilter>,
+    lookup: &mut crate::customers::CustomerLookup,
 ) -> Result<Vec<crate::host::summary_build::CycleRollup>, HostConnectorError> {
     use crate::host::summary_build::CycleRollup;
 
@@ -531,6 +611,20 @@ fn collect_cycle_rollups(
         Err(e) => return Err(HostConnectorError::Invalid(e.to_string())),
     };
 
+    let records: Vec<_> = match customer {
+        None => records,
+        Some(f) => {
+            let projects = repo_projects(global_dir);
+            let mut kept = Vec::with_capacity(records.len());
+            for r in records {
+                if cycle_matches(&r, f, &projects, lookup)? {
+                    kept.push(r);
+                }
+            }
+            kept
+        }
+    };
+
     Ok(records
         .iter()
         .map(|r| CycleRollup {
@@ -538,6 +632,58 @@ fn collect_cycle_rollups(
             failed: r.failed_cycles as u64,
         })
         .collect())
+}
+
+/// `<platform>:<owner>/<repo>` — the `repo_ref` form autoflow events carry —
+/// for a git remote URL github/gitlab can be parsed from.
+fn repo_ref_of_remote(remote: &str) -> Option<String> {
+    let web = rupu_scm::weburl::parse_repo_remote(remote)?;
+    let platform = match web.platform {
+        rupu_scm::Platform::Github => "github",
+        rupu_scm::Platform::Gitlab => "gitlab",
+    };
+    Some(format!("{platform}:{}/{}", web.owner, web.repo))
+}
+
+/// Registered workspace ids by the repo ref of their remote.
+fn repo_projects(global_dir: &std::path::Path) -> HashMap<String, Vec<String>> {
+    let store = rupu_workspace::WorkspaceStore {
+        root: global_dir.join("workspaces"),
+    };
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for w in store.list().unwrap_or_default() {
+        if let Some(r) = w.repo_remote.as_deref().and_then(repo_ref_of_remote) {
+            out.entry(r).or_default().push(w.id);
+        }
+    }
+    out
+}
+
+/// Does `cycle` belong to `filter`'s customer, through the projects of the
+/// repos it touched? A cycle whose repos resolve to no registered project
+/// matches nothing.
+fn cycle_matches(
+    cycle: &rupu_runtime::AutoflowCycleRecord,
+    filter: &crate::customers::CustomerFilter,
+    projects: &HashMap<String, Vec<String>>,
+    lookup: &mut crate::customers::CustomerLookup,
+) -> Result<bool, HostConnectorError> {
+    let repos = cycle
+        .events
+        .iter()
+        .filter_map(|e| e.repo_ref.as_deref())
+        .chain(cycle.repo_filter.as_deref());
+    for repo in repos {
+        for ws in projects.get(repo).into_iter().flatten() {
+            let slug = lookup
+                .assigned(ws)
+                .map_err(|e| HostConnectorError::Internal(e.1))?;
+            if filter.matches(slug.as_deref()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Best-effort RFC-3339 parse; falls back to `now()` on a malformed
@@ -564,6 +710,22 @@ fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
 fn count_open_findings(global_dir: &std::path::Path) -> u64 {
     let findings = crate::api::findings::collect_all_findings(global_dir);
     crate::api::findings::build_response(findings).summary.total as u64
+}
+
+/// [`count_open_findings`] over the projects CURRENTLY assigned to the
+/// filter's customer (findings record none; plan ruling 6).
+fn count_open_findings_of(
+    global_dir: &std::path::Path,
+    filter: &crate::customers::CustomerFilter,
+    lookup: &mut crate::customers::CustomerLookup,
+) -> Result<u64, crate::error::ApiError> {
+    let mut kept = Vec::new();
+    for f in crate::api::findings::collect_all_findings(global_dir) {
+        if filter.matches(lookup.assigned(&f.ws_id)?.as_deref()) {
+            kept.push(f);
+        }
+    }
+    Ok(crate::api::findings::build_response(kept).summary.total as u64)
 }
 
 #[cfg(test)]
@@ -594,7 +756,10 @@ mod dashboard_summary_tests {
         });
         store.save(&record).unwrap();
 
-        let rollups = collect_cycle_rollups(global.path()).unwrap();
+        let mut lookup = crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(
+            global.path(),
+        ));
+        let rollups = collect_cycle_rollups(global.path(), None, &mut lookup).unwrap();
         assert_eq!(rollups.len(), 1);
         let rollup = &rollups[0];
         assert_eq!(
@@ -605,6 +770,66 @@ mod dashboard_summary_tests {
             (rollup.started_at - started).num_seconds().abs() < 2,
             "started_at must round-trip through the real store"
         );
+    }
+
+    /// Under a customer filter a cycle counts for the customer of the project
+    /// whose repo it touched (`repo_ref` ↔ the workspace's `repo_remote`); a
+    /// cycle no registered project resolves for counts for nobody.
+    #[test]
+    fn cycles_are_attributed_through_their_repos_project() {
+        let global = tempfile::tempdir().unwrap();
+        let g = global.path();
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(g.join("workspaces")).unwrap();
+        std::fs::write(
+            g.join("workspaces/ws_acme.toml"),
+            format!(
+                "id = \"ws_acme\"\npath = \"{}\"\nrepo_remote = \"git@github.com:acme/app.git\"\n\
+                 created_at = \"2026-01-01T00:00:00Z\"\n",
+                proj.path().display()
+            ),
+        )
+        .unwrap();
+        let customers = rupu_workspace::CustomerStore::new(g);
+        customers
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        customers
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_acme"))
+            .unwrap();
+
+        let store = AutoflowHistoryStore::new(g.join("autoflows").join("history"));
+        let at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let mut touched = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, at);
+        touched.events.push(AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::RunLaunched,
+            repo_ref: Some("github:acme/app".into()),
+            ..Default::default()
+        });
+        store.save(&touched).unwrap();
+        let mut elsewhere = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, at);
+        elsewhere.repo_filter = Some("github:other/repo".into());
+        store.save(&elsewhere).unwrap();
+
+        let count = |filter: Option<&str>| {
+            let f = crate::customers::CustomerFilter::parse(filter).unwrap();
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(g));
+            collect_cycle_rollups(g, f.as_ref(), &mut lookup)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count(None), 2);
+        assert_eq!(count(Some("acme")), 1);
+        assert_eq!(count(Some("globex")), 0);
+        // Unresolvable cycles are not "unassigned" — they are left out.
+        assert_eq!(count(Some("none")), 0);
     }
 }
 
