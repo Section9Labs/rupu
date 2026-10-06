@@ -20,3 +20,4 @@ mod netflow_capture;
 mod oauth_refresh_persists;
 mod oauth_refresh_tracking;
 mod provider_resolution;
+mod sync_provider_build;

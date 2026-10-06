@@ -19,7 +19,8 @@ pub use autoflow_history::{
 };
 pub use backend::{ExecutionBackend, PreparedRun, RunResult, RunResultStatus};
 pub use provider_factory::{
-    build_for_provider, build_for_provider_with_config, FactoryError, ProviderConfig,
+    build_for_provider, build_for_provider_with_config, build_provider_from_credential,
+    FactoryError, ProviderConfig,
 };
 pub use run_envelope::{
     AutoflowEnvelope, ExecutionRequest, RepoBinding, RunContext, RunCorrelation, RunEnvelope,
