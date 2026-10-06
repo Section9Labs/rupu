@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::budget::{parse_duration, BudgetStage, UsageSource};
-use crate::def::AgentiflowDef;
+use crate::def::{AgentiflowDef, WorkflowsSpec};
 use crate::dispatch_tools::fleet_dispatch_tools;
 use crate::envelope::{
     Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome, StopReason,
@@ -71,6 +71,8 @@ use crate::envelope::{
 use crate::error::AgentiflowError;
 use crate::lead::{LeadConfig, ProviderFactory, RunAgentLeadDriver};
 use crate::operator::OperatorQueue;
+use crate::roster::{roster_collector, roster_tools, RosterCtx};
+use crate::status_tools::status_tools;
 use crate::subprocess::SubprocessUnitLauncher;
 use crate::supervisor::FleetSupervisor;
 use crate::unit::UnitLauncher;
@@ -223,6 +225,22 @@ fn has_automatic_terminator(def: &AgentiflowDef) -> bool {
             .as_ref()
             .and_then(|r| r.ceiling.as_ref())
             .is_some_and(|c| c.rounds.is_some() || c.wall_clock.is_some())
+}
+
+/// The workflow ids the lead's roster index names. A listed pool is taken as
+/// written; `workflows: all` is resolved against the catalog as it stands at
+/// run start (a workflow added mid-run is not indexed, though `workflows.list`
+/// still shows it).
+fn pool_workflow_ids(spec: &WorkflowsSpec, ctx: &RosterCtx) -> Vec<String> {
+    match spec {
+        WorkflowsSpec::List(ids) => ids.clone(),
+        WorkflowsSpec::All(_) => {
+            rupu_orchestrator::list_workflow_summaries(&ctx.global, ctx.project.as_deref())
+                .into_iter()
+                .map(|w| w.id)
+                .collect()
+        }
+    }
 }
 
 /// The usage source for this build: reports nothing spent.
@@ -511,6 +529,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 ceiling_rounds,
                 ceiling_wall_clock,
             };
+            // The lead's status tools evaluate the same pooled scope the envelope
+            // does, so keep a copy of the paths before the envelope takes them.
+            let status_paths = paths.clone();
             let mut envelope = Envelope::new(
                 paths,
                 active,
@@ -560,7 +581,34 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 Arc::new(def.pool.agents.clone()),
                 def.engagement_profiles.clone(),
             ));
-            let collectors = crate::collectors::lead_collectors(mailbox, board, "lead");
+
+            // Roster awareness + steering. The roster tools read the agent and
+            // workflow catalog (global + the workspace's `.rupu`); the status tools
+            // re-run the envelope's own evaluators over the pooled scope and let
+            // the lead write a standing board directive. All appended to the lead's
+            // always-on tools, never replacing the fleet / dispatch tools above.
+            let roster_ctx = Arc::new(RosterCtx {
+                global: global.clone(),
+                project: Some(workspace.join(".rupu")),
+            });
+            extra_tools.extend(roster_tools(roster_ctx.clone()));
+            extra_tools.extend(status_tools(
+                def.goals.clone(),
+                def.coverage.clone(),
+                status_paths,
+                findings_engagement.clone(),
+                board.clone(),
+            ));
+
+            let mut collectors = crate::collectors::lead_collectors(mailbox, board, "lead");
+            // The lead's ambient index of what it can dispatch: its pool, resolved
+            // against the catalog.
+            let pool_workflows = pool_workflow_ids(&def.pool.workflows, &roster_ctx);
+            collectors.push(roster_collector(
+                def.pool.agents.clone(),
+                pool_workflows,
+                roster_ctx,
+            ));
             let lead_cfg = LeadConfig {
                 agent_name: lead.agent_name,
                 system_prompt: lead.system_prompt,
@@ -1616,6 +1664,153 @@ mod tests {
         );
         // A unit that finished by itself is not signalled at wind-down.
         assert!(launcher.terminated().is_empty());
+    }
+
+    // ---- roster awareness + status / steering tools -----------------------
+
+    /// Write one agent file under the fixture's global `agents/` dir.
+    fn write_agent(fx: &Fixture, name: &str, description: &str) {
+        let dir = fx.global.join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: {description}\ntools: [read_file]\n---\nYou are {name}.\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_lead_sees_the_roster_steers_the_board_and_checks_goal_status() {
+        use crate::unit::{MockUnitLauncher, UnitStatus};
+        let fx = fixture();
+        let id = "af_roster";
+
+        // The catalog: the two pool agents plus `scout`, which the pool does NOT
+        // name -- so it can only reach the lead through `agents.list`, never
+        // through the pool-scoped roster index.
+        write_agent(&fx, "lead", "Runs the engagement.");
+        write_agent(&fx, "recon", "Maps the exposed gateway surface.");
+        write_agent(&fx, "scout", "Walks the legacy intranet pages.");
+
+        // The mock unit reports a finding into the run's POOLED scope at spawn.
+        let ws = fx.workspace.clone();
+        let launcher = Arc::new(
+            MockUnitLauncher::scripted(vec![UnitStatus::Running]).with_on_spawn(move |_, _| {
+                let paths = CoveragePaths::new(&ws, &target_id(&ws, id));
+                append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_unit")).unwrap();
+            }),
+        );
+
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn("t0", "agents.list", json!({})),
+            // Before any unit has reported: the goal is not yet met.
+            tool_turn("t1", "goal.status", json!({})),
+            tool_turn(
+                "t2",
+                "board.directive",
+                json!({ "body": "prioritize the gateway" }),
+            ),
+            tool_turn(
+                "t3",
+                "dispatch",
+                json!({ "agent": "recon", "prompt": "scan" }),
+            ),
+            // After the unit's finding is pooled: the goal is met.
+            tool_turn("t4", "goal.status", json!({})),
+            done_turn(),
+        ]]);
+        let mut o = opts(
+            &fx,
+            def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        o.unit_launcher = Some(launcher.clone());
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 6, "one model call per scripted turn");
+
+        // (a) The RosterCollector's pool index reached the model on its very
+        // first call: the pool's agents, resolved against the catalog. `scout`
+        // is in the catalog but not the pool, so it is absent here.
+        let first = request_texts(&reqs[0]);
+        assert!(
+            any_contains(&first, "source: roster")
+                && any_contains(&first, "Maps the exposed gateway surface."),
+            "the roster index reaches the lead's first turn: {first:?}"
+        );
+        assert!(
+            !any_contains(&first, "scout"),
+            "the index is the pool, not the whole catalog: {first:?}"
+        );
+        // ...and is re-asserted every turn.
+        assert!(any_contains(&request_texts(&reqs[5]), "source: roster"));
+
+        // (b) `agents.list` ran for real: the whole catalog (including `scout`)
+        // came back to the model after that turn.
+        let after_list = request_texts(&reqs[1]);
+        assert!(
+            any_contains(&after_list, "Walks the legacy intranet pages."),
+            "{after_list:?}"
+        );
+
+        // (c) `board.directive` wrote a standing directive, read back through a
+        // FRESH board handle over the run dir.
+        let directives = rupu_fleet::Board::new(run_dir(&fx, id))
+            .read_directives()
+            .unwrap();
+        assert_eq!(directives.len(), 1, "{directives:?}");
+        assert_eq!(directives[0].author, "lead");
+        assert_eq!(directives[0].body, "prioritize the gateway");
+
+        // (d) `goal.status` re-evaluated live: unmet before the unit's finding
+        // was pooled, met after it.
+        let before = request_texts(&reqs[2]);
+        assert!(
+            any_contains(&before, "\"id\":\"any-finding\"")
+                && any_contains(&before, "\"satisfied\":false"),
+            "{before:?}"
+        );
+        let after = request_texts(&reqs[5]);
+        assert!(
+            any_contains(&after, "\"id\":\"any-finding\"")
+                && any_contains(&after, "\"satisfied\":true"),
+            "{after:?}"
+        );
+        let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap();
+        assert!(findings.contains("fnd_unit"), "{findings}");
+    }
+
+    #[test]
+    fn a_listed_workflow_pool_is_taken_as_written_and_all_resolves_to_the_catalog() {
+        let fx = fixture();
+        let wf = fx.global.join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("sweep.yaml"),
+            "name: Sweep\nsteps:\n  - id: only\n    agent: recon\n    prompt: hi\n",
+        )
+        .unwrap();
+        let ctx = RosterCtx {
+            global: fx.global.clone(),
+            project: Some(fx.workspace.join(".rupu")),
+        };
+        // A list is passed through untouched, even for an id the catalog lacks
+        // (the collector marks it `(not found)`).
+        let listed = WorkflowsSpec::List(vec!["sweep".into(), "ghost".into()]);
+        assert_eq!(pool_workflow_ids(&listed, &ctx), ["sweep", "ghost"]);
+        // `all` is the catalog's ids.
+        let all = AgentiflowDef::parse_str(
+            "name: n\nlead: lead\nengagement_profiles: [network]\n\
+             goals:\n  - id: g\n    objective: o\n    target: { findings: {}, count_gte: 1 }\n\
+             scope: { authorized: true }\npool: { agents: [lead], workflows: all }\n",
+        )
+        .unwrap()
+        .pool
+        .workflows;
+        assert_eq!(pool_workflow_ids(&all, &ctx), ["sweep"]);
     }
 
     #[test]
