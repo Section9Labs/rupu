@@ -203,14 +203,15 @@ struct TranscriptFold {
 }
 
 impl TranscriptFold {
-    fn clear_keep_cursor(&mut self) {
-        let cursor = std::mem::take(&mut self.cursor);
-        *self = TranscriptFold {
-            cursor,
-            generation: self.generation,
-            resets: self.resets,
-            ..TranscriptFold::default()
-        };
+    /// Zero the folded accumulators, leaving the cursor, generation and reset
+    /// counters untouched. Used by [`drain`](Self::drain) on a file reset,
+    /// where the cursor is held outside `self` and must not be disturbed.
+    fn clear_fold_state(&mut self) {
+        self.start = None;
+        self.by_model = BTreeMap::new();
+        self.turns = 0;
+        self.duration_ms = None;
+        self.points = Vec::new();
     }
 
     fn apply_line(&mut self, line: &str) {
@@ -269,24 +270,44 @@ impl TranscriptFold {
 
     /// Fold every line appended since the last drain. A missing file is "no
     /// data yet"; a shrunk/replaced file restarts the fold.
+    ///
+    /// Each line is folded as it is read — never collected into a `Vec<String>`
+    /// first. A transcript's bulk is tool-result and delta lines (which
+    /// [`apply_line`](Self::apply_line) discards without a full parse), so a
+    /// multi-GB transcript folded on the aggregate path would otherwise
+    /// materialise its entire new content as owned `String`s at once. The
+    /// cursor is moved out of `self` for the call so `on_reset` / `on_line` can
+    /// borrow the rest of `self`; `on_reset` fires before the first new line
+    /// (cursor contract), so a reset clears stale state in the right order.
     fn drain(&mut self, path: &Path) {
-        let mut lines: Vec<String> = Vec::new();
-        match self
-            .cursor
-            .drain_with(path, || {}, |l| lines.push(l.to_owned()))
-        {
+        let mut cursor = std::mem::take(&mut self.cursor);
+        let did_reset = std::cell::Cell::new(false);
+        let mut cleared = false;
+        let result = cursor.drain_with(
+            path,
+            || did_reset.set(true),
+            |l| {
+                if did_reset.get() && !cleared {
+                    self.clear_fold_state();
+                    cleared = true;
+                }
+                self.apply_line(l);
+            },
+        );
+        self.cursor = cursor;
+        match result {
             Ok(stats) => {
                 self.unreadable = false;
+                // A reset with no following lines still clears the fold.
+                if did_reset.get() && !cleared {
+                    self.clear_fold_state();
+                }
                 if stats.reset {
-                    self.clear_keep_cursor();
                     self.resets += 1;
                     self.generation += 1;
                 }
                 if stats.bytes > 0 {
                     self.generation += 1;
-                }
-                for l in &lines {
-                    self.apply_line(l);
                 }
             }
             Err(e) => {
@@ -1356,6 +1377,46 @@ mod tests {
             .open(path)
             .unwrap();
         f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn transcript_fold_streams_lines_skips_bulk_and_clears_on_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("t.jsonl");
+
+        // RunStart + 2 usage turns, interleaved with bulk lines that
+        // `apply_line` must skip (a tool_result event and a non-event line) —
+        // the kind of content whose per-line owned-String materialisation was
+        // the memory spike this fold now avoids.
+        append(&p, &event_json(&Event::RunStart {
+            codename: None,
+            run_id: "run_T".into(),
+            workspace_id: "ws".into(),
+            agent: "a".into(),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            started_at: Utc::now(),
+            mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
+        }));
+        append(&p, "{\"type\":\"tool_result\",\"blob\":\"xxxxxxxxxxxxxxxxxxxx\"}\n");
+        append(&p, &usage_line("anthropic", "m", 10, 5, None));
+        append(&p, "not even json, a raw delta line\n");
+        append(&p, &usage_line("anthropic", "m", 20, 7, None));
+
+        let mut fold = TranscriptFold::default();
+        fold.drain(&p);
+        assert_eq!(fold.points.len(), 2, "two usage turns folded");
+        assert_eq!(fold.turns, 2, "bulk lines did not count as turns");
+
+        // Truncating and rewriting the file (a reset) must clear the stale
+        // fold before the new content is applied — not accumulate onto it.
+        std::fs::write(&p, "").unwrap();
+        append(&p, &transcript_lines("a", "anthropic", "m", &[(1, 1)]));
+        fold.drain(&p);
+        assert_eq!(fold.points.len(), 1, "reset cleared stale points before applying");
+        assert_eq!(fold.resets, 1, "the shrink was counted as a reset");
     }
 
     fn step_result(step: &str, transcript: &Path) -> StepResultRecord {

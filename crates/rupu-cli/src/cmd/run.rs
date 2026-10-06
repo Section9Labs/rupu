@@ -1072,6 +1072,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 n
             },
         ));
+
+        // Process-wide subprocess-capture backend, warmed off the async
+        // runtime (its first call blocks). The dispatcher hands the same
+        // Arc to every child run.
+        let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+        dispatcher.set_net_capture(Arc::clone(&net_capture));
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
         let tool_context = ToolContext {
@@ -1095,6 +1101,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             agent: None,
             provider: None,
             coverage_stream: Some(coverage_stream.clone()),
+            netflow_sink: Some(netflow_sink.clone()),
+            net_capture: Some(net_capture),
+            tool_call_id: None,
         };
 
         let backend_id = "local_checkout".to_string();

@@ -73,7 +73,44 @@ export type NetflowScope = 'run' | 'project' | 'global';
  *  hint, which has no scope of its own to key off) or through
  *  [`netflowCoverageList`], which now just returns this same string for
  *  every scope. */
-export const NETFLOW_COVERAGE_LIST = 'provider APIs, SCM connectors';
+export const NETFLOW_COVERAGE_LIST =
+  'provider APIs, SCM connectors, and bash subprocess connections (TCP/UDP, by process, ' +
+  "attributed to the tool call) where subprocess capture is enabled — see the run's capture status";
+
+/** Honest limits of the subprocess (bash) capture — the gaps that make a
+ *  quiet subprocess list "not seen" rather than "did nothing". Authored
+ *  once, here, with the rest of the scope-limit wording. */
+export const SUBPROCESS_CAPTURE_LIMITS =
+  'Subprocess flows carry no hostnames (IP + ASN only); unconnected UDP has no destination; ' +
+  'detached children and very short connections may be missed; and a remote host\'s bash ' +
+  'flows stay on that host.';
+
+/** The run-scoped capture summary (`NetflowResponse.capture`), structurally
+ *  typed here to keep this module free of a `lib/netflow.ts` dependency
+ *  cycle (same convention as `NetflowWindowEcho`). */
+export interface NetflowCaptureStatus {
+  state: 'active' | 'unavailable';
+  reason?: string | null;
+  notes: string[];
+}
+
+/** The capture-state sentences for a run: unavailability (with the
+ *  backend's reason) and any visible-loss notes. Empty when the run's
+ *  capture was active with nothing to report, or when there is no
+ *  capture status at all (older run, project/global scope). */
+export function captureStatusText(capture?: NetflowCaptureStatus | null): string {
+  if (!capture) return '';
+  const parts: string[] = [];
+  if (capture.state === 'unavailable') {
+    parts.push(
+      `Subprocess capture unavailable on this run${capture.reason ? `: ${capture.reason}` : ''}.`,
+    );
+  }
+  if (capture.notes.length > 0) {
+    parts.push(`Capture notes: ${capture.notes.join('; ')}.`);
+  }
+  return parts.join(' ');
+}
 
 /** `NETFLOW_COVERAGE_LIST`, at every scope — see the header comment's "CP
  *  fleet traffic" and "ASN refresh" notes for why global scope no longer
@@ -101,15 +138,18 @@ const RUN_SCOPE_SUB_AGENT_NOTE =
 /** Exported (previously private to `NetflowScopeDisclosure`) so the
  *  explorer's CoveragePopover can render the same single-sourced text —
  *  run scope appends the sub-agent folding note here and nowhere else. */
-export function disclosureText(scope: NetflowScope): string {
+export function disclosureText(scope: NetflowScope, capture?: NetflowCaptureStatus | null): string {
   const coverage = netflowCoverageList(scope);
+  const captureText = scope === 'run' ? captureStatusText(capture) : '';
   return (
-    `This covers rupu's own egress — ${coverage} — never traffic from the agent's bash ` +
-    `subprocess. It also can't see non-HTTP egress: git2 clones (often a run's ` +
+    `This covers rupu's own egress — ${coverage}. ` +
+    `${SUBPROCESS_CAPTURE_LIMITS} ` +
+    `It also can't see non-HTTP egress from rupu itself: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
     `here too. Ledgers are kept indefinitely unless an operator runs rupu netflow prune — ` +
     `nothing here expires or rotates on its own.` +
-    (scope === 'run' ? RUN_SCOPE_SUB_AGENT_NOTE : '')
+    (scope === 'run' ? RUN_SCOPE_SUB_AGENT_NOTE : '') +
+    (captureText ? ` ${captureText}` : '')
   );
 }
 
@@ -144,7 +184,7 @@ export function disclosureText(scope: NetflowScope): string {
  *  has since been deleted (an orphan). Neither is a bug to chase; see
  *  that function's own doc comment for the full accounting. */
 export function netflowEmptyStateHint(scope: NetflowScope): string {
-  const generic = `Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`;
+  const generic = `Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}.`;
   if (scope !== 'project') return generic;
   return (
     `This covers both this project's own .rupu/netflow/ directory (if it has one) and ` +

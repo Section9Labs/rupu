@@ -82,6 +82,9 @@ pub struct CliAgentDispatcher {
     /// `codenames.json` as the run's static slots. `None` until installed;
     /// [`Self::namer_for`] then falls back to an in-memory namer.
     namer: std::sync::Mutex<Option<rupu_codename::SharedNamer>>,
+    /// The process-wide subprocess-capture backend (see
+    /// [`Self::set_net_capture`]); handed to every child's `ToolContext`.
+    net_capture: std::sync::Mutex<Option<Arc<dyn rupu_netflow::SubprocessCapture>>>,
     /// The ROOT workflow run's usage ledger (`<run>/usage.jsonl`), when this
     /// dispatcher serves a workflow run. Every dispatched child (and its own
     /// grandchildren, which reuse this dispatcher) appends its per-LLM-call
@@ -163,6 +166,7 @@ impl CliAgentDispatcher {
             kinds,
             findings_base,
             namer: std::sync::Mutex::new(None),
+            net_capture: std::sync::Mutex::new(None),
             usage_ledger,
             limits_ctx,
             coverage_stream,
@@ -172,6 +176,18 @@ impl CliAgentDispatcher {
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
         arc
+    }
+
+    /// Install the process-wide subprocess-capture backend (warmed via
+    /// [`crate::netflow_sink::net_capture`]) so every dispatched child's
+    /// `ToolContext` shares the parent's one capture while keeping its own
+    /// per-run sink. Production callers MUST install it (the choke-point
+    /// test enforces this); an uninstalled dispatcher (tests) gives children
+    /// no capture.
+    pub fn set_net_capture(&self, capture: Arc<dyn rupu_netflow::SubprocessCapture>) {
+        if let Ok(mut g) = self.net_capture.lock() {
+            *g = Some(capture);
+        }
     }
 
     /// Install the run's codename namer (`RunNaming::namer()`), so
@@ -424,6 +440,9 @@ impl AgentDispatcher for CliAgentDispatcher {
             agent: None,
             provider: None,
             coverage_stream: self.coverage_stream.clone(),
+            netflow_sink: Some(netflow_sink.clone()),
+            net_capture: self.net_capture.lock().ok().and_then(|g| g.clone()),
+            tool_call_id: None,
         };
 
         // What a fallback hop keeps from this child's agent: exactly what its

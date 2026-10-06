@@ -13,7 +13,7 @@
 // calls also include the host param.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
@@ -56,6 +56,7 @@ import {
 } from '../components/transcript/subrunIdentity';
 import { parseCodename } from '../lib/codename';
 import { useRunUsage } from '../lib/runUsage';
+import { parseCallHash, useToolCallAnchor } from '../lib/toolCallAnchor';
 
 const MAX_EVENTS = 2000;
 
@@ -162,12 +163,20 @@ export default function RunDetail() {
   const [searchParams] = useSearchParams();
   const host = searchParams.get('host') ?? undefined;
   const navigate = useNavigate();
+  const { hash } = useLocation();
 
   // Full graph state (used for both local and remote runs).
   const [graph, setGraph] = useState<RunGraphResponse | null>(null);
 
   const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('transcript');
+
+  // `#call-<id>` (a socket flow's "transcript" link): make sure the Transcript
+  // tab is showing — the link may be followed from this run's Network tab — and
+  // scroll to the tool call's card once the transcript has rendered it.
+  useEffect(() => {
+    if (parseCallHash(hash) !== null) setTab('transcript');
+  }, [hash]);
 
   // Live state, fed by the single SSE subscription below.
   const [events, setEvents] = useState<SeqEvent[]>([]);
@@ -741,6 +750,15 @@ export default function RunDetail() {
   const selectedFanout = useMemo(() => fanoutOf(selectedNode ?? undefined), [selectedNode]);
   const selectedTranscriptPath = selectedNode?.transcriptPath ?? null;
 
+  // `#call-<id>` scroll (see the hash effect near `tab`). Re-armed whenever the
+  // transcript on screen changes, so picking the step that ran the call — what
+  // the "not in the transcript shown" notice asks for — scrolls to it.
+  const callAnchor = useToolCallAnchor(
+    hash,
+    tab === 'transcript',
+    `${selection?.stepId ?? ''}:${selection?.unitIndex ?? ''}:${selectedTranscriptPath ?? ''}`,
+  );
+
   // Events filtered to the selected step (run-level events, which carry no
   // step_id, drop out naturally); the whole feed when nothing is selected.
   const feedEvents = useMemo<SeqEvent[]>(() => {
@@ -1305,6 +1323,15 @@ export default function RunDetail() {
           have room and own their internal scroll; the whole page scrolls in the
           parent <main>. */}
       <div className="flex h-[65vh] min-h-[420px] flex-col px-8 pb-6 pt-3">
+        {tab === 'transcript' && callAnchor.status === 'missing' && (
+          <div
+            role="status"
+            className="mb-2 rounded-md border border-border bg-panel px-3 py-1.5 text-note text-ink-dim"
+          >
+            Tool call <span className="font-mono">{callAnchor.callId}</span> isn&apos;t in the
+            transcript shown. A run&apos;s transcript is per step — select the step that ran it.
+          </div>
+        )}
         {tab === 'transcript' && (
           <SubrunIdentityContext.Provider value={subrunIdentities}>
             <div className="flex h-full min-h-0 flex-col overflow-auto">

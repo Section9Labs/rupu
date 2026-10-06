@@ -3,7 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import FlowDetailPanel from './FlowDetailPanel';
-import { flowView } from './explorerFixtures';
+import { flowView, socketFlowView } from './explorerFixtures';
 
 afterEach(() => {
   cleanup();
@@ -65,5 +65,27 @@ describe('FlowDetailPanel', () => {
     render(<FlowDetailPanel flow={flowView()} scope="global" onClose={onClose} />);
     fireEvent.click(screen.getByRole('button', { name: /close flow detail/i }));
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('shows the socket field set and none of the http-only rows for a socket flow', () => {
+    render(<FlowDetailPanel flow={socketFlowView()} scope="global" onClose={() => {}} />);
+    expect(screen.getByText('140.82.116.3:443')).toBeInTheDocument();
+    expect(screen.getByText('curl (pid 4412)')).toBeInTheDocument();
+    expect(screen.getByText('10.0.0.2:51000')).toBeInTheDocument();
+    expect(screen.getByText('outbound')).toBeInTheDocument();
+    expect(screen.getByText('4.0 KB')).toBeInTheDocument();
+    expect(screen.getByText('128 B')).toBeInTheDocument();
+    expect(screen.queryByText('Status')).not.toBeInTheDocument();
+    expect(screen.queryByText('TTFB')).not.toBeInTheDocument();
+    expect(screen.queryByText('Peer IP')).not.toBeInTheDocument();
+    expect(screen.queryByText(/GET|POST/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the http rows for an http flow', () => {
+    render(<FlowDetailPanel flow={flowView({ ttfb_ms: 12 })} scope="global" onClose={() => {}} />);
+    expect(screen.getByText('Status')).toBeInTheDocument();
+    expect(screen.getByText('TTFB')).toBeInTheDocument();
+    expect(screen.queryByText('Local address')).not.toBeInTheDocument();
+    expect(screen.queryByText('Process')).not.toBeInTheDocument();
   });
 });

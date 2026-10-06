@@ -124,10 +124,7 @@ fn project_root() -> Option<PathBuf> {
         if cur.join(".rupu").is_dir() {
             return Some(cur.to_path_buf());
         }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => return None,
-        }
+        cur = cur.parent()?;
     }
 }
 

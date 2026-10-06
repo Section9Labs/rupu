@@ -41,6 +41,13 @@ pub trait SubprocessCapture: Send + Sync {
 pub trait CaptureCall: Send {
     /// Shell text to prepend to the command (e.g. to enter a cgroup), if
     /// the backend needs the child to cooperate.
+    ///
+    /// Contract: the prefix is prepended as ONE line before the user's
+    /// command, so it must be idempotent and side-effect-only. It must NOT
+    /// change shell options (no `set -e`), exit, or otherwise alter the
+    /// command's semantics, nor shift `$LINENO`-sensitive behavior beyond
+    /// that single prepended line. (The Linux backend's
+    /// `{ ...; } 2>/dev/null` line satisfies this.)
     fn shell_prefix(&self) -> Option<String>;
 
     /// The child was spawned with this pid.

@@ -3783,6 +3783,11 @@ pub(crate) async fn resume_run(
         Some(&store.root.join(run_id)),
     ));
     dispatcher.set_namer(naming.namer());
+    // Process-wide subprocess-capture backend, warmed off the async runtime
+    // (its first call blocks). Shared by the dispatcher (children) and the
+    // step factory (this workflow's steps).
+    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+    dispatcher.set_net_capture(Arc::clone(&net_capture));
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
@@ -3828,6 +3833,7 @@ pub(crate) async fn resume_run(
         // A resumed run is never an agentiflow unit (workflow units refuse
         // gated workflows), so it keeps the workflow's own scope.
         scope_name_override: None,
+        net_capture: Some(net_capture),
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -5631,6 +5637,11 @@ async fn execute_workflow_invocation(
         Some(&runs_dir.join(&run_id)),
     ));
     dispatcher.set_namer(naming.namer());
+    // Process-wide subprocess-capture backend, warmed off the async runtime
+    // (its first call blocks). Shared by the dispatcher (children) and the
+    // step factory (this workflow's steps).
+    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+    dispatcher.set_net_capture(Arc::clone(&net_capture));
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
     // approve-resume `resume_opts` built further down this function —
@@ -5679,6 +5690,7 @@ async fn execute_workflow_invocation(
         providers: cfg.providers.clone(),
         recovery: cfg.recovery.clone(),
         scope_name_override: overlay.scope_name.clone(),
+        net_capture: Some(net_capture),
     });
 
     let workflow_for_resume = workflow.clone();

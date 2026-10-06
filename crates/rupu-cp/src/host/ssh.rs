@@ -18,9 +18,9 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_stream_run_events, read_transcript_file, CoverageRead, EventByteStream, FeedGuard,
-        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
-        RunStartEvidence, MAX_WORKSPACE_BYTES,
+        blocking_host, mirror_stream_run_events, read_transcript_file, CoverageRead,
+        EventByteStream, FeedGuard, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
+        RunKind, RunListQuery, RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -391,6 +391,10 @@ fn cache_io_err(e: std::io::Error) -> HostConnectorError {
 /// Write `body` to `cache` atomically (tmp + rename), then the `.complete`
 /// sidecar when `complete` (spec §6.1 step 4).
 ///
+/// One hop to tokio's blocking pool for the whole sequence, so the mark is
+/// only ever written right after its own rename, and a caller dropped
+/// mid-await still leaves the write to run to completion.
+///
 /// The tmp name carries a fresh ULID. A fixed `{cache}.tmp` is shared by every
 /// concurrent pull of the same path — and pulls are PER REQUEST, so two
 /// viewers opening the same transcript are enough: both `write` the same tmp
@@ -401,7 +405,15 @@ fn cache_io_err(e: std::io::Error) -> HostConnectorError {
 /// feeding `cache` is retired (`LazyTailRegistry::retire`) before the
 /// authoritative pull calls this, so the sidecar is only ever written over an
 /// atomically-replaced file. See `pump_pull_step_transcripts`.
-pub(crate) fn write_cache_file(
+pub(crate) async fn write_cache_file(
+    cache: PathBuf,
+    body: String,
+    complete: bool,
+) -> Result<(), HostConnectorError> {
+    blocking_host(move || write_cache_file_blocking(&cache, &body, complete)).await
+}
+
+fn write_cache_file_blocking(
     cache: &Path,
     body: &str,
     complete: bool,
@@ -1266,6 +1278,10 @@ pub(crate) fn split_batched_cat(stdout: &str) -> std::collections::HashMap<Strin
 /// Retiring does not disconnect the viewers: their `TranscriptTail` reads the
 /// cache by PATH at a byte offset, and after the rename that path holds the
 /// authoritative body — a superset of the replay they already received.
+///
+/// The disk work runs on tokio's blocking pool: one hop for the scan
+/// ([`step_transcript_pull_targets`]), then one per file written, each
+/// awaited only after its `retire` returned.
 async fn pump_pull_step_transcripts(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
@@ -1273,26 +1289,28 @@ async fn pump_pull_step_transcripts(
     run_id: &str,
     host_id: &str,
 ) {
-    let global = mirror.global_dir();
-    let agent_mirror = mirror.transcript_mirror_path(run_id);
-    let mut targets: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for recorded in
-        crate::host::transcript_paths::recorded_transcript_paths(mirror.run_store(), run_id)
-    {
-        if recorded == agent_mirror {
-            continue; // handled by pump_catch_up_transcript
+    let scan = {
+        let store = Arc::clone(mirror.run_store());
+        let global = mirror.global_dir();
+        let agent_mirror = mirror.transcript_mirror_path(run_id);
+        let (run_id, host_id) = (run_id.to_owned(), host_id.to_owned());
+        blocking_host(move || {
+            Ok(step_transcript_pull_targets(
+                &store,
+                &global,
+                &agent_mirror,
+                &host_id,
+                &run_id,
+            ))
+        })
+    };
+    let targets = match scan.await {
+        Ok(targets) => targets,
+        Err(e) => {
+            tracing::warn!(host_id, run_id, error = %e, "terminal transcript pull: scan failed; left for on-demand retry");
+            return;
         }
-        let Some(cache) = crate::host::transcript_paths::cache_path(&global, host_id, &recorded)
-        else {
-            continue;
-        };
-        if crate::host::transcript_paths::is_complete(&cache) {
-            continue;
-        }
-        if let Some(remote) = recorded.to_str() {
-            targets.push((remote.to_string(), cache));
-        }
-    }
+    };
     if targets.is_empty() {
         return;
     }
@@ -1300,13 +1318,13 @@ async fn pump_pull_step_transcripts(
     let Ok(out) = exec.run(&batch_cat_command(&remotes)).await else {
         return;
     };
-    let files = split_batched_cat(&out.stdout);
+    let mut files = split_batched_cat(&out.stdout);
     for (remote, cache) in &targets {
-        if let Some(body) = files.get(remote) {
+        if let Some(body) = files.remove(remote) {
             // Sole-writer handoff: stop any feed and wait for it to really
             // stop before replacing the file. retire is a no-op on an unknown path.
             lazy.retire(cache).await;
-            if let Err(e) = write_cache_file(cache, body, true) {
+            if let Err(e) = write_cache_file(cache.clone(), body, true).await {
                 tracing::warn!(host_id, run_id, cache = %cache.display(), error = %e, "terminal transcript pull: cache write failed");
             }
         } else {
@@ -1318,6 +1336,68 @@ async fn pump_pull_step_transcripts(
             );
         }
     }
+}
+
+/// `(remote path, cache path)` for every step transcript `run_id`'s own
+/// artifacts record that [`pump_pull_step_transcripts`] still has to pull:
+/// not the run's own agent transcript (`agent_mirror`, which
+/// `pump_catch_up_transcript` owns), not a path with no cache mapping, and
+/// not a cache already marked complete. Reads the run store and stats the
+/// marks, so it runs on the blocking pool.
+fn step_transcript_pull_targets(
+    store: &RunStore,
+    global: &Path,
+    agent_mirror: &Path,
+    host_id: &str,
+    run_id: &str,
+) -> Vec<(String, PathBuf)> {
+    let mut targets = Vec::new();
+    for recorded in crate::host::transcript_paths::recorded_transcript_paths(store, run_id) {
+        if recorded == agent_mirror {
+            continue; // handled by pump_catch_up_transcript
+        }
+        let Some(cache) = crate::host::transcript_paths::cache_path(global, host_id, &recorded)
+        else {
+            continue;
+        };
+        if crate::host::transcript_paths::is_complete(&cache) {
+            continue;
+        }
+        if let Some(remote) = recorded.to_str() {
+            targets.push((remote.to_string(), cache));
+        }
+    }
+    targets
+}
+
+/// The blocking body of [`SshHostConnector::authorize_remote_transcript`].
+fn authorize_remote_transcript_blocking(
+    store: &RunStore,
+    global: &Path,
+    host_id: &str,
+    run_id: &str,
+    recorded: &Path,
+) -> Result<PathBuf, HostConnectorError> {
+    let cache =
+        crate::host::transcript_paths::cache_path(global, host_id, recorded).ok_or_else(|| {
+            HostConnectorError::Invalid(format!("not a transcript path: {}", recorded.display()))
+        })?;
+    let rec = store
+        .load(run_id)
+        .map_err(|_| HostConnectorError::NotFound(run_id.to_string()))?;
+    if rec.worker_id.as_deref() != Some(host_id) {
+        return Err(HostConnectorError::Invalid(format!(
+            "run {run_id} does not belong to host {host_id}"
+        )));
+    }
+    let claimed = crate::host::transcript_paths::recorded_transcript_paths(store, run_id);
+    if !claimed.iter().any(|p| p == recorded) {
+        return Err(HostConnectorError::Invalid(format!(
+            "run {run_id} did not record transcript {}",
+            recorded.display()
+        )));
+    }
+    Ok(cache)
 }
 
 /// What one [`pump_finalize_if_terminal`] probe learned about the run.
@@ -1703,39 +1783,23 @@ impl SshHostConnector {
     /// Spec §3.3: a remote read is scoped to a run. `run_id` must be a run
     /// this host executed (`worker_id`), and `recorded` must be a path that
     /// run's own artifacts claim. Returns the cache path the file serves
-    /// from. Never touches the remote.
-    pub(crate) fn authorize_remote_transcript(
+    /// from. Never touches the remote. The run-store reads make one hop to
+    /// the blocking pool.
+    pub(crate) async fn authorize_remote_transcript(
         &self,
         run_id: &str,
         recorded: &Path,
     ) -> Result<PathBuf, HostConnectorError> {
-        let cache =
-            crate::host::transcript_paths::cache_path(&self.global_dir(), &self.host_id, recorded)
-                .ok_or_else(|| {
-                    HostConnectorError::Invalid(format!(
-                        "not a transcript path: {}",
-                        recorded.display()
-                    ))
-                })?;
-        let rec = self
-            .run_store
-            .load(run_id)
-            .map_err(|_| HostConnectorError::NotFound(run_id.to_string()))?;
-        if rec.worker_id.as_deref() != Some(self.host_id.as_str()) {
-            return Err(HostConnectorError::Invalid(format!(
-                "run {run_id} does not belong to host {}",
-                self.host_id
-            )));
-        }
-        let claimed =
-            crate::host::transcript_paths::recorded_transcript_paths(&self.run_store, run_id);
-        if !claimed.iter().any(|p| p == recorded) {
-            return Err(HostConnectorError::Invalid(format!(
-                "run {run_id} did not record transcript {}",
-                recorded.display()
-            )));
-        }
-        Ok(cache)
+        let (store, global, host_id) = (
+            Arc::clone(&self.run_store),
+            self.global_dir(),
+            self.host_id.clone(),
+        );
+        let (run_id, recorded) = (run_id.to_owned(), recorded.to_path_buf());
+        blocking_host(move || {
+            authorize_remote_transcript_blocking(&store, &global, &host_id, &run_id, &recorded)
+        })
+        .await
     }
 
     /// Wrap a shell-escaped remote control command (`rupu workflow resume`)
@@ -2987,7 +3051,7 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
-        read_transcript_file(path)
+        read_transcript_file(path).await
     }
 
     fn local_transcript_path(&self, recorded: &Path) -> PathBuf {
@@ -3001,7 +3065,7 @@ impl HostConnector for SshHostConnector {
         recorded: &Path,
         terminal: bool,
     ) -> Result<(), HostConnectorError> {
-        let cache = self.authorize_remote_transcript(run_id, recorded)?;
+        let cache = self.authorize_remote_transcript(run_id, recorded).await?;
         // A live tail is already filling this cache from byte zero, and holds
         // an append handle on its inode. Pulling would `rename` a fresh file
         // over that dentry, stranding the feed on an unlinked inode: the SSE
@@ -3009,7 +3073,7 @@ impl HostConnector for SshHostConnector {
         // every later subscriber joins the same zombie. The web panel mounts a
         // GET and a stream for the same path, so this is the common case, not
         // an edge one. Step aside — the handler serves the file the feed fills.
-        if self.lazy.has_live_feed(&cache) {
+        if self.lazy.has_live_feed(&cache).await {
             return Ok(());
         }
         let remote = recorded
@@ -3037,7 +3101,7 @@ impl HostConnector for SshHostConnector {
         } else {
             out.stdout
         };
-        write_cache_file(&cache, &body, terminal)
+        write_cache_file(cache, body, terminal).await
     }
 
     async fn ensure_transcript_feed(
@@ -3045,7 +3109,7 @@ impl HostConnector for SshHostConnector {
         run_id: &str,
         recorded: &Path,
     ) -> Result<FeedGuard, HostConnectorError> {
-        let cache = self.authorize_remote_transcript(run_id, recorded)?;
+        let cache = self.authorize_remote_transcript(run_id, recorded).await?;
         let remote = recorded
             .to_str()
             .ok_or_else(|| HostConnectorError::Invalid("non-UTF-8 transcript path".into()))?;
@@ -3611,6 +3675,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::host::runtime_liveness::{assert_runtime_live_while_parked_on, make_fifo};
 
     #[test]
     fn shell_escape_wraps_and_escapes_quotes() {
@@ -6282,7 +6347,7 @@ mod tests {
             .unwrap()
             .expect("a live feed is shared, not refused");
         assert!(handle.alive());
-        assert!(conn.lazy.has_live_feed(&cache));
+        assert!(conn.lazy.has_live_feed(&cache).await);
 
         pump_pull_step_transcripts(
             fake.as_ref(),
@@ -6297,9 +6362,9 @@ mod tests {
             !handle.alive(),
             "the feed must be stopped before the authoritative write"
         );
-        assert!(!conn.lazy.has_live_feed(&cache));
+        assert!(!conn.lazy.has_live_feed(&cache).await);
         assert_eq!(
-            conn.lazy.live_feeds(),
+            conn.lazy.live_feeds().await,
             0,
             "the registry entry is gone, so the ssh child is released"
         );
@@ -6321,6 +6386,145 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "stray tmp files left behind: {strays:?}");
+    }
+
+    /// The terminal pull's run-store scan (`recorded_transcript_paths`)
+    /// runs on the blocking pool: parked on a FIFO `events.jsonl`, the
+    /// runtime keeps ticking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_pull_scans_the_run_store_off_the_runtime() {
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01SCAN.jsonl";
+        let mut fake = FakeExec::ok(vec![]);
+        fake.batch_cat_stdout = Some(format!(
+            "==> {claimed} <==\n{{\"type\":\"run_start\"}}\n\n==> end <==\n"
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        seed_claimed_run(&conn, &run_store, "run_01SCANRUN", claimed, false).await;
+        let events = run_store.events_path("run_01SCANRUN");
+        if !make_fifo(&events) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01SCAN.jsonl");
+
+        let pull = pump_pull_step_transcripts(
+            fake.as_ref(),
+            &conn.mirror,
+            &conn.lazy,
+            "run_01SCANRUN",
+            "host_abc",
+        );
+        assert_runtime_live_while_parked_on(pull, &events, false).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n"
+        );
+        assert!(crate::host::transcript_paths::is_complete(&cache));
+    }
+
+    /// The terminal pull's cache write (tmp + rename + `.complete`) runs on
+    /// the blocking pool: parked on a FIFO `.complete` mark, the runtime
+    /// keeps ticking — and the rename has already landed when the mark
+    /// write starts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_pull_writes_the_cache_off_the_runtime() {
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01WRITE.jsonl";
+        let mut fake = FakeExec::ok(vec![]);
+        fake.batch_cat_stdout = Some(format!(
+            "==> {claimed} <==\n{{\"type\":\"run_complete\"}}\n\n==> end <==\n"
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        seed_claimed_run(&conn, &run_store, "run_01WRITERUN", claimed, false).await;
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01WRITE.jsonl");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        // Not a regular file, so `is_complete` still says "pull this one".
+        let mark = crate::host::transcript_paths::complete_marker(&cache);
+        if !make_fifo(&mark) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+
+        let pull = pump_pull_step_transcripts(
+            fake.as_ref(),
+            &conn.mirror,
+            &conn.lazy,
+            "run_01WRITERUN",
+            "host_abc",
+        );
+        assert_runtime_live_while_parked_on(pull, &mark, true).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_complete\"}\n"
+        );
+    }
+
+    /// `pull_transcript`'s allowlist check (`authorize_remote_transcript`'s
+    /// `RunStore::load` + `recorded_transcript_paths`) runs on the blocking
+    /// pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssh_pull_transcript_authorizes_off_the_runtime() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.cat_transcript_stdout = Some("{\"type\":\"run_start\"}\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01AUTH.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01AUTHRUN", claimed, false).await;
+        let events = run_store.events_path("run_01AUTHRUN");
+        if !make_fifo(&events) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01AUTH.jsonl");
+
+        let pull = conn.pull_transcript("run_01AUTHRUN", std::path::Path::new(claimed), false);
+        assert_runtime_live_while_parked_on(pull, &events, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n"
+        );
+    }
+
+    /// `pull_transcript`'s cache write runs on the blocking pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssh_pull_transcript_writes_the_cache_off_the_runtime() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.cat_transcript_stdout = Some("{\"type\":\"run_complete\"}\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01PWRITE.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01PWRITERUN", claimed, true).await;
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01PWRITE.jsonl");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let mark = crate::host::transcript_paths::complete_marker(&cache);
+        if !make_fifo(&mark) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+
+        let pull = conn.pull_transcript("run_01PWRITERUN", std::path::Path::new(claimed), true);
+        assert_runtime_live_while_parked_on(pull, &mark, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_complete\"}\n"
+        );
     }
 
     #[tokio::test]

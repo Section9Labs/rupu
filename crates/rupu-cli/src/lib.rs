@@ -361,6 +361,23 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     );
     tracing::debug!(?fd_report, "open-file limit configured");
 
+    // Machine-level job admission: a process-wide ceiling on concurrent local
+    // agent jobs plus a memory watchdog, so a wide fan-out / `split:` DAG
+    // cannot drive the host out of memory regardless of what a workflow
+    // declares. Same `[runtime]` config as the fd limit; env overrides
+    // (`RUPU_MAX_CONCURRENT_JOBS` / `RUPU_MIN_FREE_MEMORY_MB`) are applied
+    // inside `configure`. Inert for single-agent runs (one permit, taken at
+    // once); it bounds the orchestrator fan-out.
+    rupu_runtime::admission::configure(&cli_cfg.runtime);
+    {
+        let gate = rupu_runtime::admission::global();
+        tracing::debug!(
+            ceiling = ?gate.ceiling(),
+            min_free_mb = gate.min_free_bytes() / (1024 * 1024),
+            "job admission configured"
+        );
+    }
+
     // Passive "update available" notice: interactive, non-structured
     // invocations only, and never for `rupu update`/`rupu
     // __apply-update` themselves (those already report update status

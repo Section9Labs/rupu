@@ -45,3 +45,4 @@ predicates.workspace = true
 serde_yaml.workspace = true
 pty-process.workspace = true
 rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }
+rupu-netflow = { workspace = true }

@@ -215,6 +215,74 @@ pub struct NetflowResponse {
     /// answer for one is not "no traffic", it is "we could not look".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete: Vec<IncompleteSource>,
+    /// Subprocess-capture availability for this run (run scope only), so
+    /// the UI can say "capture unavailable: <reason>" instead of letting
+    /// an empty bash-flow list read as "no connections". Absent when the
+    /// run's ledger(s) carry no `Capture` line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureSummary>,
+}
+
+/// Flattened view of a run's `LedgerLine::Capture` lines.
+///
+/// `state` is the LATEST line's state (by `ts`; file order breaks ties);
+/// `reason` is that line's reason when it is `unavailable`; `notes` is
+/// every non-empty visible-loss note across the run's capture lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureSummary {
+    /// `"active"` or `"unavailable"`.
+    pub state: String,
+    pub reason: Option<String>,
+    pub notes: Vec<String>,
+}
+
+/// Fold a run's capture lines into the web-facing summary. `ledgers` holds
+/// one entry list PER LEDGER (the run's own plus its units' and
+/// sub-agents'); `None` when no ledger carries a capture line.
+///
+/// Latest-wins applies WITHIN a ledger (a watcher death is permanent, and
+/// `note_loss` emits loss notes as newer `Active` lines). ACROSS ledgers
+/// it does not: if ANY ledger's latest line is `unavailable`, the run is
+/// `unavailable` — a sibling's newer `Active` line must not mask that one
+/// unit's capture died. The reason comes from the newest such line.
+/// `notes` is the union over every ledger.
+pub fn summarize_capture(
+    ledgers: &[Vec<rupu_netflow::ledger::CaptureEntry>],
+) -> Option<CaptureSummary> {
+    use rupu_netflow::CaptureState;
+    // `max_by_key` returns the LAST maximal element, so ties go to the
+    // later line in file order.
+    let latest_per_ledger: Vec<&rupu_netflow::ledger::CaptureEntry> = ledgers
+        .iter()
+        .filter_map(|entries| entries.iter().max_by_key(|e| e.ts))
+        .collect();
+    if latest_per_ledger.is_empty() {
+        return None;
+    }
+    let worst = latest_per_ledger
+        .iter()
+        .filter(|e| matches!(e.state, CaptureState::Unavailable { .. }))
+        .max_by_key(|e| e.ts);
+    let (state, reason) = match worst {
+        Some(e) => match &e.state {
+            CaptureState::Unavailable { reason } => ("unavailable", Some(reason.clone())),
+            CaptureState::Active { .. } => ("active", None),
+        },
+        None => ("active", None),
+    };
+    let mut notes: Vec<String> = Vec::new();
+    for e in ledgers.iter().flatten() {
+        if let Some(n) = e.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            if !notes.iter().any(|x| x == n) {
+                notes.push(n.to_string());
+            }
+        }
+    }
+    Some(CaptureSummary {
+        state: state.to_string(),
+        reason,
+        notes,
+    })
 }
 
 /// One source of this run's flows that could not be read, and why.
@@ -1055,6 +1123,7 @@ pub(crate) fn build_filtered_response(
         // Builders serve local data; a caller that also read a remote
         // source records any gap on the returned value.
         incomplete: Vec::new(),
+        capture: None,
     }
 }
 
@@ -1177,6 +1246,16 @@ fn collect_run_netflow(
     let mut resp =
         build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters);
     resp.incomplete = incomplete;
+    // One entry list per ledger file: `summarize_capture` applies
+    // latest-wins within a ledger but lets any ledger's `unavailable` win.
+    let mut ledgers = Vec::new();
+    for id in run_and_unit_ids(store, run_id) {
+        for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
+            ledgers
+                .push(rupu_netflow::ledger::read_capture_states(&ledger_path).unwrap_or_default());
+        }
+    }
+    resp.capture = summarize_capture(&ledgers);
     resp
 }
 
@@ -3419,5 +3498,62 @@ mod tests {
             "a known-unknown id must be served from cache, not rebuilt every request"
         );
         assert_eq!(first.attribution("orphan-run"), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod capture_summary_tests {
+    use super::*;
+    use rupu_netflow::ledger::CaptureEntry;
+    use rupu_netflow::CaptureState;
+
+    fn entry(secs: i64, state: CaptureState, note: Option<&str>) -> CaptureEntry {
+        CaptureEntry {
+            ts: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            state,
+            tool_call_id: None,
+            note: note.map(str::to_string),
+        }
+    }
+    fn active() -> CaptureState {
+        CaptureState::Active {
+            backend: "lsof".into(),
+        }
+    }
+    fn unavailable(reason: &str) -> CaptureState {
+        CaptureState::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn a_siblings_newer_active_line_does_not_mask_an_older_unavailable_ledger() {
+        // Ledger A (a unit): capture died at t=10. Ledger B (the run): an
+        // Active loss-note line at t=500, much newer.
+        let a = vec![
+            entry(5, active(), None),
+            entry(10, unavailable("watcher died"), None),
+        ];
+        let b = vec![entry(500, active(), Some("2 short connections missed"))];
+        for order in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+            let s = summarize_capture(&order).unwrap();
+            assert_eq!(s.state, "unavailable");
+            assert_eq!(s.reason.as_deref(), Some("watcher died"));
+            assert_eq!(s.notes, vec!["2 short connections missed".to_string()]);
+        }
+    }
+
+    #[test]
+    fn latest_wins_within_one_ledger() {
+        let l = vec![entry(1, unavailable("x"), None), entry(2, active(), None)];
+        let s = summarize_capture(&[l]).unwrap();
+        assert_eq!(s.state, "active");
+        assert_eq!(s.reason, None);
+    }
+
+    #[test]
+    fn no_capture_lines_yield_none() {
+        assert!(summarize_capture(&[]).is_none());
+        assert!(summarize_capture(&[Vec::new(), Vec::new()]).is_none());
     }
 }

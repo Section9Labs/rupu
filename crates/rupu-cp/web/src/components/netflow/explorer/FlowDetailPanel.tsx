@@ -12,7 +12,7 @@ import { useEffect } from 'react';
 import { formatBytes, type FlowView } from '../../../lib/netflow';
 import { absoluteTime } from '../../../lib/time';
 import { FidelityBadge, FIDELITY_TITLE } from '../FidelityBadge';
-import { originLabel } from '../NetflowTable';
+import { isSocketFlow, originLabel } from '../NetflowTable';
 import { Badge } from '../../ui/Badge';
 import type { NetflowScope } from '../ScopeDisclosure';
 
@@ -41,6 +41,7 @@ export function FlowDetailPanel({ flow, scope, onClose }: FlowDetailPanelProps) 
 
   if (!flow) return null;
   const coarse = flow.fidelity === 'coarse';
+  const socket = isSocketFlow(flow);
   const rows: { k: string; v: string }[] = [
     // `absoluteTime` (not a raw Date round-trip): the shared formatter
     // renders an unparseable ts as an em dash, never "Invalid Date".
@@ -54,12 +55,23 @@ export function FlowDetailPanel({ flow, scope, onClose }: FlowDetailPanelProps) 
         ]
       : []),
     { k: 'Origin', v: originLabel(flow) },
-    { k: 'Status', v: flow.status != null ? String(flow.status) : '—' },
+    // A socket sees no HTTP exchange: no status, TTFB or separate peer-IP
+    // row (the remote IP is the host) — show its own field set instead.
+    ...(socket
+      ? [
+          {
+            k: 'Process',
+            v: flow.process ? `${flow.process.name} (pid ${flow.process.pid})` : '—',
+          },
+          { k: 'Local address', v: flow.local_addr ?? '—' },
+          { k: 'Direction', v: flow.direction ?? '—' },
+        ]
+      : [{ k: 'Status', v: flow.status != null ? String(flow.status) : '—' }]),
     { k: 'Bytes in', v: formatBytes(flow.bytes_in) },
     { k: 'Bytes out', v: formatBytes(flow.bytes_out) },
-    { k: 'TTFB', v: flow.ttfb_ms != null ? `${flow.ttfb_ms} ms` : '—' },
+    ...(socket ? [] : [{ k: 'TTFB', v: flow.ttfb_ms != null ? `${flow.ttfb_ms} ms` : '—' }]),
     { k: 'Duration', v: flow.duration_ms != null ? `${flow.duration_ms} ms` : '—' },
-    { k: 'Peer IP', v: flow.peer_ip ?? '—' },
+    ...(socket ? [] : [{ k: 'Peer IP', v: flow.peer_ip ?? '—' }]),
     { k: 'Network', v: flow.asn ? `AS${flow.asn.asn} ${flow.asn.org}` : '—' },
     ...(flow.error ? [{ k: 'Error', v: flow.error }] : []),
   ];
@@ -88,12 +100,12 @@ export function FlowDetailPanel({ flow, scope, onClose }: FlowDetailPanelProps) 
           {flow.host}:{flow.port}
         </p>
         <p className="mb-3.5 break-all font-mono text-note text-ink-dim">
-          {flow.method} {flow.path}
+          {socket ? flow.scheme : `${flow.method} ${flow.path}`}
         </p>
         <div className="mb-4 flex items-center gap-2">
           <Badge tone={flow.outcome === 'ok' ? 'green' : 'red'} size="md">
             {flow.outcome}
-            {flow.status != null ? ` · ${flow.status}` : ''}
+            {!socket && flow.status != null ? ` · ${flow.status}` : ''}
           </Badge>
           <FidelityBadge fidelity={flow.fidelity} />
         </div>

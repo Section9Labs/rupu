@@ -1,14 +1,19 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { fireEvent, render as rtlRender, screen, within } from '@testing-library/react';
+import type { ReactElement } from 'react';
+import { MemoryRouter } from 'react-router-dom';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup } from '@testing-library/react';
 import NetflowTable from './NetflowTable';
 import type { FlowView } from '../../lib/netflow';
+import { socketFlowView } from './explorer/explorerFixtures';
 
 afterEach(() => {
   cleanup();
 });
+
+const render = (ui: ReactElement) => rtlRender(<MemoryRouter>{ui}</MemoryRouter>);
 
 function flow(over: Partial<FlowView> = {}): FlowView {
   return {
@@ -137,10 +142,10 @@ describe('NetflowTable', () => {
     expect(screen.getByText(/ASN data not loaded/i)).toBeInTheDocument();
   });
 
-  it('states the phase-1 scope limit on the empty state', () => {
+  it('states the covered scope (incl. bash subprocess connections) on the empty state', () => {
     render(<NetflowTable flows={[]} droppedTotal={0} asnLoaded />);
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
-    expect(screen.getByText(/does not cover.*subprocess/i)).toBeInTheDocument();
+    expect(screen.getByText(/own egress.*bash subprocess connections/i)).toBeInTheDocument();
   });
 
   it('surfaces a non-zero dropped count even when every flow was dropped', () => {
@@ -219,5 +224,79 @@ describe('NetflowTable', () => {
       />,
     );
     expect(screen.queryByText(/no network flows/i)).not.toBeInTheDocument();
+  });
+
+  describe('socket flows', () => {
+    it('renders the process, a tcp endpoint, em dashes for path/status, and a transcript link', () => {
+      render(<NetflowTable flows={[socketFlowView()]} droppedTotal={0} asnLoaded />);
+      const row = screen.getByText('tcp → 140.82.116.3:443').closest('tr') as HTMLElement;
+      expect(row).not.toBeNull();
+      // Origin cell: the process name and its pid.
+      expect(within(row).getByText(/curl/)).toBeInTheDocument();
+      expect(within(row).getByText(/4412/)).toBeInTheDocument();
+      // Path + status cells are honest dashes, not a blank or a bogus method.
+      expect(within(row).getAllByText('—').length).toBeGreaterThanOrEqual(2);
+      expect(within(row).queryByText('GET')).not.toBeInTheDocument();
+      const link = within(row).getByRole('link', { name: /transcript/i });
+      expect(link).toHaveAttribute('href', '/runs/run1#call-toolu_1');
+    });
+
+    it('links the TOP-LEVEL run (f.run_id), not the agent sub-run, and encodes ids', () => {
+      const f = socketFlowView({
+        run_id: 'run_top',
+        ctx: {
+          origin: { kind: 'subprocess', name: 'curl' },
+          run_id: 'run_sub',
+          tool_call_id: 'toolu/1 x',
+        },
+      });
+      render(<NetflowTable flows={[f]} droppedTotal={0} asnLoaded />);
+      expect(screen.getByRole('link', { name: /transcript/i })).toHaveAttribute(
+        'href',
+        '/runs/run_top#call-toolu%2F1%20x',
+      );
+    });
+
+    it('keyboard Enter on the transcript link does not open the row detail', () => {
+      const onRowClick = vi.fn();
+      render(
+        <NetflowTable
+          flows={[socketFlowView()]}
+          droppedTotal={0}
+          asnLoaded
+          onRowClick={onRowClick}
+        />,
+      );
+      fireEvent.keyDown(screen.getByRole('link', { name: /transcript/i }), { key: 'Enter' });
+      expect(onRowClick).not.toHaveBeenCalled();
+    });
+
+    it('renders the socket status dash muted even when the outcome failed', () => {
+      render(
+        <NetflowTable
+          flows={[socketFlowView({ outcome: 'transport_error' })]}
+          droppedTotal={0}
+          asnLoaded
+        />,
+      );
+      const row = screen.getByText('tcp → 140.82.116.3:443').closest('tr') as HTMLElement;
+      for (const d of within(row).getAllByText('—')) expect(d).not.toHaveClass('text-err');
+    });
+
+    it('omits the transcript link when the tool call is unknown', () => {
+      const f = socketFlowView({
+        ctx: { origin: { kind: 'subprocess', name: 'curl' }, run_id: 'run1' },
+      });
+      render(<NetflowTable flows={[f]} droppedTotal={0} asnLoaded />);
+      expect(screen.queryByRole('link', { name: /transcript/i })).not.toBeInTheDocument();
+    });
+
+    it('leaves http rows unchanged: path text, status, no transcript link, no tcp endpoint', () => {
+      render(<NetflowTable flows={[flow({ status: 201 })]} droppedTotal={0} asnLoaded />);
+      expect(screen.getByText('/v1/messages')).toBeInTheDocument();
+      expect(screen.getByText('201')).toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: /transcript/i })).not.toBeInTheDocument();
+      expect(screen.queryByText(/tcp →/)).not.toBeInTheDocument();
+    });
   });
 });

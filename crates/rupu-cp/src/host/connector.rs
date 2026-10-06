@@ -860,6 +860,20 @@ pub(crate) fn mirror_get_run(
     run_id: &str,
     pricing: &rupu_config::PricingConfig,
 ) -> Result<serde_json::Value, HostConnectorError> {
+    check_mirror_run(run_store, worker_id, run_id)?;
+    crate::api::runs::query_run_detail(run_store, run_id, pricing)
+        .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+}
+
+/// `Ok` when `run_id` is in the mirror and `worker_id` ran it, else
+/// [`HostConnectorError::NotFound`] for either miss (see [`mirror_get_run`]).
+/// Reads `run.json`, so callers on the async runtime run it on the blocking
+/// pool.
+fn check_mirror_run(
+    run_store: &RunStore,
+    worker_id: &str,
+    run_id: &str,
+) -> Result<(), HostConnectorError> {
     let record = run_store.load(run_id).map_err(|e| match e {
         rupu_orchestrator::RunStoreError::NotFound(_) => {
             HostConnectorError::NotFound(run_id.to_string())
@@ -869,12 +883,12 @@ pub(crate) fn mirror_get_run(
     if record.worker_id.as_deref() != Some(worker_id) {
         return Err(HostConnectorError::NotFound(run_id.to_string()));
     }
-    crate::api::runs::query_run_detail(run_store, run_id, pricing)
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+    Ok(())
 }
 
 /// Open a live SSE byte-stream for `run_id`, verifying it belongs to
-/// `worker_id` first.
+/// `worker_id` first — a read of `run.json`, made in one hop to the
+/// blocking pool.
 ///
 /// Returns [`HostConnectorError::NotFound`] when the run does not exist or
 /// belongs to a different node.
@@ -883,15 +897,12 @@ pub(crate) async fn mirror_stream_run_events(
     worker_id: &str,
     run_id: &str,
 ) -> Result<EventByteStream, HostConnectorError> {
-    let record = run_store.load(run_id).map_err(|e| match e {
-        rupu_orchestrator::RunStoreError::NotFound(_) => {
-            HostConnectorError::NotFound(run_id.to_string())
-        }
-        other => HostConnectorError::Invalid(other.to_string()),
-    })?;
-    if record.worker_id.as_deref() != Some(worker_id) {
-        return Err(HostConnectorError::NotFound(run_id.to_string()));
-    }
+    let (store, worker, id) = (
+        Arc::clone(run_store),
+        worker_id.to_owned(),
+        run_id.to_owned(),
+    );
+    blocking_host(move || check_mirror_run(&store, &worker, &id)).await?;
     open_run_events_tail(run_store, run_id).await
 }
 
@@ -1059,9 +1070,11 @@ where
 /// Returns the same value regardless of whether it is called from a local or
 /// tunnel connector.  Basic path safety (no `..` components, must be `.jsonl`)
 /// is enforced here; callers that accept user-supplied paths must also apply
-/// their own `allowed_roots` checks before delegating.
-pub(crate) fn read_transcript_file(path: &str) -> Result<serde_json::Value, HostConnectorError> {
-    use std::path::Path;
+/// their own `allowed_roots` checks before delegating. The path checks run
+/// in place; the read is one hop to the blocking pool.
+pub(crate) async fn read_transcript_file(
+    path: &str,
+) -> Result<serde_json::Value, HostConnectorError> {
     let p = Path::new(path);
     if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
         return Err(HostConnectorError::Invalid("not a .jsonl file".into()));
@@ -1071,6 +1084,13 @@ pub(crate) fn read_transcript_file(path: &str) -> Result<serde_json::Value, Host
             "path must not contain ..".into(),
         ));
     }
+    let p = p.to_path_buf();
+    blocking_host(move || read_transcript_blocking(&p)).await
+}
+
+/// The blocking body of [`read_transcript_file`], once its path checks
+/// passed.
+fn read_transcript_blocking(p: &Path) -> Result<serde_json::Value, HostConnectorError> {
     if !p.exists() {
         return Ok(serde_json::json!({ "events": [], "summary": null }));
     }
@@ -1134,6 +1154,70 @@ mod codec_tests {
         assert!(decode_payload(&[]).is_err());
         assert!(decode_payload(&[9]).is_err()); // unknown mode tag
         assert!(decode_delta(&[0, 0]).is_err()); // shorter than 4-byte header len
+    }
+}
+
+#[cfg(test)]
+mod off_runtime_tests {
+    use super::*;
+    use crate::host::runtime_liveness::{assert_runtime_live_while_parked_on, make_fifo};
+
+    /// Every connector's `get_transcript` is `read_transcript_file`, and its
+    /// read runs on the blocking pool: parked on a FIFO transcript, the
+    /// runtime keeps ticking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_transcript_file_reads_off_the_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run_01FIFO.jsonl");
+        if !make_fifo(&path) {
+            eprintln!("mkfifo unavailable; skipping");
+            return;
+        }
+
+        let read = read_transcript_file(path.to_str().unwrap());
+        let got = assert_runtime_live_while_parked_on(read, &path, false)
+            .await
+            .unwrap();
+
+        assert_eq!(got, serde_json::json!({ "events": [], "summary": null }));
+    }
+
+    /// `stream_run_events` on a mirror-backed connector (SSH, tunnel,
+    /// bucket) is `mirror_stream_run_events`, and its ownership check — a
+    /// read of `run.json`, which no FIFO can park (`RunStore::load` refuses a
+    /// non-regular file) — waits for the blocking pool. The run belongs to
+    /// another host, so the check is the whole call.
+    #[test]
+    fn mirror_stream_run_events_checks_ownership_off_the_runtime() {
+        use crate::host::runtime_liveness::{
+            assert_waits_for_the_blocking_pool, one_blocking_thread_runtime, HeldBlockingThread,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "run_01ELSEWHERE",
+            "workflow_name": "wf",
+            "status": "running",
+            "inputs": {},
+            "workspace_id": "ws_1",
+            "workspace_path": "/tmp/proj",
+            "transcript_dir": "/tmp/proj/.rupu/transcripts",
+            "started_at": "2026-10-06T00:00:00Z",
+            "worker_id": "host_other",
+        }))
+        .unwrap();
+        store.create(record, "name: wf\n").unwrap();
+
+        one_blocking_thread_runtime().block_on(async {
+            let held = HeldBlockingThread::hold();
+            let open = mirror_stream_run_events(&store, "host_abc", "run_01ELSEWHERE");
+            let got = assert_waits_for_the_blocking_pool(open, held).await;
+
+            assert!(
+                matches!(got, Err(HostConnectorError::NotFound(ref id)) if id == "run_01ELSEWHERE"),
+                "another host's run is not found"
+            );
+        });
     }
 }
 

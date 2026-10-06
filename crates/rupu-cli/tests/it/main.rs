@@ -39,6 +39,7 @@ mod init_with_samples;
 mod mcp_serve_stdio_smoke;
 mod models_subcommand;
 mod multi_provider_e2e;
+mod netflow_capture_wiring;
 mod no_stream_flag;
 mod output_line_stream;
 mod run_continue;
