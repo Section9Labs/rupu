@@ -255,16 +255,30 @@ pub async fn build_reject_cleanup_opts(
 /// persisted `<run>/customer_dir` (the repo's checkout for an autoflow
 /// worktree or clone-target run), else — for a run that predates it — its
 /// `workspace_path`. A sidecar that exists but cannot be read is an error,
-/// never a silent fall back.
+/// never a silent fall back; so is one naming a directory that no longer
+/// exists — the lookup would walk up to an ancestor and could quietly resume
+/// the run on global config.
 pub(crate) fn customer_lookup_dir(
     store: &RunStore,
     run_id: &str,
     workspace_path: &Path,
 ) -> anyhow::Result<PathBuf> {
-    Ok(store
+    let Some(dir) = store
         .read_customer_dir(run_id)
         .map_err(|e| anyhow::anyhow!("read customer lookup dir of run {run_id}: {e}"))?
-        .unwrap_or_else(|| workspace_path.to_path_buf()))
+    else {
+        return Ok(workspace_path.to_path_buf());
+    };
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "the launch directory of run {run_id} ({}) no longer exists, so its customer \
+             cannot be determined; restore the directory, or write the project's current \
+             path into {} to resume the run under its customer",
+            dir.display(),
+            store.customer_dir_path(run_id).display()
+        );
+    }
+    Ok(dir)
 }
 
 /// Shared disk-rebuild step for [`resume_run`] (approve-resume) and
@@ -527,4 +541,51 @@ async fn rebuild_opts_from_disk(
     };
 
     Ok((opts, prior_step_results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_run(tmp: &Path) -> RunStore {
+        std::fs::create_dir_all(tmp.join("runs/run_1")).unwrap();
+        RunStore::new(tmp.join("runs"))
+    }
+
+    #[test]
+    fn customer_lookup_dir_without_a_sidecar_is_the_workspace_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_run(tmp.path());
+        let ws = tmp.path().join("gone-worktree");
+        assert_eq!(customer_lookup_dir(&store, "run_1", &ws).unwrap(), ws);
+    }
+
+    #[test]
+    fn customer_lookup_dir_uses_the_persisted_launch_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_run(tmp.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        store.write_customer_dir("run_1", &repo).unwrap();
+        assert_eq!(
+            customer_lookup_dir(&store, "run_1", &tmp.path().join("worktree")).unwrap(),
+            repo
+        );
+    }
+
+    #[test]
+    fn customer_lookup_dir_refuses_a_launch_dir_that_no_longer_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_run(tmp.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        store.write_customer_dir("run_1", &repo).unwrap();
+        std::fs::remove_dir(&repo).unwrap();
+        let err = customer_lookup_dir(&store, "run_1", tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("run_1"), "{err}");
+        assert!(err.contains(&repo.display().to_string()), "{err}");
+        assert!(err.contains("no longer exists"), "{err}");
+    }
 }
