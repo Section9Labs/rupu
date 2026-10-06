@@ -382,6 +382,89 @@ pub fn finding_ledgers(global_dir: &std::path::Path) -> HashMap<String, Vec<Cove
     out
 }
 
+/// One workspace's part of a cross-workspace tag change.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTagResult {
+    pub ws_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<rupu_coverage::TagOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What a tag change did across the registered workspaces. Each workspace's
+/// batch is atomic; the whole is not.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TagAcrossResult {
+    pub workspaces: Vec<WorkspaceTagResult>,
+    /// Ids no registered workspace holds.
+    pub unknown: Vec<String>,
+}
+
+/// Apply `change` to findings wherever they live: ids are grouped by the
+/// registered workspace holding them and `rupu_coverage::apply` runs once
+/// per workspace (spec "Batches that span workspaces"). An id found in two
+/// distinct workspace paths is tagged in both. Used by `rupu findings tag`
+/// and, in Plan 2, `POST /api/findings/tags`.
+pub fn tag_findings_across(
+    global_dir: &std::path::Path,
+    change: &rupu_coverage::TagChange,
+    by: &rupu_coverage::TagActor,
+) -> Result<TagAcrossResult, rupu_coverage::TagError> {
+    change.check()?;
+    // finding id → each (ws_id, workspace path) holding it, once per path.
+    let mut homes: HashMap<String, Vec<(String, std::path::PathBuf)>> = HashMap::new();
+    each_ledger(global_dir, |w, _, _, records| {
+        let path = std::path::PathBuf::from(&w.path);
+        for r in records {
+            let entry = homes.entry(r.id).or_default();
+            if !entry.iter().any(|(_, p)| *p == path) {
+                entry.push((w.id.clone(), path.clone()));
+            }
+        }
+    });
+    let mut out = TagAcrossResult::default();
+    let mut by_ws: std::collections::BTreeMap<(String, std::path::PathBuf), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for id in &change.finding_ids {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        match homes.get(id) {
+            Some(hs) => {
+                for h in hs {
+                    by_ws.entry(h.clone()).or_default().push(id.to_string());
+                }
+            }
+            None if !out.unknown.iter().any(|u| u == id) => out.unknown.push(id.to_string()),
+            None => {}
+        }
+    }
+    for ((ws_id, path), ids) in by_ws {
+        let one = rupu_coverage::TagChange {
+            finding_ids: ids,
+            add: change.add.clone(),
+            remove: change.remove.clone(),
+        };
+        let log = rupu_coverage::TagLog::for_workspace(&path);
+        out.workspaces
+            .push(match rupu_coverage::apply(&log, &one, by) {
+                Ok(outcomes) => WorkspaceTagResult {
+                    ws_id,
+                    outcomes,
+                    error: None,
+                },
+                Err(e) => WorkspaceTagResult {
+                    ws_id,
+                    outcomes: vec![],
+                    error: Some(e.to_string()),
+                },
+            });
+    }
+    Ok(out)
+}
+
 /// The set of run ids a finding may be attributed to, for a Findings-tab query
 /// scoped to `parent`. A `for_each` / `panel` unit runs as its own sub-run, so
 /// its findings carry the UNIT's run id (`declared_by.run_id`), not `parent` —
