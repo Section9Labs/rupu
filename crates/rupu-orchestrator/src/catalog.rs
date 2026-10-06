@@ -57,8 +57,10 @@ fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    // `read_dir` order is platform-defined; sort so two files that
-    // declare the same `name:` in one scope resolve deterministically.
+    // `read_dir` order is platform-defined; sort for deterministic iteration.
+    // Entries are keyed and shadowed by file stem below, and stems are unique
+    // within a scope, so this order doesn't affect which entry wins; the final
+    // result is id-sorted regardless.
     let mut paths: Vec<_> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())

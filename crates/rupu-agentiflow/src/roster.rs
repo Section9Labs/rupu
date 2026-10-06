@@ -124,7 +124,8 @@ impl Tool for AgentsList {
 
     fn description(&self) -> &'static str {
         "List the agents you can draw on (global and project): each one's name, \
-         description and declared tools. Use agents.get for one agent's detail."
+         description and declared tools. `tools: null` means the agent uses the \
+         default tool set, not none. Use agents.get for one agent's detail."
     }
 
     fn input_schema(&self) -> Value {

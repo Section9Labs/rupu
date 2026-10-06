@@ -225,8 +225,9 @@ impl Tool for BoardDirective {
 
     fn description(&self) -> &'static str {
         "Steer the fleet: write a standing directive to the board. Units see it on \
-         every turn until it is lifted, so keep it short and actionable. Omit \
-         `addressed_to` to address everyone; name a unit or role to address only it."
+         every turn for the rest of the run -- there is no retraction, so \
+         directives accumulate; post sparingly and keep each short and actionable. \
+         Omit `addressed_to` to address everyone; name a unit or role to address only it."
     }
 
     fn input_schema(&self) -> Value {
