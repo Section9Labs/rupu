@@ -2245,6 +2245,47 @@ impl RunStore {
         self.artifact_manifest(run_id)
     }
 
+    /// `<run>/customer_dir` — the directory the launch looked the run's
+    /// customer up from, as one line. `workflow resume` reads it so a
+    /// resumed run keeps its customer when its `workspace_path` (an autoflow
+    /// issue worktree, a temp clone) lies under no assignment. Runs that
+    /// predate it have none; resume then uses `workspace_path`.
+    pub fn customer_dir_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("customer_dir")
+    }
+
+    /// Persist [`Self::customer_dir_path`], atomically. A path that is not
+    /// UTF-8 is refused (workspace records refuse those too).
+    pub fn write_customer_dir(&self, run_id: &str, dir: &Path) -> Result<(), RunStoreError> {
+        if !self.run_dir(run_id).is_dir() {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        }
+        let text = dir.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("customer lookup dir is not UTF-8: {}", dir.display()),
+            )
+        })?;
+        write_atomic(
+            &self.customer_dir_path(run_id),
+            format!("{text}\n").as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// The run's persisted customer lookup dir; `None` when the run has
+    /// none (it predates the file) or the file is blank.
+    pub fn read_customer_dir(&self, run_id: &str) -> Result<Option<PathBuf>, RunStoreError> {
+        match std::fs::read_to_string(self.customer_dir_path(run_id)) {
+            Ok(text) => {
+                let line = text.trim_end_matches(['\n', '\r']);
+                Ok((!line.is_empty()).then(|| PathBuf::from(line)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Path to the executor's event stream log for a run.
     pub fn events_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("events.jsonl")
@@ -4410,6 +4451,32 @@ mod tests {
             .unwrap();
         let loaded = store.read_run_envelope(&envelope.run_id).unwrap();
         assert_eq!(loaded, envelope);
+    }
+
+    #[test]
+    fn customer_dir_round_trips_and_is_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        assert!(matches!(
+            store.write_customer_dir("run_cd_01", Path::new("/srv/repo")),
+            Err(RunStoreError::NotFound(_))
+        ));
+        let envelope = sample_envelope("run_cd_01");
+        store
+            .write_run_envelope(&envelope.run_id, &envelope)
+            .unwrap();
+        assert_eq!(store.read_customer_dir("run_cd_01").unwrap(), None);
+        store
+            .write_customer_dir("run_cd_01", Path::new("/srv/my repo"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.customer_dir_path("run_cd_01")).unwrap(),
+            "/srv/my repo\n"
+        );
+        assert_eq!(
+            store.read_customer_dir("run_cd_01").unwrap(),
+            Some(PathBuf::from("/srv/my repo"))
+        );
     }
 
     #[test]
