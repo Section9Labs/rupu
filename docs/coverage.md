@@ -858,7 +858,8 @@ not gain any.
   tags_in_use}`: one page of slim rows, a cursor for the next, the number of
   matches, and every tag already used in the workspace with its count (so an
   agent reuses a tag instead of inventing a near-duplicate). `limit` defaults
-  to 50 and is at most 500. `tag_findings` adds or removes tags on one or many
+  to 50 and is at most 500; `all: true` returns every match in one answer
+  instead (no `limit` or `cursor`). `tag_findings` adds or removes tags on one or many
   findings and returns each finding's tags before and after. Both work only on
   the agent's own workspace, and `tag_findings` is allowed in `readonly` mode:
   it annotates the ledger and never touches the workspace's files.
@@ -1102,6 +1103,28 @@ named `=high`; quote the query word (or the whole query). Put `--limit` and
 An agent calls `query_findings` the same way (`{"q": "has:poc tag:class:xss"}`);
 a bad `q` comes back as a tool error with the parse message, and `cursor` is
 the previous page's `next_cursor`.
+
+To work on every finding a query matches, fan out over it: `all: true`
+returns every match unpaged, and a `for_each` takes its rows. Each `item` is a
+slim row (`id`, `title`, `severity`, `scope`, `location`, `concern_id`,
+`tags`, `declared_at`, `run_id`).
+
+```yaml
+steps:
+  - id: tagged
+    action: findings.query
+    with: { q: "tag:needs-poc severity>=high", all: true }
+  - id: poc
+    agent: poc-writer
+    for_each: "{{ (steps.tagged.output | fromjson).rows | tojson }}"
+    max_parallel: 4
+    prompt: |
+      Write a proof of concept for finding {{ item.id }}: {{ item.title }}
+      ({{ item.location }}). When it works, tag it `has-poc` with tag_findings.
+```
+
+`| tojson` hands `for_each` an exact JSON array rather than relying on how the
+template engine happens to print a list.
 
 Control plane: the Findings page has a query bar. Press `/` to focus it. Typing
 offers fuzzy suggestions (keys, then values with counts); Enter or Tab accepts

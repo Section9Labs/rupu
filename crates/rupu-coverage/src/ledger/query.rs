@@ -30,6 +30,10 @@ pub struct FindingQuery {
     /// A previous page's `next_cursor`.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Every match in one answer, unpaged (for a workflow `for_each` over the
+    /// rows). Refused together with `limit` or `cursor`.
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,6 +46,8 @@ pub enum QueryError {
     Limit(usize),
     #[error("`cursor` is not one this query returned: {0}")]
     Cursor(String),
+    #[error("`all` returns every match in one answer, so it takes no `limit` or `cursor`")]
+    AllWithPaging,
 }
 
 /// Sort rank: critical (4) first.
@@ -141,6 +147,9 @@ fn parse_cursor(c: &str) -> Result<SortKey, QueryError> {
 /// One page of matches, after `q.cursor`. A cursor is a sort key, not an
 /// offset, so findings appended while paging never shift or repeat rows.
 pub fn query(records: &[FindingRecord], q: &FindingQuery) -> Result<Page, QueryError> {
+    if q.all && (q.limit.is_some() || q.cursor.is_some()) {
+        return Err(QueryError::AllWithPaging);
+    }
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 || limit > MAX_LIMIT {
         return Err(QueryError::Limit(limit));
@@ -149,6 +158,7 @@ pub fn query(records: &[FindingRecord], q: &FindingQuery) -> Result<Page, QueryE
     check_available(&parsed, false)?;
     let all = select(records, FindingView::bare, &parsed, &RunScopes::new());
     let total = all.len();
+    let limit = if q.all { total } else { limit };
     let start = match q.cursor.as_deref() {
         None => 0,
         Some(c) => {
@@ -217,7 +227,8 @@ pub fn query_input_schema() -> serde_json::Value {
         "properties": {
             "q": { "type": "string", "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything." },
             "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Rows per page (default 50)." },
-            "cursor": { "type": "string", "description": "`next_cursor` from the previous page." }
+            "cursor": { "type": "string", "description": "`next_cursor` from the previous page." },
+            "all": { "type": "boolean", "description": "Return every match in one answer, unpaged (no `limit`/`cursor`). For a workflow `for_each` over the rows; rows are slim (no report body)." }
         }
     })
 }
@@ -337,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn query_input_is_q_limit_cursor_only() {
+    fn query_input_is_q_limit_cursor_all_only() {
         let ok: FindingQuery =
             serde_json::from_value(serde_json::json!({"q": "tag:x", "limit": 5})).unwrap();
         assert_eq!(ok.q, "tag:x");
@@ -346,6 +357,9 @@ mod tests {
         );
         let empty: FindingQuery = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(empty.q, "");
+        assert!(!empty.all);
+        let all: FindingQuery = serde_json::from_value(serde_json::json!({"all": true})).unwrap();
+        assert!(all.all);
     }
 
     #[test]
@@ -377,6 +391,65 @@ mod tests {
         let p2_ids: Vec<&str> = p2.rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(p2_ids, ["fnd_high_old", "fnd_low"]);
         assert_eq!(p2.next_cursor, None);
+    }
+
+    #[test]
+    fn all_returns_every_match_past_the_page_cap() {
+        let f: Vec<FindingRecord> = (0..MAX_LIMIT as u32 + 100)
+            .map(|i| {
+                rec(
+                    &format!("fnd_{i:04}"),
+                    Severity::High,
+                    i % 60,
+                    &["needs-poc"],
+                )
+            })
+            .chain([rec("fnd_other", Severity::High, 0, &[])])
+            .collect();
+        let p = query(
+            &f,
+            &FindingQuery {
+                q: "tag:needs-poc".into(),
+                all: true,
+                ..q()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.total, MAX_LIMIT + 100);
+        assert_eq!(p.rows.len(), MAX_LIMIT + 100);
+        assert_eq!(p.next_cursor, None);
+        let none = query(
+            &f,
+            &FindingQuery {
+                q: "tag:nothing".into(),
+                all: true,
+                ..q()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (none.total, none.rows.len(), none.next_cursor),
+            (0, 0, None)
+        );
+    }
+
+    #[test]
+    fn all_refuses_limit_and_cursor() {
+        let f = fixture();
+        for paged in [
+            FindingQuery {
+                all: true,
+                limit: Some(10),
+                ..q()
+            },
+            FindingQuery {
+                all: true,
+                cursor: Some("4|2026-01-01T00:00:00Z|fnd_x".into()),
+                ..q()
+            },
+        ] {
+            assert_eq!(query(&f, &paged).unwrap_err(), QueryError::AllWithPaging);
+        }
     }
 
     #[test]
