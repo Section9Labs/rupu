@@ -212,6 +212,90 @@ describe('Findings — query bar', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(/unknown/i);
   });
 
+  /** The page under a router, with buttons that navigate to `q` values. */
+  function renderWithNav(start: string, targets: Record<string, string>) {
+    function Nav() {
+      const navigate = useNavigate();
+      return (
+        <>
+          {Object.entries(targets).map(([label, q]) => (
+            <button key={label} onClick={() => navigate(`/security?tab=findings&q=${encodeURIComponent(q)}`)}>
+              {label}
+            </button>
+          ))}
+        </>
+      );
+    }
+    return render(
+      <MemoryRouter initialEntries={[`/security?tab=findings&q=${encodeURIComponent(start)}`]}>
+        <Nav />
+        <Findings />
+      </MemoryRouter>,
+    );
+  }
+
+  it('drops the old rows and export when the server rejects the next query', async () => {
+    vi.spyOn(api, 'getFindings').mockImplementation(async (opts) => {
+      if (opts?.q === 'tag:b') throw new Error('server rejected tag:b');
+      return resp([FINDING]);
+    });
+    renderWithNav('tag:a', { 'go-b': 'tag:b' });
+    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Export report' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('go-b'));
+
+    expect(await screen.findByText('server rejected tag:b')).toBeInTheDocument();
+    expect(screen.queryByText(FINDING.summary)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /filter by high/i })).toBeNull();
+    // The bar stays, so the query can be fixed.
+    expect(screen.getByRole('combobox', { name: 'Filter findings' })).toBeInTheDocument();
+  });
+
+  it("never shows the previous query's rows while the next one loads", async () => {
+    const OTHER: FindingOut = { ...FINDING, id: 'f2', summary: 'Hardcoded token in the deploy script' };
+    let release: (r: FindingsResponse) => void = () => {};
+    vi.spyOn(api, 'getFindings').mockImplementation((opts) =>
+      opts?.q === 'tag:b'
+        ? new Promise<FindingsResponse>((r) => {
+            release = r;
+          })
+        : Promise.resolve(resp([FINDING])),
+    );
+    renderWithNav('tag:a', { 'go-b': 'tag:b' });
+    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('go-b'));
+
+    await waitFor(() => expect(screen.queryByText(FINDING.summary)).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
+    expect(screen.getByRole('combobox', { name: 'Filter findings' })).toBeInTheDocument();
+    expect(screen.getByText('Loading findings…')).toBeInTheDocument();
+
+    release(resp([OTHER]));
+    expect(await screen.findByText(OTHER.summary)).toBeInTheDocument();
+    expect(screen.queryByText('Loading findings…')).toBeNull();
+  });
+
+  it('an invalid query fixed back to a valid one fetches and shows its rows', async () => {
+    const OTHER: FindingOut = { ...FINDING, id: 'f2', summary: 'Hardcoded token in the deploy script' };
+    const spy = vi
+      .spyOn(api, 'getFindings')
+      .mockImplementation(async (opts) => resp(opts?.q === 'tag:b' ? [OTHER] : [FINDING]));
+    renderWithNav('tag:a', { 'go-bad': 'sevrity:x', 'go-b': 'tag:b' });
+    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('go-bad'));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/unknown/i);
+
+    fireEvent.click(screen.getByText('go-b'));
+    expect(await screen.findByText(OTHER.summary)).toBeInTheDocument();
+    expect(spy).toHaveBeenLastCalledWith({ q: 'tag:b' });
+    expect(screen.queryByText(FINDING.summary)).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('says which query matched nothing', async () => {
     vi.spyOn(api, 'getFindings').mockResolvedValue(resp([]));
     renderPage('/security?tab=findings&q=tag%3Anope');

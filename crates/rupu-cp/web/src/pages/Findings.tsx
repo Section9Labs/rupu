@@ -65,29 +65,43 @@ export default function Findings() {
     return p.ok ? null : p.error.message;
   }, [q]);
 
-  const [data, setData] = useState<FindingsResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Each answer and error is kept with the query it answers: the page shows
+  // rows, tiles and the export only for the query in the URL, never an
+  // earlier one's while the next loads or after the server rejects it.
+  const [answer, setAnswer] = useState<{ q: string; resp: FindingsResponse } | null>(null);
+  const [failure, setFailure] = useState<{ q: string; message: string } | null>(null);
+  // Facets describe the scope before `q`, so the last answer's keep serving
+  // the bar's suggestions while the next query loads or after it fails.
+  const [facets, setFacets] = useState<FindingsResponse['facets'] | undefined>(undefined);
+  // Set once the first fetch settles: until then the page is one spinner.
+  const [settled, setSettled] = useState(false);
 
   useEffect(() => {
     // A query that doesn't parse never reaches the server; the page shows why
-    // in place of the results. Drop any earlier server error with it.
-    if (localError) {
-      setError(null);
-      return;
-    }
+    // in place of the results.
+    if (localError) return;
     let cancelled = false;
-    setError(null);
+    setFailure(null);
     (q ? api.getFindings({ q }) : api.getFindings())
-      .then((d) => {
-        if (!cancelled) setData(d);
+      .then((resp) => {
+        if (cancelled) return;
+        setAnswer({ q, resp });
+        setFacets(resp.facets);
+        setSettled(true);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(apiErrorMessage(e));
+        if (cancelled) return;
+        setAnswer(null);
+        setFailure({ q, message: apiErrorMessage(e) });
+        setSettled(true);
       });
     return () => {
       cancelled = true;
     };
   }, [q, localError]);
+
+  const data = !localError && answer?.q === q ? answer.resp : null;
+  const error = !localError && failure?.q === q ? failure.message : null;
 
   const tileSummary: FindingsSummary = useMemo(() => {
     const counts = Object.fromEntries((data?.facets?.severity ?? []).map((v) => [v.value, v.count]));
@@ -109,6 +123,7 @@ export default function Findings() {
   }, [data]);
 
   const active = activeSeverity(q);
+  // A fetch for this query is in flight (the last answer was for another).
   const loading = data === null && !localError && !error;
   const noneAtAll = !q && data !== null && tileSummary.total === 0 && data.findings.length === 0;
 
@@ -124,7 +139,7 @@ export default function Findings() {
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
-      {loading ? (
+      {loading && !settled ? (
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading findings…" />
         </div>
@@ -135,7 +150,7 @@ export default function Findings() {
         />
       ) : (
         <div className="space-y-6">
-          {data && !localError && (
+          {data && (
             <FindingMetrics
               summary={tileSummary}
               active={active}
@@ -149,13 +164,13 @@ export default function Findings() {
                 value={q}
                 onChange={setQ}
                 fields={FINDING_FIELDS}
-                facets={data?.facets}
+                facets={facets}
                 valueTone={sevTone}
                 label="Filter findings"
               />
             </div>
             {/* The report covers exactly the rows the query leaves. */}
-            {data && !localError && <ExportReportButton findings={data.findings} defaultTitle="Findings report" />}
+            {data && <ExportReportButton findings={data.findings} defaultTitle="Findings report" />}
           </div>
 
           {localError && (
@@ -164,7 +179,13 @@ export default function Findings() {
             </p>
           )}
 
-          {data && !localError && unreadable.length > 0 && (
+          {loading && (
+            <div className="flex items-center gap-2 text-note text-ink-mute">
+              <Spinner size="sm" label="Loading findings…" />
+            </div>
+          )}
+
+          {data && unreadable.length > 0 && (
             <div
               role="status"
               className="rounded-lg bg-warn-bg px-3 py-2 text-note text-warn ring-1 ring-warn/30"
@@ -174,7 +195,6 @@ export default function Findings() {
           )}
 
           {data &&
-            !localError &&
             (data.findings.length === 0 && q ? (
               <EmptyState title="No matches" hint={`No findings match \`${q}\`.`} />
             ) : (
