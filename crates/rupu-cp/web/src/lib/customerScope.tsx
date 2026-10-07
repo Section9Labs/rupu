@@ -34,6 +34,8 @@ export interface CustomerScopeValue {
   /** Clear a scope the backend rejected and show `message` as a one-line
    *  notice. Pages call this on a 400 from a request carrying the scope. */
   rejectScope(message: string): void;
+  /** True once the active list has loaded (successfully) at least once. */
+  loaded?: boolean;
   /** Refetch the list — after create / rename / archive / delete. A failed
    *  refetch keeps the rows already loaded. */
   reload(): void;
@@ -150,8 +152,8 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
   );
 
   const value = useMemo<CustomerScopeValue>(
-    () => ({ scope, customer, customers, setScope, rejectScope, reload, notice, noticeSeq }),
-    [scope, customer, customers, setScope, rejectScope, reload, notice, noticeSeq],
+    () => ({ scope, customer, customers, loaded, setScope, rejectScope, reload, notice, noticeSeq }),
+    [scope, customer, customers, loaded, setScope, rejectScope, reload, notice, noticeSeq],
   );
   return <CustomerScopeContext.Provider value={value}>{children}</CustomerScopeContext.Provider>;
 }
@@ -167,6 +169,12 @@ export function useCustomerScope(): CustomerScopeValue {
  *  decorates a row, so a surface mounted without the scope still renders. */
 export function useCustomerDirectory(): CustomerRow[] {
   return useContext(CustomerScopeContext)?.customers ?? [];
+}
+
+/** [`useCustomerDirectory`] plus whether the active list has loaded yet. */
+export function useCustomerDirectoryState(): { customers: CustomerRow[]; loaded: boolean } {
+  const ctx = useContext(CustomerScopeContext);
+  return { customers: ctx?.customers ?? [], loaded: ctx?.loaded ?? true };
 }
 
 /** The value list fetches pass as their `customer` argument. */

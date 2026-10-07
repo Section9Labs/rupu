@@ -3,8 +3,9 @@
 // `null` (no customer) or ABSENT (the host/record can't say; never "none") —
 // and `derived` marks an attribution taken from the project's current customer.
 
-import type { CustomerRef, CustomerRow } from '../../lib/api';
-import { useCustomerDirectory } from '../../lib/customerScope';
+import { useEffect, useRef, useState } from 'react';
+import { api, type CustomerRef, type CustomerRow } from '../../lib/api';
+import { useCustomerDirectoryState } from '../../lib/customerScope';
 import { CustomerChip, DERIVED_CUSTOMER_TITLE, UNKNOWN_CUSTOMER_TITLE } from './CustomerChip';
 import type { Column } from '../lists/SortableTable';
 import { CustomerDot } from './CustomerDot';
@@ -18,6 +19,28 @@ export function resolveCustomerRef(slug: string, customers: CustomerRow[]): Cust
   return { slug, name: slug, tint: { light: 'currentColor', dark: 'currentColor' }, archived: false };
 }
 
+/** The customers a run surface can name: the active ones plus — loaded ONCE,
+ *  lazily, the first time a slug in `slugs` is not an active customer — the
+ *  archived ones (a run keeps the customer it recorded after it is archived).
+ *  A slug in neither list stays unresolved (a deleted customer). */
+export function useRunCustomers(slugs: (string | null | undefined)[]): CustomerRow[] {
+  const { customers: active, loaded } = useCustomerDirectoryState();
+  const [archived, setArchived] = useState<CustomerRow[]>([]);
+  const asked = useRef(false);
+  const unresolved = slugs.some((s) => typeof s === 'string' && !active.some((c) => c.slug === s));
+  useEffect(() => {
+    if (!loaded || !unresolved || asked.current) return;
+    asked.current = true;
+    api.getCustomers({ archived: true }).then(
+      (rows) => setArchived(rows.filter((r) => r.archived)),
+      () => {
+        // Can't tell: such a slug keeps showing by its slug.
+      },
+    );
+  }, [loaded, unresolved]);
+  return archived.length === 0 ? active : [...active, ...archived.filter((a) => !active.some((c) => c.slug === a.slug))];
+}
+
 /** The run page's header chip. With no customers defined, a run with none (or
  *  an unknowable one) shows nothing — the feature is not in play. */
 export function RunCustomerChip({
@@ -27,7 +50,7 @@ export function RunCustomerChip({
   customer: string | null | undefined;
   derived?: boolean;
 }) {
-  const customers = useCustomerDirectory();
+  const customers = useRunCustomers([customer]);
   if (typeof customer === 'string') {
     return <CustomerChip customer={resolveCustomerRef(customer, customers)} derived={derived} />;
   }
@@ -78,13 +101,15 @@ export function customerSortValue(
 
 /** The runs tables' Customer column — placed right after Host. Add it only
  *  while the list is NOT scoped to a customer (when scoped, every row is that
- *  customer's) and customers exist; otherwise `columns` is returned as is. */
+ *  customer's) and the feature is in play (customers exist — archived ones
+ *  included — or a listed row names one); otherwise `columns` is returned as is. */
 export function withCustomerColumn<T extends { customer?: string | null; customer_derived?: boolean }>(
   columns: Column<T>[],
   customers: CustomerRow[],
+  rows: T[],
   show: boolean,
 ): Column<T>[] {
-  if (!show || customers.length === 0) return columns;
+  if (!show || (customers.length === 0 && !rows.some((r) => typeof r.customer === 'string'))) return columns;
   const col: Column<T> = {
     key: 'customer',
     header: 'Customer',

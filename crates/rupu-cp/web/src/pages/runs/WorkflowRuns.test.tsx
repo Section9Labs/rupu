@@ -752,4 +752,18 @@ describe('WorkflowRuns — the Customer column', () => {
     await waitFor(() => expect(screen.getByText('wf-a')).toBeInTheDocument());
     expect(headers(container)).not.toContain('Customer');
   });
+
+  it('shows the column (and names archived customers) when only archived customers exist', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getCustomers').mockImplementation(async (o) =>
+      o?.archived ? [customerRow('oldco', { name: 'Old Co', archived: true })] : [],
+    );
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation(
+      onlyHost('local', [makeRun({ id: 'run_a', workflow_name: 'wf-a', customer: 'oldco' })]),
+    );
+    const { container } = renderWith('/', []);
+    await waitFor(() => expect(screen.getByText('wf-a')).toBeInTheDocument());
+    await waitFor(() => expect(headers(container)).toContain('Customer'));
+    expect(await screen.findByText('Old Co')).toBeInTheDocument();
+  });
 });

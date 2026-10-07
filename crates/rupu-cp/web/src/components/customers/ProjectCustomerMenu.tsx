@@ -53,8 +53,11 @@ function customerScmRoutes(view: ConfigView): ScmRoute[] {
   const scm = view.effective?.scm as { rules?: unknown } | undefined;
   const rules = scm?.rules;
   if (!Array.isArray(rules)) return [];
-  const own =
-    view.provenance?.['scm.rules']?.source === 'customer' || /scm\.rules/.test(view.raw_customer ?? '');
+  // Only the provenance says whose rules these are (keys under `scm.rules`
+  // resolved from the customer layer) — never a guess from the raw TOML.
+  const own = Object.entries(view.provenance ?? {}).some(
+    ([key, p]) => /^scm\.rules(\.|\[|$)/.test(key) && p.source === 'customer',
+  );
   if (!own) return [];
   const out: ScmRoute[] = [];
   for (const r of rules) {
@@ -109,7 +112,7 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
   const assigned = customer ?? null;
 
   const items = useCallback(
-    () => Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []),
+    () => Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"]') ?? []),
     [],
   );
 
@@ -123,8 +126,16 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
   useEffect(() => {
     if (!open) return;
     const all = items();
-    (all.find((el) => el.getAttribute('aria-current') === 'true') ?? all[0])?.focus();
+    (all.find((el) => el.getAttribute('aria-checked') === 'true') ?? all[0])?.focus();
   }, [open, items]);
+
+  // After a refusal the busy items were disabled (focus fell to <body>): put
+  // focus back on the menu so Escape still reaches it.
+  useEffect(() => {
+    if (!open || busy || !error) return;
+    const all = items();
+    (all.find((el) => el.getAttribute('aria-checked') === 'true') ?? all[0])?.focus();
+  }, [open, busy, error, items]);
 
   // Click outside closes.
   useEffect(() => {
@@ -155,6 +166,11 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
   function focusCustomer(c: CustomerRow) {
     setPreviewSlug(c.slug);
     loadRoutes(c.slug);
+  }
+  /** The preview follows keyboard focus when it is on a customer, else clears. */
+  function restorePreview() {
+    const f = document.activeElement as HTMLElement | null;
+    setPreviewSlug(f && menuRef.current?.contains(f) ? (f.dataset.slug ?? null) : null);
   }
   function clearPreview() {
     setPreviewSlug(null);
@@ -228,7 +244,7 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
       all[(at + 1) % all.length]?.focus();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      all[(at - 1 + all.length) % all.length]?.focus();
+      all[at <= 0 ? all.length - 1 : at - 1]?.focus();
     } else if (e.key === 'Home') {
       e.preventDefault();
       all[0]?.focus();
@@ -267,74 +283,77 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
 
       {open && (
         <div
-          ref={menuRef}
-          id={menuId}
-          role="menu"
-          aria-label="Assign to customer"
-          aria-describedby={noteId}
           onKeyDown={onMenuKey}
           className="absolute left-0 top-full z-30 mt-1 w-80 rounded-lg border border-border bg-panel py-1 shadow-lg"
         >
           <div
-            aria-hidden
-            className="px-3 pb-1 pt-1.5 text-meta font-semibold uppercase tracking-wide text-ink-mute"
+            ref={menuRef}
+            id={menuId}
+            role="menu"
+            aria-label="Assign to customer"
+            aria-describedby={noteId}
           >
-            Assign to customer
-          </div>
-          {customers.length === 0 && (
-            <div className="px-3 py-2 text-note text-ink-mute">No customers yet.</div>
-          )}
-          {customers.map((c) => {
-            const current = assigned?.slug === c.slug;
-            return (
+            <div
+              aria-hidden
+              className="px-3 pb-1 pt-1.5 text-meta font-semibold uppercase tracking-wide text-ink-mute"
+            >
+              Assign to customer
+            </div>
+            {customers.length === 0 && (
+              <div className="px-3 py-2 text-note text-ink-mute">No customers yet.</div>
+            )}
+            {customers.map((c) => {
+              const current = assigned?.slug === c.slug;
+              return (
+                <button
+                  key={c.slug}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={current}
+                  disabled={busy}
+                  data-slug={c.slug}
+                  onClick={() => void assign(c.slug)}
+                  onFocus={() => focusCustomer(c)}
+                  onMouseEnter={() => focusCustomer(c)}
+                  onMouseLeave={restorePreview}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-ink hover:bg-surface-hover focus:bg-surface-hover focus:outline-none disabled:opacity-60"
+                >
+                  <CustomerDot tint={c.tint} />
+                  <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                  {c.default_account && (
+                    <span className="font-mono text-note text-ink-mute">{c.default_account.account}</span>
+                  )}
+                  {current && <Check size={13} aria-hidden className="text-brand-600" />}
+                </button>
+              );
+            })}
+            <div role="separator" className="my-1 border-t border-border" />
+            {assigned && (
               <button
-                key={c.slug}
                 type="button"
                 role="menuitem"
                 disabled={busy}
-                aria-current={current ? 'true' : undefined}
-                data-slug={c.slug}
-                onClick={() => void assign(c.slug)}
-                onFocus={() => focusCustomer(c)}
-                onMouseEnter={() => focusCustomer(c)}
-                onMouseLeave={clearPreview}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-ink hover:bg-surface-hover focus:bg-surface-hover focus:outline-none disabled:opacity-60"
+                onClick={() => void unassign()}
+                onFocus={clearPreview}
+                className="flex w-full items-center px-3 py-1.5 text-left text-sm text-ink hover:bg-surface-hover focus:bg-surface-hover focus:outline-none disabled:opacity-60"
               >
-                <CustomerDot tint={c.tint} />
-                <span className="min-w-0 flex-1 truncate">{c.name}</span>
-                {c.default_account && (
-                  <span className="font-mono text-note text-ink-mute">{c.default_account.account}</span>
-                )}
-                {current && <Check size={13} aria-hidden className="text-brand-600" />}
+                Unassign
               </button>
-            );
-          })}
-          <div role="separator" className="my-1 border-t border-border" />
-          {assigned && (
+            )}
             <button
               type="button"
               role="menuitem"
               disabled={busy}
-              onClick={() => void unassign()}
+              onClick={() => {
+                setCreating(true);
+                setOpen(false);
+              }}
               onFocus={clearPreview}
-              className="flex w-full items-center px-3 py-1.5 text-left text-sm text-ink hover:bg-surface-hover focus:bg-surface-hover focus:outline-none disabled:opacity-60"
+              className="flex w-full items-center px-3 py-1.5 text-left text-sm text-brand-700 hover:bg-surface-hover focus:bg-surface-hover focus:outline-none disabled:opacity-60"
             >
-              Unassign
+              New customer…
             </button>
-          )}
-          <button
-            type="button"
-            role="menuitem"
-            disabled={busy}
-            onClick={() => {
-              setCreating(true);
-              setOpen(false);
-            }}
-            onFocus={clearPreview}
-            className="flex w-full items-center px-3 py-1.5 text-left text-sm text-brand-700 hover:bg-surface-hover focus:bg-surface-hover focus:outline-none disabled:opacity-60"
-          >
-            New customer…
-          </button>
+          </div>
           <p
             id={noteId}
             role="note"

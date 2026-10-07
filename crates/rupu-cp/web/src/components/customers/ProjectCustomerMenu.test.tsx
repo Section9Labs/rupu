@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { useState } from 'react';
 import { api, ApiError, type ConfigView, type CustomerRef, type ProjectRow } from '../../lib/api';
@@ -52,6 +52,9 @@ function mount(initial: CustomerRef | null | undefined, customers = [ACME, GLOBE
   return utils;
 }
 
+const allItems = () =>
+  Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"]'));
+
 async function open() {
   fireEvent.click(screen.getByRole('button', { name: /customer/i }));
   await screen.findByRole('menu', { name: 'Assign to customer' });
@@ -62,7 +65,7 @@ describe('ProjectCustomerMenu', () => {
     mount(null);
     expect(screen.getByText('No customer')).toBeInTheDocument();
     await open();
-    const items = await screen.findAllByRole('menuitem');
+    const items = await screen.findAllByRole('menuitemradio');
     const names = items.map((i) => i.textContent);
     expect(names.some((t) => t?.includes('Acme') && t.includes('anthropic-acme'))).toBe(true);
     expect(names.some((t) => t?.includes('Globex'))).toBe(true);
@@ -80,14 +83,14 @@ describe('ProjectCustomerMenu', () => {
   it('previews the account switch on focus, with its tag', async () => {
     mount(null);
     await open();
-    fireEvent.focus(await screen.findByRole('menuitem', { name: /Acme/ }));
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
     expect(
       screen.getByText(/Assigning to Acme switches this project’s runs to anthropic-acme \(locked\)/),
     ).toBeInTheDocument();
     expect(screen.getByText(/Runs already finished keep their history/)).toBeInTheDocument();
-    fireEvent.focus(screen.getByRole('menuitem', { name: /Globex/ }));
+    fireEvent.focus(screen.getByRole('menuitemradio', { name: /Globex/ }));
     expect(screen.getByText(/anthropic-main \(inherits global\)/)).toBeInTheDocument();
-    fireEvent.focus(screen.getByRole('menuitem', { name: /Initech/ }));
+    fireEvent.focus(screen.getByRole('menuitemradio', { name: /Initech/ }));
     expect(screen.getByText(/anthropic-initech \(customer default\)/)).toBeInTheDocument();
   });
 
@@ -103,11 +106,28 @@ describe('ProjectCustomerMenu', () => {
     );
     mount(null);
     await open();
-    fireEvent.focus(await screen.findByRole('menuitem', { name: /Acme/ }));
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
     expect(await screen.findByText(/and routes acme-corp\/\* repos to github-acme/)).toBeInTheDocument();
     expect(spy).toHaveBeenCalledWith('acme');
-    fireEvent.focus(screen.getByRole('menuitem', { name: /Globex/ }));
+    fireEvent.focus(screen.getByRole('menuitemradio', { name: /Globex/ }));
     await waitFor(() => expect(spy).toHaveBeenCalledWith('globex'));
+    expect(screen.queryByText(/routes/)).toBeNull();
+  });
+
+  it('does not claim SCM routing from raw TOML when provenance says the rules are not the customer’s', async () => {
+    const view = {
+      effective: { scm: { rules: [{ owner: 'global-org', account: 'github-main' }] } },
+      provenance: { 'scm.rules': { source: 'global', locked: false } },
+      raw_global: '',
+      raw_project: null,
+      raw_customer: '# mentions scm.rules in a comment\n',
+    } as unknown as ConfigView;
+    const spy = vi.spyOn(api, 'getCustomerConfig').mockResolvedValue(view);
+    mount(null);
+    await open();
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    await Promise.resolve();
     expect(screen.queryByText(/routes/)).toBeNull();
   });
 
@@ -115,7 +135,7 @@ describe('ProjectCustomerMenu', () => {
     vi.spyOn(api, 'getCustomerConfig').mockRejectedValue(new Error('boom'));
     mount(null);
     await open();
-    fireEvent.focus(await screen.findByRole('menuitem', { name: /Acme/ }));
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
     expect(screen.getByText(/Assigning to Acme/)).toBeInTheDocument();
     expect(screen.queryByText(/routes/)).toBeNull();
   });
@@ -124,8 +144,8 @@ describe('ProjectCustomerMenu', () => {
     const spy = vi.spyOn(api, 'assignProject').mockResolvedValue(projectRow(ref(GLOBEX)));
     mount(ref(ACME));
     await open();
-    expect(screen.getByRole('menuitem', { name: /Acme/ })).toHaveAttribute('aria-current', 'true');
-    fireEvent.click(await screen.findByRole('menuitem', { name: /Globex/ }));
+    expect(screen.getByRole('menuitemradio', { name: /Acme/ })).toHaveAttribute('aria-checked', 'true');
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Globex/ }));
     await waitFor(() => expect(spy).toHaveBeenCalledWith('globex', 'ws1'));
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
     expect(screen.getByRole('button', { name: /Customer: Globex/ })).toBeInTheDocument();
@@ -135,7 +155,7 @@ describe('ProjectCustomerMenu', () => {
     vi.spyOn(api, 'assignProject').mockRejectedValue(new ApiError(409, 'customer is archived'));
     mount(null);
     await open();
-    fireEvent.click(await screen.findByRole('menuitem', { name: /Acme/ }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Acme/ }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/archived/);
     expect(screen.getByRole('menu')).toBeInTheDocument();
     expect(screen.getByText('No customer')).toBeInTheDocument();
@@ -185,11 +205,57 @@ describe('ProjectCustomerMenu', () => {
   it('arrow keys move between items', async () => {
     mount(null);
     await open();
-    const items = screen.getAllByRole('menuitem');
-    items[0].focus();
+    const items = allItems();
+    act(() => items[0].focus());
     fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowDown' });
     expect(items[1]).toHaveFocus();
     fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowUp' });
     expect(items[0]).toHaveFocus();
+  });
+
+  it('keeps the note and the error outside the menu element', async () => {
+    vi.spyOn(api, 'assignProject').mockRejectedValue(new ApiError(409, 'customer is archived'));
+    mount(null);
+    await open();
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /Acme/ }));
+    const alert = await screen.findByRole('alert');
+    const menu = screen.getByRole('menu');
+    expect(menu.contains(alert)).toBe(false);
+    expect(menu.contains(screen.getByRole('note'))).toBe(false);
+    expect(menu).toHaveAttribute('aria-describedby', screen.getByRole('note').id);
+  });
+
+  it('puts focus back on the menu after a refusal, so Escape still closes it', async () => {
+    vi.spyOn(api, 'assignProject').mockRejectedValue(new ApiError(409, 'customer is archived'));
+    mount(null);
+    await open();
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    await screen.findByRole('alert');
+    await waitFor(() => expect(screen.getAllByRole('menuitemradio')[0]).toHaveFocus());
+    fireEvent.keyDown(document.activeElement as Element, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('ArrowUp with nothing focused goes to the last item', async () => {
+    mount(null);
+    await open();
+    act(() => (document.activeElement as HTMLElement).blur());
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowUp' });
+    const items = allItems();
+    expect(items[items.length - 1]).toHaveFocus();
+  });
+
+  it('a mouse leaving another row does not clear the preview keyboard focus is showing', async () => {
+    mount(null);
+    await open();
+    const acme = await screen.findByRole('menuitemradio', { name: /Acme/ });
+    act(() => acme.focus());
+    expect(screen.getByText(/Assigning to Acme/)).toBeInTheDocument();
+    const globex = screen.getByRole('menuitemradio', { name: /Globex/ });
+    fireEvent.mouseEnter(globex);
+    expect(screen.getByText(/Assigning to Globex/)).toBeInTheDocument();
+    fireEvent.mouseLeave(globex);
+    expect(screen.getByText(/Assigning to Acme/)).toBeInTheDocument();
   });
 });

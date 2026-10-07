@@ -1482,4 +1482,23 @@ describe('RunDetail: customer chip', () => {
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
     expect(screen.queryByText('No customer')).toBeNull();
   });
+
+  it('resolves an archived customer (loaded once, lazily) and shows its archived state', async () => {
+    stubCustomerRun({ customer: 'oldco' });
+    const spy = vi
+      .spyOn(api, 'getCustomers')
+      .mockImplementation(async (o) => (o?.archived ? [customerRow('oldco', { name: 'Old Co', archived: true })] : []));
+    renderWithCustomers([]);
+    expect(await screen.findByText('Old Co')).toBeInTheDocument();
+    expect(screen.getByText('(archived)')).toBeInTheDocument();
+    expect(spy.mock.calls.filter(([o]) => o?.archived).length).toBe(1);
+  });
+
+  it('does not load the archived list when the slug is an active customer', async () => {
+    stubCustomerRun({ customer: 'acme' });
+    const spy = vi.spyOn(api, 'getCustomers').mockResolvedValue([customerRow('acme', { name: 'Acme Corp' })]);
+    renderWithCustomers();
+    expect(await screen.findByText('Acme Corp')).toBeInTheDocument();
+    expect(spy.mock.calls.filter(([o]) => o?.archived).length).toBe(0);
+  });
 });

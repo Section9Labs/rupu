@@ -236,6 +236,28 @@ impl From<Attribution> for RowCustomer {
     }
 }
 
+/// Write a run's attribution onto its serialized record (`GET /api/runs/:id`'s
+/// and `/graph`'s `run`), as the list rows carry it: the RAW record only says
+/// what the run recorded (its `customer` key is absent for a legacy run), so
+/// its keys are replaced — a slug or `null`, with `customer_derived` — or, when
+/// the attribution can't be known (`None`: an unreadable assignment, a legacy
+/// mirrored run), both are left out, never read as "no customer".
+pub fn stamp_run_customer(run: &mut serde_json::Value, who: Option<Attribution>) {
+    let Some(obj) = run.as_object_mut() else {
+        return;
+    };
+    obj.remove("customer");
+    obj.remove("customer_derived");
+    if let Some(who) = who {
+        let row = RowCustomer::from(who);
+        obj.insert("customer".into(), serde_json::json!(row.customer));
+        obj.insert(
+            "customer_derived".into(),
+            serde_json::json!(row.customer_derived),
+        );
+    }
+}
+
 /// A per-request memo over a [`CustomerStore`]: each workspace's current
 /// assignment, and each customer's record, is read at most once however many
 /// rows share it (a legacy run's derived attribution otherwise costs one

@@ -913,6 +913,53 @@ async fn an_unreadable_assignment_degrades_an_unfiltered_list() {
     assert_eq!(detail["customer"], "acme");
 }
 
+/// `GET /api/runs/:id` and `/graph` carry the run's ATTRIBUTION on `run`, as
+/// the list rows do: a recorded slug (not derived), a recorded none (`null`),
+/// a legacy run in an assigned project (derived), and — for an unreadable
+/// assignment — neither key (never "no customer").
+#[tokio::test]
+async fn a_runs_detail_and_graph_carry_its_attribution() {
+    let f = seed_fleet();
+    // A snapshot the graph can parse (the shared seed's is a bare name).
+    let store = RunStore::new(f.global.join("runs"));
+    for id in ["r_acme", "r_acme_legacy", "r_globex", "r_none"] {
+        std::fs::write(
+            store.workflow_snapshot_path(id),
+            "name: wf\nsteps:\n  - id: s1\n    agent: reviewer\n    prompt: hi\n",
+        )
+        .unwrap();
+    }
+    let base = spawn(&f.global).await;
+    for (id, customer, derived) in [
+        ("r_acme", json!("acme"), false),
+        ("r_globex", json!("globex"), false),
+        ("r_acme_legacy", json!("acme"), true),
+        ("r_none", Value::Null, false),
+    ] {
+        let detail = get_json(format!("{base}/api/runs/{id}")).await;
+        let graph = get_json(format!("{base}/api/runs/{id}/graph")).await;
+        for (what, v) in [("detail", &detail), ("graph", &graph)] {
+            let run = v["run"].as_object().unwrap();
+            assert_eq!(run["customer"], customer, "{id} {what}");
+            assert_eq!(run["customer_derived"], derived, "{id} {what}");
+        }
+    }
+
+    // An unreadable assignment: the legacy run says nothing (both keys left
+    // out); a run that recorded its customer is unaffected.
+    let sidecar = f.global.join("workspaces").join("ws_acme.customer");
+    std::fs::remove_file(&sidecar).unwrap();
+    std::fs::create_dir_all(&sidecar).unwrap();
+    for path in ["/api/runs/r_acme_legacy", "/api/runs/r_acme_legacy/graph"] {
+        let v = get_json(format!("{base}{path}")).await;
+        let run = v["run"].as_object().unwrap();
+        assert!(!run.contains_key("customer"), "{path}: {v}");
+        assert!(!run.contains_key("customer_derived"), "{path}: {v}");
+    }
+    let v = get_json(format!("{base}/api/runs/r_acme")).await;
+    assert_eq!(v["run"]["customer"], "acme");
+}
+
 // ── residual fixes ──────────────────────────────────────────────────────
 
 /// `GET /api/sessions/:id` carries `customer` / `customer_derived`, attributed

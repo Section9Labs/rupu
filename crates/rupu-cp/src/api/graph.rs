@@ -153,7 +153,8 @@ fn build_run_graph_json(
     // Priced at the run's attributed customer, as its row and detail are.
     let mut lookup =
         crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global));
-    let key = crate::usage::run_price_key(&run, &mut lookup);
+    let who = lookup.attribute_run(&run, false).unwrap_or(None);
+    let key = crate::customers::PriceKey::of(who.as_ref());
     let usage = crate::usage::summarize_run_keyed(
         store,
         id,
@@ -161,8 +162,13 @@ fn build_run_graph_json(
         &mut crate::customers::PricingMemo::new(pricing),
     );
 
+    // The raw record only says what the run recorded; the attributed customer
+    // (and whether it was derived) is written over it, as the list rows carry.
+    let mut run_json = serde_json::to_value(&run).map_err(|e| ApiError::internal(e.to_string()))?;
+    crate::customers::stamp_run_customer(&mut run_json, who);
+
     Ok(serde_json::json!({
-        "run": run,
+        "run": run_json,
         "workflow": dag,
         "step_results": step_results,
         "units": units,

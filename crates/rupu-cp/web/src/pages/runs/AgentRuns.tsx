@@ -56,8 +56,7 @@ import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components
 import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
-import { withCustomerColumn } from '../../components/customers/RunCustomer';
-import { useCustomerScope } from '../../lib/customerScope';
+import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
 import { useScopedList } from '../../lib/useScopedList';
 
 type Tab = 'active' | 'completed' | 'failed';
@@ -128,7 +127,6 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
   const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
   const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
   const { customer, embedded } = scoped;
-  const { customers } = useCustomerScope();
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -285,8 +283,10 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
     handleStandaloneArchive,
     handleStandaloneDelete,
   );
+  // The Customer column resolves slugs (archived customers load on first need).
+  const customers = useRunCustomers(!customer ? rows.map((r) => r.customer) : []);
   const columns: Column<AgentRunRow>[] = [
-    ...withCustomerColumn(AGENT_RUN_COLUMNS, customers, !customer),
+    ...withCustomerColumn(AGENT_RUN_COLUMNS, customers, rows, !customer),
     actionColumn,
   ];
   // A fresh action error (e.g. this click's Archive/Delete refusal) must win

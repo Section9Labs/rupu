@@ -1018,17 +1018,18 @@ pub fn query_run_detail(
 ) -> Result<serde_json::Value, rupu_orchestrator::RunStoreError> {
     let record = store.load(id)?;
     let steps = store.read_step_results(id).unwrap_or_default();
-    let key = match lookup {
-        Some(l) => crate::usage::run_price_key(&record, l),
-        None => crate::customers::PriceKey::of(
-            crate::customers::Attribution::recorded_only(crate::customers::Recorded::of(
-                &record.customer,
-            ))
-            .as_ref(),
-        ),
+    // The attribution: through the lookup (a mirrored worker run by what it
+    // recorded only), else by what the run recorded; `None` = can't be known.
+    let who = match lookup {
+        Some(l) => l.attribute_run(&record, false).unwrap_or(None),
+        None => crate::customers::Attribution::recorded_only(crate::customers::Recorded::of(
+            &record.customer,
+        )),
     };
+    let key = crate::customers::PriceKey::of(who.as_ref());
     let usage = crate::usage::summarize_run_keyed(store, id, &key, prices);
     let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
+    crate::customers::stamp_run_customer(&mut out["run"], who);
     crate::codename::inject_codename(&mut out["run"], &record.id, None);
     // Legacy runs: derive names below the run level too (steps, units,
     // panelists, fixers, parallel sub-steps, findings).

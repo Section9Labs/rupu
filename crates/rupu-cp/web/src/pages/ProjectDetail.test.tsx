@@ -317,7 +317,7 @@ describe('ProjectDetail — customer assignment in the header', () => {
     const assign = vi.spyOn(api, 'assignProject').mockResolvedValue({ ...DETAIL.project, customer: ACME_REF });
     renderAt('/projects/x', 'overview');
     fireEvent.click(await screen.findByRole('button', { name: /No customer/ }));
-    fireEvent.click(await screen.findByRole('menuitem', { name: /Acme/ }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Acme/ }));
     await waitFor(() => expect(assign).toHaveBeenCalledWith('acme', 'x'));
     expect(await screen.findByRole('button', { name: /Customer: Acme/ })).toBeInTheDocument();
   });

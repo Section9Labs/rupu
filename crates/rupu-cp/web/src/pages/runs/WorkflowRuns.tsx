@@ -53,8 +53,7 @@ import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
 import { runHref } from '../../lib/runs';
-import { withCustomerColumn } from '../../components/customers/RunCustomer';
-import { useCustomerScope } from '../../lib/customerScope';
+import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { useScopedList } from '../../lib/useScopedList';
@@ -112,7 +111,6 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
   // answers (usePerHostPagedList). A picked host lists only that host.
   const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
   const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
-  const { customers } = useCustomerScope();
   const { customer, embedded } = scoped;
   // The archived listing can't be filtered by customer: no Archived state while scoped.
   const archived = archivedPicked && !customer;
@@ -274,8 +272,10 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
     ),
   };
 
+  // The Customer column resolves slugs (archived customers load on first need).
+  const customers = useRunCustomers(!customer && !archived ? rows.map((r) => r.customer) : []);
   const columns: Column<RunListRow>[] = [
-    ...withCustomerColumn(WORKFLOW_RUN_COLUMNS, customers, !customer && !archived),
+    ...withCustomerColumn(WORKFLOW_RUN_COLUMNS, customers, rows, !customer && !archived),
     actionColumn,
   ];
   // A fresh action error (e.g. this click's Archive/Delete refusal) must win

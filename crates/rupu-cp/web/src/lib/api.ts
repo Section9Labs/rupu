@@ -172,10 +172,11 @@ export interface RunRecord {
   workspace_id?: string;
   workspace_path?: string;
   transcript_dir?: string;
-  /** The customer the run RECORDED at launch: a slug, `null` = recorded "no
-   *  customer", ABSENT = a legacy record (or a peer too old to report it) —
-   *  never read absence as "no customer". `customer_derived` is set by the
-   *  listing rows only; the raw record carries none. */
+  /** The customer the run is attributed to (as list rows report it): the one
+   *  it recorded, else (`customer_derived: true`) its project's CURRENT
+   *  assignment; `null` = no customer. ABSENT when it can't be known (an
+   *  unreadable assignment, a peer too old to report it) — never read absence
+   *  as "no customer". */
   customer?: string | null;
   customer_derived?: boolean;
   error_message?: string | null;
