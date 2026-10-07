@@ -137,22 +137,34 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
   // then exactly they are un-staged — and only while each still holds the
   // value that was saved, so an edit made during the save, or a field changed
   // again since, stays staged.
-  const savedPatchRef = useRef<Record<string, unknown> | null>(null);
+  // `after`: the last reload sequence number issued when the save's PUT
+  // resolved — only a reload started later (a higher number) read the saved
+  // file, so only it may confirm.
+  const savedPatchRef = useRef<{ patch: Record<string, unknown>; after: number } | null>(null);
+  // Every reload takes the next number when it starts; `appliedSeq` is the
+  // newest one whose answer is on screen. An answer older than that is
+  // dropped, so out-of-order GETs can never leave an older view up.
+  const reloadSeq = useRef(0);
+  const appliedSeq = useRef(0);
 
   /** Re-read the layer; resolves true on success. A failure keeps the last
    *  good view (and every staged edit) and reports inline. */
   function reload(): Promise<boolean> {
+    const seq = ++reloadSeq.current;
     return api
       .getCustomerConfig(slug)
       .then((data) => {
+        // A newer reload already answered: this one's view is older.
+        if (seq < appliedSeq.current) return true;
+        appliedSeq.current = seq;
         setView(data);
         setLoadError(null);
         setReloadError(null);
         lockRef.current = data.customer_lock ?? [];
         const saved = savedPatchRef.current;
-        if (saved) {
+        if (saved && seq > saved.after) {
           savedPatchRef.current = null;
-          setPendingPatch((prev) => unstageSaved(prev, saved));
+          setPendingPatch((prev) => unstageSaved(prev, saved.patch));
         }
         if (!settledTab.current) {
           settledTab.current = true;
@@ -161,6 +173,7 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
         return true;
       })
       .catch((e: unknown) => {
+        if (seq < appliedSeq.current) return false;
         const msg = e instanceof Error ? e.message : 'Failed to load customer config';
         setLoadError(msg);
         setReloadError(msg);
@@ -176,6 +189,8 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     settledTab.current = false;
     lockRef.current = [];
     savedPatchRef.current = null;
+    // Answers to reloads for the previous customer are never shown.
+    appliedSeq.current = reloadSeq.current + 1;
     void reload();
     // `reload` closes over `slug`; re-fetch only when the customer changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -262,7 +277,10 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
       // The edits are saved; keep them staged until a re-read confirms, so a
       // transient read failure never makes them vanish from the screen. The
       // re-read here, or a later Retry, un-stages exactly what was saved.
-      savedPatchRef.current = { ...(savedPatchRef.current ?? {}), ...patch };
+      savedPatchRef.current = {
+        patch: { ...(savedPatchRef.current?.patch ?? {}), ...patch },
+        after: reloadSeq.current,
+      };
       await reload();
       onChanged?.();
     } catch (e: unknown) {

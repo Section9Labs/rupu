@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import CustomerConfigTab from './CustomerConfigTab';
@@ -406,6 +406,50 @@ describe('CustomerConfigTab', () => {
     expect((screen.getByLabelText('Default provider') as HTMLInputElement).value).toBe('acme-staging');
     expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
     expect(screen.getByRole('button', { name: 'Save changes' })).not.toBeDisabled();
+  });
+
+  it('a reload that started before the save\'s PUT never confirms it; the newest reload wins', async () => {
+    mount();
+    fireEvent.change(await screen.findByLabelText('Log level'), { target: { value: 'debug' } });
+    // Queue the next GETs by hand: A (the lock write's re-read, started before
+    // the save) and B (the save's own re-read).
+    const gets: Array<(v: ConfigView) => void> = [];
+    get.mockImplementation(() => new Promise<ConfigView>((resolve) => gets.push(resolve)));
+    fireEvent.click(screen.getByRole('switch', { name: 'Lock default_provider for projects' }));
+    await waitFor(() => expect(gets).toHaveLength(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(put).toHaveBeenCalledWith('acme', { patch: { log_level: 'debug' } }));
+    await waitFor(() => expect(gets).toHaveLength(2));
+    const saved = view({ effective: { ...view().effective, log_level: 'debug' } });
+
+    // B (post-PUT) answers first and confirms the save...
+    await act(async () => gets[1](saved));
+    await waitFor(() => expect(screen.queryByText(/unsaved change/)).not.toBeInTheDocument());
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+    // ...then A's older (pre-save) answer lands: dropped, the view stays new.
+    await act(async () => gets[0](view()));
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+  });
+
+  it('a pre-PUT reload answering first leaves the saved key staged until a post-PUT read confirms it', async () => {
+    mount();
+    fireEvent.change(await screen.findByLabelText('Log level'), { target: { value: 'debug' } });
+    const gets: Array<(v: ConfigView) => void> = [];
+    get.mockImplementation(() => new Promise<ConfigView>((resolve) => gets.push(resolve)));
+    fireEvent.click(screen.getByRole('switch', { name: 'Lock default_provider for projects' }));
+    await waitFor(() => expect(gets).toHaveLength(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(gets).toHaveLength(2));
+
+    // A — started before the PUT, so it read the old file — answers first.
+    await act(async () => gets[0](view()));
+    expect(screen.getByText('1 unsaved change')).toBeInTheDocument();
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+
+    // B — the save's own re-read — confirms it.
+    await act(async () => gets[1](view({ effective: { ...view().effective, log_level: 'debug' } })));
+    await waitFor(() => expect(screen.queryByText(/unsaved change/)).not.toBeInTheDocument());
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
   });
 
   it('a saved key changed again during the save stays staged with the newer value', async () => {
